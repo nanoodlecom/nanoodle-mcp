@@ -109,6 +109,23 @@ publish, swap `"command": "npx"` / `"args": ["nanoodle-mcp", ...]` for
 Then ask for what a graph produces — "make me a hero image of a lighthouse at
 dawn" — and the client calls the matching tool.
 
+## Run any share link
+
+Every nanoodle share link is an executable tool. Alongside your saved graphs the
+server always exposes one more tool, **`run_noodle`**, that takes any share link
+and runs it — no file needed:
+
+```
+run_noodle("https://nanoodle.com/#g=…", { "Text": "a lighthouse at dawn" })
+```
+
+Pass the link as `url` and any workflow inputs as `inputs` (the same friendly
+keys the graph's own tool would take; media inputs take a file path or https
+URL). It accepts `#g=`/`#j=` workflow links, `#a=` app links, and da.gd /
+TinyURL short links. Direct links decode locally; only fragment-less short links
+trigger a network read, and it carries no credentials. Like every other tool, a
+run **spends from your NanoGPT balance** and ends with a `cost: $X.XXXX` line.
+
 ## Making graphs
 
 Build and test workflows in the [nanoodle editor](https://nanoodle.com), hit

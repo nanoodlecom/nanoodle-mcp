@@ -91,6 +91,7 @@ async function main() {
 
   console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${resolve(graphsDir)}`);
   for (const t of registry.tools) console.error(`  - ${t.name} (${t.file}): ${t.description}`);
+  console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
 
   serveMcp({
     name: "nanoodle-mcp",

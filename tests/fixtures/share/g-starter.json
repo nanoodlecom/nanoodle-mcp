@@ -1,0 +1,76 @@
+{
+  "name": "g-starter",
+  "url": "http://localhost:41593/index.html#g=H4sIAAAAAAAAA4VSQW7bMBD8ymLOlCvJcQvwGUEPDYocWGtjL0ItBZGRIxsC-oi-sC8paFlQAhjoldyZ2ZnZCwbYykBDwxH25wXSwEIrGKSxY1gkfk8weIf9WhqMsNW2NHgR9k2Evcz_Fo724TxS71pWisfQUVBy1DvRkVQOx4TJ4ARb1-VkFp161fG-nWW2D7POt08ybWjYw-LspAj94cvBt8Vuk_FxjIlbWDyFNzr1kpikdQemrg9tl-KGvr_1SunIJA07Ek2BgjINMkhjqOHkxHPzCUV_f_-huGdlQz5vL3ow1IbQGIpp9LyhR-78SCdJxyv3DRfUj5vF6q40iHLmq4Nlz6oupzWB7ZrAVf8W9e6WdXk3BHUail9OnbqiLrykDMtCsKheYTC4XlySoDG_rOtMzwZe9PVD1z53_dKHNgvkO1j670Kflv4ngxQ-DtTrwGwcqydf32Gs_8e4vcP4bKCZcpe3bmAfDAbhU4Z1Tn_A5lPpnD7Nxxn3zjNsNU3_AB6APizYAgAA",
+  "graph": {
+    "v": 1,
+    "nodes": [
+      {
+        "id": "n1",
+        "type": "text",
+        "x": 60,
+        "y": 130,
+        "fields": {
+          "text": "a cozy ramen shop on a rainy night"
+        },
+        "w": 220
+      },
+      {
+        "id": "n2",
+        "type": "llm",
+        "x": 340,
+        "y": 70,
+        "fields": {
+          "model": "zai-org/glm-5.2",
+          "system": "You write image prompts. Turn the idea into one vivid, detailed image prompt — scene, lighting, mood, style. Reply with the prompt only."
+        },
+        "w": 250,
+        "sizes": {
+          "system": 120
+        }
+      },
+      {
+        "id": "n3",
+        "type": "image",
+        "x": 650,
+        "y": 100,
+        "fields": {
+          "model": "nano-banana-2-lite",
+          "size": "1k",
+          "variations": "1"
+        },
+        "w": 250
+      }
+    ],
+    "links": [
+      {
+        "id": "l1",
+        "from": {
+          "node": "n1",
+          "port": "text"
+        },
+        "to": {
+          "node": "n2",
+          "port": "prompt"
+        }
+      },
+      {
+        "id": "l2",
+        "from": {
+          "node": "n2",
+          "port": "text"
+        },
+        "to": {
+          "node": "n3",
+          "port": "prompt"
+        }
+      }
+    ],
+    "nid": 5,
+    "lid": 4,
+    "view": {
+      "panX": 40,
+      "panY": 60,
+      "scale": 1
+    }
+  }
+}

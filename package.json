@@ -19,7 +19,7 @@
     "LICENSE"
   ],
   "dependencies": {
-    "nanoodle": "^0.1.0"
+    "nanoodle": "^0.2.0"
   },
   "keywords": [
     "mcp",
