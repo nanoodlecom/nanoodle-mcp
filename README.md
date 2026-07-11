@@ -44,8 +44,12 @@ For each graph:
 
 ```bash
 npm install -g nanoodle-mcp     # not published to npm yet — until then:
-git clone https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp && npm install
+git clone https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp
+npm install && npm link         # `npm link` puts `nanoodle-mcp` on your PATH
 ```
+
+(No `npm link`? Run it directly as `node bin/nanoodle-mcp.mjs` instead of
+`nanoodle-mcp` below.)
 
 ## Quickstart
 
@@ -77,9 +81,18 @@ graphs, and says why per file.
 claude mcp add nanoodle -- npx nanoodle-mcp --graphs ~/noodles
 ```
 
+`npx nanoodle-mcp` works once the package is on npm (not published yet). From
+a git clone, point at the binary directly:
+
+```bash
+claude mcp add nanoodle -- node /path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs --graphs ~/noodles
+```
+
 ### Claude Desktop
 
-Add to `claude_desktop_config.json`:
+Add to `claude_desktop_config.json` (same note as above: until the npm
+publish, swap `"command": "npx"` / `"args": ["nanoodle-mcp", ...]` for
+`"command": "node"` / `"args": ["/path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs", ...]`):
 
 ```json
 {
