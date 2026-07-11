@@ -1,24 +1,114 @@
 # nanoodle-mcp
 
-**Your saved nanoodle workflows, as MCP tools.** Point this server at a folder
-of `noodle-graph.json` saves from the [nanoodle](https://nanoodle.com) editor
-and every graph becomes a tool any MCP client can call — Claude Code, Claude
-Desktop, or anything else that speaks the
-[Model Context Protocol](https://modelcontextprotocol.io).
+**Build a multi-model media pipeline visually at [nanoodle.com](https://nanoodle.com) — then hand the whole pipeline to your agent as ONE typed tool.**
 
-Zero-dependency MCP implementation (stdio, JSON-RPC 2.0, hand-rolled — small
-enough to read). The one runtime dependency is
-[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
-executor that does all the heavy lifting.
+Point this MCP stdio server at a folder of `noodle-graph.json` saves from the
+nanoodle editor and every graph becomes a callable tool with a derived input
+schema — in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, or anything
+else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
+
+No middleman server, no account, no telemetry. The MCP implementation here is
+hand-rolled and dependency-free (stdio, JSON-RPC 2.0 — small enough to read),
+and the one runtime dependency is [`nanoodle`](https://github.com/nanoodlecom/nanoodle-js),
+the zero-dep workflow executor. Your NanoGPT API key goes straight from your
+machine to [nano-gpt.com](https://nano-gpt.com); it is never logged and never
+appears on stdout.
+
+## Install
+
+You need: **Node 20+**, a folder of saved graphs (say `~/noodles` — see
+[Making graphs](#making-graphs)), and a [nano-gpt.com](https://nano-gpt.com)
+API key in `NANOGPT_API_KEY` (or passed via `--key` / `--env-file`).
+
+> npm publish is landing alongside the public launch. Until `npx nanoodle-mcp`
+> resolves, clone this repo, `npm install && npm link`, and use `nanoodle-mcp`
+> (or `node /path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs`) as the command instead.
+
+### Claude Code
+
+```bash
+claude mcp add nanoodle --env NANOGPT_API_KEY=your-key-here -- npx -y nanoodle-mcp --graphs ~/noodles
+```
+
+Or install it as a plugin — Claude Code prompts for your noodles folder and
+API key, and also learns what a noodle is (this repo doubles as a plugin
+marketplace):
+
+```
+/plugin marketplace add nanoodlecom/nanoodle-mcp
+/plugin install nanoodle@nanoodle
+```
+
+### Cursor
+
+[Install in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=nanoodle&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIm5hbm9vZGxlLW1jcCIsIi0tZ3JhcGhzIiwifi9ub29kbGVzIl0sImVudiI6eyJOQU5PR1BUX0FQSV9LRVkiOiJZT1VSX05BTk9HUFRfS0VZIn19)
+(then edit the graphs path and key), or add to `.cursor/mcp.json` yourself:
+
+```json
+{
+  "mcpServers": {
+    "nanoodle": {
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "/absolute/path/to/noodles"],
+      "env": { "NANOGPT_API_KEY": "your-key-here" }
+    }
+  }
+}
+```
+
+### VS Code
+
+`.vscode/mcp.json` — note VS Code's root key is `servers`, not `mcpServers`:
+
+```json
+{
+  "servers": {
+    "nanoodle": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "/absolute/path/to/noodles"],
+      "env": { "NANOGPT_API_KEY": "your-key-here" }
+    }
+  }
+}
+```
+
+### Windsurf
+
+`~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "nanoodle": {
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "/absolute/path/to/noodles"],
+      "env": { "NANOGPT_API_KEY": "your-key-here" }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Same shape as Cursor/Windsurf, in `claude_desktop_config.json` under
+`mcpServers`.
+
+### ChatGPT
+
+Not reachable: ChatGPT only connects to remote HTTPS MCP servers, and this is
+a local stdio server by design. A hosted endpoint would put a middleman
+between your API key and NanoGPT, which is the opposite of the point — so
+none is planned.
 
 ## ⚠️ This spends real money
 
-BYOK: the server runs on **your** [nano-gpt.com](https://nano-gpt.com) API key.
-**Every `tools/call` executes a workflow against the NanoGPT API and spends
-from your balance** — and the caller is usually an AI agent deciding on its
-own when to call. Point it only at graphs you're happy to have run, and keep
-an eye on your balance. Each result ends with a `cost: $X.XXXX` line so the
-agent (and you) can see what a call cost.
+BYOK: the server runs on **your** nano-gpt.com API key. **Every `tools/call`
+executes a workflow against the NanoGPT API and spends from your balance** —
+and the caller is usually an AI agent deciding on its own when to call. Point
+it only at graphs you're happy to have run, and keep an eye on your balance.
+Each result ends with a `cost: $X.XXXX` line so the agent (and you) can see
+what a call cost.
 
 ## How it works
 
@@ -28,39 +118,20 @@ agent (and you) can see what a call cost.
   make-jingle.json           →  tool "make-jingle"
 ```
 
-For each graph:
+Every readable `*.json` graph in `--graphs` becomes one MCP tool:
 
-- **Tool name** — the filename minus `.json`, sanitized to `[a-z0-9_-]`.
-- **Description** — the graph's node chain (e.g. `text -> llm -> image; runs
-  on NanoGPT …`), so the client knows what it does before calling.
-- **Input schema** — derived from the workflow's unwired fields, exactly like
-  the nanoodle CLI's `inspect`. Every input is a string; media-typed inputs
-  (image / audio / video) take a **file path or https URL**.
-- **Result** — text outputs come back as text blocks; media outputs are saved
-  into `--out` (default `./nanoodle-out`) and the absolute path is returned.
-  A final text block reports the run's cost.
+| Tool field | Derived from the graph |
+| --- | --- |
+| `name` | filename minus `.json`, sanitized to `[a-z0-9_-]` (duplicates get `-2`, `-3`, …) |
+| `description` | the graph's node chain in dependency order (e.g. `text -> llm -> image`) plus a spend warning |
+| `inputSchema` | one string property per unwired field, exactly like the nanoodle CLI's `inspect`; dropdown fields become `enum`s; only inputs without a baked-in default are `required` |
+| media inputs | image / audio / video inputs take a **file path or https URL** — local files ride inline as base64 |
+| result | text outputs as text blocks; media outputs saved into `--out` (default `./nanoodle-out`) with the absolute path returned; a final text block reports the run's cost |
 
-## Install
-
-```bash
-npm install -g nanoodle-mcp     # not published to npm yet — until then:
-git clone https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp
-npm install && npm link         # `npm link` puts `nanoodle-mcp` on your PATH
-```
-
-(No `npm link`? Run it directly as `node bin/nanoodle-mcp.mjs` instead of
-`nanoodle-mcp` below.)
-
-## Quickstart
-
-```bash
-export NANOGPT_API_KEY=...      # or --key K, or --env-file .env
-nanoodle-mcp --graphs ~/noodles --out ~/noodle-out
-```
-
-The server speaks MCP over stdio — you normally don't run it by hand, your
-MCP client does. Startup logs (which tools loaded, which files were skipped
-and why) go to stderr; stdout is protocol only.
+Protocol behavior worth knowing: malformed calls (unknown tool, unknown /
+missing / non-string argument) are rejected as JSON-RPC `-32602` **before any
+money is spent**; a run that fails (network, model error, missing key) comes
+back as a normal tool result with `isError: true`.
 
 ```
 usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path]
@@ -72,42 +143,8 @@ usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path]
 ```
 
 Key precedence matches the nanoodle CLI: `--key` > `--env-file` >
-`NANOGPT_API_KEY`. It refuses to start if the directory holds no runnable
-graphs, and says why per file.
-
-### Claude Code
-
-```bash
-claude mcp add nanoodle -- npx nanoodle-mcp --graphs ~/noodles
-```
-
-`npx nanoodle-mcp` works once the package is on npm (not published yet). From
-a git clone, point at the binary directly:
-
-```bash
-claude mcp add nanoodle -- node /path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs --graphs ~/noodles
-```
-
-### Claude Desktop
-
-Add to `claude_desktop_config.json` (same note as above: until the npm
-publish, swap `"command": "npx"` / `"args": ["nanoodle-mcp", ...]` for
-`"command": "node"` / `"args": ["/path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs", ...]`):
-
-```json
-{
-  "mcpServers": {
-    "nanoodle": {
-      "command": "npx",
-      "args": ["nanoodle-mcp", "--graphs", "/Users/you/noodles"],
-      "env": { "NANOGPT_API_KEY": "your-key-here" }
-    }
-  }
-}
-```
-
-Then ask for what a graph produces — "make me a hero image of a lighthouse at
-dawn" — and the client calls the matching tool.
+`NANOGPT_API_KEY`. The server refuses to start if the directory holds no
+runnable graphs, and says why per file on stderr; stdout is protocol only.
 
 ## Making graphs
 
@@ -147,6 +184,12 @@ NanoGPT stub and drives the MCP handshake over stdio:
 ```bash
 npm test
 ```
+
+## Registry
+
+`server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)
+manifest (`io.github.nanoodlecom/nanoodle-mcp`); see [PUBLISHING.md](PUBLISHING.md)
+for the release checklist.
 
 ## License
 

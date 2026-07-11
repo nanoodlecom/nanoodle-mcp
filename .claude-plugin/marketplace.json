@@ -1,0 +1,22 @@
+{
+  "name": "nanoodle",
+  "owner": {
+    "name": "255BITS"
+  },
+  "description": "nanoodle.com tools for Claude Code",
+  "plugins": [
+    {
+      "name": "nanoodle",
+      "source": "./",
+      "description": "Run your saved nanoodle workflow graphs as MCP tools — BYOK, spends from your NanoGPT balance",
+      "version": "0.1.0",
+      "author": {
+        "name": "255BITS"
+      },
+      "homepage": "https://nanoodle.com",
+      "repository": "https://github.com/nanoodlecom/nanoodle-mcp",
+      "license": "MIT",
+      "keywords": ["mcp", "nanoodle", "nanogpt", "workflow", "image-generation", "video-generation", "byok"]
+    }
+  ]
+}
