@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "upload", "x": 80, "y": 120, "fields": {} },
+    { "id": "n2", "type": "edit", "x": 420, "y": 100, "fields": { "model": "test-edit-model", "prompt": "make it night-time" } }
+  ],
+  "links": [
+    { "id": "l1", "from": { "node": "n1", "port": "image" }, "to": { "node": "n2", "port": "image" } }
+  ]
+}

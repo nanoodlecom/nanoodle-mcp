@@ -1,0 +1,47 @@
+{
+  "name": "nanoodle-mcp",
+  "version": "0.1.0",
+  "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK, runs on the NanoGPT API",
+  "type": "module",
+  "bin": {
+    "nanoodle-mcp": "./bin/nanoodle-mcp.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "src",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "nanoodle": "^0.1.0"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "nanoodle",
+    "workflow",
+    "ai",
+    "nanogpt",
+    "image-generation",
+    "video-generation",
+    "llm",
+    "agent",
+    "tools",
+    "byok"
+  ],
+  "license": "MIT",
+  "homepage": "https://nanoodle.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nanoodlecom/nanoodle-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nanoodlecom/nanoodle-mcp/issues"
+  }
+}
