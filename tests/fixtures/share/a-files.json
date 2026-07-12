@@ -1,0 +1,79 @@
+{
+  "name": "a-files",
+  "url": "https://nanoodle.com/play.html#a=H4sIAAAAAAAAA4WSUW7bMAyGr8LxWXFtp9kAIeghhj2sGPqgRqxNVKIES03iBAZ2iJ1wJxkUJ3ALFNibLen_f_Ijz7hH3SjsBhN71OfrrwRLCfWvM7JFjdKgwjxGQo2ZjhkVHlF_rRWOqJt1rfCFydlUDC73Gg3swmmEwXgSSH2IEAQMDIZlBOGuzzgpPKBu23pSt5x2yXHOzzHr-znn24cYHyw51HgyvApDd9c5v9pURZ_GlMmjxsfwBoeBMwF70xHEIfiYUwU_3gaB3BOwJQMsOUAQgj3v2SqwlA07sh9U8Pf3H0g7ElLgSvUsnQIfglWQ8uiogu8U3QgHzv3F-6oL4sbq1uqmVpj4RJcObnU2bT0tBNYLgUv-FfXmyrr-FIIYCatnI0bMql05zkVWglBj84oK92ZgkzlIKidLOdOTQsfy-m7Wrsz6ZQi-BJQ9uM0_hiHf5j8pzOH9g3Z5MDeOS0-u_cSx_Z_j-hPHJ4VSLDelaov6XuGe6VBk0chP1GVVopHHeTnTzjhC3UxTgeZm7CyWjlWffQG3_WLDruCGcvCwzZwdPeTt3fyBCk2M1S4VbM_Bjmdvho5F1xNO0z_t-KHmPAMAAA",
+  "graph": {
+    "v": 1,
+    "nodes": [
+      {
+        "id": "n1",
+        "type": "text",
+        "x": 60,
+        "y": 130,
+        "fields": {
+          "text": "a cozy ramen shop on a rainy night"
+        },
+        "w": 220
+      },
+      {
+        "id": "n2",
+        "type": "llm",
+        "x": 340,
+        "y": 70,
+        "fields": {
+          "model": "zai-org/glm-5.2",
+          "system": "You write image prompts. Turn the idea into one vivid, detailed image prompt — scene, lighting, mood, style. Reply with the prompt only."
+        },
+        "w": 250,
+        "sizes": {
+          "system": 120
+        }
+      },
+      {
+        "id": "n3",
+        "type": "image",
+        "x": 650,
+        "y": 100,
+        "fields": {
+          "model": "nano-banana-2-lite",
+          "size": "1k",
+          "variations": "1"
+        },
+        "w": 250
+      }
+    ],
+    "links": [
+      {
+        "id": "l1",
+        "from": {
+          "node": "n1",
+          "port": "text"
+        },
+        "to": {
+          "node": "n2",
+          "port": "prompt"
+        }
+      },
+      {
+        "id": "l2",
+        "from": {
+          "node": "n2",
+          "port": "text"
+        },
+        "to": {
+          "node": "n3",
+          "port": "prompt"
+        }
+      }
+    ],
+    "nid": 5,
+    "lid": 4,
+    "view": {
+      "panX": 40,
+      "panY": 60,
+      "scale": 1
+    }
+  },
+  "app": {
+    "hasFiles": true
+  }
+}

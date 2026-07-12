@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = join(here, "..", "bin", "nanoodle-mcp.mjs");
 const FIXTURES = join(here, "fixtures");
+const SHARE_FIXTURES = join(FIXTURES, "share"); // golden { name, url, graph } share links (readdir skips subdirs, so these aren't graph tools)
 
 /** 1x1 transparent PNG (base64, starts with iVBOR → sniffs image/png). */
 const PNG_B64 =
@@ -134,7 +135,8 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     const list = await srv.request("tools/list");
     assert.equal(srv.messages.length, framesBefore + 1, "notifications/initialized must not be answered");
     const tools = list.result.tools;
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["hello-noodle", "poster", "restyle"]);
+    // one tool per fixture graph, plus the always-present run_noodle share-link tool
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["hello-noodle", "poster", "restyle", "run_noodle"]);
 
     // media-typed input advertises "file path or https URL"
     const restyle = tools.find((t) => t.name === "restyle");
@@ -280,4 +282,103 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
   const files = await readdir(join(cwd, "nanoodle-out"));
   assert.equal(files.length, 1);
   assert.match(files[0], /^poster-Image-.*\.png$/);
+});
+
+/* ============================= run_noodle ============================= */
+
+test("run_noodle is always listed, with a url-required schema and the spend warning", async () => {
+  const srv = startServer();
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+    const list = await srv.request("tools/list");
+    const rn = list.result.tools.find((t) => t.name === "run_noodle");
+    assert.ok(rn, "run_noodle must always be in tools/list");
+    assert.deepEqual(rn.inputSchema.required, ["url"]);
+    assert.equal(rn.inputSchema.properties.url.type, "string");
+    assert.equal(rn.inputSchema.properties.inputs.type, "object");
+    assert.match(rn.description, /spends real credit from your API key's balance/);
+    assert.match(rn.description, /decode locally/); // documents the no-credentials network note
+  } finally {
+    await srv.close();
+  }
+});
+
+test("run_noodle decodes a #g= workflow link offline and runs it with inputs", async () => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-run-"));
+  const srv = startServer({ outDir });
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+    const fx = JSON.parse(await readFile(join(SHARE_FIXTURES, "g-starter.json"), "utf8"));
+    // fx.url carries a #g= fragment → decodes with zero network; the run hits the stub.
+    const before = apiRequests.length;
+    const call = await srv.request("tools/call", { name: "run_noodle", arguments: { url: fx.url, inputs: { Text: "say pong" } } });
+    assert.equal(call.error, undefined);
+    assert.ok(!call.result.isError, "run should succeed: " + JSON.stringify(call.result));
+
+    // text -> llm -> image: the image output is saved into --out, cost line last
+    const saved = call.result.content.find((c) => c.text.includes("saved "));
+    assert.ok(saved, "expected a saved-media block: " + JSON.stringify(call.result.content));
+    const path = saved.text.replace(/^.*saved /, "");
+    assert.ok(path.startsWith(outDir), `saved ${path} should be inside ${outDir}`);
+    assert.ok(path.endsWith(".png"));
+    assert.ok(/[/\\]run_noodle-/.test(path), "media prefix should be run_noodle: " + path);
+    assert.match(call.result.content.at(-1).text, /^cost: \$/);
+
+    // inputs derivation: the friendly "Text" override flowed through to the llm call
+    const chat = apiRequests.slice(before).find((r) => r.path === "/api/v1/chat/completions");
+    assert.ok(chat, "the run should have hit the chat endpoint");
+    assert.equal(chat.json.messages.at(-1).content, "say pong");
+    assert.equal(chat.auth, "Bearer test-key");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("run_noodle decodes a #a= app link offline and runs it on saved defaults", async () => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-run-a-"));
+  const srv = startServer({ outDir });
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+    const fx = JSON.parse(await readFile(join(SHARE_FIXTURES, "a-files.json"), "utf8"));
+    const call = await srv.request("tools/call", { name: "run_noodle", arguments: { url: fx.url } });
+    assert.ok(!call.result.isError, "app-link run should succeed: " + JSON.stringify(call.result));
+    const saved = call.result.content.find((c) => c.text.includes("saved "));
+    assert.ok(saved && saved.text.endsWith(".png"), "expected a saved image from the app graph");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("run_noodle: bad, internal, and unrunnable links come back as tool errors, not crashes", async () => {
+  const srv = startServer();
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+
+    // #ga= is the editor↔app internal handoff — refused with a readable message
+    const ga = await srv.request("tools/call", { name: "run_noodle", arguments: { url: "https://nanoodle.com/#ga=abc" } });
+    assert.equal(ga.error, undefined, "must be a tool error, not a JSON-RPC error");
+    assert.equal(ga.result.isError, true);
+    assert.match(ga.result.content[0].text, /ga=|internal/i);
+
+    // truncated / non-base64 fragment
+    const bad = await srv.request("tools/call", { name: "run_noodle", arguments: { url: "https://nanoodle.com/#g=!!!not-base64" } });
+    assert.equal(bad.result.isError, true);
+
+    // a graph that needs a node type this library doesn't have → clear tool error, no spend
+    const badGraph = { v: 1, nodes: [{ id: "n1", type: "totally-not-a-node", pos: [0, 0], fields: {} }], links: [] };
+    const j = Buffer.from(JSON.stringify(badGraph)).toString("base64url");
+    const unk = await srv.request("tools/call", { name: "run_noodle", arguments: { url: "https://nanoodle.com/#j=" + j } });
+    assert.equal(unk.result.isError, true);
+    assert.match(unk.result.content[0].text, /run headlessly|unknown node type/i);
+
+    // missing url → malformed params (-32602), not a tool-result error
+    const noUrl = await srv.request("tools/call", { name: "run_noodle", arguments: {} });
+    assert.equal(noUrl.error.code, -32602);
+
+    // inputs of the wrong shape → -32602
+    const badInputs = await srv.request("tools/call", { name: "run_noodle", arguments: { url: "#g=x", inputs: "nope" } });
+    assert.equal(badInputs.error.code, -32602);
+  } finally {
+    await srv.close();
+  }
 });
