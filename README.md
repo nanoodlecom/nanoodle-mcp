@@ -11,6 +11,15 @@ enough to read). The one runtime dependency is
 [`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
 executor that does all the heavy lifting.
 
+**Which repo do I want?** This server exposes saved workflows as typed MCP
+tools. If your agent supports Agent Skills rather than MCP servers,
+[nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill) (teaches your
+agent to build any graph) and
+[noodle-skills](https://github.com/nanoodlecom/noodle-skills) (prebuilt
+one-task workflows) cover similar ground without running a server. Running
+graphs in GitHub CI? →
+[run-noodle-action](https://github.com/nanoodlecom/run-noodle-action).
+
 ## ⚠️ This spends real money
 
 BYOK: the server runs on **your** [nano-gpt.com](https://nano-gpt.com) API key.
@@ -63,13 +72,20 @@ MCP client does. Startup logs (which tools loaded, which files were skipped
 and why) go to stderr; stdout is protocol only.
 
 ```
-usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path]
+usage:
+  nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path]
+  nanoodle-mcp --version
 
-  --graphs dir   directory of noodle-graph.json saves (required)
+  --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required)
   --out dir      where media outputs are saved (default ./nanoodle-out)
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY from a .env-style file
+  --env-file p   read NANOGPT_API_KEY from a .env-style file (--key wins if both given)
+
+The server speaks MCP over stdio — wire it into an MCP client, don't run it by hand.
+Every tools/call spends real money from your NanoGPT balance.
 ```
+
+(`--help` / `-h` prints the same text.)
 
 Key precedence matches the nanoodle CLI: `--key` > `--env-file` >
 `NANOGPT_API_KEY`. It refuses to start if the directory holds no runnable
