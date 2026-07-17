@@ -1,0 +1,247 @@
+/**
+ * Wallet mode (accountless x402): unit tests for the Nano payer against a
+ * stubbed RPC, plus a full E2E — the real server, keyless, settles a staged
+ * HTTP 402 by "sending" XNO to a local Nano RPC stub. Fully offline.
+ */
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import http from "node:http";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock } from "nanocurrency";
+import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const BIN = join(here, "..", "bin", "nanoodle-mcp.mjs");
+const FIXTURES = join(here, "fixtures");
+
+/* Zero seed — documented Nano test vector. Account 0 pays; account 1 receives. */
+const SEED = "0".repeat(64);
+const SECRET = deriveSecretKey(SEED, 0);
+const ADDRESS = deriveAddress(derivePublicKey(SECRET), { useNanoPrefix: true });
+const PAY_TO = deriveAddress(derivePublicKey(deriveSecretKey(SEED, 1)), { useNanoPrefix: true });
+
+const FRONTIER = "B".repeat(64);
+const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
+const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
+const WORK = "bbbbbbbbbbbbbbbb";
+
+/** In-memory Nano RPC: account_info / work_generate / process, with a frontier that advances. */
+function fakeRpc(overrides = {}) {
+  const state = { frontier: FRONTIER, balance: BALANCE, processed: [] };
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    const reply = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
+    if (overrides[body.action]) return overrides[body.action](body, state, reply);
+    if (body.action === "account_info") {
+      return reply({ frontier: state.frontier, balance: state.balance, representative: ADDRESS });
+    }
+    if (body.action === "work_generate") {
+      assert.equal(body.difficulty, "fffffff800000000", "send work must use the v21 threshold");
+      return reply({ work: WORK });
+    }
+    if (body.action === "process") {
+      state.processed.push(body);
+      state.frontier = "C".repeat(63) + state.processed.length; // advance the chain
+      state.balance = body.block.balance;
+      return reply({ hash: state.frontier });
+    }
+    return reply({ error: "unknown action " + body.action });
+  };
+  return { state, fetch };
+}
+
+const invoice = (extra = {}) => ({
+  scheme: "nano", paymentId: "pay_1", payTo: PAY_TO,
+  amountRaw: AMOUNT, amountUsd: 0.0012, ...extra,
+});
+
+test("resolveWalletKey: private key wins, seed derives account 0, junk is refused", () => {
+  assert.equal(resolveWalletKey({ seed: SEED }), SECRET);
+  assert.equal(resolveWalletKey({ privateKey: SECRET, seed: "f".repeat(64) }), SECRET);
+  assert.equal(resolveWalletKey({}), null);
+  assert.throws(() => resolveWalletKey({ seed: "not-hex" }), /NANO_SEED/);
+  assert.throws(() => resolveWalletKey({ privateKey: "abc" }), /NANO_PRIVATE_KEY/);
+  // zero-seed vector from the Nano docs
+  assert.equal(ADDRESS, "nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7");
+});
+
+test("paySend: correct signed state block reaches process", async () => {
+  const rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  assert.equal(wallet.address, ADDRESS);
+  await wallet.payment(invoice());
+
+  assert.equal(rpc.state.processed.length, 1);
+  const req = rpc.state.processed[0];
+  assert.equal(req.subtype, "send");
+  assert.equal(req.json_block, "true");
+  const b = req.block;
+  assert.equal(b.account, ADDRESS);
+  assert.equal(b.previous, FRONTIER);
+  assert.equal(b.representative, ADDRESS);
+  assert.equal(b.work, WORK);
+  assert.equal(b.link_as_account, PAY_TO);
+  assert.equal(BigInt(b.balance), BigInt(BALANCE) - BigInt(AMOUNT));
+  // signature actually verifies for this account — the send is spendable, not a stub artifact
+  const { hashBlock } = await import("nanocurrency");
+  const hash = hashBlock({ account: b.account, previous: b.previous, representative: b.representative, balance: b.balance, link: b.link });
+  assert.equal(verifyBlock({ hash, signature: b.signature, publicKey: derivePublicKey(SECRET) }), true);
+});
+
+test("paySend: concurrent invoices are serialized on the advancing frontier", async () => {
+  const rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await Promise.all([wallet.payment(invoice()), wallet.payment(invoice({ paymentId: "pay_2" }))]);
+  const [first, second] = rpc.state.processed.map((p) => p.block);
+  assert.equal(first.previous, FRONTIER);
+  assert.equal(second.previous, "C".repeat(63) + "1", "second send must chain on the first's hash");
+  assert.equal(BigInt(second.balance), BigInt(BALANCE) - 2n * BigInt(AMOUNT));
+});
+
+test("paySend: a failed payment doesn't wedge the queue", async () => {
+  const rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch, maxUsd: 0.001 });
+  await assert.rejects(() => wallet.payment(invoice()), /over the --max-usd cap/);
+  const ok = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await ok.payment(invoice()); // sanity: same stub still processes fine
+  // and on the capped wallet, a cheap invoice after the refusal still goes through
+  await wallet.payment(invoice({ amountUsd: 0.0005, paymentId: "pay_3" }));
+  assert.equal(rpc.state.processed.length, 2);
+});
+
+test("paySend: readable errors — insufficient balance, unopened account, bad invoice", async () => {
+  const broke = fakeRpc({
+    account_info: (_b, _s, reply) => reply({ frontier: FRONTIER, balance: "1", representative: ADDRESS }),
+  });
+  const w1 = createNanoWallet({ secretKey: SECRET, fetch: broke.fetch });
+  await assert.rejects(() => w1.payment(invoice()), /insufficient wallet balance.*top up/s);
+
+  const unopened = fakeRpc({ account_info: (_b, _s, reply) => reply({ error: "Account not found" }) });
+  const w2 = createNanoWallet({ secretKey: SECRET, fetch: unopened.fetch });
+  await assert.rejects(() => w2.payment(invoice()), /empty or unopened/);
+
+  const w3 = createNanoWallet({ secretKey: SECRET, fetch: fakeRpc().fetch });
+  await assert.rejects(() => w3.payment(invoice({ amountRaw: "" })), /no usable Nano amount/);
+  await assert.rejects(() => w3.payment(invoice({ payTo: "nano_junk!" })), /not a valid Nano address/);
+});
+
+test("default RPC is rpc.nano.to", () => {
+  assert.equal(DEFAULT_NANO_RPC, "https://rpc.nano.to");
+});
+
+/* ============================== E2E ============================== */
+
+let nanoRpc, nanoRpcUrl, apiServer, apiUrl;
+const processed = [];   // blocks the Nano RPC stub accepted
+const apiRequests = []; // requests the NanoGPT stub saw
+
+before(async () => {
+  nanoRpc = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const send = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    if (body.action === "account_info") return send({ frontier: FRONTIER, balance: BALANCE, representative: ADDRESS });
+    if (body.action === "work_generate") return send({ work: WORK });
+    if (body.action === "process") { processed.push(body.block); return send({ hash: "D".repeat(64) }); }
+    send({ error: "unknown action" });
+  });
+  await new Promise((r) => nanoRpc.listen(0, "127.0.0.1", r));
+  nanoRpcUrl = `http://127.0.0.1:${nanoRpc.address().port}`;
+
+  apiServer = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    apiRequests.push({ path: req.url, headers: req.headers });
+    if (req.method === "POST" && req.url === "/api/v1/chat/completions") {
+      // keyless call → invoice; the complete endpoint replays the stored result after payment
+      res.writeHead(402, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        accepts: [{
+          scheme: "nano", payTo: PAY_TO, paymentId: "pay_e2e",
+          maxAmountRequired: AMOUNT, maxAmountRequiredFormatted: "0.00123 XNO", maxAmountRequiredUSD: 0.0012,
+          expiresAt: Math.floor(Date.now() / 1000) + 900,
+        }],
+      }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/api/x402/complete/pay_e2e") {
+      if (!processed.length) { res.writeHead(402, { "content-type": "application/json" }); res.end("{}"); return; }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content: "pong" } }],
+        x_nanogpt_pricing: { costUsd: 0.0012 },
+      }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "stub: no route for " + req.method + " " + req.url }));
+  });
+  await new Promise((r) => apiServer.listen(0, "127.0.0.1", r));
+  apiUrl = `http://127.0.0.1:${apiServer.address().port}`;
+});
+
+after(() => Promise.all([
+  new Promise((r) => nanoRpc.close(r)),
+  new Promise((r) => apiServer.close(r)),
+]));
+
+test("E2E: keyless server pays a 402 invoice from NANO_SEED and returns the result", async () => {
+  const env = { ...process.env, NANOGPT_BASE_URL: apiUrl, NANO_SEED: SEED, NANO_RPC_URL: nanoRpcUrl };
+  delete env.NANOGPT_API_KEY;
+  const child = spawn(process.execPath, [BIN, "--graphs", FIXTURES, "--max-usd", "1"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "", stderr = "";
+  child.stdout.setEncoding("utf8"); child.stdout.on("data", (c) => { stdout += c; });
+  child.stderr.setEncoding("utf8"); child.stderr.on("data", (c) => { stderr += c; });
+  try {
+    const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {} } });
+    send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "hello-noodle", arguments: { Idea: "say pong" } } });
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("timed out; stderr:\n" + stderr)), 20000);
+      child.stdout.on("data", () => {
+        if (stdout.split("\n").filter(Boolean).length >= 3) { clearTimeout(t); resolve(); }
+      });
+    });
+    const frames = stdout.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+    // wallet mode is announced (stderr only), with the paying address and the cap
+    assert.match(stderr, /wallet mode \(accountless x402\)/);
+    assert.ok(stderr.includes(ADDRESS));
+    assert.match(stderr, /capped at \$1\/call/);
+    assert.doesNotMatch(stderr, /no NanoGPT API key/, "wallet mode must not warn about a missing key");
+
+    // tool descriptions say where money comes from
+    const list = frames.find((f) => f.id === 2);
+    const rn = list.result.tools.find((t) => t.name === "run_noodle");
+    assert.match(rn.description, /spends real credit from your x402 Nano wallet/);
+
+    // the call succeeded off the replayed complete-endpoint result
+    const call = frames.find((f) => f.id === 3);
+    assert.equal(call.error, undefined);
+    assert.ok(!call.result.isError, JSON.stringify(call.result));
+    const texts = call.result.content.map((c) => c.text);
+    assert.equal(texts[0], "pong");
+    assert.equal(texts.at(-1), "cost: $0.0012");
+
+    // the keyless request opted into x402 and never carried credentials
+    const chat = apiRequests.find((r) => r.path === "/api/v1/chat/completions");
+    assert.equal(chat.headers["x-x402"], "true");
+    assert.equal(chat.headers.authorization, undefined);
+
+    // and a real signed send for the right amount hit the Nano RPC
+    assert.equal(processed.length, 1);
+    assert.equal(processed[0].link_as_account, PAY_TO);
+    assert.equal(BigInt(processed[0].balance), BigInt(BALANCE) - BigInt(AMOUNT));
+
+    // the x402 payment line is logged, the seed never is
+    assert.match(stderr, /x402: paid 0\.00123 XNO/);
+    assert.ok(!stdout.includes(SEED) && !stderr.includes(SEED), "seed must never be logged");
+  } finally {
+    child.stdin.end();
+    await new Promise((r) => { child.once("exit", r); setTimeout(() => child.kill(), 2000).unref(); });
+  }
+});

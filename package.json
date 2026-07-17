@@ -1,7 +1,7 @@
 {
   "name": "nanoodle-mcp",
   "version": "0.1.0",
-  "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK, runs on the NanoGPT API",
+  "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK or accountless x402 (pay per call in Nano), runs on the NanoGPT API",
   "type": "module",
   "bin": {
     "nanoodle-mcp": "./bin/nanoodle-mcp.mjs"
@@ -19,6 +19,7 @@
     "LICENSE"
   ],
   "dependencies": {
+    "nanocurrency": "^2.5.0",
     "nanoodle": "^0.4.0"
   },
   "keywords": [
@@ -33,7 +34,11 @@
     "llm",
     "agent",
     "tools",
-    "byok"
+    "byok",
+    "x402",
+    "nano",
+    "accountless",
+    "micropayments"
   ],
   "license": "MIT",
   "author": "255BITS",

@@ -95,13 +95,13 @@ const RUN_NOODLE_NAME = "run_noodle";
  * The one tool that isn't tied to a saved file: it takes any nanoodle share
  * link and runs it, so every share link on the internet is a callable tool.
  */
-const RUN_NOODLE_TOOL = {
+const runNoodleTool = (spendSource) => ({
   name: RUN_NOODLE_NAME,
   description:
     "Run any nanoodle share link as a workflow: a nanoodle.com/#g=… workflow link, a " +
     "nanoodle.com/play.html#a=… app link, or a da.gd/TinyURL short link to one. Pass the link " +
     "as `url` and any workflow inputs as `inputs`. Runs on NanoGPT — every call spends real " +
-    "credit from your API key's balance. Direct share links decode locally; only fragment-less " +
+    `credit from ${spendSource}. Direct share links decode locally; only fragment-less ` +
     "short links trigger a network read, and it carries no credentials.",
   inputSchema: {
     type: "object",
@@ -123,7 +123,7 @@ const RUN_NOODLE_TOOL = {
     },
     required: ["url"],
   },
-};
+});
 
 /**
  * Map friendly-keyed tool arguments onto a workflow's derived inputs, resolving
@@ -186,7 +186,7 @@ async function emitResult(wf, result, prefix, outDir) {
  * unknown nodes, or a run failure — throws a plain error the server surfaces as
  * an isError tool result, so the agent gets a readable message, never a crash.
  */
-async function runNoodle(params, { apiKey, baseUrl, outDir }) {
+async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
   const args = params.arguments == null ? {} : params.arguments;
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
@@ -202,7 +202,7 @@ async function runNoodle(params, { apiKey, baseUrl, outDir }) {
   // Decode: direct #g=/#j=/#a= links are offline; only fragment-less short links
   // fetch, and those are redirect-header reads with no credentials attached.
   const decoded = await decodeShareUrl(args.url.trim(), { fetch: globalThis.fetch });
-  const wf = new Workflow(decoded.graph, { apiKey, baseUrl, quiet: true });
+  const wf = new Workflow(decoded.graph, { apiKey, payment, baseUrl, quiet: true });
   if (wf.warnings.length) {
     // unknown / browser-only node types: the graph decodes but run() would always refuse
     throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
@@ -216,7 +216,9 @@ async function runNoodle(params, { apiKey, baseUrl, outDir }) {
  * Scan `dir` for graphs and build the tool registry.
  * @returns {{ tools: Array, failures: Array<{file, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dir, apiKey, baseUrl, outDir }) {
+export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
+  // Wallet mode (payment callback, no key) changes only where money comes from.
+  const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   let entries;
   try {
     entries = await readdir(dir);
@@ -233,7 +235,7 @@ export async function loadTools({ dir, apiKey, baseUrl, outDir }) {
     const path = join(dir, file);
     let wf;
     try {
-      wf = Workflow.fromJSON(await readFile(path, "utf8"), { apiKey, baseUrl, quiet: true });
+      wf = Workflow.fromJSON(await readFile(path, "utf8"), { apiKey, payment, baseUrl, quiet: true });
     } catch (e) {
       failures.push({ file, reason: e.message });
       continue;
@@ -251,7 +253,7 @@ export async function loadTools({ dir, apiKey, baseUrl, outDir }) {
       name,
       file,
       wf,
-      description: `${typeChain(wf.graph)}; runs on NanoGPT — every call spends real credit from your API key's balance`,
+      description: `${typeChain(wf.graph)}; runs on NanoGPT — every call spends real credit from ${spendSource}`,
       inputSchema: buildInputSchema(wf),
     });
   }
@@ -266,7 +268,7 @@ export async function loadTools({ dir, apiKey, baseUrl, outDir }) {
       // run_noodle is always available, alongside one tool per saved graph.
       return [
         ...tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
-        RUN_NOODLE_TOOL,
+        runNoodleTool(spendSource),
       ];
     },
 
@@ -276,7 +278,7 @@ export async function loadTools({ dir, apiKey, baseUrl, outDir }) {
         throw new ParamsError("tools/call expects a params object with { name, arguments }");
       }
       if (params.name === RUN_NOODLE_NAME) {
-        return runNoodle(params, { apiKey, baseUrl, outDir });
+        return runNoodle(params, { apiKey, payment, baseUrl, outDir });
       }
       const tool = byName.get(params.name);
       if (!tool) {

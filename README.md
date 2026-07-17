@@ -7,9 +7,11 @@ Desktop, or anything else that speaks the
 [Model Context Protocol](https://modelcontextprotocol.io).
 
 Zero-dependency MCP implementation (stdio, JSON-RPC 2.0, hand-rolled — small
-enough to read). The one runtime dependency is
+enough to read). Two runtime dependencies:
 [`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
-executor that does all the heavy lifting.
+executor that does all the heavy lifting, and
+[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) for signing
+Nano blocks in [wallet mode](#wallet-mode--no-account-no-api-key-x402).
 
 **Which repo do I want?** This server exposes saved workflows as typed MCP
 tools. If your agent supports Agent Skills rather than MCP servers,
@@ -22,12 +24,14 @@ graphs in GitHub CI? →
 
 ## ⚠️ This spends real money
 
-BYOK: the server runs on **your** [nano-gpt.com](https://nano-gpt.com) API key.
-**Every `tools/call` executes a workflow against the NanoGPT API and spends
-from your balance** — and the caller is usually an AI agent deciding on its
-own when to call. Point it only at graphs you're happy to have run, and keep
-an eye on your balance. Each result ends with a `cost: $X.XXXX` line so the
-agent (and you) can see what a call cost.
+The server runs on **your** money — either a
+[nano-gpt.com](https://nano-gpt.com) API key (BYOK) or, keyless, your own Nano
+wallet via [x402](#wallet-mode--no-account-no-api-key-x402). **Every
+`tools/call` executes a workflow against the NanoGPT API and spends from that
+balance** — and the caller is usually an AI agent deciding on its own when to
+call. Point it only at graphs you're happy to have run, and keep an eye on
+your balance. Each result ends with a `cost: $X.XXXX` line so the agent (and
+you) can see what a call cost.
 
 ## How it works
 
@@ -71,16 +75,23 @@ and why) go to stderr; stdout is protocol only.
 
 ```
 usage:
-  nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path]
+  nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
   nanoodle-mcp --version
 
   --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required)
   --out dir      where media outputs are saved (default ./nanoodle-out)
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY from a .env-style file (--key wins if both given)
+  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
+                 (--key wins over its NANOGPT_API_KEY if both given)
+  --nano-rpc u   Nano RPC node for wallet mode (default https://rpc.nano.to; NANO_RPC_URL)
+  --max-usd n    wallet mode: refuse any single x402 invoice above $n
+
+No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
+each call's HTTP 402 invoice is paid in Nano (XNO) from that wallet via x402.
+Use a dedicated wallet with a small balance — it doubles as your spend cap.
 
 The server speaks MCP over stdio — wire it into an MCP client, don't run it by hand.
-Every tools/call spends real money from your NanoGPT balance.
+Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).
 ```
 
 (`--help` / `-h` prints the same text.)
@@ -88,6 +99,36 @@ Every tools/call spends real money from your NanoGPT balance.
 Key precedence matches the nanoodle CLI: `--key` > `--env-file` >
 `NANOGPT_API_KEY`. It refuses to start if the directory holds no runnable
 graphs, and says why per file.
+
+## Wallet mode — no account, no API key (x402)
+
+NanoGPT supports [x402 accountless payments](https://docs.nano-gpt.com/api-reference/miscellaneous/x402):
+a keyless API call answers `HTTP 402` with a Nano invoice, you pay it, the
+call completes. Give the server a wallet and it does this automatically —
+**no NanoGPT account, no API key, no signup anywhere**:
+
+```bash
+export NANO_SEED=<64-hex seed>        # account 0 pays; or NANO_PRIVATE_KEY=<64-hex key>
+nanoodle-mcp --graphs ~/noodles --max-usd 0.50
+```
+
+Per call, the server: sees the 402 invoice → signs a Nano send block locally →
+broadcasts it through a Nano RPC node (`--nano-rpc` / `NANO_RPC_URL`, default
+[rpc.nano.to](https://rpc.nano.to)) → NanoGPT detects the deposit and returns
+the result. The seed/private key never leaves the process: only the *signed
+block* goes to the RPC node, and neither secret is ever logged. An API key,
+if present, always wins — the wallet is only used keyless.
+
+**This is a hot wallet.** Use a dedicated wallet holding pocket money, not
+your savings: its balance is a natural spend ceiling, and `--max-usd` adds a
+per-call one on top. NanoGPT auto-refunds overpayments and failed generations
+on its side.
+
+**Prefer prepay?** Wallet mode settles on-chain per call. If you'd rather pay
+once and draw down a balance, that's exactly what a NanoGPT account is:
+[deposit crypto](https://docs.nano-gpt.com/api-reference/endpoint/crypto-deposits)
+(Nano included) into an account, take its API key, and run the server in
+normal BYOK mode — same tools, one payment instead of many.
 
 ### Claude Code
 
@@ -167,11 +208,13 @@ Honest list — most of these are inherited from the executor:
   startup with a stderr note.
 - **Media rides inline.** NanoGPT has no upload endpoint, so media inputs are
   sent as base64 in the request body (~4 MB max, checked before spending).
-- **No cost cap.** The server won't stop a client from calling an expensive
-  graph repeatedly. Your NanoGPT balance is the only brake.
+- **No cost cap in key mode.** The server won't stop a client from calling an
+  expensive graph repeatedly. Your NanoGPT balance is the only brake. (Wallet
+  mode is better here: `--max-usd` caps each call, and the wallet's balance
+  caps the total.)
 
-No telemetry, no analytics; the API key is never logged and never appears on
-stdout.
+No telemetry, no analytics; the API key and wallet secrets are never logged
+and never appear on stdout.
 
 ## Testing
 
