@@ -52,13 +52,11 @@ For each graph:
 ## Install
 
 ```bash
-npm install -g nanoodle-mcp     # not published to npm yet — until then:
-git clone https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp
-npm install && npm link         # `npm link` puts `nanoodle-mcp` on your PATH
+npm install -g nanoodle-mcp
 ```
 
-(No `npm link`? Run it directly as `node bin/nanoodle-mcp.mjs` instead of
-`nanoodle-mcp` below.)
+(Hacking on it? `git clone https://github.com/nanoodlecom/nanoodle-mcp && cd
+nanoodle-mcp && npm install`, then run it as `node bin/nanoodle-mcp.mjs`.)
 
 ## Quickstart
 
@@ -97,8 +95,7 @@ graphs, and says why per file.
 claude mcp add nanoodle -- npx nanoodle-mcp --graphs ~/noodles
 ```
 
-`npx nanoodle-mcp` works once the package is on npm (not published yet). From
-a git clone, point at the binary directly:
+From a git clone, point at the binary directly instead:
 
 ```bash
 claude mcp add nanoodle -- node /path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs --graphs ~/noodles
@@ -161,9 +158,13 @@ Honest list — most of these are inherited from the executor:
 - **Graphs load once at startup.** Adding or editing files in `--graphs`
   needs a restart; the tool list doesn't change mid-session (no
   `listChanged` notifications).
-- **Browser-only nodes don't run.** Graphs using local media processing
-  (resize, combine, trim, extract-audio, video-frames, soundtrack) are
-  skipped at startup with a stderr note — the library can't run them.
+- **Local media nodes need nanoodle ≥ 0.4** (this package's dependency).
+  Graphs using resize, combine, trim, extract-audio, video-frames, or
+  soundtrack run headlessly — pure JS where possible, ffmpeg on `PATH` for
+  the rest (see the [supported-nodes
+  table](https://github.com/nanoodlecom/nanoodle-js#supported-nodes)). A
+  graph with a node type the library doesn't know is still skipped at
+  startup with a stderr note.
 - **Media rides inline.** NanoGPT has no upload endpoint, so media inputs are
   sent as base64 in the request body (~4 MB max, checked before spending).
 - **No cost cap.** The server won't stop a client from calling an expensive
