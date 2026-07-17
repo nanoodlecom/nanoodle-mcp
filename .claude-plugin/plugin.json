@@ -1,0 +1,36 @@
+{
+  "name": "nanoodle",
+  "displayName": "nanoodle",
+  "version": "0.1.0",
+  "description": "Run your saved nanoodle workflow graphs as MCP tools — BYOK or accountless x402, spends from your NanoGPT balance or Nano wallet",
+  "author": {
+    "name": "255BITS",
+    "url": "https://github.com/nanoodlecom"
+  },
+  "homepage": "https://nanoodle.com",
+  "repository": "https://github.com/nanoodlecom/nanoodle-mcp",
+  "license": "MIT",
+  "keywords": ["mcp", "nanoodle", "nanogpt", "workflow", "image-generation", "video-generation", "byok"],
+  "mcpServers": "./.claude-plugin/mcp.json",
+  "userConfig": {
+    "graphs_dir": {
+      "type": "directory",
+      "title": "Noodles folder",
+      "description": "Directory of noodle-graph.json saves from the nanoodle.com editor — each file becomes one tool",
+      "required": true
+    },
+    "nanogpt_api_key": {
+      "type": "string",
+      "title": "NanoGPT API key",
+      "description": "Your nano-gpt.com API key. Every tool call runs a workflow and spends from this key's balance.",
+      "sensitive": true,
+      "required": true
+    },
+    "out_dir": {
+      "type": "directory",
+      "title": "Output folder",
+      "description": "Where generated media (images, audio, video) is saved",
+      "default": "nanoodle-out"
+    }
+  }
+}

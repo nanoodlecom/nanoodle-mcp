@@ -1,104 +1,117 @@
 # nanoodle-mcp
 
-**Your saved nanoodle workflows, as MCP tools.** Point this server at a folder
-of `noodle-graph.json` saves from the [nanoodle](https://nanoodle.com) editor
-and every graph becomes a tool any MCP client can call — Claude Code, Claude
-Desktop, or anything else that speaks the
-[Model Context Protocol](https://modelcontextprotocol.io).
+**Build a multi-model media pipeline visually at [nanoodle.com](https://nanoodle.com) — then hand the whole pipeline to your agent as ONE typed tool.**
 
-Zero-dependency MCP implementation (stdio, JSON-RPC 2.0, hand-rolled — small
-enough to read). Two runtime dependencies:
+Point this MCP stdio server at a folder of `noodle-graph.json` saves from the
+nanoodle editor and every graph becomes a callable tool with a derived input
+schema — in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, or anything
+else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
+
+No middleman server, no telemetry — and with [wallet mode](#wallet-mode--no-account-no-api-key-x402),
+no account either. The MCP implementation here is hand-rolled (stdio, JSON-RPC
+2.0 — small enough to read). Two runtime dependencies:
 [`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
 executor that does all the heavy lifting, and
 [`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) for signing
-Nano blocks in [wallet mode](#wallet-mode--no-account-no-api-key-x402).
-
-**Which repo do I want?** This server exposes saved workflows as typed MCP
-tools. If your agent supports Agent Skills rather than MCP servers,
-[nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill) (teaches your
-agent to build any graph) and
-[noodle-skills](https://github.com/nanoodlecom/noodle-skills) (prebuilt
-one-task workflows) cover similar ground without running a server. Running
-graphs in GitHub CI? →
-[run-noodle-action](https://github.com/nanoodlecom/run-noodle-action).
-
-## ⚠️ This spends real money
-
-The server runs on **your** money — either a
-[nano-gpt.com](https://nano-gpt.com) API key (BYOK) or, keyless, your own Nano
-wallet via [x402](#wallet-mode--no-account-no-api-key-x402). **Every
-`tools/call` executes a workflow against the NanoGPT API and spends from that
-balance** — and the caller is usually an AI agent deciding on its own when to
-call. Point it only at graphs you're happy to have run, and keep an eye on
-your balance. Each result ends with a `cost: $X.XXXX` line so the agent (and
-you) can see what a call cost.
-
-## How it works
-
-```
-~/noodles/
-  generate-hero-image.json   →  tool "generate-hero-image"
-  make-jingle.json           →  tool "make-jingle"
-```
-
-For each graph:
-
-- **Tool name** — the filename minus `.json`, sanitized to `[a-z0-9_-]`.
-- **Description** — the graph's node chain (e.g. `text -> llm -> image; runs
-  on NanoGPT …`), so the client knows what it does before calling.
-- **Input schema** — derived from the workflow's unwired fields, exactly like
-  the nanoodle CLI's `inspect`. Every input is a string; media-typed inputs
-  (image / audio / video) take a **file path or https URL**.
-- **Result** — text outputs come back as text blocks; media outputs are saved
-  into `--out` (default `./nanoodle-out`) and the absolute path is returned.
-  A final text block reports the run's cost.
+Nano blocks in wallet mode. Your NanoGPT API key goes straight from your
+machine to [nano-gpt.com](https://nano-gpt.com); it is never logged and never
+appears on stdout.
 
 ## Install
 
+You need: **Node 20+**, a folder of saved graphs (say `~/noodles` — see
+[Making graphs](#making-graphs)), and a [nano-gpt.com](https://nano-gpt.com)
+API key in `NANOGPT_API_KEY` (or passed via `--key` / `--env-file`) — or no
+key at all with a Nano wallet, see
+[wallet mode](#wallet-mode--no-account-no-api-key-x402).
+
+### Claude Code
+
 ```bash
-npm install -g nanoodle-mcp
+claude mcp add nanoodle --env NANOGPT_API_KEY=your-key-here -- npx -y nanoodle-mcp --graphs ~/noodles
 ```
 
-(Hacking on it? `git clone https://github.com/nanoodlecom/nanoodle-mcp && cd
-nanoodle-mcp && npm install`, then run it as `node bin/nanoodle-mcp.mjs`.)
-
-## Quickstart
-
-```bash
-export NANOGPT_API_KEY=...      # or --key K, or --env-file .env
-nanoodle-mcp --graphs ~/noodles --out ~/noodle-out
-```
-
-The server speaks MCP over stdio — you normally don't run it by hand, your
-MCP client does. Startup logs (which tools loaded, which files were skipped
-and why) go to stderr; stdout is protocol only.
+Or install it as a plugin — Claude Code prompts for your noodles folder and
+API key, and also learns what a noodle is (this repo doubles as a plugin
+marketplace):
 
 ```
-usage:
-  nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
-  nanoodle-mcp --version
-
-  --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required)
-  --out dir      where media outputs are saved (default ./nanoodle-out)
-  --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
-                 (--key wins over its NANOGPT_API_KEY if both given)
-  --nano-rpc u   Nano RPC node for wallet mode (default https://rpc.nano.to; NANO_RPC_URL)
-  --max-usd n    wallet mode: refuse any single x402 invoice above $n
-
-No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
-each call's HTTP 402 invoice is paid in Nano (XNO) from that wallet via x402.
-Use a dedicated wallet with a small balance — it doubles as your spend cap.
-
-The server speaks MCP over stdio — wire it into an MCP client, don't run it by hand.
-Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).
+/plugin marketplace add nanoodlecom/nanoodle-mcp
+/plugin install nanoodle@nanoodle
 ```
 
-(`--help` / `-h` prints the same text.)
+### Cursor
 
-Key precedence matches the nanoodle CLI: `--key` > `--env-file` >
-`NANOGPT_API_KEY`. It refuses to start if the directory holds no runnable
-graphs, and says why per file.
+[Install in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=nanoodle&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIm5hbm9vZGxlLW1jcCIsIi0tZ3JhcGhzIiwifi9ub29kbGVzIl0sImVudiI6eyJOQU5PR1BUX0FQSV9LRVkiOiJZT1VSX05BTk9HUFRfS0VZIn19)
+(then edit the graphs path and key), or add to `.cursor/mcp.json` yourself:
+
+```json
+{
+  "mcpServers": {
+    "nanoodle": {
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "/absolute/path/to/noodles"],
+      "env": { "NANOGPT_API_KEY": "your-key-here" }
+    }
+  }
+}
+```
+
+### VS Code
+
+`.vscode/mcp.json` — note VS Code's root key is `servers`, not `mcpServers`:
+
+```json
+{
+  "servers": {
+    "nanoodle": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "/absolute/path/to/noodles"],
+      "env": { "NANOGPT_API_KEY": "your-key-here" }
+    }
+  }
+}
+```
+
+### Windsurf
+
+`~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "nanoodle": {
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "/absolute/path/to/noodles"],
+      "env": { "NANOGPT_API_KEY": "your-key-here" }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Same shape as Cursor/Windsurf, in `claude_desktop_config.json` under
+`mcpServers`.
+
+### ChatGPT
+
+Not reachable: ChatGPT only connects to remote HTTPS MCP servers, and this is
+a local stdio server by design. A hosted endpoint would put a middleman
+between your API key and NanoGPT, which is the opposite of the point — so
+none is planned.
+
+## ⚠️ This spends real money
+
+The server runs on **your** money — either a nano-gpt.com API key (BYOK) or,
+keyless, your own Nano wallet via
+[x402](#wallet-mode--no-account-no-api-key-x402). **Every `tools/call`
+executes a workflow against the NanoGPT API and spends from that balance** —
+and the caller is usually an AI agent deciding on its own when to call. Point
+it only at graphs you're happy to have run, and keep an eye on your balance.
+Each result ends with a `cost: $X.XXXX` line so the agent (and you) can see
+what a call cost.
 
 ## Wallet mode — no account, no API key (x402)
 
@@ -130,38 +143,44 @@ once and draw down a balance, that's exactly what a NanoGPT account is:
 (Nano included) into an account, take its API key, and run the server in
 normal BYOK mode — same tools, one payment instead of many.
 
-### Claude Code
+## How it works
 
-```bash
-claude mcp add nanoodle -- npx nanoodle-mcp --graphs ~/noodles
+```
+~/noodles/
+  generate-hero-image.json   →  tool "generate-hero-image"
+  make-jingle.json           →  tool "make-jingle"
 ```
 
-From a git clone, point at the binary directly instead:
+Every readable `*.json` graph in `--graphs` becomes one MCP tool:
 
-```bash
-claude mcp add nanoodle -- node /path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs --graphs ~/noodles
+| Tool field | Derived from the graph |
+| --- | --- |
+| `name` | filename minus `.json`, sanitized to `[a-z0-9_-]` (duplicates get `-2`, `-3`, …) |
+| `description` | the graph's node chain in dependency order (e.g. `text -> llm -> image`) plus a spend warning |
+| `inputSchema` | one string property per unwired field, exactly like the nanoodle CLI's `inspect`; dropdown fields become `enum`s; only inputs without a baked-in default are `required` |
+| media inputs | image / audio / video inputs take a **file path or https URL** — local files ride inline as base64 |
+| result | text outputs as text blocks; media outputs saved into `--out` (default `./nanoodle-out`) with the absolute path returned; a final text block reports the run's cost |
+
+Protocol behavior worth knowing: malformed calls (unknown tool, unknown /
+missing / non-string argument) are rejected as JSON-RPC `-32602` **before any
+money is spent**; a run that fails (network, model error, missing key) comes
+back as a normal tool result with `isError: true`.
+
+```
+usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+
+  --graphs dir   directory of noodle-graph.json saves (required)
+  --out dir      where media outputs are saved (default ./nanoodle-out)
+  --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
+  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
+  --nano-rpc u   Nano RPC node for wallet mode (default https://rpc.nano.to; NANO_RPC_URL)
+  --max-usd n    wallet mode: refuse any single x402 invoice above $n
 ```
 
-### Claude Desktop
-
-Add to `claude_desktop_config.json` (same note as above: until the npm
-publish, swap `"command": "npx"` / `"args": ["nanoodle-mcp", ...]` for
-`"command": "node"` / `"args": ["/path/to/nanoodle-mcp/bin/nanoodle-mcp.mjs", ...]`):
-
-```json
-{
-  "mcpServers": {
-    "nanoodle": {
-      "command": "npx",
-      "args": ["nanoodle-mcp", "--graphs", "/Users/you/noodles"],
-      "env": { "NANOGPT_API_KEY": "your-key-here" }
-    }
-  }
-}
-```
-
-Then ask for what a graph produces — "make me a hero image of a lighthouse at
-dawn" — and the client calls the matching tool.
+Key precedence matches the nanoodle CLI: `--key` > `--env-file` >
+`NANOGPT_API_KEY`; wallet secrets come only from the environment or
+`--env-file`, never argv. The server refuses to start if the directory holds
+no runnable graphs, and says why per file on stderr; stdout is protocol only.
 
 ## Run any share link
 
@@ -175,10 +194,10 @@ run_noodle("https://nanoodle.com/#g=…", { "Text": "a lighthouse at dawn" })
 
 Pass the link as `url` and any workflow inputs as `inputs` (the same friendly
 keys the graph's own tool would take; media inputs take a file path or https
-URL). It accepts `#g=`/`#j=` workflow links, `#a=` app links, and da.gd /
-TinyURL short links. Direct links decode locally; only fragment-less short links
-trigger a network read, and it carries no credentials. Like every other tool, a
-run **spends from your NanoGPT balance** and ends with a `cost: $X.XXXX` line.
+URL). It accepts `#g=`/`#j=` workflow links, `#a=` app links, and short links
+to one. Direct links decode locally; only fragment-less short links trigger a
+network read, and it carries no credentials. Like every other tool, a run
+**spends real money** and ends with a `cost: $X.XXXX` line.
 
 ## Making graphs
 
@@ -224,6 +243,23 @@ NanoGPT stub and drives the MCP handshake over stdio:
 ```bash
 npm test
 ```
+
+## Registry
+
+`server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)
+manifest (`io.github.nanoodlecom/nanoodle-mcp`); see [PUBLISHING.md](PUBLISHING.md)
+for the release checklist.
+
+## Which repo do I want?
+
+This server exposes saved workflows as typed MCP tools. If your agent supports
+Agent Skills rather than MCP servers,
+[nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill) (teaches your
+agent to build any graph) and
+[noodle-skills](https://github.com/nanoodlecom/noodle-skills) (prebuilt
+one-task workflows) cover similar ground without running a server. Running
+graphs in GitHub CI? →
+[run-noodle-action](https://github.com/nanoodlecom/run-noodle-action).
 
 ## License
 

@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "nanoodle": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "nanoodle-mcp",
+        "--graphs",
+        "${user_config.graphs_dir}",
+        "--out",
+        "${user_config.out_dir}"
+      ],
+      "env": {
+        "NANOGPT_API_KEY": "${user_config.nanogpt_api_key}"
+      }
+    }
+  }
+}
