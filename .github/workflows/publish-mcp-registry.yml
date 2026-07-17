@@ -1,0 +1,30 @@
+name: publish-mcp-registry
+
+# Publishes server.json to the official MCP registry
+# (registry.modelcontextprotocol.io). OIDC from this org repo grants the
+# io.github.nanoodlecom/* namespace — no interactive login, no secrets.
+#
+# Run it manually after each npm publish (PUBLISHING.md has the version-bump
+# rule: package.json + server.json version + server.json packages[0].version).
+
+on: workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mcp-publisher
+        run: |
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+
+      - name: Publish to MCP registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

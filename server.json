@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.nanoodlecom/nanoodle-mcp",
   "title": "nanoodle",
-  "description": "Your saved nanoodle workflow graphs as MCP tools — BYOK or accountless x402 (pay per call in Nano), runs on the NanoGPT API",
+  "description": "Your saved nanoodle workflow graphs as MCP tools — BYOK or pay per call in Nano (x402)",
   "version": "0.1.0",
   "websiteUrl": "https://nanoodle.com",
   "repository": {
