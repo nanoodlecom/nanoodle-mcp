@@ -148,12 +148,22 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(hello.inputSchema.type, "object");
     // text node is named "Idea" and is the node's only required input → key "Idea"
     assert.equal(hello.inputSchema.properties.Idea.type, "string");
-    // llm system prompt is optional with a baked-in default
-    assert.ok(hello.inputSchema.properties["System prompt"]);
+    // llm system prompt is optional with a baked-in default; its key is sanitized
+    // ("System prompt" → "System_prompt") to satisfy clients that enforce
+    // ^[a-zA-Z0-9_.-]{1,64}$ on property keys, with the original spelling described
+    assert.ok(hello.inputSchema.properties.System_prompt);
+    assert.match(hello.inputSchema.properties.System_prompt.description, /System prompt/);
     assert.deepEqual(hello.inputSchema.required, ["Idea"]);
+    // no advertised property key may violate the client-enforced pattern
+    for (const t of tools) {
+      for (const key of Object.keys(t.inputSchema.properties)) {
+        assert.match(key, /^[a-zA-Z0-9_.-]{1,64}$/, `tool ${t.name} advertises invalid key "${key}"`);
+      }
+    }
 
     // -- tools/call (text output): stubbed chat completion + cost line
-    const call = await srv.request("tools/call", { name: "hello-noodle", arguments: { Idea: "say pong" } });
+    // passing the sanitized key must land on the graph's real "System prompt" input
+    const call = await srv.request("tools/call", { name: "hello-noodle", arguments: { Idea: "say pong", System_prompt: "reply with pong" } });
     assert.equal(call.error, undefined);
     assert.ok(!call.result.isError, "run should succeed: " + JSON.stringify(call.result));
     const texts = call.result.content.map((c) => c.text);

@@ -63,25 +63,43 @@ function typeChain(graph) {
   return nodes.filter((n) => n.type !== "comment").map((n) => n.type).join(" -> ");
 }
 
+/** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
+function schemaKey(key) {
+  const safe = String(key).replace(/[^a-zA-Z0-9_.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
+  return safe || "input";
+}
+
+/** Derived inputs paired with schema-safe keys ("System prompt" → "System_prompt"), deduped. */
+function keyedInputs(wf) {
+  const used = new Map();
+  return wf.inputs.map((inp) => {
+    let safe = schemaKey(inp.key);
+    const count = (used.get(safe) || 0) + 1;
+    used.set(safe, count);
+    if (count > 1) safe = `${safe.slice(0, 61)}_${count}`;
+    return { inp, safe, hasDef: inp.def != null && String(inp.def) !== "" };
+  });
+}
+
 function buildInputSchema(wf) {
   const properties = {};
   const required = [];
-  for (const inp of wf.inputs) {
+  for (const { inp, safe, hasDef } of keyedInputs(wf)) {
     const prop = { type: "string" };
     const bits = [];
     if (MEDIA_KINDS.has(inp.kind)) bits.push(`${inp.kind === "inpaint" ? "image" : inp.kind} — file path or https URL`);
-    else if (inp.label && inp.label !== inp.key) bits.push(inp.label);
+    else if (inp.label && inp.label !== safe) bits.push(inp.label);
+    else if (safe !== inp.key) bits.push(inp.key);
     if (inp.options) prop.enum = inp.options.map(String);
-    const hasDef = inp.def != null && String(inp.def) !== "";
     if (hasDef && !MEDIA_KINDS.has(inp.kind)) {
       const d = String(inp.def);
       bits.push(`default: ${JSON.stringify(d.length > 120 ? d.slice(0, 117) + "..." : d)}`);
     }
     if (bits.length) prop.description = bits.join("; ");
-    properties[inp.key] = prop;
+    properties[safe] = prop;
     // A non-optional input with a baked-in default still runs when omitted (the library
     // backfills it), so only inputs that would actually fail are marked required.
-    if (!inp.optional && !hasDef) required.push(inp.key);
+    if (!inp.optional && !hasDef) required.push(safe);
   }
   return { type: "object", properties, ...(required.length ? { required } : {}) };
 }
@@ -131,12 +149,18 @@ const runNoodleTool = (spendSource) => ({
  * for unknown keys, non-string values, or a missing required input.
  */
 async function resolveInputs(wf, args, label) {
-  const inputsByKey = new Map(wf.inputs.map((i) => [i.key.toLowerCase(), i]));
+  const keyed = keyedInputs(wf);
+  // Both spellings resolve: the schema-safe key the tool advertises and the graph's own key.
+  const inputsByKey = new Map();
+  for (const { inp, safe } of keyed) {
+    inputsByKey.set(safe.toLowerCase(), inp);
+    inputsByKey.set(inp.key.toLowerCase(), inp);
+  }
   const inputs = {};
   for (const [k, v] of Object.entries(args)) {
     const entry = inputsByKey.get(String(k).trim().toLowerCase());
     if (!entry) {
-      throw new ParamsError(`unknown input "${k}" for ${label} — inputs: ${wf.inputs.map((i) => `"${i.key}"`).join(", ") || "(none)"}`);
+      throw new ParamsError(`unknown input "${k}" for ${label} — inputs: ${keyed.map(({ safe }) => `"${safe}"`).join(", ") || "(none)"}`);
     }
     if (typeof v !== "string") {
       throw new ParamsError(`input "${k}" must be a string`);
@@ -147,10 +171,9 @@ async function resolveInputs(wf, args, label) {
       inputs[entry.key] = v;
     }
   }
-  const required = buildInputSchema(wf).required || [];
-  const missing = required.filter((k) => inputs[k] === undefined);
+  const missing = keyed.filter(({ inp, hasDef }) => !inp.optional && !hasDef && inputs[inp.key] === undefined);
   if (missing.length) {
-    throw new ParamsError(`missing required input${missing.length > 1 ? "s" : ""} for ${label}: ${missing.map((k) => `"${k}"`).join(", ")}`);
+    throw new ParamsError(`missing required input${missing.length > 1 ? "s" : ""} for ${label}: ${missing.map(({ safe }) => `"${safe}"`).join(", ")}`);
   }
   return inputs;
 }
