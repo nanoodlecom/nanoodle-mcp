@@ -100,6 +100,40 @@ test("paySend: concurrent invoices are serialized on the advancing frontier", as
   assert.equal(BigInt(second.balance), BigInt(BALANCE) - 2n * BigInt(AMOUNT));
 });
 
+test("paySend: workUrl routes work_generate to the work server, everything else to the node", async () => {
+  const rpc = fakeRpc();
+  const calls = [];
+  const spyFetch = (url, init) => { calls.push({ url, action: JSON.parse(init.body).action }); return rpc.fetch(url, init); };
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: spyFetch, workUrl: "http://127.0.0.1:7076/" });
+  await wallet.payment(invoice());
+  assert.deepEqual(
+    calls.map((c) => [c.action, c.url]),
+    [
+      ["account_info", DEFAULT_NANO_RPC],
+      ["work_generate", "http://127.0.0.1:7076"], // trailing slash trimmed
+      ["process", DEFAULT_NANO_RPC],
+    ]);
+  assert.equal(rpc.state.processed[0].block.work, WORK);
+});
+
+test("paySend: a dead work server falls back to the node's work_generate", async () => {
+  const rpc = fakeRpc();
+  const logs = [];
+  const spyFetch = (url, init) => {
+    if (url === "http://dead.local" ) throw new Error("ECONNREFUSED");
+    return rpc.fetch(url, init);
+  };
+  const wallet = createNanoWallet({
+    secretKey: SECRET, fetch: spyFetch, workUrl: "http://dead.local",
+    log: (l) => logs.push(l),
+  });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 1, "payment must still settle via the node's work");
+  assert.equal(rpc.state.processed[0].block.work, WORK);
+  assert.ok(logs.some((l) => /work_generate via work server http:\/\/dead\.local failed/.test(l)),
+    "the fallback must be logged");
+});
+
 test("paySend: a failed payment doesn't wedge the queue", async () => {
   const rpc = fakeRpc();
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch, maxUsd: 0.001 });

@@ -132,6 +132,15 @@ the result. The seed/private key never leaves the process: only the *signed
 block* goes to the RPC node, and neither secret is ever logged. An API key,
 if present, always wins — the wallet is only used keyless.
 
+**Proof-of-work reliability.** Every send block needs Nano proof-of-work. The
+server asks the RPC node's `work_generate` first, but public nodes routinely
+refuse or throttle it (no GPU, key required); the fallback is local
+single-threaded CPU work, which can take a minute. For fast, dependable sends,
+run [nano-work-server](https://github.com/nanocurrency/nano-work-server) on
+the same machine and point `--work-rpc` / `NANO_WORK_URL` at it
+(`nano-work-server --cpu-threads 8 -l 127.0.0.1:7076` → work in a few
+seconds). Order: `--work-rpc` → `--nano-rpc` node → local CPU.
+
 **This is a hot wallet.** Use a dedicated wallet holding pocket money, not
 your savings: its balance is a natural spend ceiling, and `--max-usd` adds a
 per-call one on top. NanoGPT auto-refunds overpayments and failed generations
@@ -167,13 +176,15 @@ money is spent**; a run that fails (network, model error, missing key) comes
 back as a normal tool result with `isError: true`.
 
 ```
-usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--work-rpc url] [--max-usd n]
 
   --graphs dir   directory of noodle-graph.json saves (required)
   --out dir      where media outputs are saved (default ./nanoodle-out)
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
+  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY / NANO_WORK_URL from a .env-style file
   --nano-rpc u   Nano RPC node for wallet mode (default https://rpc.nano.to; NANO_RPC_URL)
+  --work-rpc u   dedicated work_generate endpoint, e.g. a local nano-work-server
+                 (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work)
   --max-usd n    wallet mode: refuse any single x402 invoice above $n
 ```
 
