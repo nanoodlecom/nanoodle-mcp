@@ -392,3 +392,28 @@ test("run_noodle: bad, internal, and unrunnable links come back as tool errors, 
     await srv.close();
   }
 });
+
+test("describeRunFailure: leads with the root-cause node, lists the cascade", async () => {
+  const { describeRunFailure } = await import("../src/tools.mjs");
+  const runError = Object.assign(new Error('run failed — "Image→Video": upstream failed: Image'), {
+    result: {
+      errors: [
+        { nodeId: "n17", name: "LLM", message: "x402 invoice is $0.1082, over the --max-usd cap of $0.1 — raise the cap" },
+        { nodeId: "n18", name: "Join", message: "upstream failed: LLM" },
+        { nodeId: "n2", name: "Image", message: "upstream failed: Join" },
+        { nodeId: "n6", name: "Image→Video", message: "upstream failed: Image" },
+      ],
+    },
+  });
+  const out = describeRunFailure(runError);
+  assert.match(out.message, /^run failed at "LLM": x402 invoice is \$0\.1082/);
+  assert.match(out.message, /downstream never ran: "Join", "Image", "Image→Video"/);
+  assert.equal(out.cause, runError, "original RunError stays reachable");
+
+  // no per-node record (network error before the run, ParamsError, …) → untouched
+  const plain = new Error("boom");
+  assert.equal(describeRunFailure(plain), plain);
+  // all errors are cascades (shouldn't happen, but never fabricate a root) → untouched
+  const odd = Object.assign(new Error("x"), { result: { errors: [{ nodeId: "a", name: "A", message: "upstream failed: B" }] } });
+  assert.equal(describeRunFailure(odd), odd);
+});
