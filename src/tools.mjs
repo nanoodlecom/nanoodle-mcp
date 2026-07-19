@@ -178,6 +178,28 @@ async function resolveInputs(wf, args, label) {
   return inputs;
 }
 
+/**
+ * Make a failed run's error lead with the node that actually broke.
+ *
+ * The library's RunError message names the failed *sink* ("Image→Video":
+ * upstream failed: Image), which buries the real failure when it happened
+ * nodes earlier (a wallet cap refusal on an LLM read as an image failure).
+ * The per-node record on e.result has the truth — surface it.
+ */
+export function describeRunFailure(e) {
+  const errs = e && e.result && Array.isArray(e.result.errors) ? e.result.errors : null;
+  if (!errs || !errs.length) return e;
+  const isCascade = (m) => /^upstream failed: /.test(m || "");
+  const roots = errs.filter((x) => !isCascade(x.message));
+  if (!roots.length) return e;
+  const cascaded = errs.filter((x) => isCascade(x.message)).map((x) => `"${x.name}"`);
+  const out = new Error(
+    `run failed at ${roots.map((x) => `"${x.name}": ${x.message}`).join("; ")}` +
+    (cascaded.length ? ` — downstream never ran: ${cascaded.join(", ")}` : ""));
+  out.cause = e;
+  return out;
+}
+
 /** Turn a completed run into MCP tool-result content: media saved to disk, text inline, cost line. */
 async function emitResult(wf, result, prefix, outDir) {
   const content = [];
@@ -231,7 +253,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
     throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
   }
   const inputs = await resolveInputs(wf, inputArgs, `run_noodle (${decoded.url})`);
-  const result = await wf.run(inputs);
+  const result = await wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
   return emitResult(wf, result, RUN_NOODLE_NAME, outDir);
 }
 
@@ -315,7 +337,7 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
       const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
 
       // Everything past this point is a run failure, not a protocol error → isError content.
-      const result = await tool.wf.run(inputs);
+      const result = await tool.wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
       return emitResult(tool.wf, result, tool.name, outDir);
     },
   };
