@@ -94,9 +94,14 @@ function typeChain(graph) {
   return runs.map((r) => (r.n > 1 ? `${r.label}×${r.n}` : r.label)).join(" -> ");
 }
 
-/** "org/model" → "model": the org prefix is noise in a one-line description. */
+/**
+ * "org/model" → "model": the org prefix is noise in a one-line description.
+ * Only the first segment goes — deeper paths like "org/model/variant" keep
+ * "model/variant", where the tail alone would be generic.
+ */
 function shortModel(model) {
-  return String(model).split("/").pop();
+  const segs = String(model).split("/");
+  return segs.length > 1 ? segs.slice(1).join("/") : segs[0];
 }
 
 /**
