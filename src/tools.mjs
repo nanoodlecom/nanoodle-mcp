@@ -11,7 +11,7 @@
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
-import { readdir, readFile, mkdir, writeFile } from "node:fs/promises";
+import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
@@ -119,7 +119,9 @@ function graphIntent(graph) {
 
 /**
  * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
- * size / variations, plus the on-disk contract (media never rides inline in the result).
+ * size, plus the on-disk contract (media never rides inline in the result).
+ * One file per media sink — the run keeps only a sink's primary output, so
+ * variations never multiply what the caller receives.
  */
 function describeOutputs(wf) {
   const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
@@ -131,9 +133,8 @@ function describeOutputs(wf) {
     const details = [];
     if (f.model) details.push(shortModel(f.model));
     if (kind === "image" && f.size && f.size !== "auto") details.push(String(f.size).replace("x", "×"));
-    const variations = parseInt(f.variations, 10);
-    mediaFiles += variations > 1 ? variations : 1;
-    return `${variations > 1 ? `${variations}× ` : ""}${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
+    mediaFiles += 1;
+    return `${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
   });
   if (!parts.length) return "";
   const joined = parts.join(" + ");
@@ -451,7 +452,11 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
     costs[tool.name] = rec;
     try {
       await mkdir(outDir, { recursive: true });
-      await writeFile(costsPath, JSON.stringify(costs, null, 2) + "\n");
+      // write-then-rename: overlapping runs may record concurrently, and two
+      // writeFile calls on the same path can interleave — rename is atomic.
+      const tmp = `${costsPath}.${++saveSeq}.tmp`;
+      await writeFile(tmp, JSON.stringify(costs, null, 2) + "\n");
+      await rename(tmp, costsPath);
     } catch (e) {
       console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
     }

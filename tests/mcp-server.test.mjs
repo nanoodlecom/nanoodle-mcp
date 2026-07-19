@@ -487,7 +487,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
   await writeFile(join(dir, "collapse.json"), graph(
     [t("n1"), t("n2"), { id: "n3", type: "join", x: 0, y: 0, fields: {} }, { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "m" } }],
     [link("l1", ["n1", "text"], ["n3", "a"]), link("l2", ["n2", "text"], ["n3", "b"]), link("l3", ["n3", "text"], ["n4", "prompt"])]));
-  // variations > 1 → "3× image"; size "auto" stays out of the parenthetical
+  // variations never multiply the contract (the run keeps one file per sink); size "auto" stays out of the parenthetical
   await writeFile(join(dir, "variants.json"), graph(
     [t("n1"), { id: "n2", type: "image", x: 0, y: 0, fields: { model: "test-img", size: "auto", variations: "3" } }],
     [link("l1", ["n1", "text"], ["n2", "prompt"])]));
@@ -508,7 +508,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
     "text×2 -> join -> llm; returns text. " +
     "Runs on NanoGPT — every call spends real credit from your API key's balance.");
   assert.equal(desc.variants,
-    "text -> image; returns 3× image (test-img) saved to disk (file paths in result). " +
+    "text -> image; returns image (test-img) saved to disk (file path in result). " +
     "Runs on NanoGPT — every call spends real credit from your API key's balance.");
   assert.equal(desc.mixed,
     "text -> llm -> image; returns text + image (img-model); media saved to disk (file path in result). " +
