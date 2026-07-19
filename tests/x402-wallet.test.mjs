@@ -239,6 +239,42 @@ test("paySend: a bounced send refetches the frontier and retries exactly once", 
   assert.equal(alwaysFork.state.infoCalls, 2, "exactly one refetch before giving up");
 });
 
+test("paySend: a lost process response republishes the identical block", async () => {
+  let dropped = 0;
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      if (dropped++ === 0) throw new Error("fetch failed"); // transport dies, node never saw it
+      state.processed.push(body);
+      return reply({ hash: "C".repeat(64) });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 1);
+  assert.equal(rpc.state.processed[0].block.previous, FRONTIER, "republish must be the same block, not a rebuild");
+});
+
+test("paySend: a lost response for a block that DID land is not republished", async () => {
+  const { hashBlock } = await import("nanocurrency");
+  let sent = null;
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      if (!sent) { sent = body.block; throw new Error("fetch failed"); } // accepted, response lost
+      state.processed.push(body); // a second publish would land here
+      return reply({ hash: "C".repeat(64) });
+    },
+    account_info: (_b, _s, reply) => reply({
+      frontier: sent
+        ? hashBlock({ account: sent.account, previous: sent.previous, representative: sent.representative, balance: sent.balance, link: sent.link })
+        : FRONTIER,
+      balance: BALANCE, representative: ADDRESS,
+    }),
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice()); // must resolve — the money moved
+  assert.equal(rpc.state.processed.length, 0, "no double publish after the frontier confirms the block");
+});
+
 test("default RPC is rpc.nano.to", () => {
   assert.equal(DEFAULT_NANO_RPC, "https://rpc.nano.to");
 });

@@ -157,6 +157,27 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     return state;
   }
 
+  /**
+   * Recover from a transport failure while publishing a send: the response was
+   * lost, so the node may or may not have the block. The same signed block is
+   * idempotent (same previous), so check the frontier and republish if it
+   * didn't land. Returns true once the block is known to be on the account.
+   */
+  async function settleAfterTransportError(hash, block) {
+    for (let i = 1; i <= 3; i++) {
+      await new Promise((r) => setTimeout(r, 1500 * i));
+      try {
+        const info = await rpc({ action: "account_info", account: address });
+        if (info.frontier === hash) return true; // first publish did land, only the response was lost
+        await rpc({ action: "process", json_block: "true", subtype: "send", block });
+        return true;
+      } catch (e) {
+        log(`republish attempt ${i} failed (${e.message})`);
+      }
+    }
+    return false;
+  }
+
   async function paySend(invoice) {
     if (!/^\d+$/.test(String(invoice.amountRaw || ""))) {
       throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
@@ -196,16 +217,23 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
       try {
         await rpc({ action: "process", json_block: "true", subtype: "send", block });
       } catch (e) {
+        // Lost response mid-publish: the node may already have the block — verify,
+        // republish the identical block if not, and only then give up.
+        if (/unreachable/.test(e.message)) {
+          log(`process transport failure (${e.message}) — verifying and republishing`);
+          if (await settleAfterTransportError(hash, block)) { /* landed */ }
+          else throw e;
+        }
         // Public RPC proxies (rpc.nano.to) can serve a cached account_info for a
         // few seconds after a block lands, so the first build may sit on a stale
         // frontier. One refetch-and-rebuild covers it; a second bounce is real.
-        if (attempt === 0 && /fork|gap previous|old block|invalid block balance/i.test(e.message)) {
+        else if (attempt === 0 && /fork|gap previous|old block|invalid block balance/i.test(e.message)) {
           log(`send bounced (${e.message}) — refetching frontier and retrying once`);
           state = await accountState();
           if (amount > state.balance) throw insufficient();
           continue;
         }
-        throw e;
+        else throw e;
       }
       log(`x402: paid ${rawToXno(amount)} XNO` +
         (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
