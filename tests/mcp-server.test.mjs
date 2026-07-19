@@ -616,6 +616,9 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
   assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\.$/);
   assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\.$/); // under-reported runs
   assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\.$/); // sub-basis-point runs
+  // inexact figures are floors — "<$0.0001" would overclaim, so the "+" form wins
+  assert.match(await withRec({ usd: 0.00005, at, exact: false }), /; last run \$0\.0001\+\.$/);
+  assert.match(await withRec({ usd: 0, at, exact: false }), /; last run \$0\.00\+\.$/); // all calls unpriced
 
   // corrupt or junk sidecars are ignored, never fatal
   await writeFile(join(outDir, "costs.json"), "{not json");

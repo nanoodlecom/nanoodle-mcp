@@ -160,11 +160,12 @@ function buildDescription(wf, spendSource, { cost } = {}) {
 /**
  * "last run $X" from the cost sidecar record — the only description segment that
  * changes at runtime. Trailing zeros trimmed but never past cents; a run whose
- * calls didn't all report a price renders "+" (it cost at least X).
+ * calls didn't all report a price renders "+" (it cost at least X) — that rules
+ * out the "<$0.0001" claim too, since the recorded figure is only a floor.
  */
 function renderCost(rec) {
   if (!rec || typeof rec.usd !== "number" || !Number.isFinite(rec.usd)) return "";
-  if (rec.usd < 0.0001) return "last run <$0.0001";
+  if (rec.usd < 0.0001 && rec.exact !== false) return "last run <$0.0001";
   const usd = rec.usd.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
   return `last run $${usd}${rec.exact === false ? "+" : ""}`;
 }
