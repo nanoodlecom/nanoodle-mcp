@@ -26,6 +26,8 @@ export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
 /** Network send threshold since Nano v21 — nanocurrency's default is the old, lower one. */
 const SEND_WORK_THRESHOLD = "fffffff800000000";
+/** Receive blocks are allowed much cheaper work since v21. */
+const RECEIVE_WORK_THRESHOLD = "fffffe0000000000";
 
 /** raw → XNO display string (1 XNO = 10^30 raw), trimmed to something readable. */
 function rawToXno(raw) {
@@ -85,6 +87,70 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, fetch =
     return json;
   }
 
+  async function accountState() {
+    const info = await rpc({ action: "account_info", account: address, representative: "true" }).catch((e) => {
+      if (/Account not found/i.test(e.message)) {
+        throw new Error(
+          `wallet ${address} is empty or unopened — fund it with a little XNO first ` +
+          "(pending deposits also need one receive; open the account in any Nano wallet)");
+      }
+      throw e;
+    });
+    return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative };
+  }
+
+  // Work: ask the RPC node first (fast); fall back to local CPU work so a
+  // work-less node still functions, just slowly.
+  async function workFor(frontier, threshold) {
+    try {
+      return (await rpc({ action: "work_generate", hash: frontier, difficulty: threshold })).work;
+    } catch (e) {
+      log(`work_generate failed (${e.message}) — computing work locally, this can take a while`);
+      return computeWork(frontier, { workThreshold: threshold });
+    }
+  }
+
+  /**
+   * Pocket everything receivable. NanoGPT invoices charge the *maximum* a call
+   * could cost and refund the difference as a Nano send back to this wallet —
+   * without receiving those blocks the refunds never rejoin the spendable
+   * balance and the wallet drains far faster than the calls actually cost.
+   * Best-effort by design: a receive failure logs and moves on, never blocks
+   * the payment that triggered it.
+   */
+  async function pocketReceivables(state) {
+    let blocks;
+    try {
+      const r = await rpc({ action: "receivable", account: address, count: "20", threshold: "1" });
+      blocks = r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
+    } catch {
+      return state;
+    }
+    for (const [sendHash, v] of blocks) {
+      const amountRaw = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
+      if (!/^[0-9A-F]{64}$/i.test(sendHash) || !/^\d+$/.test(String(amountRaw || ""))) continue;
+      try {
+        const work = await workFor(state.frontier, RECEIVE_WORK_THRESHOLD);
+        const { hash, block } = createBlock(secretKey, {
+          work,
+          previous: state.frontier,
+          representative: state.representative,
+          balance: (state.balance + BigInt(amountRaw)).toString(),
+          link: sendHash,
+        });
+        block.account = address;
+        delete block.link_as_account; // link is a block hash here, not an account
+        await rpc({ action: "process", json_block: "true", subtype: "receive", block });
+        state = { ...state, frontier: hash, balance: state.balance + BigInt(amountRaw) };
+        log(`x402: received ${rawToXno(amountRaw)} XNO (refund/deposit ${sendHash.slice(0, 8)}…, block ${hash})`);
+      } catch (e) {
+        log(`receive of ${sendHash.slice(0, 8)}… failed (${e.message}) — continuing with current balance`);
+        break; // frontier state is now uncertain; stop and let the send path refetch if needed
+      }
+    }
+    return state;
+  }
+
   async function paySend(invoice) {
     if (!/^\d+$/.test(String(invoice.amountRaw || ""))) {
       throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
@@ -95,52 +161,51 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, fetch =
     if (maxUsd != null && invoice.amountUsd != null && invoice.amountUsd > maxUsd) {
       throw new Error(
         `x402 invoice is $${invoice.amountUsd.toFixed(4)}, over the --max-usd cap of $${maxUsd} — ` +
-        "raise the cap to allow calls this expensive");
+        "raise the cap to allow calls this expensive (invoices are priced at the call's maximum; " +
+        "unused amount is refunded)");
     }
-
-    const info = await rpc({ action: "account_info", account: address, representative: "true" }).catch((e) => {
-      if (/Account not found/i.test(e.message)) {
-        throw new Error(
-          `wallet ${address} is empty or unopened — fund it with a little XNO first ` +
-          "(pending deposits also need one receive; open the account in any Nano wallet)");
-      }
-      throw e;
-    });
 
     const amount = BigInt(invoice.amountRaw);
-    const balance = BigInt(info.balance);
-    if (amount > balance) {
-      throw new Error(
-        `insufficient wallet balance: invoice is ${rawToXno(amount)} XNO` +
-        (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
-        ` but ${address} holds ${rawToXno(balance)} XNO — top up the wallet to continue`);
-    }
+    let state = await pocketReceivables(await accountState());
 
-    // Work: ask the RPC node first (fast); fall back to local CPU work so a
-    // work-less node still functions, just slowly.
-    let work;
-    try {
-      work = (await rpc({ action: "work_generate", hash: info.frontier, difficulty: SEND_WORK_THRESHOLD })).work;
-    } catch (e) {
-      log(`work_generate failed (${e.message}) — computing work locally, this can take a while`);
-      work = await computeWork(info.frontier, { workThreshold: SEND_WORK_THRESHOLD });
-    }
-
-    const { hash, block } = createBlock(secretKey, {
-      work,
-      previous: info.frontier,
-      representative: info.representative,
-      balance: (balance - amount).toString(),
-      link: invoice.payTo,
-    });
-    // createBlock renders addresses with the legacy xrb_ prefix; same account, and the
-    // signature covers the public key, so normalizing the display form is safe
-    block.account = address;
-    block.link_as_account = invoice.payTo;
-    await rpc({ action: "process", json_block: "true", subtype: "send", block });
-    log(`x402: paid ${rawToXno(amount)} XNO` +
+    const insufficient = () => new Error(
+      `insufficient wallet balance: invoice is ${rawToXno(amount)} XNO` +
       (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
-      ` to ${invoice.payTo} (block ${hash})`);
+      ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
+    if (amount > state.balance) throw insufficient();
+
+    for (let attempt = 0; ; attempt++) {
+      const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
+      const { hash, block } = createBlock(secretKey, {
+        work,
+        previous: state.frontier,
+        representative: state.representative,
+        balance: (state.balance - amount).toString(),
+        link: invoice.payTo,
+      });
+      // createBlock renders addresses with the legacy xrb_ prefix; same account, and the
+      // signature covers the public key, so normalizing the display form is safe
+      block.account = address;
+      block.link_as_account = invoice.payTo;
+      try {
+        await rpc({ action: "process", json_block: "true", subtype: "send", block });
+      } catch (e) {
+        // Public RPC proxies (rpc.nano.to) can serve a cached account_info for a
+        // few seconds after a block lands, so the first build may sit on a stale
+        // frontier. One refetch-and-rebuild covers it; a second bounce is real.
+        if (attempt === 0 && /fork|gap previous|old block|invalid block balance/i.test(e.message)) {
+          log(`send bounced (${e.message}) — refetching frontier and retrying once`);
+          state = await accountState();
+          if (amount > state.balance) throw insufficient();
+          continue;
+        }
+        throw e;
+      }
+      log(`x402: paid ${rawToXno(amount)} XNO` +
+        (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
+        ` to ${invoice.payTo} (block ${hash})`);
+      return;
+    }
   }
 
   // Serialize sends — the queue survives failures (a rejected link must not wedge later payments).

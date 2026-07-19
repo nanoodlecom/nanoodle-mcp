@@ -27,19 +27,25 @@ const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
 
-/** In-memory Nano RPC: account_info / work_generate / process, with a frontier that advances. */
+/** In-memory Nano RPC: account_info / work_generate / receivable / process, with a frontier that advances. */
 function fakeRpc(overrides = {}) {
-  const state = { frontier: FRONTIER, balance: BALANCE, processed: [] };
+  const state = { frontier: FRONTIER, balance: BALANCE, processed: [], workDifficulties: [], infoCalls: 0 };
   const fetch = async (url, init) => {
     const body = JSON.parse(init.body);
     const reply = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
     if (overrides[body.action]) return overrides[body.action](body, state, reply);
     if (body.action === "account_info") {
+      state.infoCalls++;
       return reply({ frontier: state.frontier, balance: state.balance, representative: ADDRESS });
     }
     if (body.action === "work_generate") {
-      assert.equal(body.difficulty, "fffffff800000000", "send work must use the v21 threshold");
+      state.workDifficulties.push(body.difficulty);
+      assert.ok(["fffffff800000000", "fffffe0000000000"].includes(body.difficulty),
+        "work difficulty must be the v21 send or receive threshold");
       return reply({ work: WORK });
+    }
+    if (body.action === "receivable") {
+      return reply({ blocks: "" }); // a real node returns "" when nothing is receivable
     }
     if (body.action === "process") {
       state.processed.push(body);
@@ -125,6 +131,77 @@ test("paySend: readable errors — insufficient balance, unopened account, bad i
   const w3 = createNanoWallet({ secretKey: SECRET, fetch: fakeRpc().fetch });
   await assert.rejects(() => w3.payment(invoice({ amountRaw: "" })), /no usable Nano amount/);
   await assert.rejects(() => w3.payment(invoice({ payTo: "nano_junk!" })), /not a valid Nano address/);
+});
+
+test("paySend: pockets receivable refunds before sending", async () => {
+  const REFUND = "2000000000000000000000000000"; // 0.002 XNO refund waiting
+  const REFUND_HASH = "E".repeat(64);
+  const rpc = fakeRpc({
+    receivable: (_b, state, reply) =>
+      // only the first ask has a pending block — once received it's gone
+      reply({ blocks: state.processed.length ? "" : { [REFUND_HASH]: REFUND } }),
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+
+  assert.equal(rpc.state.processed.length, 2);
+  const [receive, send] = rpc.state.processed;
+  assert.equal(receive.subtype, "receive");
+  assert.equal(receive.block.previous, FRONTIER);
+  assert.equal(receive.block.link, REFUND_HASH);
+  assert.equal(receive.block.link_as_account, undefined, "receive link is a hash, not an account");
+  assert.equal(BigInt(receive.block.balance), BigInt(BALANCE) + BigInt(REFUND));
+  assert.equal(send.subtype, "send");
+  const { hashBlock } = await import("nanocurrency");
+  const receiveHash = hashBlock({
+    account: receive.block.account, previous: receive.block.previous,
+    representative: receive.block.representative, balance: receive.block.balance, link: receive.block.link,
+  });
+  assert.equal(send.block.previous, receiveHash, "send must chain on the receive block's real hash");
+  assert.equal(BigInt(send.block.balance), BigInt(BALANCE) + BigInt(REFUND) - BigInt(AMOUNT));
+  // receive work is allowed the cheap threshold; the send still uses the v21 send threshold
+  assert.deepEqual(rpc.state.workDifficulties, ["fffffe0000000000", "fffffff800000000"]);
+});
+
+test("paySend: a refund can cover an invoice the bare balance cannot", async () => {
+  const rpc = fakeRpc({
+    account_info: (_b, state, reply) => { state.infoCalls++; return reply({ frontier: state.frontier, balance: "1", representative: ADDRESS }); },
+    receivable: (_b, state, reply) => reply({ blocks: state.processed.length ? "" : { ["E".repeat(64)]: BALANCE } }),
+    process: (body, state, reply) => { state.processed.push(body); state.frontier = "C".repeat(63) + state.processed.length; return reply({ hash: state.frontier }); },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 2, "receive then send");
+});
+
+test("paySend: a bounced send refetches the frontier and retries exactly once", async () => {
+  const TRUE_FRONTIER = "D".repeat(64);
+  let processCalls = 0;
+  const rpc = fakeRpc({
+    account_info: (_b, state, reply) => {
+      state.infoCalls++;
+      // first ask serves a stale cached frontier; the refetch sees the real one
+      return reply({ frontier: state.infoCalls === 1 ? FRONTIER : TRUE_FRONTIER, balance: BALANCE, representative: ADDRESS });
+    },
+    process: (body, state, reply) => {
+      processCalls++;
+      if (processCalls === 1) return reply({ error: "Fork" });
+      state.processed.push(body);
+      return reply({ hash: "C".repeat(64) });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+
+  assert.equal(processCalls, 2);
+  assert.equal(rpc.state.infoCalls, 2);
+  assert.equal(rpc.state.processed[0].block.previous, TRUE_FRONTIER, "retry must build on the fresh frontier");
+
+  // a second bounce is a real error, not an infinite retry
+  const alwaysFork = fakeRpc({ process: (_b, _s, reply) => reply({ error: "Fork" }) });
+  const w2 = createNanoWallet({ secretKey: SECRET, fetch: alwaysFork.fetch });
+  await assert.rejects(() => w2.payment(invoice()), /Fork/);
+  assert.equal(alwaysFork.state.infoCalls, 2, "exactly one refetch before giving up");
 });
 
 test("default RPC is rpc.nano.to", () => {
