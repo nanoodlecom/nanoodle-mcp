@@ -57,25 +57,26 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * Build the wallet: derives the address and returns the x402 `payment`
  * callback to pass to the nanoodle Workflow.
  *
- * @param {{ secretKey: string, rpcUrl?: string, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
+ * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl = null, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   const rpcBase = String(rpcUrl).replace(/\/+$/, "");
+  const workBase = workUrl ? String(workUrl).replace(/\/+$/, "") : null;
 
-  async function rpc(body) {
+  async function rpc(body, base = rpcBase) {
     let r;
     try {
-      r = await fetch(rpcBase, {
+      r = await fetch(base, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
     } catch (e) {
-      throw new Error(`Nano RPC ${rpcBase} unreachable (action ${body.action}): ${e.message}`);
+      throw new Error(`Nano RPC ${base} unreachable (action ${body.action}): ${e.message}`);
     }
     const text = await r.text();
     let json = null;
@@ -99,15 +100,20 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, fetch =
     return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative };
   }
 
-  // Work: ask the RPC node first (fast); fall back to local CPU work so a
-  // work-less node still functions, just slowly.
+  // Work: dedicated work server first (--work-rpc, e.g. a local nano-work-server —
+  // public nodes routinely refuse or throttle work_generate), then the main RPC
+  // node, then local CPU work so a work-less setup still functions, just slowly.
   async function workFor(frontier, threshold) {
-    try {
-      return (await rpc({ action: "work_generate", hash: frontier, difficulty: threshold })).work;
-    } catch (e) {
-      log(`work_generate failed (${e.message}) — computing work locally, this can take a while`);
-      return computeWork(frontier, { workThreshold: threshold });
+    const workSources = workBase ? [["work server " + workBase, workBase], ["Nano RPC", rpcBase]] : [["Nano RPC", rpcBase]];
+    for (const [label, base] of workSources) {
+      try {
+        return (await rpc({ action: "work_generate", hash: frontier, difficulty: threshold }, base)).work;
+      } catch (e) {
+        log(`work_generate via ${label} failed (${e.message})`);
+      }
     }
+    log("computing work locally, this can take a while");
+    return computeWork(frontier, { workThreshold: threshold });
   }
 
   /**

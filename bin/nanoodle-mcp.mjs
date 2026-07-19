@@ -36,6 +36,8 @@ function usage(code = 1) {
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
   --nano-rpc u   Nano RPC node for wallet mode (default ${DEFAULT_NANO_RPC}; NANO_RPC_URL)
+  --work-rpc u   dedicated work_generate endpoint, e.g. a local nano-work-server
+                 (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work)
   --max-usd n    wallet mode: refuse any single x402 invoice above $n
 
 No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
@@ -49,7 +51,7 @@ Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).`
 
 async function main() {
   const argv = process.argv.slice(2);
-  let graphsDir = null, outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, maxUsdFlag = null;
+  let graphsDir = null, outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -63,6 +65,7 @@ async function main() {
     else if (a === "--key") keyFlag = val("--key");
     else if (a === "--env-file") envFile = val("--env-file");
     else if (a === "--nano-rpc") nanoRpcFlag = val("--nano-rpc");
+    else if (a === "--work-rpc") workRpcFlag = val("--work-rpc");
     else if (a === "--max-usd") maxUsdFlag = val("--max-usd");
     else if (a === "--help" || a === "-h") usage(0);
     else if (a === "--version") {
@@ -82,6 +85,7 @@ async function main() {
   let apiKey = keyFlag ?? process.env.NANOGPT_API_KEY;
   // wallet material: --env-file > environment; never argv (it leaks via `ps`)
   let nanoSeed = process.env.NANO_SEED, nanoKey = process.env.NANO_PRIVATE_KEY;
+  let workUrl = workRpcFlag || process.env.NANO_WORK_URL || null;
   if (envFile) {
     let envText;
     try { envText = await readFile(envFile, "utf8"); }
@@ -94,6 +98,7 @@ async function main() {
     if (fileKey && keyFlag == null) apiKey = fileKey;
     nanoSeed = entry("NANO_SEED") ?? nanoSeed;
     nanoKey = entry("NANO_PRIVATE_KEY") ?? nanoKey;
+    if (!workRpcFlag) workUrl = entry("NANO_WORK_URL") ?? workUrl;
     if (!fileKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined) {
       console.error(`--env-file: no NANOGPT_API_KEY, NANO_SEED, or NANO_PRIVATE_KEY entry in ${envFile}`);
       process.exit(1);
@@ -108,6 +113,7 @@ async function main() {
       wallet = createNanoWallet({
         secretKey: resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed }),
         rpcUrl: nanoRpcFlag || process.env.NANO_RPC_URL || undefined,
+        workUrl,
         maxUsd,
         log: (line) => console.error("nanoodle-mcp: " + line),
       });
@@ -141,7 +147,8 @@ async function main() {
   }
   if (wallet) {
     console.error(`nanoodle-mcp: wallet mode (accountless x402) — paying from ${wallet.address}` +
-      (maxUsd != null ? `, capped at $${maxUsd}/call` : ", no per-call cap (--max-usd)"));
+      (maxUsd != null ? `, capped at $${maxUsd}/call` : ", no per-call cap (--max-usd)") +
+      (workUrl ? `, work via ${workUrl}` : ""));
   }
 
   console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${resolve(graphsDir)}`);
