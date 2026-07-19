@@ -143,8 +143,12 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.match(restyle.inputSchema.properties.Image.description, /file path or https URL/);
 
     const hello = tools.find((t) => t.name === "hello-noodle");
-    assert.match(hello.description, /text -> llm/);
+    // named text node annotates the chain; text-only graph advertises "returns text"
+    assert.match(hello.description, /text:Idea -> llm; returns text\./);
     assert.match(hello.description, /NanoGPT/);
+    // media sink: model in the parenthetical + the saved-to-disk contract
+    const posterTool = tools.find((t) => t.name === "poster");
+    assert.match(posterTool.description, /returns image \(test-image-model\) saved to disk \(file path in result\)/);
     assert.equal(hello.inputSchema.type, "object");
     // text node is named "Idea" and is the node's only required input → key "Idea"
     assert.equal(hello.inputSchema.properties.Idea.type, "string");
@@ -438,6 +442,60 @@ test("describeRunFailure: leads with the root-cause node, lists the cascade", as
   // all errors are cascades (shouldn't happen, but never fabricate a root) → untouched
   const odd = Object.assign(new Error("x"), { result: { errors: [{ nodeId: "a", name: "A", message: "upstream failed: B" }] } });
   assert.equal(describeRunFailure(odd), odd);
+});
+
+test("tool descriptions: chain annotations, ×N collapsing, and the returns contract", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-desc-"));
+  const graph = (nodes, links) => JSON.stringify({ v: 1, nodes, links });
+  const t = (id, name, extra) => ({ id, type: "text", x: 0, y: 0, ...(name ? { name } : {}), fields: { text: "x" }, ...extra });
+  const link = (id, from, to) => ({ id, from: { node: from[0], port: from[1] }, to: { node: to[0], port: to[1] } });
+
+  // named nodes (incl. a name with a space) + org-prefixed model + explicit size
+  await writeFile(join(dir, "named.json"), graph(
+    [
+      t("n1", "Feature"),
+      t("n2", "Style guide"),
+      { id: "n3", type: "join", x: 0, y: 0, fields: {} },
+      { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
+      { id: "n5", type: "image", x: 0, y: 0, name: "Mockup", fields: { model: "openai/nano-banana-2-lite", size: "1024x1024" } },
+    ],
+    [
+      link("l1", ["n1", "text"], ["n3", "a"]),
+      link("l2", ["n2", "text"], ["n3", "b"]),
+      link("l3", ["n3", "text"], ["n4", "prompt"]),
+      link("l4", ["n4", "text"], ["n5", "prompt"]),
+    ]));
+  // adjacent unnamed twins collapse to ×2
+  await writeFile(join(dir, "collapse.json"), graph(
+    [t("n1"), t("n2"), { id: "n3", type: "join", x: 0, y: 0, fields: {} }, { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "m" } }],
+    [link("l1", ["n1", "text"], ["n3", "a"]), link("l2", ["n2", "text"], ["n3", "b"]), link("l3", ["n3", "text"], ["n4", "prompt"])]));
+  // variations > 1 → "3× image"; size "auto" stays out of the parenthetical
+  await writeFile(join(dir, "variants.json"), graph(
+    [t("n1"), { id: "n2", type: "image", x: 0, y: 0, fields: { model: "test-img", size: "auto", variations: "3" } }],
+    [link("l1", ["n1", "text"], ["n2", "prompt"])]));
+  // mixed text + media sinks → media-only disk note
+  await writeFile(join(dir, "mixed.json"), graph(
+    [t("n1"), { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "m" } }, { id: "n3", type: "image", x: 0, y: 0, fields: { model: "img-model" } }],
+    [link("l1", ["n1", "text"], ["n2", "prompt"]), link("l2", ["n1", "text"], ["n3", "prompt"])]));
+
+  const reg = await loadTools({ dir, apiKey: "test-key", outDir: dir });
+  assert.deepEqual(reg.failures, []);
+  const desc = Object.fromEntries(reg.tools.map((x) => [x.name, x.description]));
+
+  assert.equal(desc.named,
+    "text:Feature -> text:Style guide -> join -> llm -> image:Mockup; " +
+    "returns image (nano-banana-2-lite, 1024×1024) saved to disk (file path in result). " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+  assert.equal(desc.collapse,
+    "text×2 -> join -> llm; returns text. " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+  assert.equal(desc.variants,
+    "text -> image; returns 3× image (test-img) saved to disk (file paths in result). " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+  assert.equal(desc.mixed,
+    "text -> llm -> image; returns text + image (img-model); media saved to disk (file path in result). " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
 });
 
 test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () => {

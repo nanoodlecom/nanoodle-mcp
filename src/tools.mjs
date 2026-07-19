@@ -3,7 +3,7 @@
  *
  * Each readable noodle-graph.json in the directory becomes one tool:
  *   - name        = filename minus .json, sanitized to [a-z0-9_-]
- *   - description = the graph's node-type chain ("text -> llm -> image; runs on NanoGPT …")
+ *   - description = node chain + output contract ("text:Idea -> llm; returns text. Runs on NanoGPT …")
  *   - inputSchema = JSON Schema built from the workflow's derived inputs
  *   - call(args)  = wf.run(...) with media args resolved from file paths / URLs
  *
@@ -57,7 +57,13 @@ function sanitizeName(file) {
   return name || "graph";
 }
 
-/** Node-type chain in dependency order (local Kahn sort — keeps us on the library's public API). */
+/** Chain label for one node: bare type, or type:Name when the author named it. */
+function nodeLabel(n) {
+  const name = typeof n.name === "string" ? n.name.trim() : "";
+  return name ? `${n.type}:${name}` : n.type;
+}
+
+/** Node-label chain in dependency order (local Kahn sort — keeps us on the library's public API). */
 function typeChain(graph) {
   const indeg = new Map(graph.nodes.map((n) => [n.id, 0]));
   const out = new Map(graph.nodes.map((n) => [n.id, []]));
@@ -77,7 +83,57 @@ function typeChain(graph) {
     }
   }
   const nodes = order.length === graph.nodes.length ? order : graph.nodes; // cyclic → raw order
-  return nodes.filter((n) => n.type !== "comment").map((n) => n.type).join(" -> ");
+  // Adjacent identical labels collapse to label×N — named nodes rarely collapse (labels differ).
+  const runs = [];
+  for (const label of nodes.filter((n) => n.type !== "comment").map(nodeLabel)) {
+    const last = runs[runs.length - 1];
+    if (last && last.label === label) last.n++;
+    else runs.push({ label, n: 1 });
+  }
+  return runs.map((r) => (r.n > 1 ? `${r.label}×${r.n}` : r.label)).join(" -> ");
+}
+
+/** "org/model" → "model": the org prefix is noise in a one-line description. */
+function shortModel(model) {
+  return String(model).split("/").pop();
+}
+
+/**
+ * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
+ * size / variations, plus the on-disk contract (media never rides inline in the result).
+ */
+function describeOutputs(wf) {
+  const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
+  let mediaFiles = 0;
+  const parts = wf.outputs.map((o) => {
+    const kind = (o.ports && o.ports[0] && o.ports[0].type) || o.type; // odd types may declare no ports
+    if (kind === "text") return "text";
+    const f = (byId.get(o.nodeId) || {}).fields || {};
+    const details = [];
+    if (f.model) details.push(shortModel(f.model));
+    if (kind === "image" && f.size && f.size !== "auto") details.push(String(f.size).replace("x", "×"));
+    const variations = parseInt(f.variations, 10);
+    mediaFiles += variations > 1 ? variations : 1;
+    return `${variations > 1 ? `${variations}× ` : ""}${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
+  });
+  if (!parts.length) return "";
+  const joined = parts.join(" + ");
+  if (!mediaFiles) return `returns ${joined}`;
+  const pathNote = `(file path${mediaFiles > 1 ? "s" : ""} in result)`;
+  return parts.every((p) => p !== "text")
+    ? `returns ${joined} saved to disk ${pathNote}`
+    : `returns ${joined}; media saved to disk ${pathNote}`;
+}
+
+/**
+ * One place assembles the whole description so it can be re-run when pieces change.
+ * `intent` (graph comment) and `cost` (last observed run) are optional segments
+ * wired in separately — pass them pre-rendered.
+ */
+function buildDescription(wf, spendSource, { intent, cost } = {}) {
+  const returns = describeOutputs(wf);
+  return `${intent ? `${intent} ` : ""}${typeChain(wf.graph)}${returns ? `; ${returns}` : ""}. ` +
+    `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.`;
 }
 
 /** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
@@ -339,7 +395,7 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
       name,
       file,
       wf,
-      description: `${typeChain(wf.graph)}; runs on NanoGPT — every call spends real credit from ${spendSource}`,
+      description: buildDescription(wf, spendSource),
       inputSchema: buildInputSchema(wf),
     });
   }
