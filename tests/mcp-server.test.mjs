@@ -417,3 +417,14 @@ test("describeRunFailure: leads with the root-cause node, lists the cascade", as
   const odd = Object.assign(new Error("x"), { result: { errors: [{ nodeId: "a", name: "A", message: "upstream failed: B" }] } });
   assert.equal(describeRunFailure(odd), odd);
 });
+
+test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () => {
+  const { extForMedia } = await import("../src/tools.mjs");
+  const ftyp = new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0]); // ....ftypisom
+  assert.equal(extForMedia(ftyp, "video/mp4"), "mp4");
+  assert.equal(extForMedia(ftyp, "application/octet-stream"), "mp4"); // the live LTX video case
+  assert.equal(extForMedia(ftyp, null), "mp4");
+  assert.equal(extForMedia(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), null), "png");
+  assert.equal(extForMedia(new Uint8Array([0xff, 0xd8, 0xff]), ""), "jpg");
+  assert.equal(extForMedia(new Uint8Array([1, 2, 3, 4]), null), "bin"); // truly unknown stays bin
+});
