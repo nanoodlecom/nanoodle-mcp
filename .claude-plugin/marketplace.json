@@ -9,7 +9,7 @@
       "name": "nanoodle",
       "source": "./",
       "description": "Run your saved nanoodle workflow graphs as MCP tools — BYOK or accountless x402, spends from your NanoGPT balance or Nano wallet",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "255BITS"
       },
