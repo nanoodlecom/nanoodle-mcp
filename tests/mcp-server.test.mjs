@@ -498,6 +498,43 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
     "Runs on NanoGPT — every call spends real credit from your API key's balance.");
 });
 
+test("tool descriptions: the first comment node leads as the tool's intent", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-intent-"));
+  const graph = (nodes, links = []) => JSON.stringify({ v: 1, nodes, links });
+  const comment = (id, text) => ({ id, type: "comment", x: 0, y: 0, fields: { text, color: "yellow" } });
+  const t = (id) => ({ id, type: "text", x: 0, y: 0, fields: { text: "x" } });
+  const llm = (id) => ({ id, type: "llm", x: 0, y: 0, fields: { model: "m" } });
+  const link = (id, from, to) => ({ id, from: { node: from[0], port: from[1] }, to: { node: to[0], port: to[1] } });
+  const wire = [link("l1", ["n1", "text"], ["n2", "prompt"])];
+  const TAIL = "Runs on NanoGPT — every call spends real credit from your API key's balance.";
+
+  // comment leads; missing terminal punctuation gets a period; comment stays out of the chain
+  await writeFile(join(dir, "commented.json"), graph([comment("c1", "Draft a tagline from a product idea"), t("n1"), llm("n2")], wire));
+  // multiline / indented text collapses to single spaces; existing "!" is kept
+  await writeFile(join(dir, "multiline.json"), graph([t("n1"), llm("n2"), comment("c1", "  Turn a\n\n  rough idea\tinto copy!  ")], wire));
+  // over 200 chars → 197 + "…", which already terminates the sentence
+  const long = "word ".repeat(50).trim(); // 249 chars
+  await writeFile(join(dir, "long.json"), graph([comment("c1", long), t("n1"), llm("n2")], wire));
+  // first comment IN ARRAY ORDER with non-empty text wins; empty ones are skipped
+  await writeFile(join(dir, "pick-first.json"), graph([comment("c0", "   "), comment("c1", "Second comment wins."), comment("c2", "Not this one."), t("n1"), llm("n2")], wire));
+  // no comment → description starts with the chain, exactly as before
+  await writeFile(join(dir, "plain.json"), graph([t("n1"), llm("n2")], wire));
+  // comment-only graph: no chain, no outputs — must not crash, intent stands alone
+  await writeFile(join(dir, "only-comment.json"), graph([comment("c1", "Just a note")]));
+
+  const reg = await loadTools({ dir, apiKey: "test-key", outDir: dir });
+  assert.deepEqual(reg.failures, []);
+  const desc = Object.fromEntries(reg.tools.map((x) => [x.name, x.description]));
+
+  assert.equal(desc.commented, `Draft a tagline from a product idea. text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc.multiline, `Turn a rough idea into copy! text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc.long, `${long.slice(0, 197)}… text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc["pick-first"], `Second comment wins. text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc.plain, `text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc["only-comment"], `Just a note. ${TAIL}`);
+});
+
 test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () => {
   const { extForMedia } = await import("../src/tools.mjs");
   const ftyp = new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0]); // ....ftypisom

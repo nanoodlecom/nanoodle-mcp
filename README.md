@@ -170,7 +170,7 @@ Every readable `*.json` graph in `--graphs` becomes one MCP tool:
 | Tool field | Derived from the graph |
 | --- | --- |
 | `name` | filename minus `.json`, sanitized to `[a-z0-9_-]` (duplicates get `-2`, `-3`, …) |
-| `description` | the graph's node chain in dependency order (e.g. `text -> llm -> image`) plus a spend warning |
+| `description` | the graph's first comment (if any), its node chain in dependency order (e.g. `text -> llm -> image`), and a spend warning |
 | `inputSchema` | one string property per unwired field, exactly like the nanoodle CLI's `inspect`; dropdown fields become `enum`s; only inputs without a baked-in default are `required` |
 | media inputs | image / audio / video inputs take a **file path or https URL** — local files ride inline as base64 |
 | result | text outputs as text blocks; media outputs saved into `--out` (default `./nanoodle-out`) with the absolute path returned; a final text block reports the run's cost |
@@ -221,6 +221,15 @@ Build and test workflows in the [nanoodle editor](https://nanoodle.com), hit
 💾, and drop the downloaded `noodle-graph.json` into your `--graphs` folder
 (rename it — the filename becomes the tool name). Restart the server (or your
 MCP client) to pick up new files.
+
+### Describing your tools
+
+The first comment node in a graph doubles as the MCP tool's description: its
+text leads the auto-derived node chain, so the calling agent reads your words
+first. Keep it to one sentence saying what the tool produces from what inputs —
+e.g. *"Renders a product mockup image from a one-line feature description."*
+Long text is truncated to 200 characters and whitespace is collapsed, so write
+for one line. Graphs without a comment just get the node chain, as before.
 
 ## Limitations
 

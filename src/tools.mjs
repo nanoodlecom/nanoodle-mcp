@@ -3,7 +3,8 @@
  *
  * Each readable noodle-graph.json in the directory becomes one tool:
  *   - name        = filename minus .json, sanitized to [a-z0-9_-]
- *   - description = node chain + output contract ("text:Idea -> llm; returns text. Runs on NanoGPT …")
+ *   - description = comment intent + node chain + output contract
+ *                   ("Draft a tagline. text:Idea -> llm; returns text. Runs on NanoGPT …")
  *   - inputSchema = JSON Schema built from the workflow's derived inputs
  *   - call(args)  = wf.run(...) with media args resolved from file paths / URLs
  *
@@ -99,6 +100,18 @@ function shortModel(model) {
 }
 
 /**
+ * The first comment node's text doubles as the tool's stated intent — the
+ * author's own words lead the description. One line, capped, sentence-final.
+ */
+function graphIntent(graph) {
+  const c = graph.nodes.find((n) => n.type === "comment" && String((n.fields || {}).text || "").trim());
+  if (!c) return "";
+  let text = String(c.fields.text).replace(/\s+/g, " ").trim();
+  if (text.length > 200) text = text.slice(0, 197) + "…";
+  return /[.!?…]$/.test(text) ? text : text + ".";
+}
+
+/**
  * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
  * size / variations, plus the on-disk contract (media never rides inline in the result).
  */
@@ -127,12 +140,14 @@ function describeOutputs(wf) {
 
 /**
  * One place assembles the whole description so it can be re-run when pieces change.
- * `intent` (graph comment) and `cost` (last observed run) are optional segments
- * wired in separately — pass them pre-rendered.
+ * `cost` (last observed run) is an optional segment wired in separately — pass it
+ * pre-rendered. A comment-only graph has no chain — the intent stands alone.
  */
-function buildDescription(wf, spendSource, { intent, cost } = {}) {
+function buildDescription(wf, spendSource, { cost } = {}) {
+  const intent = graphIntent(wf.graph);
+  const chain = typeChain(wf.graph);
   const returns = describeOutputs(wf);
-  return `${intent ? `${intent} ` : ""}${typeChain(wf.graph)}${returns ? `; ${returns}` : ""}. ` +
+  return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
     `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.`;
 }
 
