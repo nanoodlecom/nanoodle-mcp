@@ -2,6 +2,11 @@
 
 **Build a multi-model media pipeline visually at [nanoodle.com](https://nanoodle.com) — then hand the whole pipeline to your agent as ONE typed tool.**
 
+> **Skill or MCP?** Running (or designing) a *single* workflow? The
+> [nanoodle skill](https://github.com/nanoodlecom/nanoodle-skill) is one
+> command and no setup. This server is for when you've built up a *folder*
+> of saved graphs and want each one exposed to your agent as its own tool.
+
 Point this MCP stdio server at a folder of `noodle-graph.json` saves from the
 nanoodle editor and every graph becomes a callable tool with a derived input
 schema — in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, or anything
