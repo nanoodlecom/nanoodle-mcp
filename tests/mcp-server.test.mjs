@@ -123,7 +123,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     });
     assert.equal(init.error, undefined);
     assert.equal(init.result.protocolVersion, "2025-06-18");
-    assert.deepEqual(init.result.capabilities, { tools: {} });
+    assert.deepEqual(init.result.capabilities, { tools: { listChanged: true } });
     assert.equal(init.result.serverInfo.name, "nanoodle-mcp");
     assert.match(init.result.serverInfo.version, /^\d+\.\d+\.\d+/);
 
@@ -191,6 +191,16 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(chat.json.model, "test-model");
     assert.equal(chat.auth, "Bearer test-key");
     assert.deepEqual(chat.json.messages.at(-1), { role: "user", content: "say pong" });
+
+    // -- observed cost: the run's price lands in the description, a list_changed
+    //    notification (a frame with no id) tells the client to re-list, and the
+    //    sidecar persists it for the next server start
+    await srv.waitFor((m) => m.method === "notifications/tools/list_changed" && m.id === undefined);
+    const relist = await srv.request("tools/list");
+    assert.match(relist.result.tools.find((t) => t.name === "hello-noodle").description,
+      /balance; last run \$0\.0012\.$/);
+    const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
+    assert.equal(sidecar["hello-noodle"].usd, 0.0012);
 
     // -- tools/call: an author-optional input can be omitted — the run proceeds with an
     // empty value (local-only graph: text + text → join, no API traffic)
@@ -309,15 +319,19 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "poster", arguments: { Text: "x" } } }) + "\n");
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("timed out")), 15000);
+    // wait for the tools/call REPLY specifically — a list_changed notification
+    // frame lands on stdout first, so a bare line count would fire early
     child.stdout.on("data", () => {
-      if (out.split("\n").filter(Boolean).length >= 2) { clearTimeout(t); resolve(); }
+      if (out.includes('"id":2')) { clearTimeout(t); resolve(); }
     });
   });
   child.stdin.end();
   await new Promise((r) => child.once("exit", r));
   const files = await readdir(join(cwd, "nanoodle-out"));
-  assert.equal(files.length, 1);
-  assert.match(files[0], /^poster-Image-.*\.png$/);
+  assert.ok(files.includes("costs.json"), "cost sidecar should land in the out dir too");
+  const media = files.filter((f) => f !== "costs.json");
+  assert.equal(media.length, 1);
+  assert.match(media[0], /^poster-Image-.*\.png$/);
 });
 
 /* ============================= run_noodle ============================= */
@@ -365,6 +379,9 @@ test("run_noodle decodes a #g= workflow link offline and runs it with inputs", a
     assert.ok(chat, "the run should have hit the chat endpoint");
     assert.equal(chat.json.messages.at(-1).content, "say pong");
     assert.equal(chat.auth, "Bearer test-key");
+
+    // run_noodle is excluded from cost tracking — no sidecar appears
+    assert.ok(!(await readdir(outDir)).includes("costs.json"));
   } finally {
     await srv.close();
   }
@@ -533,6 +550,73 @@ test("tool descriptions: the first comment node leads as the tool's intent", asy
   assert.equal(desc["pick-first"], `Second comment wins. text -> llm; returns text. ${TAIL}`);
   assert.equal(desc.plain, `text -> llm; returns text. ${TAIL}`);
   assert.equal(desc["only-comment"], `Just a note. ${TAIL}`);
+});
+
+test("cost sidecar: a run records its price, re-renders the description, and notifies once", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-cost-"));
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-cost-out-"));
+  await writeFile(join(dir, "chat.json"), JSON.stringify({
+    v: 1,
+    nodes: [
+      { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+      { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
+    ],
+    links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
+  }));
+
+  const reg = await loadTools({ dir, apiKey: "test-key", baseUrl: apiUrl, outDir });
+  let notified = 0;
+  reg.onToolsChanged = () => notified++;
+  assert.ok(!reg.tools[0].description.includes("last run"), "no cost segment before any run");
+
+  await reg.callTool({ name: "chat", arguments: {} }); // stub charges $0.0012
+  assert.equal(notified, 1);
+  assert.match(reg.tools[0].description, /balance; last run \$0\.0012\.$/);
+  assert.match(reg.listTools().find((t) => t.name === "chat").description, /last run \$0\.0012/);
+  const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
+  assert.equal(sidecar.chat.usd, 0.0012);
+  assert.match(sidecar.chat.at, /^\d{4}-\d{2}-\d{2}T/);
+
+  // same price again → description unchanged → no second notification
+  await reg.callTool({ name: "chat", arguments: {} });
+  assert.equal(notified, 1);
+
+  // a fresh registry picks the recorded cost up at startup
+  const reg2 = await loadTools({ dir, apiKey: "test-key", baseUrl: apiUrl, outDir });
+  assert.match(reg2.tools[0].description, /last run \$0\.0012\.$/);
+});
+
+test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrupt file ignored", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-render-"));
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-render-out-"));
+  await writeFile(join(dir, "chat.json"), JSON.stringify({
+    v: 1,
+    nodes: [
+      { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+      { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "m" } },
+    ],
+    links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
+  }));
+  const load = async () => (await loadTools({ dir, apiKey: "test-key", outDir })).tools[0].description;
+  const at = "2026-07-19T00:00:00.000Z";
+  const withRec = async (rec) => {
+    await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: rec }));
+    return load();
+  };
+
+  assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\.$/);       // 0.0200 → trailing zeros trimmed
+  assert.match(await withRec({ usd: 0.1, at }), /; last run \$0\.10\.$/);        // …but never past cents
+  assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\.$/);
+  assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\.$/); // under-reported runs
+  assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\.$/); // sub-basis-point runs
+
+  // corrupt or junk sidecars are ignored, never fatal
+  await writeFile(join(outDir, "costs.json"), "{not json");
+  assert.ok(!(await load()).includes("last run"));
+  await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: { usd: "expensive", at } }));
+  assert.ok(!(await load()).includes("last run"));
 });
 
 test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () => {

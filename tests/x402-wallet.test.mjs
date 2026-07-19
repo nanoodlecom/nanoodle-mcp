@@ -7,6 +7,8 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock } from "nanocurrency";
@@ -339,7 +341,8 @@ after(() => Promise.all([
 test("E2E: keyless server pays a 402 invoice from NANO_SEED and returns the result", async () => {
   const env = { ...process.env, NANOGPT_BASE_URL: apiUrl, NANO_SEED: SEED, NANO_RPC_URL: nanoRpcUrl };
   delete env.NANOGPT_API_KEY;
-  const child = spawn(process.execPath, [BIN, "--graphs", FIXTURES, "--max-usd", "1"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-x402-out-")); // keeps the cost sidecar out of the repo's ./nanoodle-out
+  const child = spawn(process.execPath, [BIN, "--graphs", FIXTURES, "--out", outDir, "--max-usd", "1"], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "", stderr = "";
   child.stdout.setEncoding("utf8"); child.stdout.on("data", (c) => { stdout += c; });
   child.stderr.setEncoding("utf8"); child.stderr.on("data", (c) => { stderr += c; });
@@ -350,8 +353,10 @@ test("E2E: keyless server pays a 402 invoice from NANO_SEED and returns the resu
     send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "hello-noodle", arguments: { Idea: "say pong" } } });
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("timed out; stderr:\n" + stderr)), 20000);
+      // wait for the tools/call REPLY specifically — the cost's list_changed
+      // notification frame arrives first, so a bare line count would fire early
       child.stdout.on("data", () => {
-        if (stdout.split("\n").filter(Boolean).length >= 3) { clearTimeout(t); resolve(); }
+        if (stdout.includes('"id":3')) { clearTimeout(t); resolve(); }
       });
     });
     const frames = stdout.split("\n").filter(Boolean).map((l) => JSON.parse(l));

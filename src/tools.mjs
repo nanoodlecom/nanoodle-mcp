@@ -3,7 +3,7 @@
  *
  * Each readable noodle-graph.json in the directory becomes one tool:
  *   - name        = filename minus .json, sanitized to [a-z0-9_-]
- *   - description = comment intent + node chain + output contract
+ *   - description = comment intent + node chain + output contract + last observed cost
  *                   ("Draft a tagline. text:Idea -> llm; returns text. Runs on NanoGPT …")
  *   - inputSchema = JSON Schema built from the workflow's derived inputs
  *   - call(args)  = wf.run(...) with media args resolved from file paths / URLs
@@ -149,6 +149,18 @@ function buildDescription(wf, spendSource, { cost } = {}) {
   const returns = describeOutputs(wf);
   return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
     `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.`;
+}
+
+/**
+ * "last run $X" from the cost sidecar record — the only description segment that
+ * changes at runtime. Trailing zeros trimmed but never past cents; a run whose
+ * calls didn't all report a price renders "+" (it cost at least X).
+ */
+function renderCost(rec) {
+  if (!rec || typeof rec.usd !== "number" || !Number.isFinite(rec.usd)) return "";
+  if (rec.usd < 0.0001) return "last run <$0.0001";
+  const usd = rec.usd.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
+  return `last run $${usd}${rec.exact === false ? "+" : ""}`;
 }
 
 /** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
@@ -376,6 +388,13 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
 export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
+  // Last-observed-cost sidecar: purely informational, so it must never block startup.
+  const costsPath = join(outDir, "costs.json");
+  let costs = {};
+  try {
+    const parsed = JSON.parse(await readFile(costsPath, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) costs = parsed;
+  } catch { /* missing or corrupt → no cost segments yet */ }
   let entries;
   try {
     entries = await readdir(dir);
@@ -410,16 +429,37 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
       name,
       file,
       wf,
-      description: buildDescription(wf, spendSource),
+      description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
       inputSchema: buildInputSchema(wf),
     });
   }
 
   const byName = new Map(tools.map((t) => [t.name, t]));
 
-  return {
+  /** Record a run's observed cost and refresh the tool's description. Best-effort — never throws. */
+  async function recordCost(tool, result) {
+    if (typeof result.costUsd !== "number" || !Number.isFinite(result.costUsd)) return;
+    const rec = { usd: result.costUsd, at: new Date().toISOString() };
+    if (result.costExact === false) rec.exact = false; // renders "$X+"
+    costs[tool.name] = rec;
+    try {
+      await mkdir(outDir, { recursive: true });
+      await writeFile(costsPath, JSON.stringify(costs, null, 2) + "\n");
+    } catch (e) {
+      console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
+    }
+    const description = buildDescription(tool.wf, spendSource, { cost: renderCost(rec) });
+    if (description !== tool.description) {
+      tool.description = description;
+      if (registry.onToolsChanged) registry.onToolsChanged();
+    }
+  }
+
+  const registry = {
     tools,
     failures,
+    /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
+    onToolsChanged: null,
 
     listTools() {
       // run_noodle is always available, alongside one tool per saved graph.
@@ -450,7 +490,9 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const result = await tool.wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
+      await recordCost(tool, result); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir);
     },
   };
+  return registry;
 }

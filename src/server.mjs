@@ -2,7 +2,7 @@
  * Minimal MCP stdio server — newline-delimited JSON-RPC 2.0, zero dependencies.
  *
  * Protocol surface (the whole point is that this file is small enough to read):
- *   initialize                → protocolVersion + capabilities.tools + serverInfo
+ *   initialize                → protocolVersion + capabilities.tools (listChanged) + serverInfo
  *   notifications/initialized → no response (notifications never get one)
  *   ping                      → {}
  *   tools/list                → tools from the registry
@@ -58,7 +58,7 @@ export function serveMcp({
         const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : LATEST_PROTOCOL_VERSION;
         return reply(id, {
           protocolVersion,
-          capabilities: { tools: {} },
+          capabilities: { tools: { listChanged: true } },
           serverInfo: { name, version },
         });
       }
@@ -102,4 +102,10 @@ export function serveMcp({
     }
   });
   input.on("end", onClose);
+
+  // Tool descriptions can change mid-session (observed costs) — the host pushes
+  // notifications/tools/list_changed through this. Notifications carry no id.
+  return {
+    notify: (method, params) => write({ jsonrpc: "2.0", method, ...(params !== undefined ? { params } : {}) }),
+  };
 }
