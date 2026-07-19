@@ -10,7 +10,7 @@
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
-import { readdir, readFile, mkdir } from "node:fs/promises";
+import { readdir, readFile, mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
@@ -27,6 +27,23 @@ const MIME_EXT = {
 };
 function extForMime(mime) {
   return MIME_EXT[String(mime || "").split(";")[0].trim().toLowerCase()] || "bin";
+}
+
+/** Extension from mime, falling back to magic bytes — hosted media often arrives as octet-stream. */
+export function extForMedia(bytes, mime) {
+  const byMime = extForMime(mime);
+  if (byMime !== "bin") return byMime;
+  const b = bytes || [];
+  const ascii = (o, n) => String.fromCharCode(...Array.from(b.slice(o, o + n)));
+  if (b.length > 12 && ascii(4, 4) === "ftyp") return "mp4";
+  if (ascii(0, 4) === "RIFF") return ascii(8, 4) === "WAVE" ? "wav" : ascii(8, 4) === "WEBP" ? "webp" : "bin";
+  if (b[0] === 0x89 && ascii(1, 3) === "PNG") return "png";
+  if (b[0] === 0xff && b[1] === 0xd8) return "jpg";
+  if (ascii(0, 4) === "GIF8") return "gif";
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return "webm";
+  if (ascii(0, 4) === "OggS") return "ogg";
+  if (ascii(0, 3) === "ID3") return "mp3";
+  return "bin";
 }
 
 /** Error the server maps to JSON-RPC -32602 (invalid params) instead of a tool-result error. */
@@ -208,9 +225,11 @@ async function emitResult(wf, result, prefix, outDir) {
     if (value === undefined) continue;
     if (value instanceof MediaRef) {
       await mkdir(outDir, { recursive: true });
+      // bytes() before naming: for hosted media the mime is only known after the fetch
+      const bytes = await value.bytes();
       const safeKey = o.key.replace(/[^\w.-]+/g, "_");
-      const path = resolve(outDir, `${prefix}-${safeKey}-${Date.now()}-${++saveSeq}.${extForMime(value.mime)}`);
-      await value.save(path);
+      const path = resolve(outDir, `${prefix}-${safeKey}-${Date.now()}-${++saveSeq}.${extForMedia(bytes, value.mime)}`);
+      await writeFile(path, bytes);
       content.push({ type: "text", text: `${o.key}: saved ${path}` });
     } else {
       content.push({ type: "text", text: String(value) });
