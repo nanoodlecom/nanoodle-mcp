@@ -1,3 +1,6 @@
 node_modules/
 nanoodle-out/
 .env
+.agents/
+.claude/
+skills-lock.json
