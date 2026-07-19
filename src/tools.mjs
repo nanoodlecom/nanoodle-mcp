@@ -86,6 +86,18 @@ function schemaKey(key) {
   return safe || "input";
 }
 
+/**
+ * Author-marked optional node (the editor's "optional input" checkbox, saved as
+ * fields.optional). Read off the graph itself so it holds even when the installed
+ * nanoodle library predates optional-aware deriveInputs (< 0.6.0).
+ */
+function authorOptional(wf, inp) {
+  const nodes = (wf.graph && wf.graph.nodes) || [];
+  const n = nodes.find((x) => x.id === inp.nodeId);
+  const v = n && n.fields && n.fields.optional;
+  return v === true || v === "true";
+}
+
 /** Derived inputs paired with schema-safe keys ("System prompt" → "System_prompt"), deduped. */
 function keyedInputs(wf) {
   const used = new Map();
@@ -94,14 +106,18 @@ function keyedInputs(wf) {
     const count = (used.get(safe) || 0) + 1;
     used.set(safe, count);
     if (count > 1) safe = `${safe.slice(0, 61)}_${count}`;
-    return { inp, safe, hasDef: inp.def != null && String(inp.def) !== "" };
+    return {
+      inp, safe,
+      optional: !!inp.optional || authorOptional(wf, inp),
+      hasDef: inp.def != null && String(inp.def) !== "",
+    };
   });
 }
 
 function buildInputSchema(wf) {
   const properties = {};
   const required = [];
-  for (const { inp, safe, hasDef } of keyedInputs(wf)) {
+  for (const { inp, safe, optional, hasDef } of keyedInputs(wf)) {
     const prop = { type: "string" };
     const bits = [];
     if (MEDIA_KINDS.has(inp.kind)) bits.push(`${inp.kind === "inpaint" ? "image" : inp.kind} — file path or https URL`);
@@ -112,11 +128,17 @@ function buildInputSchema(wf) {
       const d = String(inp.def);
       bits.push(`default: ${JSON.stringify(d.length > 120 ? d.slice(0, 117) + "..." : d)}`);
     }
+    // A non-optional input with a baked-in default still runs when omitted (the library
+    // backfills it), so only inputs that would actually fail are marked required — and
+    // starred, so the designation survives clients that don't render `required`.
+    if (!optional && !hasDef) {
+      required.push(safe);
+      bits.unshift("* required");
+    } else {
+      bits.push("optional");
+    }
     if (bits.length) prop.description = bits.join("; ");
     properties[safe] = prop;
-    // A non-optional input with a baked-in default still runs when omitted (the library
-    // backfills it), so only inputs that would actually fail are marked required.
-    if (!inp.optional && !hasDef) required.push(safe);
   }
   return { type: "object", properties, ...(required.length ? { required } : {}) };
 }
@@ -188,7 +210,7 @@ async function resolveInputs(wf, args, label) {
       inputs[entry.key] = v;
     }
   }
-  const missing = keyed.filter(({ inp, hasDef }) => !inp.optional && !hasDef && inputs[inp.key] === undefined);
+  const missing = keyed.filter(({ inp, optional, hasDef }) => !optional && !hasDef && inputs[inp.key] === undefined);
   if (missing.length) {
     throw new ParamsError(`missing required input${missing.length > 1 ? "s" : ""} for ${label}: ${missing.map(({ safe }) => `"${safe}"`).join(", ")}`);
   }

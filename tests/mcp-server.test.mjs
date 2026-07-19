@@ -136,7 +136,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(srv.messages.length, framesBefore + 1, "notifications/initialized must not be answered");
     const tools = list.result.tools;
     // one tool per fixture graph, plus the always-present run_noodle share-link tool
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["hello-noodle", "poster", "restyle", "run_noodle"]);
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "poster", "restyle", "run_noodle"]);
 
     // media-typed input advertises "file path or https URL"
     const restyle = tools.find((t) => t.name === "restyle");
@@ -154,6 +154,18 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.ok(hello.inputSchema.properties.System_prompt);
     assert.match(hello.inputSchema.properties.System_prompt.description, /System prompt/);
     assert.deepEqual(hello.inputSchema.required, ["Idea"]);
+    // required inputs carry a leading "*" designation so the flag survives clients
+    // that don't render the schema's `required` array
+    assert.match(hello.inputSchema.properties.Idea.description, /^\* required/);
+    assert.match(hello.inputSchema.properties.System_prompt.description, /optional/);
+
+    // author-marked optional (fields.optional on the node): out of `required`,
+    // described as optional, and still keyed by the node's custom name
+    const card = tools.find((t) => t.name === "greeting-card");
+    assert.deepEqual(card.inputSchema.required, ["Greeting"]);
+    assert.match(card.inputSchema.properties.Greeting.description, /^\* required/);
+    assert.match(card.inputSchema.properties.Postscript.description, /optional/);
+    assert.doesNotMatch(card.inputSchema.properties.Postscript.description, /required/);
     // no advertised property key may violate the client-enforced pattern
     for (const t of tools) {
       for (const key of Object.keys(t.inputSchema.properties)) {
@@ -175,6 +187,16 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(chat.json.model, "test-model");
     assert.equal(chat.auth, "Bearer test-key");
     assert.deepEqual(chat.json.messages.at(-1), { role: "user", content: "say pong" });
+
+    // -- tools/call: an author-optional input can be omitted — the run proceeds with an
+    // empty value (local-only graph: text + text → join, no API traffic)
+    const cardCall = await srv.request("tools/call", { name: "greeting-card", arguments: { Greeting: "happy launch day" } });
+    assert.ok(!cardCall.result.isError, "omitting an optional input should run: " + JSON.stringify(cardCall.result));
+    assert.equal(cardCall.result.content[0].text, "happy launch day"); // join drops the empty optional part
+    // …while omitting the REQUIRED input is still an invalid-params error
+    const cardMissing = await srv.request("tools/call", { name: "greeting-card", arguments: {} });
+    assert.equal(cardMissing.error.code, -32602);
+    assert.match(cardMissing.error.message, /missing required input.*"Greeting"/);
 
     // -- tools/call (media output): image saved into --out, absolute path returned
     const poster = await srv.request("tools/call", { name: "poster", arguments: { Text: "a lighthouse" } });
