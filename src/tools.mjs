@@ -3,14 +3,15 @@
  *
  * Each readable noodle-graph.json in the directory becomes one tool:
  *   - name        = filename minus .json, sanitized to [a-z0-9_-]
- *   - description = the graph's node-type chain ("text -> llm -> image; runs on NanoGPT …")
+ *   - description = comment intent + node chain + output contract + last observed cost
+ *                   ("Draft a tagline. text:Idea -> llm; returns text. Runs on NanoGPT …")
  *   - inputSchema = JSON Schema built from the workflow's derived inputs
  *   - call(args)  = wf.run(...) with media args resolved from file paths / URLs
  *
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
-import { readdir, readFile, mkdir, writeFile } from "node:fs/promises";
+import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
@@ -57,7 +58,13 @@ function sanitizeName(file) {
   return name || "graph";
 }
 
-/** Node-type chain in dependency order (local Kahn sort — keeps us on the library's public API). */
+/** Chain label for one node: bare type, or type:Name when the author named it. */
+function nodeLabel(n) {
+  const name = typeof n.name === "string" ? n.name.trim() : "";
+  return name ? `${n.type}:${name}` : n.type;
+}
+
+/** Node-label chain in dependency order (local Kahn sort — keeps us on the library's public API). */
 function typeChain(graph) {
   const indeg = new Map(graph.nodes.map((n) => [n.id, 0]));
   const out = new Map(graph.nodes.map((n) => [n.id, []]));
@@ -77,7 +84,96 @@ function typeChain(graph) {
     }
   }
   const nodes = order.length === graph.nodes.length ? order : graph.nodes; // cyclic → raw order
-  return nodes.filter((n) => n.type !== "comment").map((n) => n.type).join(" -> ");
+  // Adjacent identical labels collapse to label×N — named nodes rarely collapse (labels differ).
+  const runs = [];
+  for (const label of nodes.filter((n) => n.type !== "comment").map(nodeLabel)) {
+    const last = runs[runs.length - 1];
+    if (last && last.label === label) last.n++;
+    else runs.push({ label, n: 1 });
+  }
+  return runs.map((r) => (r.n > 1 ? `${r.label}×${r.n}` : r.label)).join(" -> ");
+}
+
+/**
+ * "org/model" → "model": the org prefix is noise in a one-line description.
+ * Only the first segment goes — deeper paths like "org/model/variant" keep
+ * "model/variant", where the tail alone would be generic.
+ */
+function shortModel(model) {
+  const segs = String(model).split("/");
+  return segs.length > 1 ? segs.slice(1).join("/") : segs[0];
+}
+
+/**
+ * The first comment node's text doubles as the tool's stated intent — the
+ * author's own words lead the description. One line, capped, sentence-final.
+ */
+function graphIntent(graph) {
+  const c = graph.nodes.find((n) => n.type === "comment" && String((n.fields || {}).text || "").trim());
+  if (!c) return "";
+  let text = String(c.fields.text).replace(/\s+/g, " ").trim();
+  if (text.length > 200) {
+    let cut = text.slice(0, 197);
+    // A cut landing mid-surrogate-pair leaves a lone surrogate — strict-UTF-8 JSON
+    // parsers (Rust MCP clients) then reject the whole tools/list response.
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    text = cut + "…";
+  }
+  return /[.!?…]$/.test(text) ? text : text + ".";
+}
+
+/**
+ * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
+ * size, plus the on-disk contract (media never rides inline in the result).
+ * One file per media sink — the run keeps only a sink's primary output, so
+ * variations never multiply what the caller receives.
+ */
+function describeOutputs(wf) {
+  const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
+  let mediaFiles = 0;
+  const parts = wf.outputs.map((o) => {
+    const kind = (o.ports && o.ports[0] && o.ports[0].type) || o.type; // odd types may declare no ports
+    if (kind === "text") return "text";
+    const f = (byId.get(o.nodeId) || {}).fields || {};
+    const details = [];
+    if (f.model) details.push(shortModel(f.model));
+    if (kind === "image" && f.size && f.size !== "auto") details.push(String(f.size).replace("x", "×"));
+    mediaFiles += 1;
+    return `${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
+  });
+  if (!parts.length) return "";
+  const joined = parts.join(" + ");
+  if (!mediaFiles) return `returns ${joined}`;
+  const pathNote = `(file path${mediaFiles > 1 ? "s" : ""} in result)`;
+  return parts.every((p) => p !== "text")
+    ? `returns ${joined} saved to disk ${pathNote}`
+    : `returns ${joined}; media saved to disk ${pathNote}`;
+}
+
+/**
+ * One place assembles the whole description so it can be re-run when pieces change.
+ * `cost` (last observed run) is an optional segment wired in separately — pass it
+ * pre-rendered. A comment-only graph has no chain — the intent stands alone.
+ */
+function buildDescription(wf, spendSource, { cost } = {}) {
+  const intent = graphIntent(wf.graph);
+  const chain = typeChain(wf.graph);
+  const returns = describeOutputs(wf);
+  return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
+    `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.`;
+}
+
+/**
+ * "last run $X" from the cost sidecar record — the only description segment that
+ * changes at runtime. Trailing zeros trimmed but never past cents; a run whose
+ * calls didn't all report a price renders "+" (it cost at least X) — that rules
+ * out the "<$0.0001" claim too, since the recorded figure is only a floor.
+ */
+function renderCost(rec) {
+  if (!rec || typeof rec.usd !== "number" || !Number.isFinite(rec.usd)) return "";
+  if (rec.usd < 0.0001 && rec.exact !== false) return "last run <$0.0001";
+  const usd = rec.usd.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
+  return `last run $${usd}${rec.exact === false ? "+" : ""}`;
 }
 
 /** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
@@ -305,6 +401,13 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
 export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
+  // Last-observed-cost sidecar: purely informational, so it must never block startup.
+  const costsPath = join(outDir, "costs.json");
+  let costs = {};
+  try {
+    const parsed = JSON.parse(await readFile(costsPath, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) costs = parsed;
+  } catch { /* missing or corrupt → no cost segments yet */ }
   let entries;
   try {
     entries = await readdir(dir);
@@ -339,16 +442,41 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
       name,
       file,
       wf,
-      description: `${typeChain(wf.graph)}; runs on NanoGPT — every call spends real credit from ${spendSource}`,
+      description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
       inputSchema: buildInputSchema(wf),
     });
   }
 
   const byName = new Map(tools.map((t) => [t.name, t]));
 
-  return {
+  /** Record a run's observed cost and refresh the tool's description. Best-effort — never throws. */
+  async function recordCost(tool, result) {
+    if (typeof result.costUsd !== "number" || !Number.isFinite(result.costUsd)) return;
+    const rec = { usd: result.costUsd, at: new Date().toISOString() };
+    if (result.costExact === false) rec.exact = false; // renders "$X+"
+    costs[tool.name] = rec;
+    try {
+      await mkdir(outDir, { recursive: true });
+      // write-then-rename: overlapping runs may record concurrently, and two
+      // writeFile calls on the same path can interleave — rename is atomic.
+      const tmp = `${costsPath}.${++saveSeq}.tmp`;
+      await writeFile(tmp, JSON.stringify(costs, null, 2) + "\n");
+      await rename(tmp, costsPath);
+    } catch (e) {
+      console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
+    }
+    const description = buildDescription(tool.wf, spendSource, { cost: renderCost(rec) });
+    if (description !== tool.description) {
+      tool.description = description;
+      if (registry.onToolsChanged) registry.onToolsChanged();
+    }
+  }
+
+  const registry = {
     tools,
     failures,
+    /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
+    onToolsChanged: null,
 
     listTools() {
       // run_noodle is always available, alongside one tool per saved graph.
@@ -379,7 +507,9 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const result = await tool.wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
+      await recordCost(tool, result); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir);
     },
   };
+  return registry;
 }

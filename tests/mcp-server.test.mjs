@@ -123,7 +123,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     });
     assert.equal(init.error, undefined);
     assert.equal(init.result.protocolVersion, "2025-06-18");
-    assert.deepEqual(init.result.capabilities, { tools: {} });
+    assert.deepEqual(init.result.capabilities, { tools: { listChanged: true } });
     assert.equal(init.result.serverInfo.name, "nanoodle-mcp");
     assert.match(init.result.serverInfo.version, /^\d+\.\d+\.\d+/);
 
@@ -143,8 +143,12 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.match(restyle.inputSchema.properties.Image.description, /file path or https URL/);
 
     const hello = tools.find((t) => t.name === "hello-noodle");
-    assert.match(hello.description, /text -> llm/);
+    // named text node annotates the chain; text-only graph advertises "returns text"
+    assert.match(hello.description, /text:Idea -> llm; returns text\./);
     assert.match(hello.description, /NanoGPT/);
+    // media sink: model in the parenthetical + the saved-to-disk contract
+    const posterTool = tools.find((t) => t.name === "poster");
+    assert.match(posterTool.description, /returns image \(test-image-model\) saved to disk \(file path in result\)/);
     assert.equal(hello.inputSchema.type, "object");
     // text node is named "Idea" and is the node's only required input → key "Idea"
     assert.equal(hello.inputSchema.properties.Idea.type, "string");
@@ -187,6 +191,16 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(chat.json.model, "test-model");
     assert.equal(chat.auth, "Bearer test-key");
     assert.deepEqual(chat.json.messages.at(-1), { role: "user", content: "say pong" });
+
+    // -- observed cost: the run's price lands in the description, a list_changed
+    //    notification (a frame with no id) tells the client to re-list, and the
+    //    sidecar persists it for the next server start
+    await srv.waitFor((m) => m.method === "notifications/tools/list_changed" && m.id === undefined);
+    const relist = await srv.request("tools/list");
+    assert.match(relist.result.tools.find((t) => t.name === "hello-noodle").description,
+      /balance; last run \$0\.0012\.$/);
+    const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
+    assert.equal(sidecar["hello-noodle"].usd, 0.0012);
 
     // -- tools/call: an author-optional input can be omitted — the run proceeds with an
     // empty value (local-only graph: text + text → join, no API traffic)
@@ -305,15 +319,19 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "poster", arguments: { Text: "x" } } }) + "\n");
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("timed out")), 15000);
+    // wait for the tools/call REPLY specifically — a list_changed notification
+    // frame lands on stdout first, so a bare line count would fire early
     child.stdout.on("data", () => {
-      if (out.split("\n").filter(Boolean).length >= 2) { clearTimeout(t); resolve(); }
+      if (out.includes('"id":2')) { clearTimeout(t); resolve(); }
     });
   });
   child.stdin.end();
   await new Promise((r) => child.once("exit", r));
   const files = await readdir(join(cwd, "nanoodle-out"));
-  assert.equal(files.length, 1);
-  assert.match(files[0], /^poster-Image-.*\.png$/);
+  assert.ok(files.includes("costs.json"), "cost sidecar should land in the out dir too");
+  const media = files.filter((f) => f !== "costs.json");
+  assert.equal(media.length, 1);
+  assert.match(media[0], /^poster-Image-.*\.png$/);
 });
 
 /* ============================= run_noodle ============================= */
@@ -361,6 +379,9 @@ test("run_noodle decodes a #g= workflow link offline and runs it with inputs", a
     assert.ok(chat, "the run should have hit the chat endpoint");
     assert.equal(chat.json.messages.at(-1).content, "say pong");
     assert.equal(chat.auth, "Bearer test-key");
+
+    // run_noodle is excluded from cost tracking — no sidecar appears
+    assert.ok(!(await readdir(outDir)).includes("costs.json"));
   } finally {
     await srv.close();
   }
@@ -438,6 +459,172 @@ test("describeRunFailure: leads with the root-cause node, lists the cascade", as
   // all errors are cascades (shouldn't happen, but never fabricate a root) → untouched
   const odd = Object.assign(new Error("x"), { result: { errors: [{ nodeId: "a", name: "A", message: "upstream failed: B" }] } });
   assert.equal(describeRunFailure(odd), odd);
+});
+
+test("tool descriptions: chain annotations, ×N collapsing, and the returns contract", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-desc-"));
+  const graph = (nodes, links) => JSON.stringify({ v: 1, nodes, links });
+  const t = (id, name, extra) => ({ id, type: "text", x: 0, y: 0, ...(name ? { name } : {}), fields: { text: "x" }, ...extra });
+  const link = (id, from, to) => ({ id, from: { node: from[0], port: from[1] }, to: { node: to[0], port: to[1] } });
+
+  // named nodes (incl. a name with a space) + org-prefixed model + explicit size
+  await writeFile(join(dir, "named.json"), graph(
+    [
+      t("n1", "Feature"),
+      t("n2", "Style guide"),
+      { id: "n3", type: "join", x: 0, y: 0, fields: {} },
+      { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
+      { id: "n5", type: "image", x: 0, y: 0, name: "Mockup", fields: { model: "openai/nano-banana-2-lite", size: "1024x1024" } },
+    ],
+    [
+      link("l1", ["n1", "text"], ["n3", "a"]),
+      link("l2", ["n2", "text"], ["n3", "b"]),
+      link("l3", ["n3", "text"], ["n4", "prompt"]),
+      link("l4", ["n4", "text"], ["n5", "prompt"]),
+    ]));
+  // adjacent unnamed twins collapse to ×2
+  await writeFile(join(dir, "collapse.json"), graph(
+    [t("n1"), t("n2"), { id: "n3", type: "join", x: 0, y: 0, fields: {} }, { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "m" } }],
+    [link("l1", ["n1", "text"], ["n3", "a"]), link("l2", ["n2", "text"], ["n3", "b"]), link("l3", ["n3", "text"], ["n4", "prompt"])]));
+  // variations never multiply the contract (the run keeps one file per sink); size "auto" stays out of the parenthetical
+  await writeFile(join(dir, "variants.json"), graph(
+    [t("n1"), { id: "n2", type: "image", x: 0, y: 0, fields: { model: "test-img", size: "auto", variations: "3" } }],
+    [link("l1", ["n1", "text"], ["n2", "prompt"])]));
+  // mixed text + media sinks → media-only disk note
+  await writeFile(join(dir, "mixed.json"), graph(
+    [t("n1"), { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "m" } }, { id: "n3", type: "image", x: 0, y: 0, fields: { model: "img-model" } }],
+    [link("l1", ["n1", "text"], ["n2", "prompt"]), link("l2", ["n1", "text"], ["n3", "prompt"])]));
+
+  const reg = await loadTools({ dir, apiKey: "test-key", outDir: dir });
+  assert.deepEqual(reg.failures, []);
+  const desc = Object.fromEntries(reg.tools.map((x) => [x.name, x.description]));
+
+  assert.equal(desc.named,
+    "text:Feature -> text:Style guide -> join -> llm -> image:Mockup; " +
+    "returns image (nano-banana-2-lite, 1024×1024) saved to disk (file path in result). " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+  assert.equal(desc.collapse,
+    "text×2 -> join -> llm; returns text. " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+  assert.equal(desc.variants,
+    "text -> image; returns image (test-img) saved to disk (file path in result). " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+  assert.equal(desc.mixed,
+    "text -> llm -> image; returns text + image (img-model); media saved to disk (file path in result). " +
+    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+});
+
+test("tool descriptions: the first comment node leads as the tool's intent", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-intent-"));
+  const graph = (nodes, links = []) => JSON.stringify({ v: 1, nodes, links });
+  const comment = (id, text) => ({ id, type: "comment", x: 0, y: 0, fields: { text, color: "yellow" } });
+  const t = (id) => ({ id, type: "text", x: 0, y: 0, fields: { text: "x" } });
+  const llm = (id) => ({ id, type: "llm", x: 0, y: 0, fields: { model: "m" } });
+  const link = (id, from, to) => ({ id, from: { node: from[0], port: from[1] }, to: { node: to[0], port: to[1] } });
+  const wire = [link("l1", ["n1", "text"], ["n2", "prompt"])];
+  const TAIL = "Runs on NanoGPT — every call spends real credit from your API key's balance.";
+
+  // comment leads; missing terminal punctuation gets a period; comment stays out of the chain
+  await writeFile(join(dir, "commented.json"), graph([comment("c1", "Draft a tagline from a product idea"), t("n1"), llm("n2")], wire));
+  // multiline / indented text collapses to single spaces; existing "!" is kept
+  await writeFile(join(dir, "multiline.json"), graph([t("n1"), llm("n2"), comment("c1", "  Turn a\n\n  rough idea\tinto copy!  ")], wire));
+  // over 200 chars → 197 + "…", which already terminates the sentence
+  const long = "word ".repeat(50).trim(); // 249 chars
+  await writeFile(join(dir, "long.json"), graph([comment("c1", long), t("n1"), llm("n2")], wire));
+  // astral char straddling index 197: the cut must not leave a lone surrogate
+  const emojiLong = "x".repeat(196) + "🦆".repeat(10); // 🦆 spans UTF-16 units 196–197
+  await writeFile(join(dir, "emoji-long.json"), graph([comment("c1", emojiLong), t("n1"), llm("n2")], wire));
+  // first comment IN ARRAY ORDER with non-empty text wins; empty ones are skipped
+  await writeFile(join(dir, "pick-first.json"), graph([comment("c0", "   "), comment("c1", "Second comment wins."), comment("c2", "Not this one."), t("n1"), llm("n2")], wire));
+  // no comment → description starts with the chain, exactly as before
+  await writeFile(join(dir, "plain.json"), graph([t("n1"), llm("n2")], wire));
+  // comment-only graph: no chain, no outputs — must not crash, intent stands alone
+  await writeFile(join(dir, "only-comment.json"), graph([comment("c1", "Just a note")]));
+
+  const reg = await loadTools({ dir, apiKey: "test-key", outDir: dir });
+  assert.deepEqual(reg.failures, []);
+  const desc = Object.fromEntries(reg.tools.map((x) => [x.name, x.description]));
+
+  assert.equal(desc.commented, `Draft a tagline from a product idea. text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc.multiline, `Turn a rough idea into copy! text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc.long, `${long.slice(0, 197)}… text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc["emoji-long"], `${"x".repeat(196)}… text -> llm; returns text. ${TAIL}`);
+  assert.ok(desc["emoji-long"].isWellFormed());
+  assert.equal(desc["pick-first"], `Second comment wins. text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc.plain, `text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc["only-comment"], `Just a note. ${TAIL}`);
+});
+
+test("cost sidecar: a run records its price, re-renders the description, and notifies once", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-cost-"));
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-cost-out-"));
+  await writeFile(join(dir, "chat.json"), JSON.stringify({
+    v: 1,
+    nodes: [
+      { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+      { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
+    ],
+    links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
+  }));
+
+  const reg = await loadTools({ dir, apiKey: "test-key", baseUrl: apiUrl, outDir });
+  let notified = 0;
+  reg.onToolsChanged = () => notified++;
+  assert.ok(!reg.tools[0].description.includes("last run"), "no cost segment before any run");
+
+  await reg.callTool({ name: "chat", arguments: {} }); // stub charges $0.0012
+  assert.equal(notified, 1);
+  assert.match(reg.tools[0].description, /balance; last run \$0\.0012\.$/);
+  assert.match(reg.listTools().find((t) => t.name === "chat").description, /last run \$0\.0012/);
+  const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
+  assert.equal(sidecar.chat.usd, 0.0012);
+  assert.match(sidecar.chat.at, /^\d{4}-\d{2}-\d{2}T/);
+
+  // same price again → description unchanged → no second notification
+  await reg.callTool({ name: "chat", arguments: {} });
+  assert.equal(notified, 1);
+
+  // a fresh registry picks the recorded cost up at startup
+  const reg2 = await loadTools({ dir, apiKey: "test-key", baseUrl: apiUrl, outDir });
+  assert.match(reg2.tools[0].description, /last run \$0\.0012\.$/);
+});
+
+test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrupt file ignored", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-render-"));
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-render-out-"));
+  await writeFile(join(dir, "chat.json"), JSON.stringify({
+    v: 1,
+    nodes: [
+      { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+      { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "m" } },
+    ],
+    links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
+  }));
+  const load = async () => (await loadTools({ dir, apiKey: "test-key", outDir })).tools[0].description;
+  const at = "2026-07-19T00:00:00.000Z";
+  const withRec = async (rec) => {
+    await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: rec }));
+    return load();
+  };
+
+  assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\.$/);       // 0.0200 → trailing zeros trimmed
+  assert.match(await withRec({ usd: 0.1, at }), /; last run \$0\.10\.$/);        // …but never past cents
+  assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\.$/);
+  assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\.$/); // under-reported runs
+  assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\.$/); // sub-basis-point runs
+  // inexact figures are floors — "<$0.0001" would overclaim, so the "+" form wins
+  assert.match(await withRec({ usd: 0.00005, at, exact: false }), /; last run \$0\.0001\+\.$/);
+  assert.match(await withRec({ usd: 0, at, exact: false }), /; last run \$0\.00\+\.$/); // all calls unpriced
+
+  // corrupt or junk sidecars are ignored, never fatal
+  await writeFile(join(outDir, "costs.json"), "{not json");
+  assert.ok(!(await load()).includes("last run"));
+  await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: { usd: "expensive", at } }));
+  assert.ok(!(await load()).includes("last run"));
 });
 
 test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () => {

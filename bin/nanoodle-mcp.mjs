@@ -155,12 +155,14 @@ async function main() {
   for (const t of registry.tools) console.error(`  - ${t.name} (${t.file}): ${t.description}`);
   console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
 
-  serveMcp({
+  const srv = serveMcp({
     name: "nanoodle-mcp",
     version: pkg.version,
     listTools: () => registry.listTools(),
     callTool: (params) => registry.callTool(params),
   });
+  // A run's observed cost lands in the tool's description — tell the client to re-list.
+  registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
