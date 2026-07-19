@@ -107,7 +107,13 @@ function graphIntent(graph) {
   const c = graph.nodes.find((n) => n.type === "comment" && String((n.fields || {}).text || "").trim());
   if (!c) return "";
   let text = String(c.fields.text).replace(/\s+/g, " ").trim();
-  if (text.length > 200) text = text.slice(0, 197) + "…";
+  if (text.length > 200) {
+    let cut = text.slice(0, 197);
+    // A cut landing mid-surrogate-pair leaves a lone surrogate — strict-UTF-8 JSON
+    // parsers (Rust MCP clients) then reject the whole tools/list response.
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    text = cut + "…";
+  }
   return /[.!?…]$/.test(text) ? text : text + ".";
 }
 

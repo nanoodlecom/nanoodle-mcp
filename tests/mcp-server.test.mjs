@@ -533,6 +533,9 @@ test("tool descriptions: the first comment node leads as the tool's intent", asy
   // over 200 chars → 197 + "…", which already terminates the sentence
   const long = "word ".repeat(50).trim(); // 249 chars
   await writeFile(join(dir, "long.json"), graph([comment("c1", long), t("n1"), llm("n2")], wire));
+  // astral char straddling index 197: the cut must not leave a lone surrogate
+  const emojiLong = "x".repeat(196) + "🦆".repeat(10); // 🦆 spans UTF-16 units 196–197
+  await writeFile(join(dir, "emoji-long.json"), graph([comment("c1", emojiLong), t("n1"), llm("n2")], wire));
   // first comment IN ARRAY ORDER with non-empty text wins; empty ones are skipped
   await writeFile(join(dir, "pick-first.json"), graph([comment("c0", "   "), comment("c1", "Second comment wins."), comment("c2", "Not this one."), t("n1"), llm("n2")], wire));
   // no comment → description starts with the chain, exactly as before
@@ -547,6 +550,8 @@ test("tool descriptions: the first comment node leads as the tool's intent", asy
   assert.equal(desc.commented, `Draft a tagline from a product idea. text -> llm; returns text. ${TAIL}`);
   assert.equal(desc.multiline, `Turn a rough idea into copy! text -> llm; returns text. ${TAIL}`);
   assert.equal(desc.long, `${long.slice(0, 197)}… text -> llm; returns text. ${TAIL}`);
+  assert.equal(desc["emoji-long"], `${"x".repeat(196)}… text -> llm; returns text. ${TAIL}`);
+  assert.ok(desc["emoji-long"].isWellFormed());
   assert.equal(desc["pick-first"], `Second comment wins. text -> llm; returns text. ${TAIL}`);
   assert.equal(desc.plain, `text -> llm; returns text. ${TAIL}`);
   assert.equal(desc["only-comment"], `Just a note. ${TAIL}`);
