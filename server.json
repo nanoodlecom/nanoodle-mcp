@@ -3,7 +3,7 @@
   "name": "io.github.nanoodlecom/nanoodle-mcp",
   "title": "nanoodle",
   "description": "Your saved nanoodle workflow graphs as MCP tools — BYOK or pay per call in Nano (x402)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "websiteUrl": "https://nanoodle.com",
   "repository": {
     "url": "https://github.com/nanoodlecom/nanoodle-mcp",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "nanoodle-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
