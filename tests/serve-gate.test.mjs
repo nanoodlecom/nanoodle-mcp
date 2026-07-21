@@ -57,18 +57,19 @@ function fakeRegistry({ author = null, onCall } = {}) {
   return registry;
 }
 
-function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage } = {}) {
+function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
     usd,
     validate: registry ? (p) => registry.prepareCall(p) : null,
-    xnoUsd: 1.0, // static rate: $1/XNO keeps amounts easy to reason about, no CoinGecko
+    xnoUsd, // tests default to a static $1/XNO rate: amounts easy to reason about, no network
     publicBase: "http://pay.test",
     pollMs,
     waitMs,
     usage,
     now,
+    fetch,
   });
   return gate;
 }
@@ -164,23 +165,55 @@ test("failed run refunds the payer in full", async () => {
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
 });
 
-test("author payout: 20% off the top, uncut; no field → no transfer", async () => {
+test("author payout: 100% of the margin (charge − cost), exact integer math", async () => {
   const chain = fakeChain();
-  const registry = fakeRegistry({ author: PAYER });
+  // $0.05 charge at $1/XNO; the run reports $0.02 metered cost → margin = charge − 0.02 XNO exactly
+  const registry = fakeRegistry({ author: PAYER, onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.02 }) });
   const events = [];
   const { callTool, listTools } = makeGate(chain, { registry, usage: (e, f) => events.push([e, f]) }).wrapRegistry(registry);
-  assert.match(listTools()[0].description, /author earns 20% of every call/);
+  assert.match(listTools()[0].description, /full margin of every call .* goes to the graph's author/);
   const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
   chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!res.isError);
-  assert.match(res.content.at(-1).text, /20% goes to this noodle's author/);
+  assert.ok(!("costUsd" in res), "cost sidecar must be stripped from the caller's result");
+  assert.match(res.content.at(-1).text, /full margin goes to this noodle's author/);
   // the payout rides the send queue — give the microtask a beat
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(chain.state.transfers.length, 1);
   assert.equal(chain.state.transfers[0].to, PAYER);
-  assert.equal(chain.state.transfers[0].amountRaw, ((BigInt(x.amountRaw) * 20n) / 100n).toString());
-  assert.ok(events.some(([e, f]) => e === "author_payout" && f.ok));
+  // margin = amountRaw − ceil($0.02 at $1/XNO → 0.02 XNO in raw), exactly; dust stays with the author
+  assert.equal(chain.state.transfers[0].amountRaw, (BigInt(x.amountRaw) - 2n * 10n ** 28n).toString());
+  const payout = events.find(([e]) => e === "author_payout")[1];
+  assert.ok(payout.ok);
+  assert.equal(BigInt(payout.amountRaw) + 2n * 10n ** 28n, BigInt(payout.chargeRaw)); // charge = cost + payout, to the raw
+});
+
+test("author payout: run costing more than its price pays nothing and is logged", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry({ author: PAYER, onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.06 }) });
+  const events = [];
+  const { callTool } = makeGate(chain, { registry, usage: (e, f) => events.push([e, f]) }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(chain.state.transfers.length, 0);
+  const payout = events.find(([e]) => e === "author_payout")[1];
+  assert.equal(payout.ok, false);
+  assert.equal(payout.error, "no margin");
+});
+
+test("author payout: unreported cost treats the whole charge as margin", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry({ author: PAYER }); // default onCall reports no costUsd
+  const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(chain.state.transfers.length, 1);
+  assert.equal(chain.state.transfers[0].amountRaw, x.amountRaw); // full charge, dust included
 });
 
 test("already-pocketed payments are found via account_history", async () => {
@@ -220,6 +253,63 @@ test("two live quotes never share an amount", async () => {
   const b = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
   assert.notEqual(a.amountRaw, b.amountRaw);
   assert.notEqual(a.paymentId, b.paymentId);
+});
+
+test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const probes = [];
+  // 0.2 XNO priced at $0.05 → $0.25/XNO → a $0.05 quote should be ~0.2 XNO
+  const fetch = async (url, opts) => {
+    probes.push(url);
+    assert.match(url, /nano-gpt\.com\/api\/v1\/chat\/completions/);
+    assert.equal(opts.headers["x-x402"], "true");
+    return {
+      status: 402,
+      json: async () => ({
+        payment: {
+          paymentId: "probe",
+          accepted: [{ scheme: "nano", payTo: GATE_ADDR, amount: "200000000000000000000000000000", amountUsd: "0.05" }],
+        },
+      }),
+    };
+  };
+  const events = [];
+  const { callTool } = makeGate(chain, { registry, xnoUsd: null, fetch, usage: (e, f) => events.push([e, f]) }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  assert.ok(BigInt(x.amountRaw) >= 2n * 10n ** 29n && BigInt(x.amountRaw) < 2n * 10n ** 29n + 10n ** 20n,
+    `expected ~0.2 XNO, got ${x.amountXno}`);
+  // second quote inside the cache window: no second probe
+  await callTool({ name: "poster", arguments: { Text: "b" } });
+  assert.equal(probes.length, 1);
+  assert.equal(events[0][1].rateSource, "nanogpt-x402");
+  assert.ok(Math.abs(events[0][1].xnoUsd - 0.25) < 1e-9);
+});
+
+test("rate oracle: stale cache survives a probe outage; no cache at all is a clean error", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let t = 1_000_000, probeOk = true, probes = 0;
+  const fetch = async () => {
+    probes++;
+    if (!probeOk) return { status: 500, json: async () => ({}) };
+    return {
+      status: 402,
+      json: async () => ({ payment: { paymentId: "p", accepted: [
+        { scheme: "nano", payTo: GATE_ADDR, amount: "100000000000000000000000000000", amountUsd: "0.05" }] } }),
+    };
+  };
+  const { callTool } = makeGate(chain, { registry, xnoUsd: null, fetch, now: () => t }).wrapRegistry(registry);
+  const a = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  t += 61_000; // cache expired, oracle down → stale rate keeps quoting
+  probeOk = false;
+  const b = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
+  assert.equal(BigInt(a.amountRaw) / 10n ** 20n, BigInt(b.amountRaw) / 10n ** 20n); // same rate, different dust
+  assert.equal(probes, 2);
+
+  // a gate that never got a rate refuses to quote, readably
+  const cold = makeGate(fakeChain(), { registry, xnoUsd: null, fetch }).wrapRegistry(fakeRegistry());
+  await assert.rejects(() => cold.callTool({ name: "poster", arguments: { Text: "a" } }), /rate probe failed/);
 });
 
 test("hashArgs is order-insensitive and value-sensitive", () => {
@@ -297,7 +387,7 @@ test("a hand-added x402 block on a graph file reaches the gate (price + author)"
   const { listTools } = makeGate(fakeChain(), {}).wrapRegistry(registry);
   const t = listTools().find((t) => t.name === "hello-noodle");
   assert.match(t.description, /\$0\.10 per call/);
-  assert.match(t.description, /author earns 20%/);
+  assert.match(t.description, /full margin of every call/);
 });
 
 test("qrSvg encodes a nano URI into a QR matrix svg", () => {

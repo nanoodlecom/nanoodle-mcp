@@ -65,7 +65,8 @@ Serve mode (host your noodles over HTTP instead of stdio):
                    (required in practice behind a reverse proxy or tunnel)
   --nano-ws u      Nano node websocket (wss://…) for push payment detection;
                    polling via --nano-rpc is the always-on fallback
-  --xno-usd n      static XNO/USD rate override (default: live CoinGecko, cached)
+  --xno-usd n      static XNO/USD rate override (default: NanoGPT's own x402 invoices
+                   are the rate oracle — the rate we pay is the rate we charge; cached 60s)
 
 No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
 each call's HTTP 402 invoice is paid in Nano (XNO) from that wallet via x402.
@@ -236,7 +237,8 @@ async function main() {
       name: "nanoodle-mcp",
       version: pkg.version,
       listTools: () => registry.listTools(),
-      callTool: (params) => registry.callTool(params),
+      // strip the gate-facing costUsd sidecar — stdio clients get pure MCP content
+      callTool: (params) => registry.callTool(params).then(({ costUsd, ...r }) => r),
     });
     // A run's observed cost lands in the tool's description — tell the client to re-list.
     registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
@@ -267,6 +269,7 @@ async function main() {
       usd: chargeUsd,
       validate: (p) => registry.prepareCall(p),
       xnoUsd,
+      oracleBase: process.env.NANOGPT_BASE_URL || undefined,
       wsUrl: nanoWsFlag || null,
       publicBase,
       log: (line) => console.error("nanoodle-mcp: " + line),
@@ -285,8 +288,8 @@ async function main() {
       const t0 = Date.now();
       const tool = params && typeof params === "object" && !Array.isArray(params) ? params.name : undefined;
       try {
-        const r = await registry.callTool(params);
-        usageLog("run", { tool, ok: !r.isError, ms: Date.now() - t0, paid: false });
+        const { costUsd, ...r } = await registry.callTool(params);
+        usageLog("run", { tool, ok: !r.isError, ms: Date.now() - t0, paid: false, costUsd: costUsd ?? null });
         return r;
       } catch (e) {
         usageLog("run", { tool, ok: false, ms: Date.now() - t0, paid: false, error: String((e && e.message) || e) });
