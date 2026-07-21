@@ -204,8 +204,12 @@ on either side. The flow their agent walks through (the server's MCP
    second — the gate watches the chain by RPC polling, or push via
    `--nano-ws`). The user tells their agent; the agent re-calls the tool with
    the same arguments plus the `_payment_id` from step 1.
-3. The run executes and the result streams back with a payment receipt.
-   Re-calls with the same `_payment_id` replay the cached result free.
+3. The run executes and the result streams back with a receipt. **What they
+   paid is a deposit, not the price**: the call settles at the run's *actual*
+   metered model cost + 20%, and everything above that is sent back to the
+   paying wallet as change — the same deposit→meter→refund model NanoGPT
+   itself uses, one layer up. Nobody ever pays off an estimate. Re-calls with
+   the same `_payment_id` replay the cached result free.
 
 Nano has no payment memo, so each quote's amount carries a few raw of random
 dust — **the amount is the memo**. Quotes expire after 15 minutes; a payment
@@ -214,10 +218,15 @@ payment is refunded automatically**. Arguments are validated *before* a quote
 is issued (nobody pays for a typo), and `run_noodle` is withdrawn in charge
 mode — an arbitrary share link's cost can't be priced up front.
 
-Pricing: `--charge-usd` is the default price. The XNO conversion rate comes
-from **NanoGPT itself**: the gate fires a keyless `x-x402` probe and reads the
-invoice's raw-XNO/USD pair — the same rate your downstream payments settle at,
-so quotes and costs can never drift apart on FX, and no market-data service is
+Pricing: `--charge-usd` sets the default **deposit** — a ceiling, not a
+price. Size it generously; over-covering costs callers nothing since the
+difference comes back as change, while an under-sized deposit means runs can
+cost more than was collected and *you* eat the difference (the gate warns at
+startup when a graph's deposit is below its last observed cost + 20%, from
+the `costs.json` sidecar). The XNO conversion comes from **NanoGPT itself**:
+the gate fires a keyless `x-x402` probe and keeps the invoice's exact
+raw-XNO/USD pair — the same rate your downstream payments settle at, so
+quotes and costs can never drift apart on FX, and no market-data service is
 involved (probe invoices are never paid; they just expire). Cached 60s, stale
 cache rides out probe outages, and `--xno-usd` forces a static rate if you
 ever need one. Per-graph overrides are a hand-added top-level block in the
@@ -227,15 +236,26 @@ graph JSON:
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
 ```
 
-`usd` overrides the price. `author` routes **the full margin of every
-successful call — the charge minus the metered model cost — to that address**.
-Nano has no network fees and this server takes no cut, so creators keep 100%
-of what their noodle earns; the conversion uses the same NanoGPT rate the
-quote was priced at, with the cost rounded up so payouts only ever round down
-(by at most 1e-8 XNO). A run that costs more than its price pays out nothing —
-the operator absorbs the loss. No `author` field → your wallet keeps the
-margin. All amounts are integer raw end to end; floats never touch an
-on-chain value.
+`usd` overrides the deposit. `author` routes **the whole 20% markup of every
+successful call to that address** — computed on what the run *actually* cost,
+never on the deposit. Nano has no network fees and this server takes no cut
+of it, so creators keep 100% of what their noodle earns. In exact raw, per
+settled call:
+
+```
+cost   = metered model cost, converted at the deposit's own oracle pair, rounded up
+markup = cost / 5                    (20%, integer floor)
+take   = min(markup, deposit − cost) → author (or kept, if no author field)
+change = deposit − cost − take       → back to the payer
+```
+
+A run costing more than its deposit keeps the whole deposit and the operator
+absorbs the excess; a run whose model reports no cost settles at $0 and the
+whole deposit is returned (the caller is never billed off a number the meter
+didn't produce). The math is **integer-exact end to end**: USD decimals parse
+by string into nano-dollars, the rate is the oracle invoice's literal
+raw/USD pair, every conversion is BigInt ratio arithmetic with an explicit
+floor or ceil, and floats never touch an on-chain value.
 
 The wallet (`NANO_SEED` / `NANO_PRIVATE_KEY`, via `--env-file`) receives
 payments, sends refunds and author payouts, and — if you don't set an API
