@@ -216,6 +216,39 @@ just by dropping a same-named graph in `./noodles`, while everything else in
 `~/noodles` stays available. An unreadable dir (a typo, a folder that isn't
 there) is a hard startup error naming the offender — no silent half-load.
 
+#### Wiring it into your editor
+
+MCP config is per-project in most clients, so the two-dir pattern lives in the
+repo, right next to the graphs it serves. For Claude Code that's a `.mcp.json`
+at the project root — commit it along with `noodles/` and everyone who clones
+gets the same tools:
+
+```json
+{
+  "mcpServers": {
+    "nanoodle": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "nanoodle-mcp", "--graphs", "./noodles", "--graphs", "/home/you/noodles"]
+    }
+  }
+}
+```
+
+Relative paths resolve from the project root. A project-scoped server named
+`nanoodle` shadows a user-scoped one of the same name, so repos with a
+`.mcp.json` get their own graphs and every other directory falls back to your
+global install untouched.
+
+Two things to keep out of a committed config: your **API key** (leave `env`
+out and let `NANOGPT_API_KEY` come from the environment, or point
+`--env-file` at a file outside the repo — never commit a key) and, for team
+repos, your **personal library path** (the second `--graphs` above is an
+absolute path on *your* machine; drop it from a shared repo's config and keep
+just `./noodles`, since `~` is not expanded in MCP args). Cursor
+(`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`) take the same `args` in
+the config shapes shown under [Install](#install).
+
 ## Run any share link
 
 Every nanoodle share link is an executable tool. Alongside your saved graphs the
