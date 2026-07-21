@@ -164,6 +164,13 @@ Order: `--work-rpc` (2-minute timeout, so a hung server can't stall a payment)
 next block** the moment one publishes, and serve mode prewarms at boot — with
 any healthy work source, callers effectively never wait on proof-of-work.
 
+The local-CPU last resort runs on the Node main thread: in `--serve` mode a
+send-difficulty grind (minutes) freezes the whole HTTP server while it runs.
+If your remote work sources are dependable, pass `--no-local-work` — the send
+then fails cleanly instead (an unpayable invoice is refused up front, and a
+failed refund/payout send leaves the balance in the wallet for the next
+settle to move).
+
 **This is a hot wallet.** Use a dedicated wallet holding pocket money, not
 your savings: its balance is a natural spend ceiling, and `--max-usd` adds a
 per-call one on top. NanoGPT auto-refunds overpayments and failed generations
@@ -325,8 +332,10 @@ jq 'select(.event=="run" and .paid) | .usd' usage.jsonl | jq -s add             
   regularly; if you run with an API key, cap that account's balance too.
 - **Work server**: refunds and payouts are Nano sends and need proof-of-work —
   use a hosted GPU work API (nano.to, Nanswap — key in `NANO_WORK_KEY` in the
-  env file) or run `nano-work-server` locally (see wallet mode above), or
-  they'll be slow. Wallet-material and key env vars all belong in the
+  env file), or point `NANO_WORK_URL` at a `nano-work-server --gpu` on any box
+  you own over a tailnet (work requests carry only block hashes — nothing
+  secret). Pair either with `--no-local-work` so a work outage can't freeze
+  the server on CPU work. Wallet-material and key env vars all belong in the
   `--env-file`, which also takes `NANO_WS_URL` for a key-bearing websocket URL
   (e.g. Nanswap's `wss://nodes.nanswap.com/ws/?ticker=XNO&api_key=…`).
 - There is intentionally **no auth**: on a charged server, payment is the
