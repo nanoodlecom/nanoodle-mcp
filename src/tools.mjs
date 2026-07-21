@@ -516,6 +516,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   const registry = {
     tools,
     failures,
+    /** Live last-observed-cost records by tool name — the --charge gate reads these to sanity-check deposits. */
+    costs,
     /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
     onToolsChanged: null,
 

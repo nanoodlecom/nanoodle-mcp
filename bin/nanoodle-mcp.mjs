@@ -56,11 +56,12 @@ function usage(code = 1) {
 Serve mode (host your noodles over HTTP instead of stdio):
   --serve [h:]p    speak MCP over streamable HTTP on [host:]port (default 127.0.0.1:8402);
                    also serves a landing page, /pay pages, and generated media under /out/
-  --charge-usd n   charge callers $n per tool call, paid in Nano via x402 (default price;
-                   per-graph override: add "x402": {"usd": 0.10} to the graph JSON, and
-                   "x402": {"author": "nano_…"} to route 20% of every call to its author).
+  --charge-usd n   take a $n deposit per tool call, paid in Nano via x402. Calls settle at
+                   the run's ACTUAL metered cost + 20% and the rest returns to the payer as
+                   change; the 20% goes to the graph's x402.author address if set, else stays.
+                   Per-graph deposit override: "x402": {"usd": 0.10} in the graph JSON.
                    Requires the wallet (NANO_SEED / NANO_PRIVATE_KEY) — it receives payments
-                   and sends refunds. Calls are logged to <out>/usage.jsonl either way.
+                   and sends refunds/change/payouts. Calls are logged to <out>/usage.jsonl.
   --public-url u   absolute base URL callers see in pay links / media links
                    (required in practice behind a reverse proxy or tunnel)
   --nano-ws u      Nano node websocket (wss://…) for push payment detection;
@@ -280,8 +281,10 @@ async function main() {
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
       "Calling a tool normally returns PAYMENT REQUIRED with a payment link: show that link to your user " +
       "(it renders a QR code and confirms on-screen when the payment lands, usually within a second), then " +
-      "call the same tool again with identical arguments plus the given _payment_id. Quotes expire after " +
-      "15 minutes. If a run fails after payment, the payment is refunded automatically.";
+      "call the same tool again with identical arguments plus the given _payment_id. The amount paid is a " +
+      "DEPOSIT: the real price is the run's actual metered model cost + 20%, and the difference is sent back " +
+      "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
+      "payment, the whole payment is refunded automatically.";
   } else {
     // Free serve mode still logs runs, so the operator can see what gets used.
     callTool = async (params) => {

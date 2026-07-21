@@ -19,7 +19,6 @@
  */
 import { randomBytes, createHash } from "node:crypto";
 import { checkAddress } from "nanocurrency";
-import { parseNanoInvoice } from "nanoodle";
 import { rawToXno } from "./wallet.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -27,14 +26,29 @@ const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund
 const HISTORY_EVERY = 5; // check account_history every Nth poll tick
 
 /**
- * USD → raw, quantized at 8 XNO decimal places then exact BigInt from there on.
- * This is the ONLY place a float touches an on-chain amount; `mode` makes the
- * rounding direction explicit ("ceil" for costs so margins only round down).
+ * Exact money math — no floating point anywhere near an on-chain amount.
+ *
+ * USD values are parsed from their decimal-string form into integer
+ * nano-dollars (1e-9 USD) by string manipulation; digits beyond 1e-9 USD
+ * truncate (a defined floor of under a billionth of a dollar, in the payer's
+ * favor). The "rate" is never a number: it is the oracle invoice's exact pair
+ * (R raw costs U nano-dollars), and conversions are BigInt ratio arithmetic
+ * with an explicit floor/ceil.
  */
-function usdToRaw(usdAmount, usdRate, mode = "round") {
-  const units = (usdAmount / usdRate) * 1e8; // 1e-8 XNO units
-  const n = mode === "ceil" ? Math.ceil(units) : Math.round(units);
-  return BigInt(Math.max(0, n)) * 10n ** 22n;
+export function parseUsdNano(v) {
+  const s = String(v).trim();
+  const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
+  if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  const digits = m[2] + (m[3] || "");
+  const exp = (m[4] ? parseInt(m[4], 10) : 0) - (m[3] ? m[3].length : 0) + 9; // scale to nano-USD
+  if (exp >= 0) return BigInt(digits) * 10n ** BigInt(exp);
+  return BigInt(digits.slice(0, digits.length + exp) || "0"); // truncate below 1e-9 USD
+}
+
+/** USD → raw via the exact oracle pair {usdNano, raw}: raw = usd·R/U, floor or ceil. */
+function usdToRaw(usdValue, pair, mode = "floor") {
+  const num = parseUsdNano(usdValue) * pair.raw;
+  return mode === "ceil" ? (num + pair.usdNano - 1n) / pair.usdNano : num / pair.usdNano;
 }
 
 /** Deterministic hash of (tool, arguments) — a payment id is bound to exactly this call. */
@@ -97,45 +111,59 @@ export function createChargeGate({
   const oracleUrl = `${String(oracleBase || "https://nano-gpt.com").replace(/\/+$/, "")}/api/v1/chat/completions`;
   const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
 
-  async function nanoGptRate() {
+  async function nanoGptPair() {
     const r = await fetch(oracleUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-x402": "true" },
       body: JSON.stringify({ model: ORACLE_MODEL, messages: [{ role: "user", content: "x402 rate probe" }] }),
     });
     if (r.status !== 402) throw new Error(`expected 402 from x402 probe, got HTTP ${r.status}`);
-    const inv = parseNanoInvoice(await r.json(), oracleUrl);
-    if (!inv || inv.amountUsd == null || !/^\d+$/.test(String(inv.amountRaw)) || BigInt(inv.amountRaw) <= 0n) {
+    const body = await r.json();
+    // Extract the pair straight off the wire, before anything Number()s it —
+    // amountUsd is a decimal string in the payload and we keep it exact.
+    const pay = body && body.payment;
+    const pool = [
+      ...(Array.isArray(body && body.accepts) ? body.accepts : []),
+      ...(Array.isArray(pay && pay.accepted) ? pay.accepted : []),
+    ];
+    const nano = pool.find((a) => a && a.scheme === "nano");
+    const rawStr = String((nano && (nano.maxAmountRequired || nano.amount)) || "");
+    const usdVal = nano && (nano.maxAmountRequiredUSD ?? nano.amountUsd ?? (pay && pay.amountUsd));
+    if (!/^\d+$/.test(rawStr) || BigInt(rawStr) <= 0n || usdVal == null) {
       throw new Error("402 carried no usable XNO/USD pair");
     }
-    const v = inv.amountUsd / (Number(inv.amountRaw) / 1e30);
-    if (!Number.isFinite(v) || v <= 0) throw new Error("bad implied rate");
-    return v;
+    const usdNano = parseUsdNano(usdVal);
+    if (usdNano <= 0n) throw new Error("402 USD amount parsed to zero");
+    return { usdNano, raw: BigInt(rawStr) };
   }
 
-  let rate = Number.isFinite(xnoUsd) && xnoUsd > 0 ? { usdPerXno: xnoUsd, at: Infinity, source: "static" } : null;
-  async function usdPerXno() {
-    if (rate && (rate.at === Infinity || now() - rate.at < 60_000)) return rate.usdPerXno;
+  let rate = Number.isFinite(xnoUsd) && xnoUsd > 0
+    ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: 10n ** 30n }, at: Infinity, source: "static" }
+    : null;
+  async function ratePair() {
+    if (rate && (rate.at === Infinity || now() - rate.at < 60_000)) return rate.pair;
     try {
-      const v = await nanoGptRate();
-      rate = { usdPerXno: v, at: now(), source: "nanogpt-x402" };
-      return v;
+      const pair = await nanoGptPair();
+      rate = { pair, at: now(), source: "nanogpt-x402" };
+      return pair;
     } catch (e) {
       if (rate) {
-        log(`NanoGPT rate oracle failed (${e.message}) — using stale cached rate $${rate.usdPerXno}`);
-        return rate.usdPerXno;
+        log(`NanoGPT rate oracle failed (${e.message}) — using stale cached pair`);
+        return rate.pair;
       }
       throw new Error("cannot price this call: the NanoGPT x402 rate probe failed " +
         `(${e.message}) and there is no cached rate or --xno-usd override`);
     }
   }
   const rateSource = () => (rate ? rate.source : null);
+  /** Display-only float view of the pair — never used for money. */
+  const rateDisplay = (pair) => (Number(pair.usdNano) / 1e9) * (1e30 / Number(pair.raw));
 
-  /** Price → raw amount with a dust tag unique among live quotes (the amount is the memo). */
-  function tagAmount(usdPrice, usdRate) {
-    // 8 decimal places of XNO precision for the price itself (never below 1e-8 XNO)…
-    let base = usdToRaw(usdPrice, usdRate);
-    if (base <= 0n) base = 10n ** 22n;
+  /** Deposit → raw amount with a dust tag unique among live quotes (the amount is the memo). */
+  function tagAmount(usdPrice, pair) {
+    // exact conversion, ceiled so the deposit always covers its USD figure (floor 1e-8 XNO)…
+    let base = usdToRaw(usdPrice, pair, "ceil");
+    if (base < 10n ** 22n) base = 10n ** 22n;
     for (;;) {
       // …plus < 10^-10 XNO of random dust: invisible in any display, unmistakable on-chain
       const dust = BigInt("0x" + randomBytes(8).toString("hex")) % 10n ** 20n;
@@ -316,7 +344,8 @@ export function createChargeGate({
       expiresAt: new Date(q.expiresAt).toISOString(),
     };
     const text =
-      `PAYMENT REQUIRED — this tool costs ${fmtUsd(q.usd)} (≈${rawToXno(q.amountRaw)} XNO), paid per call in Nano. No account needed.\n\n` +
+      `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (≈${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
+      `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
       `To proceed:\n` +
       `1. Show your user this payment link (it renders a QR code to scan with any Nano wallet, and turns into a green check the moment the payment lands):\n` +
       `   ${payUrl(q)}\n` +
@@ -369,9 +398,18 @@ export function createChargeGate({
         return Number.isFinite(v) && v > 0 ? v : usd;
       };
       const prices = new Map(registry.tools.map((t) => [t.name, priceFor(t)]));
-      // Hand-added `"x402": {"author": "nano_…"}` on a graph routes 100% of each
-      // successful call's margin (charge − metered model cost) to its author —
-      // Nano has no fees, so nothing is skimmed. No field → the wallet keeps it.
+      // Under-deposited graphs cost the operator money every call — say so up front.
+      for (const t of registry.tools) {
+        const rec = registry.costs && registry.costs[t.name];
+        const dep = prices.get(t.name) ?? usd;
+        if (rec && typeof rec.usd === "number" && rec.usd * 1.2 > dep) {
+          log(`warning: ${t.name} deposit ${fmtUsd(dep)} is below its last observed cost ${fmtUsd(rec.usd)} + 20% — ` +
+            `runs may exceed the deposit and you eat the difference; raise x402.usd in its graph file`);
+        }
+      }
+      // Hand-added `"x402": {"author": "nano_…"}` on a graph routes the whole 20%
+      // markup of each successful call to its author — Nano has no fees, so
+      // nothing is skimmed off it. No field → the wallet keeps the markup.
       const authorFor = (tool) => {
         const a = tool.x402 && typeof tool.x402.author === "string" ? tool.x402.author.trim() : "";
         if (!a) return null;
@@ -381,29 +419,59 @@ export function createChargeGate({
       const authors = new Map(registry.tools.map((t) => [t.name, authorFor(t)]));
 
       /**
-       * Forward the full margin of a settled call to the graph's author; queued,
-       * never blocks the caller's result. Margin = charge − metered model cost,
-       * converted at the SAME oracle rate the quote was priced at, cost rounded
-       * up — so the payout only ever rounds in the operator's favor by ≤1e-8 XNO.
-       * A run that cost more than its price pays out nothing (operator eats it).
+       * Settle a completed call against what it ACTUALLY cost — the quote was
+       * only a deposit, never the price. In exact raw:
+       *
+       *   deposit  = what the caller paid (quote incl. dust)
+       *   cost     = metered model cost, converted at the quote's own oracle
+       *              rate, rounded up (unreported cost settles as $0 — the
+       *              caller is never billed off a number we don't have)
+       *   markup   = cost / 5 (20% of the true cost, integer floor)
+       *   take     = min(markup, deposit − cost)  → the author (100%, no cut),
+       *              or kept by the wallet when the graph names no author
+       *   change   = deposit − cost − take       → sent back to the payer
+       *
+       * A run costing more than its deposit keeps the whole deposit and the
+       * operator eats the rest; take and change are then zero. Transfers are
+       * queued and never block the caller's result. Returns the numbers for
+       * the receipt.
        */
-      function payAuthor(q, name, costUsd) {
+      function settle(q, name, costUsd) {
         const author = authors.get(name);
-        if (!author) return;
-        const cost = Number.isFinite(costUsd) ? costUsd : 0; // unreported cost → whole charge is margin
-        const costRaw = usdToRaw(cost, q.rate, "ceil");
-        const margin = BigInt(q.amountRaw) - costRaw;
-        if (margin <= 0n) {
-          log(`no author payout for ${q.id} (${name}): run cost $${cost} ≥ the ${rawToXno(q.amountRaw)} XNO charge`);
-          usage("author_payout", { paymentId: q.id, tool: name, ok: false, to: author, chargeRaw: q.amountRaw, costUsd: cost, error: "no margin" });
-          return;
+        const deposit = BigInt(q.amountRaw);
+        const known = Number.isFinite(costUsd);
+        const costRaw0 = known ? usdToRaw(costUsd, q.pair, "ceil") : 0n;
+        const costRaw = costRaw0 > deposit ? deposit : costRaw0;
+        const remaining = deposit - costRaw;
+        const markup = costRaw0 / 5n;
+        const take = markup < remaining ? markup : remaining;
+        const change = remaining - take;
+
+        if (costRaw0 > deposit) {
+          log(`call ${q.id} (${name}) cost $${costUsd} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
-        ops.transfer(author, margin.toString(), "author payout:")
-          .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: margin.toString(), chargeRaw: q.amountRaw, costUsd: cost, hash }))
-          .catch((e) => {
-            log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
-            usage("author_payout", { paymentId: q.id, tool: name, ok: false, to: author, amountRaw: margin.toString(), costUsd: cost, error: e.message });
-          });
+        if (author && take > 0n) {
+          ops.transfer(author, take.toString(), "author payout:")
+            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? costUsd : null, hash }))
+            .catch((e) => {
+              log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
+              usage("author_payout", { paymentId: q.id, tool: name, ok: false, to: author, amountRaw: take.toString(), error: e.message });
+            });
+        }
+        if (change > 0n) {
+          if (q.source) {
+            ops.transfer(q.source, change.toString(), "change:")
+              .then((hash) => usage("change", { paymentId: q.id, tool: name, ok: true, to: q.source, amountRaw: change.toString(), hash }))
+              .catch((e) => {
+                log(`change for ${q.id} (→ ${q.source}) failed: ${e.message}`);
+                usage("change", { paymentId: q.id, tool: name, ok: false, to: q.source, amountRaw: change.toString(), error: e.message });
+              });
+          } else {
+            log(`cannot return ${rawToXno(change)} XNO change for ${q.id}: payer account unknown`);
+            usage("change", { paymentId: q.id, tool: name, ok: false, amountRaw: change.toString(), error: "payer account unknown" });
+          }
+        }
+        return { known, costRaw, take, change, author: !!author };
       }
 
       const listTools = () =>
@@ -413,8 +481,8 @@ export function createChargeGate({
             const price = prices.get(t.name) ?? usd;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
-              `${fmtUsd(price)} per call, paid in Nano (XNO) at call time — no account needed`) +
-              (authors.get(t.name) ? " The full margin of every call (charge minus model cost) goes to the graph's author." : "");
+              `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
+              (authors.get(t.name) ? " The 20% markup goes to the graph's author." : "");
             const inputSchema = {
               ...t.inputSchema,
               properties: {
@@ -447,18 +515,18 @@ export function createChargeGate({
         if (_payment_id == null) {
           // Never charge for a call that couldn't run: unknown tool / bad args throw here, pre-quote.
           if (validate) await validate({ name, arguments: args });
-          const usdRate = await usdPerXno();
+          const pair = await ratePair();
           const q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price ?? usd,
-            rate: usdRate, // the margin math must use the rate the quote was priced at
-            amountRaw: tagAmount(price ?? usd, usdRate),
+            pair, // settle math must use the exact pair the deposit was priced at
+            amountRaw: tagAmount(price ?? usd, pair),
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
           };
           quotes.set(q.id, q);
           ensureWatching();
-          usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: usdRate, rateSource: rateSource() });
+          usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
           return paymentRequiredResult(q);
         }
 
@@ -493,12 +561,16 @@ export function createChargeGate({
           q.running = (async () => {
             try {
               const { costUsd, ...result } = await registry.callTool({ name, arguments: args });
-              const receipt = `paid ${rawToXno(q.amountRaw)} XNO (${fmtUsd(q.usd)})` +
-                (q.payHash ? ` — block ${q.payHash}` : "") +
-                (authors.get(name) ? " — the full margin goes to this noodle's author" : "");
+              const s = settle(q, name, costUsd);
+              const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
+                (q.payHash ? ` (block ${q.payHash})` : "") +
+                (s.known
+                  ? ` — settled at actual cost ${fmtUsd(costUsd)} + 20%` +
+                    (s.author && s.take > 0n ? " (markup goes to this noodle's author)" : "") +
+                    (s.change > 0n ? `; ${rawToXno(s.change)} XNO change returned to your wallet` : "")
+                  : " — the model reported no cost, so the whole deposit is being returned to your wallet");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               usage("run", { paymentId: q.id, tool: name, ok: true, ms: now() - t0, usd: q.usd, costUsd: costUsd ?? null, paid: true });
-              payAuthor(q, name, costUsd);
             } catch (e) {
               const msg = String((e && e.message) || e);
               usage("run", { paymentId: q.id, tool: name, ok: false, ms: now() - t0, usd: q.usd, paid: true, error: msg });
