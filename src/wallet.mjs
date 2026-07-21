@@ -57,23 +57,24 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * Build the wallet: derives the address and returns the x402 `payment`
  * callback to pass to the nanoodle Workflow.
  *
- * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
+ * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl = null, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl = null, workKey = null, workTimeoutMs = 120_000, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   const rpcBase = String(rpcUrl).replace(/\/+$/, "");
   const workBase = workUrl ? String(workUrl).replace(/\/+$/, "") : null;
 
-  async function rpc(body, base = rpcBase) {
+  async function rpc(body, base = rpcBase, { headers = {}, signal } = {}) {
     let r;
     try {
       r = await fetch(base, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify(body),
+        signal,
       });
     } catch (e) {
       throw new Error(`Nano RPC ${base} unreachable (action ${body.action}): ${e.message}`);
@@ -100,18 +101,57 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative };
   }
 
-  // Work: dedicated work server first (--work-rpc, e.g. a local nano-work-server —
-  // public nodes routinely refuse or throttle work_generate), then the main RPC
-  // node, then local CPU work so a work-less setup still functions, just slowly.
-  async function workFor(frontier, threshold) {
+  // Work: dedicated work server first (--work-rpc, e.g. a local nano-work-server
+  // or a hosted GPU work API — public nodes routinely refuse or throttle
+  // work_generate), then the main RPC node, then local CPU work so a work-less
+  // setup still functions, just slowly. Remote asks carry a timeout so a dead
+  // or hopelessly congested work source falls through instead of hanging the
+  // payment — set ABOVE worst-case CPU work-server time (~1min at send
+  // difficulty), because aborting throws away compute the server has already
+  // sunk into the request.
+  // With `workKey` set, the dedicated server gets it both as a `key` body field
+  // (nano.to style) and a `nodes-api-key` header (Nanswap style).
+  async function remoteWork(frontier, threshold) {
     const workSources = workBase ? [["work server " + workBase, workBase], ["Nano RPC", rpcBase]] : [["Nano RPC", rpcBase]];
     for (const [label, base] of workSources) {
+      const withKey = workKey && base === workBase;
       try {
-        return (await rpc({ action: "work_generate", hash: frontier, difficulty: threshold }, base)).work;
+        return (await rpc(
+          { action: "work_generate", hash: frontier, difficulty: threshold, ...(withKey ? { key: workKey } : {}) },
+          base,
+          { headers: withKey ? { "nodes-api-key": workKey } : {}, signal: AbortSignal.timeout(workTimeoutMs) },
+        )).work;
       } catch (e) {
         log(`work_generate via ${label} failed (${e.message})`);
       }
     }
+    return null;
+  }
+
+  // Work generated at the send threshold is valid for any block type, so one
+  // precomputed value serves whatever block the frontier grows next. The cache
+  // is filled fire-and-forget after every published block — sends and receives
+  // are serialized on the queue, so by the time the next block needs work it is
+  // usually already there and the caller-facing wait drops to ~0.
+  const workCache = new Map(); // frontier hash -> Promise<string|null>
+  function precomputeWork(frontier) {
+    if (workCache.has(frontier)) return;
+    if (workCache.size >= 8) workCache.clear(); // superseded frontiers; only the newest matters
+    workCache.set(frontier, remoteWork(frontier, SEND_WORK_THRESHOLD).then((w) => {
+      if (w == null) workCache.delete(frontier); // don't cache failure; the live path retries + has local CPU
+      return w;
+    }));
+  }
+
+  async function workFor(frontier, threshold) {
+    const cached = workCache.get(frontier);
+    if (cached) {
+      const w = await cached;
+      workCache.delete(frontier); // single-use: the frontier advances once this block publishes
+      if (w != null) return w;
+    }
+    const w = await remoteWork(frontier, threshold);
+    if (w != null) return w;
     log("computing work locally, this can take a while");
     return computeWork(frontier, { workThreshold: threshold });
   }
@@ -147,6 +187,7 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         block.account = address;
         delete block.link_as_account; // link is a block hash here, not an account
         await rpc({ action: "process", json_block: "true", subtype: "receive", block });
+        precomputeWork(hash);
         state = { ...state, frontier: hash, balance: state.balance + BigInt(amountRaw) };
         log(`x402: received ${rawToXno(amountRaw)} XNO (refund/deposit ${sendHash.slice(0, 8)}…, block ${hash})`);
       } catch (e) {
@@ -222,6 +263,7 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         }
         else throw e;
       }
+      precomputeWork(hash);
       log(`x402: ${describe} ${rawToXno(amount)} XNO${extra} to ${to} (block ${hash})`);
       return hash;
     }
@@ -279,6 +321,15 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         return sendFrom(state, to, BigInt(amountRaw), describe);
       }),
       pocket: () => enqueue(async () => pocketReceivables(await accountState())),
+      /**
+       * Kick off work precompute for the current frontier so the first block of
+       * the session doesn't wait on work generation. Best-effort and off the
+       * queue — meant for long-lived serve mode at boot, not per-session stdio
+       * (a session that never pays would burn one work per boot for nothing).
+       */
+      prewarm: () => accountState()
+        .then((s) => precomputeWork(s.frontier))
+        .catch((e) => log(`work prewarm skipped (${e.message})`)),
     },
   };
 }
