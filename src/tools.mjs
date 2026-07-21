@@ -13,6 +13,7 @@
  */
 import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
 
@@ -335,8 +336,18 @@ export function describeRunFailure(e) {
   return out;
 }
 
-/** Turn a completed run into MCP tool-result content: media saved to disk, text inline, cost line. */
-async function emitResult(wf, result, prefix, outDir) {
+/** Small enough to ride inline as an MCP image block alongside its download URL. */
+const INLINE_IMAGE_MAX = 1_500_000;
+const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+
+/**
+ * Turn a completed run into MCP tool-result content: media saved to disk, text
+ * inline, cost line. Locally (stdio) media is referenced by file path; when
+ * `publicBase` is set (--serve, remote callers can't read our disk) the file
+ * gets an unguessable name, is referenced by its /out/ URL, and small images
+ * additionally ride inline so they render right in the caller's terminal.
+ */
+async function emitResult(wf, result, prefix, outDir, { publicBase = null } = {}) {
   const content = [];
   for (const o of wf.outputs) {
     const value = result.outputs[o.key];
@@ -346,9 +357,19 @@ async function emitResult(wf, result, prefix, outDir) {
       // bytes() before naming: for hosted media the mime is only known after the fetch
       const bytes = await value.bytes();
       const safeKey = o.key.replace(/[^\w.-]+/g, "_");
-      const path = resolve(outDir, `${prefix}-${safeKey}-${Date.now()}-${++saveSeq}.${extForMedia(bytes, value.mime)}`);
+      const ext = extForMedia(bytes, value.mime);
+      const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
+      const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
       await writeFile(path, bytes);
-      content.push({ type: "text", text: `${o.key}: saved ${path}` });
+      if (publicBase) {
+        content.push({ type: "text", text: `${o.key}: ${publicBase}/out/${basename(path)}` });
+        const mime = /^image\//.test(value.mime || "") ? value.mime : EXT_MIME[ext];
+        if (mime && bytes.length <= INLINE_IMAGE_MAX) {
+          content.push({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: mime });
+        }
+      } else {
+        content.push({ type: "text", text: `${o.key}: saved ${path}` });
+      }
     } else {
       content.push({ type: "text", text: String(value) });
     }
@@ -368,7 +389,7 @@ async function emitResult(wf, result, prefix, outDir) {
  * unknown nodes, or a run failure — throws a plain error the server surfaces as
  * an isError tool result, so the agent gets a readable message, never a crash.
  */
-async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
+async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase }) {
   const args = params.arguments == null ? {} : params.arguments;
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
@@ -391,7 +412,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
   }
   const inputs = await resolveInputs(wf, inputArgs, `run_noodle (${decoded.url})`);
   const result = await wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
-  return emitResult(wf, result, RUN_NOODLE_NAME, outDir);
+  return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase });
 }
 
 /**
@@ -404,7 +425,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
  * same filename in two directories stays distinguishable in logs.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -432,9 +453,14 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir }) {
     const files = entries.filter((f) => f.toLowerCase().endsWith(".json")).sort();
     for (const file of files) {
       const path = join(dir, file);
-      let wf;
+      let wf, x402 = null;
       try {
-        wf = Workflow.fromJSON(await readFile(path, "utf8"), { apiKey, payment, baseUrl, quiet: true });
+        const text = await readFile(path, "utf8");
+        wf = Workflow.fromJSON(text, { apiKey, payment, baseUrl, quiet: true });
+        // The library normalizes graphs and drops unknown keys — the hand-added
+        // "x402" block (per-graph price / author payout address) rides the raw file.
+        const parsed = JSON.parse(text);
+        if (parsed && parsed.x402 && typeof parsed.x402 === "object") x402 = parsed.x402;
       } catch (e) {
         failures.push({ file, dir, reason: e.message });
         continue;
@@ -453,6 +479,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir }) {
         file,
         dir,
         wf,
+        x402,
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
         inputSchema: buildInputSchema(wf),
       });
@@ -498,13 +525,16 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir }) {
       ];
     },
 
-    /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
-    async callTool(params) {
+    /**
+     * Everything callTool checks before any money moves: tool exists, argument
+     * shapes are right, required inputs present, local media readable. The
+     * --charge gate runs this at quote time so a call that could never run is
+     * rejected before the caller is ever asked to pay. run_noodle is excluded
+     * (its validation is inseparable from decoding the link).
+     */
+    async prepareCall(params) {
       if (params == null || typeof params !== "object" || Array.isArray(params)) {
         throw new ParamsError("tools/call expects a params object with { name, arguments }");
-      }
-      if (params.name === RUN_NOODLE_NAME) {
-        return runNoodle(params, { apiKey, payment, baseUrl, outDir });
       }
       const tool = byName.get(params.name);
       if (!tool) {
@@ -516,11 +546,20 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir }) {
         throw new ParamsError("tools/call arguments must be an object");
       }
       const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
+      return { tool, inputs };
+    },
+
+    /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
+    async callTool(params) {
+      if (params != null && typeof params === "object" && !Array.isArray(params) && params.name === RUN_NOODLE_NAME) {
+        return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase });
+      }
+      const { tool, inputs } = await registry.prepareCall(params);
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const result = await tool.wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
       await recordCost(tool, result); // run_noodle never reaches here — its costs aren't tracked
-      return emitResult(tool.wf, result, tool.name, outDir);
+      return emitResult(tool.wf, result, tool.name, outDir, { publicBase });
     },
   };
   return registry;

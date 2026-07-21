@@ -7,14 +7,18 @@
 > command and no setup. This server is for when you've built up a *folder*
 > of saved graphs and want each one exposed to your agent as its own tool.
 
-Point this MCP stdio server at a folder of `noodle-graph.json` saves from the
+Point this MCP server at a folder of `noodle-graph.json` saves from the
 nanoodle editor and every graph becomes a callable tool with a derived input
 schema — in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, or anything
 else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
+It speaks stdio to your own agent by default, or HTTP to everyone with
+[serve mode](#serve-mode--host-your-noodles-as-a-service---serve) — including
+[charging per call in Nano](#charging-per-call---charge-usd), so strangers'
+agents can pay to run your noodles with no account anywhere.
 
 No middleman server, no telemetry — and with [wallet mode](#wallet-mode--no-account-no-api-key-x402),
-no account either. The MCP implementation here is hand-rolled (stdio, JSON-RPC
-2.0 — small enough to read). Two runtime dependencies:
+no account either. The MCP implementation here is hand-rolled (stdio +
+streamable HTTP, JSON-RPC 2.0 — small enough to read). Two runtime dependencies:
 [`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
 executor that does all the heavy lifting, and
 [`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) for signing
@@ -156,6 +160,128 @@ once and draw down a balance, that's exactly what a NanoGPT account is:
 [deposit crypto](https://docs.nano-gpt.com/api-reference/endpoint/crypto-deposits)
 (Nano included) into an account, take its API key, and run the server in
 normal BYOK mode — same tools, one payment instead of many.
+
+## Serve mode — host your noodles as a service (`--serve`)
+
+Everything above speaks MCP over stdio to *your own* agent. `--serve` speaks
+MCP over **streamable HTTP** instead, turning a directory of noodles into a
+service *anyone's* agent can connect to:
+
+```bash
+nanoodle-mcp --graphs ~/noodles --serve 8402
+```
+
+Callers connect with one command — no key, no signup:
+
+```bash
+claude mcp add --transport http noodles https://your-host/mcp
+```
+
+`GET /` serves a landing page with the tool list and that exact command, so
+sharing your server's bare URL *is* the onboarding. Generated media is served
+back under unguessable `/out/…` URLs (small images also ride inline in the
+tool result), and every call is appended to `<out>/usage.jsonl` so you can see
+what actually gets used.
+
+Free serve mode runs on **your** balance — fine on a trusted network, ruinous
+on the open internet. For that, charge for calls:
+
+### Charging per call (`--charge-usd`)
+
+```bash
+nanoodle-mcp --graphs ~/noodles --env-file wallet.env \
+  --serve 0.0.0.0:8402 --public-url https://noodles.example.com --charge-usd 0.05
+```
+
+Now every tool call is paid in Nano (XNO) **by the caller**, with no accounts
+on either side. The flow their agent walks through (the server's MCP
+`instructions` teach it automatically):
+
+1. First `tools/call` returns **PAYMENT REQUIRED** with a `payUrl` — a
+   self-contained pay page showing a QR code for the exact amount. The agent
+   shows its user the link; any Nano wallet scans it.
+2. The page flips to a green check the moment the payment lands (about a
+   second — the gate watches the chain by RPC polling, or push via
+   `--nano-ws`). The user tells their agent; the agent re-calls the tool with
+   the same arguments plus the `_payment_id` from step 1.
+3. The run executes and the result streams back with a payment receipt.
+   Re-calls with the same `_payment_id` replay the cached result free.
+
+Nano has no payment memo, so each quote's amount carries a few raw of random
+dust — **the amount is the memo**. Quotes expire after 15 minutes; a payment
+that arrives late is bounced straight back, and **a run that fails after
+payment is refunded automatically**. Arguments are validated *before* a quote
+is issued (nobody pays for a typo), and `run_noodle` is withdrawn in charge
+mode — an arbitrary share link's cost can't be priced up front.
+
+Pricing: `--charge-usd` is the default price; `--xno-usd` pins the conversion
+rate (default: live CoinGecko, cached). Per-graph overrides are a hand-added
+top-level block in the graph JSON:
+
+```json
+"x402": { "usd": 0.10, "author": "nano_1abc…" }
+```
+
+`usd` overrides the price. `author` routes **20% of every successful call,
+uncut, to that address** — point it at a graph author's wallet and useful
+noodles pay their makers. No field → your wallet keeps it all.
+
+The wallet (`NANO_SEED` / `NANO_PRIVATE_KEY`, via `--env-file`) receives
+payments, sends refunds and author payouts, and — if you don't set an API
+key — also pays NanoGPT per call via x402, making the whole service
+nano-in/nano-out. With an API key, runs spend from the key and the wallet only
+handles the customer side.
+
+### Payment detection
+
+Polling `receivable` on your Nano RPC node (1s while quotes are pending) is
+the always-on default. Add `--nano-ws wss://…` to subscribe to a Nano node
+websocket for push detection — settlement is then effectively instant and
+polling relaxes to a safety net. Public websockets exist (e.g.
+`wss://nanoslo.0x.no/websocket` worked at the time of writing); your own node
+is the dependable option. Either way the poller also checks `account_history`,
+so payments pocketed by a concurrently-running wallet are still found.
+
+### Usage log
+
+`<out>/usage.jsonl` gets one line per event (`quote`, `paid`, `run`, `refund`,
+`author_payout`) — your server's own log, nothing client-side. Some starters:
+
+```bash
+jq -r 'select(.event=="run") | .tool' usage.jsonl | sort | uniq -c | sort -rn   # calls per tool
+jq 'select(.event=="run") | .ms' usage.jsonl | jq -s add/length                 # mean run time
+jq 'select(.event=="paid") | .settleMs' usage.jsonl                             # quote→settle latency
+jq 'select(.event=="run" and .paid) | .usd' usage.jsonl | jq -s add             # gross revenue
+```
+
+### Hosting checklist
+
+- **Reverse proxy / tunnel**: bind localhost, put Caddy/nginx/cloudflared in
+  front for HTTPS, and set `--public-url` to the outside URL (it's what pay
+  links and media links are built from).
+- **systemd** (adjust paths):
+
+  ```ini
+  [Unit]
+  Description=nanoodle-mcp serve
+  After=network-online.target
+
+  [Service]
+  ExecStart=/usr/bin/npx nanoodle-mcp --graphs /srv/noodles --out /srv/noodle-out \
+    --env-file /srv/wallet.env --serve 8402 --public-url https://noodles.example.com \
+    --charge-usd 0.05 --work-rpc http://127.0.0.1:7076
+  Restart=on-failure
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+
+- **Keep the float small**: the wallet is hot. Sweep revenue to cold storage
+  regularly; if you run with an API key, cap that account's balance too.
+- **Work server**: refunds and payouts are Nano sends and need proof-of-work —
+  run `nano-work-server` locally (see wallet mode above) or they'll be slow.
+- There is intentionally **no auth**: on a charged server, payment is the
+  authorization. Don't serve graphs you wouldn't want strangers running.
 
 ## How it works
 
