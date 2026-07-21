@@ -30,7 +30,7 @@ const SEND_WORK_THRESHOLD = "fffffff800000000";
 const RECEIVE_WORK_THRESHOLD = "fffffe0000000000";
 
 /** raw → XNO display string (1 XNO = 10^30 raw), trimmed to something readable. */
-function rawToXno(raw) {
+export function rawToXno(raw) {
   const s = BigInt(raw).toString().padStart(31, "0");
   const whole = s.slice(0, -30);
   const frac = s.slice(-30, -30 + 8).replace(/0+$/, "");
@@ -178,29 +178,16 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     return false;
   }
 
-  async function paySend(invoice) {
-    if (!/^\d+$/.test(String(invoice.amountRaw || ""))) {
-      throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
-    }
-    if (!checkAddress(String(invoice.payTo || ""))) {
-      throw new Error(`x402 invoice payTo is not a valid Nano address: ${invoice.payTo}`);
-    }
-    if (maxUsd != null && invoice.amountUsd != null && invoice.amountUsd > maxUsd) {
-      throw new Error(
-        `x402 invoice is $${invoice.amountUsd.toFixed(4)}, over the --max-usd cap of $${maxUsd} — ` +
-        "raise the cap to allow calls this expensive (invoices are priced at the call's maximum; " +
-        "unused amount is refunded)");
-    }
-
-    const amount = BigInt(invoice.amountRaw);
-    let state = await pocketReceivables(await accountState());
-
+  /**
+   * Build, sign, and publish one send block from a known state. Handles the
+   * lost-response republish and the one stale-frontier rebuild. Returns the
+   * block hash. `describe` labels the log line ("paid", "refunded", …).
+   */
+  async function sendFrom(state, to, amount, describe = "sent", extra = "") {
     const insufficient = () => new Error(
-      `insufficient wallet balance: invoice is ${rawToXno(amount)} XNO` +
-      (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
+      `insufficient wallet balance: send is ${rawToXno(amount)} XNO` +
       ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
     if (amount > state.balance) throw insufficient();
-
     for (let attempt = 0; ; attempt++) {
       const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
       const { hash, block } = createBlock(secretKey, {
@@ -208,12 +195,12 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         previous: state.frontier,
         representative: state.representative,
         balance: (state.balance - amount).toString(),
-        link: invoice.payTo,
+        link: to,
       });
       // createBlock renders addresses with the legacy xrb_ prefix; same account, and the
       // signature covers the public key, so normalizing the display form is safe
       block.account = address;
-      block.link_as_account = invoice.payTo;
+      block.link_as_account = to;
       try {
         await rpc({ action: "process", json_block: "true", subtype: "send", block });
       } catch (e) {
@@ -235,20 +222,63 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         }
         else throw e;
       }
-      log(`x402: paid ${rawToXno(amount)} XNO` +
-        (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
-        ` to ${invoice.payTo} (block ${hash})`);
-      return;
+      log(`x402: ${describe} ${rawToXno(amount)} XNO${extra} to ${to} (block ${hash})`);
+      return hash;
     }
+  }
+
+  async function paySend(invoice) {
+    if (!/^\d+$/.test(String(invoice.amountRaw || ""))) {
+      throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
+    }
+    if (!checkAddress(String(invoice.payTo || ""))) {
+      throw new Error(`x402 invoice payTo is not a valid Nano address: ${invoice.payTo}`);
+    }
+    if (maxUsd != null && invoice.amountUsd != null && invoice.amountUsd > maxUsd) {
+      throw new Error(
+        `x402 invoice is $${invoice.amountUsd.toFixed(4)}, over the --max-usd cap of $${maxUsd} — ` +
+        "raise the cap to allow calls this expensive (invoices are priced at the call's maximum; " +
+        "unused amount is refunded)");
+    }
+
+    const amount = BigInt(invoice.amountRaw);
+    const state = await pocketReceivables(await accountState());
+    if (amount > state.balance) {
+      throw new Error(
+        `insufficient wallet balance: invoice is ${rawToXno(amount)} XNO` +
+        (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
+        ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
+    }
+    await sendFrom(state, invoice.payTo, amount, "paid",
+      invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "");
   }
 
   // Serialize sends — the queue survives failures (a rejected link must not wedge later payments).
   let queue = Promise.resolve();
-  const payment = (invoice) => {
-    const next = queue.then(() => paySend(invoice));
+  const enqueue = (fn) => {
+    const next = queue.then(fn);
     queue = next.catch(() => {});
     return next;
   };
+  const payment = (invoice) => enqueue(() => paySend(invoice));
 
-  return { address, payment };
+  return {
+    address,
+    payment,
+    /**
+     * Low-level operations for co-owners of this account (the --charge gate):
+     * everything that publishes blocks goes through the same queue as payments,
+     * so two writers never race on the frontier. `transfer` pockets receivables
+     * first — a refund's source funds usually ARE a pending receivable.
+     */
+    ops: {
+      rpc,
+      transfer: (to, amountRaw, describe = "sent") => enqueue(async () => {
+        if (!checkAddress(String(to || ""))) throw new Error(`not a valid Nano address: ${to}`);
+        const state = await pocketReceivables(await accountState());
+        return sendFrom(state, to, BigInt(amountRaw), describe);
+      }),
+      pocket: () => enqueue(async () => pocketReceivables(await accountState())),
+    },
+  };
 }

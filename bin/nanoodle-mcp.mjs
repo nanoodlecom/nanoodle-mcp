@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 /**
- * nanoodle-mcp — MCP stdio server that exposes saved nanoodle workflow graphs as tools.
+ * nanoodle-mcp — MCP server that exposes saved nanoodle workflow graphs as tools.
  *
  *   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+ *   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
+ *
+ * Default transport is MCP over stdio. --serve speaks MCP over streamable HTTP
+ * instead — host a directory of noodles as a service — and --charge-usd puts an
+ * x402 payment gate in front of every call: callers pay in Nano (XNO), no
+ * accounts anywhere, refunds on failed runs, optional per-graph author payouts.
  *
  * Every *.json noodle-graph save in a --graphs dir becomes one MCP tool. --graphs
  * may be repeated to serve several dirs (e.g. a per-project ./noodles plus a shared
@@ -21,16 +27,19 @@
  * leaks via `ps`. NANO_RPC_URL / --nano-rpc picks the Nano node (default rpc.nano.to);
  * --max-usd refuses any single invoice above $n.
  */
-import { readFile } from "node:fs/promises";
+import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
 import { loadTools } from "../src/tools.mjs";
 import { serveMcp } from "../src/server.mjs";
+import { serveHttp } from "../src/http.mjs";
+import { createChargeGate } from "../src/gate.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
 
 function usage(code = 1) {
   console.error(`usage:
   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+  nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
   nanoodle-mcp --version
 
   --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required;
@@ -39,16 +48,30 @@ function usage(code = 1) {
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
-  --nano-rpc u   Nano RPC node for wallet mode (default ${DEFAULT_NANO_RPC}; NANO_RPC_URL)
+  --nano-rpc u   Nano RPC node for wallet operations (default ${DEFAULT_NANO_RPC}; NANO_RPC_URL)
   --work-rpc u   dedicated work_generate endpoint, e.g. a local nano-work-server
                  (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work)
   --max-usd n    wallet mode: refuse any single x402 invoice above $n
+
+Serve mode (host your noodles over HTTP instead of stdio):
+  --serve [h:]p    speak MCP over streamable HTTP on [host:]port (default 127.0.0.1:8402);
+                   also serves a landing page, /pay pages, and generated media under /out/
+  --charge-usd n   charge callers $n per tool call, paid in Nano via x402 (default price;
+                   per-graph override: add "x402": {"usd": 0.10} to the graph JSON, and
+                   "x402": {"author": "nano_…"} to route 20% of every call to its author).
+                   Requires the wallet (NANO_SEED / NANO_PRIVATE_KEY) — it receives payments
+                   and sends refunds. Calls are logged to <out>/usage.jsonl either way.
+  --public-url u   absolute base URL callers see in pay links / media links
+                   (required in practice behind a reverse proxy or tunnel)
+  --nano-ws u      Nano node websocket (wss://…) for push payment detection;
+                   polling via --nano-rpc is the always-on fallback
+  --xno-usd n      static XNO/USD rate override (default: live CoinGecko, cached)
 
 No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
 each call's HTTP 402 invoice is paid in Nano (XNO) from that wallet via x402.
 Use a dedicated wallet with a small balance — it doubles as your spend cap.
 
-The server speaks MCP over stdio — wire it into an MCP client, don't run it by hand.
+Without --serve the server speaks MCP over stdio — wire it into an MCP client.
 Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).`);
   process.exit(code);
 }
@@ -57,6 +80,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const graphDirs = []; // --graphs is repeatable; order = precedence on name clashes
   let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null;
+  let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -72,6 +96,14 @@ async function main() {
     else if (a === "--nano-rpc") nanoRpcFlag = val("--nano-rpc");
     else if (a === "--work-rpc") workRpcFlag = val("--work-rpc");
     else if (a === "--max-usd") maxUsdFlag = val("--max-usd");
+    else if (a === "--serve") {
+      // the value is optional: `--serve` alone binds 127.0.0.1:8402
+      serveSpec = argv[i + 1] !== undefined && !argv[i + 1].startsWith("--") ? argv[++i] : "";
+    }
+    else if (a === "--charge-usd") chargeUsdFlag = val("--charge-usd");
+    else if (a === "--public-url") publicUrlFlag = val("--public-url");
+    else if (a === "--nano-ws") nanoWsFlag = val("--nano-ws");
+    else if (a === "--xno-usd") xnoUsdFlag = val("--xno-usd");
     else if (a === "--help" || a === "-h") usage(0);
     else if (a === "--version") {
       const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -85,6 +117,22 @@ async function main() {
     maxUsd = Number(maxUsdFlag);
     if (!Number.isFinite(maxUsd) || maxUsd <= 0) { console.error("--max-usd expects a positive number"); usage(); }
   }
+  const positive = (flag, v) => {
+    if (v == null) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) { console.error(`${flag} expects a positive number`); usage(); }
+    return n;
+  };
+  const chargeUsd = positive("--charge-usd", chargeUsdFlag);
+  const xnoUsd = positive("--xno-usd", xnoUsdFlag);
+  let serveHost = "127.0.0.1", servePort = 8402;
+  if (serveSpec !== null && serveSpec !== "") {
+    const m = serveSpec.match(/^(?:([^:]+):)?(\d+)$/);
+    if (!m) { console.error(`--serve expects [host:]port, got "${serveSpec}"`); usage(); }
+    if (m[1]) serveHost = m[1];
+    servePort = Number(m[2]);
+  }
+  if (chargeUsd != null && serveSpec === null) { console.error("--charge-usd only makes sense with --serve"); usage(); }
 
   // key precedence: --key > --env-file > NANOGPT_API_KEY (mirrors the nanoodle CLI)
   let apiKey = keyFlag ?? process.env.NANOGPT_API_KEY;
@@ -110,10 +158,12 @@ async function main() {
     }
   }
 
-  // wallet mode: accountless x402, only when there's no API key (a key always wins,
-  // matching the nanoodle library's own precedence)
+  // The wallet exists for two independent jobs: paying NanoGPT x402 invoices when
+  // there's no API key (a key always wins for runs, matching the library), and — in
+  // --charge-usd mode — receiving callers' payments and sending refunds/payouts,
+  // which is needed even when an API key funds the runs themselves.
   let wallet = null;
-  if (!apiKey && (nanoKey || nanoSeed)) {
+  if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null)) {
     try {
       wallet = createNanoWallet({
         secretKey: resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed }),
@@ -123,17 +173,30 @@ async function main() {
         log: (line) => console.error("nanoodle-mcp: " + line),
       });
     } catch (e) { console.error("nanoodle-mcp: " + e.message); process.exit(1); }
-  } else if (apiKey && (nanoKey || nanoSeed)) {
+  }
+  if (apiKey && (nanoKey || nanoSeed) && chargeUsd == null) {
     console.error("nanoodle-mcp: both an API key and a Nano wallet are configured — using the key (wallet ignored)");
+  }
+  if (chargeUsd != null && !wallet) {
+    console.error("nanoodle-mcp: --charge-usd needs a Nano wallet (NANO_SEED or NANO_PRIVATE_KEY, env or --env-file) " +
+      "to receive payments and send refunds");
+    process.exit(1);
+  }
+
+  const resolvedOut = resolve(outDir || "./nanoodle-out");
+  const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");
+  if (chargeUsd != null && serveHost === "0.0.0.0" && !publicUrlFlag) {
+    console.error("nanoodle-mcp: warning — charging on 0.0.0.0 without --public-url: pay links will point at 127.0.0.1");
   }
 
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const registry = await loadTools({
     dirs: graphDirs,
     apiKey,
-    payment: wallet ? wallet.payment : undefined,
+    payment: wallet && !apiKey ? wallet.payment : undefined,
     baseUrl: process.env.NANOGPT_BASE_URL || undefined,
-    outDir: resolve(outDir || "./nanoodle-out"),
+    outDir: resolvedOut,
+    publicBase: serveSpec !== null ? publicBase : null,
   });
 
   // With several dirs in play, a bare filename is ambiguous — qualify it with its dir.
@@ -162,16 +225,95 @@ async function main() {
 
   console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${dirList}`);
   for (const t of registry.tools) console.error(`  - ${t.name} (${label(t)}): ${t.description}`);
-  console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
+  if (serveSpec === null || chargeUsd == null) {
+    console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
+  } else {
+    console.error("  - run_noodle: disabled in charge mode (arbitrary share links can't be priced up front)");
+  }
 
-  const srv = serveMcp({
+  if (serveSpec === null) {
+    const srv = serveMcp({
+      name: "nanoodle-mcp",
+      version: pkg.version,
+      listTools: () => registry.listTools(),
+      callTool: (params) => registry.callTool(params),
+    });
+    // A run's observed cost lands in the tool's description — tell the client to re-list.
+    registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
+    return;
+  }
+
+  /* ---- --serve: MCP over streamable HTTP, optionally charging per call ---- */
+
+  // Append-only per-call log — the operator's own server log, nothing client-side.
+  const usagePath = join(resolvedOut, "usage.jsonl");
+  let usageChain = Promise.resolve();
+  const usageLog = (event, fields) => {
+    const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
+    usageChain = usageChain
+      .then(() => mkdir(resolvedOut, { recursive: true }))
+      .then(() => appendFile(usagePath, line))
+      .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
+  };
+
+  let listTools = () => registry.listTools();
+  let callTool;
+  let gate = null;
+  let instructions;
+  if (chargeUsd != null) {
+    gate = createChargeGate({
+      address: wallet.address,
+      ops: wallet.ops,
+      usd: chargeUsd,
+      validate: (p) => registry.prepareCall(p),
+      xnoUsd,
+      wsUrl: nanoWsFlag || null,
+      publicBase,
+      log: (line) => console.error("nanoodle-mcp: " + line),
+      usage: usageLog,
+    });
+    ({ listTools, callTool } = gate.wrapRegistry(registry));
+    instructions =
+      "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
+      "Calling a tool normally returns PAYMENT REQUIRED with a payment link: show that link to your user " +
+      "(it renders a QR code and confirms on-screen when the payment lands, usually within a second), then " +
+      "call the same tool again with identical arguments plus the given _payment_id. Quotes expire after " +
+      "15 minutes. If a run fails after payment, the payment is refunded automatically.";
+  } else {
+    // Free serve mode still logs runs, so the operator can see what gets used.
+    callTool = async (params) => {
+      const t0 = Date.now();
+      const tool = params && typeof params === "object" && !Array.isArray(params) ? params.name : undefined;
+      try {
+        const r = await registry.callTool(params);
+        usageLog("run", { tool, ok: !r.isError, ms: Date.now() - t0, paid: false });
+        return r;
+      } catch (e) {
+        usageLog("run", { tool, ok: false, ms: Date.now() - t0, paid: false, error: String((e && e.message) || e) });
+        throw e;
+      }
+    };
+  }
+
+  await serveHttp({
+    host: serveHost,
+    port: servePort,
     name: "nanoodle-mcp",
     version: pkg.version,
-    listTools: () => registry.listTools(),
-    callTool: (params) => registry.callTool(params),
+    listTools,
+    callTool,
+    instructions,
+    gate,
+    outDir: resolvedOut,
+    publicBase,
+    log: (...a) => console.error(...a),
   });
-  // A run's observed cost lands in the tool's description — tell the client to re-list.
-  registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
+  console.error(`nanoodle-mcp: MCP over HTTP on http://${serveHost}:${servePort}/mcp` +
+    (chargeUsd != null
+      ? ` — charging $${chargeUsd}/call in XNO to ${wallet.address}`
+      : " — free (runs spend from this server's balance)"));
+  console.error(`nanoodle-mcp: connect with: claude mcp add --transport http noodles ${publicBase}/mcp`);
+  console.error(`nanoodle-mcp: usage log: ${usagePath}`);
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
