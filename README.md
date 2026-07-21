@@ -181,9 +181,10 @@ money is spent**; a run that fails (network, model error, missing key) comes
 back as a normal tool result with `isError: true`.
 
 ```
-usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--work-rpc url] [--max-usd n]
+usage: nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--work-rpc url] [--max-usd n]
 
-  --graphs dir   directory of noodle-graph.json saves (required)
+  --graphs dir   directory of noodle-graph.json saves (required; repeat to serve
+                 several dirs — scanned in order, so an earlier dir wins name clashes)
   --out dir      where media outputs are saved (default ./nanoodle-out)
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY / NANO_WORK_URL from a .env-style file
@@ -195,8 +196,25 @@ usage: nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--na
 
 Key precedence matches the nanoodle CLI: `--key` > `--env-file` >
 `NANOGPT_API_KEY`; wallet secrets come only from the environment or
-`--env-file`, never argv. The server refuses to start if the directory holds
-no runnable graphs, and says why per file on stderr; stdout is protocol only.
+`--env-file`, never argv. The server refuses to start if no directory holds a
+runnable graph, and says why per file on stderr; stdout is protocol only.
+
+### Per-project graphs + a shared library
+
+`--graphs` is repeatable, so one server can merge several folders. The pattern:
+commit a `noodles/` dir to a repo for that project's own tools, then list your
+global library after it as a fallback:
+
+```
+nanoodle-mcp --graphs ./noodles --graphs ~/noodles
+```
+
+Dirs are scanned in the order given, and **the earlier dir wins a name clash**:
+if both folders have a `changelog.json`, the project's becomes `changelog` and
+the shared one becomes `changelog-2`. So a project can override a shared tool
+just by dropping a same-named graph in `./noodles`, while everything else in
+`~/noodles` stays available. An unreadable dir (a typo, a folder that isn't
+there) is a hard startup error naming the offender — no silent half-load.
 
 ## Run any share link
 

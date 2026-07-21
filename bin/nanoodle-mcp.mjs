@@ -2,9 +2,12 @@
 /**
  * nanoodle-mcp — MCP stdio server that exposes saved nanoodle workflow graphs as tools.
  *
- *   nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+ *   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
  *
- * Every *.json noodle-graph save in --graphs becomes one MCP tool. Each tools/call
+ * Every *.json noodle-graph save in a --graphs dir becomes one MCP tool. --graphs
+ * may be repeated to serve several dirs (e.g. a per-project ./noodles plus a shared
+ * ~/noodles); dirs are scanned in order, so on a name clash the earlier one wins.
+ * Each tools/call
  * runs the workflow on the NanoGPT API and SPENDS from your key's balance — or, in
  * wallet mode, pays each call's x402 invoice in Nano from your own wallet.
  *
@@ -19,7 +22,7 @@
  * --max-usd refuses any single invoice above $n.
  */
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import process from "node:process";
 import { loadTools } from "../src/tools.mjs";
 import { serveMcp } from "../src/server.mjs";
@@ -27,10 +30,11 @@ import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wal
 
 function usage(code = 1) {
   console.error(`usage:
-  nanoodle-mcp --graphs <dir> [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+  nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
   nanoodle-mcp --version
 
-  --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required)
+  --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required;
+                 repeat to serve several dirs — scanned in order, so an earlier dir wins name clashes)
   --out dir      where media outputs are saved (default ./nanoodle-out)
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
@@ -51,7 +55,8 @@ Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).`
 
 async function main() {
   const argv = process.argv.slice(2);
-  let graphsDir = null, outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null;
+  const graphDirs = []; // --graphs is repeatable; order = precedence on name clashes
+  let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -60,7 +65,7 @@ async function main() {
   };
   for (; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--graphs") graphsDir = val("--graphs");
+    if (a === "--graphs") graphDirs.push(val("--graphs"));
     else if (a === "--out") outDir = val("--out");
     else if (a === "--key") keyFlag = val("--key");
     else if (a === "--env-file") envFile = val("--env-file");
@@ -74,7 +79,7 @@ async function main() {
       process.exit(0);
     } else { console.error("unknown argument: " + a); usage(); }
   }
-  if (!graphsDir) { console.error("--graphs <dir> is required"); usage(); }
+  if (!graphDirs.length) { console.error("--graphs <dir> is required"); usage(); }
   let maxUsd = null;
   if (maxUsdFlag != null) {
     maxUsd = Number(maxUsdFlag);
@@ -124,18 +129,22 @@ async function main() {
 
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const registry = await loadTools({
-    dir: graphsDir,
+    dirs: graphDirs,
     apiKey,
     payment: wallet ? wallet.payment : undefined,
     baseUrl: process.env.NANOGPT_BASE_URL || undefined,
     outDir: resolve(outDir || "./nanoodle-out"),
   });
 
+  // With several dirs in play, a bare filename is ambiguous — qualify it with its dir.
+  const multiDir = graphDirs.length > 1;
+  const label = (rec) => (multiDir ? join(rec.dir, rec.file) : rec.file);
+  const dirList = graphDirs.map((d) => resolve(d)).join(", ");
   for (const f of registry.failures) {
-    console.error(`nanoodle-mcp: skipping ${f.file}: ${f.reason}`);
+    console.error(`nanoodle-mcp: skipping ${label(f)}: ${f.reason}`);
   }
   if (!registry.tools.length) {
-    console.error(`nanoodle-mcp: no runnable graphs in ${resolve(graphsDir)} — ` +
+    console.error(`nanoodle-mcp: no runnable graphs in ${dirList} — ` +
       (registry.failures.length
         ? "every .json file was skipped (reasons above)."
         : "no .json files found. Save workflows from the nanoodle editor (💾 → noodle-graph.json) into that directory."));
@@ -151,8 +160,8 @@ async function main() {
       (workUrl ? `, work via ${workUrl}` : ""));
   }
 
-  console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${resolve(graphsDir)}`);
-  for (const t of registry.tools) console.error(`  - ${t.name} (${t.file}): ${t.description}`);
+  console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${dirList}`);
+  for (const t of registry.tools) console.error(`  - ${t.name} (${label(t)}): ${t.description}`);
   console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
 
   const srv = serveMcp({

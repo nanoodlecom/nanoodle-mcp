@@ -1,7 +1,7 @@
 /**
- * Graph directory → MCP tool registry.
+ * Graph directories → MCP tool registry.
  *
- * Each readable noodle-graph.json in the directory becomes one tool:
+ * Each readable noodle-graph.json across the directories becomes one tool:
  *   - name        = filename minus .json, sanitized to [a-z0-9_-]
  *   - description = comment intent + node chain + output contract + last observed cost
  *                   ("Draft a tagline. text:Idea -> llm; returns text. Runs on NanoGPT …")
@@ -395,10 +395,16 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir }) {
 }
 
 /**
- * Scan `dir` for graphs and build the tool registry.
- * @returns {{ tools: Array, failures: Array<{file, reason}>, listTools(), callTool(params) }}
+ * Scan each dir in `dirs` for graphs and build the tool registry.
+ *
+ * Directories are scanned in the order given, so on a tool-name collision the
+ * earlier directory keeps the bare name and later ones get `-2`/`-3` suffixes
+ * (the usedNames dedup below) — a per-project dir listed first shadows a shared
+ * library listed after it. Failures and tools carry their source `dir` so the
+ * same filename in two directories stays distinguishable in logs.
+ * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -408,43 +414,49 @@ export async function loadTools({ dir, apiKey, payment, baseUrl, outDir }) {
     const parsed = JSON.parse(await readFile(costsPath, "utf8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) costs = parsed;
   } catch { /* missing or corrupt → no cost segments yet */ }
-  let entries;
-  try {
-    entries = await readdir(dir);
-  } catch (e) {
-    throw new Error(`cannot read --graphs directory ${dir}: ${e.message}`);
-  }
-  const files = entries.filter((f) => f.toLowerCase().endsWith(".json")).sort();
   const tools = [];
   const failures = [];
   // Seed the reserved run_noodle name so a file that sanitizes to it gets suffixed, not shadowed.
+  // Shared across every dir, so the first-scanned occurrence of a name wins it.
   const usedNames = new Map([[RUN_NOODLE_NAME, 1]]);
 
-  for (const file of files) {
-    const path = join(dir, file);
-    let wf;
+  for (const dir of dirs) {
+    let entries;
     try {
-      wf = Workflow.fromJSON(await readFile(path, "utf8"), { apiKey, payment, baseUrl, quiet: true });
+      entries = await readdir(dir);
     } catch (e) {
-      failures.push({ file, reason: e.message });
-      continue;
+      // An unreadable dir is a hard startup error, naming the specific one — a typo
+      // in a merged list must not silently degrade to "some of your graphs loaded".
+      throw new Error(`cannot read --graphs directory ${dir}: ${e.message}`);
     }
-    if (wf.warnings.length) {
-      // unknown / browser-only node types: the graph loads but run() would always refuse
-      failures.push({ file, reason: wf.warnings.join("; ") });
-      continue;
+    const files = entries.filter((f) => f.toLowerCase().endsWith(".json")).sort();
+    for (const file of files) {
+      const path = join(dir, file);
+      let wf;
+      try {
+        wf = Workflow.fromJSON(await readFile(path, "utf8"), { apiKey, payment, baseUrl, quiet: true });
+      } catch (e) {
+        failures.push({ file, dir, reason: e.message });
+        continue;
+      }
+      if (wf.warnings.length) {
+        // unknown / browser-only node types: the graph loads but run() would always refuse
+        failures.push({ file, dir, reason: wf.warnings.join("; ") });
+        continue;
+      }
+      let name = sanitizeName(file);
+      const count = (usedNames.get(name) || 0) + 1;
+      usedNames.set(name, count);
+      if (count > 1) name = `${name}-${count}`;
+      tools.push({
+        name,
+        file,
+        dir,
+        wf,
+        description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
+        inputSchema: buildInputSchema(wf),
+      });
     }
-    let name = sanitizeName(file);
-    const count = (usedNames.get(name) || 0) + 1;
-    usedNames.set(name, count);
-    if (count > 1) name = `${name}-${count}`;
-    tools.push({
-      name,
-      file,
-      wf,
-      description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
-      inputSchema: buildInputSchema(wf),
-    });
   }
 
   const byName = new Map(tools.map((t) => [t.name, t]));
