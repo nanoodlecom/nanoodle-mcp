@@ -57,7 +57,9 @@ after(() => new Promise((r) => apiServer.close(r)));
 
 /* ---- tiny MCP client over the child's stdio ---- */
 function startServer({ graphs = FIXTURES, outDir, env = {} } = {}) {
-  const child = spawn(process.execPath, [BIN, "--graphs", graphs, ...(outDir ? ["--out", outDir] : [])], {
+  // `graphs` is one dir or several — each becomes its own repeated --graphs flag.
+  const graphArgs = (Array.isArray(graphs) ? graphs : [graphs]).flatMap((g) => ["--graphs", g]);
+  const child = spawn(process.execPath, [BIN, ...graphArgs, ...(outDir ? ["--out", outDir] : [])], {
     env: { ...process.env, NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: apiUrl, ...env },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -496,7 +498,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
     [t("n1"), { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "m" } }, { id: "n3", type: "image", x: 0, y: 0, fields: { model: "img-model" } }],
     [link("l1", ["n1", "text"], ["n2", "prompt"]), link("l2", ["n1", "text"], ["n3", "prompt"])]));
 
-  const reg = await loadTools({ dir, apiKey: "test-key", outDir: dir });
+  const reg = await loadTools({ dirs: [dir], apiKey: "test-key", outDir: dir });
   assert.deepEqual(reg.failures, []);
   const desc = Object.fromEntries(reg.tools.map((x) => [x.name, x.description]));
 
@@ -543,7 +545,7 @@ test("tool descriptions: the first comment node leads as the tool's intent", asy
   // comment-only graph: no chain, no outputs — must not crash, intent stands alone
   await writeFile(join(dir, "only-comment.json"), graph([comment("c1", "Just a note")]));
 
-  const reg = await loadTools({ dir, apiKey: "test-key", outDir: dir });
+  const reg = await loadTools({ dirs: [dir], apiKey: "test-key", outDir: dir });
   assert.deepEqual(reg.failures, []);
   const desc = Object.fromEntries(reg.tools.map((x) => [x.name, x.description]));
 
@@ -570,7 +572,7 @@ test("cost sidecar: a run records its price, re-renders the description, and not
     links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
   }));
 
-  const reg = await loadTools({ dir, apiKey: "test-key", baseUrl: apiUrl, outDir });
+  const reg = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: apiUrl, outDir });
   let notified = 0;
   reg.onToolsChanged = () => notified++;
   assert.ok(!reg.tools[0].description.includes("last run"), "no cost segment before any run");
@@ -588,7 +590,7 @@ test("cost sidecar: a run records its price, re-renders the description, and not
   assert.equal(notified, 1);
 
   // a fresh registry picks the recorded cost up at startup
-  const reg2 = await loadTools({ dir, apiKey: "test-key", baseUrl: apiUrl, outDir });
+  const reg2 = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: apiUrl, outDir });
   assert.match(reg2.tools[0].description, /last run \$0\.0012\.$/);
 });
 
@@ -604,7 +606,7 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
     ],
     links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
   }));
-  const load = async () => (await loadTools({ dir, apiKey: "test-key", outDir })).tools[0].description;
+  const load = async () => (await loadTools({ dirs: [dir], apiKey: "test-key", outDir })).tools[0].description;
   const at = "2026-07-19T00:00:00.000Z";
   const withRec = async (rec) => {
     await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: rec }));
@@ -625,6 +627,88 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
   assert.ok(!(await load()).includes("last run"));
   await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: { usd: "expensive", at } }));
   assert.ok(!(await load()).includes("last run"));
+});
+
+/* ========================= multiple --graphs dirs ========================= */
+
+// Minimal runnable graph (text -> llm, no warnings) written under `name` in `dir`.
+const writeGraph = (dir, name) => writeFile(join(dir, name), JSON.stringify({
+  v: 1,
+  nodes: [
+    { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+    { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "m" } },
+  ],
+  links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
+}));
+
+test("multiple --graphs dirs merge into one tool set, each tool tagged with its source dir", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const a = await mkdtemp(join(tmpdir(), "nanoodle-mcp-multi-a-"));
+  const b = await mkdtemp(join(tmpdir(), "nanoodle-mcp-multi-b-"));
+  await writeGraph(a, "alpha.json");
+  await writeGraph(b, "beta.json");
+
+  const reg = await loadTools({ dirs: [a, b], apiKey: "test-key", outDir: a });
+  assert.deepEqual(reg.failures, []);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta"]);
+  // each tool remembers which dir it came from (keeps same-named files distinguishable)
+  assert.equal(reg.tools.find((t) => t.name === "alpha").dir, a);
+  assert.equal(reg.tools.find((t) => t.name === "beta").dir, b);
+});
+
+test("collision across dirs: the first dir wins the bare name, later dirs get a suffix", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const proj = await mkdtemp(join(tmpdir(), "nanoodle-mcp-proj-"));
+  const shared = await mkdtemp(join(tmpdir(), "nanoodle-mcp-shared-"));
+  await writeGraph(proj, "tagline.json");
+  await writeGraph(shared, "tagline.json");
+
+  const reg = await loadTools({ dirs: [proj, shared], apiKey: "test-key", outDir: proj });
+  const bare = reg.tools.find((t) => t.name === "tagline");
+  const suffixed = reg.tools.find((t) => t.name === "tagline-2");
+  assert.ok(bare && suffixed, "expected tagline + tagline-2: " + reg.tools.map((t) => t.name).join(", "));
+  // first dir (per-project) keeps the bare name; the shared library falls back to the suffix
+  assert.equal(bare.dir, proj);
+  assert.equal(suffixed.dir, shared);
+});
+
+test("single --graphs dir behaves exactly as before (bare names, no suffixes)", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-single-"));
+  await writeGraph(dir, "one.json");
+  await writeGraph(dir, "two.json");
+
+  const reg = await loadTools({ dirs: [dir], apiKey: "test-key", outDir: dir });
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "two"]);
+});
+
+test("an unreadable --graphs dir is a hard error naming the specific dir", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const good = await mkdtemp(join(tmpdir(), "nanoodle-mcp-good-"));
+  await writeGraph(good, "ok.json");
+  const missing = join(tmpdir(), "nanoodle-mcp-does-not-exist-" + Date.now());
+
+  await assert.rejects(
+    loadTools({ dirs: [good, missing], apiKey: "test-key", outDir: good }),
+    (e) => e.message.includes(missing) && /cannot read --graphs directory/.test(e.message),
+  );
+});
+
+test("the bin passes several --graphs flags through and merges their tools", async () => {
+  const extra = await mkdtemp(join(tmpdir(), "nanoodle-mcp-extra-"));
+  await writeGraph(extra, "extra-tool.json");
+  const srv = startServer({ graphs: [FIXTURES, extra] });
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+    const list = await srv.request("tools/list");
+    const names = list.result.tools.map((t) => t.name);
+    // fixtures' tools and the second dir's tool both show up, alongside run_noodle
+    assert.ok(names.includes("hello-noodle"), "fixtures dir should still load: " + names.join(", "));
+    assert.ok(names.includes("extra-tool"), "second dir should merge in: " + names.join(", "));
+    assert.ok(names.includes("run_noodle"));
+  } finally {
+    await srv.close();
+  }
 });
 
 test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () => {
