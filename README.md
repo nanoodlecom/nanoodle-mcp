@@ -214,17 +214,28 @@ payment is refunded automatically**. Arguments are validated *before* a quote
 is issued (nobody pays for a typo), and `run_noodle` is withdrawn in charge
 mode — an arbitrary share link's cost can't be priced up front.
 
-Pricing: `--charge-usd` is the default price; `--xno-usd` pins the conversion
-rate (default: live CoinGecko, cached). Per-graph overrides are a hand-added
-top-level block in the graph JSON:
+Pricing: `--charge-usd` is the default price. The XNO conversion rate comes
+from **NanoGPT itself**: the gate fires a keyless `x-x402` probe and reads the
+invoice's raw-XNO/USD pair — the same rate your downstream payments settle at,
+so quotes and costs can never drift apart on FX, and no market-data service is
+involved (probe invoices are never paid; they just expire). Cached 60s, stale
+cache rides out probe outages, and `--xno-usd` forces a static rate if you
+ever need one. Per-graph overrides are a hand-added top-level block in the
+graph JSON:
 
 ```json
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
 ```
 
-`usd` overrides the price. `author` routes **20% of every successful call,
-uncut, to that address** — point it at a graph author's wallet and useful
-noodles pay their makers. No field → your wallet keeps it all.
+`usd` overrides the price. `author` routes **the full margin of every
+successful call — the charge minus the metered model cost — to that address**.
+Nano has no network fees and this server takes no cut, so creators keep 100%
+of what their noodle earns; the conversion uses the same NanoGPT rate the
+quote was priced at, with the cost rounded up so payouts only ever round down
+(by at most 1e-8 XNO). A run that costs more than its price pays out nothing —
+the operator absorbs the loss. No `author` field → your wallet keeps the
+margin. All amounts are integer raw end to end; floats never touch an
+on-chain value.
 
 The wallet (`NANO_SEED` / `NANO_PRIVATE_KEY`, via `--env-file`) receives
 payments, sends refunds and author payouts, and — if you don't set an API

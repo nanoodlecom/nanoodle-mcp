@@ -377,7 +377,9 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null } = {}
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
     content.push({ type: "text", text: `cost: $${result.costUsd.toFixed(4)}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
   }
-  return { content };
+  // costUsd rides as a structured sidecar for the --charge gate's margin math
+  // (author payout = charge − cost); the serving layers strip it before replying.
+  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null };
 }
 
 /**
