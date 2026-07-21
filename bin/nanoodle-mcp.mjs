@@ -55,6 +55,10 @@ function usage(code = 1) {
                  NANO_WORK_KEY — env or --env-file, never a flag — adds the API key as
                  both a \`key\` body field and a \`nodes-api-key\` header)
   --max-usd n    wallet mode: refuse any single x402 invoice above $n
+  --no-local-work  never compute proof-of-work on this machine's CPU — if every
+                 remote work source fails, the send fails cleanly instead. Local
+                 CPU work blocks the whole process for minutes; recommended off
+                 in --serve mode when --work-rpc points somewhere dependable
 
 Serve mode (host your noodles over HTTP instead of stdio):
   --serve [h:]p    speak MCP over streamable HTTP on [host:]port (default 127.0.0.1:8402);
@@ -86,7 +90,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const graphDirs = []; // --graphs is repeatable; order = precedence on name clashes
   let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null;
-  let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null;
+  let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null, noLocalWork = false;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -110,6 +114,7 @@ async function main() {
     else if (a === "--public-url") publicUrlFlag = val("--public-url");
     else if (a === "--nano-ws") nanoWsFlag = val("--nano-ws");
     else if (a === "--xno-usd") xnoUsdFlag = val("--xno-usd");
+    else if (a === "--no-local-work") noLocalWork = true;
     else if (a === "--help" || a === "-h") usage(0);
     else if (a === "--version") {
       const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -180,6 +185,7 @@ async function main() {
         rpcUrl: nanoRpcFlag || process.env.NANO_RPC_URL || undefined,
         workUrl,
         workKey,
+        localWork: !noLocalWork,
         maxUsd,
         log: (line) => console.error("nanoodle-mcp: " + line),
       });

@@ -223,6 +223,18 @@ test("a hung work server times out and falls through to the node's work", async 
   assert.ok(logs.some((l) => /work_generate via work server http:\/\/slow\.local failed/.test(l)));
 });
 
+test("localWork: false fails the send cleanly when every remote work source is down", async () => {
+  const rpc = fakeRpc({ work_generate: (_b, _s, reply) => reply({ error: "work generation is disabled" }) });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch, localWork: false });
+  await assert.rejects(() => wallet.payment(invoice()), /remote work source failed.*--no-local-work/s);
+  assert.equal(rpc.state.processed.length, 0, "no block may be published without work");
+  // the queue survives: a later payment with working sources goes through
+  const ok = fakeRpc();
+  const wallet2 = createNanoWallet({ secretKey: SECRET, fetch: ok.fetch, localWork: false });
+  await wallet2.payment(invoice());
+  assert.equal(ok.state.processed.length, 1);
+});
+
 test("paySend: a failed payment doesn't wedge the queue", async () => {
   const rpc = fakeRpc();
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch, maxUsd: 0.001 });

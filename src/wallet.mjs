@@ -60,7 +60,7 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl = null, workKey = null, workTimeoutMs = 120_000, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl = null, workKey = null, workTimeoutMs = 120_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
@@ -152,6 +152,14 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     }
     const w = await remoteWork(frontier, threshold);
     if (w != null) return w;
+    if (!localWork) {
+      // Local CPU work runs on the main thread — in serve mode a send-difficulty
+      // grind (minutes) would freeze the whole HTTP server, so operators with
+      // dependable remote work sources turn it off and let the send fail cleanly
+      // (a failed payment is refused up front; a failed refund/payout send stays
+      // in the wallet and the next settle's pocket/queue picks the balance up).
+      throw new Error("every remote work source failed and local CPU work is disabled (--no-local-work)");
+    }
     log("computing work locally, this can take a while");
     return computeWork(frontier, { workThreshold: threshold });
   }
