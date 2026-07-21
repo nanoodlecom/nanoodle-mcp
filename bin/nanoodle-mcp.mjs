@@ -49,8 +49,11 @@ function usage(code = 1) {
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
   --nano-rpc u   Nano RPC node for wallet operations (default ${DEFAULT_NANO_RPC}; NANO_RPC_URL)
-  --work-rpc u   dedicated work_generate endpoint, e.g. a local nano-work-server
-                 (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work)
+  --work-rpc u   dedicated work_generate endpoint — a local nano-work-server or a hosted
+                 GPU work API like rpc.nano.to or nodes.nanswap.com
+                 (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work.
+                 NANO_WORK_KEY — env or --env-file, never a flag — adds the API key as
+                 both a \`key\` body field and a \`nodes-api-key\` header)
   --max-usd n    wallet mode: refuse any single x402 invoice above $n
 
 Serve mode (host your noodles over HTTP instead of stdio):
@@ -65,7 +68,8 @@ Serve mode (host your noodles over HTTP instead of stdio):
   --public-url u   absolute base URL callers see in pay links / media links
                    (required in practice behind a reverse proxy or tunnel)
   --nano-ws u      Nano node websocket (wss://…) for push payment detection;
-                   polling via --nano-rpc is the always-on fallback
+                   polling via --nano-rpc is the always-on fallback (NANO_WS_URL —
+                   env or --env-file — keeps a key-bearing ws URL off the command line)
   --xno-usd n      static XNO/USD rate override (default: NanoGPT's own x402 invoices
                    are the rate oracle — the rate we pay is the rate we charge; cached 60s)
 
@@ -141,6 +145,8 @@ async function main() {
   // wallet material: --env-file > environment; never argv (it leaks via `ps`)
   let nanoSeed = process.env.NANO_SEED, nanoKey = process.env.NANO_PRIVATE_KEY;
   let workUrl = workRpcFlag || process.env.NANO_WORK_URL || null;
+  let workKey = process.env.NANO_WORK_KEY || null;
+  let nanoWs = nanoWsFlag || process.env.NANO_WS_URL || null;
   if (envFile) {
     let envText;
     try { envText = await readFile(envFile, "utf8"); }
@@ -154,6 +160,8 @@ async function main() {
     nanoSeed = entry("NANO_SEED") ?? nanoSeed;
     nanoKey = entry("NANO_PRIVATE_KEY") ?? nanoKey;
     if (!workRpcFlag) workUrl = entry("NANO_WORK_URL") ?? workUrl;
+    workKey = entry("NANO_WORK_KEY") ?? workKey;
+    if (!nanoWsFlag) nanoWs = entry("NANO_WS_URL") ?? nanoWs;
     if (!fileKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined) {
       console.error(`--env-file: no NANOGPT_API_KEY, NANO_SEED, or NANO_PRIVATE_KEY entry in ${envFile}`);
       process.exit(1);
@@ -171,6 +179,7 @@ async function main() {
         secretKey: resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed }),
         rpcUrl: nanoRpcFlag || process.env.NANO_RPC_URL || undefined,
         workUrl,
+        workKey,
         maxUsd,
         log: (line) => console.error("nanoodle-mcp: " + line),
       });
@@ -222,7 +231,7 @@ async function main() {
   if (wallet) {
     console.error(`nanoodle-mcp: wallet mode (accountless x402) — paying from ${wallet.address}` +
       (maxUsd != null ? `, capped at $${maxUsd}/call` : ", no per-call cap (--max-usd)") +
-      (workUrl ? `, work via ${workUrl}` : ""));
+      (workUrl ? `, work via ${workUrl}${workKey ? " (keyed)" : ""}` : ""));
   }
 
   console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${dirList}`);
@@ -248,6 +257,10 @@ async function main() {
 
   /* ---- --serve: MCP over streamable HTTP, optionally charging per call ---- */
 
+  // Long-lived server: have send work ready before the first payment arrives.
+  // (Not done in stdio mode — a session that never pays would waste one work per boot.)
+  if (wallet) wallet.ops.prewarm();
+
   // Append-only per-call log — the operator's own server log, nothing client-side.
   const usagePath = join(resolvedOut, "usage.jsonl");
   let usageChain = Promise.resolve();
@@ -271,7 +284,7 @@ async function main() {
       validate: (p) => registry.prepareCall(p),
       xnoUsd,
       oracleBase: process.env.NANOGPT_BASE_URL || undefined,
-      wsUrl: nanoWsFlag || null,
+      wsUrl: nanoWs,
       publicBase,
       log: (line) => console.error("nanoodle-mcp: " + line),
       usage: usageLog,

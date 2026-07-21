@@ -31,7 +31,7 @@ const WORK = "bbbbbbbbbbbbbbbb";
 
 /** In-memory Nano RPC: account_info / work_generate / receivable / process, with a frontier that advances. */
 function fakeRpc(overrides = {}) {
-  const state = { frontier: FRONTIER, balance: BALANCE, processed: [], workDifficulties: [], infoCalls: 0 };
+  const state = { frontier: FRONTIER, balance: BALANCE, processed: [], workDifficulties: [], workHashes: [], infoCalls: 0 };
   const fetch = async (url, init) => {
     const body = JSON.parse(init.body);
     const reply = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
@@ -42,6 +42,7 @@ function fakeRpc(overrides = {}) {
     }
     if (body.action === "work_generate") {
       state.workDifficulties.push(body.difficulty);
+      state.workHashes.push(body.hash);
       assert.ok(["fffffff800000000", "fffffe0000000000"].includes(body.difficulty),
         "work difficulty must be the v21 send or receive threshold");
       return reply({ work: WORK });
@@ -121,6 +122,7 @@ test("paySend: workUrl routes work_generate to the work server, everything else 
       ["receivable", DEFAULT_NANO_RPC],
       ["work_generate", "http://127.0.0.1:7076"], // trailing slash trimmed
       ["process", DEFAULT_NANO_RPC],
+      ["work_generate", "http://127.0.0.1:7076"], // precompute for the new frontier
     ]);
   assert.equal(rpc.state.processed[0].block.work, WORK);
 });
@@ -141,6 +143,84 @@ test("paySend: a dead work server falls back to the node's work_generate", async
   assert.equal(rpc.state.processed[0].block.work, WORK);
   assert.ok(logs.some((l) => /work_generate via work server http:\/\/dead\.local failed/.test(l)),
     "the fallback must be logged");
+});
+
+test("precompute: the next send finds work already generated for the fresh frontier", async () => {
+  const { hashBlock } = await import("nanocurrency");
+  // advance the fake frontier to the block's REAL hash, like a real node does —
+  // that's what makes the precompute cache line up with the next account_info
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      state.processed.push(body);
+      const b = body.block;
+      state.frontier = hashBlock({ account: b.account, previous: b.previous, representative: b.representative, balance: b.balance, link: b.link });
+      state.balance = b.balance;
+      return reply({ hash: state.frontier });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  assert.deepEqual(rpc.state.workHashes, [FRONTIER, rpc.state.frontier],
+    "publishing must precompute work for the new frontier");
+  await wallet.payment(invoice({ paymentId: "pay_2" }));
+  assert.equal(rpc.state.processed.length, 2);
+  assert.equal(rpc.state.workHashes.length, 3,
+    "the second send must consume the precomputed work instead of asking again");
+  assert.equal(rpc.state.workHashes[2], rpc.state.frontier);
+});
+
+test("ops.prewarm readies work for the session's first block", async () => {
+  const rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.ops.prewarm();
+  assert.deepEqual(rpc.state.workHashes, [FRONTIER]);
+  await wallet.payment(invoice());
+  // the send consumed the prewarmed work — only the post-send precompute was added
+  assert.equal(rpc.state.workHashes.length, 2);
+  assert.equal(rpc.state.processed.length, 1);
+  assert.equal(rpc.state.processed[0].block.work, WORK);
+});
+
+test("work API key goes to the dedicated work server only, as body key + header", async () => {
+  const asks = [];
+  const spy = (rpc) => (url, init) => {
+    const body = JSON.parse(init.body);
+    if (body.action === "work_generate") asks.push({ url, key: body.key, header: init.headers["nodes-api-key"] });
+    if (url === "http://dead.local") throw new Error("ECONNREFUSED");
+    return rpc.fetch(url, init);
+  };
+  const ok = createNanoWallet({ secretKey: SECRET, fetch: spy(fakeRpc()), workUrl: "http://work.local", workKey: "k_test" });
+  await ok.payment(invoice());
+  const keyed = asks.find((a) => a.url === "http://work.local");
+  assert.equal(keyed.key, "k_test");
+  assert.equal(keyed.header, "k_test");
+
+  asks.length = 0;
+  const dead = createNanoWallet({ secretKey: SECRET, fetch: spy(fakeRpc()), workUrl: "http://dead.local", workKey: "k_test" });
+  await dead.payment(invoice());
+  const fallback = asks.find((a) => a.url === DEFAULT_NANO_RPC);
+  assert.equal(fallback.key, undefined, "the node fallback must not leak the work API key");
+  assert.equal(fallback.header, undefined);
+});
+
+test("a hung work server times out and falls through to the node's work", async () => {
+  const rpc = fakeRpc();
+  const logs = [];
+  const spyFetch = (url, init) => {
+    if (url === "http://slow.local") {
+      // never answers; only the abort signal ends it — like a congested shared work server
+      return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason)));
+    }
+    return rpc.fetch(url, init);
+  };
+  const wallet = createNanoWallet({
+    secretKey: SECRET, fetch: spyFetch, workUrl: "http://slow.local", workTimeoutMs: 30,
+    log: (l) => logs.push(l),
+  });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 1, "payment must still settle via the node's work");
+  assert.equal(rpc.state.processed[0].block.work, WORK);
+  assert.ok(logs.some((l) => /work_generate via work server http:\/\/slow\.local failed/.test(l)));
 });
 
 test("paySend: a failed payment doesn't wedge the queue", async () => {
@@ -196,8 +276,11 @@ test("paySend: pockets receivable refunds before sending", async () => {
   });
   assert.equal(send.block.previous, receiveHash, "send must chain on the receive block's real hash");
   assert.equal(BigInt(send.block.balance), BigInt(BALANCE) + BigInt(REFUND) - BigInt(AMOUNT));
-  // receive work is allowed the cheap threshold; the send still uses the v21 send threshold
-  assert.deepEqual(rpc.state.workDifficulties, ["fffffe0000000000", "fffffff800000000"]);
+  // The first receive asks at the cheap threshold; the receive's publish precomputes
+  // send-grade work for the new frontier, which the send then consumes from cache
+  // (send-threshold work is valid for any block). The final entry is the post-send precompute.
+  assert.deepEqual(rpc.state.workDifficulties, ["fffffe0000000000", "fffffff800000000", "fffffff800000000"]);
+  assert.equal(rpc.state.workHashes[1], receiveHash, "the send's work must come from the precompute on the receive's hash");
 });
 
 test("paySend: a refund can cover an invoice the bare balance cannot", async () => {

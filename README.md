@@ -144,11 +144,25 @@ if present, always wins — the wallet is only used keyless.
 **Proof-of-work reliability.** Every send block needs Nano proof-of-work. The
 server asks the RPC node's `work_generate` first, but public nodes routinely
 refuse or throttle it (no GPU, key required); the fallback is local
-single-threaded CPU work, which can take a minute. For fast, dependable sends,
-run [nano-work-server](https://github.com/nanocurrency/nano-work-server) on
-the same machine and point `--work-rpc` / `NANO_WORK_URL` at it
-(`nano-work-server --cpu-threads 8 -l 127.0.0.1:7076` → work in a few
-seconds). Order: `--work-rpc` → `--nano-rpc` node → local CPU.
+single-threaded CPU work, which can take a minute. Two fast options, both via
+`--work-rpc` / `NANO_WORK_URL`:
+
+- **Hosted GPU work API** — sub-second work, no hardware. E.g.
+  [nano.to's PoW API](https://docs.nano.to/pow) (`--work-rpc https://rpc.nano.to`)
+  or [Nanswap Nodes](https://nanswap.com/nodes)
+  (`--work-rpc https://nodes.nanswap.com/XNO` — the fast work server is on
+  their paid plan; the free one queues for minutes). Put the API key in
+  `NANO_WORK_KEY` (env or `--env-file`, never a flag) — it's sent as both a
+  `key` body field (nano.to style) and a `nodes-api-key` header (Nanswap
+  style).
+- **Your own [nano-work-server](https://github.com/nanocurrency/nano-work-server)**
+  on the same machine (`nano-work-server --cpu-threads 8 -l 127.0.0.1:7076` →
+  work in a few seconds, free forever).
+
+Order: `--work-rpc` (2-minute timeout, so a hung server can't stall a payment)
+→ `--nano-rpc` node → local CPU. The wallet also **precomputes work for the
+next block** the moment one publishes, and serve mode prewarms at boot — with
+any healthy work source, callers effectively never wait on proof-of-work.
 
 **This is a hot wallet.** Use a dedicated wallet holding pocket money, not
 your savings: its balance is a natural spend ceiling, and `--max-usd` adds a
@@ -310,7 +324,11 @@ jq 'select(.event=="run" and .paid) | .usd' usage.jsonl | jq -s add             
 - **Keep the float small**: the wallet is hot. Sweep revenue to cold storage
   regularly; if you run with an API key, cap that account's balance too.
 - **Work server**: refunds and payouts are Nano sends and need proof-of-work —
-  run `nano-work-server` locally (see wallet mode above) or they'll be slow.
+  use a hosted GPU work API (nano.to, Nanswap — key in `NANO_WORK_KEY` in the
+  env file) or run `nano-work-server` locally (see wallet mode above), or
+  they'll be slow. Wallet-material and key env vars all belong in the
+  `--env-file`, which also takes `NANO_WS_URL` for a key-bearing websocket URL
+  (e.g. Nanswap's `wss://nodes.nanswap.com/ws/?ticker=XNO&api_key=…`).
 - There is intentionally **no auth**: on a charged server, payment is the
   authorization. Don't serve graphs you wouldn't want strangers running.
 
@@ -344,10 +362,12 @@ usage: nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [-
                  several dirs — scanned in order, so an earlier dir wins name clashes)
   --out dir      where media outputs are saved (default ./nanoodle-out)
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY / NANO_WORK_URL from a .env-style file
+  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY / NANO_WORK_URL /
+                 NANO_WORK_KEY / NANO_WS_URL from a .env-style file
   --nano-rpc u   Nano RPC node for wallet mode (default https://rpc.nano.to; NANO_RPC_URL)
-  --work-rpc u   dedicated work_generate endpoint, e.g. a local nano-work-server
-                 (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work)
+  --work-rpc u   dedicated work_generate endpoint — a local nano-work-server or a hosted
+                 GPU work API (NANO_WORK_URL; NANO_WORK_KEY carries its API key;
+                 falls back to --nano-rpc, then local CPU work)
   --max-usd n    wallet mode: refuse any single x402 invoice above $n
 ```
 
