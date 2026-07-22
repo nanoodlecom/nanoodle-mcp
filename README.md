@@ -207,8 +207,9 @@ key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
 out the economics (deposits settle at metered cost + 20%, the markup is the
 workflow author's cut) and how to self-host — this stack is MIT end to end. Generated media is served
 back under unguessable `/out/…` URLs (small images also ride inline in the
-tool result), and every call is appended to `<out>/usage.jsonl` so you can see
-what actually gets used.
+tool result). Runs themselves are **not logged**: free serve mode keeps no
+record of who called what, and charge mode keeps only a payments ledger (money
+events, never run telemetry — see below).
 
 **Generated media is deleted after `--out-ttl` hours** — a privacy backstop so
 a hosted server doesn't hoard every caller's generations on disk forever. In
@@ -316,16 +317,25 @@ polling relaxes to a safety net. Public websockets exist (e.g.
 is the dependable option. Either way the poller also checks `account_history`,
 so payments pocketed by a concurrently-running wallet are still found.
 
-### Usage log
+### Payments ledger
 
-`<out>/usage.jsonl` gets one line per event (`quote`, `paid`, `run`, `refund`,
-`author_payout`) — your server's own log, nothing client-side. Some starters:
+In charge mode `<out>/usage.jsonl` is a **payments ledger**: one line per money
+event only — `quote`, `paid`, `refund`, `change`, `author_payout` — your
+server's own record of money moving, nothing client-side. It is deliberately
+**not** a usage log: there are no `run` events, no run timing, no
+success/failure telemetry, and no upstream error strings (which can quote user
+content). A money event does carry `.tool` — the tool name is the *subject of
+the payment*, not a record of a run — so you can see what earns, but not who
+ran what when or whether it failed. Refunds record a fixed category
+(`run_failed`, `late_payment`), never the underlying error text — the full
+error still reaches the caller and the operator's stderr. Free serve mode
+writes no ledger at all. Some starters:
 
 ```bash
-jq -r 'select(.event=="run") | .tool' usage.jsonl | sort | uniq -c | sort -rn   # calls per tool
-jq 'select(.event=="run") | .ms' usage.jsonl | jq -s add/length                 # mean run time
+jq -r 'select(.event=="paid") | .tool' usage.jsonl | sort | uniq -c | sort -rn  # paid calls per tool
 jq 'select(.event=="paid") | .settleMs' usage.jsonl                             # quote→settle latency
-jq 'select(.event=="run" and .paid) | .usd' usage.jsonl | jq -s add             # gross revenue
+jq 'select(.event=="paid") | .usd' usage.jsonl | jq -s add                      # gross deposits taken
+jq -r 'select(.event=="refund") | .reason' usage.jsonl | sort | uniq -c         # refunds by category
 ```
 
 ### Hosting checklist

@@ -32,6 +32,13 @@ import { rawToXno } from "./wallet.mjs";
 import { fmtDur } from "./tools.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
+/**
+ * The ONLY refund reasons the payments ledger may record — fixed categories,
+ * never free text. A ledger line must never carry an upstream error string
+ * (it can quote user content), so any reason outside this set is coerced to
+ * "run_failed" before it can reach usage.jsonl.
+ */
+const REFUND_REASONS = new Set(["run_failed", "late_payment"]);
 const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund late payments
 const HISTORY_EVERY = 5; // check account_history every Nth poll tick
 /**
@@ -102,7 +109,10 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
  *                                        whole TTL (heartbeats keep the connection alive).
  * @param {string|null} [opts.stateFile]  persist quotes + owed sends here (write-then-rename JSON) and
  *                                        restore them at startup — in-flight money survives restarts
- * @param {(event: string, fields: object) => void} [opts.usage]  usage-log sink
+ * @param {(event: string, fields: object) => void} [opts.usage]  payments-ledger sink:
+ *                                        money lifecycle events only (quote, paid, refund,
+ *                                        change, author_payout) — never run telemetry or
+ *                                        error strings, which can quote user content
  */
 export function createChargeGate({
   address,
@@ -273,7 +283,16 @@ export function createChargeGate({
     }
   }
 
+  /*
+   * `reason` is a FIXED CATEGORY, never free text — it is written to the
+   * payments ledger (usage.jsonl), and that file must never carry an upstream
+   * error string, which can quote user content. Callers pass "run_failed" or
+   * "late_payment"; the full failure text reaches the caller (q.error) and
+   * stderr (log()) instead. Any transport-level error attached below
+   * (ops.transfer bounced) is operational, not user content.
+   */
   async function refund(q, reason) {
+    reason = REFUND_REASONS.has(reason) ? reason : "run_failed";
     if (q.refunding) return q.refunding;
     if (!q.source) {
       log(`cannot refund ${q.id}: payer account unknown — ${rawToXno(q.amountRaw)} XNO stays in the wallet`);
@@ -346,8 +365,16 @@ export function createChargeGate({
         quotes.set(q.id, q);
       }
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
+        // Legacy state files predate the payments-ledger policy: their queued
+        // refunds carry free-text reasons like "run failed: <upstream error>",
+        // which can quote user content. When such an owed send later lands (or
+        // gives up), its fields are spread verbatim into a NEW ledger line — so
+        // scrub any non-category reason down to "run_failed" here, at the door,
+        // keeping every other field intact.
+        const fields = s.fields && typeof s.fields === "object" ? { ...s.fields } : s.fields;
+        if (fields && "reason" in fields && !REFUND_REASONS.has(fields.reason)) fields.reason = "run_failed";
         owed.push({
-          ...s, at: now() + OWED_BACKOFF_MS[0],
+          ...s, fields, at: now() + OWED_BACKOFF_MS[0],
           onOk: s.event === "refund" && s.fields && s.fields.paymentId
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
             : null,
@@ -390,7 +417,7 @@ export function createChargeGate({
       if (q.status === "expired" && !q.refunding) {
         log(`late payment for expired quote ${q.id} — refunding`);
         q.source = q.source || meta.source || null;
-        return void refund(q, "quote expired before payment arrived");
+        return void refund(q, "late_payment");
       }
       return; // paid/consumed already — a re-scan of the same block, not a new payment
     }
@@ -768,12 +795,19 @@ export function createChargeGate({
                     (s.change > 0n ? `; ${rawToXno(s.change)} XNO change returned to your wallet` : "")
                   : " — the model reported no cost, so the whole deposit is being returned to your wallet");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
-              usage("run", { paymentId: q.id, tool: name, ok: true, ms: now() - t0, usd: q.usd, costUsd: costUsd ?? null, paid: true });
+              // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
+              // (quote, paid, refund, change, author_payout), never run telemetry.
+              // A run event would record the tool, timing, cost, and (on failure)
+              // the upstream error string, which can quote user content; none of
+              // that belongs in a privacy-respecting ledger. The settle() below
+              // still emits the money events (change / author_payout).
               persist();
             } catch (e) {
               const msg = String((e && e.message) || e);
-              usage("run", { paymentId: q.id, tool: name, ok: false, ms: now() - t0, usd: q.usd, paid: true, error: msg });
-              const refunded = await refund(q, `run failed: ${msg}`);
+              // Only the CALLER (q.error) and the operator's stderr (via log,
+              // inside refund) see the upstream error text; the ledger records
+              // the failure as the fixed category "run_failed".
+              const refunded = await refund(q, "run_failed");
               q.error = `run failed: ${msg}` + (refunded
                 ? ` — your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}.`
                 : q.source

@@ -75,7 +75,8 @@ Serve mode (host your noodles over HTTP instead of stdio):
                    shrink to 2x its observed cost+20% (whole cents, 1c floor) automatically.
                    Per-graph deposit override: "x402": {"usd": 0.10} in the graph JSON.
                    Requires the wallet (NANO_SEED / NANO_PRIVATE_KEY) — it receives payments
-                   and sends refunds/change/payouts. Calls are logged to <out>/usage.jsonl.
+                   and sends refunds/change/payouts. Payments (not runs) are logged to a
+                   ledger at <out>/usage.jsonl — money events only, no run telemetry.
   --public-url u   absolute base URL callers see in pay links / media links
                    (required in practice behind a reverse proxy or tunnel)
   --nano-ws u      Nano node websocket (wss://…) for push payment detection;
@@ -301,22 +302,29 @@ async function main() {
   // (Not done in stdio mode — a session that never pays would waste one work per boot.)
   if (wallet) wallet.ops.prewarm();
 
-  // Append-only per-call log — the operator's own server log, nothing client-side.
-  const usagePath = join(resolvedOut, "usage.jsonl");
-  let usageChain = Promise.resolve();
-  const usageLog = (event, fields) => {
-    const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
-    usageChain = usageChain
-      .then(() => mkdir(resolvedOut, { recursive: true }))
-      .then(() => appendFile(usagePath, line))
-      .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
-  };
+  // Append-only PAYMENTS LEDGER — the operator's own record of money moving,
+  // nothing client-side. It exists only in charge mode: money lifecycle events
+  // (quote, paid, refund, change, author_payout) and nothing else. Free serve
+  // mode writes NO ledger at all — it moves no money, and run telemetry (which
+  // tool ran, timing, and upstream error strings that can quote user content)
+  // is deliberately not recorded anywhere on the server.
+  let usagePath = null;
+  let usageLog = () => {};
 
   let listTools = () => registry.listTools();
   let callTool;
   let gate = null;
   let instructions;
   if (chargeUsd != null) {
+    usagePath = join(resolvedOut, "usage.jsonl");
+    let usageChain = Promise.resolve();
+    usageLog = (event, fields) => {
+      const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
+      usageChain = usageChain
+        .then(() => mkdir(resolvedOut, { recursive: true }))
+        .then(() => appendFile(usagePath, line))
+        .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
+    };
     gate = createChargeGate({
       address: wallet.address,
       ops: wallet.ops,
@@ -344,19 +352,11 @@ async function main() {
       "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
       "payment, the whole payment is refunded automatically.";
   } else {
-    // Free serve mode still logs runs, so the operator can see what gets used.
-    callTool = async (params) => {
-      const t0 = Date.now();
-      const tool = params && typeof params === "object" && !Array.isArray(params) ? params.name : undefined;
-      try {
-        const { costUsd, ...r } = await registry.callTool(params);
-        usageLog("run", { tool, ok: !r.isError, ms: Date.now() - t0, paid: false, costUsd: costUsd ?? null });
-        return r;
-      } catch (e) {
-        usageLog("run", { tool, ok: false, ms: Date.now() - t0, paid: false, error: String((e && e.message) || e) });
-        throw e;
-      }
-    };
+    // Free serve mode writes NO usage.jsonl — no money moves, so there is no
+    // payments ledger, and we deliberately don't log run telemetry either
+    // (which tool ran, or upstream error text that can quote user content).
+    // Strip only the gate-facing costUsd sidecar so HTTP clients get pure MCP.
+    callTool = (params) => registry.callTool(params).then(({ costUsd, ...r }) => r);
   }
 
   await serveHttp({
@@ -378,7 +378,8 @@ async function main() {
       ? ` — charging $${chargeUsd}/call in XNO to ${wallet.address}`
       : " — free (runs spend from this server's balance)"));
   console.error(`nanoodle-mcp: connect with: claude mcp add --transport http noodles ${publicBase}/mcp`);
-  console.error(`nanoodle-mcp: usage log: ${usagePath}`);
+  // The ledger records money only, and only exists in charge mode.
+  if (usagePath) console.error(`nanoodle-mcp: payments ledger: ${usagePath}`);
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
