@@ -696,6 +696,69 @@ test("landing page links each workflow, states the author cut, and shows self-ho
   }
 });
 
+test("landing hero: connect command, payment flow strip, llms.txt pointer", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.match(html, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(html, /402 payment quote/);
+    assert.match(html, /No tab, no tip, no signup\./);
+    assert.match(html, /href="\/llms\.txt"/);
+  } finally {
+    server.close();
+  }
+});
+
+test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode drops payment", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{ name: "poster", x402: null, rawText: "{}", editorUrl: "https://nanoodle.com/#g=abc" }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const res = await fetch(`${base}/llms.txt`);
+    assert.match(res.headers.get("content-type"), /text\/plain/);
+    const txt = await res.text();
+    assert.match(txt, /endpoint: http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /## Payment \(x402, Nano\/XNO\)/);
+    assert.match(txt, /settles at metered model cost \+ 20%/);
+    assert.match(txt, /- poster: /);
+    assert.match(txt, /graph: http:\/\/pay\.test\/graph\/poster\.json/);
+    assert.match(txt, /npx nanoodle-mcp --graphs/);
+  } finally {
+    server.close();
+  }
+
+  const freeReg = fakeRegistry();
+  const freeServer = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools: freeReg.listTools, callTool: freeReg.callTool,
+    publicBase: "http://pay.test", log: () => {},
+  });
+  const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
+  try {
+    const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
+    assert.doesNotMatch(txt, /Payment/);
+    assert.match(txt, /- poster: /);
+  } finally {
+    freeServer.close();
+  }
+});
+
 test("free-mode landing page skips the payment story but still shows self-hosting", async () => {
   const registry = fakeRegistry();
   const server = await serveHttp({

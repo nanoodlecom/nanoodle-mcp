@@ -8,8 +8,9 @@
  *                        tools/call from an SSE-capable client answers as an
  *                        event stream with progress heartbeats — generations
  *                        and payment waits outlive client tool timeouts.
- *   GET  /               landing page: tool list w/ prices, per-workflow editor links,
- *                        the one-line connect command, self-hosting + author-payout story
+ *   GET  /               landing page: hero connect command, how payment flows, tool list
+ *                        w/ per-workflow editor links, self-hosting + author-payout story
+ *   GET  /llms.txt       the same story as plain text, written for agents
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
@@ -70,40 +71,106 @@ const PAGE_CSS = `
   ul{padding-left:1.2rem}li{margin:.35rem 0}
 `;
 
-const htmlPage = (title, body) =>
+/*
+ * The landing page commits to a dark look (the pay pages stay theme-following):
+ * its job is a first impression, and the hero is one copyable command.
+ */
+const LANDING_CSS = `
+  :root{--fg:#e6edf3;--bg:#0d1117;--muted:#8b949e;--card:#161b22;--edge:#2a313a;--accent:#2dd4bf}
+  *{box-sizing:border-box}
+  body{margin:0;font:16px/1.55 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+  main{max-width:56rem;margin:0 auto;padding:1.25rem 1rem 3rem}
+  a{color:var(--accent)}
+  code{font:.85em/1.5 ui-monospace,monospace;background:rgba(139,148,158,.14);border-radius:6px;padding:.1rem .35rem;word-break:break-all}
+  pre{font:.85rem/1.5 ui-monospace,monospace;background:rgba(139,148,158,.14);border-radius:6px;padding:.75rem 1rem;overflow-x:auto}
+  .muted{color:var(--muted);font-size:.9rem}
+  .top{display:flex;align-items:baseline;gap:.75rem;padding-bottom:2rem}
+  .top .v{color:var(--muted);font-size:.85rem}
+  .top nav{margin-left:auto;display:flex;gap:1rem;font-size:.9rem}
+  .top nav a{color:var(--muted);text-decoration:none}
+  .top nav a:hover{color:var(--fg)}
+  .brand{font-weight:700;font-size:1.05rem;color:var(--fg);text-decoration:none}
+  .eyebrow{color:var(--accent);font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;text-align:center;margin:1.5rem 0 .6rem}
+  h1{font-size:clamp(2rem,6vw,3rem);margin:0;text-align:center;letter-spacing:-.02em}
+  .sub{color:var(--muted);text-align:center;margin:.75rem auto 2rem;max-width:40rem}
+  .connect{display:flex;align-items:center;gap:1rem;background:var(--card);border:1px solid var(--accent);
+    border-radius:14px;box-shadow:0 0 28px rgba(45,212,191,.16);padding:1rem 1.25rem}
+  .connect pre{margin:0;padding:0;background:none;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:hidden;font-size:.95rem;color:var(--accent)}
+  button{font:inherit;font-size:.85rem;padding:.4rem .9rem;border-radius:8px;border:1px solid var(--edge);
+    background:var(--card);color:var(--fg);cursor:pointer;flex:none}
+  button:hover{border-color:var(--accent)}
+  .hint{color:var(--muted);font-size:.85rem;text-align:center;margin:.75rem 0 2.25rem}
+  .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));gap:1rem;margin-bottom:2.25rem}
+  .step{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1rem 1.1rem}
+  .step .n{display:inline-block;background:rgba(45,212,191,.14);color:var(--accent);border-radius:6px;
+    font:600 .78rem/1 ui-monospace,monospace;padding:.3rem .45rem;margin-right:.5rem}
+  .step p{margin:.6rem 0 0;color:var(--muted);font-size:.85rem}
+  .flow{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:.6rem;background:var(--card);
+    border:1px solid var(--edge);border-radius:12px;padding:.9rem 1rem;font:.85rem/1.5 ui-monospace,monospace}
+  .flow .arr{color:var(--accent)}
+  .tagline{text-align:center;color:var(--muted);font-size:.9rem;margin:.75rem 0 0}
+  h2{font-size:1.15rem;margin:2.5rem 0 .5rem}
+  .tools{display:grid;grid-template-columns:repeat(auto-fill,minmax(19rem,1fr));gap:1rem;padding:0;margin:1rem 0 0;list-style:none}
+  .tool{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1rem 1.1rem}
+  .tool p{margin:.5rem 0}
+  .tool .links{font-size:.85rem}
+  .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
+  .card h2{margin-top:0}
+  footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
+`;
+
+const htmlPage = (title, body, css = PAGE_CSS) =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-  `<title>${esc(title)}</title><style>${PAGE_CSS}</style></head><body><main>${body}</main></body></html>`;
+  `<title>${esc(title)}</title><style>${css}</style></head><body><main>${body}</main></body></html>`;
 
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [] }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
-  const items = tools.map((t) => {
+  const cmd = `claude mcp add --transport http noodles ${publicBase}/mcp`;
+  const cards = tools.map((t) => {
     const info = infoByName.get(t.name);
-    const links = info ? ` <span class="muted">— <a href="${esc(info.editorUrl)}">open in editor</a>` +
-      ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>` : "";
+    const links = info ? `<div class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
+      ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></div>` : "";
     const author = info && info.x402 && info.x402.author
-      ? `<div class="muted">author payout: <code>${esc(info.x402.author)}</code></div>` : "";
-    return `<li><code>${esc(t.name)}</code>${links}<div class="muted">${esc(t.description)}</div>${author}</li>`;
+      ? `<p class="muted">author payout: <code>${esc(info.x402.author)}</code></p>` : "";
+    return `<li class="tool"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>${links}${author}</li>`;
   }).join("");
   return htmlPage(name, `
-    <h1>${esc(name)} <span class="muted">v${esc(version)}</span></h1>
-    <p class="muted">AI workflow tools over MCP${charged
-      ? " — pay per call in Nano (XNO). No signup, no API key, no card."
-      : ""}. Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
-    <div class="card"><h2>Connect from Claude Code</h2>
-      <pre>claude mcp add --transport http noodles ${esc(publicBase)}/mcp</pre>
-      ${charged ? `<p class="muted">Then just ask for what you want. When a tool needs payment, your agent
-      shows you a link with a QR code — scan it with any Nano wallet and the result streams back seconds later.
-      Failed runs are refunded automatically.</p>
-      <p class="muted">What you pay up front is a <strong>deposit</strong>: each run settles at the model's
-      metered cost + 20%, and the difference is returned to your wallet on-chain. The 20% is the
-      <strong>workflow author's cut</strong>, not a platform fee.</p>` : ""}
+    <header class="top">
+      <a class="brand" href="/">${esc(name)}</a><span class="v">v${esc(version)}</span>
+      <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
+    </header>
+    <p class="eyebrow">public MCP server</p>
+    <h1>10-second connect.</h1>
+    <p class="sub">${tools.length} AI media workflows — image, video, audio, text — behind one MCP endpoint.
+      ${charged ? "No account, no API key — pay per call in Nano (XNO)." : "No account, no API key."}
+      Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
+    <div class="connect"><pre id="cmd">${esc(cmd)}</pre><button onclick="copyCmd(this)">copy</button></div>
+    <p class="hint">works with Claude Code, Cursor, and any MCP client</p>
+    <div class="steps">
+      <div class="step"><span class="n">01</span><b>paste the command</b>
+        <p>one line registers all ${tools.length} tools with your agent.</p></div>
+      <div class="step"><span class="n">02</span><b>ask for what you want</b>
+        <p>your agent picks a workflow and calls it — a poster, a soundtrack, an OG card.</p></div>
+      ${charged ? `<div class="step"><span class="n">03</span><b>pay per call</b>
+        <p>a few cents of Nano, settled automatically. failed runs are refunded.</p></div>`
+      : `<div class="step"><span class="n">03</span><b>results stream back</b>
+        <p>media arrives as links, usually in seconds.</p></div>`}
     </div>
-    <div class="card"><h2>Workflows (${tools.length})</h2>
-      <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
+    ${charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>402 payment quote</span>
+      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
+    <p class="tagline">No tab, no tip, no signup.</p>
+    <div class="card"><h2>What a call costs</h2>
+      <p class="muted">When a tool needs payment, your agent shows you a link with a QR code — scan it with
+      any Nano wallet and the result streams back seconds later. What you pay up front is a
+      <strong>deposit</strong>: each run settles at the model's metered cost + 20%, and the difference is
+      returned to your wallet on-chain. The 20% is the <strong>workflow author's cut</strong>, not a platform fee.</p>
+    </div>` : ""}
+    <h2>Workflows (${tools.length})</h2>
+    <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
       <a href="https://nanoodle.com">nanoodle editor</a> to see exactly how it works, remix it, or run it
       on your own key.</p>
-      <ul>${items}</ul></div>
+    <ul class="tools">${cards}</ul>
     ${charged ? `<div class="card"><h2>Workflow authors earn the 20%</h2>
       <p class="muted">A graph that declares a Nano address (<code>"x402": {"author": "nano_…"}</code> in its
       JSON) receives the full 20% markup of every paid run, paid out on-chain automatically. The public
@@ -119,7 +186,56 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
     </div>
-  `);
+    <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a></footer>
+    <script>
+      function copyCmd(b){
+        navigator.clipboard.writeText(document.getElementById("cmd").textContent).then(() => {
+          b.textContent = "copied";
+          setTimeout(() => { b.textContent = "copy"; }, 1200);
+        });
+      }
+    </script>
+  `, LANDING_CSS);
+}
+
+/** The landing page's story as plain text — the version an agent should read. */
+function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] }) {
+  const tools = listTools().filter((t) => t.name !== "run_noodle");
+  const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
+  const lines = [
+    `# ${name} v${version}`,
+    ``,
+    `Public MCP server: ${tools.length} AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
+    ``,
+    `endpoint: ${publicBase}/mcp (MCP streamable HTTP — POST JSON-RPC, SSE progress on tools/call)`,
+    `connect:  claude mcp add --transport http noodles ${publicBase}/mcp`,
+    ``,
+  ];
+  if (charged) {
+    lines.push(
+      `## Payment (x402, Nano/XNO)`,
+      ``,
+      `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a pay page at ${publicBase}/pay/<id>.`,
+      `- Send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id — or call with it immediately and the server waits for the payment.`,
+      `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
+      `- The 20% is the workflow author's cut, not a platform fee.`,
+      ``,
+    );
+  }
+  lines.push(`## Tools`, ``);
+  for (const t of tools) {
+    lines.push(`- ${t.name}: ${t.description}`);
+    if (infoByName.has(t.name)) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
+  }
+  lines.push(
+    ``,
+    `## Source`,
+    ``,
+    `MIT-licensed end to end: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, workflow library https://github.com/nanoodlecom/awesome-noodles.`,
+    `Self-host: npx nanoodle-mcp --graphs ./noodles --serve 8402`,
+    ``,
+  );
+  return lines.join("\n");
 }
 
 function payPageHtml(q) {
@@ -281,6 +397,10 @@ export async function serveHttp({
 
       if (url.pathname === "/") {
         return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo }), "text/html; charset=utf-8");
+      }
+
+      if (url.pathname === "/llms.txt") {
+        return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo }), "text/plain; charset=utf-8");
       }
 
       const graphMatch = url.pathname.match(/^\/graph\/([^/]+)\.json$/);
