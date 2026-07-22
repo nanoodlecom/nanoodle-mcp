@@ -2,7 +2,7 @@
 /**
  * nanoodle-mcp — MCP server that exposes saved nanoodle workflow graphs as tools.
  *
- *   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+ *   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--out-ttl h] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
  *   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
  *
  * Default transport is MCP over stdio. --serve speaks MCP over streamable HTTP
@@ -35,16 +35,21 @@ import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { createChargeGate } from "../src/gate.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
+import { startSweeper } from "../src/sweep.mjs";
 
 function usage(code = 1) {
   console.error(`usage:
-  nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
+  nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--out-ttl h] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
   nanoodle-mcp --version
 
   --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required;
                  repeat to serve several dirs — scanned in order, so an earlier dir wins name clashes)
   --out dir      where media outputs are saved (default ./nanoodle-out)
+  --out-ttl h    privacy: auto-delete generated media older than h hours (fractions ok;
+                 0 disables). Default 24 in --serve mode (a hosted server must not hoard
+                 customers' generations), off in stdio mode (local files are yours to keep).
+                 Only media artifacts are ever deleted — never costs.json/gate-state.json/usage.jsonl
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
@@ -91,7 +96,7 @@ Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).`
 async function main() {
   const argv = process.argv.slice(2);
   const graphDirs = []; // --graphs is repeatable; order = precedence on name clashes
-  let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null;
+  let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null, outTtlFlag = null;
   let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null, noLocalWork = false;
   let i = 0;
   const val = (flag) => {
@@ -103,6 +108,7 @@ async function main() {
     const a = argv[i];
     if (a === "--graphs") graphDirs.push(val("--graphs"));
     else if (a === "--out") outDir = val("--out");
+    else if (a === "--out-ttl") outTtlFlag = val("--out-ttl");
     else if (a === "--key") keyFlag = val("--key");
     else if (a === "--env-file") envFile = val("--env-file");
     else if (a === "--nano-rpc") nanoRpcFlag = val("--nano-rpc");
@@ -146,6 +152,23 @@ async function main() {
     servePort = Number(m[2]);
   }
   if (chargeUsd != null && serveSpec === null) { console.error("--charge-usd only makes sense with --serve"); usage(); }
+
+  // --out-ttl: auto-delete generated media older than N hours (fractions allowed; 0 disables).
+  // Default differs by mode: a hosted --serve server must not hoard customers' generations, so
+  // it defaults to 24h; a local stdio user saved those files to their own disk on purpose, so
+  // it defaults OFF (but honors the flag if they pass it). 24h is deliberately the same window
+  // as the charge gate's RETAIN_MS: a paid quote's cached result references /out/ URLs and is
+  // replayable for 24h, so keeping media 24h keeps replay links alive exactly that long.
+  // Lowering --out-ttl below 24h in charge mode means replayed results may point at deleted files.
+  const serveMode = serveSpec !== null;
+  let outTtlHours;
+  if (outTtlFlag != null) {
+    outTtlHours = Number(outTtlFlag);
+    if (!Number.isFinite(outTtlHours) || outTtlHours < 0) { console.error("--out-ttl expects a non-negative number of hours (0 disables)"); usage(); }
+  } else {
+    outTtlHours = serveMode ? 24 : 0;
+  }
+  const outTtlMs = outTtlHours > 0 ? outTtlHours * 60 * 60 * 1000 : 0;
 
   // key precedence: --key > --env-file > NANOGPT_API_KEY (mirrors the nanoodle CLI)
   let apiKey = keyFlag ?? process.env.NANOGPT_API_KEY;
@@ -248,6 +271,15 @@ async function main() {
     console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
   } else {
     console.error("  - run_noodle: disabled in charge mode (arbitrary share links can't be priced up front)");
+  }
+
+  // Privacy backstop: delete generated media once it's older than the TTL, so a hosted
+  // server stops hoarding customers' artifacts. Runs in both transports (off by default in
+  // stdio unless --out-ttl was passed); the interval is unref()'d, so it never holds the
+  // process open on its own.
+  if (outTtlMs > 0) {
+    startSweeper({ dir: resolvedOut, ttlMs: outTtlMs, log: (line) => console.error("nanoodle-mcp: " + line) });
+    console.error(`nanoodle-mcp: --out-ttl ${outTtlHours}h — generated media in ${resolvedOut} is deleted after ${outTtlHours}h`);
   }
 
   if (serveSpec === null) {

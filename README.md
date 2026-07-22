@@ -210,6 +210,18 @@ back under unguessable `/out/…` URLs (small images also ride inline in the
 tool result), and every call is appended to `<out>/usage.jsonl` so you can see
 what actually gets used.
 
+**Generated media is deleted after `--out-ttl` hours** — a privacy backstop so
+a hosted server doesn't hoard every caller's generations on disk forever. In
+`--serve` mode it defaults to **24h**; pass `--out-ttl <hours>` to change it
+(fractions like `0.5` are fine) or `--out-ttl 0` to keep everything. Stdio mode
+defaults to **off** — files you generated locally are yours to keep — but honors
+the flag if you pass it. The sweep only ever removes media artifacts (images,
+video, audio); the operator's own `costs.json`, `gate-state.json`, and
+`usage.jsonl` are never touched. Note the 24h default matches the charge gate's
+replay window: a paid result stays replayable for 24h and references its `/out/`
+URL, so lowering `--out-ttl` below 24h in charge mode means a replayed result
+can point at a file that's already been swept.
+
 Free serve mode runs on **your** balance — fine on a trusted network, ruinous
 on the open internet. For that, charge for calls:
 
