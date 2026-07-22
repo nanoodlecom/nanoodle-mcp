@@ -49,8 +49,8 @@ function usage(code = 1) {
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
   --nano-rpc u   Nano RPC node for wallet operations (default ${DEFAULT_NANO_RPC}; NANO_RPC_URL)
-  --work-rpc u   dedicated work_generate endpoint — a local nano-work-server or a hosted
-                 GPU work API like rpc.nano.to or nodes.nanswap.com
+  --work-rpc u   dedicated work_generate endpoint(s), comma-separated, tried in order —
+                 nano-work-server boxes and/or hosted GPU work APIs like rpc.nano.to
                  (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work.
                  NANO_WORK_KEY — env or --env-file, never a flag — adds the API key as
                  both a \`key\` body field and a \`nodes-api-key\` header)
