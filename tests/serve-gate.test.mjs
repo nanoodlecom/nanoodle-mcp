@@ -1078,6 +1078,50 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
   }
 });
 
+test("landing carries OG/social meta and the favicon; brand assets are served", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    // social card meta, absolute against publicBase
+    assert.match(html, /property="og:image" content="http:\/\/pay\.test\/og\.jpg"/);
+    assert.match(html, /property="og:title"/);
+    assert.match(html, /property="og:description"/);
+    assert.match(html, /property="og:url" content="http:\/\/pay\.test\/"/);
+    assert.match(html, /property="og:image:alt"/);
+    assert.match(html, /name="twitter:card" content="summary_large_image"/);
+    // favicon links + the icon sits next to the brand name
+    assert.match(html, /rel="icon" href="\/favicon\.ico"/);
+    assert.match(html, /rel="apple-touch-icon"/);
+    assert.match(html, /<a class="brand" href="\/"><img src="\/favicon\.png"/);
+
+    // the assets themselves are served with real bytes and the right type
+    for (const [path, type] of [
+      ["/favicon.ico", "image/x-icon"], ["/favicon.png", "image/png"],
+      ["/apple-touch-icon.png", "image/png"], ["/icon-512.png", "image/png"], ["/og.jpg", "image/jpeg"],
+    ]) {
+      const r = await fetch(`${base}${path}`);
+      assert.equal(r.status, 200, path);
+      assert.equal(r.headers.get("content-type"), type, path);
+      assert.ok((await r.arrayBuffer()).byteLength > 500, `${path} should have real image bytes`);
+    }
+
+    // pay pages get the favicon links too
+    const arg = argOf(await callTool({ name: "poster", arguments: { Text: "x" } }));
+    const pay = await (await fetch(`${base}/pay/${arg.paymentId}`)).text();
+    assert.match(pay, /rel="icon" href="\/favicon\.ico"/);
+  } finally {
+    server.close();
+  }
+});
+
 test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode drops payment", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
