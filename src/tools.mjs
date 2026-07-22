@@ -164,17 +164,29 @@ function buildDescription(wf, spendSource, { cost } = {}) {
     `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.`;
 }
 
+/** Milliseconds → compact human duration ("15s", "2m 10s") for ETA copy. */
+export function fmtDur(ms) {
+  const s = Math.max(1, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  const m = Math.floor(s / 60), r = s % 60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
+
 /**
- * "last run $X" from the cost sidecar record — the only description segment that
- * changes at runtime. Trailing zeros trimmed but never past cents; a run whose
- * calls didn't all report a price renders "+" (it cost at least X) — that rules
- * out the "<$0.0001" claim too, since the recorded figure is only a floor.
+ * "last run $X, ~Ys" from the cost sidecar record — the only description
+ * segment that changes at runtime. Trailing zeros trimmed but never past cents;
+ * a run whose calls didn't all report a price renders "+" (it cost at least X)
+ * — that rules out the "<$0.0001" claim too, since the recorded figure is only
+ * a floor. Duration renders only when it's long enough to matter (≥ 2.5s):
+ * callers plan around a 15-second image or a 2-minute video, not a sub-second
+ * text run — and near-instant timings would churn descriptions for nothing.
  */
 function renderCost(rec) {
   if (!rec || typeof rec.usd !== "number" || !Number.isFinite(rec.usd)) return "";
-  if (rec.usd < 0.0001 && rec.exact !== false) return "last run <$0.0001";
+  const dur = typeof rec.ms === "number" && rec.ms >= 2500 ? `, ~${fmtDur(rec.ms)}` : "";
+  if (rec.usd < 0.0001 && rec.exact !== false) return `last run <$0.0001${dur}`;
   const usd = rec.usd.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
-  return `last run $${usd}${rec.exact === false ? "+" : ""}`;
+  return `last run $${usd}${rec.exact === false ? "+" : ""}${dur}`;
 }
 
 /** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
@@ -490,10 +502,11 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
 
   const byName = new Map(tools.map((t) => [t.name, t]));
 
-  /** Record a run's observed cost and refresh the tool's description. Best-effort — never throws. */
-  async function recordCost(tool, result) {
+  /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
+  async function recordCost(tool, result, ms) {
     if (typeof result.costUsd !== "number" || !Number.isFinite(result.costUsd)) return;
     const rec = { usd: result.costUsd, at: new Date().toISOString() };
+    if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
     if (result.costExact === false) rec.exact = false; // renders "$X+"
     costs[tool.name] = rec;
     try {
@@ -561,8 +574,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const { tool, inputs } = await registry.prepareCall(params);
 
       // Everything past this point is a run failure, not a protocol error → isError content.
+      const t0 = Date.now();
       const result = await tool.wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
-      await recordCost(tool, result); // run_noodle never reaches here — its costs aren't tracked
+      await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir, { publicBase });
     },
   };

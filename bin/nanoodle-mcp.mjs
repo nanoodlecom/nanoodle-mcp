@@ -292,6 +292,8 @@ async function main() {
       oracleBase: process.env.NANOGPT_BASE_URL || undefined,
       wsUrl: nanoWs,
       publicBase,
+      // In-flight money (pending quotes, queued refunds) survives restarts here.
+      stateFile: join(resolvedOut, "gate-state.json"),
       log: (line) => console.error("nanoodle-mcp: " + line),
       usage: usageLog,
     });
@@ -300,7 +302,9 @@ async function main() {
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
       "Calling a tool normally returns PAYMENT REQUIRED with a payment link: show that link to your user " +
       "(it renders a QR code and confirms on-screen when the payment lands, usually within a second), then " +
-      "call the same tool again with identical arguments plus the given _payment_id. The amount paid is a " +
+      "call the same tool again with identical arguments plus the given _payment_id — you may call again " +
+      "right away: the call waits for the payment to land, then runs, streaming progress (with the tool's " +
+      "typical runtime) while it works. The amount paid is a " +
       "DEPOSIT: the real price is the run's actual metered model cost + 20%, and the difference is sent back " +
       "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
       "payment, the whole payment is refunded automatically.";

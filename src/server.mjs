@@ -29,14 +29,16 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-1
  * @param {(params: object) => Promise<object>} opts.callTool  may throw; err.mcpCode → JSON-RPC error
  * @param {string} [opts.instructions]  server-level guidance surfaced to the client on initialize
  * @param {(...args) => void} [opts.log]
- * @returns {(msg: any) => Promise<object|null>} resolves to a JSON-RPC response, or null when
- *   the message is a notification (or a malformed non-request) and gets no reply
+ * @returns {(msg: any, ctx?: object|null) => Promise<object|null>} resolves to a JSON-RPC response,
+ *   or null when the message is a notification (or a malformed non-request) and gets no reply.
+ *   `ctx` (optional) rides through to callTool — a streaming transport passes { streaming, report }
+ *   so long-running tools can surface progress.
  */
 export function createDispatcher({ name, version, listTools, callTool, instructions, log = (...a) => console.error(...a) }) {
   const reply = (id, result) => ({ jsonrpc: "2.0", id, result });
   const fail = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
 
-  return async function dispatch(msg) {
+  return async function dispatch(msg, ctx = null) {
     if (msg === null || typeof msg !== "object" || Array.isArray(msg) || msg.jsonrpc !== "2.0") {
       // includes JSON-RPC batches — removed from MCP as of 2025-06-18
       return fail(null, -32600, "invalid request — expected a single JSON-RPC 2.0 object");
@@ -63,7 +65,7 @@ export function createDispatcher({ name, version, listTools, callTool, instructi
       if (method === "tools/list") return reply(id, { tools: listTools() });
       if (method === "tools/call") {
         try {
-          return reply(id, await callTool(params));
+          return reply(id, await callTool(params, ctx));
         } catch (e) {
           if (e && e.mcpCode) return fail(id, e.mcpCode, e.message); // malformed args → -32602
           // the tool ran and failed (RunError, missing key, network, ...) → tool-level error result

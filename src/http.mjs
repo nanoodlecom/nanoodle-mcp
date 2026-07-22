@@ -5,6 +5,9 @@
  *   POST /mcp            MCP streamable HTTP (stateless): one JSON-RPC message in,
  *                        its response out. Notifications → 202. The same
  *                        createDispatcher() that powers stdio handles everything.
+ *                        tools/call from an SSE-capable client answers as an
+ *                        event stream with progress heartbeats — generations
+ *                        and payment waits outlive client tool timeouts.
  *   GET  /               landing page: tool list w/ prices + the one-line connect command
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
@@ -97,9 +100,9 @@ function payPageHtml(q) {
       <p class="muted">for one run of <code>${esc(q.tool)}</code> — scan with any Nano wallet</p>
       <a class="qr" href="${esc(q.uri)}">${qrSvg(q.uri)}</a>
       <p><button onclick="navigator.clipboard.writeText('${esc(q.address)}')">copy address</button>
-         <button onclick="navigator.clipboard.writeText('${esc(q.amountRaw)}')">copy raw amount</button></p>
-      <p class="muted">Send <strong>exactly</strong> the amount in the QR code — it identifies your payment.<br>
-         Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountRaw)}</code> raw</p>
+         <button onclick="navigator.clipboard.writeText('${esc(q.amountXno)}')">copy amount</button></p>
+      <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
+         Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
       <p class="muted" id="status">waiting for payment… settles in about a second</p>
     </div>
     <script>
@@ -130,6 +133,7 @@ function payPageHtml(q) {
  * @param {number} opts.port
  * @param {object|null} [opts.gate]  charge gate (createChargeGate) — null serves free
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
+ * @param {number} [opts.progressMs]  heartbeat interval on streamed tools/call responses
  * @returns {Promise<http.Server>}
  */
 export async function serveHttp({
@@ -143,6 +147,7 @@ export async function serveHttp({
   gate = null,
   outDir = null,
   publicBase,
+  progressMs = 10_000,
   log = (...a) => console.error(...a),
 }) {
   const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
@@ -180,6 +185,46 @@ export async function serveHttp({
         let msg;
         try { msg = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
         catch { return send(400, JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } })); }
+
+        /*
+         * tools/call from an SSE-capable client streams: heartbeats every
+         * progressMs — MCP progress notifications when the client sent a
+         * progressToken (clients reset their tool timeout on these), plain SSE
+         * comments otherwise (keeps proxies from idling the socket) — then the
+         * final response. A generation or payment wait can take minutes; a
+         * silent held-open POST is exactly what client timeouts kill.
+         */
+        const isCall = msg && typeof msg === "object" && msg.method === "tools/call" && msg.id !== null && msg.id !== undefined;
+        if (isCall && /\btext\/event-stream\b/i.test(req.headers.accept || "")) {
+          const progressToken = msg.params && msg.params._meta ? msg.params._meta.progressToken : undefined;
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": "*",
+          });
+          const event = (obj) => { if (!res.writableEnded && !res.destroyed) res.write(`event: message\ndata: ${JSON.stringify(obj)}\n\n`); };
+          const t0 = Date.now();
+          const ctx = { streaming: true, status: "working", report(s) { this.status = s; } };
+          let ticks = 0;
+          const beat = setInterval(() => {
+            const line = `${ctx.status} (${Math.round((Date.now() - t0) / 1000)}s elapsed)`;
+            if (progressToken !== undefined) {
+              event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message: line } });
+            } else if (!res.writableEnded && !res.destroyed) {
+              res.write(`: ${line}\n\n`); // SSE comment — connection warmth without protocol noise
+            }
+          }, progressMs);
+          if (beat.unref) beat.unref();
+          try {
+            const response = await dispatch(msg, ctx);
+            if (response) event(response);
+          } finally {
+            clearInterval(beat);
+            if (!res.writableEnded && !res.destroyed) res.end();
+          }
+          return;
+        }
+
         const response = await dispatch(msg);
         if (!response) { res.writeHead(202, { "Access-Control-Allow-Origin": "*" }); return res.end(); }
         return send(200, JSON.stringify(response));
