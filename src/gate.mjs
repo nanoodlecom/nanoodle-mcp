@@ -15,8 +15,12 @@
  *      refunded to the payer's account automatically.
  *
  * Detection watches `receivable` on the gate address and, as a race-cover,
- * `account_history` — a concurrently running wallet may pocket the customer's
- * send between polls, at which point it only shows up as a received entry.
+ * walks `account_history` back to the last block it has already seen — a
+ * concurrently running wallet may pocket the customer's send between polls, at
+ * which point it only exists as a received history entry. The walk is bounded
+ * by actual chain churn, never a fixed window, so a burst of simultaneous
+ * payments of any size settles instead of scrolling out of view (a fixed
+ * 25-entry window demonstrably stranded every payment past ~70 in a burst).
  * Payments that arrive after their quote expired are refunded automatically.
  *
  * With `stateFile` set, quotes and the owed-send queue persist across restarts —
@@ -40,7 +44,18 @@ const QUOTE_TTL_MS = 15 * 60 * 1000;
  */
 const REFUND_REASONS = new Set(["run_failed", "late_payment"]);
 const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund late payments
-const HISTORY_EVERY = 5; // check account_history every Nth poll tick
+/**
+ * Payment-detection windows. RECEIVABLE_COUNT must comfortably exceed any
+ * plausible burst of concurrent payments: matched deposits stay receivable
+ * until housekeeping pockets them, so during a burst the window fills with
+ * already-matched blocks and payments beyond it are invisible. If it fills
+ * anyway, the scanner asks the wallet to pocket — pocketed blocks reappear in
+ * account_history, which is walked exhaustively (see scanHistory), so overflow
+ * recovers instead of stranding.
+ */
+const RECEIVABLE_COUNT = 500;
+const HISTORY_PAGE = 100; // account_history entries per RPC while walking
+const HISTORY_MAX_PAGES = 10; // churn cap per scan — far above real block throughput per poll
 /**
  * 1e-8 XNO in raw — the resolution wallets actually display and let a human
  * type. Quote amounts are whole multiples of this, so the friendly "0.13647256
@@ -176,10 +191,12 @@ export function createChargeGate({
   let rate = Number.isFinite(xnoUsd) && xnoUsd > 0
     ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: 10n ** 30n }, at: Infinity, source: "static" }
     : null;
+  let rateProbe = null; // in-flight oracle probe — concurrent cold quoters share one request
   async function ratePair() {
     if (rate && (rate.at === Infinity || now() - rate.at < 60_000)) return rate.pair;
     try {
-      const pair = await nanoGptPair();
+      if (!rateProbe) rateProbe = nanoGptPair().finally(() => { rateProbe = null; });
+      const pair = await rateProbe;
       rate = { pair, at: now(), source: "nanogpt-x402" };
       return pair;
     } catch (e) {
@@ -480,7 +497,6 @@ export function createChargeGate({
   /* ---------------- payment watcher: RPC polling + optional websocket ---------------- */
 
   let timer = null;
-  let tickCount = 0;
   let wsConnected = false;
 
   const anyPending = () => [...quotes.values()].some((q) => q.status === "pending");
@@ -493,28 +509,69 @@ export function createChargeGate({
       q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS));
   };
 
+  /**
+   * Race cover for pocketed payments: the wallet (same process, other duties)
+   * pockets receivables indiscriminately — including deposits this scanner has
+   * not matched yet — after which they only exist as received history entries.
+   * A fixed history window loses them under burst churn, so this walks
+   * newest-to-oldest until the newest block the PREVIOUS walk saw: work done
+   * scales with actual chain activity and nothing scrolls out of view. The
+   * first walk (marker unset) reads one page to seed the marker — anything
+   * older and unpocketed is still in `receivable`, which scan() reads first.
+   */
+  let lastHistoryHash = null;
+  async function scanHistory() {
+    let head = null;
+    let newest = null;
+    for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
+      const h = await ops.rpc({
+        action: "account_history", account: address,
+        count: String(HISTORY_PAGE), ...(head ? { head } : {}),
+      });
+      const entries = Array.isArray(h && h.history) ? h.history : [];
+      if (!entries.length) break;
+      if (newest === null) newest = entries[0].hash || null;
+      let reachedMarker = false;
+      for (const entry of entries) {
+        if (!entry) continue;
+        if (entry.hash === lastHistoryHash) { reachedMarker = true; break; }
+        if (entry.type === "receive") {
+          matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll" });
+        }
+      }
+      if (reachedMarker || lastHistoryHash === null) break; // caught up (first walk seeds the marker from one page)
+      head = typeof (h && h.previous) === "string" ? h.previous : null;
+      if (head === null) break; // history exhausted before the marker — everything was scanned anyway
+      if (page === HISTORY_MAX_PAGES - 1) {
+        log(`history walk hit its ${HISTORY_MAX_PAGES * HISTORY_PAGE}-entry cap before the last-seen block — ` +
+          "a payment pocketed under that churn may go unmatched until its quote expires");
+      }
+    }
+    // Empty history seeds an empty-string sentinel: it matches no real hash, so
+    // once the account's FIRST blocks appear the walk reads them all (bounded by
+    // the page cap) instead of treating that scan as another one-page seeding.
+    if (newest) lastHistoryHash = newest;
+    else if (lastHistoryHash === null) lastHistoryHash = "";
+  }
+
   async function scan() {
     prune();
     await retryOwed();
     if (!anyWatchable()) return;
-    tickCount++;
-    const r = await ops.rpc({ action: "receivable", account: address, count: "50", threshold: "1", source: "true" });
+    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true" });
     const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     for (const [hash, v] of blocks) {
       const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
       const source = typeof v === "object" && v !== null ? v.source : null;
       matchAmount(amount, { source, hash, via: "receivable poll" });
     }
-    // Race cover: a concurrently running wallet may have pocketed the customer's send
-    // between polls — then it only exists as a received history entry.
-    if (tickCount % HISTORY_EVERY === 0 && anyWatchable()) {
-      const h = await ops.rpc({ action: "account_history", account: address, count: "25" });
-      for (const entry of Array.isArray(h && h.history) ? h.history : []) {
-        if (entry && entry.type === "receive") {
-          matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll" });
-        }
-      }
+    // A full window means blocks beyond it are invisible — ask the wallet to
+    // pocket (queued housekeeping, never blocks a payment) so the overflow
+    // reappears in account_history, which the walk below reads exhaustively.
+    if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
+      ops.pocket().catch(() => {}); // best-effort; the next tick retries
     }
+    if (anyWatchable()) await scanHistory();
   }
 
   function tick() {
