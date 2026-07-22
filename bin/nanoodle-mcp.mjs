@@ -288,8 +288,8 @@ async function main() {
       name: "nanoodle-mcp",
       version: pkg.version,
       listTools: () => registry.listTools(),
-      // strip the gate-facing costUsd sidecar — stdio clients get pure MCP content
-      callTool: (params) => registry.callTool(params).then(({ costUsd, ...r }) => r),
+      // strip the gate-facing sidecars (costUsd, textOutput) — stdio clients get pure MCP content
+      callTool: (params) => registry.callTool(params).then(({ costUsd, textOutput, ...r }) => r),
     });
     // A run's observed cost lands in the tool's description — tell the client to re-list.
     registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
@@ -355,8 +355,8 @@ async function main() {
     // Free serve mode writes NO usage.jsonl — no money moves, so there is no
     // payments ledger, and we deliberately don't log run telemetry either
     // (which tool ran, or upstream error text that can quote user content).
-    // Strip only the gate-facing costUsd sidecar so HTTP clients get pure MCP.
-    callTool = (params) => registry.callTool(params).then(({ costUsd, ...r }) => r);
+    // Strip the gate-facing sidecars (costUsd, textOutput) so HTTP clients get pure MCP.
+    callTool = (params) => registry.callTool(params).then(({ costUsd, textOutput, ...r }) => r);
   }
 
   await serveHttp({

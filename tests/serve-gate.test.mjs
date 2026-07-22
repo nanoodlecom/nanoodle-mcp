@@ -487,6 +487,230 @@ test("restore scrubs legacy free-text refund reasons: no upstream error text rea
     "not one byte of the legacy free-text reason may reach the new ledger line");
 });
 
+test("a text output never touches disk: state file holds no output text, restart re-runs (charged once)", async () => {
+  const { mkdtemp, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-textout-")), "gate-state.json");
+
+  // The tool output is the customer's paid content — tagged textOutput by emitResult.
+  const SECRET = "THE-CROWN-JEWELS-summary-42";
+  const textOut = { content: [{ type: "text", text: SECRET }], costUsd: 0.02, textOutput: true };
+
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => textOut });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!first.isError && first.content.some((c) => c.text === SECRET), "the caller still gets their output in-process");
+  await new Promise((r) => setTimeout(r, 60)); // settle + persist land
+
+  // settle DID run on the first (successful) run: change went back to the payer
+  assert.ok(chain1.state.transfers.some((t) => t.describe === "change:"), "the first run settles as normal");
+
+  // The persisted bytes must not contain the customer's output text.
+  const bytes = await readFile(stateFile, "utf8");
+  assert.doesNotMatch(bytes, /CROWN-JEWELS/, "no tool output text may be written to disk");
+
+  // Restart: the quote demotes to paid and RE-RUNS on retry — delivered, not charged twice.
+  const chain2 = fakeChain();
+  const registry2 = fakeRegistry({ onCall: async () => textOut });
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
+  const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!replay.isError && replay.content.some((c) => c.text === SECRET), "retry after restart re-runs and delivers");
+  assert.equal(registry2.callCount(), 1, "the tool re-runs once after a restart (the operator eats the duplicate call)");
+  await new Promise((r) => setTimeout(r, 60));
+  // Not charged twice: no fresh payment was demanded, and change/author are NOT paid a second time.
+  assert.ok(!replay.structuredContent, "no new payment-required response — the original deposit still counts");
+  assert.equal(chain2.state.transfers.filter((t) => t.describe === "change:").length, 0,
+    "the re-run must not pay change a second time");
+});
+
+test("a media-URL result persists and replays after a restart (pointers are safe at rest)", async () => {
+  const { mkdtemp, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-media-")), "gate-state.json");
+
+  // Media output: a /out/ URL pointer + cost line, no textOutput flag.
+  const URL = "http://pay.test/out/poster-image-123.png";
+  const mediaOut = { content: [{ type: "text", text: `image: ${URL}` }], costUsd: 0.02 };
+
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => mediaOut });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!first.isError);
+  await new Promise((r) => setTimeout(r, 60));
+
+  const bytes = await readFile(stateFile, "utf8");
+  assert.match(bytes, /out\/poster-image-123\.png/, "the media pointer persists (the file itself dies by --out-ttl)");
+
+  const chain2 = fakeChain();
+  const registry2 = fakeRegistry({ onCall: async () => mediaOut });
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
+  const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!replay.isError);
+  assert.equal(replay.content[0].text, first.content[0].text, "the media result replays byte-for-byte");
+  assert.equal(registry2.callCount(), 0, "a persisted media result replays — it does not re-run");
+});
+
+test("a failed paid run persists refund status but no upstream error text; replay shows the placeholder", async () => {
+  const { mkdtemp, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-err-")), "gate-state.json");
+
+  const SECRET = "upstream said PROMPT-LEAK-xyz in the body";
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => { throw new Error(SECRET); } });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  // The refund bounces so the quote stays "consumed" carrying its (redacted) error,
+  // which is the state that replays a placeholder after a restart. (A refund that
+  // lands flips the quote to "refunded" and replays the gate's "call again" note —
+  // also content-free, but it doesn't exercise the error redaction on disk.)
+  chain1.state.failTransfer = true;
+  const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(first.isError && first.content[0].text.includes(SECRET), "the caller sees the full error in-process");
+  await new Promise((r) => setTimeout(r, 60));
+
+  const bytes = await readFile(stateFile, "utf8");
+  assert.doesNotMatch(bytes, /PROMPT-LEAK/, "the upstream error text must not be written to disk");
+  assert.match(bytes, /error details not retained across restarts/, "the redacted placeholder is persisted");
+  assert.match(bytes, /refunded to/, "the gate-authored refund status IS kept");
+
+  const chain2 = fakeChain();
+  chain2.state.failTransfer = true; // keep the refund pending so the quote replays its error, not "refunded"
+  const registry2 = fakeRegistry({ onCall: async () => { throw new Error(SECRET); } });
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
+  const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(replay.isError);
+  assert.doesNotMatch(replay.content[0].text, /PROMPT-LEAK/, "the replayed error carries no upstream text");
+  assert.match(replay.content[0].text, /error details not retained across restarts/);
+  assert.match(replay.content[0].text, /refunded to/, "the replayed error keeps the refund status");
+  assert.equal(registry2.callCount(), 0, "a failed quote replays its redacted error — it does not re-run or re-refund");
+});
+
+test("a legacy state file with a text result + free-text error never re-persists its content", async () => {
+  const { mkdtemp, writeFile, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-legacy2-")), "gate-state.json");
+
+  const RESULT_SECRET = "LEGACY-OUTPUT-abc";
+  const ERROR_SECRET = "LEGACY-ERROR-def";
+  const pair = { usdNano: "1000000000", raw: "1000000000000000000000000000000" };
+  const base = { tool: "poster", argsHash: hashArgs("poster", {}), usd: 0.05, pair,
+    amountRaw: "50000000000000000000000000000", createdAt: 1000, expiresAt: 9_000_000_000_000,
+    source: PAYER, payHash: "P".repeat(64), paidAt: 2000 };
+  // A pre-v2 file: one consumed quote with a text result, one with a free-text error.
+  await writeFile(stateFile, JSON.stringify({
+    v: 1,
+    quotes: [
+      { ...base, id: "pay_legacy_result", status: "consumed",
+        result: { content: [{ type: "text", text: RESULT_SECRET }] }, error: null },
+      { ...base, id: "pay_legacy_error", argsHash: hashArgs("poster", { Text: "z" }), status: "consumed",
+        result: null, error: `run failed: ${ERROR_SECRET} — your payment was refunded to ${PAYER}.` },
+    ],
+    owed: [],
+  }));
+
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, stateFile }).wrapRegistry(registry);
+
+  // The legacy errored quote replays a redacted placeholder — no re-run, no re-refund.
+  const errReplay = await gate.callTool({ name: "poster", arguments: { Text: "z", _payment_id: "pay_legacy_error" } });
+  assert.ok(errReplay.isError);
+  assert.doesNotMatch(errReplay.content[0].text, /LEGACY-ERROR/, "the legacy error text is gone from the replay");
+  assert.match(errReplay.content[0].text, /error details not retained across restarts/);
+
+  // Force a fresh persist (a new quote), then inspect the rewritten v2 file.
+  await gate.callTool({ name: "poster", arguments: { Text: "new" } });
+  await new Promise((r) => setTimeout(r, 60));
+  const bytes = await readFile(stateFile, "utf8");
+  assert.doesNotMatch(bytes, /LEGACY-OUTPUT|LEGACY-ERROR/, "no legacy content may leak into the rewritten state file");
+  assert.match(bytes, /"v":2/, "the file is rewritten in the content-stripping era format");
+  assert.equal(registry.callCount(), 0, "restoring a legacy file must not re-run any paid call on its own");
+});
+
+test("a redacted error survives a SECOND restart: the refund-status sentence is never lost", async () => {
+  const { mkdtemp, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-err2-")), "gate-state.json");
+
+  const SECRET = "PROMPT-LEAK-2nd-restart";
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => { throw new Error(SECRET); } });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain1.state.failTransfer = true; // refund bounces → quote stays consumed with its redacted error
+  await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  await new Promise((r) => setTimeout(r, 60));
+
+  // First restart: restore, then force a re-persist (a new quote) so the error round-trips.
+  const chain2 = fakeChain();
+  chain2.state.failTransfer = true;
+  const gate2 = makeGate(chain2, { registry: fakeRegistry({ onCall: async () => { throw new Error(SECRET); } }), stateFile }).wrapRegistry(fakeRegistry());
+  await gate2.callTool({ name: "poster", arguments: { Text: "z" } }); // triggers persist
+  await new Promise((r) => setTimeout(r, 60));
+
+  const bytes = await readFile(stateFile, "utf8");
+  assert.doesNotMatch(bytes, /PROMPT-LEAK/, "no upstream text after the second persist");
+  assert.match(bytes, /error details not retained across restarts/, "the placeholder survives");
+  assert.match(bytes, /refunded to/, "the refund-status sentence is NOT collapsed to the bare fallback");
+
+  // Second restart: the replayed error still carries the refund status.
+  const chain3 = fakeChain();
+  chain3.state.failTransfer = true;
+  const gate3 = makeGate(chain3, { registry: fakeRegistry(), stateFile }).wrapRegistry(fakeRegistry());
+  const replay = await gate3.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(replay.isError);
+  assert.match(replay.content[0].text, /refunded to/, "refund status still present after two restarts");
+  assert.doesNotMatch(replay.content[0].text, /PROMPT-LEAK/);
+});
+
+test("a re-run after restart reports the FIRST run's settled cost and change, not the second run's", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-receipt-")), "gate-state.json");
+
+  const SECRET = "RECEIPT-OUTPUT-text";
+  // First run: a known cost of $0.02 → partial change is sent, receipt says "$0.0200".
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: SECRET }], costUsd: 0.02, textOutput: true }) });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.match(first.content.at(-1).text, /actual cost \$0\.02/);
+  assert.match(first.content.at(-1).text, /change returned to your wallet/);
+  await new Promise((r) => setTimeout(r, 60));
+
+  // Restart: the SECOND run reports NO cost. Money doesn't move again, and the
+  // receipt must still describe the first run's settlement — not claim "whole
+  // deposit returned" off the second run's missing cost.
+  const chain2 = fakeChain();
+  const registry2 = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: SECRET }], textOutput: true }) }); // no costUsd
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
+  const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.equal(registry2.callCount(), 1, "the text quote re-runs after restart");
+  const receipt = replay.content.at(-1).text;
+  assert.match(receipt, /actual cost \$0\.02/, "receipt reports the FIRST run's cost");
+  assert.match(receipt, /change returned to your wallet/, "receipt reports the FIRST run's change");
+  assert.doesNotMatch(receipt, /whole deposit is being returned/, "must NOT claim a full refund off the second run's missing cost");
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(chain2.state.transfers.filter((t) => t.describe === "change:").length, 0, "no money moves on the re-run");
+});
+
 test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
