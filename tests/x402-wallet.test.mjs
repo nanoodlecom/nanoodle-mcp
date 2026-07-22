@@ -99,14 +99,46 @@ test("paySend: correct signed state block reaches process", async () => {
   assert.equal(verifyBlock({ hash, signature: b.signature, publicKey: derivePublicKey(SECRET) }), true);
 });
 
-test("paySend: concurrent invoices are serialized on the advancing frontier", async () => {
+test("paySend: concurrent invoices are serialized on the locally-tracked frontier", async () => {
+  const { hashBlock } = await import("nanocurrency");
   const rpc = fakeRpc();
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
   await Promise.all([wallet.payment(invoice()), wallet.payment(invoice({ paymentId: "pay_2" }))]);
   const [first, second] = rpc.state.processed.map((p) => p.block);
   assert.equal(first.previous, FRONTIER);
-  assert.equal(second.previous, "C".repeat(63) + "1", "second send must chain on the first's hash");
+  // the chain advances on the block hash computed at signing time — no account_info between sends
+  const firstHash = hashBlock({ account: first.account, previous: first.previous, representative: first.representative, balance: first.balance, link: first.link });
+  assert.equal(second.previous, firstHash, "second send must chain on the first's hash");
   assert.equal(BigInt(second.balance), BigInt(BALANCE) - 2n * BigInt(AMOUNT));
+  assert.equal(rpc.state.infoCalls, 1, "chain state is tracked locally — one account scan for both sends");
+});
+
+test("queue priority: a payment jumps ahead of queued housekeeping transfers", async () => {
+  const rpc = fakeRpc();
+  // stall the first block's work so the queue backs up behind a running task
+  let releaseWork, reachedWork;
+  const gate = new Promise((r) => { releaseWork = r; });
+  const stalled = new Promise((r) => { reachedWork = r; });
+  let gated = false;
+  const gatedFetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (body.action === "work_generate" && !gated) {
+      gated = true;
+      reachedWork();
+      await gate;
+    }
+    return rpc.fetch(url, init);
+  };
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: gatedFetch });
+  const order = [];
+  const first = wallet.ops.transfer(PAY_TO, AMOUNT, "change:").then(() => order.push("transfer-1"));
+  const second = wallet.ops.transfer(PAY_TO, AMOUNT, "change:").then(() => order.push("transfer-2"));
+  const paid = wallet.payment(invoice()).then(() => order.push("payment"));
+  await stalled; // the first transfer is mid-flight; the other two sit queued
+  releaseWork();
+  await Promise.all([first, second, paid]);
+  assert.deepEqual(order, ["transfer-1", "payment", "transfer-2"],
+    "the payment must overtake housekeeping that was queued before it");
 });
 
 test("paySend: workUrl routes work_generate to the work server, everything else to the node", async () => {
@@ -116,13 +148,12 @@ test("paySend: workUrl routes work_generate to the work server, everything else 
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: spyFetch, workUrl: "http://127.0.0.1:7076/" });
   await wallet.payment(invoice());
   assert.deepEqual(
-    calls.map((c) => [c.action, c.url]),
+    calls.slice(0, 4).map((c) => [c.action, c.url]), // the post-payment receivable sweep trails these
     [
       ["account_info", DEFAULT_NANO_RPC],
-      ["receivable", DEFAULT_NANO_RPC],
       ["work_generate", "http://127.0.0.1:7076"], // trailing slash trimmed
+      ["work_generate", "http://127.0.0.1:7076"], // next frontier's precompute starts before the publish
       ["process", DEFAULT_NANO_RPC],
-      ["work_generate", "http://127.0.0.1:7076"], // precompute for the new frontier
     ]);
   assert.equal(rpc.state.processed[0].block.work, WORK);
 });
@@ -280,24 +311,52 @@ test("paySend: readable errors — insufficient balance, unopened account, bad i
   await assert.rejects(() => w3.payment(invoice({ payTo: "nano_junk!" })), /not a valid Nano address/);
 });
 
-test("paySend: pockets receivable refunds before sending", async () => {
+test("paySend: a funded wallet sends first; refunds are swept off the critical path", async () => {
   const REFUND = "2000000000000000000000000000"; // 0.002 XNO refund waiting
   const REFUND_HASH = "E".repeat(64);
   const rpc = fakeRpc({
     receivable: (_b, state, reply) =>
-      // only the first ask has a pending block — once received it's gone
-      reply({ blocks: state.processed.length ? "" : { [REFUND_HASH]: REFUND } }),
+      // pending until received — a receive publish makes it disappear
+      reply({ blocks: state.processed.some((p) => p.subtype === "receive") ? "" : { [REFUND_HASH]: REFUND } }),
   });
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
   await wallet.payment(invoice());
 
+  // the payment never waited on the refund: the send is the FIRST published block
+  assert.equal(rpc.state.processed[0].subtype, "send");
+  const send = rpc.state.processed[0];
+  assert.equal(send.block.previous, FRONTIER);
+  assert.equal(BigInt(send.block.balance), BigInt(BALANCE) - BigInt(AMOUNT));
+
+  // the post-payment sweep pockets the refund once the queue is quiet
+  await wallet.ops.pocket(); // queued behind the auto-sweep — awaiting it flushes both
   assert.equal(rpc.state.processed.length, 2);
+  const receive = rpc.state.processed[1];
+  assert.equal(receive.subtype, "receive");
+  assert.equal(receive.block.link, REFUND_HASH);
+  assert.equal(receive.block.link_as_account, undefined, "receive link is a hash, not an account");
+  const { hashBlock } = await import("nanocurrency");
+  const sendHash = hashBlock({
+    account: send.block.account, previous: send.block.previous,
+    representative: send.block.representative, balance: send.block.balance, link: send.block.link,
+  });
+  assert.equal(receive.block.previous, sendHash, "the sweep's receive must chain on the send's real hash");
+  assert.equal(BigInt(receive.block.balance), BigInt(BALANCE) - BigInt(AMOUNT) + BigInt(REFUND));
+});
+
+test("paySend: a short balance pulls in receivables on the spot, then sends", async () => {
+  const REFUND = "2000000000000000000000000000"; // covers the invoice the bare balance can't
+  const REFUND_HASH = "E".repeat(64);
+  const rpc = fakeRpc({
+    account_info: (_b, state, reply) => { state.infoCalls++; return reply({ frontier: state.frontier, balance: "1", representative: ADDRESS }); },
+    receivable: (_b, state, reply) =>
+      reply({ blocks: state.processed.some((p) => p.subtype === "receive") ? "" : { [REFUND_HASH]: REFUND } }),
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
   const [receive, send] = rpc.state.processed;
   assert.equal(receive.subtype, "receive");
   assert.equal(receive.block.previous, FRONTIER);
-  assert.equal(receive.block.link, REFUND_HASH);
-  assert.equal(receive.block.link_as_account, undefined, "receive link is a hash, not an account");
-  assert.equal(BigInt(receive.block.balance), BigInt(BALANCE) + BigInt(REFUND));
   assert.equal(send.subtype, "send");
   const { hashBlock } = await import("nanocurrency");
   const receiveHash = hashBlock({
@@ -305,10 +364,9 @@ test("paySend: pockets receivable refunds before sending", async () => {
     representative: receive.block.representative, balance: receive.block.balance, link: receive.block.link,
   });
   assert.equal(send.block.previous, receiveHash, "send must chain on the receive block's real hash");
-  assert.equal(BigInt(send.block.balance), BigInt(BALANCE) + BigInt(REFUND) - BigInt(AMOUNT));
-  // The first receive asks at the cheap threshold; the receive's publish precomputes
-  // send-grade work for the new frontier, which the send then consumes from cache
-  // (send-threshold work is valid for any block). The final entry is the post-send precompute.
+  // The receive asks at the cheap threshold; its publish precomputes send-grade
+  // work for the new frontier, which the send consumes from cache (send-threshold
+  // work is valid for any block). The last entry is the send's own precompute.
   assert.deepEqual(rpc.state.workDifficulties, ["fffffe0000000000", "fffffff800000000", "fffffff800000000"]);
   assert.equal(rpc.state.workHashes[1], receiveHash, "the send's work must come from the precompute on the receive's hash");
 });
@@ -322,6 +380,48 @@ test("paySend: a refund can cover an invoice the bare balance cannot", async () 
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
   await wallet.payment(invoice());
   assert.equal(rpc.state.processed.length, 2, "receive then send");
+});
+
+test("paySend: an ambiguous publish failure drops the cache — the next send rebuilds from the node", async () => {
+  let processCalls = 0;
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      // first publish dies with a definite-looking but ambiguous node error
+      if (++processCalls === 1) return reply({ error: "Gap source block" });
+      state.processed.push(body);
+      state.frontier = "C".repeat(63) + state.processed.length;
+      return reply({ hash: state.frontier });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await assert.rejects(() => wallet.payment(invoice()), /Gap source block/);
+  await wallet.payment(invoice({ paymentId: "pay_2" }));
+  assert.equal(rpc.state.infoCalls, 2, "the failure must invalidate the cache — the retry asks the node");
+  assert.equal(rpc.state.processed[0].block.previous, FRONTIER, "the second send builds on the node's own frontier");
+});
+
+test("paySend: an HTTP-5xx from the RPC proxy verifies and republishes instead of losing the block", async () => {
+  let processCalls = 0;
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      processCalls++;
+      if (processCalls === 1) return { ok: false, status: 502, text: async () => "bad gateway" }; // proxy died; node never saw it
+      state.processed.push(body);
+      return reply({ hash: "C".repeat(64) });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 1);
+  assert.equal(rpc.state.processed[0].block.previous, FRONTIER, "republish must be the same block, not a rebuild");
+});
+
+test("post-payment sweep: a failing receivable RPC never crashes or wedges the queue", async () => {
+  const rpc = fakeRpc({ receivable: () => { throw new Error("boom"); } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  await wallet.payment(invoice({ paymentId: "pay_2" })); // queue still drains after the sweep's failure
+  assert.equal(rpc.state.processed.length, 2);
 });
 
 test("paySend: a bounced send refetches the frontier and retries exactly once", async () => {
