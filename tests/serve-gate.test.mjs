@@ -611,6 +611,14 @@ test("a hand-added x402 block on a graph file reaches the gate (price + author)"
   const t = listTools().find((t) => t.name === "hello-noodle");
   assert.match(t.description, /\$0\.10 deposit per call/);
   assert.match(t.description, /20% markup goes to the graph's author/);
+
+  // the minted editor link is the exact file, gzip+base64url — the editor's own wire format
+  const { gunzipSync } = await import("node:zlib");
+  const tool = registry.tools[0];
+  assert.equal(tool.rawText, JSON.stringify(g));
+  assert.match(tool.editorUrl, /^https:\/\/nanoodle\.com\/#g=[A-Za-z0-9_-]+$/);
+  const decoded = gunzipSync(Buffer.from(tool.editorUrl.split("#g=")[1], "base64url")).toString("utf8");
+  assert.equal(decoded, tool.rawText);
 });
 
 test("deposits track observed cost: cheap tools quote small deposits, live", async () => {
@@ -646,6 +654,66 @@ test("deposit derivation: high-water mark, inexact costs, ceiling, pinned x402.u
   pinnedReg.costs = { poster: { usd: 0.004 } };
   const pinnedGate = makeGate(fakeChain(), { registry: pinnedReg }).wrapRegistry(pinnedReg);
   assert.equal(argOf(await pinnedGate.callTool({ name: "poster", arguments: { Text: "d" } })).amountUsd, 0.10);
+});
+
+test("landing page links each workflow, states the author cut, and shows self-hosting; /graph serves the JSON", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry({ author: PAYER });
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const rawText = JSON.stringify({ nodes: [], links: [] });
+  const toolInfo = [{
+    name: "poster", x402: registry.tools[0].x402, rawText,
+    editorUrl: "https://nanoodle.com/#g=H4sIAAAAtest",
+  }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    // each workflow: a load-in-editor link + its raw graph JSON
+    assert.match(html, /href="https:\/\/nanoodle\.com\/#g=H4sIAAAAtest">open in editor</);
+    assert.match(html, /href="\/graph\/poster\.json">graph JSON</);
+    // the money story: deposit → cost + 20%, markup is the author's
+    assert.match(html, /workflow author&#39;s cut|workflow author's cut/);
+    assert.match(html, /authors earn the 20%/);
+    assert.match(html, new RegExp(PAYER)); // per-tool author payout address
+    // open source + host your own
+    assert.match(html, /Open source — host your own/);
+    assert.match(html, /MIT-licensed/);
+    assert.match(html, /npx nanoodle-mcp --graphs/);
+    assert.match(html, /github\.com\/nanoodlecom\/nanoodle-mcp/);
+
+    const graph = await fetch(`${base}/graph/poster.json`);
+    assert.equal(graph.status, 200);
+    assert.match(graph.headers.get("content-type"), /application\/json/);
+    assert.equal(await graph.text(), rawText);
+    assert.equal((await fetch(`${base}/graph/nope.json`)).status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("free-mode landing page skips the payment story but still shows self-hosting", async () => {
+  const registry = fakeRegistry();
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools: registry.listTools, callTool: registry.callTool,
+    toolInfo: [{ name: "poster", x402: null, rawText: "{}", editorUrl: "https://nanoodle.com/#g=abc" }],
+    publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.doesNotMatch(html, /authors earn the 20%/);
+    assert.doesNotMatch(html, /deposit/i);
+    assert.match(html, /open in editor/);
+    assert.match(html, /Open source — host your own/);
+  } finally {
+    server.close();
+  }
 });
 
 test("qrSvg encodes a nano URI into a QR matrix svg", () => {
