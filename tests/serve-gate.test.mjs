@@ -97,6 +97,7 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   assert.ok(!quoteRes.isError);
   const x = argOf(quoteRes);
   assert.match(quoteRes.content[0].text, /PAYMENT REQUIRED/);
+  assert.match(quoteRes.content[0].text, /expires in about 15 minutes \(\d{4}-\d{2}-\d{2}T/);
   assert.match(quoteRes.content[0].text, new RegExp(x.paymentId));
   assert.equal(x.payUrl, `http://pay.test/pay/${x.paymentId}`);
   assert.equal(x.address, GATE_ADDR);
