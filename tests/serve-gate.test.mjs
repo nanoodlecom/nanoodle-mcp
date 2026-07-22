@@ -1053,6 +1053,92 @@ test("free-mode landing page skips the payment story but still shows self-hostin
   }
 });
 
+test("landing page states the privacy contract; charged mode adds the ledger line", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.match(html, /Private by design/);
+    assert.match(html, /No accounts, no API keys, no sign-ins/);
+    assert.match(html, /never written to disk or logs/);
+    assert.match(html, /auto-deletes after 24 hours/);
+    assert.match(html, /held in memory for delivery, not stored/);
+    assert.match(html, /the server keeps no request logs/);
+    // charge-mode-only ledger claim
+    assert.match(html, /payments ledger: money events that mirror what is already public/);
+    // the honest NanoGPT caveat + verify-in-source link
+    assert.match(html, /governed by <a href="https:\/\/nano-gpt\.com\/privacy">their privacy policy/);
+    assert.match(html, /Verify every line in the source/);
+  } finally {
+    server.close();
+  }
+});
+
+test("free-mode landing keeps the privacy card but drops the payments-ledger line", async () => {
+  const registry = fakeRegistry();
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools: registry.listTools, callTool: registry.callTool,
+    publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.match(html, /Private by design/);
+    assert.match(html, /auto-deletes after 24 hours/);
+    assert.doesNotMatch(html, /payments ledger: money events/);
+  } finally {
+    server.close();
+  }
+});
+
+test("llms.txt carries a Privacy section; free mode drops the charge-specific lines", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const txt = await (await fetch(`${base}/llms.txt`)).text();
+    assert.match(txt, /## Privacy/);
+    assert.match(txt, /No accounts, no API keys, no sign-ins/);
+    assert.match(txt, /Prompts and inputs are never written to disk or logs/);
+    assert.match(txt, /short hash binding a payment to its call/); // charge-only
+    assert.match(txt, /auto-deletes after 24h/);
+    assert.match(txt, /payments ledger \(usage\.jsonl\)/); // charge-only
+    assert.match(txt, /nano-gpt\.com\/privacy/);
+  } finally {
+    server.close();
+  }
+
+  const freeReg = fakeRegistry();
+  const freeServer = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools: freeReg.listTools, callTool: freeReg.callTool,
+    publicBase: "http://pay.test", log: () => {},
+  });
+  const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
+  try {
+    const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
+    assert.match(txt, /## Privacy/);
+    assert.doesNotMatch(txt, /short hash binding a payment/);
+    assert.doesNotMatch(txt, /payments ledger \(usage\.jsonl\)/);
+  } finally {
+    freeServer.close();
+  }
+});
+
 test("qrSvg encodes a nano URI into a QR matrix svg", () => {
   const svg = qrSvg(`nano:${GATE_ADDR}?amount=123`);
   assert.match(svg, /^<svg /);
