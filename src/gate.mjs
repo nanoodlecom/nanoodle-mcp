@@ -197,11 +197,14 @@ export function createChargeGate({
     let base = usdToRaw(usdPrice, pair, "ceil");
     base = ((base + GRAIN - 1n) / GRAIN) * GRAIN;
     if (base < GRAIN) base = GRAIN;
-    for (;;) {
+    for (let attempt = 0; ; attempt++) {
       // …plus up to 0.0001 XNO (a few thousandths of a cent) of random tag in
       // whole 1e-8 XNO steps: visible to the matcher, negligible to the payer,
-      // and returned with the change anyway.
-      const tag = (BigInt("0x" + randomBytes(4).toString("hex")) % 10_000n) * GRAIN;
+      // and returned with the change anyway. If the retained-quote population
+      // ever crowds that space, widen it 100× (still under a cent) rather than
+      // loop forever.
+      const span = attempt < 50 ? 10_000n : 1_000_000n;
+      const tag = (BigInt("0x" + randomBytes(4).toString("hex")) % span) * GRAIN;
       const amountRaw = (base + tag).toString();
       // Unique across ALL retained quotes (not just pending) — the matcher
       // compares at GRAIN resolution against every quote it still remembers.
