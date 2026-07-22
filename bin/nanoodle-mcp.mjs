@@ -307,7 +307,8 @@ async function main() {
       "call the same tool again with identical arguments plus the given _payment_id — you may call again " +
       "right away: the call waits for the payment to land, then runs, streaming progress (with the tool's " +
       "typical runtime) while it works. The amount paid is a " +
-      "DEPOSIT: the real price is the run's actual metered model cost + 20%, and the difference is sent back " +
+      "DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the workflow " +
+      "author's cut), and the difference is sent back " +
       "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
       "payment, the whole payment is refunded automatically.";
   } else {
@@ -335,6 +336,7 @@ async function main() {
     callTool,
     instructions,
     gate,
+    toolInfo: registry.tools,
     outDir: resolvedOut,
     publicBase,
     log: (...a) => console.error(...a),

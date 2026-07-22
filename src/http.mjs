@@ -8,7 +8,9 @@
  *                        tools/call from an SSE-capable client answers as an
  *                        event stream with progress heartbeats — generations
  *                        and payment waits outlive client tool timeouts.
- *   GET  /               landing page: tool list w/ prices + the one-line connect command
+ *   GET  /               landing page: tool list w/ prices, per-workflow editor links,
+ *                        the one-line connect command, self-hosting + author-payout story
+ *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
  *   GET  /out/:file      generated media (unguessable filenames), when an outDir is given
@@ -72,10 +74,17 @@ const htmlPage = (title, body) =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
   `<title>${esc(title)}</title><style>${PAGE_CSS}</style></head><body><main>${body}</main></body></html>`;
 
-function landingHtml({ name, version, listTools, publicBase, charged }) {
+function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [] }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
-  const items = tools.map((t) =>
-    `<li><code>${esc(t.name)}</code><div class="muted">${esc(t.description)}</div></li>`).join("");
+  const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
+  const items = tools.map((t) => {
+    const info = infoByName.get(t.name);
+    const links = info ? ` <span class="muted">— <a href="${esc(info.editorUrl)}">open in editor</a>` +
+      ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>` : "";
+    const author = info && info.x402 && info.x402.author
+      ? `<div class="muted">author payout: <code>${esc(info.x402.author)}</code></div>` : "";
+    return `<li><code>${esc(t.name)}</code>${links}<div class="muted">${esc(t.description)}</div>${author}</li>`;
+  }).join("");
   return htmlPage(name, `
     <h1>${esc(name)} <span class="muted">v${esc(version)}</span></h1>
     <p class="muted">AI workflow tools over MCP${charged
@@ -85,10 +94,31 @@ function landingHtml({ name, version, listTools, publicBase, charged }) {
       <pre>claude mcp add --transport http noodles ${esc(publicBase)}/mcp</pre>
       ${charged ? `<p class="muted">Then just ask for what you want. When a tool needs payment, your agent
       shows you a link with a QR code — scan it with any Nano wallet and the result streams back seconds later.
-      Failed runs are refunded automatically.</p>` : ""}
+      Failed runs are refunded automatically.</p>
+      <p class="muted">What you pay up front is a <strong>deposit</strong>: each run settles at the model's
+      metered cost + 20%, and the difference is returned to your wallet on-chain. The 20% is the
+      <strong>workflow author's cut</strong>, not a platform fee.</p>` : ""}
     </div>
-    <div class="card"><h2>Tools (${tools.length})</h2><ul>${items}</ul></div>
-    <p class="muted">Host your own directory of noodles: <a href="https://github.com/nanoodlecom/nanoodle-mcp">nanoodle-mcp</a> — <code>--serve</code> turns any folder of graphs into a server like this one.</p>
+    <div class="card"><h2>Workflows (${tools.length})</h2>
+      <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
+      <a href="https://nanoodle.com">nanoodle editor</a> to see exactly how it works, remix it, or run it
+      on your own key.</p>
+      <ul>${items}</ul></div>
+    ${charged ? `<div class="card"><h2>Workflow authors earn the 20%</h2>
+      <p class="muted">A graph that declares a Nano address (<code>"x402": {"author": "nano_…"}</code> in its
+      JSON) receives the full 20% markup of every paid run, paid out on-chain automatically. The public
+      library behind this server is <a href="https://github.com/nanoodlecom/awesome-noodles">awesome-noodles</a> —
+      add your workflow there with your address to get listed and earn on every run.</p>
+    </div>` : ""}
+    <div class="card"><h2>Open source — host your own</h2>
+      <p class="muted">This whole stack is MIT-licensed: the
+      <a href="https://github.com/nanoodlecom/nanoodle-mcp">server</a>, the
+      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, and every workflow above
+      (grab any graph JSON). One command turns your own folder of graphs into a server exactly like this one:</p>
+      <pre>npx nanoodle-mcp --graphs ./noodles --serve 8402</pre>
+      <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
+      charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
+    </div>
   `);
 }
 
@@ -146,6 +176,7 @@ function payPageHtml(q) {
  * @param {string} opts.host  bind address (default 127.0.0.1 — use 0.0.0.0 behind a reverse proxy)
  * @param {number} opts.port
  * @param {object|null} [opts.gate]  charge gate (createChargeGate) — null serves free
+ * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402 for the landing page and /graph/:name.json
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
  * @param {number} [opts.progressMs]  heartbeat interval on streamed tools/call responses
  * @returns {Promise<http.Server>}
@@ -159,12 +190,14 @@ export async function serveHttp({
   callTool,
   instructions,
   gate = null,
+  toolInfo = [],
   outDir = null,
   publicBase,
   progressMs = 10_000,
   log = (...a) => console.error(...a),
 }) {
   const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
+  const graphByName = new Map(toolInfo.filter((t) => t.rawText).map((t) => [t.name, t.rawText]));
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -247,7 +280,14 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (url.pathname === "/") {
-        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate }), "text/html; charset=utf-8");
+        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo }), "text/html; charset=utf-8");
+      }
+
+      const graphMatch = url.pathname.match(/^\/graph\/([^/]+)\.json$/);
+      if (graphMatch) {
+        const raw = graphByName.get(decodeURIComponent(graphMatch[1]));
+        if (!raw) return send(404, JSON.stringify({ error: "not found" }));
+        return send(200, raw, "application/json; charset=utf-8");
       }
 
       const payMatch = url.pathname.match(/^\/pay\/([^/]+)$/);

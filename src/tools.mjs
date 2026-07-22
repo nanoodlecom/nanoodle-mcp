@@ -15,7 +15,18 @@ import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
+import { gzipSync } from "node:zlib";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
+
+/**
+ * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
+ * the same wire format the editor's own 🔗 Share mints and loadFromHash reads.
+ * Encoded from the raw file text, so extra keys (x402, comment intent) ride
+ * along — the editor ignores what it doesn't know.
+ */
+export function editorShareUrl(rawText) {
+  return `https://nanoodle.com/#g=${gzipSync(rawText).toString("base64url")}`;
+}
 
 /** Input kinds whose values are media (file path or URL), mirroring the library's MEDIA_KINDS. */
 const MEDIA_KINDS = new Set(["image", "audio", "video", "inpaint"]);
@@ -467,9 +478,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     const files = entries.filter((f) => f.toLowerCase().endsWith(".json")).sort();
     for (const file of files) {
       const path = join(dir, file);
-      let wf, x402 = null;
+      let wf, x402 = null, text;
       try {
-        const text = await readFile(path, "utf8");
+        text = await readFile(path, "utf8");
         wf = Workflow.fromJSON(text, { apiKey, payment, baseUrl, quiet: true });
         // The library normalizes graphs and drops unknown keys — the hand-added
         // "x402" block (per-graph price / author payout address) rides the raw file.
@@ -494,6 +505,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         dir,
         wf,
         x402,
+        rawText: text,               // exact served bytes — /graph/<name>.json and the editor link both come from these
+        editorUrl: editorShareUrl(text),
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
         inputSchema: buildInputSchema(wf),
       });

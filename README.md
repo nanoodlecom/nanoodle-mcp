@@ -199,7 +199,13 @@ claude mcp add --transport http noodles https://your-host/mcp
 ```
 
 `GET /` serves a landing page with the tool list and that exact command, so
-sharing your server's bare URL *is* the onboarding. Generated media is served
+sharing your server's bare URL *is* the onboarding. Every workflow on it links
+to its source: an **open in editor** link (a share link minted from the exact
+graph file being served — it loads the workflow in the
+[nanoodle editor](https://nanoodle.com) to inspect, remix, or run on your own
+key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
+out the economics (deposits settle at metered cost + 20%, the markup is the
+workflow author's cut) and how to self-host — this stack is MIT end to end. Generated media is served
 back under unguessable `/out/…` URLs (small images also ride inline in the
 tool result), and every call is appended to `<out>/usage.jsonl` so you can see
 what actually gets used.
