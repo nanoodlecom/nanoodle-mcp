@@ -15,7 +15,10 @@
  * refunds, receivable sweeps) — and chain state is maintained locally between
  * blocks, so a queued payment costs one work fetch (usually precomputed) plus
  * one publish, not a fresh account scan. N parallel tool calls therefore start
- * their runs within ~N × work-time, not N × full-payment-time.
+ * their runs within ~N × work-time, not N × full-payment-time. Running
+ * receivable sweeps yield between blocks when a payment is queued, and use
+ * receive-grade work (~64× cheaper than send-grade) so housekeeping never
+ * monopolizes the chain or the work server while customers wait.
  */
 import {
   checkAddress,
@@ -155,27 +158,39 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     return null;
   }
 
-  // Work generated at the send threshold is valid for any block type, so one
-  // precomputed value serves whatever block the frontier grows next. The cache
-  // is filled fire-and-forget after every published block — sends and receives
-  // are serialized on the queue, so by the time the next block needs work it is
-  // usually already there and the caller-facing wait drops to ~0.
-  const workCache = new Map(); // frontier hash -> Promise<string|null>
-  function precomputeWork(frontier) {
-    if (workCache.has(frontier)) return;
-    if (workCache.size >= 8) workCache.clear(); // superseded frontiers; only the newest matters
-    workCache.set(frontier, remoteWork(frontier, SEND_WORK_THRESHOLD).then((w) => {
-      if (w == null) workCache.delete(frontier); // don't cache failure; the live path retries + has local CPU
+  // Work precomputed fire-and-forget after every published block — sends and
+  // receives are serialized on the queue, so by the time the next block needs
+  // work it is usually already there and the caller-facing wait drops to ~0.
+  // The cache is THRESHOLD-AWARE: receive blocks are allowed ~64× cheaper work
+  // than sends, and a receive sweep that precomputed send-grade work for every
+  // interior block would hog the work server for seconds — exactly when a
+  // burst of customer payments needs it. So the sweep precomputes receive-grade
+  // work between its own blocks (near-instant) and send-grade only for the
+  // frontier a send might grow next. Send-grade work satisfies any block;
+  // receive-grade work never satisfies a send.
+  const atLeast = (have, need) => BigInt("0x" + have) >= BigInt("0x" + need);
+  const workCache = new Map(); // frontier hash -> { threshold, promise }
+  function precomputeWork(frontier, threshold = SEND_WORK_THRESHOLD) {
+    const existing = workCache.get(frontier);
+    if (existing && atLeast(existing.threshold, threshold)) return; // already as strong or stronger
+    if (!existing && workCache.size >= 8) workCache.clear(); // superseded frontiers; only the newest matters
+    const promise = remoteWork(frontier, threshold).then((w) => {
+      // don't cache failure (the live path retries + has local CPU) — but only
+      // evict our own entry; a concurrent upgrade may have replaced it
+      if (w == null && workCache.get(frontier)?.promise === promise) workCache.delete(frontier);
       return w;
-    }));
+    });
+    workCache.set(frontier, { threshold, promise });
   }
 
   async function workFor(frontier, threshold) {
     const cached = workCache.get(frontier);
-    if (cached) {
-      const w = await cached;
+    if (cached && atLeast(cached.threshold, threshold)) {
+      const w = await cached.promise;
       workCache.delete(frontier); // single-use: the frontier advances once this block publishes
       if (w != null) return w;
+    } else if (cached) {
+      workCache.delete(frontier); // cached at a weaker threshold than this block needs
     }
     const w = await remoteWork(frontier, threshold);
     if (w != null) return w;
@@ -200,19 +215,29 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
    * the payment that triggered it. Off the payment hot path — payments only
    * pocket when the bare balance can't cover the invoice; otherwise refunds
    * are swept by a queued housekeeping pass.
+   *
+   * `stopEarly(state)`, checked between blocks (after at least one), ends the
+   * pass with whatever has been pocketed so far — housekeeping passes use it to
+   * yield to a queued URGENT payment (a sweep of 50 must never make a paying
+   * customer wait out 50 publishes), and a short-balance payment uses it to
+   * stop the moment the invoice is covered. Whatever is left stays safely
+   * receivable for the next pass.
    */
-  async function pocketReceivables(fresh = false) {
+  async function pocketReceivables(fresh = false, stopEarly = null) {
     let state = await currentState(fresh);
     let blocks;
     try {
-      const r = await rpc({ action: "receivable", account: address, count: "20", threshold: "1" });
+      const r = await rpc({ action: "receivable", account: address, count: "50", threshold: "1" });
       blocks = r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     } catch {
       return state;
     }
-    for (const [sendHash, v] of blocks) {
+    let pocketed = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      const [sendHash, v] = blocks[i];
       const amountRaw = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
       if (!/^[0-9A-F]{64}$/i.test(sendHash) || !/^\d+$/.test(String(amountRaw || ""))) continue;
+      if (pocketed > 0 && stopEarly && stopEarly(state)) break;
       try {
         const work = await workFor(state.frontier, RECEIVE_WORK_THRESHOLD);
         const { hash, block } = createBlock(secretKey, {
@@ -224,16 +249,23 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         });
         block.account = address;
         delete block.link_as_account; // link is a block hash here, not an account
-        precomputeWork(hash); // next block's work computes while this one publishes
+        // next block's work computes while this one publishes — receive-grade
+        // between receives, send-grade for the frontier a send might grow next
+        precomputeWork(hash, i < blocks.length - 1 ? RECEIVE_WORK_THRESHOLD : SEND_WORK_THRESHOLD);
         await rpc({ action: "process", json_block: "true", subtype: "receive", block });
         chain = state = { ...state, frontier: hash, balance: state.balance + BigInt(amountRaw) };
+        pocketed++;
         log(`x402: received ${rawToXno(amountRaw)} XNO (refund/deposit ${sendHash.slice(0, 8)}…, block ${hash})`);
       } catch (e) {
         log(`receive of ${sendHash.slice(0, 8)}… failed (${e.message}) — continuing with current balance`);
         chain = null; // the publish may have half-landed; refetch before the next block
-        break;
+        return state;
       }
     }
+    // The pass may have ended mid-list (yield, stop, skips) with only
+    // receive-grade work in flight — upgrade the frontier to send-grade so the
+    // block that preempted us (usually a customer's payment) finds warm work.
+    precomputeWork(state.frontier, SEND_WORK_THRESHOLD);
     return state;
   }
 
@@ -331,9 +363,10 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     const amount = BigInt(invoice.amountRaw);
     // Hot path: send straight off the locally-tracked state. Receivables are
     // only pulled in when the bare balance can't cover the invoice (refunds
-    // and deposits waiting to be pocketed usually can).
+    // and deposits waiting to be pocketed usually can) — and only until it can:
+    // the caller is waiting, the rest sweeps later.
     let state = await currentState();
-    if (amount > state.balance) state = await pocketReceivables(true);
+    if (amount > state.balance) state = await pocketReceivables(true, (s) => amount <= s.balance);
     if (amount > state.balance) {
       throw new Error(
         `insufficient wallet balance: invoice is ${rawToXno(amount)} XNO` +
@@ -354,6 +387,9 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
   const URGENT = 0, HOUSEKEEPING = 1;
   const tasks = [];
   let draining = false;
+  // A customer's payment is queued RIGHT NOW — running housekeeping passes
+  // check this between blocks and hand the chain over instead of finishing.
+  const urgentWaiting = () => tasks.length > 0 && tasks[0].priority === URGENT;
   function enqueue(fn, priority = HOUSEKEEPING) {
     return new Promise((resolve, reject) => {
       const task = { fn, priority, resolve, reject };
@@ -378,7 +414,7 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
   function queueSweep() {
     if (sweepQueued) return;
     sweepQueued = true;
-    enqueue(() => { sweepQueued = false; return pocketReceivables(); }).catch(() => {});
+    enqueue(() => { sweepQueued = false; return pocketReceivables(false, urgentWaiting); }).catch(() => {});
   }
   const payment = (invoice) => {
     const p = enqueue(() => paySend(invoice), URGENT);
@@ -401,10 +437,12 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
       rpc,
       transfer: (to, amountRaw, describe = "sent") => enqueue(async () => {
         if (!checkAddress(String(to || ""))) throw new Error(`not a valid Nano address: ${to}`);
-        const state = await pocketReceivables();
+        // sweep first (a refund's source funds usually ARE a pending receivable),
+        // but yield to a waiting payment once this send itself is covered
+        const state = await pocketReceivables(false, (s) => urgentWaiting() && BigInt(amountRaw) <= s.balance);
         return sendFrom(state, to, BigInt(amountRaw), describe);
       }),
-      pocket: () => enqueue(() => pocketReceivables()),
+      pocket: () => enqueue(() => pocketReceivables(false, urgentWaiting)),
       /**
        * Kick off work precompute for the current frontier so the first block of
        * the session doesn't wait on work generation. Best-effort and off the

@@ -371,6 +371,71 @@ test("paySend: a short balance pulls in receivables on the spot, then sends", as
   assert.equal(rpc.state.workHashes[1], receiveHash, "the send's work must come from the precompute on the receive's hash");
 });
 
+/** Receivable override: entries disappear once a receive for them is processed. */
+const pendingReceivables = (entries) => (_b, state, reply) => {
+  const done = new Set(state.processed.filter((p) => p.subtype === "receive").map((p) => p.block.link.toUpperCase()));
+  const left = Object.fromEntries(Object.entries(entries).filter(([h]) => !done.has(h)));
+  return reply({ blocks: Object.keys(left).length ? left : "" });
+};
+
+test("a receive sweep asks for cheap receive-grade work between its blocks, send-grade only at the end", async () => {
+  const { hashBlock } = await import("nanocurrency");
+  const rpc = fakeRpc({
+    receivable: pendingReceivables({ ["1".repeat(64)]: AMOUNT, ["2".repeat(64)]: AMOUNT, ["3".repeat(64)]: AMOUNT }),
+    // advance the fake frontier to the block's REAL hash so the precompute cache lines up
+    process: (body, state, reply) => {
+      state.processed.push(body);
+      const b = body.block;
+      state.frontier = hashBlock({ account: b.account, previous: b.previous, representative: b.representative, balance: b.balance, link: b.link });
+      state.balance = b.balance;
+      return reply({ hash: state.frontier });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.ops.pocket();
+  assert.equal(rpc.state.processed.length, 3);
+  assert.deepEqual(rpc.state.workDifficulties,
+    ["fffffe0000000000", "fffffe0000000000", "fffffe0000000000", "fffffff800000000"],
+    "interior blocks must ride receive-grade work; only the final frontier warms send-grade");
+});
+
+test("a queued payment preempts a running receive sweep after at most one more block", async () => {
+  const entries = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [(i + 1).toString(16).repeat(64).slice(0, 64).toUpperCase(), AMOUNT]));
+  const rpc = fakeRpc({ receivable: pendingReceivables(entries) });
+  let wallet = null;
+  let payment = null;
+  let receives = 0;
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    const res = await rpc.fetch(url, init);
+    if (body.action === "process" && body.subtype === "receive" && ++receives === 2) {
+      payment = wallet.payment(invoice()); // a customer pays while the sweep is mid-pass
+    }
+    return res;
+  };
+  wallet = createNanoWallet({ secretKey: SECRET, fetch: f });
+  await wallet.ops.pocket();
+  await payment;
+  assert.deepEqual(rpc.state.processed.slice(0, 3).map((p) => p.subtype), ["receive", "receive", "send"],
+    "the sweep must yield the chain to the payment instead of finishing all 10 receives");
+  // nothing is lost: later sweeps pocket the rest
+  await wallet.ops.pocket();
+  await wallet.ops.pocket();
+  assert.equal(rpc.state.processed.filter((p) => p.subtype === "receive").length, 10);
+});
+
+test("paySend: short-balance pocketing stops the moment the invoice is covered", async () => {
+  const REFUND = "2000000000000000000000000000"; // each covers the 0.00123 XNO invoice alone
+  const rpc = fakeRpc({
+    account_info: (_b, state, reply) => { state.infoCalls++; return reply({ frontier: state.frontier, balance: "1", representative: ADDRESS }); },
+    receivable: pendingReceivables({ ["D".repeat(64)]: REFUND, ["E".repeat(64)]: REFUND, ["F".repeat(64)]: REFUND }),
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  assert.deepEqual(rpc.state.processed.slice(0, 2).map((p) => p.subtype), ["receive", "send"],
+    "one receive covers the invoice — the caller must not wait out the other two");
+});
+
 test("paySend: a refund can cover an invoice the bare balance cannot", async () => {
   const rpc = fakeRpc({
     account_info: (_b, state, reply) => { state.infoCalls++; return reply({ frontier: state.frontier, balance: "1", representative: ADDRESS }); },
