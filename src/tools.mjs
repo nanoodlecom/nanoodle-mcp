@@ -372,6 +372,12 @@ const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: 
  */
 async function emitResult(wf, result, prefix, outDir, { publicBase = null } = {}) {
   const content = [];
+  // Does any content block carry an actual tool OUTPUT as text (an LLM/text
+  // node's result), as opposed to a /out/ URL, a "saved <path>" pointer, or the
+  // cost line? Only true text output is the customer's paid content; the gate
+  // uses this flag to keep it off disk (media pointers + receipts are safe to
+  // persist, the files themselves die by --out-ttl).
+  let textOutput = false;
   for (const o of wf.outputs) {
     const value = result.outputs[o.key];
     if (value === undefined) continue;
@@ -395,14 +401,17 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null } = {}
       }
     } else {
       content.push({ type: "text", text: String(value) });
+      textOutput = true;
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
     content.push({ type: "text", text: `cost: $${result.costUsd.toFixed(4)}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
   }
-  // costUsd rides as a structured sidecar for the --charge gate's margin math
-  // (author payout = charge − cost); the serving layers strip it before replying.
-  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null };
+  // costUsd and textOutput ride as structured sidecars for the --charge gate:
+  // costUsd feeds its margin math (author payout = charge − cost), textOutput
+  // tells persist() this result holds paid content that must never hit disk.
+  // Every serving layer strips BOTH before replying to an MCP client.
+  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, textOutput };
 }
 
 /**

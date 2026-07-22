@@ -335,16 +335,41 @@ export function createChargeGate({
     saveChain = saveChain.then(async () => {
       saveQueued = false; // snapshot at write time — later mutations queue another write
       const data = JSON.stringify({
-        v: 1,
-        quotes: [...quotes.values()].map((q) => ({
-          id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
-          pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
-          amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
-          status: q.status === "consumed" && !q.result && !q.error ? "paid" : q.status,
-          source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
-          result: q.result ? { ...q.result, content: (q.result.content || []).filter((c) => c.type !== "image") } : null,
-          error: q.error ?? null,
-        })),
+        // v:2 is the content-stripping era — its results are provably media-only
+        // (text output is written as null) and its errors are pre-redacted. A
+        // v:1 (or unversioned) file predates this and may hold user content, so
+        // restore treats it as legacy: drop its results, redact its errors.
+        v: 2,
+        quotes: [...quotes.values()].map((q) => {
+          // What we're willing to write to disk for this quote's outcome:
+          //   - Media-only results persist as today (minus inline image blocks;
+          //     the files live on disk and keep their /out/ URLs). Their text is
+          //     pointers + a cost line + a gate-authored receipt — no user content.
+          //   - Text-output results (LLM/text nodes) hold the customer's paid
+          //     content, so they NEVER hit disk: persist null. With the status
+          //     rule below that demotes the quote back to "paid", so a retry after
+          //     a restart RE-RUNS instead of replaying content from disk. Charged
+          //     once / delivered once still holds; the only cost is one duplicate
+          //     model call in the rare restart-between-run-and-retry window — the
+          //     operator eats it, and privacy wins the trade.
+          //   - Errors persist in their redacted q.errorPersist form (upstream
+          //     text swapped for a placeholder, refund status kept). Its presence
+          //     keeps status "consumed" so the redacted error replays after restart.
+          const result = q.result && !q.textOutput
+            ? { ...q.result, content: (q.result.content || []).filter((c) => c.type !== "image") }
+            : null;
+          const error = q.error ? (q.errorPersist ?? "run failed: (error details not retained across restarts)") : null;
+          return {
+            id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
+            pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
+            amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
+            status: q.status === "consumed" && !result && !error ? "paid" : q.status,
+            source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
+            settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
+            result,
+            error,
+          };
+        }),
         owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
       });
       await mkdir(dirname(stateFile), { recursive: true });
@@ -357,10 +382,33 @@ export function createChargeGate({
   if (stateFile) {
     try {
       const data = JSON.parse(readFileSync(stateFile, "utf8"));
+      // A pre-v2 file predates content stripping: its results may be full tool
+      // output (text included) and its errors may be free-text upstream messages
+      // — both can quote user content. We can't prove any legacy field is clean,
+      // so we scrub at the door and never let it re-persist.
+      const legacy = data.v !== 2;
       for (const s of Array.isArray(data.quotes) ? data.quotes : []) {
         const q = { ...s, pair: { usdNano: BigInt(s.pair.usdNano), raw: BigInt(s.pair.raw) }, waiters: [] };
+        if (legacy) {
+          // Legacy result: drop it. Old code only cached a result AFTER settling,
+          // so a consumed quote that carried one was already settled — mark it so
+          // the forced re-run (result now null → demoted to "paid") recomputes the
+          // receipt WITHOUT paying change/author a second time. Money-safe; the
+          // operator eats at most one duplicate model call, and no output text
+          // survives to be written into the new v2 file.
+          if (q.result) { q.settled = q.settled === true || q.status === "consumed"; q.result = null; }
+          // Legacy error: it inlines the upstream message. Replace it wholesale
+          // with a gate-authored placeholder and keep the quote a REPLAY (below)
+          // — an errored quote was already refunded, so re-running it would refund
+          // twice. The caller sees the placeholder instead of their content; both
+          // the memory and persistable copies are the redacted string so a second
+          // restart round-trips it unchanged.
+          if (q.error) q.error = q.errorPersist = "run failed: (error details not retained across restarts) — the run was paid for; if you have not received a refund, contact the operator.";
+        }
         // A finished run replays its cached outcome; without this, a retry
-        // after restart would run (and settle) the same payment twice.
+        // after restart would run (and settle) the same payment twice. A quote
+        // whose result we just dropped has neither result nor error, so it is
+        // NOT marked a replay here — it re-runs on retry (guarded by q.settled).
         if (q.status === "consumed" && (q.result || q.error)) q.running = Promise.resolve();
         quotes.set(q.id, q);
       }
@@ -645,8 +693,16 @@ export function createChargeGate({
        * operator eats the rest; take and change are then zero. Transfers are
        * queued and never block the caller's result. Returns the numbers for
        * the receipt.
+       *
+       * `alreadySettled` is set only on the re-run that follows a restart of a
+       * text-output quote (see the persist() note): that quote's change and
+       * author payout went out on the FIRST run, so the re-run recomputes the
+       * receipt numbers but must NOT move money again. Without this the caller
+       * would be paid change twice and the author twice — the demote-and-re-run
+       * trade-off is meant to cost the operator exactly one duplicate model
+       * call, nothing more.
        */
-      function settle(q, name, costUsd) {
+      function settle(q, name, costUsd, alreadySettled = false) {
         const author = authors.get(name);
         const deposit = BigInt(q.amountRaw);
         const known = Number.isFinite(costUsd);
@@ -656,6 +712,9 @@ export function createChargeGate({
         const markup = costRaw0 / 5n;
         const take = markup < remaining ? markup : remaining;
         const change = remaining - take;
+
+        // Recompute-only replay after a restart: the money already moved.
+        if (alreadySettled) return { known, costRaw, take, change, author: !!author };
 
         if (costRaw0 > deposit) {
           log(`call ${q.id} (${name}) cost $${costUsd} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
@@ -785,8 +844,17 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, ...result } = await registry.callTool({ name, arguments: args });
-              const s = settle(q, name, costUsd);
+              const { costUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args });
+              // Whether this result carries the customer's paid text output. Kept
+              // on q (not inside q.result) so in-process replay is unchanged but
+              // persist() knows this result must not be written to disk.
+              q.textOutput = !!textOutput;
+              // q.settled is only ever true here on the re-run of a text-output
+              // quote that was demoted to "paid" across a restart — its money
+              // already moved, so settle() recomputes the receipt without paying
+              // change/author twice. Set it before persist() records it.
+              const s = settle(q, name, costUsd, q.settled === true);
+              q.settled = true;
               const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
                 (q.payHash ? ` (block ${q.payHash})` : "") +
                 (s.known
@@ -808,11 +876,21 @@ export function createChargeGate({
               // inside refund) see the upstream error text; the ledger records
               // the failure as the fixed category "run_failed".
               const refunded = await refund(q, "run_failed");
-              q.error = `run failed: ${msg}` + (refunded
+              // The refund-status sentence is gate-authored (no user content), so
+              // it's safe on disk; the upstream `msg` can quote prompt content, so
+              // it is not. q.error carries the full text for in-process replay;
+              // q.errorPersist swaps msg for a placeholder and is what persist()
+              // writes. After a restart the placeholder variant IS q.error, so a
+              // replayed failure shows "(error details not retained…)" plus the
+              // real refund status — enough for the caller to know the money is
+              // handled, without keeping their content at rest.
+              const refundStatus = refunded
                 ? ` — your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}.`
                 : q.source
                   ? ` — your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands).`
-                  : " — the run was paid for; contact the operator about a refund.");
+                  : " — the run was paid for; contact the operator about a refund.";
+              q.error = `run failed: ${msg}` + refundStatus;
+              q.errorPersist = `run failed: (error details not retained across restarts)` + refundStatus;
               persist();
             }
           })();

@@ -223,6 +223,16 @@ replay window: a paid result stays replayable for 24h and references its `/out/`
 URL, so lowering `--out-ttl` below 24h in charge mode means a replayed result
 can point at a file that's already been swept.
 
+`gate-state.json` itself never holds customer content. It exists to keep
+in-flight money safe across the restart a deploy causes — quotes and owed sends
+survive — but a paid tool's **text output and any upstream error detail are
+never written to disk**. Media results persist only their `/out/` pointer and a
+receipt; a text result persists as nothing, so a restart between a run and the
+caller's retry simply re-runs the tool (charged once, delivered once — the
+operator eats one duplicate model call) rather than replaying content from disk,
+and a failed run replays a fixed placeholder plus its refund status, never the
+original error message.
+
 Free serve mode runs on **your** balance — fine on a trusted network, ruinous
 on the open internet. For that, charge for calls:
 
