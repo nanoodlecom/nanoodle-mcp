@@ -191,6 +191,43 @@ export function createChargeGate({
     resolveWaiters(q);
   }
 
+  /*
+   * Money owed to someone whose send bounced (RPC hiccup, work outage, rate
+   * limit) — retried on the watcher timer with backoff until it lands. A
+   * failed send must never silently strand a customer's or author's money:
+   * that's the difference between "the RPC blipped" and "the operator kept it".
+   */
+  const owed = []; // { to, amountRaw, describe, event, fields, onOk, tries, at }
+  const OWED_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
+  const OWED_MAX_TRIES = 100; // ≈16h at the 10-min cap — after that it needs a human
+  function owe(to, amountRaw, describe, event, fields, onOk) {
+    owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, tries: 0, at: now() + OWED_BACKOFF_MS[0] });
+    log(`${describe} ${rawToXno(amountRaw)} XNO to ${to} failed — queued for retry`);
+    ensureWatching();
+  }
+  async function retryOwed() {
+    const t = now();
+    for (const o of [...owed]) {
+      if (t < o.at) continue;
+      o.tries++;
+      try {
+        const hash = await ops.transfer(o.to, o.amountRaw, o.describe);
+        owed.splice(owed.indexOf(o), 1);
+        usage(o.event, { ...o.fields, ok: true, to: o.to, amountRaw: o.amountRaw, hash, retries: o.tries });
+        if (o.onOk) o.onOk(hash);
+      } catch (e) {
+        if (o.tries >= OWED_MAX_TRIES) {
+          owed.splice(owed.indexOf(o), 1);
+          log(`GIVING UP on ${o.describe} ${rawToXno(o.amountRaw)} XNO to ${o.to} after ${o.tries} tries (${e.message}) — refund manually`);
+          usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw, error: e.message, retries: o.tries, gaveUp: true });
+          continue;
+        }
+        o.at = t + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
+        log(`retry ${o.tries} of ${o.describe} to ${o.to} failed: ${e.message}`);
+      }
+    }
+  }
+
   async function refund(q, reason) {
     if (q.refunding) return q.refunding;
     if (!q.source) {
@@ -207,6 +244,8 @@ export function createChargeGate({
       } catch (e) {
         log(`refund of ${q.id} to ${q.source} failed: ${e.message}`);
         usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: e.message, reason });
+        owe(q.source, q.amountRaw, "refunded", "refund",
+          { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; });
         return false;
       }
     })();
@@ -252,12 +291,13 @@ export function createChargeGate({
   const LATE_WATCH_MS = 60 * 60 * 1000;
   const anyWatchable = () => {
     const t = now();
-    return [...quotes.values()].some((q) =>
+    return owed.length > 0 || [...quotes.values()].some((q) =>
       q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS));
   };
 
   async function scan() {
     prune();
+    await retryOwed();
     if (!anyWatchable()) return;
     tickCount++;
     const r = await ops.rpc({ action: "receivable", account: address, count: "50", threshold: "1", source: "true" });
@@ -455,7 +495,7 @@ export function createChargeGate({
             .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? costUsd : null, hash }))
             .catch((e) => {
               log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
-              usage("author_payout", { paymentId: q.id, tool: name, ok: false, to: author, amountRaw: take.toString(), error: e.message });
+              owe(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id, tool: name });
             });
         }
         if (change > 0n) {
@@ -464,7 +504,7 @@ export function createChargeGate({
               .then((hash) => usage("change", { paymentId: q.id, tool: name, ok: true, to: q.source, amountRaw: change.toString(), hash }))
               .catch((e) => {
                 log(`change for ${q.id} (→ ${q.source}) failed: ${e.message}`);
-                usage("change", { paymentId: q.id, tool: name, ok: false, to: q.source, amountRaw: change.toString(), error: e.message });
+                owe(q.source, change.toString(), "change:", "change", { paymentId: q.id, tool: name });
               });
           } else {
             log(`cannot return ${rawToXno(change)} XNO change for ${q.id}: payer account unknown`);
@@ -577,7 +617,9 @@ export function createChargeGate({
               const refunded = await refund(q, `run failed: ${msg}`);
               q.error = `run failed: ${msg}` + (refunded
                 ? ` — your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}.`
-                : " — the run was paid for; contact the operator about a refund.");
+                : q.source
+                  ? ` — your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands).`
+                  : " — the run was paid for; contact the operator about a refund.");
             }
           })();
         }

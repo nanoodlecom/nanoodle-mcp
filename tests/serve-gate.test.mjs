@@ -169,6 +169,51 @@ test("failed run refunds the payer in full", async () => {
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
 });
 
+test("a bounced refund is retried until it lands — the customer's money is never stranded", async () => {
+  let t = 1_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  const events = [];
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5, usage: (e, f) => events.push([e, f]) }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+
+  chain.state.failTransfer = true; // the refund send bounces (rate limit, RPC blip…)
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(res.isError);
+  assert.match(res.content[0].text, /refunded to .* automatically/, "caller must be told the refund retries, not to chase the operator");
+  assert.deepEqual(chain.state.transfers, []);
+
+  chain.state.failTransfer = false;
+  t += 31_000; // past the first retry backoff
+  await new Promise((r) => setTimeout(r, 80)); // let the watcher tick
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+  const retried = events.filter(([e, f]) => e === "refund" && f.ok);
+  assert.equal(retried.length, 1);
+  assert.equal(retried[0][1].retries, 1);
+});
+
+test("a bounced change send is retried too", async () => {
+  let t = 2_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.02 }) });
+  const events = [];
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5, usage: (e, f) => events.push([e, f]) }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["E".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain.state.failTransfer = true;
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!res.isError, "the run itself succeeded — only the change send bounced");
+  await new Promise((r) => setTimeout(r, 30));
+  chain.state.failTransfer = false;
+  t += 31_000;
+  await new Promise((r) => setTimeout(r, 80));
+  const change = chain.state.transfers.find((tr) => tr.describe === "change:");
+  assert.ok(change, "change must land on retry");
+  assert.equal(BigInt(x.amountRaw) - 24n * 10n ** 27n, BigInt(change.amountRaw)); // deposit − (cost+markup) at $1/XNO
+  assert.ok(events.find(([e, f]) => e === "change" && f.ok && f.retries === 1));
+});
+
 test("settle: cost + 20% markup to the author, change back to the payer, exact to the raw", async () => {
   const chain = fakeChain();
   // $0.05 deposit at $1/XNO; the run meters $0.02 → cost 0.02 XNO, markup 0.004 XNO, rest is change
