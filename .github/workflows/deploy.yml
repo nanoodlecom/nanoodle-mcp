@@ -1,0 +1,20 @@
+# Template: copy to <repo>/.github/workflows/deploy.yml, set APP_NAME.
+# Repo secret DEPLOY_SSH_KEY = contents of /root/.ssh/deploy_key on the box
+# (key is locked to the deploy-app forced command — it cannot run anything else).
+name: deploy
+on:
+  push:
+    branches: [main, master]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to 255labs box
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "159.195.17.119 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHcFN8/48EuW9f6MXgGx9a/syadihZ4XpY+EazT2KbQe" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp"
