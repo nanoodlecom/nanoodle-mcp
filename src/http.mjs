@@ -104,7 +104,21 @@ function payPageHtml(q) {
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
          Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
       <p class="muted" id="status">waiting for payment… settles in about a second</p>
+      <p class="muted" id="expiry"></p>
     </div>
+    <script>
+      const EXP = Date.parse(${JSON.stringify(q.expiresAt)});
+      function tickExpiry(){
+        const el = document.getElementById("expiry");
+        if(!el) return; // paybox was replaced by the paid check
+        const s = Math.max(0, Math.floor((EXP - Date.now())/1000));
+        el.textContent = s > 0
+          ? "quote expires in " + Math.floor(s/60) + ":" + String(s%60).padStart(2,"0")
+          : "quote expired — ask your agent for a fresh one";
+        if(s > 0) setTimeout(tickExpiry, 1000);
+      }
+      tickExpiry();
+    </script>
     <script>
       async function poll(){
         try{

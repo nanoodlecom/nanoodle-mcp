@@ -500,6 +500,9 @@ export function createChargeGate({
       amountUsd: q.usd,
       expiresAt: new Date(q.expiresAt).toISOString(),
     };
+    // Agents relay this text to humans verbatim — "in 15 minutes" is usable
+    // at a glance where a bare ISO timestamp forces timezone math.
+    const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const text =
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
@@ -511,7 +514,8 @@ export function createChargeGate({
       (q.etaMs ? ` Once paid, this tool typically finishes in ~${fmtDur(q.etaMs)}.` : "") + `\n\n` +
       `Paying without the page: send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
       `the exact amount is how the payment is recognized (URI: ${nanoUri(q)}).\n` +
-      `This quote expires ${x402.expiresAt}. If the run fails after payment, the payment is refunded automatically.`;
+      `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"} (${x402.expiresAt}). ` +
+      `If the run fails after payment, the payment is refunded automatically.`;
     return { content: [{ type: "text", text }], structuredContent: { x402 } };
   }
 
