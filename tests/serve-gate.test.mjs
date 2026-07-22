@@ -982,6 +982,24 @@ test("a hand-added x402 block on a graph file reaches the gate (price + author)"
   assert.equal(decoded, tool.rawText);
 });
 
+test("editor-saved filenames make clean tool names, and legacy cost keys migrate", async () => {
+  const { mkdtemp, readFile, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const { loadTools } = await import("../src/tools.mjs");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dir = await mkdtemp(join(tmpdir(), "clean-names-"));
+  const g = await readFile(join(here, "fixtures", "hello-noodle.json"), "utf8");
+  await writeFile(join(dir, "poster.noodle-graph.json"), g);
+  await writeFile(join(dir, "costs.json"), JSON.stringify({ "poster-noodle-graph": { usd: 0.04, at: "2026-07-22T00:00:00Z" } }));
+  const registry = await loadTools({ dirs: [dir], apiKey: "k", outDir: dir });
+  assert.equal(registry.tools[0].name, "poster", "the .noodle-graph save suffix is not part of the name");
+  assert.equal(registry.costs.poster.usd, 0.04, "pre-rename cost record still prices the deposit");
+  assert.equal(registry.costs["poster-noodle-graph"], undefined);
+  assert.match(registry.tools[0].description, /\$0\.04/);
+});
+
 test("deposits track observed cost: cheap tools quote small deposits, live", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();

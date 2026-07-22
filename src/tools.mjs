@@ -65,7 +65,8 @@ export class ParamsError extends Error {
 }
 
 function sanitizeName(file) {
-  const stem = basename(file).replace(/\.json$/i, "");
+  // "poster.noodle-graph.json" (the editor's save name) and "poster.json" both → "poster"
+  const stem = basename(file).replace(/(\.noodle-graph)?\.json$/i, "");
   const name = stem.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return name || "graph";
 }
@@ -508,6 +509,11 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const count = (usedNames.get(name) || 0) + 1;
       usedNames.set(name, count);
       if (count > 1) name = `${name}-${count}`;
+      // cost records written before ".noodle-graph" was stripped keep pricing deposits
+      if (!costs[name] && costs[`${name}-noodle-graph`]) {
+        costs[name] = costs[`${name}-noodle-graph`];
+        delete costs[`${name}-noodle-graph`];
+      }
       tools.push({
         name,
         file,
