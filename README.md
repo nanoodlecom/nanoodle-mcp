@@ -322,11 +322,14 @@ so payments pocketed by a concurrently-running wallet are still found.
 In charge mode `<out>/usage.jsonl` is a **payments ledger**: one line per money
 event only — `quote`, `paid`, `refund`, `change`, `author_payout` — your
 server's own record of money moving, nothing client-side. It is deliberately
-**not** a usage log: there are no `run` events, no per-call timing, no tool-call
-telemetry, and no upstream error strings (which can quote user content). Refunds
-record a fixed category (`run_failed`, `late_payment`), never the underlying
-error text — the full error still reaches the caller and the operator's stderr.
-Free serve mode writes no ledger at all. Some starters:
+**not** a usage log: there are no `run` events, no run timing, no
+success/failure telemetry, and no upstream error strings (which can quote user
+content). A money event does carry `.tool` — the tool name is the *subject of
+the payment*, not a record of a run — so you can see what earns, but not who
+ran what when or whether it failed. Refunds record a fixed category
+(`run_failed`, `late_payment`), never the underlying error text — the full
+error still reaches the caller and the operator's stderr. Free serve mode
+writes no ledger at all. Some starters:
 
 ```bash
 jq -r 'select(.event=="paid") | .tool' usage.jsonl | sort | uniq -c | sort -rn  # paid calls per tool

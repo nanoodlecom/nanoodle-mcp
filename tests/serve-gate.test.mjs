@@ -451,6 +451,42 @@ test("gate state survives a restart: a queued refund retries under the new proce
     "the customer's refund must land even though the process that owed it died");
 });
 
+test("restore scrubs legacy free-text refund reasons: no upstream error text reaches a new ledger line", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-legacy-")), "gate-state.json");
+  let t = 6_000_000;
+
+  // A state file written by a PRE-policy build: the queued refund's reason is
+  // the old free-text form that can quote user content.
+  const SENTINEL = "run failed: PROMPT LEAK abc123 SECRET";
+  await writeFile(stateFile, JSON.stringify({
+    v: 1,
+    quotes: [],
+    owed: [{
+      to: PAYER, amountRaw: "50000000000000000000000000000", describe: "refunded",
+      event: "refund", fields: { paymentId: "pay_legacy", tool: "poster", reason: SENTINEL }, tries: 0,
+    }],
+  }));
+
+  const chain = fakeChain();
+  const events = [];
+  // Restore under the new build; the owed send lands on the first retry tick.
+  makeGate(chain, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5, usage: (e, f) => events.push([e, f]) })
+    .wrapRegistry(fakeRegistry());
+  t += 31_000; // past the first retry backoff
+  await new Promise((r) => setTimeout(r, 80)); // restored watcher ticks and sends
+
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: "50000000000000000000000000000", describe: "refunded" }]);
+  const refund = events.find(([e, f]) => e === "refund" && f.ok);
+  assert.ok(refund, "the restored refund must land and log a money event");
+  assert.equal(refund[1].reason, "run_failed", "the legacy reason is coerced to a category");
+  const line = JSON.stringify({ ts: new Date().toISOString(), event: refund[0], ...refund[1] });
+  assert.doesNotMatch(line, /PROMPT LEAK|abc123|SECRET/,
+    "not one byte of the legacy free-text reason may reach the new ledger line");
+});
+
 test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();

@@ -32,6 +32,13 @@ import { rawToXno } from "./wallet.mjs";
 import { fmtDur } from "./tools.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
+/**
+ * The ONLY refund reasons the payments ledger may record — fixed categories,
+ * never free text. A ledger line must never carry an upstream error string
+ * (it can quote user content), so any reason outside this set is coerced to
+ * "run_failed" before it can reach usage.jsonl.
+ */
+const REFUND_REASONS = new Set(["run_failed", "late_payment"]);
 const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund late payments
 const HISTORY_EVERY = 5; // check account_history every Nth poll tick
 /**
@@ -285,6 +292,7 @@ export function createChargeGate({
    * (ops.transfer bounced) is operational, not user content.
    */
   async function refund(q, reason) {
+    reason = REFUND_REASONS.has(reason) ? reason : "run_failed";
     if (q.refunding) return q.refunding;
     if (!q.source) {
       log(`cannot refund ${q.id}: payer account unknown — ${rawToXno(q.amountRaw)} XNO stays in the wallet`);
@@ -357,8 +365,16 @@ export function createChargeGate({
         quotes.set(q.id, q);
       }
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
+        // Legacy state files predate the payments-ledger policy: their queued
+        // refunds carry free-text reasons like "run failed: <upstream error>",
+        // which can quote user content. When such an owed send later lands (or
+        // gives up), its fields are spread verbatim into a NEW ledger line — so
+        // scrub any non-category reason down to "run_failed" here, at the door,
+        // keeping every other field intact.
+        const fields = s.fields && typeof s.fields === "object" ? { ...s.fields } : s.fields;
+        if (fields && "reason" in fields && !REFUND_REASONS.has(fields.reason)) fields.reason = "run_failed";
         owed.push({
-          ...s, at: now() + OWED_BACKOFF_MS[0],
+          ...s, fields, at: now() + OWED_BACKOFF_MS[0],
           onOk: s.event === "refund" && s.fields && s.fields.paymentId
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
             : null,
