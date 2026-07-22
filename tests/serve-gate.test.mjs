@@ -13,15 +13,35 @@ import { rawToXno } from "../src/wallet.mjs";
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
 const PAYER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
 
-/** Scripted chain: receivable/history state the gate polls, transfers it makes. */
+/**
+ * Scripted chain: receivable/history state the gate polls, transfers it makes.
+ * Behaves like a REAL node where it matters for burst detection: `receivable`
+ * honors its count (stable hash order), `account_history` honors count and
+ * pages via head/previous (history[0] is newest), and `pocket` moves
+ * receivables into history the way wallet housekeeping does.
+ */
 function fakeChain() {
   const state = { receivable: {}, history: [], transfers: [], failTransfer: false };
   return {
     state,
     ops: {
       rpc: async (body) => {
-        if (body.action === "receivable") return { blocks: state.receivable };
-        if (body.action === "account_history") return { history: state.history };
+        if (body.action === "receivable") {
+          const count = parseInt(body.count || "50", 10);
+          const entries = Object.entries(state.receivable).sort(([a], [b]) => (a < b ? -1 : 1)).slice(0, count);
+          return { blocks: Object.fromEntries(entries) };
+        }
+        if (body.action === "account_history") {
+          const count = parseInt(body.count || "25", 10);
+          let start = 0;
+          if (body.head) {
+            const i = state.history.findIndex((e) => e.hash === body.head);
+            start = i === -1 ? state.history.length : i;
+          }
+          const res = { history: state.history.slice(start, start + count) };
+          if (start + count < state.history.length) res.previous = state.history[start + count].hash;
+          return res;
+        }
         throw new Error("unexpected rpc action " + body.action);
       },
       transfer: async (to, amountRaw, describe) => {
@@ -29,7 +49,12 @@ function fakeChain() {
         state.transfers.push({ to, amountRaw, describe });
         return "F".repeat(64);
       },
-      pocket: async () => {},
+      pocket: async () => {
+        for (const [hash, v] of Object.entries(state.receivable)) {
+          delete state.receivable[hash];
+          state.history.unshift({ type: "receive", account: v.source ?? null, amount: v.amount ?? v, hash });
+        }
+      },
     },
   };
 }
@@ -312,6 +337,68 @@ test("already-pocketed payments are found via account_history", async () => {
   chain.state.history.push({ type: "receive", account: PAYER, amount: x.amountRaw, hash: "D".repeat(64) });
   const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!res.isError, JSON.stringify(res.content));
+});
+
+/*
+ * Burst regression: pre-fix, `receivable` was polled with count 50 and history
+ * with a fixed 25-entry window every 5th tick, so a burst of simultaneous
+ * payments hard-capped at ~70 settled — everything past that was pocketed by
+ * housekeeping, scrolled out of the history window, and silently stranded
+ * (paid, never run, never refunded). These tests run against a fake node that
+ * honors the RPC count params, which is what exposed the caps.
+ */
+const testHash = (i) => i.toString(16).padStart(64, "0").toUpperCase();
+
+test("burst: 120 payments pocketed by a concurrent wallet all match via the history walk", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+  const xs = [];
+  for (let i = 0; i < 120; i++) xs.push(argOf(await callTool({ name: "poster", arguments: { Text: "p" + i } })));
+  await new Promise((r) => setTimeout(r, 25)); // watcher ticks at least once pre-burst (seeds the history marker)
+  // every deposit was pocketed the instant it arrived — never visible in
+  // receivable — then buried under 40 later housekeeping sends. 160 entries
+  // spans multiple history pages, so this exercises pagination too.
+  for (let i = 0; i < 120; i++) chain.state.history.unshift({ type: "receive", account: PAYER, amount: xs[i].amountRaw, hash: testHash(i) });
+  for (let i = 0; i < 40; i++) chain.state.history.unshift({ type: "send", account: PAYER, amount: "1", hash: testHash(1000 + i) });
+  const statuses = await Promise.all(xs.map((x) => gate.waitForPayment(x.paymentId, 2000)));
+  assert.equal(statuses.filter((s) => s === "paid").length, 120, `expected all 120 paid, got: ${JSON.stringify(statuses.filter((s) => s !== "paid"))}`);
+});
+
+test("burst: receivables past the poll window recover via pocketing + the history walk", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+  const xs = [];
+  for (let i = 0; i < 520; i++) xs.push(argOf(await callTool({ name: "poster", arguments: { Text: "p" + i } })));
+  await new Promise((r) => setTimeout(r, 25));
+  // 520 simultaneous receivables — 20 beyond even the widened 500 window. The
+  // scanner must notice the full window, have the wallet pocket, and pick the
+  // overflow up from history.
+  for (let i = 0; i < 520; i++) chain.state.receivable[testHash(i)] = { amount: xs[i].amountRaw, source: PAYER };
+  const statuses = await Promise.all(xs.map((x) => gate.waitForPayment(x.paymentId, 2000)));
+  assert.equal(statuses.filter((s) => s === "paid").length, 520, `expected all 520 paid, got ${statuses.filter((s) => s === "paid").length}`);
+});
+
+test("burst: concurrent cold-cache quotes share ONE rate-oracle probe", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let probes = 0;
+  const fetch = async () => {
+    probes++;
+    await new Promise((r) => setTimeout(r, 20)); // all quoters arrive while the probe is in flight
+    return {
+      status: 402,
+      json: async () => ({ payment: { accepted: [
+        { scheme: "nano", payTo: GATE_ADDR, amount: "1" + "0".repeat(30), amountUsd: "1" }] } }),
+    };
+  };
+  const { callTool } = makeGate(chain, { registry, xnoUsd: null, fetch }).wrapRegistry(registry);
+  const quotes = await Promise.all(Array.from({ length: 10 }, (_, i) => callTool({ name: "poster", arguments: { Text: "t" + i } })));
+  assert.equal(probes, 1, "10 concurrent cold quotes must not stampede the oracle");
+  assert.equal(new Set(quotes.map((q) => argOf(q).amountRaw)).size, 10);
 });
 
 test("expired quotes reject; a late payment is auto-refunded", async () => {
