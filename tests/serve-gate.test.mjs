@@ -1075,6 +1075,71 @@ test("landing page links each workflow, states the author cut, and shows self-ho
   }
 });
 
+test("landing workflow card: title + id, intent, tinted pipeline chips, last-run cost — boilerplate stated once, not per card", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{
+    name: "poster", x402: null, rawText: "{}",
+    editorUrl: "https://nanoodle.com/#g=H4sIAAAAtest",
+    card: {
+      intent: "Turns one line into a printable poster.",
+      steps: [
+        { label: "text", kind: "text", n: 1 },
+        { label: "llm", kind: "llm", n: 2 },
+        { label: "image", kind: "image", n: 1 },
+      ],
+    },
+  }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo,
+    costs: { poster: { usd: 0.04, ms: 15_000 } },
+    publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    // layered card: human title beside the exact tool id, then the author's intent
+    assert.match(html, /<span class="tname">Poster<\/span><code class="tid">poster<\/code>/);
+    assert.match(html, /<p class="intent">Turns one line into a printable poster\.<\/p>/);
+    // pipeline chips carry their media-class tints; ×N collapse survives
+    assert.match(html, /<span class="chip k-text">text<\/span>/);
+    assert.match(html, /<span class="chip k-llm">llm×2<\/span>/);
+    assert.match(html, /<span class="chip k-image">image<\/span>/);
+    // real price signal on the card, links intact
+    assert.match(html, /last run \$0\.04, ~15s/);
+    assert.match(html, /open in editor/);
+    // the payment contract is told once above the grid, not inside every card
+    assert.match(html, /settles at the model(?:&#39;|')s actual cost \+ 20%, change returned/);
+    assert.doesNotMatch(html, /deposit per call, paid in Nano/);
+  } finally {
+    server.close();
+  }
+});
+
+test("landing workflow card without structured pieces falls back to the one-line description", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{ name: "poster", x402: null, rawText: "{}", editorUrl: "https://nanoodle.com/#g=H4sIAAAAtest" }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.match(html, /<li class="tool"><code>poster<\/code>/);
+    assert.match(html, /deposit per call, paid in Nano/); // the gated description carries the contract here
+    assert.match(html, /open in editor/);
+  } finally {
+    server.close();
+  }
+});
+
 test("landing hero: connect command, payment flow strip, llms.txt pointer", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
