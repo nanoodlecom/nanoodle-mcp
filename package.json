@@ -16,6 +16,7 @@
   "files": [
     "src",
     "bin",
+    "assets",
     "README.md",
     "LICENSE"
   ],
