@@ -171,6 +171,21 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <a href="https://nanoodle.com">nanoodle editor</a> to see exactly how it works, remix it, or run it
       on your own key.</p>
     <ul class="tools">${cards}</ul>
+    <div class="card"><h2>Private by design</h2>
+      <p class="muted">Every line here is checkable in the source — nothing to take on faith.</p>
+      <ul>
+        <li>No accounts, no API keys, no sign-ins${charged ? " — paying is the only thing that authorizes a call" : ""}.</li>
+        <li>Your prompts and inputs are never written to disk or logs.</li>
+        <li>Input media rides in memory only — it is never stored.</li>
+        <li>Generated media auto-deletes after 24 hours, served at unguessable URLs until then.</li>
+        <li>Results are held in memory for delivery, not stored.</li>
+        <li>No analytics, no trackers, no IP logs — the server keeps no request logs.</li>
+        ${charged ? `<li>The only thing written down is a payments ledger: money events that mirror what is already public on the Nano ledger — no run telemetry, no error text.</li>` : ""}
+      </ul>
+      <p class="muted">One caveat, stated plainly: generation runs on <a href="https://nano-gpt.com">NanoGPT</a>'s API,
+        so your prompt content in flight is governed by <a href="https://nano-gpt.com/privacy">their privacy policy</a>.</p>
+      <p class="muted"><a href="https://github.com/nanoodlecom/nanoodle-mcp">Verify every line in the source →</a></p>
+    </div>
     ${charged ? `<div class="card"><h2>Workflow authors earn the 20%</h2>
       <p class="muted">A graph that declares a Nano address (<code>"x402": {"author": "nano_…"}</code> in its
       JSON) receives the full 20% markup of every paid run, paid out on-chain automatically. The public
@@ -228,6 +243,23 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     if (infoByName.has(t.name)) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
   }
   lines.push(
+    ``,
+    `## Privacy`,
+    ``,
+    `Relay this to anyone deciding whether to pay — every line is verifiable in the MIT-licensed source.`,
+    `- No accounts, no API keys, no sign-ins${charged ? " — paying is the only thing that authorizes a call" : ""}.`,
+    `- Prompts and inputs are never written to disk or logs.`,
+  );
+  if (charged) lines.push(`- The server keeps only a short hash binding a payment to its call, never the arguments themselves.`);
+  lines.push(
+    `- Input media is held in memory only, never stored.`,
+    `- Generated media auto-deletes after 24h (the --out-ttl default in serve mode), served at unguessable URLs until then.`,
+    `- Results are held in memory for delivery, not stored.`,
+    `- No analytics, trackers, IP logs, or access logs — the server keeps no request logs.`,
+  );
+  if (charged) lines.push(`- The only log is a payments ledger (usage.jsonl): money-lifecycle events that mirror the public Nano ledger — no run telemetry, no error text.`);
+  lines.push(
+    `- Caveat: generation runs on NanoGPT's API (https://nano-gpt.com), so prompt content in flight is governed by their privacy policy (https://nano-gpt.com/privacy).`,
     ``,
     `## Source`,
     ``,

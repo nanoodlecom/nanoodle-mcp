@@ -223,6 +223,26 @@ replay window: a paid result stays replayable for 24h and references its `/out/`
 URL, so lowering `--out-ttl` below 24h in charge mode means a replayed result
 can point at a file that's already been swept.
 
+### Privacy — what your server keeps
+
+Run with the defaults and the same promise the hosted server makes holds on
+your box, every line checkable in this repo:
+
+- **No accounts, no API keys, no sign-ins.** In charge mode, paying is the only
+  thing that authorizes a call.
+- **Prompts and inputs are never written to disk or logs.** Input media rides
+  in memory only — it is never stored. In charge mode the gate keeps only a
+  short hash binding a payment to its call (`hashArgs`), never the arguments.
+- **Generated media auto-deletes after `--out-ttl` hours** (default 24h in
+  `--serve`, off for local stdio), served at unguessable `/out/…` URLs until
+  then. Set `--out-ttl 0` to keep everything.
+- **Results are held in memory for delivery, not stored** — the restart-state
+  file carries no result text or error detail.
+- **No analytics, no trackers, no IP logs** — the app keeps no request logs.
+  In charge mode the one thing it writes is `usage.jsonl`, a payments ledger of
+  money-lifecycle events that mirror the public Nano ledger — no run telemetry,
+  no error text. Free serve mode writes no ledger at all.
+
 `gate-state.json` itself never holds customer content. It exists to keep
 in-flight money safe across the restart a deploy causes — quotes and owed sends
 survive — but a paid tool's **text output and any upstream error detail are
@@ -232,6 +252,10 @@ caller's retry simply re-runs the tool (charged once, delivered once — the
 operator eats one duplicate model call) rather than replaying content from disk,
 and a failed run replays a fixed placeholder plus its refund status, never the
 original error message.
+
+One caveat, stated plainly: generation runs on [NanoGPT](https://nano-gpt.com)'s
+API, so prompt content in flight is governed by
+[their privacy policy](https://nano-gpt.com/privacy).
 
 Free serve mode runs on **your** balance — fine on a trusted network, ruinous
 on the open internet. For that, charge for calls:
