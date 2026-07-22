@@ -203,6 +203,24 @@ test("work API key goes to the dedicated work server only, as body key + header"
   assert.equal(fallback.header, undefined);
 });
 
+test("workUrl list: a dead first work server falls through to the second", async () => {
+  const rpc = fakeRpc();
+  const calls = [];
+  const spyFetch = (url, init) => {
+    if (JSON.parse(init.body).action === "work_generate") calls.push(url);
+    if (url === "http://gpu.local:7076") throw new Error("ECONNREFUSED");
+    return rpc.fetch(url, init);
+  };
+  const wallet = createNanoWallet({
+    secretKey: SECRET, fetch: spyFetch,
+    workUrl: "http://gpu.local:7076, https://work2.local/",
+  });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 1);
+  assert.deepEqual(calls.slice(0, 2), ["http://gpu.local:7076", "https://work2.local"],
+    "listed work servers must be tried in order (trimmed, slash-stripped)");
+});
+
 test("a hung work server times out and falls through to the node's work", async () => {
   const rpc = fakeRpc();
   const logs = [];

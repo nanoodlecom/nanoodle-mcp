@@ -65,7 +65,12 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   const rpcBase = String(rpcUrl).replace(/\/+$/, "");
-  const workBase = workUrl ? String(workUrl).replace(/\/+$/, "") : null;
+  // workUrl accepts a comma-separated list, tried in order — e.g. a GPU box on
+  // the tailnet first, a public work API second. `workKey` (if set) goes to
+  // every listed work server, so list only servers that accept it (or set none).
+  const workBases = workUrl
+    ? String(workUrl).split(",").map((u) => u.trim().replace(/\/+$/, "")).filter(Boolean)
+    : [];
 
   async function rpc(body, base = rpcBase, { headers = {}, signal } = {}) {
     let r;
@@ -112,9 +117,9 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
   // With `workKey` set, the dedicated server gets it both as a `key` body field
   // (nano.to style) and a `nodes-api-key` header (Nanswap style).
   async function remoteWork(frontier, threshold) {
-    const workSources = workBase ? [["work server " + workBase, workBase], ["Nano RPC", rpcBase]] : [["Nano RPC", rpcBase]];
+    const workSources = [...workBases.map((b) => ["work server " + b, b]), ["Nano RPC", rpcBase]];
     for (const [label, base] of workSources) {
-      const withKey = workKey && base === workBase;
+      const withKey = workKey && workBases.includes(base);
       try {
         return (await rpc(
           { action: "work_generate", hash: frontier, difficulty: threshold, ...(withKey ? { key: workKey } : {}) },
