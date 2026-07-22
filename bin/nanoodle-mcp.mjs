@@ -369,6 +369,7 @@ async function main() {
     instructions,
     gate,
     toolInfo: registry.tools,
+    costs: registry.costs,
     outDir: resolvedOut,
     publicBase,
     log: (...a) => console.error(...a),

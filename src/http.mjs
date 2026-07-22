@@ -30,6 +30,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { qrModules } from "nanoodle";
 import { createDispatcher } from "./server.mjs";
+import { renderCost } from "./tools.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024; // media inputs may ride inline as data: URLs
 
@@ -133,9 +134,23 @@ const LANDING_CSS = `
   .tagline{text-align:center;color:var(--muted);font-size:.9rem;margin:.75rem 0 0}
   h2{font-size:1.15rem;margin:2.5rem 0 .5rem}
   .tools{display:grid;grid-template-columns:repeat(auto-fill,minmax(19rem,1fr));gap:1rem;padding:0;margin:1rem 0 0;list-style:none}
-  .tool{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1rem 1.1rem}
+  .tool{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column}
   .tool p{margin:.5rem 0}
-  .tool .links{font-size:.85rem}
+  .tool .links{font-size:.85rem;white-space:nowrap}
+  .tool .thead{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem}
+  .tool .tname{font-weight:700;font-size:1.02rem}
+  .tool .tid{font-size:.72rem;color:var(--muted)}
+  .tool .intent{color:var(--muted);font-size:.88rem;margin:.45rem 0 .7rem}
+  .chain{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .35rem;margin:0 0 .8rem}
+  .chain .arr{color:var(--muted);font-size:.75rem}
+  .chip{font:.72rem/1 ui-monospace,monospace;padding:.28rem .45rem;border-radius:7px;background:rgba(139,148,158,.14);color:#9aa4ae;white-space:nowrap}
+  .chip.k-text{background:rgba(167,139,250,.14);color:#c4b5fd}
+  .chip.k-llm{background:rgba(45,212,191,.13);color:#5eead4}
+  .chip.k-image{background:rgba(251,191,36,.12);color:#fcd34d}
+  .chip.k-video{background:rgba(251,113,133,.13);color:#fda4af}
+  .chip.k-audio{background:rgba(74,222,128,.12);color:#86efac}
+  .tool .tfoot{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.25rem .75rem;margin-top:auto}
+  .tool .cost{font:.75rem/1.4 ui-monospace,monospace;color:var(--muted);white-space:nowrap}
   .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
   .card h2{margin-top:0}
   footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
@@ -145,17 +160,43 @@ const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
   `<title>${esc(title)}</title>${ICON_LINKS}${head}<style>${css}</style></head><body><main>${body}</main></body></html>`;
 
-function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [] }) {
+/** "auto-dub" → "Auto dub": the card title for humans; the exact tool id rides beside it. */
+const toolTitle = (name) => {
+  const s = String(name).replace(/-/g, " ");
+  return s.charAt(0).toUpperCase() + s.slice(1);
+};
+
+function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const cmd = `claude mcp add --transport http noodles ${publicBase}/mcp`;
   const cards = tools.map((t) => {
     const info = infoByName.get(t.name);
-    const links = info ? `<div class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
-      ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></div>` : "";
+    const links = info ? `<span class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
+      ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>` : "";
     const author = info && info.x402 && info.x402.author
       ? `<p class="muted">author payout: <code>${esc(info.x402.author)}</code></p>` : "";
-    return `<li class="tool"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>${links}${author}</li>`;
+    const card = info && info.card;
+    // No structured pieces (a bare toolInfo entry) → the one-line description stands in.
+    if (!card || !card.intent && !card.steps.length) {
+      return `<li class="tool"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
+        `${links ? `<div class="tfoot">${links}</div>` : ""}${author}</li>`;
+    }
+    /*
+     * The card lays the description's pieces out as layers instead of one blob:
+     * title → plain-words intent → tinted pipeline chips → cost + links. The
+     * shared payment contract lives once above the grid, not on every card —
+     * agents still get the full per-tool contract via tools/list and /llms.txt.
+     */
+    const chips = card.steps.map((s) =>
+      `<span class="chip k-${esc(s.kind)}">${esc(s.n > 1 ? `${s.label}×${s.n}` : s.label)}</span>`
+    ).join(`<span class="arr">→</span>`);
+    const cost = renderCost(costs[t.name]);
+    return `<li class="tool">` +
+      `<div class="thead"><span class="tname">${esc(toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
+      `<p class="intent">${esc(card.intent || t.description)}</p>` +
+      (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
+      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${author}</li>`;
   }).join("");
   const desc = `${tools.length} AI media workflows — image, video, audio, text — behind one MCP endpoint. ` +
     (charged ? "No account, no API key — pay per call in Nano (XNO)." : "No account, no API key.");
@@ -207,7 +248,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     <h2>Workflows (${tools.length})</h2>
     <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
       <a href="https://nanoodle.com">nanoodle editor</a> to see exactly how it works, remix it, or run it
-      on your own key.</p>
+      on your own key.${charged ? " Costs shown are the last observed run — each call deposits a few cents and settles at the model's actual cost + 20%, change returned." : ""}</p>
     <ul class="tools">${cards}</ul>
     <div class="card"><h2>Private by design</h2>
       <p class="muted">Every line here is checkable in the source — nothing to take on faith.</p>
@@ -362,7 +403,8 @@ function payPageHtml(q) {
  * @param {string} opts.host  bind address (default 127.0.0.1 — use 0.0.0.0 behind a reverse proxy)
  * @param {number} opts.port
  * @param {object|null} [opts.gate]  charge gate (createChargeGate) — null serves free
- * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402 for the landing page and /graph/:name.json
+ * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402/card for the landing page and /graph/:name.json
+ * @param {object} [opts.costs]  registry.costs — live last-observed-cost records, shown on the landing cards
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
  * @param {number} [opts.progressMs]  heartbeat interval on streamed tools/call responses
  * @returns {Promise<http.Server>}
@@ -377,6 +419,7 @@ export async function serveHttp({
   instructions,
   gate = null,
   toolInfo = [],
+  costs = {},
   outDir = null,
   publicBase,
   progressMs = 10_000,
@@ -466,7 +509,7 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (url.pathname === "/") {
-        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo }), "text/html; charset=utf-8");
+        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs }), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/llms.txt") {

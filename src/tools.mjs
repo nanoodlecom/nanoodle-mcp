@@ -77,8 +77,8 @@ function nodeLabel(n) {
   return name ? `${n.type}:${name}` : n.type;
 }
 
-/** Node-label chain in dependency order (local Kahn sort — keeps us on the library's public API). */
-function typeChain(graph) {
+/** Non-comment nodes in dependency order (local Kahn sort — keeps us on the library's public API). */
+function orderedNodes(graph) {
   const indeg = new Map(graph.nodes.map((n) => [n.id, 0]));
   const out = new Map(graph.nodes.map((n) => [n.id, []]));
   for (const l of graph.links) {
@@ -97,14 +97,46 @@ function typeChain(graph) {
     }
   }
   const nodes = order.length === graph.nodes.length ? order : graph.nodes; // cyclic → raw order
+  return nodes.filter((n) => n.type !== "comment");
+}
+
+function typeChain(graph) {
+  const nodes = orderedNodes(graph);
   // Adjacent identical labels collapse to label×N — named nodes rarely collapse (labels differ).
   const runs = [];
-  for (const label of nodes.filter((n) => n.type !== "comment").map(nodeLabel)) {
+  for (const label of nodes.map(nodeLabel)) {
     const last = runs[runs.length - 1];
     if (last && last.label === label) last.n++;
     else runs.push({ label, n: 1 });
   }
   return runs.map((r) => (r.n > 1 ? `${r.label}×${r.n}` : r.label)).join(" -> ");
+}
+
+/*
+ * Media class per node type, for the landing page's tinted pipeline chips.
+ * Classed by what the node produces; a type missing here just renders in the
+ * neutral tint, so new node types degrade gracefully.
+ */
+const CHIP_KINDS = {
+  text: "text", join: "text", choice: "text", transcribe: "text",
+  llm: "llm", vision: "llm",
+  image: "image", upload: "image", edit: "image", resize: "image", draw: "image", inpaint: "image", vframes: "image",
+  ivideo: "video", vupload: "video", lipsync: "video", soundtrack: "video", vedit: "video", combine: "video",
+  audio: "audio", music: "audio", tts: "audio", extractaudio: "audio", trim: "audio", remix: "audio",
+};
+
+/**
+ * The chain as data for the landing page's cards: bare types (names would
+ * overflow a chip) collapsed like typeChain, each with its media class.
+ */
+function chainSteps(graph) {
+  const runs = [];
+  for (const n of orderedNodes(graph)) {
+    const last = runs[runs.length - 1];
+    if (last && last.label === n.type) last.n++;
+    else runs.push({ label: n.type, kind: CHIP_KINDS[n.type] || "any", n: 1 });
+  }
+  return runs;
 }
 
 /**
@@ -193,7 +225,7 @@ export function fmtDur(ms) {
  * callers plan around a 15-second image or a 2-minute video, not a sub-second
  * text run — and near-instant timings would churn descriptions for nothing.
  */
-function renderCost(rec) {
+export function renderCost(rec) {
   if (!rec || typeof rec.usd !== "number" || !Number.isFinite(rec.usd)) return "";
   const dur = typeof rec.ms === "number" && rec.ms >= 2500 ? `, ~${fmtDur(rec.ms)}` : "";
   if (rec.usd < 0.0001 && rec.exact !== false) return `last run <$0.0001${dur}`;
@@ -522,6 +554,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         x402,
         rawText: text,               // exact served bytes — /graph/<name>.json and the editor link both come from these
         editorUrl: editorShareUrl(text),
+        // Description pieces as data — the landing page lays them out as a card
+        // instead of re-parsing the one-line description.
+        card: { intent: graphIntent(wf.graph), steps: chainSteps(wf.graph) },
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
         inputSchema: buildInputSchema(wf),
       });
