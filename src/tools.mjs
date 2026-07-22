@@ -508,6 +508,13 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     const rec = { usd: result.costUsd, at: new Date().toISOString() };
     if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
     if (result.costExact === false) rec.exact = false; // renders "$X+"
+    // High-water mark across runs — the charge gate prices deposits off the
+    // worst run on record, so one cheap run can't shrink the deposit below it.
+    const prev = costs[tool.name];
+    const hi = Math.max(
+      prev && Number.isFinite(prev.hiUsd) ? prev.hiUsd : 0,
+      prev && Number.isFinite(prev.usd) ? prev.usd : 0);
+    if (hi > result.costUsd) rec.hiUsd = hi;
     costs[tool.name] = rec;
     try {
       await mkdir(outDir, { recursive: true });
