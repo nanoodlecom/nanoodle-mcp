@@ -5,8 +5,10 @@
  *   1. tools/call without `_payment_id` → a payment-required result: price, a
  *      pay-page link (QR), the exact raw amount, and agent-directed instructions.
  *   2. The caller pays the EXACT amount to the gate's wallet address. Nano has
- *      no payment memo, so each quote's amount carries a random sub-cent "dust
- *      tag" that makes it unique among live quotes — the amount IS the memo.
+ *      no payment memo, so each quote's amount carries a random tag in whole
+ *      1e-8 XNO steps that makes it unique among retained quotes — the amount
+ *      IS the memo, and it survives being typed into a wallet by hand (8
+ *      decimals is what wallets display and send).
  *   3. tools/call again with `_payment_id` → the gate long-polls its watcher
  *      (RPC polling, plus node websocket push when configured), then runs the
  *      tool exactly once. Re-calls replay the cached result; run failures are
@@ -16,14 +18,30 @@
  * `account_history` — a concurrently running wallet may pocket the customer's
  * send between polls, at which point it only shows up as a received entry.
  * Payments that arrive after their quote expired are refunded automatically.
+ *
+ * With `stateFile` set, quotes and the owed-send queue persist across restarts —
+ * a deploy landing between "customer paid" and "run replied" must never eat the
+ * payment (observed live 2026-07-22).
  */
 import { randomBytes, createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { writeFile, rename, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
+import { fmtDur } from "./tools.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund late payments
 const HISTORY_EVERY = 5; // check account_history every Nth poll tick
+/**
+ * 1e-8 XNO in raw — the resolution wallets actually display and let a human
+ * type. Quote amounts are whole multiples of this, so the friendly "0.13647256
+ * XNO" figure IS the exact payable amount; payments are matched at this
+ * resolution too, so a wallet that pads or truncates deeper digits can't
+ * orphan a payment.
+ */
+const GRAIN = 10n ** 22n;
 
 /**
  * Exact money math — no floating point anywhere near an on-chain amount.
@@ -76,7 +94,13 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
  * @param {string|null} [opts.wsUrl]      Nano node websocket (wss://…) for push confirmations
  * @param {string} opts.publicBase        absolute base URL for pay links (no trailing slash)
  * @param {number} [opts.pollMs]          receivable poll interval while quotes are pending
- * @param {number} [opts.waitMs]          how long a _payment_id call blocks waiting for settlement
+ * @param {number} [opts.waitMs]          how long a NON-streaming _payment_id call blocks waiting for
+ *                                        settlement — kept under typical MCP client tool timeouts so the
+ *                                        caller gets our "not arrived yet, call again" message, never an
+ *                                        opaque client-side timeout. Streaming calls wait out the quote's
+ *                                        whole TTL (heartbeats keep the connection alive).
+ * @param {string|null} [opts.stateFile]  persist quotes + owed sends here (write-then-rename JSON) and
+ *                                        restore them at startup — in-flight money survives restarts
  * @param {(event: string, fields: object) => void} [opts.usage]  usage-log sink
  */
 export function createChargeGate({
@@ -89,7 +113,8 @@ export function createChargeGate({
   wsUrl = null,
   publicBase,
   pollMs = 1000,
-  waitMs = 75_000,
+  waitMs = 20_000,
+  stateFile = null,
   fetch = globalThis.fetch,
   log = () => {},
   usage = () => {},
@@ -159,17 +184,32 @@ export function createChargeGate({
   /** Display-only float view of the pair — never used for money. */
   const rateDisplay = (pair) => (Number(pair.usdNano) / 1e9) * (1e30 / Number(pair.raw));
 
-  /** Deposit → raw amount with a dust tag unique among live quotes (the amount is the memo). */
+  /**
+   * Deposit → raw amount with a tag unique among retained quotes (the amount is
+   * the memo). The whole amount is a multiple of GRAIN, so its 8-decimal XNO
+   * rendering is EXACT — a human typing "0.13647256 XNO" into any wallet sends
+   * precisely the quoted amount. (An early version hid the tag below display
+   * resolution; a hand-typed payment then never matched and sat orphaned.)
+   */
   function tagAmount(usdPrice, pair) {
-    // exact conversion, ceiled so the deposit always covers its USD figure (floor 1e-8 XNO)…
+    // exact conversion, ceiled so the deposit always covers its USD figure,
+    // then ceiled again to a whole 1e-8 XNO…
     let base = usdToRaw(usdPrice, pair, "ceil");
-    if (base < 10n ** 22n) base = 10n ** 22n;
-    for (;;) {
-      // …plus < 10^-10 XNO of random dust: invisible in any display, unmistakable on-chain
-      const dust = BigInt("0x" + randomBytes(8).toString("hex")) % 10n ** 20n;
-      const amountRaw = (base + dust).toString();
+    base = ((base + GRAIN - 1n) / GRAIN) * GRAIN;
+    if (base < GRAIN) base = GRAIN;
+    for (let attempt = 0; ; attempt++) {
+      // …plus up to 0.0001 XNO (a few thousandths of a cent) of random tag in
+      // whole 1e-8 XNO steps: visible to the matcher, negligible to the payer,
+      // and returned with the change anyway. If the retained-quote population
+      // ever crowds that space, widen it 100× (still under a cent) rather than
+      // loop forever.
+      const span = attempt < 50 ? 10_000n : 1_000_000n;
+      const tag = (BigInt("0x" + randomBytes(4).toString("hex")) % span) * GRAIN;
+      const amountRaw = (base + tag).toString();
+      // Unique across ALL retained quotes (not just pending) — the matcher
+      // compares at GRAIN resolution against every quote it still remembers.
       let clash = false;
-      for (const q of quotes.values()) if (q.status === "pending" && q.amountRaw === amountRaw) { clash = true; break; }
+      for (const q of quotes.values()) if (BigInt(q.amountRaw) / GRAIN === (base + tag) / GRAIN) { clash = true; break; }
       if (!clash) return amountRaw;
     }
   }
@@ -188,6 +228,7 @@ export function createChargeGate({
     log(`payment ${q.id}: ${rawToXno(q.amountRaw)} XNO received via ${via}` +
       (source ? ` from ${source}` : "") + ` (${q.tool})`);
     usage("paid", { paymentId: q.id, tool: q.tool, amountRaw: q.amountRaw, usd: q.usd, source: q.source, via, settleMs: q.paidAt - q.createdAt });
+    persist();
     resolveWaiters(q);
   }
 
@@ -203,6 +244,7 @@ export function createChargeGate({
   function owe(to, amountRaw, describe, event, fields, onOk) {
     owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, tries: 0, at: now() + OWED_BACKOFF_MS[0] });
     log(`${describe} ${rawToXno(amountRaw)} XNO to ${to} failed — queued for retry`);
+    persist();
     ensureWatching();
   }
   async function retryOwed() {
@@ -214,12 +256,14 @@ export function createChargeGate({
         const hash = await ops.transfer(o.to, o.amountRaw, o.describe);
         owed.splice(owed.indexOf(o), 1);
         usage(o.event, { ...o.fields, ok: true, to: o.to, amountRaw: o.amountRaw, hash, retries: o.tries });
+        persist();
         if (o.onOk) o.onOk(hash);
       } catch (e) {
         if (o.tries >= OWED_MAX_TRIES) {
           owed.splice(owed.indexOf(o), 1);
           log(`GIVING UP on ${o.describe} ${rawToXno(o.amountRaw)} XNO to ${o.to} after ${o.tries} tries (${e.message}) — refund manually`);
           usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw, error: e.message, retries: o.tries, gaveUp: true });
+          persist();
           continue;
         }
         o.at = t + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
@@ -240,6 +284,7 @@ export function createChargeGate({
         const hash = await ops.transfer(q.source, q.amountRaw, "refunded");
         q.status = "refunded";
         usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: q.amountRaw, to: q.source, hash, reason });
+        persist();
         return true;
       } catch (e) {
         log(`refund of ${q.id} to ${q.source} failed: ${e.message}`);
@@ -252,23 +297,94 @@ export function createChargeGate({
     return q.refunding;
   }
 
+  /* ---------------- durable state ---------------- */
+
+  /*
+   * Quotes and the owed queue are money in flight; both must survive a restart
+   * (CI deploys restart the process on every merge). Serialization drops the
+   * live-only bits: waiters/refunding always, inline image blocks from cached
+   * results (the media files themselves persist on disk and keep their /out/
+   * URLs), and a consumed-but-unfinished run demotes back to "paid" so the
+   * retry after restart runs it — charged once, delivered once.
+   */
+  let saveChain = Promise.resolve();
+  let saveQueued = false;
+  function persist() {
+    if (!stateFile || saveQueued) return;
+    saveQueued = true;
+    saveChain = saveChain.then(async () => {
+      saveQueued = false; // snapshot at write time — later mutations queue another write
+      const data = JSON.stringify({
+        v: 1,
+        quotes: [...quotes.values()].map((q) => ({
+          id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
+          pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
+          amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
+          status: q.status === "consumed" && !q.result && !q.error ? "paid" : q.status,
+          source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
+          result: q.result ? { ...q.result, content: (q.result.content || []).filter((c) => c.type !== "image") } : null,
+          error: q.error ?? null,
+        })),
+        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
+      });
+      await mkdir(dirname(stateFile), { recursive: true });
+      const tmp = stateFile + ".tmp";
+      await writeFile(tmp, data);
+      await rename(tmp, stateFile);
+    }).catch((e) => log(`cannot persist gate state to ${stateFile}: ${e.message}`));
+  }
+
+  if (stateFile) {
+    try {
+      const data = JSON.parse(readFileSync(stateFile, "utf8"));
+      for (const s of Array.isArray(data.quotes) ? data.quotes : []) {
+        const q = { ...s, pair: { usdNano: BigInt(s.pair.usdNano), raw: BigInt(s.pair.raw) }, waiters: [] };
+        // A finished run replays its cached outcome; without this, a retry
+        // after restart would run (and settle) the same payment twice.
+        if (q.status === "consumed" && (q.result || q.error)) q.running = Promise.resolve();
+        quotes.set(q.id, q);
+      }
+      for (const s of Array.isArray(data.owed) ? data.owed : []) {
+        owed.push({
+          ...s, at: now() + OWED_BACKOFF_MS[0],
+          onOk: s.event === "refund" && s.fields && s.fields.paymentId
+            ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
+            : null,
+        });
+      }
+      if (quotes.size || owed.length) log(`restored ${quotes.size} quote(s) and ${owed.length} queued send(s) from ${stateFile}`);
+    } catch (e) {
+      if (e.code !== "ENOENT") log(`cannot read gate state ${stateFile}: ${e.message} — starting fresh`);
+    }
+  }
+
   function prune() {
     const t = now();
+    let changed = false;
     for (const q of quotes.values()) {
       if (q.status === "pending" && t > q.expiresAt) {
         q.status = "expired";
         resolveWaiters(q);
+        changed = true;
       }
-      if (t - q.createdAt > RETAIN_MS) quotes.delete(q.id);
+      if (t - q.createdAt > RETAIN_MS) { quotes.delete(q.id); changed = true; }
     }
+    if (changed) persist();
   }
 
-  /** An incoming amount either settles a pending quote or, on a dead quote, bounces back. */
+  /**
+   * An incoming amount either settles a pending quote or, on a dead quote,
+   * bounces back. Matching is at GRAIN (1e-8 XNO) resolution — quotes are exact
+   * multiples of it, so this accepts the exact send AND a send some wallet
+   * padded with sub-display dust, while staying unambiguous (tagAmount enforces
+   * bucket uniqueness across retained quotes).
+   */
   function matchAmount(amountRaw, meta) {
     const amt = String(amountRaw);
     if (!/^\d+$/.test(amt)) return;
+    const bucket = BigInt(amt) / GRAIN;
     for (const q of quotes.values()) {
-      if (q.amountRaw !== amt) continue;
+      if (BigInt(q.amountRaw) / GRAIN !== bucket) continue;
       if (q.status === "pending") return void markPaid(q, meta);
       if (q.status === "expired" && !q.refunding) {
         log(`late payment for expired quote ${q.id} — refunding`);
@@ -384,13 +500,16 @@ export function createChargeGate({
       expiresAt: new Date(q.expiresAt).toISOString(),
     };
     const text =
-      `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (≈${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
+      `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
       `To proceed:\n` +
       `1. Show your user this payment link (it renders a QR code to scan with any Nano wallet, and turns into a green check the moment the payment lands):\n` +
       `   ${payUrl(q)}\n` +
-      `2. Once they say they've paid (settlement takes about a second), call this tool again with the SAME arguments plus "_payment_id": "${q.id}".\n\n` +
-      `Paying without the page: send EXACTLY ${q.amountRaw} raw to ${address} (URI: ${nanoUri(q)}).\n` +
+      `2. Call this tool again with the SAME arguments plus "_payment_id": "${q.id}". You can call again right away — ` +
+      `the call waits for the payment to land (settlement takes about a second) and then runs.` +
+      (q.etaMs ? ` Once paid, this tool typically finishes in ~${fmtDur(q.etaMs)}.` : "") + `\n\n` +
+      `Paying without the page: send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
+      `the exact amount is how the payment is recognized (URI: ${nanoUri(q)}).\n` +
       `This quote expires ${x402.expiresAt}. If the run fails after payment, the payment is refunded automatically.`;
     return { content: [{ type: "text", text }], structuredContent: { x402 } };
   }
@@ -538,7 +657,14 @@ export function createChargeGate({
             return { ...t, description, inputSchema };
           });
 
-      async function callTool(params) {
+      // Typical runtime for a tool, from the cost sidecar — only when it's long
+      // enough to be worth saying (sub-second graphs don't need an ETA).
+      const etaOf = (n) => {
+        const rec = registry.costs && registry.costs[n];
+        return rec && Number.isFinite(rec.ms) && rec.ms >= 2500 ? rec.ms : null;
+      };
+
+      async function callTool(params, ctx = null) {
         // Malformed shells fall through to the registry for its usual ParamsError texts.
         if (params == null || typeof params !== "object" || Array.isArray(params)) return registry.callTool(params);
         if (params.name === runNoodleName) {
@@ -563,8 +689,10 @@ export function createChargeGate({
             amountRaw: tagAmount(price ?? usd, pair),
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
+            etaMs: etaOf(name),
           };
           quotes.set(q.id, q);
+          persist();
           ensureWatching();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
           return paymentRequiredResult(q);
@@ -585,7 +713,12 @@ export function createChargeGate({
           return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
         }
         if (q.status === "pending") {
-          const st = await gate.waitForPayment(q.id, waitMs);
+          // Streaming callers can afford to wait out the quote — heartbeats keep
+          // their tool timeout at bay. Plain-JSON callers get one short wait, so
+          // OUR "not arrived yet" message always beats their client-side timeout.
+          if (ctx && ctx.report) ctx.report(`waiting for the ${rawToXno(q.amountRaw)} XNO payment to land`);
+          const budget = ctx && ctx.streaming ? Math.max(waitMs, q.expiresAt - now()) : waitMs;
+          const st = await gate.waitForPayment(q.id, budget);
           if (st === "pending") {
             return errResult(`payment ${q.id} hasn't arrived yet. If your user has the page open at ${payUrl(q)} ` +
               `it will show a green check when it lands — then call this tool again with the same _payment_id.`);
@@ -594,6 +727,7 @@ export function createChargeGate({
             return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
           }
         }
+        if (ctx && ctx.report) ctx.report(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
         // paid (or consumed): run exactly once, replay the cached outcome afterwards
         if (!q.running) {
           q.status = "consumed";
@@ -611,6 +745,7 @@ export function createChargeGate({
                   : " — the model reported no cost, so the whole deposit is being returned to your wallet");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               usage("run", { paymentId: q.id, tool: name, ok: true, ms: now() - t0, usd: q.usd, costUsd: costUsd ?? null, paid: true });
+              persist();
             } catch (e) {
               const msg = String((e && e.message) || e);
               usage("run", { paymentId: q.id, tool: name, ok: false, ms: now() - t0, usd: q.usd, paid: true, error: msg });
@@ -620,6 +755,7 @@ export function createChargeGate({
                 : q.source
                   ? ` — your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands).`
                   : " — the run was paid for; contact the operator about a refund.");
+              persist();
             }
           })();
         }
@@ -630,5 +766,8 @@ export function createChargeGate({
       return { listTools, callTool };
     },
   };
+  // Restored pending quotes / owed sends need the watcher running from boot,
+  // not from the next quote — a payment may land while nobody is calling.
+  if (anyWatchable()) ensureWatching();
   return gate;
 }
