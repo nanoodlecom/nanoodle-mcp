@@ -366,6 +366,7 @@ export function createChargeGate({
             status: q.status === "consumed" && !result && !error ? "paid" : q.status,
             source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
             settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
+            settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
             result,
             error,
           };
@@ -405,6 +406,11 @@ export function createChargeGate({
           // restart round-trips it unchanged.
           if (q.error) q.error = q.errorPersist = "run failed: (error details not retained across restarts) — the run was paid for; if you have not received a refund, contact the operator.";
         }
+        // A restored error IS already the redacted form (v2 only ever persists
+        // errorPersist). Mirror it back into errorPersist so the NEXT persist
+        // writes the same redacted string — otherwise it would collapse to the
+        // bare fallback and drop the gate-authored refund-status sentence.
+        if (q.error && q.errorPersist == null) q.errorPersist = q.error;
         // A finished run replays its cached outcome; without this, a retry
         // after restart would run (and settle) the same payment twice. A quote
         // whose result we just dropped has neither result nor error, so it is
@@ -851,16 +857,31 @@ export function createChargeGate({
               q.textOutput = !!textOutput;
               // q.settled is only ever true here on the re-run of a text-output
               // quote that was demoted to "paid" across a restart — its money
-              // already moved, so settle() recomputes the receipt without paying
-              // change/author twice. Set it before persist() records it.
+              // already moved, so settle() recomputes the numbers without paying
+              // change/author twice.
               const s = settle(q, name, costUsd, q.settled === true);
+              // The receipt must describe the money that ACTUALLY moved, which is
+              // the FIRST run's settlement — a post-restart re-run may report a
+              // different cost (or none), and the change/payout already went out at
+              // the first run's figures. So on the first settle we stash those
+              // figures (money integers + the display cost only — no content, safe
+              // at rest) and every receipt, first run or replay, is built from them.
+              // Keyed on settleReceipt (not settled) so a legacy quote — marked
+              // settled on restore but carrying no stored figures — falls back to
+              // this recompute-only run's numbers rather than reading undefined.
+              if (!q.settleReceipt) {
+                q.settleReceipt = { known: s.known, costUsd: s.known ? costUsd : null,
+                  take: s.take.toString(), change: s.change.toString(), author: s.author };
+              }
               q.settled = true;
+              const r = q.settleReceipt;
+              const rTake = BigInt(r.take), rChange = BigInt(r.change);
               const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
                 (q.payHash ? ` (block ${q.payHash})` : "") +
-                (s.known
-                  ? ` — settled at actual cost ${fmtUsd(costUsd)} + 20%` +
-                    (s.author && s.take > 0n ? " (markup goes to this noodle's author)" : "") +
-                    (s.change > 0n ? `; ${rawToXno(s.change)} XNO change returned to your wallet` : "")
+                (r.known
+                  ? ` — settled at actual cost ${fmtUsd(r.costUsd)} + 20%` +
+                    (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
+                    (rChange > 0n ? `; ${rawToXno(rChange)} XNO change returned to your wallet` : "")
                   : " — the model reported no cost, so the whole deposit is being returned to your wallet");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
