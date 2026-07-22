@@ -116,11 +116,16 @@ test("paySend: concurrent invoices are serialized on the locally-tracked frontie
 test("queue priority: a payment jumps ahead of queued housekeeping transfers", async () => {
   const rpc = fakeRpc();
   // stall the first block's work so the queue backs up behind a running task
-  let releaseWork;
+  let releaseWork, reachedWork;
+  const gate = new Promise((r) => { releaseWork = r; });
+  const stalled = new Promise((r) => { reachedWork = r; });
+  let gated = false;
   const gatedFetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    if (body.action === "work_generate" && releaseWork === undefined) {
-      await new Promise((r) => { releaseWork = r; });
+    if (body.action === "work_generate" && !gated) {
+      gated = true;
+      reachedWork();
+      await gate;
     }
     return rpc.fetch(url, init);
   };
@@ -129,7 +134,7 @@ test("queue priority: a payment jumps ahead of queued housekeeping transfers", a
   const first = wallet.ops.transfer(PAY_TO, AMOUNT, "change:").then(() => order.push("transfer-1"));
   const second = wallet.ops.transfer(PAY_TO, AMOUNT, "change:").then(() => order.push("transfer-2"));
   const paid = wallet.payment(invoice()).then(() => order.push("payment"));
-  await new Promise((r) => setTimeout(r, 20)); // let the first transfer reach the stalled work ask
+  await stalled; // the first transfer is mid-flight; the other two sit queued
   releaseWork();
   await Promise.all([first, second, paid]);
   assert.deepEqual(order, ["transfer-1", "payment", "transfer-2"],
@@ -375,6 +380,48 @@ test("paySend: a refund can cover an invoice the bare balance cannot", async () 
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
   await wallet.payment(invoice());
   assert.equal(rpc.state.processed.length, 2, "receive then send");
+});
+
+test("paySend: an ambiguous publish failure drops the cache — the next send rebuilds from the node", async () => {
+  let processCalls = 0;
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      // first publish dies with a definite-looking but ambiguous node error
+      if (++processCalls === 1) return reply({ error: "Gap source block" });
+      state.processed.push(body);
+      state.frontier = "C".repeat(63) + state.processed.length;
+      return reply({ hash: state.frontier });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await assert.rejects(() => wallet.payment(invoice()), /Gap source block/);
+  await wallet.payment(invoice({ paymentId: "pay_2" }));
+  assert.equal(rpc.state.infoCalls, 2, "the failure must invalidate the cache — the retry asks the node");
+  assert.equal(rpc.state.processed[0].block.previous, FRONTIER, "the second send builds on the node's own frontier");
+});
+
+test("paySend: an HTTP-5xx from the RPC proxy verifies and republishes instead of losing the block", async () => {
+  let processCalls = 0;
+  const rpc = fakeRpc({
+    process: (body, state, reply) => {
+      processCalls++;
+      if (processCalls === 1) return { ok: false, status: 502, text: async () => "bad gateway" }; // proxy died; node never saw it
+      state.processed.push(body);
+      return reply({ hash: "C".repeat(64) });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  assert.equal(rpc.state.processed.length, 1);
+  assert.equal(rpc.state.processed[0].block.previous, FRONTIER, "republish must be the same block, not a rebuild");
+});
+
+test("post-payment sweep: a failing receivable RPC never crashes or wedges the queue", async () => {
+  const rpc = fakeRpc({ receivable: () => { throw new Error("boom"); } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
+  await wallet.payment(invoice());
+  await wallet.payment(invoice({ paymentId: "pay_2" })); // queue still drains after the sweep's failure
+  assert.equal(rpc.state.processed.length, 2);
 });
 
 test("paySend: a bounced send refetches the frontier and retries exactly once", async () => {

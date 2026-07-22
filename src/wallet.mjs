@@ -123,6 +123,7 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
   let chain = null;
   async function currentState(fresh = false) {
     if (!fresh && chain) return chain;
+    chain = null; // a failed refetch must not leave the suspect cache behind
     chain = await accountState();
     return chain;
   }
@@ -284,9 +285,10 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
       try {
         await rpc({ action: "process", json_block: "true", subtype: "send", block });
       } catch (e) {
-        // Lost response mid-publish: the node may already have the block — verify,
-        // republish the identical block if not, and only then give up.
-        if (/unreachable/.test(e.message)) {
+        // Lost response mid-publish — dead transport or a fronting proxy's
+        // HTTP-5xx: the node may already have the block. Verify, republish
+        // the identical block if not, and only then give up.
+        if (/unreachable|failed \(HTTP 5\d\d\)/.test(e.message)) {
           chain = null; // until settled, the frontier is uncertain
           log(`process transport failure (${e.message}) — verifying and republishing`);
           if (await settleAfterTransportError(hash, block)) { /* landed */ }
@@ -301,7 +303,10 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
           if (amount > state.balance) throw insufficient();
           continue;
         }
-        else throw e;
+        // Anything else is ambiguous — an HTTP-5xx from a fronting proxy can
+        // mean the node accepted the block and the response died. Drop the
+        // cache so the next send rebuilds from the node's own frontier.
+        else { chain = null; throw e; }
       }
       chain = { frontier: hash, balance: state.balance - amount, representative: state.representative };
       log(`x402: ${describe} ${rawToXno(amount)} XNO${extra} to ${to} (block ${hash})`);
