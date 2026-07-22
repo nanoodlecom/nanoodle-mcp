@@ -63,9 +63,11 @@ function usage(code = 1) {
 Serve mode (host your noodles over HTTP instead of stdio):
   --serve [h:]p    speak MCP over streamable HTTP on [host:]port (default 127.0.0.1:8402);
                    also serves a landing page, /pay pages, and generated media under /out/
-  --charge-usd n   take a $n deposit per tool call, paid in Nano via x402. Calls settle at
-                   the run's ACTUAL metered cost + 20% and the rest returns to the payer as
-                   change; the 20% goes to the graph's x402.author address if set, else stays.
+  --charge-usd n   charge for tool calls, paid in Nano via x402: a deposit up front, settled
+                   at the run's ACTUAL metered cost + 20% with the rest returned to the payer
+                   as change; the 20% goes to the graph's x402.author address if set, else stays.
+                   $n is the ceiling deposit — once a tool's metered cost is known, its quotes
+                   shrink to 2x its observed cost+20% (whole cents, 1c floor) automatically.
                    Per-graph deposit override: "x402": {"usd": 0.10} in the graph JSON.
                    Requires the wallet (NANO_SEED / NANO_PRIVATE_KEY) — it receives payments
                    and sends refunds/change/payouts. Calls are logged to <out>/usage.jsonl.

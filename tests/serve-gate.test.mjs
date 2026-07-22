@@ -612,6 +612,41 @@ test("a hand-added x402 block on a graph file reaches the gate (price + author)"
   assert.match(t.description, /20% markup goes to the graph's author/);
 });
 
+test("deposits track observed cost: cheap tools quote small deposits, live", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  registry.costs = { poster: { usd: 0.004, at: "2026-07-21T00:00:00Z" } };
+  const { listTools, callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+  // $0.004 observed → 2× (cost + 20%) = $0.0096 → 1¢ floor, not the flat $0.05
+  assert.match(listTools()[0].description, /\$0\.01 deposit per call/);
+  assert.equal(argOf(await callTool({ name: "poster", arguments: { Text: "a" } })).amountUsd, 0.01);
+  // the cost record is live — the very next quote follows a fresh recording
+  registry.costs.poster = { usd: 0.015, at: "2026-07-21T00:01:00Z" };
+  assert.equal(argOf(await callTool({ name: "poster", arguments: { Text: "b" } })).amountUsd, 0.04); // ceil($0.036)
+});
+
+test("deposit derivation: high-water mark, inexact costs, ceiling, pinned x402.usd", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+  const quoteUsd = async (text) => argOf(await callTool({ name: "poster", arguments: { Text: text } })).amountUsd;
+  // the worst run on record prices the deposit, not the (cheaper) last one
+  registry.costs = { poster: { usd: 0.002, hiUsd: 0.012 } };
+  assert.equal(await quoteUsd("a"), 0.03); // ceil(0.012 · 2.4) → $0.03
+  // a lower-bound cost (exact:false) can't cap a deposit → flat default
+  registry.costs = { poster: { usd: 0.001, exact: false } };
+  assert.equal(await quoteUsd("b"), 0.05);
+  // a cost above the ceiling still quotes the ceiling (startup warning covers this)
+  registry.costs = { poster: { usd: 0.2 } };
+  assert.equal(await quoteUsd("c"), 0.05);
+  // a pinned per-graph price ignores observed costs entirely
+  const pinnedReg = fakeRegistry();
+  pinnedReg.tools[0].x402 = { usd: 0.10 };
+  pinnedReg.costs = { poster: { usd: 0.004 } };
+  const pinnedGate = makeGate(fakeChain(), { registry: pinnedReg }).wrapRegistry(pinnedReg);
+  assert.equal(argOf(await pinnedGate.callTool({ name: "poster", arguments: { Text: "d" } })).amountUsd, 0.10);
+});
+
 test("qrSvg encodes a nano URI into a QR matrix svg", () => {
   const svg = qrSvg(`nano:${GATE_ADDR}?amount=123`);
   assert.match(svg, /^<svg /);

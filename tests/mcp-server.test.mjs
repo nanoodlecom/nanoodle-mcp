@@ -594,6 +594,33 @@ test("cost sidecar: a run records its price, re-renders the description, and not
   assert.match(reg2.tools[0].description, /last run \$0\.0012\.$/);
 });
 
+test("cost sidecar: a cheaper run keeps the worst cost on record as hiUsd", async () => {
+  const { loadTools } = await import("../src/tools.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-hiusd-"));
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-hiusd-out-"));
+  await writeFile(join(dir, "chat.json"), JSON.stringify({
+    v: 1,
+    nodes: [
+      { id: "n1", type: "text", x: 0, y: 0, fields: { text: "hi" } },
+      { id: "n2", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
+    ],
+    links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
+  }));
+  // a past run cost $0.02; the stub's next run charges only $0.0012
+  await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
+
+  const reg = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: apiUrl, outDir });
+  await reg.callTool({ name: "chat", arguments: {} });
+  let sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
+  assert.equal(sidecar.chat.usd, 0.0012);
+  assert.equal(sidecar.chat.hiUsd, 0.02, "the worst observed cost survives as the high-water mark");
+
+  // and it survives further cheap runs
+  await reg.callTool({ name: "chat", arguments: {} });
+  sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
+  assert.equal(sidecar.chat.hiUsd, 0.02);
+});
+
 test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrupt file ignored", async () => {
   const { loadTools } = await import("../src/tools.mjs");
   const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-render-"));

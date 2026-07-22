@@ -239,12 +239,16 @@ payment is refunded automatically**. Arguments are validated *before* a quote
 is issued (nobody pays for a typo), and `run_noodle` is withdrawn in charge
 mode — an arbitrary share link's cost can't be priced up front.
 
-Pricing: `--charge-usd` sets the default **deposit** — a ceiling, not a
-price. Size it generously; over-covering costs callers nothing since the
-difference comes back as change, while an under-sized deposit means runs can
-cost more than was collected and *you* eat the difference (the gate warns at
-startup when a graph's deposit is below its last observed cost + 20%, from
-the `costs.json` sidecar). The XNO conversion comes from **NanoGPT itself**:
+Pricing: `--charge-usd` sets the **ceiling** deposit, and the opening quote
+for a tool that has never run. Once a tool has run, its deposit tracks its
+real cost automatically: quotes become twice the settle price (worst observed
+metered cost + 20%, from the `costs.json` sidecar), ceiled to a whole cent
+with a 1¢ floor — a tool that meters $0.004 quotes a $0.01 deposit, not the
+flat ceiling. Size the ceiling generously; over-covering costs callers
+nothing since the difference comes back as change, while an under-sized
+deposit means runs can cost more than was collected and *you* eat the
+difference (the gate warns at startup when a graph's deposit is below its
+last observed cost + 20%). The XNO conversion comes from **NanoGPT itself**:
 the gate fires a keyless `x-x402` probe and keeps the invoice's exact
 raw-XNO/USD pair — the same rate your downstream payments settle at, so
 quotes and costs can never drift apart on FX, and no market-data service is

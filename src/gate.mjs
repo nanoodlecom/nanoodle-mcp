@@ -85,7 +85,8 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
  * @param {object} opts
  * @param {string} opts.address           Nano address payments arrive at (the wallet account)
  * @param {object} opts.ops               wallet ops ({ rpc, transfer, pocket }) — refunds + chain RPC
- * @param {number} opts.usd               default price per call
+ * @param {number} opts.usd               ceiling deposit per call — tools with a known metered
+ *                                        cost quote 2× their observed cost + 20% instead
  * @param {(params) => Promise<void>} [opts.validate]  registry arg validation — quotes are only
  *                                        issued for calls that would actually run (never charge for a typo)
  * @param {number|null} [opts.xnoUsd]     static XNO/USD rate override; null (default) → NanoGPT's own
@@ -552,15 +553,34 @@ export function createChargeGate({
      * and callTool enforces quote → pay → run-once → replay.
      */
     wrapRegistry(registry, { runNoodleName = "run_noodle" } = {}) {
-      const priceFor = (tool) => {
-        const v = tool.x402 && Number(tool.x402.usd);
-        return Number.isFinite(v) && v > 0 ? v : usd;
+      const pinned = new Map(registry.tools.map((t) => {
+        const v = t.x402 && Number(t.x402.usd);
+        return [t.name, Number.isFinite(v) && v > 0 ? v : null];
+      }));
+      /**
+       * Deposit for a tool as of right now. A graph's own x402.usd is pinned and
+       * always wins. Otherwise, once the tool's metered cost is known
+       * (registry.costs is live — every run that reports a cost updates it),
+       * the deposit is twice the settle price (cost + 20%), against the worst
+       * run on record, ceiled to a whole cent with a 1¢ floor. The flat
+       * --charge-usd is only a ceiling, and the opening quote for a tool that
+       * has never run. A cost that was a lower bound (exact:false) can't be
+       * trusted to cap a deposit, so it keeps the default too.
+       */
+      const priceFor = (name) => {
+        const pin = pinned.get(name);
+        if (pin) return pin;
+        const rec = registry.costs && registry.costs[name];
+        const hi = rec && rec.exact !== false
+          ? Math.max(Number.isFinite(rec.usd) ? rec.usd : 0, Number.isFinite(rec.hiUsd) ? rec.hiUsd : 0)
+          : 0;
+        if (!(hi > 0)) return usd;
+        return Math.min(usd, Math.max(0.01, Math.ceil(hi * 1.2 * 2 * 100) / 100));
       };
-      const prices = new Map(registry.tools.map((t) => [t.name, priceFor(t)]));
       // Under-deposited graphs cost the operator money every call — say so up front.
       for (const t of registry.tools) {
         const rec = registry.costs && registry.costs[t.name];
-        const dep = prices.get(t.name) ?? usd;
+        const dep = priceFor(t.name);
         if (rec && typeof rec.usd === "number" && rec.usd * 1.2 > dep) {
           log(`warning: ${t.name} deposit ${fmtUsd(dep)} is below its last observed cost ${fmtUsd(rec.usd)} + 20% — ` +
             `runs may exceed the deposit and you eat the difference; raise x402.usd in its graph file`);
@@ -637,7 +657,7 @@ export function createChargeGate({
         registry.listTools()
           .filter((t) => t.name !== runNoodleName)
           .map((t) => {
-            const price = prices.get(t.name) ?? usd;
+            const price = priceFor(t.name);
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
               `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
@@ -676,7 +696,7 @@ export function createChargeGate({
         const { _payment_id, ...args } = rawArgs;
         const name = params.name;
         const argsHash = hashArgs(name, args);
-        const price = prices.get(name);
+        const price = priceFor(name);
 
         if (_payment_id == null) {
           // Never charge for a call that couldn't run: unknown tool / bad args throw here, pre-quote.
@@ -684,9 +704,9 @@ export function createChargeGate({
           const pair = await ratePair();
           const q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
-            tool: name, argsHash, usd: price ?? usd,
+            tool: name, argsHash, usd: price,
             pair, // settle math must use the exact pair the deposit was priced at
-            amountRaw: tagAmount(price ?? usd, pair),
+            amountRaw: tagAmount(price, pair),
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
             etaMs: etaOf(name),
