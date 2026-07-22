@@ -128,7 +128,9 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
 
   await new Promise((r) => setTimeout(r, 50));
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "change:" }]);
-  assert.deepEqual(events.map(([e]) => e).filter((e) => e !== "change"), ["quote", "paid", "run"]);
+  // usage.jsonl is a payments ledger: money events only, never a "run" event.
+  assert.deepEqual(events.map(([e]) => e).filter((e) => e !== "change"), ["quote", "paid"]);
+  assert.ok(!events.some(([e]) => e === "run"), "no run telemetry in the payments ledger");
   const paidEvent = events[1][1];
   assert.equal(paidEvent.source, PAYER);
   assert.equal(typeof paidEvent.settleMs, "number");
@@ -164,15 +166,27 @@ test("run_noodle is withdrawn in charge mode", async () => {
 
 test("failed run refunds the payer in full", async () => {
   const chain = fakeChain();
-  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
-  const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded: PROMPT LEAK abc123"); } });
+  const events = [];
+  const { callTool } = makeGate(chain, { registry, usage: (e, f) => events.push([e, f]) }).wrapRegistry(registry);
   const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
   chain.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(res.isError);
-  assert.match(res.content[0].text, /model exploded/);
+  // the FULL upstream error still reaches the caller…
+  assert.match(res.content[0].text, /model exploded: PROMPT LEAK abc123/);
   assert.match(res.content[0].text, /refunded to/);
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+
+  // …but the payments ledger records only a categorical refund — no run event,
+  // and not one byte of the upstream error text lands in the serialized line.
+  assert.ok(!events.some(([e]) => e === "run"), "no run telemetry in the ledger");
+  const refund = events.find(([e]) => e === "refund");
+  assert.ok(refund, "a failed paid run writes a refund event");
+  assert.equal(refund[1].reason, "run_failed");
+  const line = JSON.stringify({ ts: new Date().toISOString(), event: refund[0], ...refund[1] });
+  assert.doesNotMatch(line, /model exploded|PROMPT LEAK|abc123/,
+    "the ledger line must not carry upstream error text (it can quote user content)");
 });
 
 test("a bounced refund is retried until it lands — the customer's money is never stranded", async () => {
