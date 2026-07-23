@@ -7,13 +7,17 @@
  *                        createDispatcher() that powers stdio handles everything.
  *                        tools/call from an SSE-capable client answers as an
  *                        event stream with progress heartbeats — generations
- *                        and payment waits outlive client tool timeouts.
+ *                        and payment waits outlive client tool timeouts. On a
+ *                        paid server the first call is held open through payment
+ *                        (pay link pushed as progress), so the agent never re-calls.
  *   GET  /               landing page: hero connect command, how payment flows, tool list
  *                        w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
+ *   GET  /x402/watch/:id   SSE: one `status` event per state change, closes on settle
+ *                        (the pay page subscribes to it; falls back to /x402/status)
  *   GET  /out/:file      generated media (unguessable filenames), when an outDir is given
  *   GET  /favicon.ico|/favicon.png|/apple-touch-icon.png|/icon-512.png|/og.jpg
  *                        brand assets from assets/ — the icon and the social (OG) card,
@@ -314,7 +318,9 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       `## Payment (x402, Nano/XNO)`,
       ``,
       `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a pay page at ${publicBase}/pay/<id>.`,
-      `- Send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id — or call with it immediately and the server waits for the payment.`,
+      `- Streaming clients (Accept: text/event-stream on tools/call) don't re-call: the same call is held open, the pay link arrives as a progress update, and the result returns once the payment lands.`,
+      `- Otherwise send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id — or call with it immediately and the server waits for the payment.`,
+      `- Watch a quote settle over SSE at ${publicBase}/x402/watch/<id> (one status event per state change) or poll ${publicBase}/x402/status/<id>?wait=1.`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
       `- The 20% is the workflow author's cut, not a platform fee.`,
       ``,
@@ -355,6 +361,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
 
 function payPageHtml(q) {
   const statusUrl = `/x402/status/${encodeURIComponent(q.id)}?wait=1`;
+  const watchUrl = `/x402/watch/${encodeURIComponent(q.id)}`;
   return htmlPage(`Pay ${q.amountXno} XNO`, `
     <div class="card center" id="paybox">
       <h1>Pay ${esc(q.amountXno)} XNO <span class="muted">(≈$${esc(q.usd.toFixed(q.usd < 0.01 ? 4 : 2))})</span></h1>
@@ -381,23 +388,42 @@ function payPageHtml(q) {
       tickExpiry();
     </script>
     <script>
-      async function poll(){
-        try{
-          const r = await fetch(${JSON.stringify(statusUrl)});
-          const j = await r.json();
-          if(j.status === "paid" || j.status === "consumed"){
-            document.getElementById("paybox").innerHTML =
-              '<h1 class="ok">✓ Paid</h1><p>All set — go back to your terminal and tell your agent you paid.</p>';
-            return;
-          }
-          if(j.status === "expired" || j.status === "unknown"){
-            document.getElementById("status").textContent = "this quote expired — ask your agent for a fresh one";
-            return;
-          }
-        }catch{}
-        setTimeout(poll, 1000);
+      var done = false;
+      function apply(status){
+        if(done) return false;
+        if(status === "paid" || status === "consumed"){
+          done = true;
+          document.getElementById("paybox").innerHTML =
+            '<h1 class="ok">✓ Paid</h1><p>All set — go back to your terminal, the result is on its way.</p>';
+          return true;
+        }
+        if(status === "expired" || status === "unknown"){
+          done = true;
+          document.getElementById("status").textContent = "this quote expired — ask your agent for a fresh one";
+          return true;
+        }
+        return false;
       }
-      poll();
+      // Prefer the server-push watch stream; fall back to polling if EventSource
+      // is unavailable or the stream errors (proxy, old browser, at capacity).
+      async function poll(){
+        while(!done){
+          try{
+            const r = await fetch(${JSON.stringify(statusUrl)});
+            if(apply((await r.json()).status)) return;
+          }catch{ await new Promise(function(r){ setTimeout(r, 1000); }); }
+        }
+      }
+      function watch(){
+        if(typeof EventSource === "undefined") return poll();
+        var es;
+        try{ es = new EventSource(${JSON.stringify(watchUrl)}); }catch(e){ return poll(); }
+        es.addEventListener("status", function(ev){
+          try{ if(apply(JSON.parse(ev.data).status)){ es.close(); } }catch{}
+        });
+        es.onerror = function(){ es.close(); if(!done) poll(); }; // stream dropped → poll
+      }
+      watch();
     </script>
   `);
 }
@@ -411,6 +437,11 @@ function payPageHtml(q) {
  * @param {object} [opts.costs]  registry.costs — live last-observed-cost records, shown on the landing cards
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
  * @param {number} [opts.progressMs]  heartbeat interval on streamed tools/call responses
+ * @param {number} [opts.maxStreams]  cap on concurrently-held event streams (tools/call holds +
+ *                                    /x402/watch subscribers). At the cap, new tools/call requests
+ *                                    are answered as plain JSON (the pre-hold-open behaviour) and
+ *                                    new watch subscriptions get a 503 so the pay page falls back to
+ *                                    polling — a held-connection backstop, far above real concurrency.
  * @returns {Promise<http.Server>}
  */
 export async function serveHttp({
@@ -427,10 +458,17 @@ export async function serveHttp({
   outDir = null,
   publicBase,
   progressMs = 10_000,
+  maxStreams = 4096,
   log = (...a) => console.error(...a),
 }) {
   const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
   const graphByName = new Map(toolInfo.filter((t) => t.rawText).map((t) => [t.name, t.rawText]));
+
+  // Every held event stream (a streaming tools/call, a /x402/watch subscriber)
+  // rides the gate's ONE shared payment watcher — no per-connection polling — so
+  // a parked connection costs a socket, a heartbeat timer, and a waiter slot,
+  // nothing that scales with the chain. This counter is only a socket backstop.
+  let activeStreams = 0;
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -475,22 +513,42 @@ export async function serveHttp({
          * silent held-open POST is exactly what client timeouts kill.
          */
         const isCall = msg && typeof msg === "object" && msg.method === "tools/call" && msg.id !== null && msg.id !== undefined;
-        if (isCall && /\btext\/event-stream\b/i.test(req.headers.accept || "")) {
+        // At the held-connection cap we don't refuse the call — we drop to the
+        // plain-JSON path below, which still answers correctly (a paid call just
+        // returns its quote to relay instead of holding open). Graceful, not a 503.
+        if (isCall && activeStreams < maxStreams && /\btext\/event-stream\b/i.test(req.headers.accept || "")) {
           const progressToken = msg.params && msg.params._meta ? msg.params._meta.progressToken : undefined;
           res.writeHead(200, {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             "Access-Control-Allow-Origin": "*",
           });
+          activeStreams++;
           const event = (obj) => { if (!res.writableEnded && !res.destroyed) res.write(`event: message\ndata: ${JSON.stringify(obj)}\n\n`); };
           const t0 = Date.now();
-          const ctx = { streaming: true, status: "working", report(s) { this.status = s; } };
           let ticks = 0;
+          const emitProgress = (message) => {
+            if (progressToken === undefined) return false; // no progress channel on this call
+            event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message } });
+            return true;
+          };
+          /*
+           * ctx rides through the dispatcher to the (gated) tool:
+           *   report(s)   — set the status the next heartbeat repeats
+           *   announce(s) — push a progress line to the human RIGHT NOW (returns
+           *                 false when the call carries no progressToken, so the
+           *                 gate knows it can't surface a pay link and shouldn't
+           *                 silently hold the call open on it)
+           */
+          const ctx = {
+            streaming: true,
+            status: "working",
+            report(s) { this.status = s; },
+            announce(s) { this.status = s; return emitProgress(s); },
+          };
           const beat = setInterval(() => {
             const line = `${ctx.status} (${Math.round((Date.now() - t0) / 1000)}s elapsed)`;
-            if (progressToken !== undefined) {
-              event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message: line } });
-            } else if (!res.writableEnded && !res.destroyed) {
+            if (!emitProgress(line) && !res.writableEnded && !res.destroyed) {
               res.write(`: ${line}\n\n`); // SSE comment — connection warmth without protocol noise
             }
           }, progressMs);
@@ -500,6 +558,7 @@ export async function serveHttp({
             if (response) event(response);
           } finally {
             clearInterval(beat);
+            activeStreams--;
             if (!res.writableEnded && !res.destroyed) res.end();
           }
           return;
@@ -552,6 +611,50 @@ export async function serveHttp({
         if (url.searchParams.get("wait")) await gate.waitForPayment(id, 25_000);
         const q = gate.quote(id);
         return send(200, JSON.stringify(q ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt } : { status: "unknown" }));
+      }
+
+      /*
+       * SSE payment watch: one `status` event per state change, closing the
+       * instant the payment lands (or the quote dies). It's push, not polling —
+       * the pay page subscribes to it (falling back to /x402/status polling if the
+       * browser can't), and any HTTP client can too. It rides the gate's shared
+       * waiter list, so a thousand subscribers still cost one chain poll. At the
+       * held-connection cap it 503s and the caller falls back to polling.
+       */
+      const watchMatch = url.pathname.match(/^\/x402\/watch\/([^/]+)$/);
+      if (watchMatch && gate) {
+        const id = decodeURIComponent(watchMatch[1]);
+        if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: "too many open streams — poll /x402/status instead" }));
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Access-Control-Allow-Origin": "*",
+        });
+        activeStreams++;
+        let alive = true;
+        req.on("close", () => { alive = false; });
+        const sse = (ev, obj) => { if (alive && !res.writableEnded && !res.destroyed) res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`); };
+        const ping = setInterval(() => { if (alive && !res.writableEnded && !res.destroyed) res.write(`: ping\n\n`); }, progressMs);
+        if (ping.unref) ping.unref();
+        try {
+          let q = gate.quote(id);
+          sse("status", q ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt } : { status: "unknown" });
+          // Hold the stream open across state changes until the quote settles or
+          // the client leaves. Each wait resolves on the shared watcher firing
+          // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
+          // dropped connection be noticed and cleaned up.
+          const deadline = Date.now() + 20 * 60 * 1000; // never outlive a quote (15m TTL + slack)
+          while (alive && q && q.status === "pending" && Date.now() < deadline) {
+            await gate.waitForPayment(id, 25_000);
+            q = gate.quote(id);
+            if (q) sse("status", { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt });
+          }
+        } finally {
+          clearInterval(ping);
+          activeStreams--;
+          if (!res.writableEnded && !res.destroyed) res.end();
+        }
+        return;
       }
 
       const outMatch = url.pathname.match(/^\/out\/([^/]+)$/);
