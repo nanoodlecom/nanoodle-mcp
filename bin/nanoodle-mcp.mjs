@@ -34,7 +34,7 @@ import { loadTools, attachEstimates } from "../src/tools.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { createChargeGate } from "../src/gate.mjs";
-import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
+import { createNanoWallet, resolveWalletKey } from "../src/wallet.mjs";
 import { startSweeper } from "../src/sweep.mjs";
 
 function usage(code = 1) {
@@ -53,7 +53,9 @@ function usage(code = 1) {
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
   --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
-  --nano-rpc u   Nano RPC node for wallet operations (default ${DEFAULT_NANO_RPC}; NANO_RPC_URL)
+  --nano-rpc u   Nano RPC node(s) for wallet reads/publishes, comma-separated,
+                 tried in order with failover so one throttling node can't end a
+                 settlement (default: a resilient public chain; NANO_RPC_URL)
   --work-rpc u   dedicated work_generate endpoint(s), comma-separated, tried in order —
                  nano-work-server boxes and/or hosted GPU work APIs like rpc.nano.to
                  (NANO_WORK_URL; falls back to --nano-rpc, then local CPU work.

@@ -555,6 +555,60 @@ test("paySend: a lost response for a block that DID land is not republished", as
   assert.equal(rpc.state.processed.length, 0, "no double publish after the frontier confirms the block");
 });
 
+test("failover: a 429 on the primary settles on the secondary (reads AND publish)", async () => {
+  // The real incident: the primary proxy 429s the whole settlement. A 429 is an
+  // explicit refusal — the block never reaches the node — so even the publish is
+  // safe to retry on a healthy peer. Distributed network: one node saying "no"
+  // must not end the payment.
+  const primaryActions = [];
+  const good = fakeRpc();
+  const fetch = async (url, init) => {
+    if (url.startsWith("http://primary")) {
+      primaryActions.push(JSON.parse(init.body).action);
+      return { ok: false, status: 429, text: async () => "too many requests" };
+    }
+    return good.fetch(url, init);
+  };
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "http://primary,http://good", fetch });
+  await wallet.payment(invoice());
+  assert.equal(good.state.processed.length, 1, "block published via the healthy secondary");
+  assert.ok(primaryActions.includes("account_info"), "primary tried first for the read");
+  assert.ok(primaryActions.includes("process"), "primary tried first for the publish, then failed over");
+});
+
+test("failover: an ambiguous 5xx on publish is verified, never cross-node republished", async () => {
+  // A 5xx from a fronting proxy is NOT a clean refusal — the node may have taken
+  // the block and only the response died. That must go through the frontier-check
+  // recovery, never a blind republish to another node (which would double-submit).
+  const { hashBlock } = await import("nanocurrency");
+  let sent = null;
+  const secondaryProcesses = [];
+  const primary = fakeRpc({
+    process: (body, state, reply) => {
+      if (!sent) { sent = body.block; return { ok: false, status: 502, text: async () => "bad gateway" }; }
+      state.processed.push(body);
+      return reply({ hash: "C".repeat(64) });
+    },
+    account_info: (_b, _s, reply) => reply({
+      frontier: sent
+        ? hashBlock({ account: sent.account, previous: sent.previous, representative: sent.representative, balance: sent.balance, link: sent.link })
+        : FRONTIER,
+      balance: BALANCE, representative: ADDRESS,
+    }),
+  });
+  const fetch = async (url, init) => {
+    if (url.startsWith("http://secondary")) {
+      if (JSON.parse(init.body).action === "process") secondaryProcesses.push(1);
+      return fakeRpc().fetch(url, init);
+    }
+    return primary.fetch(url, init);
+  };
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "http://primary,http://secondary", fetch });
+  await wallet.payment(invoice()); // resolves — the frontier check proves the block landed
+  assert.equal(primary.state.processed.length, 0, "not republished on the primary");
+  assert.equal(secondaryProcesses.length, 0, "and never failed a publish over to the secondary");
+});
+
 test("default RPC is rpc.nano.to", () => {
   assert.equal(DEFAULT_NANO_RPC, "https://rpc.nano.to");
 });
