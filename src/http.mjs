@@ -318,9 +318,9 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     lines.push(
       `## Payment (x402, Nano/XNO)`,
       ``,
-      `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a pay page at ${publicBase}/pay/<id>.`,
-      `- Send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id. On a streaming transport (Accept: text/event-stream) that second call is held open — it waits for the payment to land, then runs — so you never re-invoke AFTER paying; call it right after showing the link.`,
-      `- Watch a quote settle over SSE at ${publicBase}/x402/watch/<id> (one status event per state change) or poll ${publicBase}/x402/status/<id>?wait=1.`,
+      `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a payUrl (${publicBase}/pay/<id>). Show the user ONLY the payUrl.`,
+      `- Send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id. On a streaming transport (Accept: text/event-stream) that second call is held open — it waits for the payment to land, then runs — so you never re-invoke AFTER paying; call it right after showing the link. That call is how you watch for the payment.`,
+      `- Agent-only (never show the user): to watch a payment settle yourself, subscribe to the SSE stream ${publicBase}/x402/watch/<id> (one status event per state change) or poll ${publicBase}/x402/status/<id>?wait=1.`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
       `- The 20% is the workflow author's cut, not a platform fee.`,
       ``,
