@@ -35,6 +35,7 @@ import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { createChargeGate } from "../src/gate.mjs";
 import { createNanoWallet, resolveWalletKey } from "../src/wallet.mjs";
+import { redactUrl } from "../src/redact.mjs";
 import { startSweeper } from "../src/sweep.mjs";
 
 function usage(code = 1) {
@@ -267,7 +268,7 @@ async function main() {
   if (wallet) {
     console.error(`nanoodle-mcp: wallet mode (accountless x402) — paying from ${wallet.address}` +
       (maxUsd != null ? `, capped at $${maxUsd}/call` : ", no per-call cap (--max-usd)") +
-      (workUrl ? `, work via ${workUrl}${workKey ? " (keyed)" : ""}` : ""));
+      (workUrl ? `, work via ${redactUrl(workUrl)}${workKey ? " (keyed)" : ""}` : ""));
   }
 
   console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${dirList}`);
