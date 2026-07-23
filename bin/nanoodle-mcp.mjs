@@ -30,7 +30,7 @@
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
-import { loadTools } from "../src/tools.mjs";
+import { loadTools, attachEstimates } from "../src/tools.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { createChargeGate } from "../src/gate.mjs";
@@ -71,8 +71,10 @@ Serve mode (host your noodles over HTTP instead of stdio):
   --charge-usd n   charge for tool calls, paid in Nano via x402: a deposit up front, settled
                    at the run's ACTUAL metered cost + 20% with the rest returned to the payer
                    as change; the 20% goes to the graph's x402.author address if set, else stays.
-                   $n is the ceiling deposit — once a tool's metered cost is known, its quotes
-                   shrink to 2x its observed cost+20% (whole cents, 1c floor) automatically.
+                   $n is the COLD-START deposit (used before a tool can be priced), not a cap:
+                   each tool's per-run cost is forecast up front from the public catalog and
+                   its quote tracks that (and its real observed cost once it runs), so expensive
+                   graphs deposit what they actually cost. Change still returns any slack.
                    Per-graph deposit override: "x402": {"usd": 0.10} in the graph JSON.
                    Requires the wallet (NANO_SEED / NANO_PRIVATE_KEY) — it receives payments
                    and sends refunds/change/payouts. Payments (not runs) are logged to a
@@ -325,6 +327,23 @@ async function main() {
         .then(() => appendFile(usagePath, line))
         .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
     };
+    // Forecast each graph's per-run cost from the public catalog so the FIRST quote
+    // for a never-run tool already deposits enough to cover it (change returns the
+    // slack). Best-effort — a catalog that won't load just leaves the flat opening
+    // deposit in place. Refreshed hourly so estimates track catalog/price changes;
+    // the timer is unref()'d so it never holds the process open.
+    const catalogBase = process.env.NANOGPT_BASE_URL || "https://nano-gpt.com";
+    const refreshEstimates = () => attachEstimates(registry, {
+      baseUrl: catalogBase,
+      log: (line) => console.error("nanoodle-mcp: " + line),
+    }).then((est) => {
+      const n = est ? Object.keys(est).length : 0;
+      if (n) console.error(`nanoodle-mcp: cost forecast ready for ${n}/${registry.tools.length} tool(s) — deposits track estimated model cost`);
+    }).catch(() => {});
+    await refreshEstimates();
+    const estTimer = setInterval(refreshEstimates, 60 * 60 * 1000);
+    if (estTimer.unref) estTimer.unref();
+
     gate = createChargeGate({
       address: wallet.address,
       ops: wallet.ops,

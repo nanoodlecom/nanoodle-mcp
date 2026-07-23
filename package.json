@@ -1,6 +1,6 @@
 {
   "name": "nanoodle-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "mcpName": "io.github.nanoodlecom/nanoodle-mcp",
   "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK or accountless x402 (pay per call in Nano), runs on the NanoGPT API",
   "type": "module",

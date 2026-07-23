@@ -17,6 +17,7 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
+import { estimateGraphCost, graphModelKinds } from "./estimate.mjs"; // vendored from nanoodle@0.7.0 until the dep is bumped
 
 /**
  * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
@@ -26,6 +27,56 @@ import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
  */
 export function editorShareUrl(rawText) {
   return `https://nanoodle.com/#g=${gzipSync(rawText).toString("base64url")}`;
+}
+
+/** Public NanoGPT catalog endpoints by pricing kind — no API key, `{ data: [...] }`. */
+const CATALOG_PATH = {
+  chat: "/api/v1/models?detailed=true",
+  image: "/api/v1/image-models",
+  video: "/api/v1/video-models",
+  audio: "/api/v1/audio-models",
+};
+
+/**
+ * Fetch the public catalog(s) each hosted graph needs and forecast every tool's
+ * per-run cost UP FRONT, into `registry.estimates` (name → {usd, exact, priced,
+ * unpriced}). The charge gate reads this so the very first quote for a tool that
+ * has never run still deposits enough to cover it — instead of a flat guess.
+ *
+ * Best-effort by design: a catalog that won't load leaves those tools without an
+ * estimate (the gate falls back to its flat opening deposit + whatever it later
+ * learns from real runs). Pass the same `baseUrl`/`fetch` the runs use so the
+ * forecast is priced against the same NanoGPT instance that bills them.
+ * Re-callable — a periodic refresh keeps estimates fresh as the catalog changes.
+ */
+export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {} } = {}) {
+  const base = String(baseUrl).replace(/\/+$/, "");
+  const needed = new Set();
+  for (const t of registry.tools) for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
+  if (!needed.size) return (registry.estimates = {});
+
+  const catalogs = {};
+  await Promise.all([...needed].map(async (kind) => {
+    try {
+      const r = await fetch(base + CATALOG_PATH[kind], { headers: { Accept: "application/json" } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()).data;
+      if (Array.isArray(data) && data.length) catalogs[kind] = data;
+      else log(`cost forecast: ${kind} catalog came back empty — those tools quote the opening deposit until they've run`);
+    } catch (e) {
+      log(`cost forecast: could not load ${kind} catalog (${e.message}) — those tools quote the opening deposit until they've run`);
+    }
+  }));
+
+  const estimates = {};
+  for (const t of registry.tools) {
+    try {
+      const e = estimateGraphCost(t.wf.graph, catalogs);
+      if (e.priced > 0) estimates[t.name] = e;
+    } catch (e) { log(`cost forecast for ${t.name} failed: ${e.message}`); }
+  }
+  registry.estimates = estimates;
+  return estimates;
 }
 
 /** Input kinds whose values are media (file path or URL), mirroring the library's MEDIA_KINDS. */
@@ -601,6 +652,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     failures,
     /** Live last-observed-cost records by tool name — the --charge gate reads these to sanity-check deposits. */
     costs,
+    /** Up-front per-run cost forecasts by tool name (attachEstimates fills this) — the gate quotes off it before a tool has ever run. */
+    estimates: {},
     /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
     onToolsChanged: null,
 
