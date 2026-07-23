@@ -1522,7 +1522,10 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
     assert.ok(x.paymentId, "the first call returns the payment-required quote as its result");
     assert.match(final.result.content[0].text, /PAYMENT REQUIRED/, "the pay link is in the RESULT content, not only a progress message");
     assert.match(final.result.content[0].text, /\/pay\//);
-    assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`);
+    // the watch endpoint is agent/pay-page plumbing — it must NOT ride in the
+    // per-call result (agents relay this to users; only the payUrl is user-facing)
+    assert.equal(x.watchUrl, undefined, "watchUrl must not be in the quote result shown to users");
+    assert.doesNotMatch(final.result.content[0].text, /x402\/watch/, "the watch URL is never in the human-facing text");
     assert.equal(registry.callCount(), 0, "nothing runs on the first call");
 
     // The no-re-invoke-AFTER-paying path: the follow-up _payment_id call on a
@@ -1558,8 +1561,7 @@ test("GET /x402/watch/:id streams status: pending, then paid when the payment la
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
-    assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "the quote advertises its watch endpoint");
-
+    // the endpoint is derived from the paymentId (agent-only; not advertised in the result)
     const res = await fetch(`${base}/x402/watch/${x.paymentId}`, { headers: { Accept: "text/event-stream" } });
     assert.match(res.headers.get("content-type"), /text\/event-stream/);
 

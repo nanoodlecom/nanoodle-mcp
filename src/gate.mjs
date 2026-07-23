@@ -626,19 +626,17 @@ export function createChargeGate({
   /* ---------------- MCP-facing results ---------------- */
 
   const payUrl = (q) => `${publicBase}/pay/${q.id}`;
-  const watchUrl = (q) => `${publicBase}/x402/watch/${q.id}`;
   const nanoUri = (q) => `nano:${address}?amount=${q.amountRaw}`;
 
   function paymentRequiredResult(q) {
+    // Only user-facing fields belong here — agents relay this object. The
+    // /x402/watch SSE endpoint is deliberately NOT included: it's agent/pay-page
+    // plumbing for watching the payment settle, not a link to hand the user, and
+    // dropping it beside payUrl made agents show it to humans. Agents that want
+    // to watch programmatically get the endpoint from the server instructions.
     const x402 = {
       paymentId: q.id,
       payUrl: payUrl(q),
-      // An SSE endpoint that emits one `status` event per state change and closes
-      // when the payment lands (or the quote dies) — a browser/HTTP client can
-      // subscribe instead of polling. An MCP agent can't consume it directly, but
-      // on a streaming tools/call the gate already holds THIS call open through
-      // payment (no re-invoke); the URL is here for the pay page and other clients.
-      watchUrl: watchUrl(q),
       uri: nanoUri(q),
       address,
       amountRaw: q.amountRaw,
@@ -653,12 +651,11 @@ export function createChargeGate({
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
       `To proceed:\n` +
-      `1. Show your user this payment link (it renders a QR code to scan with any Nano wallet, and turns into a green check the moment the payment lands):\n` +
+      `1. Show your user ONLY this payment link — it renders a QR code to scan with any Nano wallet and turns into a green check the moment the payment lands. Don't show them any other URL or the wallet address from this response:\n` +
       `   ${payUrl(q)}\n` +
-      `2. Call this tool again with the SAME arguments plus "_payment_id": "${q.id}". You can call again right away — ` +
-      `the call waits for the payment to land (settlement takes about a second) and then runs.` +
+      `2. Then call this tool again with the SAME arguments plus "_payment_id": "${q.id}". Do this right away, as soon as you've shown the link — that call waits for the payment to land (about a second) and then runs. That is how YOU watch for the payment; the user never has to tell you they paid.` +
       (q.etaMs ? ` Once paid, this tool typically finishes in ~${fmtDur(q.etaMs)}.` : "") + `\n\n` +
-      `Paying without the page: send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
+      `Manual-pay fallback (only if the user can't use the link): send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
       `the exact amount is how the payment is recognized (URI: ${nanoUri(q)}).\n` +
       `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"} (${x402.expiresAt}). ` +
       `If the run fails after payment, the payment is refunded automatically.`;
