@@ -34,6 +34,7 @@ import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
 import { fmtDur } from "./tools.mjs";
+import { redactUrl } from "./redact.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 /**
@@ -598,10 +599,11 @@ export function createChargeGate({
       if (!wsEverFailed) { wsEverFailed = true; log("--nano-ws ignored: no global WebSocket (needs Node ≥ 21)"); }
       return;
     }
-    try { ws = new WebSocket(wsUrl); } catch (e) { log(`websocket ${wsUrl} failed to open: ${e.message}`); return; }
+    const wsSafe = redactUrl(wsUrl); // ws URLs carry an api_key — never log it raw
+    try { ws = new WebSocket(wsUrl); } catch (e) { log(`websocket ${wsSafe} failed to open: ${e.message}`); return; }
     ws.onopen = () => {
       wsConnected = true;
-      log(`websocket connected: ${wsUrl} — payment detection is push-based`);
+      log(`websocket connected: ${wsSafe} — payment detection is push-based`);
       ws.send(JSON.stringify({ action: "subscribe", topic: "confirmation", options: { accounts: [address] } }));
     };
     ws.onmessage = (ev) => {
@@ -615,7 +617,7 @@ export function createChargeGate({
       }
     };
     ws.onclose = ws.onerror = () => {
-      if (wsConnected) log(`websocket ${wsUrl} disconnected — falling back to polling`);
+      if (wsConnected) log(`websocket ${wsSafe} disconnected — falling back to polling`);
       wsConnected = false;
       ws = null;
       // reconnect lazily next time something needs watching
@@ -1003,13 +1005,17 @@ export function createChargeGate({
               // replayed failure shows "(error details not retained…)" plus the
               // real refund status — enough for the caller to know the money is
               // handled, without keeping their content at rest.
-              const refundStatus = refunded
-                ? ` — your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}.`
+              // Lead with the outcome that matters to the payer — not charged,
+              // money coming back, safe to retry — then the technical detail.
+              // A throttled-RPC failure (all nodes 429) lands here too, so the
+              // caller should read "try again," never "payment failed."
+              const payer = refunded
+                ? `The run didn't complete, so your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source} — you were not charged. You can try again in a moment.`
                 : q.source
-                  ? ` — your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands).`
-                  : " — the run was paid for; contact the operator about a refund.";
-              q.error = `run failed: ${msg}` + refundStatus;
-              q.errorPersist = `run failed: (error details not retained across restarts)` + refundStatus;
+                  ? `The run didn't complete, so your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands) — you won't be charged for a run that didn't finish. You can try again shortly.`
+                  : `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`;
+              q.error = `${payer}\n\nDetails: ${msg}`;
+              q.errorPersist = `${payer}\n\nDetails: (error details not retained across restarts)`;
               persist();
             }
           })();

@@ -30,6 +30,7 @@ import {
   derivePublicKey,
   deriveSecretKey,
 } from "nanocurrency";
+import { redactUrl } from "./redact.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -125,13 +126,13 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         signal,
       });
     } catch (e) {
-      throw new Error(`Nano RPC ${base} unreachable (action ${body.action}): ${e.message}`);
+      throw new Error(`Nano RPC ${redactUrl(base)} unreachable (action ${body.action}): ${e.message}`);
     }
     const text = await r.text();
     let json = null;
     try { json = JSON.parse(text); } catch { /* handled below */ }
     if (!r.ok || json == null) {
-      const e = new Error(`Nano RPC ${body.action} failed at ${base} (HTTP ${r.status}): ${text.slice(0, 200)}`);
+      const e = new Error(`Nano RPC ${body.action} failed at ${redactUrl(base)} (HTTP ${r.status}): ${text.slice(0, 200)}`);
       if (r.status === 429) e.rejected = true; // throttled: request never reached the node
       throw e;
     }
@@ -162,7 +163,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         if (isPublish && !e.rejected) throw e; // ambiguous publish — hand to recovery
         lastErr = e;
         if (bases.length > 1 && i < bases.length - 1) {
-          log(`Nano RPC ${body.action} failing over past ${bases[i]} (${e.message})`);
+          log(`Nano RPC ${body.action} failing over past ${redactUrl(bases[i])} (${e.message})`);
         }
       }
     }
@@ -209,8 +210,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   // (nano.to style) and a `nodes-api-key` header (Nanswap style).
   async function remoteWork(frontier, threshold) {
     const workSources = [
-      ...workBases.map((b) => ["work server " + b, b]),
-      ...rpcBases.map((b) => ["Nano RPC " + b, b]),
+      ...workBases.map((b) => ["work server " + redactUrl(b), b]),
+      ...rpcBases.map((b) => ["Nano RPC " + redactUrl(b), b]),
     ];
     for (const [label, base] of workSources) {
       const withKey = workKey && workBases.includes(base);
