@@ -34,6 +34,14 @@ API key in `NANOGPT_API_KEY` (or passed via `--key` / `--env-file`) — or no
 key at all with a Nano wallet, see
 [wallet mode](#wallet-mode--no-account-no-api-key-x402).
 
+**Optional: `ffmpeg` on PATH.** Tools whose graphs include a local-media node
+(resize, video frames, combine, audio trim/extract) use a pure-JS path for the
+common case but fall back to `ffmpeg`/`ffprobe` for formats it can't handle —
+JPEG/WebP resize, reading video frames, compressed audio. Without ffmpeg those
+runs fail (and auto-refund in charge mode); the server prints a warning at
+startup naming the affected tools. Pure image/LLM/vision tools don't need it.
+Install with `apt install ffmpeg` (Debian/Ubuntu) / `brew install ffmpeg`.
+
 ### Claude Code
 
 ```bash
