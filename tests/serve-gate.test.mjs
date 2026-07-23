@@ -8,6 +8,8 @@ import assert from "node:assert/strict";
 import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { rawToXno } from "../src/wallet.mjs";
+import { qrModules } from "nanoodle";
+import { qrDecode, svgToMatrix } from "./qr-decode.mjs";
 
 // Any syntactically valid Nano addresses work — checkAddress validates the checksum.
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
@@ -894,6 +896,10 @@ test("pay page + status endpoint over HTTP", async () => {
     const html = await payPage.text();
     assert.match(html, /<svg/);
     assert.match(html, new RegExp(x.amountRaw));
+    // The QR a phone would actually scan off this page must decode to the exact
+    // nano: URI (address + amount), not just "contain an <svg>".
+    const svg = html.match(/<svg[\s\S]*?<\/svg>/)[0];
+    assert.equal(qrDecode(svgToMatrix(svg)), `nano:${GATE_ADDR}?amount=${x.amountRaw}`);
 
     let st = await (await fetch(`${base}/x402/status/${x.paymentId}`)).json();
     assert.equal(st.status, "pending");
@@ -1357,4 +1363,52 @@ test("qrSvg encodes a nano URI into a QR matrix svg", () => {
   const svg = qrSvg(`nano:${GATE_ADDR}?amount=123`);
   assert.match(svg, /^<svg /);
   assert.match(svg, /path d="M/);
+});
+
+// The QR is only worth showing if a camera reads it back byte-for-byte. These
+// decode the matrix with an independent decoder (tests/qr-decode.mjs) — the true
+// "does it scan" check, not just "an <svg> came out".
+test("qrModules round-trips: the encoded matrix decodes back to the input", () => {
+  // Lengths span QR versions 1 → ~large, exercising different masks and the
+  // 8-bit vs 16-bit char-count boundary at version 10.
+  for (const s of [
+    "x",
+    `nano:${GATE_ADDR}?amount=123`,
+    `nano:${GATE_ADDR}?amount=136472560000000000000000000000`,
+    "https://mcp.nanoodle.com/pay/abc123",
+    "café ☕ 日本語 — unicode survives the round-trip",
+    "A".repeat(400),
+  ]) {
+    assert.equal(qrDecode(qrModules(s)), s, `round-trip failed for length ${s.length}`);
+  }
+});
+
+test("qrSvg output parses back into the same matrix qrModules produced", () => {
+  const uri = `nano:${GATE_ADDR}?amount=136472560000000000000000000000`;
+  assert.deepEqual(svgToMatrix(qrSvg(uri)), qrModules(uri), "SVG path lost/added modules");
+  assert.equal(qrDecode(svgToMatrix(qrSvg(uri))), uri, "served SVG does not scan to the URI");
+});
+
+// A wallet pre-fills the amount only when the URI carries it in the Nano URI
+// scheme: nano:<address>?amount=<raw>, raw being integer 1e-30 XNO units.
+test("the payment quote's QR is a spec-correct nano: URI carrying the exact amount", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a lighthouse" } }));
+
+  // The URI the pay page turns into a QR (http.mjs payPageHtml → qrSvg(q.uri)).
+  assert.equal(x.uri, `nano:${GATE_ADDR}?amount=${x.amountRaw}`);
+  const u = new URL(x.uri);
+  assert.equal(u.protocol, "nano:");
+  assert.equal(u.pathname, GATE_ADDR, "address is the URI body, no double slashes");
+  const amount = u.searchParams.get("amount");
+  assert.match(amount, /^[1-9]\d*$/, "amount must be a bare integer in raw (no decimals, no scale suffix)");
+  assert.equal(amount, x.amountRaw, "QR amount must equal the quoted amountRaw");
+  // raw → XNO agrees with the human-facing figure shown next to the QR.
+  assert.equal(rawToXno(amount), x.amountXno);
+
+  // And it scans: the served SVG decodes byte-for-byte back to that URI.
+  assert.equal(qrDecode(svgToMatrix(qrSvg(x.uri))), x.uri);
 });
