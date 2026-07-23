@@ -665,24 +665,6 @@ export function createChargeGate({
     return { content: [{ type: "text", text }], structuredContent: { x402 } };
   }
 
-  /*
-   * The progress line pushed when a streaming call holds itself open through
-   * payment (see callTool). It's the human-facing message the agent surfaces
-   * live: the pay link, and the promise that the result returns on its own —
-   * no second call. The paymentId is still named so that if the stream dies
-   * before the payment lands, re-invoking with _payment_id is a clean fallback.
-   */
-  function holdAnnounceText(q) {
-    const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
-    return `PAYMENT REQUIRED — ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed.\n` +
-      `Show your user this link — it renders a QR to scan with any Nano wallet and turns into a green check the instant the payment lands:\n` +
-      `  ${payUrl(q)}\n` +
-      `I'm holding this call open and will return the result automatically once the payment lands (settlement takes about a second)` +
-      (q.etaMs ? `, then finish the run in ~${fmtDur(q.etaMs)}` : "") + ` — nothing else to do, no need to call again.\n` +
-      `Paying without the page: send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} (URI: ${nanoUri(q)}). ` +
-      `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"}; if it lapses, call again with "_payment_id": "${q.id}".`;
-  }
-
   const errResult = (text) => ({ content: [{ type: "text", text }], isError: true });
 
   /* ---------------- public surface ---------------- */
@@ -914,16 +896,16 @@ export function createChargeGate({
           persist();
           ensureWatching();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
-          // Hold-open: a streaming client that can show progress doesn't get the
-          // quote as a result to relay and re-call — it gets the pay link pushed
-          // as a progress line NOW, and this same call stays open, waits out the
-          // payment, and returns the run's result. One call, no re-invoke after
-          // paying. ctx.announce returns false when the transport can't actually
-          // surface the link (no progress channel) — then fall back to returning
-          // the quote so the agent relays it and calls again with _payment_id.
-          const held = ctx && ctx.streaming && typeof ctx.announce === "function" && ctx.announce(holdAnnounceText(q));
-          if (!held) return paymentRequiredResult(q);
-          // fall through with the fresh pending quote → wait, then run
+          // The FIRST call always returns the payment-required quote as its tool
+          // RESULT — every MCP client surfaces a result, so the pay link is always
+          // seen. (An earlier build held streaming calls open and pushed the link
+          // as a progress notification instead; clients that don't render progress
+          // messages showed the human nothing and the call hung until timeout —
+          // observed live on talking-avatar. Delivering the link in-band as a
+          // progress message is not reliable, so we don't.) To avoid a re-invoke
+          // after paying, the caller passes _payment_id on the NEXT call and, on a
+          // streaming transport, that call is held open until the payment lands.
+          return paymentRequiredResult(q);
         } else {
           q = quotes.get(String(_payment_id));
           if (!q) {

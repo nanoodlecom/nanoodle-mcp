@@ -7,9 +7,10 @@
  *                        createDispatcher() that powers stdio handles everything.
  *                        tools/call from an SSE-capable client answers as an
  *                        event stream with progress heartbeats — generations
- *                        and payment waits outlive client tool timeouts. On a
- *                        paid server the first call is held open through payment
- *                        (pay link pushed as progress), so the agent never re-calls.
+ *                        and payment waits outlive client tool timeouts. On a paid
+ *                        server the first call returns the payment-required quote;
+ *                        the follow-up _payment_id call is what's held open through
+ *                        payment (so the caller never re-invokes AFTER paying).
  *   GET  /               landing page: hero connect command, how payment flows, tool list
  *                        w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
@@ -318,8 +319,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       `## Payment (x402, Nano/XNO)`,
       ``,
       `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a pay page at ${publicBase}/pay/<id>.`,
-      `- Streaming clients (Accept: text/event-stream on tools/call) don't re-call: the same call is held open, the pay link arrives as a progress update, and the result returns once the payment lands.`,
-      `- Otherwise send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id — or call with it immediately and the server waits for the payment.`,
+      `- Send exactly the quoted amount (the amount identifies the payment), then call again with the returned _payment_id. On a streaming transport (Accept: text/event-stream) that second call is held open — it waits for the payment to land, then runs — so you never re-invoke AFTER paying; call it right after showing the link.`,
       `- Watch a quote settle over SSE at ${publicBase}/x402/watch/<id> (one status event per state change) or poll ${publicBase}/x402/status/<id>?wait=1.`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
       `- The 20% is the workflow author's cut, not a platform fee.`,
@@ -535,10 +535,10 @@ export async function serveHttp({
           /*
            * ctx rides through the dispatcher to the (gated) tool:
            *   report(s)   — set the status the next heartbeat repeats
-           *   announce(s) — push a progress line to the human RIGHT NOW (returns
-           *                 false when the call carries no progressToken, so the
-           *                 gate knows it can't surface a pay link and shouldn't
-           *                 silently hold the call open on it)
+           *   announce(s) — also push that line as a progress update immediately,
+           *                 not just at the next heartbeat (no-op returning false
+           *                 when the call carries no progressToken). Used for
+           *                 mid-run status the caller should see without waiting.
            */
           const ctx = {
             streaming: true,
