@@ -198,20 +198,22 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
       `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${author}</li>`;
   }).join("");
-  const desc = `${tools.length} AI media workflows — image, video, audio, text — behind one MCP endpoint. ` +
-    (charged ? "No account, no API key — pay per call in Nano (XNO)." : "No account, no API key.");
+  const tagline = charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
+  const desc = charged
+    ? "AI workflows paid in Nano over x402 — image, video, audio, and text pipelines behind one MCP endpoint. No account, no API key."
+    : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
   const ogHead =
     `<meta name="description" content="${esc(desc)}">` +
     `<meta property="og:type" content="website">` +
     `<meta property="og:site_name" content="${esc(name)}">` +
-    `<meta property="og:title" content="${esc(name)} — AI media workflows over MCP">` +
+    `<meta property="og:title" content="${esc(name)} — ${esc(tagline)}">` +
     `<meta property="og:description" content="${esc(desc)}">` +
     `<meta property="og:url" content="${esc(publicBase)}/">` +
     `<meta property="og:image" content="${esc(publicBase)}/og.jpg">` +
     `<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">` +
     `<meta property="og:image:alt" content="${esc(OG_IMAGE_ALT)}">` +
     `<meta name="twitter:card" content="summary_large_image">` +
-    `<meta name="twitter:title" content="${esc(name)} — AI media workflows over MCP">` +
+    `<meta name="twitter:title" content="${esc(name)} — ${esc(tagline)}">` +
     `<meta name="twitter:description" content="${esc(desc)}">` +
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
@@ -220,19 +222,19 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
     </header>
     <p class="eyebrow">public MCP server</p>
-    <h1>10-second connect.</h1>
-    <p class="sub">${tools.length} AI media workflows — image, video, audio, text — behind one MCP endpoint.
-      ${charged ? "No account, no API key — pay per call in Nano (XNO)." : "No account, no API key."}
+    <h1>${charged ? "AI workflows, paid in Nano over x402." : "AI media workflows over MCP."}</h1>
+    <p class="sub">Image, video, audio, and text pipelines behind one MCP endpoint.
+      ${charged ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
     <div class="connect"><pre id="cmd">${esc(cmd)}</pre><button onclick="copyCmd(this)">copy</button></div>
     <p class="hint">works with Claude Code, Cursor, and any MCP client</p>
     <div class="steps">
       <div class="step"><span class="n">01</span><b>paste the command</b>
-        <p>one line registers all ${tools.length} tools with your agent.</p></div>
+        <p>one line registers every workflow with your agent.</p></div>
       <div class="step"><span class="n">02</span><b>ask for what you want</b>
         <p>your agent picks a workflow and calls it — a poster, a soundtrack, an OG card.</p></div>
       ${charged ? `<div class="step"><span class="n">03</span><b>pay per call</b>
-        <p>a few cents of Nano, settled automatically. failed runs are refunded.</p></div>`
+        <p>settled automatically in Nano. failed runs are refunded.</p></div>`
       : `<div class="step"><span class="n">03</span><b>results stream back</b>
         <p>media arrives as links, usually in seconds.</p></div>`}
     </div>
@@ -248,7 +250,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     <h2>Workflows (${tools.length})</h2>
     <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
       <a href="https://nanoodle.com">nanoodle editor</a> to see exactly how it works, remix it, or run it
-      on your own key.${charged ? " Costs shown are the last observed run — each call deposits a few cents and settles at the model's actual cost + 20%, change returned." : ""}</p>
+      on your own key.${charged ? " Costs shown are the last observed run — each call is a small deposit that settles at the model's actual cost + 20%, change returned." : ""}</p>
     <ul class="tools">${cards}</ul>
     <div class="card"><h2>Private by design</h2>
       <p class="muted">Every line here is checkable in the source — nothing to take on faith.</p>
@@ -299,7 +301,9 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
   const lines = [
     `# ${name} v${version}`,
     ``,
-    `Public MCP server: ${tools.length} AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
+    charged
+      ? `Public MCP server: AI workflows (image, video, audio, text) paid per call in Nano over x402 — built with nanoodle (https://nanoodle.com).`
+      : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
     ``,
     `endpoint: ${publicBase}/mcp (MCP streamable HTTP — POST JSON-RPC, SSE progress on tools/call)`,
     `connect:  claude mcp add --transport http noodles ${publicBase}/mcp`,
