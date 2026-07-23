@@ -33,6 +33,23 @@ import {
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
+/**
+ * Default read/publish endpoint chain, tried in order with failover. The whole
+ * point of a distributed ledger is that one node saying "429" or timing out
+ * must not end a settlement — so ship more than one public proxy out of the box.
+ * A dead entry costs a single wasted attempt (then failover), never a failure,
+ * which is why plausibly-good extras are safe to include. Operators with their
+ * own node should override the lot via NANO_RPC_URL (comma-separated).
+ * All four probed live and account_info-correct on 2026-07-23; public proxies
+ * drift, but a dead one just costs one failover hop, so the chain self-heals.
+ */
+export const DEFAULT_NANO_RPCS = [
+  DEFAULT_NANO_RPC,                     // rpc.nano.to — full node, primary
+  "https://node.somenano.com/proxy",
+  "https://rainstorm.city/api",
+  "https://nanoslo.0x.no/proxy",
+];
+
 /** Network send threshold since Nano v21 — nanocurrency's default is the old, lower one. */
 const SEND_WORK_THRESHOLD = "fffffff800000000";
 /** Receive blocks are allowed much cheaper work since v21. */
@@ -69,11 +86,17 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl = null, workKey = null, workTimeoutMs = 120_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
-  const rpcBase = String(rpcUrl).replace(/\/+$/, "");
+  // rpcUrl accepts a comma-separated list, tried in order with failover — so one
+  // proxy throttling or dropping does not end a settlement. Empty/unset falls
+  // back to the resilient default chain rather than a single node.
+  const rpcBases = (rpcUrl ? String(rpcUrl).split(",") : DEFAULT_NANO_RPCS)
+    .map((u) => u.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  if (!rpcBases.length) rpcBases.push(DEFAULT_NANO_RPC);
   // workUrl accepts a comma-separated list, tried in order — e.g. a GPU box on
   // the tailnet first, a public work API second. `workKey` (if set) goes to
   // every listed work server, so list only servers that accept it (or set none).
@@ -81,7 +104,18 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     ? String(workUrl).split(",").map((u) => u.trim().replace(/\/+$/, "")).filter(Boolean)
     : [];
 
-  async function rpc(body, base = rpcBase, { headers = {}, signal } = {}) {
+  // One endpoint, one attempt. Errors are tagged so the failover layer knows how
+  // far it may safely retry:
+  //   .authoritative — the node returned a valid JSON-RPC answer that is itself
+  //     an error ("Account not found", "Fork", "Old block"). That is the
+  //     network's real answer; asking a different node would be wrong.
+  //   .rejected — the request was refused BEFORE it could take effect (HTTP 429
+  //     from a throttling proxy). The block definitely did not land, so even a
+  //     publish is safe to retry on another node.
+  //   neither — ambiguous (dropped connection, proxy 5xx, non-JSON). A read may
+  //     safely retry; a publish must NOT (the node may have accepted it and only
+  //     the response died), so that case is left to settleAfterTransportError.
+  async function rpcOnce(body, base, { headers = {}, signal } = {}) {
     let r;
     try {
       r = await fetch(base, {
@@ -97,10 +131,42 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
     let json = null;
     try { json = JSON.parse(text); } catch { /* handled below */ }
     if (!r.ok || json == null) {
-      throw new Error(`Nano RPC ${body.action} failed (HTTP ${r.status}): ${text.slice(0, 200)}`);
+      const e = new Error(`Nano RPC ${body.action} failed at ${base} (HTTP ${r.status}): ${text.slice(0, 200)}`);
+      if (r.status === 429) e.rejected = true; // throttled: request never reached the node
+      throw e;
     }
-    if (json.error) throw new Error(`Nano RPC ${body.action}: ${json.error}`);
+    if (json.error) {
+      const e = new Error(`Nano RPC ${body.action}: ${json.error}`);
+      e.authoritative = true;
+      throw e;
+    }
     return json;
+  }
+
+  // Read/publish RPC with failover across the endpoint chain. `base` defaults to
+  // the whole list; the work path passes a single explicit base so it keeps
+  // driving its own source order (workBases → public RPC). A read fails over on
+  // any non-authoritative error. A publish fails over ONLY on an explicit
+  // rejection (429) — where the block provably did not land; an ambiguous
+  // transport failure stops here so settleAfterTransportError (which re-checks
+  // the frontier) can decide whether to republish, avoiding a double-submit.
+  async function rpc(body, base = rpcBases, opts = {}) {
+    const bases = Array.isArray(base) ? base : [base];
+    const isPublish = body.action === "process";
+    let lastErr;
+    for (let i = 0; i < bases.length; i++) {
+      try {
+        return await rpcOnce(body, bases[i], opts);
+      } catch (e) {
+        if (e.authoritative) throw e;       // the network answered — don't shop around
+        if (isPublish && !e.rejected) throw e; // ambiguous publish — hand to recovery
+        lastErr = e;
+        if (bases.length > 1 && i < bases.length - 1) {
+          log(`Nano RPC ${body.action} failing over past ${bases[i]} (${e.message})`);
+        }
+      }
+    }
+    throw lastErr;
   }
 
   async function accountState() {
@@ -142,7 +208,10 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
   // With `workKey` set, the dedicated server gets it both as a `key` body field
   // (nano.to style) and a `nodes-api-key` header (Nanswap style).
   async function remoteWork(frontier, threshold) {
-    const workSources = [...workBases.map((b) => ["work server " + b, b]), ["Nano RPC", rpcBase]];
+    const workSources = [
+      ...workBases.map((b) => ["work server " + b, b]),
+      ...rpcBases.map((b) => ["Nano RPC " + b, b]),
+    ];
     for (const [label, base] of workSources) {
       const withKey = workKey && workBases.includes(base);
       try {
@@ -320,7 +389,7 @@ export function createNanoWallet({ secretKey, rpcUrl = DEFAULT_NANO_RPC, workUrl
         // Lost response mid-publish — dead transport or a fronting proxy's
         // HTTP-5xx: the node may already have the block. Verify, republish
         // the identical block if not, and only then give up.
-        if (/unreachable|failed \(HTTP 5\d\d\)/.test(e.message)) {
+        if (/unreachable|failed(?: at \S+)? \(HTTP 5\d\d\)/.test(e.message)) {
           chain = null; // until settled, the frontier is uncertain
           log(`process transport failure (${e.message}) — verifying and republishing`);
           if (await settleAfterTransportError(hash, block)) { /* landed */ }
