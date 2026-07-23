@@ -1492,7 +1492,7 @@ async function readSse(res, onEvent) {
   }
 }
 
-test("streaming hold-open: first call surfaces the pay link, then returns the result once paid — no re-invoke", async () => {
+test("streaming first call returns the quote as a RESULT (never held open on a progress-only pay link)", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
   const gate = makeGate(chain, { registry, pollMs: 5 });
@@ -1503,7 +1503,11 @@ test("streaming hold-open: first call surfaces the pay link, then returns the re
   });
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    // ONE tools/call — no _payment_id — from an SSE client that sends a progressToken.
+    // REGRESSION: an earlier build held a streaming first call open and pushed the
+    // pay link only as a progress notification. Clients that don't render progress
+    // messages (observed live on talking-avatar) then saw NOTHING and the call hung
+    // to timeout — no link, no result. The first call must ALWAYS return the quote
+    // as its tool RESULT, even for a streaming client that sends a progressToken.
     const res = await fetch(`${base}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
@@ -1512,56 +1516,31 @@ test("streaming hold-open: first call surfaces the pay link, then returns the re
         params: { name: "poster", arguments: { Text: "a lighthouse" }, _meta: { progressToken: "p1" } },
       }),
     });
-    assert.match(res.headers.get("content-type"), /text\/event-stream/);
+    const body = await res.text(); // MUST terminate promptly — not hang open
+    const final = body.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6))).find((m) => m.id === 99);
+    const x = final.result.structuredContent.x402;
+    assert.ok(x.paymentId, "the first call returns the payment-required quote as its result");
+    assert.match(final.result.content[0].text, /PAYMENT REQUIRED/, "the pay link is in the RESULT content, not only a progress message");
+    assert.match(final.result.content[0].text, /\/pay\//);
+    assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`);
+    assert.equal(registry.callCount(), 0, "nothing runs on the first call");
 
-    let payLink = null, final = null;
-    await readSse(res, ({ data }) => {
-      if (data.method === "notifications/progress") {
-        const m = data.params.message || "";
-        // the pay link is pushed as a progress update…
-        if (!payLink && /\/pay\//.test(m)) {
-          payLink = m;
-          // …and the moment we've shown it, the human pays the exact tagged amount
-          const raw = m.match(/\((\d+) raw\)/)[1];
-          chain.state.receivable["A".repeat(64)] = { amount: raw, source: PAYER };
-        }
-      } else if (data.id === 99) { final = data; return "stop"; }
-    });
-
-    assert.ok(payLink, "the pay link must be pushed as a progress update");
-    assert.match(payLink, /no need to call again/, "the human is told the call is held open");
-    assert.ok(final, "the same call must return a final response");
-    assert.ok(!final.result.isError, JSON.stringify(final.result));
-    assert.match(final.result.content[0].text, /^ran /, "the tool ran and streamed its result back on the SAME call");
-    assert.match(final.result.content.at(-1).text, /paid .* XNO deposit/, "the receipt rides the held-open result");
-    assert.equal(registry.callCount(), 1, "the tool ran exactly once — with no second tools/call");
-  } finally {
-    server.close();
-  }
-});
-
-test("streaming without a progressToken can't surface a link, so it returns the quote to relay (no silent hold)", async () => {
-  const chain = fakeChain();
-  const registry = fakeRegistry();
-  const gate = makeGate(chain, { registry, pollMs: 5 });
-  const { listTools, callTool } = gate.wrapRegistry(registry);
-  const server = await serveHttp({
-    host: "127.0.0.1", port: 0, name: "t", version: "0",
-    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 40, log: () => {},
-  });
-  const base = `http://127.0.0.1:${server.address().port}`;
-  try {
-    // SSE accepted, but NO progressToken → the gate has no channel to push the link,
-    // so it must fall back to returning PAYMENT REQUIRED (the stream ends promptly).
-    const res = await fetch(`${base}/mcp`, {
+    // The no-re-invoke-AFTER-paying path: the follow-up _payment_id call on a
+    // streaming transport is held open until the payment lands, then runs.
+    chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    const run = await fetch(`${base}/mcp`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "poster", arguments: { Text: "a" } } }),
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId }, _meta: { progressToken: "p2" } },
+      }),
     });
-    const body = await res.text(); // must terminate on its own, not hang open
-    const final = body.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6))).find((m) => m.id === 5);
-    assert.ok(final.result.structuredContent.x402.paymentId, "falls back to the payment-required quote");
-    assert.equal(registry.callCount(), 0, "nothing runs — the caller pays then re-calls with _payment_id");
+    let ran = null;
+    await readSse(run, ({ data }) => { if (data.id === 100) { ran = data; return "stop"; } });
+    assert.ok(!ran.result.isError, JSON.stringify(ran.result));
+    assert.match(ran.result.content[0].text, /^ran /, "the held-open payment call runs and returns the result");
+    assert.equal(registry.callCount(), 1, "the tool ran exactly once");
   } finally {
     server.close();
   }

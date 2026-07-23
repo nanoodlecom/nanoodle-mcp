@@ -361,13 +361,12 @@ async function main() {
     ({ listTools, callTool } = gate.wrapRegistry(registry));
     instructions =
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
-      "Calling a tool announces PAYMENT REQUIRED with a payment link: show that link to your user " +
-      "(it renders a QR code and confirms on-screen when the payment lands, usually within a second). " +
-      "If your client streams (accepts server-sent events on tools/call), the SAME call is held open: " +
-      "the pay link arrives as a progress update and the tool returns the result on its own once the " +
-      "payment lands — you do NOT need to call again. Otherwise, call the same tool again with identical " +
-      "arguments plus the given _payment_id (you may call right away: the call waits for the payment, then " +
-      "runs). Either way progress streams while it works, with the tool's typical runtime. The amount paid is a " +
+      "The first call to a tool returns PAYMENT REQUIRED with a payment link: show that link to your user " +
+      "(it renders a QR code and confirms on-screen when the payment lands, usually within a second). Then " +
+      "call the same tool again with identical arguments plus the given _payment_id — you can call right " +
+      "away, right after showing the link: that call waits for the payment to land, then runs (streaming " +
+      "progress with the tool's typical runtime), so you never have to call a third time after paying. " +
+      "The amount paid is a " +
       "DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the workflow " +
       "author's cut), and the difference is sent back " +
       "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
