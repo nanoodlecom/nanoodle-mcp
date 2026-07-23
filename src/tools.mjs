@@ -16,8 +16,7 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
-import { Workflow, MediaRef, mediaFromFile, decodeShareUrl } from "nanoodle";
-import { estimateGraphCost, graphModelKinds } from "./estimate.mjs"; // vendored from nanoodle@0.7.0 until the dep is bumped
+import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
  * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
