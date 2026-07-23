@@ -276,8 +276,18 @@ on either side. The flow their agent walks through (the server's MCP
    shows its user the link; any Nano wallet scans it.
 2. The page flips to a green check the moment the payment lands (about a
    second — the gate watches the chain by RPC polling, or push via
-   `--nano-ws`). The user tells their agent; the agent re-calls the tool with
-   the same arguments plus the `_payment_id` from step 1.
+   `--nano-ws`).
+   - **Streaming clients don't re-call.** If the agent's client accepts
+     server-sent events on `tools/call` (Claude Code, Cursor, …), the *same*
+     call is **held open**: the pay link arrives as a progress update and the
+     tool returns the result on its own once the payment settles. No second
+     call, nothing to do after paying. (The pay page and any HTTP client can
+     also subscribe to `GET /x402/watch/<id>` — one SSE `status` event per state
+     change — or poll `GET /x402/status/<id>?wait=1`.)
+   - **Non-streaming clients re-call.** The user tells their agent they paid;
+     the agent re-calls the tool with the same arguments plus the
+     `_payment_id` from step 1 (it may call immediately — the call waits for
+     the payment, then runs).
 3. The run executes and the result streams back with a receipt. **What they
    paid is a deposit, not the price**: the call settles at the run's *actual*
    metered model cost + 20%, and everything above that is sent back to the

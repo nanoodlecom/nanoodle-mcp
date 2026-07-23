@@ -1412,3 +1412,167 @@ test("the payment quote's QR is a spec-correct nano: URI carrying the exact amou
   // And it scans: the served SVG decodes byte-for-byte back to that URI.
   assert.equal(qrDecode(svgToMatrix(qrSvg(x.uri))), x.uri);
 });
+
+/* ---- streaming hold-open + SSE payment watch (no re-invoke after paying) ---- */
+
+/** Read an SSE response frame by frame, calling onEvent({event,data}) until it returns "stop" or the stream ends. */
+async function readSse(res, onEvent) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+      const evLine = frame.split("\n").find((l) => l.startsWith("event: "));
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
+      if (!dataLine) continue;
+      if (onEvent({ event: evLine ? evLine.slice(7) : "message", data: JSON.parse(dataLine.slice(6)) }) === "stop") {
+        try { await reader.cancel(); } catch {}
+        return;
+      }
+    }
+  }
+}
+
+test("streaming hold-open: first call surfaces the pay link, then returns the result once paid — no re-invoke", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 40, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    // ONE tools/call — no _payment_id — from an SSE client that sends a progressToken.
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 99, method: "tools/call",
+        params: { name: "poster", arguments: { Text: "a lighthouse" }, _meta: { progressToken: "p1" } },
+      }),
+    });
+    assert.match(res.headers.get("content-type"), /text\/event-stream/);
+
+    let payLink = null, final = null;
+    await readSse(res, ({ data }) => {
+      if (data.method === "notifications/progress") {
+        const m = data.params.message || "";
+        // the pay link is pushed as a progress update…
+        if (!payLink && /\/pay\//.test(m)) {
+          payLink = m;
+          // …and the moment we've shown it, the human pays the exact tagged amount
+          const raw = m.match(/\((\d+) raw\)/)[1];
+          chain.state.receivable["A".repeat(64)] = { amount: raw, source: PAYER };
+        }
+      } else if (data.id === 99) { final = data; return "stop"; }
+    });
+
+    assert.ok(payLink, "the pay link must be pushed as a progress update");
+    assert.match(payLink, /no need to call again/, "the human is told the call is held open");
+    assert.ok(final, "the same call must return a final response");
+    assert.ok(!final.result.isError, JSON.stringify(final.result));
+    assert.match(final.result.content[0].text, /^ran /, "the tool ran and streamed its result back on the SAME call");
+    assert.match(final.result.content.at(-1).text, /paid .* XNO deposit/, "the receipt rides the held-open result");
+    assert.equal(registry.callCount(), 1, "the tool ran exactly once — with no second tools/call");
+  } finally {
+    server.close();
+  }
+});
+
+test("streaming without a progressToken can't surface a link, so it returns the quote to relay (no silent hold)", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 40, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    // SSE accepted, but NO progressToken → the gate has no channel to push the link,
+    // so it must fall back to returning PAYMENT REQUIRED (the stream ends promptly).
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "poster", arguments: { Text: "a" } } }),
+    });
+    const body = await res.text(); // must terminate on its own, not hang open
+    const final = body.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6))).find((m) => m.id === 5);
+    assert.ok(final.result.structuredContent.x402.paymentId, "falls back to the payment-required quote");
+    assert.equal(registry.callCount(), 0, "nothing runs — the caller pays then re-calls with _payment_id");
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /x402/watch/:id streams status: pending, then paid when the payment lands", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 40, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "the quote advertises its watch endpoint");
+
+    const res = await fetch(`${base}/x402/watch/${x.paymentId}`, { headers: { Accept: "text/event-stream" } });
+    assert.match(res.headers.get("content-type"), /text\/event-stream/);
+
+    const seen = [];
+    await readSse(res, ({ event, data }) => {
+      if (event !== "status") return;
+      seen.push(data.status);
+      if (data.status === "pending") {
+        // pay after the first pending frame; the shared watcher pushes the next frame
+        chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+      } else {
+        return "stop"; // paid/consumed → the stream closes
+      }
+    });
+    assert.equal(seen[0], "pending");
+    assert.ok(seen.some((s) => s === "paid" || s === "consumed"), `expected a paid frame, got ${JSON.stringify(seen)}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("the held-connection cap degrades a streaming call to plain JSON instead of refusing it", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", maxStreams: 0, progressMs: 40, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    // maxStreams:0 forces the cap. A streaming tools/call must still get a correct
+    // (plain JSON) answer — the payment-required quote — not an error or a hang.
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "poster", arguments: { Text: "a" }, _meta: { progressToken: "z" } } }),
+    });
+    assert.match(res.headers.get("content-type"), /application\/json/, "over the cap, the call is answered as plain JSON");
+    const j = await res.json();
+    assert.ok(j.result.structuredContent.x402.paymentId);
+    // and the watch endpoint 503s so the pay page falls back to polling
+    const w = await fetch(`${base}/x402/watch/${j.result.structuredContent.x402.paymentId}`);
+    assert.equal(w.status, 503);
+  } finally {
+    server.close();
+  }
+});

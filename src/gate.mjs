@@ -625,12 +625,19 @@ export function createChargeGate({
   /* ---------------- MCP-facing results ---------------- */
 
   const payUrl = (q) => `${publicBase}/pay/${q.id}`;
+  const watchUrl = (q) => `${publicBase}/x402/watch/${q.id}`;
   const nanoUri = (q) => `nano:${address}?amount=${q.amountRaw}`;
 
   function paymentRequiredResult(q) {
     const x402 = {
       paymentId: q.id,
       payUrl: payUrl(q),
+      // An SSE endpoint that emits one `status` event per state change and closes
+      // when the payment lands (or the quote dies) — a browser/HTTP client can
+      // subscribe instead of polling. An MCP agent can't consume it directly, but
+      // on a streaming tools/call the gate already holds THIS call open through
+      // payment (no re-invoke); the URL is here for the pay page and other clients.
+      watchUrl: watchUrl(q),
       uri: nanoUri(q),
       address,
       amountRaw: q.amountRaw,
@@ -655,6 +662,24 @@ export function createChargeGate({
       `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"} (${x402.expiresAt}). ` +
       `If the run fails after payment, the payment is refunded automatically.`;
     return { content: [{ type: "text", text }], structuredContent: { x402 } };
+  }
+
+  /*
+   * The progress line pushed when a streaming call holds itself open through
+   * payment (see callTool). It's the human-facing message the agent surfaces
+   * live: the pay link, and the promise that the result returns on its own —
+   * no second call. The paymentId is still named so that if the stream dies
+   * before the payment lands, re-invoking with _payment_id is a clean fallback.
+   */
+  function holdAnnounceText(q) {
+    const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
+    return `PAYMENT REQUIRED — ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed.\n` +
+      `Show your user this link — it renders a QR to scan with any Nano wallet and turns into a green check the instant the payment lands:\n` +
+      `  ${payUrl(q)}\n` +
+      `I'm holding this call open and will return the result automatically once the payment lands (settlement takes about a second)` +
+      (q.etaMs ? `, then finish the run in ~${fmtDur(q.etaMs)}` : "") + ` — nothing else to do, no need to call again.\n` +
+      `Paying without the page: send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} (URI: ${nanoUri(q)}). ` +
+      `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"}; if it lapses, call again with "_payment_id": "${q.id}".`;
   }
 
   const errResult = (text) => ({ content: [{ type: "text", text }], isError: true });
@@ -851,11 +876,12 @@ export function createChargeGate({
         const argsHash = hashArgs(name, args);
         const price = priceFor(name);
 
+        let q;
         if (_payment_id == null) {
           // Never charge for a call that couldn't run: unknown tool / bad args throw here, pre-quote.
           if (validate) await validate({ name, arguments: args });
           const pair = await ratePair();
-          const q = {
+          q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,
             pair, // settle math must use the exact pair the deposit was priced at
@@ -868,23 +894,33 @@ export function createChargeGate({
           persist();
           ensureWatching();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
-          return paymentRequiredResult(q);
+          // Hold-open: a streaming client that can show progress doesn't get the
+          // quote as a result to relay and re-call — it gets the pay link pushed
+          // as a progress line NOW, and this same call stays open, waits out the
+          // payment, and returns the run's result. One call, no re-invoke after
+          // paying. ctx.announce returns false when the transport can't actually
+          // surface the link (no progress channel) — then fall back to returning
+          // the quote so the agent relays it and calls again with _payment_id.
+          const held = ctx && ctx.streaming && typeof ctx.announce === "function" && ctx.announce(holdAnnounceText(q));
+          if (!held) return paymentRequiredResult(q);
+          // fall through with the fresh pending quote → wait, then run
+        } else {
+          q = quotes.get(String(_payment_id));
+          if (!q) {
+            return errResult(`unknown or expired payment id "${_payment_id}" — call the tool again without _payment_id for a fresh quote.`);
+          }
+          if (q.tool !== name || q.argsHash !== argsHash) {
+            return errResult(`payment ${q.id} was issued for a different call (tool/arguments changed) — ` +
+              `call again without _payment_id to get a quote for these arguments.`);
+          }
+          if (q.status === "refunded") {
+            return errResult(`payment ${q.id} was refunded${q.source ? ` to ${q.source}` : ""} — call again without _payment_id to retry.`);
+          }
+          if (q.status === "expired") {
+            return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
+          }
         }
 
-        const q = quotes.get(String(_payment_id));
-        if (!q) {
-          return errResult(`unknown or expired payment id "${_payment_id}" — call the tool again without _payment_id for a fresh quote.`);
-        }
-        if (q.tool !== name || q.argsHash !== argsHash) {
-          return errResult(`payment ${q.id} was issued for a different call (tool/arguments changed) — ` +
-            `call again without _payment_id to get a quote for these arguments.`);
-        }
-        if (q.status === "refunded") {
-          return errResult(`payment ${q.id} was refunded${q.source ? ` to ${q.source}` : ""} — call again without _payment_id to retry.`);
-        }
-        if (q.status === "expired") {
-          return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
-        }
         if (q.status === "pending") {
           // Streaming callers can afford to wait out the quote — heartbeats keep
           // their tool timeout at bay. Plain-JSON callers get one short wait, so
