@@ -163,6 +163,59 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   assert.equal(typeof paidEvent.settleMs, "number");
 });
 
+test("quote tracks the up-front cost forecast, not a flat deposit — and covers the real cost", async () => {
+  const chain = fakeChain();
+  // A pricey graph forecast at $0.20/run (inexact — e.g. a video). Deposit = ceil(0.20 × 1.2 × 2) = $0.48.
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.20 }) });
+  registry.estimates = { poster: { usd: 0.20, exact: false, priced: 1, unpriced: 0 } };
+  const { listTools, callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+
+  assert.match(listTools()[0].description, /\$0\.48 deposit per call/);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  assert.equal(x.amountUsd, 0.48);   // NOT the flat $0.05
+
+  chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!res.isError);
+  await new Promise((r) => setTimeout(r, 50));
+  // the real $0.20 cost is fully covered by the deposit → operator keeps cost+markup, payer gets change.
+  // (At flat $0.05 this run would have overrun the deposit and the operator would eat $0.15.)
+  const deposit = BigInt(x.amountRaw), costRaw = 20n * 10n ** 28n; // $0.20 at $1/XNO
+  const change = chain.state.transfers.find((t) => t.describe === "change:");
+  assert.ok(change, "change is returned — deposit exceeded the cost");
+  assert.equal(BigInt(change.amountRaw), deposit - costRaw - costRaw / 5n);
+});
+
+test("exact (all-image) forecast quotes a tight deposit; observed cost overrides a low estimate", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  // deterministic image forecast $0.04 → ceil(0.04 × 1.2 × 1.25) = $0.06 (tighter than the variance multiplier)
+  registry.estimates = { poster: { usd: 0.04, exact: true, priced: 1, unpriced: 0 } };
+  let g = makeGate(chain, { registry }).wrapRegistry(registry);
+  assert.match(g.listTools()[0].description, /\$0\.06 deposit per call/);
+
+  // reality beats the forecast: a metered $0.10 high-water mark pushes the deposit up (variance multiplier applies)
+  registry.costs = { poster: { usd: 0.10, exact: true } };
+  g = makeGate(chain, { registry }).wrapRegistry(registry);
+  assert.match(g.listTools()[0].description, /\$0\.24 deposit per call/);  // ceil(0.10 × 1.2 × 2)
+});
+
+test("a forecast with unpriceable nodes never quotes below the opening deposit", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  // only $0.01 could be priced but a node is uncatalogued → lower bound; floor to the $0.05 opening deposit
+  registry.estimates = { poster: { usd: 0.01, exact: false, priced: 1, unpriced: 1 } };
+  const { listTools } = makeGate(chain, { registry, usd: 0.05 }).wrapRegistry(registry);
+  assert.match(listTools()[0].description, /\$0\.05 deposit per call/);
+});
+
+test("no forecast and never run → the flat opening deposit (unchanged behavior)", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const { listTools } = makeGate(chain, { registry, usd: 0.05 }).wrapRegistry(registry);
+  assert.match(listTools()[0].description, /\$0\.05 deposit per call/);
+});
+
 test("payment id is bound to the exact arguments", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
@@ -461,7 +514,8 @@ test("payment-required text carries the tool's typical runtime when known", asyn
   const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
   const quote = await callTool({ name: "poster", arguments: { Text: "a" } });
   assert.match(quote.content[0].text, /typically finishes in ~15s/);
-  assert.match(quote.content[0].text, /send exactly 0\.05\d* XNO/);
+  // $0.03 observed → deposit ceil(0.03 × 1.2 × 2) = $0.08 (tracks cost, no longer capped at the opening deposit)
+  assert.match(quote.content[0].text, /send exactly 0\.08\d* XNO/);
 });
 
 test("gate state survives a restart: pending quote pays and settles under the reloaded gate", async () => {
@@ -1019,7 +1073,7 @@ test("deposits track observed cost: cheap tools quote small deposits, live", asy
   assert.equal(argOf(await callTool({ name: "poster", arguments: { Text: "b" } })).amountUsd, 0.04); // ceil($0.036)
 });
 
-test("deposit derivation: high-water mark, inexact costs, ceiling, pinned x402.usd", async () => {
+test("deposit derivation: high-water mark, inexact costs, tracks-not-caps, pinned x402.usd", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
   const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
@@ -1027,12 +1081,12 @@ test("deposit derivation: high-water mark, inexact costs, ceiling, pinned x402.u
   // the worst run on record prices the deposit, not the (cheaper) last one
   registry.costs = { poster: { usd: 0.002, hiUsd: 0.012 } };
   assert.equal(await quoteUsd("a"), 0.03); // ceil(0.012 · 2.4) → $0.03
-  // a lower-bound cost (exact:false) can't cap a deposit → flat default
+  // a lower-bound cost (exact:false) can't be trusted as a basis → flat opening deposit
   registry.costs = { poster: { usd: 0.001, exact: false } };
   assert.equal(await quoteUsd("b"), 0.05);
-  // a cost above the ceiling still quotes the ceiling (startup warning covers this)
+  // a cost ABOVE the opening deposit now quotes what it actually costs — the deposit is no longer capped
   registry.costs = { poster: { usd: 0.2 } };
-  assert.equal(await quoteUsd("c"), 0.05);
+  assert.equal(await quoteUsd("c"), 0.48); // ceil(0.2 · 2.4)
   // a pinned per-graph price ignores observed costs entirely
   const pinnedReg = fakeRegistry();
   pinnedReg.tools[0].x402 = { usd: 0.10 };

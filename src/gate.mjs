@@ -107,8 +107,9 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
  * @param {object} opts
  * @param {string} opts.address           Nano address payments arrive at (the wallet account)
  * @param {object} opts.ops               wallet ops ({ rpc, transfer, pocket }) — refunds + chain RPC
- * @param {number} opts.usd               ceiling deposit per call — tools with a known metered
- *                                        cost quote 2× their observed cost + 20% instead
+ * @param {number} opts.usd               cold-start deposit per call — tools with a forecast
+ *                                        (registry.estimates) or a known metered cost quote off
+ *                                        that instead (see priceFor); this is the fallback, not a cap
  * @param {(params) => Promise<void>} [opts.validate]  registry arg validation — quotes are only
  *                                        issued for calls that would actually run (never charge for a typo)
  * @param {number|null} [opts.xnoUsd]     static XNO/USD rate override; null (default) → NanoGPT's own
@@ -725,24 +726,43 @@ export function createChargeGate({
         return [t.name, Number.isFinite(v) && v > 0 ? v : null];
       }));
       /**
-       * Deposit for a tool as of right now. A graph's own x402.usd is pinned and
-       * always wins. Otherwise, once the tool's metered cost is known
-       * (registry.costs is live — every run that reports a cost updates it),
-       * the deposit is twice the settle price (cost + 20%), against the worst
-       * run on record, ceiled to a whole cent with a 1¢ floor. The flat
-       * --charge-usd is only a ceiling, and the opening quote for a tool that
-       * has never run. A cost that was a lower bound (exact:false) can't be
-       * trusted to cap a deposit, so it keeps the default too.
+       * Deposit for a tool as of right now. The deposit is a HOLD, not the price:
+       * the run settles at its true metered cost + 20% and the rest comes back as
+       * change, so a deposit only needs to be big enough to cover the call — never
+       * exact. It must, though, actually cover it: a deposit below cost + 20% means
+       * the operator eats the difference (see settle()).
+       *
+       * Precedence:
+       *   1. A graph's own x402.usd is pinned and always wins.
+       *   2. Otherwise quote off the largest of two cost signals — an UP-FRONT
+       *      catalog forecast (registry.estimates, valid before the tool has ever
+       *      run) and the worst metered cost actually seen (registry.costs, a live
+       *      high-water mark) — times a safety multiplier for run-to-run variance:
+       *      1.25× when the cost is deterministic (image only), 2× otherwise.
+       *   3. With no signal at all (never run, uncatalogued), fall back to the flat
+       *      --charge-usd opening deposit.
+       *
+       * --charge-usd is the cold-start deposit, NOT a ceiling: expensive graphs
+       * quote what they actually cost (change still returns the slack), so the
+       * operator stops absorbing overages on video / multi-step tools.
        */
       const priceFor = (name) => {
         const pin = pinned.get(name);
         if (pin) return pin;
         const rec = registry.costs && registry.costs[name];
-        const hi = rec && rec.exact !== false
+        const obsHi = rec && rec.exact !== false
           ? Math.max(Number.isFinite(rec.usd) ? rec.usd : 0, Number.isFinite(rec.hiUsd) ? rec.hiUsd : 0)
           : 0;
-        if (!(hi > 0)) return usd;
-        return Math.min(usd, Math.max(0.01, Math.ceil(hi * 1.2 * 2 * 100) / 100));
+        const est = registry.estimates && registry.estimates[name];
+        const estUsd = est && Number.isFinite(est.usd) ? est.usd : 0;
+        const basis = Math.max(estUsd, obsHi);
+        if (!(basis > 0)) return usd; // nothing to price off yet → flat opening deposit
+        // deterministic (all-image forecast, and reality hasn't exceeded it) → tight hold; else headroom for variance
+        const exact = !!(est && est.exact && est.unpriced === 0) && obsHi <= estUsd;
+        let dep = Math.max(0.01, Math.ceil(basis * 1.2 * (exact ? 1.25 : 2) * 100) / 100);
+        // a forecast with unpriceable nodes is a lower bound — never quote below the opening deposit
+        if (est && est.unpriced > 0 && dep < usd) dep = usd;
+        return dep;
       };
       // Under-deposited graphs cost the operator money every call — say so up front.
       for (const t of registry.tools) {
