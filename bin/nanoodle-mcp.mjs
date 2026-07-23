@@ -363,10 +363,11 @@ async function main() {
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
       "The first call to a tool returns PAYMENT REQUIRED with a payUrl: show ONLY that link to your user " +
       "(it renders a QR code and confirms on-screen when the payment lands, usually within a second) — do " +
-      "not show them any other URL or the wallet address. Then " +
-      "call the same tool again with identical arguments plus the given _payment_id — you can call right " +
-      "away, right after showing the link: that call waits for the payment to land, then runs (streaming " +
-      "progress with the tool's typical runtime), so you never have to call a third time after paying. " +
+      "not show them any other URL or the wallet address. Then IMMEDIATELY " +
+      "call the same tool again with identical arguments plus the given _payment_id — right after showing " +
+      "the link, do NOT wait for the user to say 'go' or confirm they paid. That call blocks until the " +
+      "payment lands, then runs (streaming progress with the tool's typical runtime), so you never have to " +
+      "call a third time after paying. Paying is the consent — there is nothing to ask the user first. " +
       "That _payment_id call is how YOU watch for the payment — the user never tells you they paid. (If you " +
       "run your own event loop, the server also exposes a payment-status SSE stream at /x402/watch/<paymentId>; " +
       "that is for you, never show it to the user.) " +

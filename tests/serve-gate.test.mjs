@@ -128,6 +128,11 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   assert.match(quoteRes.content[0].text, new RegExp(x.paymentId));
   assert.equal(x.payUrl, `http://pay.test/pay/${x.paymentId}`);
   assert.equal(x.address, GATE_ADDR);
+  // machine-readable "proceed now" hints so an agent re-calls instead of pausing for a human "go"
+  assert.equal(x.blocking, true, "the result flags that the _payment_id call blocks");
+  assert.match(x.next, /_payment_id/, "the next-step imperative names the follow-up call");
+  assert.match(x.next, /do not wait for a human "go"/i);
+  assert.match(x.next, new RegExp(x.paymentId), "the next imperative carries this payment id");
   // $0.05 at $1/XNO ≈ 0.05 XNO plus a sub-cent tag, in whole 1e-8 XNO steps
   assert.ok(BigInt(x.amountRaw) >= 5n * 10n ** 28n && BigInt(x.amountRaw) < 5n * 10n ** 28n + 10n ** 26n);
   assert.equal(BigInt(x.amountRaw) % GRAIN, 0n, "amount must be exactly typeable at 8 decimals");
