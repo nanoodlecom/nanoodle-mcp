@@ -674,19 +674,51 @@ export function createChargeGate({
 
   /* ---------------- public surface ---------------- */
 
+  /**
+   * Terminal-state instructions for an agent watching this quote settle
+   * (/x402/watch SSE or /x402/status poll). Pending quotes have no `next` —
+   * the stream is still open. Once settled, the watch SSE closes with these
+   * instructions so the agent knows how to open the result stream (tools/call
+   * with _payment_id) rather than sitting on a bare "paid" with no next step.
+   */
+  function nextFor(q) {
+    if (!q || q.status === "pending") return undefined;
+    if (q.status === "paid" || q.status === "consumed") {
+      return `Payment received. Close this watch stream and call the SAME tool again with identical arguments plus "_payment_id": "${q.id}". ` +
+        `That tools/call is the result stream: it runs the workflow (with progress heartbeats on a streaming transport) and returns the result. ` +
+        `If you already have a tools/call open with this _payment_id, it will proceed on its own — leave it open and do not cancel it.`;
+    }
+    if (q.status === "expired") {
+      return `Quote expired unpaid — call the tool again without _payment_id for a fresh quote.`;
+    }
+    if (q.status === "refunded") {
+      return `Payment was refunded${q.source ? ` to ${q.source}` : ""} — call the tool again without _payment_id to retry.`;
+    }
+    return undefined;
+  }
+
   const gate = {
     address,
 
-    /** Quote/pay state for the HTTP pay page + status endpoint. */
+    /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
       const q = quotes.get(String(id));
       if (!q) return null;
       prune();
-      return {
+      const out = {
         id: q.id, tool: q.tool, status: q.status, usd: q.usd,
         amountRaw: q.amountRaw, amountXno: rawToXno(q.amountRaw),
         address, uri: nanoUri(q), expiresAt: new Date(q.expiresAt).toISOString(),
       };
+      // Terminal states close the watch SSE — package the next-step so an agent
+      // (or any event-loop subscriber) does not sit on a bare "paid" with no path
+      // to the result stream.
+      if (q.status !== "pending") {
+        out.done = true;
+        const next = nextFor(q);
+        if (next) out.next = next;
+      }
+      return out;
     },
 
     /** Resolve when the quote leaves `pending` (paid/expired), or after ms. Returns the status. */
@@ -928,11 +960,19 @@ export function createChargeGate({
           }
         }
 
+        // Prefer announce (immediate progress event) over report (next heartbeat
+        // only) so payment wait → paid is not a silent loading gap. announce falls
+        // back to report when the transport has no progressToken.
+        const note = (s) => {
+          if (ctx && typeof ctx.announce === "function") ctx.announce(s);
+          else if (ctx && typeof ctx.report === "function") ctx.report(s);
+        };
+
         if (q.status === "pending") {
           // Streaming callers can afford to wait out the quote — heartbeats keep
           // their tool timeout at bay. Plain-JSON callers get one short wait, so
           // OUR "not arrived yet" message always beats their client-side timeout.
-          if (ctx && ctx.report) ctx.report(`waiting for the ${rawToXno(q.amountRaw)} XNO payment to land`);
+          note(`waiting for the ${rawToXno(q.amountRaw)} XNO payment to land`);
           const budget = ctx && ctx.streaming ? Math.max(waitMs, q.expiresAt - now()) : waitMs;
           const st = await gate.waitForPayment(q.id, budget);
           if (st === "pending") {
@@ -943,7 +983,7 @@ export function createChargeGate({
             return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
           }
         }
-        if (ctx && ctx.report) ctx.report(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
+        note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
         // paid (or consumed): run exactly once, replay the cached outcome afterwards
         if (!q.running) {
           q.status = "consumed";

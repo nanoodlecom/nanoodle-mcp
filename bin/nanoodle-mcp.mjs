@@ -372,8 +372,9 @@ async function main() {
       "payment lands, then runs (streaming progress with the tool's typical runtime), so you never have to " +
       "call a third time after paying. Paying is the consent — there is nothing to ask the user first. " +
       "That _payment_id call is how YOU watch for the payment — the user never tells you they paid. (If you " +
-      "run your own event loop, the server also exposes a payment-status SSE stream at /x402/watch/<paymentId>; " +
-      "that is for you, never show it to the user.) " +
+      "run your own event loop, the server also exposes a payment-status SSE stream at /x402/watch/<paymentId> — " +
+      "for you, never show it to the user. When payment lands that stream CLOSES with done:true and a next field " +
+      "telling you how to open the result stream: call the same tool again with the _payment_id.) " +
       "The amount paid is a " +
       "DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the workflow " +
       "author's cut), and the difference is sent back " +

@@ -306,7 +306,9 @@ on either side. The flow their agent walks through (the server's MCP
    …) that call is **held open** — it waits for the payment to land, then runs —
    so there's no third call after paying. (The pay page, and any HTTP client,
    can also subscribe to `GET /x402/watch/<id>` — one SSE `status` event per
-   state change — or poll `GET /x402/status/<id>?wait=1`.)
+   state change; when payment lands the stream **closes** with `done: true` and
+   a `next` field telling the agent how to open the result stream (re-call with
+   `_payment_id`) — or poll `GET /x402/status/<id>?wait=1` for the same fields.)
 3. The run executes and the result streams back with a receipt. **What they
    paid is a deposit, not the price**: the call settles at the run's *actual*
    metered model cost + 20%, and everything above that is sent back to the
