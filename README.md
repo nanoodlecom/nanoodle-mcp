@@ -295,26 +295,27 @@ Now every tool call is paid in Nano (XNO) **by the caller**, with no accounts
 on either side. The flow their agent walks through (the server's MCP
 `instructions` teach it automatically):
 
-1. First `tools/call` returns **PAYMENT REQUIRED** with a `payUrl` — a
-   self-contained pay page showing a QR code for the exact amount. The agent
-   shows its user the link; any Nano wallet scans it.
-2. The page flips to a green check the moment the payment lands (about a
-   second — the gate watches the chain by RPC polling, or push via
-   `--nano-ws`). The agent re-calls the tool with the same arguments plus the
-   `_payment_id` from step 1. It can call **right after showing the link**, not
-   only after the user confirms: on a streaming transport (Claude Code, Cursor,
-   …) that call is **held open** — it waits for the payment to land, then runs —
-   so there's no third call after paying. (The pay page, and any HTTP client,
-   can also subscribe to `GET /x402/watch/<id>` — one SSE `status` event per
-   state change; when payment lands the stream **closes** with `done: true` and
-   a `next` field telling the agent how to open the result stream (re-call with
-   `_payment_id`) — or poll `GET /x402/status/<id>?wait=1` for the same fields.)
-3. The run executes and the result streams back with a receipt. **What they
-   paid is a deposit, not the price**: the call settles at the run's *actual*
-   metered model cost + 20%, and everything above that is sent back to the
-   paying wallet as change — the same deposit→meter→refund model NanoGPT
-   itself uses, one layer up. Nobody ever pays off an estimate. Re-calls with
-   the same `_payment_id` replay the cached result free.
+Three sequential phases — never in parallel (the quote's `phases`, `watchUrl`,
+and `next` spell this out; `blocking` is false):
+
+1. **Pay.** First `tools/call` returns **PAYMENT REQUIRED** with a `payUrl` and
+   **hangs up**. The agent shows its user ONLY that link (QR for the exact
+   amount); any Nano wallet scans it.
+2. **Watch.** The agent opens `GET /x402/watch/<id>` (agent-only SSE — never
+   show the user). One `status` event per state change; when payment lands the
+   stream **closes** with `done: true` and a `next` field for phase 3. (The pay
+   page uses the same stream; poll `GET /x402/status/<id>?wait=1` as a fallback.)
+   Detection is RPC polling or push via `--nano-ws` — about a second.
+3. **Results.** ONLY after the watch closes paid: re-call the tool with the same
+   arguments plus `_payment_id`. That `tools/call` is the **results stream** —
+   it runs the workflow (progress heartbeats on a streaming transport) and
+   returns the result with a receipt. Do not open it while payment is still
+   pending. Re-calls with the same `_payment_id` replay the cached result free.
+
+**What they paid is a deposit, not the price**: the call settles at the run's
+*actual* metered model cost + 20%, and everything above that is sent back to the
+paying wallet as change — the same deposit→meter→refund model NanoGPT itself
+uses, one layer up. Nobody ever pays off an estimate.
 
 Nano has no payment memo, so each quote's amount carries a few raw of random
 dust — **the amount is the memo**. Quotes expire after 15 minutes; a payment

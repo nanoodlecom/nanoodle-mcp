@@ -7,10 +7,11 @@
  *                        createDispatcher() that powers stdio handles everything.
  *                        tools/call from an SSE-capable client answers as an
  *                        event stream with progress heartbeats — generations
- *                        and payment waits outlive client tool timeouts. On a paid
- *                        server the first call returns the payment-required quote;
- *                        the follow-up _payment_id call is what's held open through
- *                        payment (so the caller never re-invokes AFTER paying).
+ *                        outlive client tool timeouts. On a paid server the flow is
+ *                        three sequential SSE phases (never parallel): (1) tools/call
+ *                        returns the payment-required quote and hangs up; (2) agent
+ *                        opens GET /x402/watch/:id until paid closes it; (3) tools/call
+ *                        with _payment_id is the RESULTS stream only.
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
  *                        flows, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
@@ -355,9 +356,11 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     lines.push(
       `## Payment (x402, Nano/XNO)`,
       ``,
-      `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a payUrl (${publicBase}/pay/<id>). Show the user ONLY the payUrl.`,
-      `- Send exactly the quoted amount (the amount identifies the payment), then IMMEDIATELY call again with the returned _payment_id — right after showing the link, do not wait for the user to say "go". On a streaming transport (Accept: text/event-stream) that call blocks (held open with heartbeats) until the payment lands, then runs. Paying is the consent; the result object carries "blocking":true and a "next" imperative saying exactly this. That call is how you watch for the payment.`,
-      `- Agent-only (never show the user): to watch a payment settle yourself, subscribe to the SSE stream ${publicBase}/x402/watch/<id> (one status event per state change). When payment lands the stream CLOSES with status "paid", done:true, and a "next" field telling you how to open the result stream — call the same tool again with _payment_id (that tools/call streams the run). Or poll ${publicBase}/x402/status/<id>?wait=1 (same terminal fields).`,
+      `- No accounts, no API keys. Three sequential phases — never in parallel:`,
+      `  1. tools/call → PAYMENT REQUIRED with payUrl (${publicBase}/pay/<id>). Show the user ONLY the payUrl. This call HANGS UP.`,
+      `  2. Agent-only: open SSE ${publicBase}/x402/watch/<id> (never show the user). Wait until it CLOSES with status "paid", done:true, and next. (Or poll ${publicBase}/x402/status/<id>?wait=1.)`,
+      `  3. ONLY THEN tools/call again with _payment_id — that is the RESULTS stream (progress heartbeats, then the result). Do not open it while payment is still pending.`,
+      `- Paying is the consent; do not wait for a human "go". The quote object carries phases, watchUrl, and a next imperative spelling this out (blocking:false).`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
       `- The 20% is the workflow author's cut, not a platform fee.`,
       ``,

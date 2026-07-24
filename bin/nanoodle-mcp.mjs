@@ -364,22 +364,17 @@ async function main() {
     ({ listTools, callTool } = gate.wrapRegistry(registry));
     instructions =
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
-      "The first call to a tool returns PAYMENT REQUIRED with a payUrl: show ONLY that link to your user " +
-      "(it renders a QR code and confirms on-screen when the payment lands, usually within a second) — do " +
-      "not show them any other URL or the wallet address. Then IMMEDIATELY " +
-      "call the same tool again with identical arguments plus the given _payment_id — right after showing " +
-      "the link, do NOT wait for the user to say 'go' or confirm they paid. That call blocks until the " +
-      "payment lands, then runs (streaming progress with the tool's typical runtime), so you never have to " +
-      "call a third time after paying. Paying is the consent — there is nothing to ask the user first. " +
-      "That _payment_id call is how YOU watch for the payment — the user never tells you they paid. (If you " +
-      "run your own event loop, the server also exposes a payment-status SSE stream at /x402/watch/<paymentId> — " +
-      "for you, never show it to the user. When payment lands that stream CLOSES with done:true and a next field " +
-      "telling you how to open the result stream: call the same tool again with the _payment_id.) " +
-      "The amount paid is a " +
-      "DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the workflow " +
-      "author's cut), and the difference is sent back " +
-      "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
-      "payment, the whole payment is refunded automatically.";
+      "THREE SEQUENTIAL PHASES — never in parallel: " +
+      "(1) tools/call returns PAYMENT REQUIRED with a payUrl and HANGS UP. Show ONLY that payUrl to your user " +
+      "(QR code; confirms on-screen when paid, usually within a second) — never show them the watch URL or wallet address. " +
+      "(2) YOU open the payment-monitor SSE at structuredContent.x402.watchUrl (GET /x402/watch/<paymentId>) — " +
+      "agent-only, never show it to the user. Wait until that stream CLOSES with status paid, done:true, and a next field. " +
+      "(3) ONLY THEN call the same tool again with identical arguments plus _payment_id — that tools/call is the " +
+      "RESULTS stream (progress heartbeats, then the result). Do not open the results call while payment is still pending, " +
+      "and do not hold a tools/call open to wait for payment. Paying is the consent — nothing to ask the user. " +
+      "The amount paid is a DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the " +
+      "workflow author's cut), and the difference is sent back to the paying wallet as change after the run. " +
+      "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically.";
   } else {
     // Free serve mode writes NO usage.jsonl — no money moves, so there is no
     // payments ledger, and we deliberately don't log run telemetry either
