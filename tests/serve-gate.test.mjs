@@ -132,13 +132,14 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   assert.equal(x.blocking, false, "results tools/call must not block on payment — watch does that");
   assert.deepEqual(x.phases, ["pay", "watch", "results"]);
   assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "agent gets watchUrl for phase 2");
-  assert.match(x.next, /THREE PHASES/i, "next spells out sequential phases");
+  assert.match(x.next, /IMMEDIATELY open/i, "next tells the agent to open the watch URL on the payment link");
+  assert.match(x.next, new RegExp(x.watchUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "next carries the concrete watch URL");
   assert.match(x.next, /_payment_id/, "phase 3 is tools/call + _payment_id");
-  assert.match(x.next, /watch/i);
-  assert.match(x.next, /do not (run them in parallel|open the results call before)/i);
   assert.match(x.next, new RegExp(x.paymentId), "the next imperative carries this payment id");
-  // human-facing text: payUrl only — watch URL stays out of the relayed prose
-  assert.doesNotMatch(quoteRes.content[0].text, /x402\/watch/);
+  // human-facing text names the watch URL with an agent-only / never-show guard
+  assert.match(quoteRes.content[0].text, /IMMEDIATELY open and watch/i);
+  assert.match(quoteRes.content[0].text, new RegExp(x.watchUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(quoteRes.content[0].text, /NEVER show this URL to the user/i);
   // $0.05 at $1/XNO ≈ 0.05 XNO plus a sub-cent tag, in whole 1e-8 XNO steps
   assert.ok(BigInt(x.amountRaw) >= 5n * 10n ** 28n && BigInt(x.amountRaw) < 5n * 10n ** 28n + 10n ** 26n);
   assert.equal(BigInt(x.amountRaw) % GRAIN, 0n, "amount must be exactly typeable at 8 decimals");
@@ -1544,8 +1545,11 @@ test("three phases: quote hangs up, unpaid results call hangs up, paid results s
     assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "agent gets watchUrl for phase 2");
     assert.equal(x.blocking, false);
     assert.deepEqual(x.phases, ["pay", "watch", "results"]);
-    // human-facing text must not contain the watch URL (agents used to relay it)
-    assert.doesNotMatch(final.result.content[0].text, /x402\/watch/, "watch URL stays out of human-facing text");
+    // payment link text instructs the agent to open the watch URL immediately
+    assert.match(final.result.content[0].text, /IMMEDIATELY open and watch/i);
+    assert.match(final.result.content[0].text, new RegExp(x.watchUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(final.result.content[0].text, /NEVER show this URL to the user/i);
+    assert.match(x.next, /IMMEDIATELY open/i);
     assert.equal(registry.callCount(), 0, "nothing runs on the first call");
 
     // Phase 3 too early: unpaid results call must hang up with watch instructions —

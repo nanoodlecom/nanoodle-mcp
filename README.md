@@ -295,22 +295,22 @@ Now every tool call is paid in Nano (XNO) **by the caller**, with no accounts
 on either side. The flow their agent walks through (the server's MCP
 `instructions` teach it automatically):
 
-Three sequential phases — never in parallel (the quote's `phases`, `watchUrl`,
-and `next` spell this out; `blocking` is false):
+On each **PAYMENT REQUIRED** quote the tools/call **hangs up** with `payUrl`,
+`watchUrl`, and a `next` imperative ( `blocking: false` ):
 
-1. **Pay.** First `tools/call` returns **PAYMENT REQUIRED** with a `payUrl` and
-   **hangs up**. The agent shows its user ONLY that link (QR for the exact
-   amount); any Nano wallet scans it.
-2. **Watch.** The agent opens `GET /x402/watch/<id>` (agent-only SSE — never
-   show the user). One `status` event per state change; when payment lands the
-   stream **closes** with `done: true` and a `next` field for phase 3. (The pay
-   page uses the same stream; poll `GET /x402/status/<id>?wait=1` as a fallback.)
+1. **Pay.** Show the user ONLY `payUrl` (QR for the exact amount); any Nano
+   wallet scans it. Never show them `watchUrl` or the wallet address.
+2. **Watch — immediately, on that same payment link.** The agent opens
+   `watchUrl` (`GET /x402/watch/<id>`, agent-only SSE) the moment it has the
+   quote. One `status` event per state change; when payment lands the stream
+   **closes** with `done: true` and a `next` field for phase 3. (The pay page
+   uses the same stream; poll `GET /x402/status/<id>?wait=1` as a fallback.)
    Detection is RPC polling or push via `--nano-ws` — about a second.
 3. **Results.** ONLY after the watch closes paid: re-call the tool with the same
    arguments plus `_payment_id`. That `tools/call` is the **results stream** —
    it runs the workflow (progress heartbeats on a streaming transport) and
-   returns the result with a receipt. Do not open it while payment is still
-   pending. Re-calls with the same `_payment_id` replay the cached result free.
+   returns the result with a receipt. Do not open it while still watching for
+   payment. Re-calls with the same `_payment_id` replay the cached result free.
 
 **What they paid is a deposit, not the price**: the call settles at the run's
 *actual* metered model cost + 20%, and everything above that is sent back to the

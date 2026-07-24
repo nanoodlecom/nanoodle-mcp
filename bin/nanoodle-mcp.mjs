@@ -364,14 +364,13 @@ async function main() {
     ({ listTools, callTool } = gate.wrapRegistry(registry));
     instructions =
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
-      "THREE SEQUENTIAL PHASES — never in parallel: " +
-      "(1) tools/call returns PAYMENT REQUIRED with a payUrl and HANGS UP. Show ONLY that payUrl to your user " +
-      "(QR code; confirms on-screen when paid, usually within a second) — never show them the watch URL or wallet address. " +
-      "(2) YOU open the payment-monitor SSE at structuredContent.x402.watchUrl (GET /x402/watch/<paymentId>) — " +
-      "agent-only, never show it to the user. Wait until that stream CLOSES with status paid, done:true, and a next field. " +
-      "(3) ONLY THEN call the same tool again with identical arguments plus _payment_id — that tools/call is the " +
-      "RESULTS stream (progress heartbeats, then the result). Do not open the results call while payment is still pending, " +
-      "and do not hold a tools/call open to wait for payment. Paying is the consent — nothing to ask the user. " +
+      "When a tools/call returns PAYMENT REQUIRED it HANGS UP with a payUrl and a watchUrl. " +
+      "On that payment link: show your user ONLY the payUrl (QR; confirms on-screen when paid) — never the watch URL or wallet address — " +
+      "and IMMEDIATELY open structuredContent.x402.watchUrl yourself (GET /x402/watch/<paymentId>, Accept: text/event-stream; agent-only). " +
+      "Wait until that watch stream CLOSES with status paid, done:true, and a next field. " +
+      "ONLY THEN call the same tool again with identical arguments plus _payment_id — that tools/call is the RESULTS stream " +
+      "(progress heartbeats, then the result). Do not open results while still watching for payment, and do not hold a tools/call open to wait for payment. " +
+      "Paying is the consent — nothing to ask the user. " +
       "The amount paid is a DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the " +
       "workflow author's cut), and the difference is sent back to the paying wallet as change after the run. " +
       "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically.";
