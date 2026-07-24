@@ -119,11 +119,12 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
  * @param {string|null} [opts.wsUrl]      Nano node websocket (wss://…) for push confirmations
  * @param {string} opts.publicBase        absolute base URL for pay links (no trailing slash)
  * @param {number} [opts.pollMs]          receivable poll interval while quotes are pending
- * @param {number} [opts.waitMs]          how long a NON-streaming _payment_id call blocks waiting for
- *                                        settlement — kept under typical MCP client tool timeouts so the
- *                                        caller gets our "not arrived yet, call again" message, never an
- *                                        opaque client-side timeout. Streaming calls wait out the quote's
- *                                        whole TTL (heartbeats keep the connection alive).
+ * @param {number} [opts.waitMs]          short grace on a _payment_id call that arrives just as payment
+ *                                        lands (race cover) — kept under typical MCP client tool timeouts.
+ *                                        Payment monitoring is NOT this call: agents open /x402/watch SSE
+ *                                        for that. A pending quote after waitMs returns "not arrived yet"
+ *                                        with instructions to watch, never holds the results stream open
+ *                                        through the quote TTL.
  * @param {string|null} [opts.stateFile]  persist quotes + owed sends here (write-then-rename JSON) and
  *                                        restore them at startup — in-flight money survives restarts
  * @param {(event: string, fields: object) => void} [opts.usage]  payments-ledger sink:
@@ -630,21 +631,31 @@ export function createChargeGate({
   const payUrl = (q) => `${publicBase}/pay/${q.id}`;
   const nanoUri = (q) => `nano:${address}?amount=${q.amountRaw}`;
 
+  const watchUrl = (q) => `${publicBase}/x402/watch/${q.id}`;
+
   function paymentRequiredResult(q) {
-    // Only user-facing fields belong here — agents relay this object. The
-    // /x402/watch SSE endpoint is deliberately NOT included: it's agent/pay-page
-    // plumbing for watching the payment settle, not a link to hand the user, and
-    // dropping it beside payUrl made agents show it to humans. Agents that want
-    // to watch programmatically get the endpoint from the server instructions.
+    // Three sequential phases — never parallel:
+    //   1) this tools/call HANGS UP with pay instructions (payUrl for the human)
+    //   2) agent opens watchUrl SSE (agent-only) until it closes with paid
+    //   3) agent opens tools/call + _payment_id = the RESULTS stream only
+    // watchUrl rides in structuredContent for the agent; the human-facing text
+    // never mentions it (agents used to relay it next to payUrl — don't).
+    const wUrl = watchUrl(q);
     const x402 = {
       paymentId: q.id,
       payUrl: payUrl(q),
-      // Machine-readable "what to do next", so a cautious agent re-calls instead
-      // of pausing for a human "go" after showing the link. `blocking` says the
-      // follow-up call waits; `next` is the imperative that flips ask-permission
-      // into re-call-and-block. Paying is the consent — there's nothing to ask.
-      blocking: true,
-      next: `Call this SAME tool again with identical arguments plus "_payment_id": "${q.id}" NOW — right after showing the user the payUrl, without waiting for them to confirm. That call blocks until the payment confirms (it holds the connection open with heartbeats), then runs and returns the result. Paying IS the consent; do not wait for a human "go".`,
+      // Agent-only. Never show this URL to the user — it is the payment-monitor SSE.
+      watchUrl: wUrl,
+      // Sequential phases. blocking:false — do NOT open the results tools/call while
+      // payment is still pending; that used to hold one SSE through pay+run and race
+      // the watch stream in parallel.
+      blocking: false,
+      phases: ["pay", "watch", "results"],
+      next: `THREE PHASES IN ORDER — do not run them in parallel:\n` +
+        `1. Show your user ONLY the payUrl (${payUrl(q)}). Nothing else — no watch URL, no wallet address.\n` +
+        `2. YOU open the payment-monitor SSE: GET ${wUrl} (Accept: text/event-stream). Never show this URL to the user. Wait until the stream CLOSES with status "paid" (done:true + next).\n` +
+        `3. ONLY THEN call this SAME tool with identical arguments plus "_payment_id": "${q.id}". That tools/call is the RESULTS stream — it runs the workflow and returns the result. Do not open it before phase 2 closes.\n` +
+        `Paying is the consent; do not wait for a human "go".`,
       uri: nanoUri(q),
       address,
       amountRaw: q.amountRaw,
@@ -658,11 +669,12 @@ export function createChargeGate({
     const text =
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
-      `To proceed:\n` +
+      `This call is done — hang up. Then three phases IN ORDER (never in parallel):\n` +
       `1. Show your user ONLY this payment link — it renders a QR code to scan with any Nano wallet and turns into a green check the moment the payment lands. Don't show them any other URL or the wallet address from this response:\n` +
       `   ${payUrl(q)}\n` +
-      `2. Then IMMEDIATELY call this tool again with the SAME arguments plus "_payment_id": "${q.id}" — right after showing the link, without waiting for the user to say "go" or confirm they paid. That call blocks until the payment lands (about a second), then runs. That is how YOU watch for the payment; paying is the consent, so there is nothing to ask the user first.` +
-      (q.etaMs ? ` Once paid, this tool typically finishes in ~${fmtDur(q.etaMs)}.` : "") + `\n\n` +
+      `2. YOU monitor payment on the agent-only SSE at structuredContent.x402.watchUrl (never show that URL to the user). Wait until it closes with status "paid".\n` +
+      `3. ONLY AFTER the watch stream closes paid: call this tool again with the SAME arguments plus "_payment_id": "${q.id}". That call is the RESULTS stream` +
+      (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : "") + ` — it runs and returns the result. Do not open the results call while still waiting for payment.\n\n` +
       `Manual-pay fallback (only if the user can't use the link): send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
       `the exact amount is how the payment is recognized (URI: ${nanoUri(q)}).\n` +
       `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"} (${x402.expiresAt}). ` +
@@ -684,9 +696,10 @@ export function createChargeGate({
   function nextFor(q) {
     if (!q || q.status === "pending") return undefined;
     if (q.status === "paid" || q.status === "consumed") {
-      return `Payment received. Close this watch stream and call the SAME tool again with identical arguments plus "_payment_id": "${q.id}". ` +
-        `That tools/call is the result stream: it runs the workflow (with progress heartbeats on a streaming transport) and returns the result. ` +
-        `If you already have a tools/call open with this _payment_id, it will proceed on its own — leave it open and do not cancel it.`;
+      return `Payment received — this watch stream is done; hang it up. ` +
+        `NOW open the RESULTS stream: call the SAME tool with identical arguments plus "_payment_id": "${q.id}". ` +
+        `That tools/call runs the workflow (progress heartbeats on a streaming transport) and returns the result. ` +
+        `Do not open a results tools/call before the watch closes, and do not keep this watch open in parallel with the results call.`;
     }
     if (q.status === "expired") {
       return `Quote expired unpaid — call the tool again without _payment_id for a fresh quote.`;
@@ -886,8 +899,9 @@ export function createChargeGate({
                 _payment_id: {
                   type: "string",
                   description: "Payment id from this tool's previous payment-required response. " +
-                    "First call the tool without it to get a payment link; after the user pays, " +
-                    "call again with the same arguments plus this id.",
+                    "Phase 3 only: after /x402/watch closes with status paid, call again with the " +
+                    "same arguments plus this id to open the RESULTS stream. Do not pass it while " +
+                    "payment is still pending — monitor the watch SSE first.",
                 },
               },
             };
@@ -933,15 +947,12 @@ export function createChargeGate({
           persist();
           ensureWatching();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
-          // The FIRST call always returns the payment-required quote as its tool
-          // RESULT — every MCP client surfaces a result, so the pay link is always
-          // seen. (An earlier build held streaming calls open and pushed the link
-          // as a progress notification instead; clients that don't render progress
-          // messages showed the human nothing and the call hung until timeout —
-          // observed live on talking-avatar. Delivering the link in-band as a
-          // progress message is not reliable, so we don't.) To avoid a re-invoke
-          // after paying, the caller passes _payment_id on the NEXT call and, on a
-          // streaming transport, that call is held open until the payment lands.
+          // Phase 1: this tools/call always HANGS UP with the payment-required
+          // quote as its RESULT — every MCP client surfaces a result, so the pay
+          // link is always seen. (An earlier build held streaming calls open and
+          // pushed the link as progress; clients that don't render progress
+          // showed nothing and hung — observed live on talking-avatar.)
+          // Phase 2 is /x402/watch; phase 3 is tools/call + _payment_id (results).
           return paymentRequiredResult(q);
         } else {
           q = quotes.get(String(_payment_id));
@@ -960,24 +971,27 @@ export function createChargeGate({
           }
         }
 
-        // Prefer announce (immediate progress event) over report (next heartbeat
-        // only) so payment wait → paid is not a silent loading gap. announce falls
-        // back to report when the transport has no progressToken.
+        // Prefer announce (immediate progress event) over report (next heartbeat).
         const note = (s) => {
           if (ctx && typeof ctx.announce === "function") ctx.announce(s);
           else if (ctx && typeof ctx.report === "function") ctx.report(s);
         };
 
         if (q.status === "pending") {
-          // Streaming callers can afford to wait out the quote — heartbeats keep
-          // their tool timeout at bay. Plain-JSON callers get one short wait, so
-          // OUR "not arrived yet" message always beats their client-side timeout.
-          note(`waiting for the ${rawToXno(q.amountRaw)} XNO payment to land`);
-          const budget = ctx && ctx.streaming ? Math.max(waitMs, q.expiresAt - now()) : waitMs;
-          const st = await gate.waitForPayment(q.id, budget);
+          // Phase 3 is the RESULTS stream — it must not also be the payment
+          // monitor. A short waitMs covers the race where payment lands as the
+          // agent switches from watch → results; it never holds through the
+          // quote TTL (that used to race a parallel watch SSE and look like a
+          // silent load). Agents still pending should be on /x402/watch.
+          note(`checking payment ${q.id}`);
+          const st = await gate.waitForPayment(q.id, waitMs);
           if (st === "pending") {
-            return errResult(`payment ${q.id} hasn't arrived yet. If your user has the page open at ${payUrl(q)} ` +
-              `it will show a green check when it lands — then call this tool again with the same _payment_id.`);
+            return errResult(
+              `payment ${q.id} hasn't arrived yet — this tools/call is the RESULTS stream, not the payment monitor. ` +
+              `Hang it up. Open the agent-only watch SSE ${watchUrl(q)} (never show that URL to the user), ` +
+              `wait until it closes with status "paid", THEN call again with the same _payment_id. ` +
+              `Do not hold a tools/call open while waiting for payment.`
+            );
           }
           if (st === "expired") {
             return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);

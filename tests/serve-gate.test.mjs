@@ -128,19 +128,27 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   assert.match(quoteRes.content[0].text, new RegExp(x.paymentId));
   assert.equal(x.payUrl, `http://pay.test/pay/${x.paymentId}`);
   assert.equal(x.address, GATE_ADDR);
-  // machine-readable "proceed now" hints so an agent re-calls instead of pausing for a human "go"
-  assert.equal(x.blocking, true, "the result flags that the _payment_id call blocks");
-  assert.match(x.next, /_payment_id/, "the next-step imperative names the follow-up call");
-  assert.match(x.next, /do not wait for a human "go"/i);
+  // three sequential phases — never hold tools/call through payment
+  assert.equal(x.blocking, false, "results tools/call must not block on payment — watch does that");
+  assert.deepEqual(x.phases, ["pay", "watch", "results"]);
+  assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "agent gets watchUrl for phase 2");
+  assert.match(x.next, /THREE PHASES/i, "next spells out sequential phases");
+  assert.match(x.next, /_payment_id/, "phase 3 is tools/call + _payment_id");
+  assert.match(x.next, /watch/i);
+  assert.match(x.next, /do not (run them in parallel|open the results call before)/i);
   assert.match(x.next, new RegExp(x.paymentId), "the next imperative carries this payment id");
+  // human-facing text: payUrl only — watch URL stays out of the relayed prose
+  assert.doesNotMatch(quoteRes.content[0].text, /x402\/watch/);
   // $0.05 at $1/XNO ≈ 0.05 XNO plus a sub-cent tag, in whole 1e-8 XNO steps
   assert.ok(BigInt(x.amountRaw) >= 5n * 10n ** 28n && BigInt(x.amountRaw) < 5n * 10n ** 28n + 10n ** 26n);
   assert.equal(BigInt(x.amountRaw) % GRAIN, 0n, "amount must be exactly typeable at 8 decimals");
 
-  // unpaid re-call with the id: reports pending, runs nothing
+  // unpaid re-call with the id: hang up with watch instructions — do not hold the results stream
   const pending = await callTool({ name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId } });
   assert.ok(pending.isError);
   assert.match(pending.content[0].text, /hasn't arrived/);
+  assert.match(pending.content[0].text, /x402\/watch/, "points the agent at the watch SSE");
+  assert.match(pending.content[0].text, /RESULTS stream/i);
   assert.equal(registry.callCount(), 0);
 
   // the exact tagged amount lands on-chain
@@ -518,7 +526,7 @@ test("payment-required text carries the tool's typical runtime when known", asyn
   registry.costs = { poster: { usd: 0.03, ms: 15_000, at: "2026-07-22T00:00:00Z" } };
   const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
   const quote = await callTool({ name: "poster", arguments: { Text: "a" } });
-  assert.match(quote.content[0].text, /typically finishes in ~15s/);
+  assert.match(quote.content[0].text, /typically ~15s/);
   // $0.03 observed → deposit ceil(0.03 × 1.2 × 2) = $0.08 (tracks cost, no longer capped at the opening deposit)
   assert.match(quote.content[0].text, /send exactly 0\.08\d* XNO/);
 });
@@ -1479,7 +1487,7 @@ test("the payment quote's QR is a spec-correct nano: URI carrying the exact amou
   assert.equal(qrDecode(svgToMatrix(qrSvg(x.uri))), x.uri);
 });
 
-/* ---- streaming hold-open + SSE payment watch (no re-invoke after paying) ---- */
+/* ---- three-phase x402: quote hang-up → watch SSE → results stream ---- */
 
 /** Read an SSE response frame by frame, calling onEvent({event,data}) until it returns "stop" or the stream ends. */
 async function readSse(res, onEvent) {
@@ -1504,10 +1512,11 @@ async function readSse(res, onEvent) {
   }
 }
 
-test("streaming first call returns the quote as a RESULT (never held open on a progress-only pay link)", async () => {
+test("three phases: quote hangs up, unpaid results call hangs up, paid results stream runs", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
-  const gate = makeGate(chain, { registry, pollMs: 5 });
+  // short waitMs so an unpaid results call hangs up promptly (not quote TTL)
+  const gate = makeGate(chain, { registry, pollMs: 5, waitMs: 40 });
   const { listTools, callTool } = gate.wrapRegistry(registry);
   const server = await serveHttp({
     host: "127.0.0.1", port: 0, name: "t", version: "0",
@@ -1515,11 +1524,8 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
   });
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    // REGRESSION: an earlier build held a streaming first call open and pushed the
-    // pay link only as a progress notification. Clients that don't render progress
-    // messages (observed live on talking-avatar) then saw NOTHING and the call hung
-    // to timeout — no link, no result. The first call must ALWAYS return the quote
-    // as its tool RESULT, even for a streaming client that sends a progressToken.
+    // Phase 1: streaming first call ALWAYS returns the quote as RESULT and hangs up
+    // (regression: progress-only pay link hung clients that don't render progress).
     const res = await fetch(`${base}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
@@ -1534,16 +1540,18 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
     assert.ok(x.paymentId, "the first call returns the payment-required quote as its result");
     assert.match(final.result.content[0].text, /PAYMENT REQUIRED/, "the pay link is in the RESULT content, not only a progress message");
     assert.match(final.result.content[0].text, /\/pay\//);
-    // the watch endpoint is agent/pay-page plumbing — it must NOT ride in the
-    // per-call result (agents relay this to users; only the payUrl is user-facing)
-    assert.equal(x.watchUrl, undefined, "watchUrl must not be in the quote result shown to users");
-    assert.doesNotMatch(final.result.content[0].text, /x402\/watch/, "the watch URL is never in the human-facing text");
+    assert.match(final.result.content[0].text, /hang up/i);
+    assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "agent gets watchUrl for phase 2");
+    assert.equal(x.blocking, false);
+    assert.deepEqual(x.phases, ["pay", "watch", "results"]);
+    // human-facing text must not contain the watch URL (agents used to relay it)
+    assert.doesNotMatch(final.result.content[0].text, /x402\/watch/, "watch URL stays out of human-facing text");
     assert.equal(registry.callCount(), 0, "nothing runs on the first call");
 
-    // The no-re-invoke-AFTER-paying path: the follow-up _payment_id call on a
-    // streaming transport is held open until the payment lands, then runs.
-    chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
-    const run = await fetch(`${base}/mcp`, {
+    // Phase 3 too early: unpaid results call must hang up with watch instructions —
+    // never hold the tools/call SSE open through payment (that raced watch in parallel).
+    const t0 = Date.now();
+    const early = await fetch(`${base}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
       body: JSON.stringify({
@@ -1551,10 +1559,29 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
         params: { name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId }, _meta: { progressToken: "p2" } },
       }),
     });
+    let earlyMsg = null;
+    await readSse(early, ({ data }) => { if (data.id === 100) { earlyMsg = data; return "stop"; } });
+    assert.ok(Date.now() - t0 < 5_000, "unpaid results call must hang up quickly, not wait the quote TTL");
+    assert.ok(earlyMsg.result.isError, "unpaid results call is an error, not a hang");
+    assert.match(earlyMsg.result.content[0].text, /hasn't arrived/);
+    assert.match(earlyMsg.result.content[0].text, /x402\/watch/);
+    assert.equal(registry.callCount(), 0, "still nothing ran");
+
+    // Phase 2 → paid, then phase 3 results stream
+    chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    await gate.waitForPayment(x.paymentId, 500);
+    const run = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 101, method: "tools/call",
+        params: { name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId }, _meta: { progressToken: "p3" } },
+      }),
+    });
     let ran = null;
-    await readSse(run, ({ data }) => { if (data.id === 100) { ran = data; return "stop"; } });
+    await readSse(run, ({ data }) => { if (data.id === 101) { ran = data; return "stop"; } });
     assert.ok(!ran.result.isError, JSON.stringify(ran.result));
-    assert.match(ran.result.content[0].text, /^ran /, "the held-open payment call runs and returns the result");
+    assert.match(ran.result.content[0].text, /^ran /, "after payment, the results stream runs");
     assert.equal(registry.callCount(), 1, "the tool ran exactly once");
   } finally {
     server.close();
@@ -1632,9 +1659,9 @@ test("GET /x402/status/:id carries done+next once the payment lands", async () =
   }
 });
 
-test("held-open _payment_id call announces payment received (not silent load)", async () => {
+test("results stream announces payment received when already paid (not silent load)", async () => {
   const chain = fakeChain();
-  // Slow the run so we can observe the progress events before the final result
+  // Slow the run so we can observe the progress event before the final result
   const registry = fakeRegistry({
     onCall: async () => {
       await new Promise((r) => setTimeout(r, 80));
@@ -1650,8 +1677,11 @@ test("held-open _payment_id call announces payment received (not silent load)", 
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
-    // Start the held-open call BEFORE the payment lands so we see wait → paid announce
-    const runP = fetch(`${base}/mcp`, {
+    // Pay first (phase 2 done), then open the results stream (phase 3)
+    chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    await gate.waitForPayment(x.paymentId, 500);
+
+    const res = await fetch(`${base}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
       body: JSON.stringify({
@@ -1663,11 +1693,6 @@ test("held-open _payment_id call announces payment received (not silent load)", 
         },
       }),
     });
-    // Give the wait-for-payment announce a moment to fire, then pay
-    await new Promise((r) => setTimeout(r, 30));
-    chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
-
-    const res = await runP;
     const progressMsgs = [];
     let final = null;
     await readSse(res, ({ data }) => {
@@ -1678,8 +1703,7 @@ test("held-open _payment_id call announces payment received (not silent load)", 
     });
     assert.ok(final && final.result && !final.result.isError, JSON.stringify(final));
     const joined = progressMsgs.join(" | ");
-    assert.match(joined, /waiting for .* payment/i, `expected wait announce, got: ${joined}`);
-    assert.match(joined, /payment received/i, `expected payment-received announce (not silent load), got: ${joined}`);
+    assert.match(joined, /payment received/i, `expected payment-received announce on results stream, got: ${joined}`);
   } finally {
     server.close();
   }
