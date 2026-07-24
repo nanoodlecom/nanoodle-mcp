@@ -9,8 +9,8 @@
 
 Point this MCP server at a folder of `noodle-graph.json` saves from the
 nanoodle editor and every graph becomes a callable tool with a derived input
-schema — in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, or anything
-else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
+schema — in Claude Code, Grok, Claude Desktop, Cursor, VS Code, Windsurf, or
+anything else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
 It speaks stdio to your own agent by default, or HTTP to everyone with
 [serve mode](#serve-mode--host-your-noodles-as-a-service---serve) — including
 [charging per call in Nano](#charging-per-call---charge-usd), so strangers'
@@ -47,6 +47,27 @@ marketplace):
 ```
 /plugin marketplace add nanoodlecom/nanoodle-mcp
 /plugin install nanoodle@nanoodle
+```
+
+### Grok
+
+```bash
+grok mcp add nanoodle -e NANOGPT_API_KEY=your-key-here -- npx -y nanoodle-mcp --graphs ~/noodles
+```
+
+Or, for a remote/serve endpoint (no local process, no API key on your machine):
+
+```bash
+grok mcp add --transport http noodles https://mcp.nanoodle.com/mcp
+```
+
+That writes `[mcp_servers.noodles]` into `~/.grok/config.toml` (or
+`.grok/config.toml` with `--scope project`). Same shape by hand:
+
+```toml
+[mcp_servers.noodles]
+url = "https://mcp.nanoodle.com/mcp"
+enabled = true
 ```
 
 ### Cursor
@@ -196,12 +217,15 @@ Callers connect with one command — no key, no signup:
 
 ```bash
 claude mcp add --transport http noodles https://your-host/mcp
+# or
+grok mcp add --transport http noodles https://your-host/mcp
 ```
 
-`GET /` serves a landing page with the tool list and that exact command, so
-sharing your server's bare URL *is* the onboarding. Every workflow on it links
-to its source: an **open in editor** link (a share link minted from the exact
-graph file being served — it loads the workflow in the
+`GET /` serves a landing page with the tool list and that exact command (Claude
+and Grok behind a one-click toggle — same endpoint, same flags), so sharing
+your server's bare URL *is* the onboarding. Every workflow on it links to its
+source: an **open in editor** link (a share link minted from the exact graph
+file being served — it loads the workflow in the
 [nanoodle editor](https://nanoodle.com) to inspect, remix, or run on your own
 key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
 out the economics (deposits settle at metered cost + 20%, the markup is the

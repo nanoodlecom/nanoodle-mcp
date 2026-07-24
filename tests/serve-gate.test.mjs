@@ -1217,10 +1217,16 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const html = await (await fetch(`${base}/`)).text();
+    // default command is Claude; Grok rides the same endpoint behind a client toggle
     assert.match(html, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(html, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(html, /data-client="claude"/);
+    assert.match(html, /data-client="grok"/);
+    assert.match(html, /selectClient/);
     assert.match(html, /402 payment quote/);
     assert.match(html, /No tab, no tip, no signup\./);
     assert.match(html, /href="\/llms\.txt"/);
+    assert.match(html, /Claude Code, Grok, Cursor/);
   } finally {
     server.close();
   }
@@ -1287,6 +1293,7 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
     const txt = await res.text();
     assert.match(txt, /endpoint: http:\/\/pay\.test\/mcp/);
     assert.match(txt, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
     assert.match(txt, /## Payment \(x402, Nano\/XNO\)/);
     assert.match(txt, /settles at metered model cost \+ 20%/);
     assert.match(txt, /- poster: /);
