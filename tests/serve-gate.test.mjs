@@ -1578,18 +1578,108 @@ test("GET /x402/watch/:id streams status: pending, then paid when the payment la
     assert.match(res.headers.get("content-type"), /text\/event-stream/);
 
     const seen = [];
+    let terminal = null;
     await readSse(res, ({ event, data }) => {
       if (event !== "status") return;
       seen.push(data.status);
       if (data.status === "pending") {
+        assert.equal(data.done, undefined, "pending frames are lean — no done/next yet");
         // pay after the first pending frame; the shared watcher pushes the next frame
         chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
       } else {
+        terminal = data;
         return "stop"; // paid/consumed → the stream closes
       }
     });
     assert.equal(seen[0], "pending");
     assert.ok(seen.some((s) => s === "paid" || s === "consumed"), `expected a paid frame, got ${JSON.stringify(seen)}`);
+    // Terminal frame must close the gap: agent gets done + next instructions for
+    // the result stream (tools/call with _payment_id), not a bare "paid".
+    assert.equal(terminal.done, true, "terminal frame marks done so the agent knows the watch is over");
+    assert.match(terminal.next, /_payment_id/, "next tells the agent how to open the result stream");
+    assert.match(terminal.next, new RegExp(x.paymentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(terminal.next, /result stream|tools\/call|call the SAME tool/i);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /x402/status/:id carries done+next once the payment lands", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 40, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    const pending = await (await fetch(`${base}/x402/status/${x.paymentId}`)).json();
+    assert.equal(pending.status, "pending");
+    assert.equal(pending.done, undefined);
+
+    chain.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    // ?wait=1 long-polls until paid
+    const paid = await (await fetch(`${base}/x402/status/${x.paymentId}?wait=1`)).json();
+    assert.ok(paid.status === "paid" || paid.status === "consumed", JSON.stringify(paid));
+    assert.equal(paid.done, true);
+    assert.match(paid.next, /_payment_id/);
+    assert.match(paid.next, new RegExp(x.paymentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    server.close();
+  }
+});
+
+test("held-open _payment_id call announces payment received (not silent load)", async () => {
+  const chain = fakeChain();
+  // Slow the run so we can observe the progress events before the final result
+  const registry = fakeRegistry({
+    onCall: async () => {
+      await new Promise((r) => setTimeout(r, 80));
+      return { content: [{ type: "text", text: "ran poster" }], costUsd: 0.01, textOutput: true };
+    },
+  });
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 200, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    // Start the held-open call BEFORE the payment lands so we see wait → paid announce
+    const runP = fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 7, method: "tools/call",
+        params: {
+          name: "poster",
+          arguments: { Text: "a", _payment_id: x.paymentId },
+          _meta: { progressToken: "pay-ack" },
+        },
+      }),
+    });
+    // Give the wait-for-payment announce a moment to fire, then pay
+    await new Promise((r) => setTimeout(r, 30));
+    chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+
+    const res = await runP;
+    const progressMsgs = [];
+    let final = null;
+    await readSse(res, ({ data }) => {
+      if (data.method === "notifications/progress") {
+        progressMsgs.push(data.params && data.params.message);
+      }
+      if (data.id === 7) { final = data; return "stop"; }
+    });
+    assert.ok(final && final.result && !final.result.isError, JSON.stringify(final));
+    const joined = progressMsgs.join(" | ");
+    assert.match(joined, /waiting for .* payment/i, `expected wait announce, got: ${joined}`);
+    assert.match(joined, /payment received/i, `expected payment-received announce (not silent load), got: ${joined}`);
   } finally {
     server.close();
   }

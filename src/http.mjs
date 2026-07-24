@@ -17,8 +17,10 @@
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
- *   GET  /x402/watch/:id   SSE: one `status` event per state change, closes on settle
- *                        (the pay page subscribes to it; falls back to /x402/status)
+ *   GET  /x402/watch/:id   SSE: one `status` event per state change; on settle
+ *                        (paid/expired/…) closes with done:true + next instructions
+ *                        telling the agent how to open the result stream (tools/call
+ *                        with _payment_id). Pay page subscribes; falls back to /x402/status
  *   GET  /out/:file      generated media (unguessable filenames), when an outDir is given
  *   GET  /favicon.ico|/favicon.png|/apple-touch-icon.png|/icon-512.png|/og.jpg
  *                        brand assets from assets/ — the icon and the social (OG) card,
@@ -355,7 +357,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       ``,
       `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a payUrl (${publicBase}/pay/<id>). Show the user ONLY the payUrl.`,
       `- Send exactly the quoted amount (the amount identifies the payment), then IMMEDIATELY call again with the returned _payment_id — right after showing the link, do not wait for the user to say "go". On a streaming transport (Accept: text/event-stream) that call blocks (held open with heartbeats) until the payment lands, then runs. Paying is the consent; the result object carries "blocking":true and a "next" imperative saying exactly this. That call is how you watch for the payment.`,
-      `- Agent-only (never show the user): to watch a payment settle yourself, subscribe to the SSE stream ${publicBase}/x402/watch/<id> (one status event per state change) or poll ${publicBase}/x402/status/<id>?wait=1.`,
+      `- Agent-only (never show the user): to watch a payment settle yourself, subscribe to the SSE stream ${publicBase}/x402/watch/<id> (one status event per state change). When payment lands the stream CLOSES with status "paid", done:true, and a "next" field telling you how to open the result stream — call the same tool again with _payment_id (that tools/call streams the run). Or poll ${publicBase}/x402/status/<id>?wait=1 (same terminal fields).`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
       `- The 20% is the workflow author's cut, not a platform fee.`,
       ``,
@@ -645,16 +647,21 @@ export async function serveHttp({
         const id = decodeURIComponent(statusMatch[1]);
         if (url.searchParams.get("wait")) await gate.waitForPayment(id, 25_000);
         const q = gate.quote(id);
-        return send(200, JSON.stringify(q ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt } : { status: "unknown" }));
+        // Terminal quotes carry done + next (agent instructions for the result stream).
+        return send(200, JSON.stringify(q
+          ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.done ? { done: true, next: q.next } : {}) }
+          : { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." }));
       }
 
       /*
-       * SSE payment watch: one `status` event per state change, closing the
-       * instant the payment lands (or the quote dies). It's push, not polling —
-       * the pay page subscribes to it (falling back to /x402/status polling if the
-       * browser can't), and any HTTP client can too. It rides the gate's shared
-       * waiter list, so a thousand subscribers still cost one chain poll. At the
-       * held-connection cap it 503s and the caller falls back to polling.
+       * SSE payment watch: one `status` event per state change. When the quote
+       * settles (paid / expired / …) the FINAL frame includes done:true and a
+       * `next` imperative telling the agent how to open the result stream
+       * (tools/call with _payment_id) — then the connection closes. Without that,
+       * a subscriber sees bare "paid" and a loading gap with no path forward.
+       * The pay page only reads `.status` (extra fields are harmless). Rides the
+       * gate's shared waiter list; at the held-connection cap it 503s so the
+       * caller falls back to polling.
        */
       const watchMatch = url.pathname.match(/^\/x402\/watch\/([^/]+)$/);
       if (watchMatch && gate) {
@@ -669,11 +676,19 @@ export async function serveHttp({
         let alive = true;
         req.on("close", () => { alive = false; });
         const sse = (ev, obj) => { if (alive && !res.writableEnded && !res.destroyed) res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`); };
+        // Frame shape shared with /x402/status — pending is lean; terminal carries
+        // done + next so the agent knows how to access the result stream after close.
+        const frame = (q) => {
+          if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
+          const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
+          if (q.done) { f.done = true; if (q.next) f.next = q.next; }
+          return f;
+        };
         const ping = setInterval(() => { if (alive && !res.writableEnded && !res.destroyed) res.write(`: ping\n\n`); }, progressMs);
         if (ping.unref) ping.unref();
         try {
           let q = gate.quote(id);
-          sse("status", q ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt } : { status: "unknown" });
+          sse("status", frame(q));
           // Hold the stream open across state changes until the quote settles or
           // the client leaves. Each wait resolves on the shared watcher firing
           // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
@@ -682,7 +697,9 @@ export async function serveHttp({
           while (alive && q && q.status === "pending" && Date.now() < deadline) {
             await gate.waitForPayment(id, 25_000);
             q = gate.quote(id);
-            if (q) sse("status", { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt });
+            if (q) sse("status", frame(q));
+            // On settle the final frame already carried done+next; the loop exits
+            // and finally{} closes the stream — that close IS the acknowledgment.
           }
         } finally {
           clearInterval(ping);
