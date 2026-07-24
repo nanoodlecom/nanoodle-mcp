@@ -640,22 +640,22 @@ export function createChargeGate({
     //   3) agent opens tools/call + _payment_id = the RESULTS stream only
     // watchUrl rides in structuredContent for the agent; the human-facing text
     // never mentions it (agents used to relay it next to payUrl — don't).
+    const pUrl = payUrl(q);
     const wUrl = watchUrl(q);
     const x402 = {
       paymentId: q.id,
-      payUrl: payUrl(q),
-      // Agent-only. Never show this URL to the user — it is the payment-monitor SSE.
+      payUrl: pUrl,
+      // Agent-only payment-monitor SSE. Open it the moment you have this quote —
+      // never show this URL to the user (they get payUrl only).
       watchUrl: wUrl,
       // Sequential phases. blocking:false — do NOT open the results tools/call while
       // payment is still pending; that used to hold one SSE through pay+run and race
       // the watch stream in parallel.
       blocking: false,
       phases: ["pay", "watch", "results"],
-      next: `THREE PHASES IN ORDER — do not run them in parallel:\n` +
-        `1. Show your user ONLY the payUrl (${payUrl(q)}). Nothing else — no watch URL, no wallet address.\n` +
-        `2. YOU open the payment-monitor SSE: GET ${wUrl} (Accept: text/event-stream). Never show this URL to the user. Wait until the stream CLOSES with status "paid" (done:true + next).\n` +
-        `3. ONLY THEN call this SAME tool with identical arguments plus "_payment_id": "${q.id}". That tools/call is the RESULTS stream — it runs the workflow and returns the result. Do not open it before phase 2 closes.\n` +
-        `Paying is the consent; do not wait for a human "go".`,
+      // Lead with the watch imperative: agents that only skim `next` must still
+      // open the monitor SSE as soon as they have the payment link.
+      next: `On this payment link: show the user ONLY ${pUrl}, and IMMEDIATELY open the payment-monitor SSE yourself: GET ${wUrl} (Accept: text/event-stream). Never show the watch URL to the user. Wait until that stream CLOSES with status "paid" (done:true + next). ONLY THEN call this SAME tool with identical arguments plus "_payment_id": "${q.id}" — that is the RESULTS stream. Do not open results while the watch is still open. Paying is the consent; do not wait for a human "go".`,
       uri: nanoUri(q),
       address,
       amountRaw: q.amountRaw,
@@ -663,18 +663,22 @@ export function createChargeGate({
       amountUsd: q.usd,
       expiresAt: new Date(q.expiresAt).toISOString(),
     };
-    // Agents relay this text to humans verbatim — "in 15 minutes" is usable
-    // at a glance where a bare ISO timestamp forces timezone math.
+    // Agents relay this text to humans — keep the payUrl line user-safe. The
+    // agent-only watch URL is stated with an explicit "do not show the user"
+    // so the agent has a concrete URL to open without mistaking it for the link
+    // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const text =
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
-      `This call is done — hang up. Then three phases IN ORDER (never in parallel):\n` +
-      `1. Show your user ONLY this payment link — it renders a QR code to scan with any Nano wallet and turns into a green check the moment the payment lands. Don't show them any other URL or the wallet address from this response:\n` +
-      `   ${payUrl(q)}\n` +
-      `2. YOU monitor payment on the agent-only SSE at structuredContent.x402.watchUrl (never show that URL to the user). Wait until it closes with status "paid".\n` +
+      `This call is done — hang up. On this payment link, do BOTH of these now:\n` +
+      `1. Show your user ONLY this payment link (QR to scan; green check when paid). Do not show them any other URL or the wallet address:\n` +
+      `   ${pUrl}\n` +
+      `2. YOU IMMEDIATELY open and watch this payment-monitor SSE (agent-only — NEVER show this URL to the user):\n` +
+      `   ${wUrl}\n` +
+      `   Wait until that stream CLOSES with status "paid" (done:true + next).\n` +
       `3. ONLY AFTER the watch stream closes paid: call this tool again with the SAME arguments plus "_payment_id": "${q.id}". That call is the RESULTS stream` +
-      (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : "") + ` — it runs and returns the result. Do not open the results call while still waiting for payment.\n\n` +
+      (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : "") + ` — it runs and returns the result. Do not open the results call while still watching for payment.\n\n` +
       `Manual-pay fallback (only if the user can't use the link): send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
       `the exact amount is how the payment is recognized (URI: ${nanoUri(q)}).\n` +
       `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"} (${x402.expiresAt}). ` +
