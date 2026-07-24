@@ -407,6 +407,7 @@ async function main() {
       ? ` — charging $${chargeUsd}/call in XNO to ${wallet.address}`
       : " — free (runs spend from this server's balance)"));
   console.error(`nanoodle-mcp: connect with: claude mcp add --transport http noodles ${publicBase}/mcp`);
+  console.error(`nanoodle-mcp:             or: grok mcp add --transport http noodles ${publicBase}/mcp`);
   // The ledger records money only, and only exists in charge mode.
   if (usagePath) console.error(`nanoodle-mcp: payments ledger: ${usagePath}`);
 }

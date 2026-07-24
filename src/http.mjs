@@ -11,8 +11,8 @@
  *                        server the first call returns the payment-required quote;
  *                        the follow-up _payment_id call is what's held open through
  *                        payment (so the caller never re-invokes AFTER paying).
- *   GET  /               landing page: hero connect command, how payment flows, tool list
- *                        w/ per-workflow editor links, self-hosting + author-payout story
+ *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
+ *                        flows, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
@@ -121,6 +121,12 @@ const LANDING_CSS = `
   .eyebrow{color:var(--accent);font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;text-align:center;margin:1.5rem 0 .6rem}
   h1{font-size:clamp(2rem,6vw,3rem);margin:0;text-align:center;letter-spacing:-.02em}
   .sub{color:var(--muted);text-align:center;margin:.75rem auto 2rem;max-width:40rem}
+  .connect-wrap{display:flex;flex-direction:column;gap:.65rem}
+  .tabs{display:flex;justify-content:center;gap:.35rem}
+  .tabs .tab{font:inherit;font-size:.8rem;padding:.35rem .85rem;border-radius:999px;border:1px solid var(--edge);
+    background:transparent;color:var(--muted);cursor:pointer}
+  .tabs .tab:hover{border-color:var(--accent);color:var(--fg)}
+  .tabs .tab.on{border-color:var(--accent);background:rgba(45,212,191,.12);color:var(--accent)}
   .connect{display:flex;align-items:center;gap:1rem;background:var(--card);border:1px solid var(--accent);
     border-radius:14px;box-shadow:0 0 28px rgba(45,212,191,.16);padding:1rem 1.25rem}
   .connect pre{margin:0;padding:0;background:none;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:hidden;font-size:.95rem;color:var(--accent)}
@@ -171,10 +177,21 @@ const toolTitle = (name) => {
   return s.charAt(0).toUpperCase() + s.slice(1);
 };
 
+/**
+ * One-line "register this server" commands for the clients that ship an
+ * `mcp add --transport http` CLI. Same endpoint, same flag shape — only the
+ * binary name changes. Landing page defaults to Claude; a toggle flips to Grok.
+ */
+const connectCmds = (publicBase) => ({
+  claude: `claude mcp add --transport http noodles ${publicBase}/mcp`,
+  grok: `grok mcp add --transport http noodles ${publicBase}/mcp`,
+});
+
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
-  const cmd = `claude mcp add --transport http noodles ${publicBase}/mcp`;
+  const cmds = connectCmds(publicBase);
+  const cmd = cmds.claude;
   const cards = tools.map((t) => {
     const info = infoByName.get(t.name);
     const links = info ? `<span class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
@@ -231,8 +248,14 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     <p class="sub">Image, video, audio, and text pipelines behind one MCP endpoint.
       ${charged ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
-    <div class="connect"><pre id="cmd">${esc(cmd)}</pre><button onclick="copyCmd(this)">copy</button></div>
-    <p class="hint">works with Claude Code, Cursor, and any MCP client</p>
+    <div class="connect-wrap">
+      <div class="tabs" role="tablist" aria-label="MCP client">
+        <button type="button" class="tab on" role="tab" aria-selected="true" data-client="claude" onclick="selectClient(this)">Claude</button>
+        <button type="button" class="tab" role="tab" aria-selected="false" data-client="grok" onclick="selectClient(this)">Grok</button>
+      </div>
+      <div class="connect"><pre id="cmd">${esc(cmd)}</pre><button type="button" onclick="copyCmd(this)">copy</button></div>
+    </div>
+    <p class="hint">works with Claude Code, Grok, Cursor, and any MCP client</p>
     <div class="steps">
       <div class="step"><span class="n">01</span><b>paste the command</b>
         <p>one line registers every workflow with your agent.</p></div>
@@ -289,6 +312,17 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     </div>
     <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a></footer>
     <script>
+      const CMDS = ${JSON.stringify(cmds)};
+      function selectClient(btn){
+        const id = btn.getAttribute("data-client");
+        if (!CMDS[id]) return;
+        document.getElementById("cmd").textContent = CMDS[id];
+        document.querySelectorAll(".tabs .tab").forEach((b) => {
+          const on = b === btn;
+          b.classList.toggle("on", on);
+          b.setAttribute("aria-selected", on ? "true" : "false");
+        });
+      }
       function copyCmd(b){
         navigator.clipboard.writeText(document.getElementById("cmd").textContent).then(() => {
           b.textContent = "copied";
@@ -311,7 +345,8 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
     ``,
     `endpoint: ${publicBase}/mcp (MCP streamable HTTP — POST JSON-RPC, SSE progress on tools/call)`,
-    `connect:  claude mcp add --transport http noodles ${publicBase}/mcp`,
+    `connect (Claude): claude mcp add --transport http noodles ${publicBase}/mcp`,
+    `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
     ``,
   ];
   if (charged) {
