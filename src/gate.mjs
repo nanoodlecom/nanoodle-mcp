@@ -506,11 +506,20 @@ export function createChargeGate({
   // Recently expired quotes stay watched so a payment that arrives too late is
   // noticed and bounced straight back instead of silently kept.
   const LATE_WATCH_MS = 60 * 60 * 1000;
-  const anyWatchable = () => {
+  // Someone is waiting on money to ARRIVE — poll fast, a caller is blocked on it.
+  const anyPaymentWatchable = () => {
     const t = now();
-    return owed.length > 0 || [...quotes.values()].some((q) =>
+    return [...quotes.values()].some((q) =>
       q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS));
   };
+  // Keep ticking for the owed queue too, but that is money going OUT on its own
+  // backoff (OWED_BACKOFF_MS) — it must never pull the receivable poll up to
+  // payment speed. A queued refund used to make anyWatchable() true forever,
+  // which pinned scan() at one `receivable` call every 5s for as long as the
+  // refund kept failing — and since a refund typically fails because the RPC is
+  // throttling, that poll fed the very rate limit that was blocking it. One
+  // failed refund held the loop for 34h and 5,158 calls on 2026-07-23/25.
+  const anyWatchable = () => owed.length > 0 || anyPaymentWatchable();
 
   /**
    * Race cover for pocketed payments: the wallet (same process, other duties)
@@ -560,7 +569,11 @@ export function createChargeGate({
   async function scan() {
     prune();
     await retryOwed();
-    if (!anyWatchable()) return;
+    // Only the owed queue left → retryOwed above is the whole job. Skip the
+    // receivable/history reads: nobody is waiting for an incoming payment, so
+    // asking the node about one is pure load on an endpoint that is usually
+    // already throttling us (that is why the refund is queued at all).
+    if (!anyPaymentWatchable()) return;
     const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true" });
     const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     for (const [hash, v] of blocks) {
@@ -574,15 +587,43 @@ export function createChargeGate({
     if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
       ops.pocket().catch(() => {}); // best-effort; the next tick retries
     }
-    if (anyWatchable()) await scanHistory();
+    if (anyPaymentWatchable()) await scanHistory();
   }
+
+  /*
+   * Consecutive-failure backoff for the scan itself. retryOwed() has had a
+   * backoff since day one; the receivable poll beside it had none, so a node
+   * answering 429 was re-asked at the full poll rate indefinitely. Doubling from
+   * the base interval keeps a genuinely pending payment responsive (a transient
+   * blip costs one or two slow ticks); the 60s ceiling means a sustained outage
+   * settles to 60 receivable calls/hour instead of 720 (ws up, 5s base: 10, 20,
+   * 40, 60…; ws down, 1s base: 2, 4, 8, 16, 32, 60…).
+   */
+  const SCAN_BACKOFF_CAP_MS = 60 * 1000; // a quote only lives ~15min — never go quiet longer than this
+  let scanFails = 0;
 
   function tick() {
     timer = null;
-    scan().catch((e) => log(`payment scan failed (${e.message}) — will retry`)).then(() => {
+    scan().then(
+      () => { scanFails = 0; },
+      (e) => {
+        scanFails++;
+        // Log the first few, then only every 12th — a stuck endpoint used to
+        // write one line per poll (5,158 in 34h), burying everything else.
+        if (scanFails <= 3 || scanFails % 12 === 0) {
+          log(`payment scan failed (${e.message}) — will retry` +
+            (scanFails > 3 ? ` (${scanFails} consecutive failures)` : ""));
+        }
+      },
+    ).then(() => {
       if (!anyWatchable()) return;
       // With a live websocket the poll is only a safety net — relax it.
-      timer = setTimeout(tick, wsConnected ? Math.max(pollMs, 5000) : pollMs);
+      let delay = wsConnected ? Math.max(pollMs, 5000) : pollMs;
+      // Only back off the tick when a scan actually failed. Owed-only ticks keep
+      // the base cadence on purpose: with the RPC skipped above they are a local
+      // array check costing nothing, so there is no reason to slow the retry.
+      if (scanFails > 0) delay = Math.min(delay * 2 ** Math.min(scanFails, 10), SCAN_BACKOFF_CAP_MS);
+      timer = setTimeout(tick, delay);
       if (timer.unref) timer.unref();
     });
   }
@@ -590,6 +631,21 @@ export function createChargeGate({
   function ensureWatching() {
     connectWs();
     if (!timer) tick();
+  }
+
+  /*
+   * A backed-off timer must not delay a caller who just arrived: their quote has
+   * its own 15-minute life and did not cause the earlier failures. Only the
+   * quote-creation path may do this. Doing it in ensureWatching() instead looks
+   * equivalent and is not: waitForPayment() calls ensureWatching() on every
+   * iteration, and each open /x402/watch stream re-enters it on a 25s ceiling
+   * for the life of the quote (src/http.mjs). That would zero the backoff every
+   * 25s per watcher — continuously, and precisely while the RPC is struggling.
+   */
+  function watchNow() {
+    scanFails = 0;
+    if (timer) { clearTimeout(timer); timer = null; }
+    ensureWatching();
   }
 
   let ws = null;
@@ -804,6 +860,18 @@ export function createChargeGate({
       for (const t of registry.tools) {
         const rec = registry.costs && registry.costs[t.name];
         const dep = priceFor(t.name);
+        // No pin, no catalog forecast, no observed cost → this tool quotes the
+        // flat opening deposit, which is a guess, not a price. That is how three
+        // calls on 2026-07-23 took a $0.05 deposit against real costs up to
+        // $0.2455. Say it out loud rather than discovering it in the ledger.
+        const est = registry.estimates && registry.estimates[t.name];
+        if (!pinned.get(t.name) && !est && !(rec && Number.isFinite(rec.usd))) {
+          log(`warning: ${t.name} has no cost forecast (its models are not in the public catalog) and has never run — ` +
+            `it quotes the flat ${fmtUsd(usd)} opening deposit and you eat any overage; pin a price with x402.usd in its graph file`);
+        } else if (est && est.unpriced > 0) {
+          log(`note: ${t.name} forecast covers ${est.priced} of ${est.priced + est.unpriced} priced node(s) — ` +
+            `${fmtUsd(dep)} deposit is a lower bound; pin x402.usd if runs exceed it`);
+        }
         if (rec && typeof rec.usd === "number" && rec.usd * 1.2 > dep) {
           log(`warning: ${t.name} deposit ${fmtUsd(dep)} is below its last observed cost ${fmtUsd(rec.usd)} + 20% — ` +
             `runs may exceed the deposit and you eat the difference; raise x402.usd in its graph file`);
@@ -949,7 +1017,7 @@ export function createChargeGate({
           };
           quotes.set(q.id, q);
           persist();
-          ensureWatching();
+          watchNow();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
           // Phase 1: this tools/call always HANGS UP with the payment-required
           // quote as its RESULT — every MCP client surfaces a result, so the pay

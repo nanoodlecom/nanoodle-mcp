@@ -1741,3 +1741,126 @@ test("the held-connection cap degrades a streaming call to plain JSON instead of
     server.close();
   }
 });
+
+/*
+ * Regression: 2026-07-23/25 production incident. A refund that could not send
+ * (RPC 429) sat in the owed queue, which kept anyWatchable() true forever, which
+ * kept scan() calling `receivable` every 5s — against the very endpoint that was
+ * throttling. It ran 34 hours and logged 5,158 failures. The queued send must
+ * keep retrying WITHOUT dragging the receivable poll along with it.
+ */
+test("a queued owed send does not keep polling receivable", async () => {
+  let t = 3_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") receivableCalls++;
+    return innerRpc(body);
+  };
+
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain.state.failTransfer = true; // refund bounces → owed queue, and stays there
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(res.isError);
+
+  // Past LATE_WATCH_MS: no quote is payment-watchable any more, only `owed` is left.
+  t += 2 * 60 * 60 * 1000;
+  await new Promise((r) => setTimeout(r, 40)); // let a tick land in the new state
+  const before = receivableCalls;
+  await new Promise((r) => setTimeout(r, 120)); // at pollMs=5 the old code got ~24 more
+  assert.equal(receivableCalls, before,
+    "owed-only ticks must not touch the node — that poll fed the rate limit blocking the refund");
+
+  // …and the retry itself still works the moment the transfer can go through.
+  chain.state.failTransfer = false;
+  t += 61_000; // past OWED_BACKOFF_MS[1], where the retry during the idle stretch left o.at
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+});
+
+test("a failing scan backs off instead of hammering at the poll rate", async () => {
+  let t = 4_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") { receivableCalls++; throw new Error("Nano RPC receivable: 429"); }
+    return innerRpc(body);
+  };
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  await callTool({ name: "poster", arguments: { Text: "a" } }); // pending quote → fast poll
+
+  await new Promise((r) => setTimeout(r, 300));
+  // Ungated at pollMs=5 this is ~60 calls; doubling 5→10→20→40… caps it well under that.
+  assert.ok(receivableCalls > 0, "it must still try");
+  assert.ok(receivableCalls <= 12, `expected backoff to bound the retries, got ${receivableCalls}`);
+});
+
+/*
+ * Regression on the fix above: the backoff reset used to live in
+ * ensureWatching(), which looks like "a new caller arrived" but is re-entered by
+ * waitForPayment() — and each open /x402/watch stream re-enters that on a 25s
+ * ceiling for the whole life of the quote. That zeroed scanFails continuously,
+ * so the backoff never engaged for any quote anyone was actually watching, which
+ * is all of them. Measured at the time: 8 watchers made MORE receivable calls
+ * than the unfixed code.
+ */
+test("an open payment watcher does not reset the scan backoff", async () => {
+  let t = 5_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") { receivableCalls++; throw new Error("Nano RPC receivable: 429"); }
+    return innerRpc(body);
+  };
+  const gate = makeGate(chain, { registry, now: () => t, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+
+  // Four watchers re-polling the way the SSE loop does, well inside the backoff.
+  let watching = true;
+  const watcher = async () => { while (watching) await gate.waitForPayment(x.paymentId, 15); };
+  const streams = [watcher(), watcher(), watcher(), watcher()];
+  await new Promise((r) => setTimeout(r, 300));
+  watching = false;
+  await Promise.all(streams);
+
+  // Ungated at pollMs=5 this is ~60; with the reset in ensureWatching it was worse.
+  assert.ok(receivableCalls <= 12,
+    `watchers must not defeat the backoff, got ${receivableCalls} receivable calls`);
+});
+
+test("a genuinely new quote does reset the scan backoff", async () => {
+  let t = 6_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let failing = true;
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") {
+      receivableCalls++;
+      if (failing) throw new Error("Nano RPC receivable: 429");
+    }
+    return innerRpc(body);
+  };
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  await callTool({ name: "poster", arguments: { Text: "a" } });
+  await new Promise((r) => setTimeout(r, 200)); // ramp the backoff up
+
+  failing = false;
+  const before = receivableCalls;
+  const y = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
+  chain.state.receivable["E".repeat(64)] = { amount: y.amountRaw, source: PAYER };
+  await new Promise((r) => setTimeout(r, 60)); // must scan promptly, not wait out the backoff
+  assert.ok(receivableCalls > before,
+    "a fresh quote must get an immediate scan rather than inherit an earlier caller's backoff");
+
+});
