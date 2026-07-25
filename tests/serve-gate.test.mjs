@@ -1800,3 +1800,67 @@ test("a failing scan backs off instead of hammering at the poll rate", async () 
   assert.ok(receivableCalls > 0, "it must still try");
   assert.ok(receivableCalls <= 12, `expected backoff to bound the retries, got ${receivableCalls}`);
 });
+
+/*
+ * Regression on the fix above: the backoff reset used to live in
+ * ensureWatching(), which looks like "a new caller arrived" but is re-entered by
+ * waitForPayment() — and each open /x402/watch stream re-enters that on a 25s
+ * ceiling for the whole life of the quote. That zeroed scanFails continuously,
+ * so the backoff never engaged for any quote anyone was actually watching, which
+ * is all of them. Measured at the time: 8 watchers made MORE receivable calls
+ * than the unfixed code.
+ */
+test("an open payment watcher does not reset the scan backoff", async () => {
+  let t = 5_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") { receivableCalls++; throw new Error("Nano RPC receivable: 429"); }
+    return innerRpc(body);
+  };
+  const gate = makeGate(chain, { registry, now: () => t, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+
+  // Four watchers re-polling the way the SSE loop does, well inside the backoff.
+  let watching = true;
+  const watcher = async () => { while (watching) await gate.waitForPayment(x.paymentId, 15); };
+  const streams = [watcher(), watcher(), watcher(), watcher()];
+  await new Promise((r) => setTimeout(r, 300));
+  watching = false;
+  await Promise.all(streams);
+
+  // Ungated at pollMs=5 this is ~60; with the reset in ensureWatching it was worse.
+  assert.ok(receivableCalls <= 12,
+    `watchers must not defeat the backoff, got ${receivableCalls} receivable calls`);
+});
+
+test("a genuinely new quote does reset the scan backoff", async () => {
+  let t = 6_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let failing = true;
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") {
+      receivableCalls++;
+      if (failing) throw new Error("Nano RPC receivable: 429");
+    }
+    return innerRpc(body);
+  };
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  await callTool({ name: "poster", arguments: { Text: "a" } });
+  await new Promise((r) => setTimeout(r, 200)); // ramp the backoff up
+
+  failing = false;
+  const before = receivableCalls;
+  const y = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
+  chain.state.receivable["E".repeat(64)] = { amount: y.amountRaw, source: PAYER };
+  await new Promise((r) => setTimeout(r, 60)); // must scan promptly, not wait out the backoff
+  assert.ok(receivableCalls > before,
+    "a fresh quote must get an immediate scan rather than inherit an earlier caller's backoff");
+
+});

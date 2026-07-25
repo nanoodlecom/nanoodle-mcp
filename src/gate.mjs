@@ -593,10 +593,11 @@ export function createChargeGate({
   /*
    * Consecutive-failure backoff for the scan itself. retryOwed() has had a
    * backoff since day one; the receivable poll beside it had none, so a node
-   * answering 429 was re-asked at the full poll rate indefinitely. Doubling
-   * from the base interval up to a 5-minute ceiling keeps a genuinely pending
-   * payment responsive (a transient blip costs one or two slow ticks) while a
-   * sustained outage settles to ~12 calls/hour instead of 720.
+   * answering 429 was re-asked at the full poll rate indefinitely. Doubling from
+   * the base interval keeps a genuinely pending payment responsive (a transient
+   * blip costs one or two slow ticks); the 60s ceiling means a sustained outage
+   * settles to 60 receivable calls/hour instead of 720 (ws up, 5s base: 10, 20,
+   * 40, 60…; ws down, 1s base: 2, 4, 8, 16, 32, 60…).
    */
   const SCAN_BACKOFF_CAP_MS = 60 * 1000; // a quote only lives ~15min — never go quiet longer than this
   let scanFails = 0;
@@ -629,14 +630,22 @@ export function createChargeGate({
 
   function ensureWatching() {
     connectWs();
-    // A backed-off timer must not delay a caller who just arrived: their quote
-    // has its own 15-minute life and did not cause the earlier failures.
-    if (timer && scanFails > 0 && anyPaymentWatchable()) {
-      clearTimeout(timer);
-      timer = null;
-      scanFails = 0;
-    }
     if (!timer) tick();
+  }
+
+  /*
+   * A backed-off timer must not delay a caller who just arrived: their quote has
+   * its own 15-minute life and did not cause the earlier failures. Only the
+   * quote-creation path may do this. Doing it in ensureWatching() instead looks
+   * equivalent and is not: waitForPayment() calls ensureWatching() on every
+   * iteration, and each open /x402/watch stream re-enters it on a 25s ceiling
+   * for the life of the quote (src/http.mjs). That would zero the backoff every
+   * 25s per watcher — continuously, and precisely while the RPC is struggling.
+   */
+  function watchNow() {
+    scanFails = 0;
+    if (timer) { clearTimeout(timer); timer = null; }
+    ensureWatching();
   }
 
   let ws = null;
@@ -1008,7 +1017,7 @@ export function createChargeGate({
           };
           quotes.set(q.id, q);
           persist();
-          ensureWatching();
+          watchNow();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
           // Phase 1: this tools/call always HANGS UP with the payment-required
           // quote as its RESULT — every MCP client surfaces a result, so the pay
