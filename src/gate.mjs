@@ -282,6 +282,17 @@ export function createChargeGate({
     const t = now();
     for (const o of [...owed]) {
       if (t < o.at) continue;
+      // An entry is only removed from `owed` AFTER its send resolves, so any
+      // second retryOwed() running during that await sees it as still owed and
+      // sends it again. That is money out the door, once per concurrent pass.
+      // It is reachable: tick() nulls `timer` before awaiting scan(), so every
+      // ensureWatching() during an in-flight send re-enters tick() — and owe()
+      // and waitForPayment() both call ensureWatching(). Observed in production
+      // 2026-07-24: three identical 0.31294478 XNO sends inside one second, same
+      // PID, no restart (blocks 52DEA6AC…, 8CC22CDE…, 58EE40E5…). A local repro
+      // with a slow transfer and four watchers reached 45 sends of one entry.
+      if (o.sending) continue;
+      o.sending = true;
       o.tries++;
       try {
         const hash = await ops.transfer(o.to, o.amountRaw, o.describe);
@@ -299,6 +310,8 @@ export function createChargeGate({
         }
         o.at = t + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
         log(`retry ${o.tries} of ${o.describe} to ${o.to} failed: ${e.message}`);
+      } finally {
+        o.sending = false;
       }
     }
   }
@@ -453,6 +466,16 @@ export function createChargeGate({
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
             : null,
         });
+        // issue #23: q.refunding is a live-only Promise that persistence drops,
+        // so after a restart a restored owed refund retries the send WHILE the
+        // watcher re-scans the same payer block, sees `expired && !q.refunding`,
+        // and starts a second refund(). Both can land — the payer is refunded
+        // twice out of the operator's float. Re-arm the marker for any quote
+        // this queue is already carrying a refund for.
+        if (s.event === "refund" && s.fields && s.fields.paymentId) {
+          const q = quotes.get(s.fields.paymentId);
+          if (q) q.refunding = Promise.resolve(false); // "already in flight", resolved so nothing awaits forever
+        }
       }
       if (quotes.size || owed.length) log(`restored ${quotes.size} quote(s) and ${owed.length} queued send(s) from ${stateFile}`);
     } catch (e) {
@@ -601,8 +624,16 @@ export function createChargeGate({
    */
   const SCAN_BACKOFF_CAP_MS = 60 * 1000; // a quote only lives ~15min — never go quiet longer than this
   let scanFails = 0;
+  let scanning = false;
 
   function tick() {
+    // tick() nulls `timer` and then awaits, so for the whole duration of a scan
+    // every ensureWatching() call sees no timer and starts ANOTHER scan on top
+    // of it. That is what let concurrent retryOwed() passes double-send (see the
+    // o.sending guard). Belt and braces: never run two scans at once — the one
+    // in flight schedules the next tick when it finishes.
+    if (scanning) return;
+    scanning = true;
     timer = null;
     scan().then(
       () => { scanFails = 0; },
@@ -616,6 +647,7 @@ export function createChargeGate({
         }
       },
     ).then(() => {
+      scanning = false;
       if (!anyWatchable()) return;
       // With a live websocket the poll is only a safety net — relax it.
       let delay = wsConnected ? Math.max(pollMs, 5000) : pollMs;

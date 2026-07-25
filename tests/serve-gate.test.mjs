@@ -1864,3 +1864,81 @@ test("a genuinely new quote does reset the scan backoff", async () => {
     "a fresh quote must get an immediate scan rather than inherit an earlier caller's backoff");
 
 });
+
+/*
+ * Regression: 2026-07-24 triple payout. An owed entry is spliced out of the
+ * queue only AFTER its send resolves, so a second retryOwed() running during
+ * that await re-sent it. Reachable because tick() nulls `timer` before awaiting
+ * scan(), and every ensureWatching() during the send re-enters tick(). Observed
+ * in production as three identical 0.31294478 XNO sends inside one second, same
+ * PID, no restart; a local repro with four watchers reached 45.
+ */
+test("a slow owed send is never sent twice", async () => {
+  let t = 7_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  const slowTransfer = chain.ops.transfer;
+  chain.ops.transfer = async (to, amountRaw, describe) => {
+    if (chain.state.failTransfer) throw new Error("transfer refused");
+    await new Promise((r) => setTimeout(r, 60)); // a real send waits on work generation
+    return slowTransfer(to, amountRaw, describe);
+  };
+  const gate = makeGate(chain, { registry, now: () => t, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain.state.failTransfer = true; // refund bounces onto the owed queue
+  assert.ok((await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } })).isError);
+
+  // A second, still-pending quote keeps watchers calling ensureWatching() —
+  // waitForPayment() returns early for a settled quote, so this is what makes
+  // the re-entrancy reachable, and it is ordinary concurrent traffic.
+  const y = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
+  chain.state.failTransfer = false;
+  t += 61_000;
+  let watching = true;
+  const watcher = async () => { while (watching) await gate.waitForPayment(y.paymentId, 5); };
+  const streams = [watcher(), watcher(), watcher(), watcher()];
+  await new Promise((r) => setTimeout(r, 400));
+  watching = false;
+  await Promise.all(streams);
+
+  const refunds = chain.state.transfers.filter((s) => s.describe === "refunded");
+  assert.equal(refunds.length, 1, `the refund must be sent exactly once, got ${refunds.length}`);
+});
+
+test("a restored owed refund blocks a second refund of the same late payment", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-dupe-")), "gate-state.json");
+  let t = 8_000_000;
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile, now: () => t, pollMs: 5 });
+  const { callTool } = gate1.wrapRegistry(registry1);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+
+  // #23 is specifically the LATE-payment path: the quote must EXPIRE unpaid,
+  // and only then does the payer's block show up. A consumed quote never
+  // reaches the `expired && !q.refunding` branch, so it cannot reproduce this.
+  t += 16 * 60 * 1000; // past QUOTE_TTL_MS
+  chain1.state.failTransfer = true; // the late-payment refund bounces → persisted owed entry
+  chain1.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  await new Promise((r) => setTimeout(r, 120)); // watcher notices the late payment and tries to bounce it
+  assert.equal(gate1.quote(x.paymentId).status, "expired", "quote must be expired, not consumed");
+  await new Promise((r) => setTimeout(r, 30)); // let persist() flush
+
+  // Restart: same state file, and the payer's block is STILL visible on chain
+  // (never pocketed), so the fresh watcher re-scans it.
+  const chain2 = fakeChain();
+  chain2.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const gate2 = makeGate(chain2, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5 });
+  gate2.wrapRegistry(fakeRegistry());
+  t += 61_000;
+  await new Promise((r) => setTimeout(r, 150));
+
+  const refunds = chain2.state.transfers.filter((s) => s.describe === "refunded");
+  assert.equal(refunds.length, 1, `restart must not refund twice, got ${refunds.length}`);
+});
