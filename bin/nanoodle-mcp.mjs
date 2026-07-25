@@ -31,6 +31,7 @@ import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
 import { loadTools, attachEstimates } from "../src/tools.mjs";
+import { warnIfFfmpegMissing } from "../src/ffmpeg-check.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { createChargeGate } from "../src/gate.mjs";
@@ -265,6 +266,10 @@ async function main() {
     console.error("nanoodle-mcp: warning — no NanoGPT API key (NANOGPT_API_KEY / --key / --env-file) " +
       "and no x402 wallet (NANO_SEED / NANO_PRIVATE_KEY); tool calls that hit the API will fail");
   }
+  // Local-media tools (resize/vframes/combine/audio) fall back to ffmpeg for formats
+  // the pure-JS path can't handle. Missing on a server = mid-run failures (auto-refunded
+  // in charge mode). Warn once at boot, naming the at-risk tools, instead of per call.
+  await warnIfFfmpegMissing(registry.tools);
   if (wallet) {
     console.error(`nanoodle-mcp: wallet mode (accountless x402) — paying from ${wallet.address}` +
       (maxUsd != null ? `, capped at $${maxUsd}/call` : ", no per-call cap (--max-usd)") +
