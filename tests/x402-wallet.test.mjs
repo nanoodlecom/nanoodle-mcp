@@ -730,3 +730,44 @@ test("E2E: keyless server pays a 402 invoice from NANO_SEED and returns the resu
     await new Promise((r) => { child.once("exit", r); setTimeout(() => child.kill(), 2000).unref(); });
   }
 });
+
+test("failover: a 200-wrapped {\"error\":\"429\"} is a refusal, not the network's answer", async () => {
+  // Production 2026-07-24: `Nano RPC account_info: 429` killed a paid run and
+  // its refund. That message is the json.error branch — a proxy answering HTTP
+  // 200 with a rate-limit BODY. Classified authoritative it never failed over,
+  // so one throttling proxy hard-failed the settlement while three healthy
+  // endpoints sat unused. It must behave exactly like the 429 status.
+  const primaryActions = [];
+  const good = fakeRpc();
+  const fetch = async (url, init) => {
+    if (url.startsWith("http://primary")) {
+      primaryActions.push(JSON.parse(init.body).action);
+      return { ok: true, status: 200, text: async () => JSON.stringify({ error: "429" }) };
+    }
+    return good.fetch(url, init);
+  };
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "http://primary,http://good", fetch });
+  await wallet.payment(invoice());
+  assert.equal(good.state.processed.length, 1, "block published via the healthy secondary");
+  assert.ok(primaryActions.includes("account_info"), "primary tried first for the read");
+  assert.ok(primaryActions.includes("process"), "a refusal is safe to retry elsewhere, publish included");
+});
+
+test("a real node error still never fails over", async () => {
+  // The guard on the fix above: only throttling is a refusal. A genuine answer
+  // ("Account not found", "Fork", "Old block") must stay authoritative — asking
+  // a different node would be wrong, and for a publish it would double-submit.
+  const { isThrottleError } = await import("../src/wallet.mjs");
+  for (const real of ["Account not found", "Fork", "Old block", "Gap previous block", "Bad signature"]) {
+    assert.equal(isThrottleError(real), false, `${real} must not read as throttling`);
+  }
+  for (const throttle of ["429", " 429 ", "Too Many Requests", "rate limit exceeded", "rate-limited", "HTTP 429"]) {
+    assert.equal(isThrottleError(throttle), true, `${throttle} must read as throttling`);
+  }
+
+  let tried = 0;
+  const fetch = async () => { tried++; return { ok: true, status: 200, text: async () => JSON.stringify({ error: "Fork" }) }; };
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "http://a,http://b,http://c", fetch });
+  await assert.rejects(() => wallet.ops.rpc({ action: "account_info", account: ADDRESS }), /Fork/);
+  assert.equal(tried, 1, "an authoritative error must stop at the first node");
+});
