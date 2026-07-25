@@ -9,8 +9,8 @@
 
 Point this MCP server at a folder of `noodle-graph.json` saves from the
 nanoodle editor and every graph becomes a callable tool with a derived input
-schema — in Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, or anything
-else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
+schema — in Claude Code, Grok, Claude Desktop, Cursor, VS Code, Windsurf, or
+anything else that speaks the [Model Context Protocol](https://modelcontextprotocol.io).
 It speaks stdio to your own agent by default, or HTTP to everyone with
 [serve mode](#serve-mode--host-your-noodles-as-a-service---serve) — including
 [charging per call in Nano](#charging-per-call---charge-usd), so strangers'
@@ -55,6 +55,27 @@ marketplace):
 ```
 /plugin marketplace add nanoodlecom/nanoodle-mcp
 /plugin install nanoodle@nanoodle
+```
+
+### Grok
+
+```bash
+grok mcp add nanoodle -e NANOGPT_API_KEY=your-key-here -- npx -y nanoodle-mcp --graphs ~/noodles
+```
+
+Or, for a remote/serve endpoint (no local process, no API key on your machine):
+
+```bash
+grok mcp add --transport http noodles https://mcp.nanoodle.com/mcp
+```
+
+That writes `[mcp_servers.noodles]` into `~/.grok/config.toml` (or
+`.grok/config.toml` with `--scope project`). Same shape by hand:
+
+```toml
+[mcp_servers.noodles]
+url = "https://mcp.nanoodle.com/mcp"
+enabled = true
 ```
 
 ### Cursor
@@ -204,12 +225,15 @@ Callers connect with one command — no key, no signup:
 
 ```bash
 claude mcp add --transport http noodles https://your-host/mcp
+# or
+grok mcp add --transport http noodles https://your-host/mcp
 ```
 
-`GET /` serves a landing page with the tool list and that exact command, so
-sharing your server's bare URL *is* the onboarding. Every workflow on it links
-to its source: an **open in editor** link (a share link minted from the exact
-graph file being served — it loads the workflow in the
+`GET /` serves a landing page with the tool list and that exact command (Claude
+and Grok behind a one-click toggle — same endpoint, same flags), so sharing
+your server's bare URL *is* the onboarding. Every workflow on it links to its
+source: an **open in editor** link (a share link minted from the exact graph
+file being served — it loads the workflow in the
 [nanoodle editor](https://nanoodle.com) to inspect, remix, or run on your own
 key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
 out the economics (deposits settle at metered cost + 20%, the markup is the
@@ -279,24 +303,27 @@ Now every tool call is paid in Nano (XNO) **by the caller**, with no accounts
 on either side. The flow their agent walks through (the server's MCP
 `instructions` teach it automatically):
 
-1. First `tools/call` returns **PAYMENT REQUIRED** with a `payUrl` — a
-   self-contained pay page showing a QR code for the exact amount. The agent
-   shows its user the link; any Nano wallet scans it.
-2. The page flips to a green check the moment the payment lands (about a
-   second — the gate watches the chain by RPC polling, or push via
-   `--nano-ws`). The agent re-calls the tool with the same arguments plus the
-   `_payment_id` from step 1. It can call **right after showing the link**, not
-   only after the user confirms: on a streaming transport (Claude Code, Cursor,
-   …) that call is **held open** — it waits for the payment to land, then runs —
-   so there's no third call after paying. (The pay page, and any HTTP client,
-   can also subscribe to `GET /x402/watch/<id>` — one SSE `status` event per
-   state change — or poll `GET /x402/status/<id>?wait=1`.)
-3. The run executes and the result streams back with a receipt. **What they
-   paid is a deposit, not the price**: the call settles at the run's *actual*
-   metered model cost + 20%, and everything above that is sent back to the
-   paying wallet as change — the same deposit→meter→refund model NanoGPT
-   itself uses, one layer up. Nobody ever pays off an estimate. Re-calls with
-   the same `_payment_id` replay the cached result free.
+On each **PAYMENT REQUIRED** quote the tools/call **hangs up** with `payUrl`,
+`watchUrl`, and a `next` imperative ( `blocking: false` ):
+
+1. **Pay.** Show the user ONLY `payUrl` (QR for the exact amount); any Nano
+   wallet scans it. Never show them `watchUrl` or the wallet address.
+2. **Watch — immediately, on that same payment link.** The agent opens
+   `watchUrl` (`GET /x402/watch/<id>`, agent-only SSE) the moment it has the
+   quote. One `status` event per state change; when payment lands the stream
+   **closes** with `done: true` and a `next` field for phase 3. (The pay page
+   uses the same stream; poll `GET /x402/status/<id>?wait=1` as a fallback.)
+   Detection is RPC polling or push via `--nano-ws` — about a second.
+3. **Results.** ONLY after the watch closes paid: re-call the tool with the same
+   arguments plus `_payment_id`. That `tools/call` is the **results stream** —
+   it runs the workflow (progress heartbeats on a streaming transport) and
+   returns the result with a receipt. Do not open it while still watching for
+   payment. Re-calls with the same `_payment_id` replay the cached result free.
+
+**What they paid is a deposit, not the price**: the call settles at the run's
+*actual* metered model cost + 20%, and everything above that is sent back to the
+paying wallet as change — the same deposit→meter→refund model NanoGPT itself
+uses, one layer up. Nobody ever pays off an estimate.
 
 Nano has no payment memo, so each quote's amount carries a few raw of random
 dust — **the amount is the memo**. Quotes expire after 15 minutes; a payment

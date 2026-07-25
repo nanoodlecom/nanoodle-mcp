@@ -8,7 +8,7 @@ this server hosts:
 
 - **Icon** (`icon-512.png` and the favicons cut from it): the
   [favicon](https://github.com/nanoodlecom/awesome-noodles/blob/main/graphs/favicon.noodle-graph.json)
-  noodle — brand description in, 512×512 icon out.
+  noodle — brand description in, one bold square glyph out.
 - **OG card** (`og.jpg`, 1200×630): an og-card noodle (brand copy + house style
   → LLM art direction → image model → 1200×630 crop).
 

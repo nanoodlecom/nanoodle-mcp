@@ -56,6 +56,18 @@ const SEND_WORK_THRESHOLD = "fffffff800000000";
 /** Receive blocks are allowed much cheaper work since v21. */
 const RECEIVE_WORK_THRESHOLD = "fffffe0000000000";
 
+/*
+ * Does a JSON-RPC `error` string mean "I refused to serve you" rather than "the
+ * network's answer is no"? Deliberately narrow: a real node's errors are things
+ * like "Account not found", "Fork", "Old block", and misreading one of those as
+ * a refusal would send a publish shopping around the chain — exactly what the
+ * authoritative class exists to prevent. Only proxy throttling matches.
+ */
+export function isThrottleError(msg) {
+  const s = String(msg == null ? "" : msg);
+  return /^\s*429\s*$/.test(s) || /\b429\b|too many requests|rate[\s_-]?limit/i.test(s);
+}
+
 /** raw → XNO display string (1 XNO = 10^30 raw), trimmed to something readable. */
 export function rawToXno(raw) {
   const s = BigInt(raw).toString().padStart(31, "0");
@@ -110,8 +122,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   //   .authoritative — the node returned a valid JSON-RPC answer that is itself
   //     an error ("Account not found", "Fork", "Old block"). That is the
   //     network's real answer; asking a different node would be wrong.
-  //   .rejected — the request was refused BEFORE it could take effect (HTTP 429
-  //     from a throttling proxy). The block definitely did not land, so even a
+  //   .rejected — the request was refused BEFORE it could take effect (a 429
+  //     from a throttling proxy, whether as an HTTP status or as a rate-limit
+  //     json.error body on a 200). The block definitely did not land, so even a
   //     publish is safe to retry on another node.
   //   neither — ambiguous (dropped connection, proxy 5xx, non-JSON). A read may
   //     safely retry; a publish must NOT (the node may have accepted it and only
@@ -138,7 +151,17 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     }
     if (json.error) {
       const e = new Error(`Nano RPC ${body.action}: ${json.error}`);
-      e.authoritative = true;
+      // Some proxies report throttling as HTTP 200 with a rate-limit ERROR BODY
+      // rather than a 429 status. Treated as authoritative that is the worst of
+      // both worlds: the chain refuses to fail over ("the network answered"), so
+      // one throttling proxy hard-fails the whole settlement even with four
+      // healthy nodes behind it. Production 2026-07-24: a paid run died on
+      // `Nano RPC account_info: 429` and its refund with it, stranding the
+      // payment, while three other endpoints sat unused. A refusal is a refusal
+      // — classify it like the 429 status it is, including for publishes: the
+      // proxy declined to forward, so the block provably did not land.
+      if (isThrottleError(json.error)) e.rejected = true;
+      else e.authoritative = true;
       throw e;
     }
     return json;

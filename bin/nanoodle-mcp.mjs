@@ -369,21 +369,16 @@ async function main() {
     ({ listTools, callTool } = gate.wrapRegistry(registry));
     instructions =
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
-      "The first call to a tool returns PAYMENT REQUIRED with a payUrl: show ONLY that link to your user " +
-      "(it renders a QR code and confirms on-screen when the payment lands, usually within a second) — do " +
-      "not show them any other URL or the wallet address. Then IMMEDIATELY " +
-      "call the same tool again with identical arguments plus the given _payment_id — right after showing " +
-      "the link, do NOT wait for the user to say 'go' or confirm they paid. That call blocks until the " +
-      "payment lands, then runs (streaming progress with the tool's typical runtime), so you never have to " +
-      "call a third time after paying. Paying is the consent — there is nothing to ask the user first. " +
-      "That _payment_id call is how YOU watch for the payment — the user never tells you they paid. (If you " +
-      "run your own event loop, the server also exposes a payment-status SSE stream at /x402/watch/<paymentId>; " +
-      "that is for you, never show it to the user.) " +
-      "The amount paid is a " +
-      "DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the workflow " +
-      "author's cut), and the difference is sent back " +
-      "to the paying wallet as change after the run. Quotes expire after 15 minutes. If a run fails after " +
-      "payment, the whole payment is refunded automatically.";
+      "When a tools/call returns PAYMENT REQUIRED it HANGS UP with a payUrl and a watchUrl. " +
+      "On that payment link: show your user ONLY the payUrl (QR; confirms on-screen when paid) — never the watch URL or wallet address — " +
+      "and IMMEDIATELY open structuredContent.x402.watchUrl yourself (GET /x402/watch/<paymentId>, Accept: text/event-stream; agent-only). " +
+      "Wait until that watch stream CLOSES with status paid, done:true, and a next field. " +
+      "ONLY THEN call the same tool again with identical arguments plus _payment_id — that tools/call is the RESULTS stream " +
+      "(progress heartbeats, then the result). Do not open results while still watching for payment, and do not hold a tools/call open to wait for payment. " +
+      "Paying is the consent — nothing to ask the user. " +
+      "The amount paid is a DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the " +
+      "workflow author's cut), and the difference is sent back to the paying wallet as change after the run. " +
+      "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically.";
   } else {
     // Free serve mode writes NO usage.jsonl — no money moves, so there is no
     // payments ledger, and we deliberately don't log run telemetry either
@@ -412,6 +407,7 @@ async function main() {
       ? ` — charging $${chargeUsd}/call in XNO to ${wallet.address}`
       : " — free (runs spend from this server's balance)"));
   console.error(`nanoodle-mcp: connect with: claude mcp add --transport http noodles ${publicBase}/mcp`);
+  console.error(`nanoodle-mcp:             or: grok mcp add --transport http noodles ${publicBase}/mcp`);
   // The ledger records money only, and only exists in charge mode.
   if (usagePath) console.error(`nanoodle-mcp: payments ledger: ${usagePath}`);
 }

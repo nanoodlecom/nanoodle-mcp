@@ -7,18 +7,21 @@
  *                        createDispatcher() that powers stdio handles everything.
  *                        tools/call from an SSE-capable client answers as an
  *                        event stream with progress heartbeats — generations
- *                        and payment waits outlive client tool timeouts. On a paid
- *                        server the first call returns the payment-required quote;
- *                        the follow-up _payment_id call is what's held open through
- *                        payment (so the caller never re-invokes AFTER paying).
- *   GET  /               landing page: hero connect command, how payment flows, tool list
- *                        w/ per-workflow editor links, self-hosting + author-payout story
+ *                        outlive client tool timeouts. On a paid server the flow is
+ *                        three sequential SSE phases (never parallel): (1) tools/call
+ *                        returns the payment-required quote and hangs up; (2) agent
+ *                        opens GET /x402/watch/:id until paid closes it; (3) tools/call
+ *                        with _payment_id is the RESULTS stream only.
+ *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
+ *                        flows, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
- *   GET  /x402/watch/:id   SSE: one `status` event per state change, closes on settle
- *                        (the pay page subscribes to it; falls back to /x402/status)
+ *   GET  /x402/watch/:id   SSE: one `status` event per state change; on settle
+ *                        (paid/expired/…) closes with done:true + next instructions
+ *                        telling the agent how to open the result stream (tools/call
+ *                        with _payment_id). Pay page subscribes; falls back to /x402/status
  *   GET  /out/:file      generated media (unguessable filenames), when an outDir is given
  *   GET  /favicon.ico|/favicon.png|/apple-touch-icon.png|/icon-512.png|/og.jpg
  *                        brand assets from assets/ — the icon and the social (OG) card,
@@ -121,6 +124,12 @@ const LANDING_CSS = `
   .eyebrow{color:var(--accent);font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;text-align:center;margin:1.5rem 0 .6rem}
   h1{font-size:clamp(2rem,6vw,3rem);margin:0;text-align:center;letter-spacing:-.02em}
   .sub{color:var(--muted);text-align:center;margin:.75rem auto 2rem;max-width:40rem}
+  .connect-wrap{display:flex;flex-direction:column;gap:.65rem}
+  .tabs{display:flex;justify-content:center;gap:.35rem}
+  .tabs .tab{font:inherit;font-size:.8rem;padding:.35rem .85rem;border-radius:999px;border:1px solid var(--edge);
+    background:transparent;color:var(--muted);cursor:pointer}
+  .tabs .tab:hover{border-color:var(--accent);color:var(--fg)}
+  .tabs .tab.on{border-color:var(--accent);background:rgba(45,212,191,.12);color:var(--accent)}
   .connect{display:flex;align-items:center;gap:1rem;background:var(--card);border:1px solid var(--accent);
     border-radius:14px;box-shadow:0 0 28px rgba(45,212,191,.16);padding:1rem 1.25rem}
   .connect pre{margin:0;padding:0;background:none;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:hidden;font-size:.95rem;color:var(--accent)}
@@ -171,10 +180,21 @@ const toolTitle = (name) => {
   return s.charAt(0).toUpperCase() + s.slice(1);
 };
 
+/**
+ * One-line "register this server" commands for the clients that ship an
+ * `mcp add --transport http` CLI. Same endpoint, same flag shape — only the
+ * binary name changes. Landing page defaults to Claude; a toggle flips to Grok.
+ */
+const connectCmds = (publicBase) => ({
+  claude: `claude mcp add --transport http noodles ${publicBase}/mcp`,
+  grok: `grok mcp add --transport http noodles ${publicBase}/mcp`,
+});
+
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
-  const cmd = `claude mcp add --transport http noodles ${publicBase}/mcp`;
+  const cmds = connectCmds(publicBase);
+  const cmd = cmds.claude;
   const cards = tools.map((t) => {
     const info = infoByName.get(t.name);
     const links = info ? `<span class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
@@ -231,8 +251,14 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     <p class="sub">Image, video, audio, and text pipelines behind one MCP endpoint.
       ${charged ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
-    <div class="connect"><pre id="cmd">${esc(cmd)}</pre><button onclick="copyCmd(this)">copy</button></div>
-    <p class="hint">works with Claude Code, Cursor, and any MCP client</p>
+    <div class="connect-wrap">
+      <div class="tabs" role="tablist" aria-label="MCP client">
+        <button type="button" class="tab on" role="tab" aria-selected="true" data-client="claude" onclick="selectClient(this)">Claude</button>
+        <button type="button" class="tab" role="tab" aria-selected="false" data-client="grok" onclick="selectClient(this)">Grok</button>
+      </div>
+      <div class="connect"><pre id="cmd">${esc(cmd)}</pre><button type="button" onclick="copyCmd(this)">copy</button></div>
+    </div>
+    <p class="hint">works with Claude Code, Grok, Cursor, and any MCP client</p>
     <div class="steps">
       <div class="step"><span class="n">01</span><b>paste the command</b>
         <p>one line registers every workflow with your agent.</p></div>
@@ -289,6 +315,17 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     </div>
     <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a></footer>
     <script>
+      const CMDS = ${JSON.stringify(cmds)};
+      function selectClient(btn){
+        const id = btn.getAttribute("data-client");
+        if (!CMDS[id]) return;
+        document.getElementById("cmd").textContent = CMDS[id];
+        document.querySelectorAll(".tabs .tab").forEach((b) => {
+          const on = b === btn;
+          b.classList.toggle("on", on);
+          b.setAttribute("aria-selected", on ? "true" : "false");
+        });
+      }
       function copyCmd(b){
         navigator.clipboard.writeText(document.getElementById("cmd").textContent).then(() => {
           b.textContent = "copied";
@@ -311,16 +348,19 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
     ``,
     `endpoint: ${publicBase}/mcp (MCP streamable HTTP — POST JSON-RPC, SSE progress on tools/call)`,
-    `connect:  claude mcp add --transport http noodles ${publicBase}/mcp`,
+    `connect (Claude): claude mcp add --transport http noodles ${publicBase}/mcp`,
+    `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
     ``,
   ];
   if (charged) {
     lines.push(
       `## Payment (x402, Nano/XNO)`,
       ``,
-      `- No accounts, no API keys. Each tools/call answers with a payment quote: an exact XNO amount, a nano: URI, and a payUrl (${publicBase}/pay/<id>). Show the user ONLY the payUrl.`,
-      `- Send exactly the quoted amount (the amount identifies the payment), then IMMEDIATELY call again with the returned _payment_id — right after showing the link, do not wait for the user to say "go". On a streaming transport (Accept: text/event-stream) that call blocks (held open with heartbeats) until the payment lands, then runs. Paying is the consent; the result object carries "blocking":true and a "next" imperative saying exactly this. That call is how you watch for the payment.`,
-      `- Agent-only (never show the user): to watch a payment settle yourself, subscribe to the SSE stream ${publicBase}/x402/watch/<id> (one status event per state change) or poll ${publicBase}/x402/status/<id>?wait=1.`,
+      `- No accounts, no API keys. On each PAYMENT REQUIRED quote (this call hangs up):`,
+      `  1. Show the user ONLY the payUrl (${publicBase}/pay/<id>).`,
+      `  2. IMMEDIATELY open the agent-only payment-monitor SSE at structuredContent.x402.watchUrl (${publicBase}/x402/watch/<id>) — never show that URL to the user. Wait until it CLOSES with status "paid", done:true, and next. (Or poll ${publicBase}/x402/status/<id>?wait=1.)`,
+      `  3. ONLY THEN tools/call again with _payment_id — that is the RESULTS stream. Do not open it while still watching for payment.`,
+      `- Paying is the consent; do not wait for a human "go". The quote carries payUrl, watchUrl, and a next imperative that says: on this payment link, show payUrl and open watchUrl now (blocking:false).`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
       `- The 20% is the workflow author's cut, not a platform fee.`,
       ``,
@@ -610,16 +650,21 @@ export async function serveHttp({
         const id = decodeURIComponent(statusMatch[1]);
         if (url.searchParams.get("wait")) await gate.waitForPayment(id, 25_000);
         const q = gate.quote(id);
-        return send(200, JSON.stringify(q ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt } : { status: "unknown" }));
+        // Terminal quotes carry done + next (agent instructions for the result stream).
+        return send(200, JSON.stringify(q
+          ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.done ? { done: true, next: q.next } : {}) }
+          : { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." }));
       }
 
       /*
-       * SSE payment watch: one `status` event per state change, closing the
-       * instant the payment lands (or the quote dies). It's push, not polling —
-       * the pay page subscribes to it (falling back to /x402/status polling if the
-       * browser can't), and any HTTP client can too. It rides the gate's shared
-       * waiter list, so a thousand subscribers still cost one chain poll. At the
-       * held-connection cap it 503s and the caller falls back to polling.
+       * SSE payment watch: one `status` event per state change. When the quote
+       * settles (paid / expired / …) the FINAL frame includes done:true and a
+       * `next` imperative telling the agent how to open the result stream
+       * (tools/call with _payment_id) — then the connection closes. Without that,
+       * a subscriber sees bare "paid" and a loading gap with no path forward.
+       * The pay page only reads `.status` (extra fields are harmless). Rides the
+       * gate's shared waiter list; at the held-connection cap it 503s so the
+       * caller falls back to polling.
        */
       const watchMatch = url.pathname.match(/^\/x402\/watch\/([^/]+)$/);
       if (watchMatch && gate) {
@@ -634,11 +679,19 @@ export async function serveHttp({
         let alive = true;
         req.on("close", () => { alive = false; });
         const sse = (ev, obj) => { if (alive && !res.writableEnded && !res.destroyed) res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`); };
+        // Frame shape shared with /x402/status — pending is lean; terminal carries
+        // done + next so the agent knows how to access the result stream after close.
+        const frame = (q) => {
+          if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
+          const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
+          if (q.done) { f.done = true; if (q.next) f.next = q.next; }
+          return f;
+        };
         const ping = setInterval(() => { if (alive && !res.writableEnded && !res.destroyed) res.write(`: ping\n\n`); }, progressMs);
         if (ping.unref) ping.unref();
         try {
           let q = gate.quote(id);
-          sse("status", q ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt } : { status: "unknown" });
+          sse("status", frame(q));
           // Hold the stream open across state changes until the quote settles or
           // the client leaves. Each wait resolves on the shared watcher firing
           // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
@@ -647,7 +700,9 @@ export async function serveHttp({
           while (alive && q && q.status === "pending" && Date.now() < deadline) {
             await gate.waitForPayment(id, 25_000);
             q = gate.quote(id);
-            if (q) sse("status", { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt });
+            if (q) sse("status", frame(q));
+            // On settle the final frame already carried done+next; the loop exits
+            // and finally{} closes the stream — that close IS the acknowledgment.
           }
         } finally {
           clearInterval(ping);

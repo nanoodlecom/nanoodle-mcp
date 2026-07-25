@@ -128,19 +128,28 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   assert.match(quoteRes.content[0].text, new RegExp(x.paymentId));
   assert.equal(x.payUrl, `http://pay.test/pay/${x.paymentId}`);
   assert.equal(x.address, GATE_ADDR);
-  // machine-readable "proceed now" hints so an agent re-calls instead of pausing for a human "go"
-  assert.equal(x.blocking, true, "the result flags that the _payment_id call blocks");
-  assert.match(x.next, /_payment_id/, "the next-step imperative names the follow-up call");
-  assert.match(x.next, /do not wait for a human "go"/i);
+  // three sequential phases — never hold tools/call through payment
+  assert.equal(x.blocking, false, "results tools/call must not block on payment — watch does that");
+  assert.deepEqual(x.phases, ["pay", "watch", "results"]);
+  assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "agent gets watchUrl for phase 2");
+  assert.match(x.next, /IMMEDIATELY open/i, "next tells the agent to open the watch URL on the payment link");
+  assert.match(x.next, new RegExp(x.watchUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "next carries the concrete watch URL");
+  assert.match(x.next, /_payment_id/, "phase 3 is tools/call + _payment_id");
   assert.match(x.next, new RegExp(x.paymentId), "the next imperative carries this payment id");
+  // human-facing text names the watch URL with an agent-only / never-show guard
+  assert.match(quoteRes.content[0].text, /IMMEDIATELY open and watch/i);
+  assert.match(quoteRes.content[0].text, new RegExp(x.watchUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(quoteRes.content[0].text, /NEVER show this URL to the user/i);
   // $0.05 at $1/XNO ≈ 0.05 XNO plus a sub-cent tag, in whole 1e-8 XNO steps
   assert.ok(BigInt(x.amountRaw) >= 5n * 10n ** 28n && BigInt(x.amountRaw) < 5n * 10n ** 28n + 10n ** 26n);
   assert.equal(BigInt(x.amountRaw) % GRAIN, 0n, "amount must be exactly typeable at 8 decimals");
 
-  // unpaid re-call with the id: reports pending, runs nothing
+  // unpaid re-call with the id: hang up with watch instructions — do not hold the results stream
   const pending = await callTool({ name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId } });
   assert.ok(pending.isError);
   assert.match(pending.content[0].text, /hasn't arrived/);
+  assert.match(pending.content[0].text, /x402\/watch/, "points the agent at the watch SSE");
+  assert.match(pending.content[0].text, /RESULTS stream/i);
   assert.equal(registry.callCount(), 0);
 
   // the exact tagged amount lands on-chain
@@ -518,7 +527,7 @@ test("payment-required text carries the tool's typical runtime when known", asyn
   registry.costs = { poster: { usd: 0.03, ms: 15_000, at: "2026-07-22T00:00:00Z" } };
   const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
   const quote = await callTool({ name: "poster", arguments: { Text: "a" } });
-  assert.match(quote.content[0].text, /typically finishes in ~15s/);
+  assert.match(quote.content[0].text, /typically ~15s/);
   // $0.03 observed → deposit ceil(0.03 × 1.2 × 2) = $0.08 (tracks cost, no longer capped at the opening deposit)
   assert.match(quote.content[0].text, /send exactly 0\.08\d* XNO/);
 });
@@ -1217,10 +1226,16 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const html = await (await fetch(`${base}/`)).text();
+    // default command is Claude; Grok rides the same endpoint behind a client toggle
     assert.match(html, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(html, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(html, /data-client="claude"/);
+    assert.match(html, /data-client="grok"/);
+    assert.match(html, /selectClient/);
     assert.match(html, /402 payment quote/);
     assert.match(html, /No tab, no tip, no signup\./);
     assert.match(html, /href="\/llms\.txt"/);
+    assert.match(html, /Claude Code, Grok, Cursor/);
   } finally {
     server.close();
   }
@@ -1287,6 +1302,7 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
     const txt = await res.text();
     assert.match(txt, /endpoint: http:\/\/pay\.test\/mcp/);
     assert.match(txt, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
     assert.match(txt, /## Payment \(x402, Nano\/XNO\)/);
     assert.match(txt, /settles at metered model cost \+ 20%/);
     assert.match(txt, /- poster: /);
@@ -1472,7 +1488,7 @@ test("the payment quote's QR is a spec-correct nano: URI carrying the exact amou
   assert.equal(qrDecode(svgToMatrix(qrSvg(x.uri))), x.uri);
 });
 
-/* ---- streaming hold-open + SSE payment watch (no re-invoke after paying) ---- */
+/* ---- three-phase x402: quote hang-up → watch SSE → results stream ---- */
 
 /** Read an SSE response frame by frame, calling onEvent({event,data}) until it returns "stop" or the stream ends. */
 async function readSse(res, onEvent) {
@@ -1497,10 +1513,11 @@ async function readSse(res, onEvent) {
   }
 }
 
-test("streaming first call returns the quote as a RESULT (never held open on a progress-only pay link)", async () => {
+test("three phases: quote hangs up, unpaid results call hangs up, paid results stream runs", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
-  const gate = makeGate(chain, { registry, pollMs: 5 });
+  // short waitMs so an unpaid results call hangs up promptly (not quote TTL)
+  const gate = makeGate(chain, { registry, pollMs: 5, waitMs: 40 });
   const { listTools, callTool } = gate.wrapRegistry(registry);
   const server = await serveHttp({
     host: "127.0.0.1", port: 0, name: "t", version: "0",
@@ -1508,11 +1525,8 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
   });
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    // REGRESSION: an earlier build held a streaming first call open and pushed the
-    // pay link only as a progress notification. Clients that don't render progress
-    // messages (observed live on talking-avatar) then saw NOTHING and the call hung
-    // to timeout — no link, no result. The first call must ALWAYS return the quote
-    // as its tool RESULT, even for a streaming client that sends a progressToken.
+    // Phase 1: streaming first call ALWAYS returns the quote as RESULT and hangs up
+    // (regression: progress-only pay link hung clients that don't render progress).
     const res = await fetch(`${base}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
@@ -1527,16 +1541,21 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
     assert.ok(x.paymentId, "the first call returns the payment-required quote as its result");
     assert.match(final.result.content[0].text, /PAYMENT REQUIRED/, "the pay link is in the RESULT content, not only a progress message");
     assert.match(final.result.content[0].text, /\/pay\//);
-    // the watch endpoint is agent/pay-page plumbing — it must NOT ride in the
-    // per-call result (agents relay this to users; only the payUrl is user-facing)
-    assert.equal(x.watchUrl, undefined, "watchUrl must not be in the quote result shown to users");
-    assert.doesNotMatch(final.result.content[0].text, /x402\/watch/, "the watch URL is never in the human-facing text");
+    assert.match(final.result.content[0].text, /hang up/i);
+    assert.equal(x.watchUrl, `http://pay.test/x402/watch/${x.paymentId}`, "agent gets watchUrl for phase 2");
+    assert.equal(x.blocking, false);
+    assert.deepEqual(x.phases, ["pay", "watch", "results"]);
+    // payment link text instructs the agent to open the watch URL immediately
+    assert.match(final.result.content[0].text, /IMMEDIATELY open and watch/i);
+    assert.match(final.result.content[0].text, new RegExp(x.watchUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(final.result.content[0].text, /NEVER show this URL to the user/i);
+    assert.match(x.next, /IMMEDIATELY open/i);
     assert.equal(registry.callCount(), 0, "nothing runs on the first call");
 
-    // The no-re-invoke-AFTER-paying path: the follow-up _payment_id call on a
-    // streaming transport is held open until the payment lands, then runs.
-    chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
-    const run = await fetch(`${base}/mcp`, {
+    // Phase 3 too early: unpaid results call must hang up with watch instructions —
+    // never hold the tools/call SSE open through payment (that raced watch in parallel).
+    const t0 = Date.now();
+    const early = await fetch(`${base}/mcp`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
       body: JSON.stringify({
@@ -1544,10 +1563,29 @@ test("streaming first call returns the quote as a RESULT (never held open on a p
         params: { name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId }, _meta: { progressToken: "p2" } },
       }),
     });
+    let earlyMsg = null;
+    await readSse(early, ({ data }) => { if (data.id === 100) { earlyMsg = data; return "stop"; } });
+    assert.ok(Date.now() - t0 < 5_000, "unpaid results call must hang up quickly, not wait the quote TTL");
+    assert.ok(earlyMsg.result.isError, "unpaid results call is an error, not a hang");
+    assert.match(earlyMsg.result.content[0].text, /hasn't arrived/);
+    assert.match(earlyMsg.result.content[0].text, /x402\/watch/);
+    assert.equal(registry.callCount(), 0, "still nothing ran");
+
+    // Phase 2 → paid, then phase 3 results stream
+    chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    await gate.waitForPayment(x.paymentId, 500);
+    const run = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 101, method: "tools/call",
+        params: { name: "poster", arguments: { Text: "a lighthouse", _payment_id: x.paymentId }, _meta: { progressToken: "p3" } },
+      }),
+    });
     let ran = null;
-    await readSse(run, ({ data }) => { if (data.id === 100) { ran = data; return "stop"; } });
+    await readSse(run, ({ data }) => { if (data.id === 101) { ran = data; return "stop"; } });
     assert.ok(!ran.result.isError, JSON.stringify(ran.result));
-    assert.match(ran.result.content[0].text, /^ran /, "the held-open payment call runs and returns the result");
+    assert.match(ran.result.content[0].text, /^ran /, "after payment, the results stream runs");
     assert.equal(registry.callCount(), 1, "the tool ran exactly once");
   } finally {
     server.close();
@@ -1571,18 +1609,105 @@ test("GET /x402/watch/:id streams status: pending, then paid when the payment la
     assert.match(res.headers.get("content-type"), /text\/event-stream/);
 
     const seen = [];
+    let terminal = null;
     await readSse(res, ({ event, data }) => {
       if (event !== "status") return;
       seen.push(data.status);
       if (data.status === "pending") {
+        assert.equal(data.done, undefined, "pending frames are lean — no done/next yet");
         // pay after the first pending frame; the shared watcher pushes the next frame
         chain.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
       } else {
+        terminal = data;
         return "stop"; // paid/consumed → the stream closes
       }
     });
     assert.equal(seen[0], "pending");
     assert.ok(seen.some((s) => s === "paid" || s === "consumed"), `expected a paid frame, got ${JSON.stringify(seen)}`);
+    // Terminal frame must close the gap: agent gets done + next instructions for
+    // the result stream (tools/call with _payment_id), not a bare "paid".
+    assert.equal(terminal.done, true, "terminal frame marks done so the agent knows the watch is over");
+    assert.match(terminal.next, /_payment_id/, "next tells the agent how to open the result stream");
+    assert.match(terminal.next, new RegExp(x.paymentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(terminal.next, /result stream|tools\/call|call the SAME tool/i);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /x402/status/:id carries done+next once the payment lands", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 40, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    const pending = await (await fetch(`${base}/x402/status/${x.paymentId}`)).json();
+    assert.equal(pending.status, "pending");
+    assert.equal(pending.done, undefined);
+
+    chain.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    // ?wait=1 long-polls until paid
+    const paid = await (await fetch(`${base}/x402/status/${x.paymentId}?wait=1`)).json();
+    assert.ok(paid.status === "paid" || paid.status === "consumed", JSON.stringify(paid));
+    assert.equal(paid.done, true);
+    assert.match(paid.next, /_payment_id/);
+    assert.match(paid.next, new RegExp(x.paymentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    server.close();
+  }
+});
+
+test("results stream announces payment received when already paid (not silent load)", async () => {
+  const chain = fakeChain();
+  // Slow the run so we can observe the progress event before the final result
+  const registry = fakeRegistry({
+    onCall: async () => {
+      await new Promise((r) => setTimeout(r, 80));
+      return { content: [{ type: "text", text: "ran poster" }], costUsd: 0.01, textOutput: true };
+    },
+  });
+  const gate = makeGate(chain, { registry, pollMs: 5 });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, publicBase: "http://pay.test", progressMs: 200, log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    // Pay first (phase 2 done), then open the results stream (phase 3)
+    chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    await gate.waitForPayment(x.paymentId, 500);
+
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 7, method: "tools/call",
+        params: {
+          name: "poster",
+          arguments: { Text: "a", _payment_id: x.paymentId },
+          _meta: { progressToken: "pay-ack" },
+        },
+      }),
+    });
+    const progressMsgs = [];
+    let final = null;
+    await readSse(res, ({ data }) => {
+      if (data.method === "notifications/progress") {
+        progressMsgs.push(data.params && data.params.message);
+      }
+      if (data.id === 7) { final = data; return "stop"; }
+    });
+    assert.ok(final && final.result && !final.result.isError, JSON.stringify(final));
+    const joined = progressMsgs.join(" | ");
+    assert.match(joined, /payment received/i, `expected payment-received announce on results stream, got: ${joined}`);
   } finally {
     server.close();
   }
@@ -1615,4 +1740,205 @@ test("the held-connection cap degrades a streaming call to plain JSON instead of
   } finally {
     server.close();
   }
+});
+
+/*
+ * Regression: 2026-07-23/25 production incident. A refund that could not send
+ * (RPC 429) sat in the owed queue, which kept anyWatchable() true forever, which
+ * kept scan() calling `receivable` every 5s — against the very endpoint that was
+ * throttling. It ran 34 hours and logged 5,158 failures. The queued send must
+ * keep retrying WITHOUT dragging the receivable poll along with it.
+ */
+test("a queued owed send does not keep polling receivable", async () => {
+  let t = 3_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") receivableCalls++;
+    return innerRpc(body);
+  };
+
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain.state.failTransfer = true; // refund bounces → owed queue, and stays there
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(res.isError);
+
+  // Past LATE_WATCH_MS: no quote is payment-watchable any more, only `owed` is left.
+  t += 2 * 60 * 60 * 1000;
+  await new Promise((r) => setTimeout(r, 40)); // let a tick land in the new state
+  const before = receivableCalls;
+  await new Promise((r) => setTimeout(r, 120)); // at pollMs=5 the old code got ~24 more
+  assert.equal(receivableCalls, before,
+    "owed-only ticks must not touch the node — that poll fed the rate limit blocking the refund");
+
+  // …and the retry itself still works the moment the transfer can go through.
+  chain.state.failTransfer = false;
+  t += 61_000; // past OWED_BACKOFF_MS[1], where the retry during the idle stretch left o.at
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+});
+
+test("a failing scan backs off instead of hammering at the poll rate", async () => {
+  let t = 4_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") { receivableCalls++; throw new Error("Nano RPC receivable: 429"); }
+    return innerRpc(body);
+  };
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  await callTool({ name: "poster", arguments: { Text: "a" } }); // pending quote → fast poll
+
+  await new Promise((r) => setTimeout(r, 300));
+  // Ungated at pollMs=5 this is ~60 calls; doubling 5→10→20→40… caps it well under that.
+  assert.ok(receivableCalls > 0, "it must still try");
+  assert.ok(receivableCalls <= 12, `expected backoff to bound the retries, got ${receivableCalls}`);
+});
+
+/*
+ * Regression on the fix above: the backoff reset used to live in
+ * ensureWatching(), which looks like "a new caller arrived" but is re-entered by
+ * waitForPayment() — and each open /x402/watch stream re-enters that on a 25s
+ * ceiling for the whole life of the quote. That zeroed scanFails continuously,
+ * so the backoff never engaged for any quote anyone was actually watching, which
+ * is all of them. Measured at the time: 8 watchers made MORE receivable calls
+ * than the unfixed code.
+ */
+test("an open payment watcher does not reset the scan backoff", async () => {
+  let t = 5_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") { receivableCalls++; throw new Error("Nano RPC receivable: 429"); }
+    return innerRpc(body);
+  };
+  const gate = makeGate(chain, { registry, now: () => t, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+
+  // Four watchers re-polling the way the SSE loop does, well inside the backoff.
+  let watching = true;
+  const watcher = async () => { while (watching) await gate.waitForPayment(x.paymentId, 15); };
+  const streams = [watcher(), watcher(), watcher(), watcher()];
+  await new Promise((r) => setTimeout(r, 300));
+  watching = false;
+  await Promise.all(streams);
+
+  // Ungated at pollMs=5 this is ~60; with the reset in ensureWatching it was worse.
+  assert.ok(receivableCalls <= 12,
+    `watchers must not defeat the backoff, got ${receivableCalls} receivable calls`);
+});
+
+test("a genuinely new quote does reset the scan backoff", async () => {
+  let t = 6_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let failing = true;
+  let receivableCalls = 0;
+  const innerRpc = chain.ops.rpc;
+  chain.ops.rpc = async (body) => {
+    if (body.action === "receivable") {
+      receivableCalls++;
+      if (failing) throw new Error("Nano RPC receivable: 429");
+    }
+    return innerRpc(body);
+  };
+  const { callTool } = makeGate(chain, { registry, now: () => t, pollMs: 5 }).wrapRegistry(registry);
+  await callTool({ name: "poster", arguments: { Text: "a" } });
+  await new Promise((r) => setTimeout(r, 200)); // ramp the backoff up
+
+  failing = false;
+  const before = receivableCalls;
+  const y = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
+  chain.state.receivable["E".repeat(64)] = { amount: y.amountRaw, source: PAYER };
+  await new Promise((r) => setTimeout(r, 60)); // must scan promptly, not wait out the backoff
+  assert.ok(receivableCalls > before,
+    "a fresh quote must get an immediate scan rather than inherit an earlier caller's backoff");
+
+});
+
+/*
+ * Regression: 2026-07-24 triple payout. An owed entry is spliced out of the
+ * queue only AFTER its send resolves, so a second retryOwed() running during
+ * that await re-sent it. Reachable because tick() nulls `timer` before awaiting
+ * scan(), and every ensureWatching() during the send re-enters tick(). Observed
+ * in production as three identical 0.31294478 XNO sends inside one second, same
+ * PID, no restart; a local repro with four watchers reached 45.
+ */
+test("a slow owed send is never sent twice", async () => {
+  let t = 7_000_000;
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  const slowTransfer = chain.ops.transfer;
+  chain.ops.transfer = async (to, amountRaw, describe) => {
+    if (chain.state.failTransfer) throw new Error("transfer refused");
+    await new Promise((r) => setTimeout(r, 60)); // a real send waits on work generation
+    return slowTransfer(to, amountRaw, describe);
+  };
+  const gate = makeGate(chain, { registry, now: () => t, pollMs: 5 });
+  const { callTool } = gate.wrapRegistry(registry);
+
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain.state.failTransfer = true; // refund bounces onto the owed queue
+  assert.ok((await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } })).isError);
+
+  // A second, still-pending quote keeps watchers calling ensureWatching() —
+  // waitForPayment() returns early for a settled quote, so this is what makes
+  // the re-entrancy reachable, and it is ordinary concurrent traffic.
+  const y = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
+  chain.state.failTransfer = false;
+  t += 61_000;
+  let watching = true;
+  const watcher = async () => { while (watching) await gate.waitForPayment(y.paymentId, 5); };
+  const streams = [watcher(), watcher(), watcher(), watcher()];
+  await new Promise((r) => setTimeout(r, 400));
+  watching = false;
+  await Promise.all(streams);
+
+  const refunds = chain.state.transfers.filter((s) => s.describe === "refunded");
+  assert.equal(refunds.length, 1, `the refund must be sent exactly once, got ${refunds.length}`);
+});
+
+test("a restored owed refund blocks a second refund of the same late payment", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-dupe-")), "gate-state.json");
+  let t = 8_000_000;
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile, now: () => t, pollMs: 5 });
+  const { callTool } = gate1.wrapRegistry(registry1);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+
+  // #23 is specifically the LATE-payment path: the quote must EXPIRE unpaid,
+  // and only then does the payer's block show up. A consumed quote never
+  // reaches the `expired && !q.refunding` branch, so it cannot reproduce this.
+  t += 16 * 60 * 1000; // past QUOTE_TTL_MS
+  chain1.state.failTransfer = true; // the late-payment refund bounces → persisted owed entry
+  chain1.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  await new Promise((r) => setTimeout(r, 120)); // watcher notices the late payment and tries to bounce it
+  assert.equal(gate1.quote(x.paymentId).status, "expired", "quote must be expired, not consumed");
+  await new Promise((r) => setTimeout(r, 30)); // let persist() flush
+
+  // Restart: same state file, and the payer's block is STILL visible on chain
+  // (never pocketed), so the fresh watcher re-scans it.
+  const chain2 = fakeChain();
+  chain2.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const gate2 = makeGate(chain2, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5 });
+  gate2.wrapRegistry(fakeRegistry());
+  t += 61_000;
+  await new Promise((r) => setTimeout(r, 150));
+
+  const refunds = chain2.state.transfers.filter((s) => s.describe === "refunded");
+  assert.equal(refunds.length, 1, `restart must not refund twice, got ${refunds.length}`);
 });

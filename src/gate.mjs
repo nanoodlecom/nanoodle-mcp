@@ -119,11 +119,12 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
  * @param {string|null} [opts.wsUrl]      Nano node websocket (wss://…) for push confirmations
  * @param {string} opts.publicBase        absolute base URL for pay links (no trailing slash)
  * @param {number} [opts.pollMs]          receivable poll interval while quotes are pending
- * @param {number} [opts.waitMs]          how long a NON-streaming _payment_id call blocks waiting for
- *                                        settlement — kept under typical MCP client tool timeouts so the
- *                                        caller gets our "not arrived yet, call again" message, never an
- *                                        opaque client-side timeout. Streaming calls wait out the quote's
- *                                        whole TTL (heartbeats keep the connection alive).
+ * @param {number} [opts.waitMs]          short grace on a _payment_id call that arrives just as payment
+ *                                        lands (race cover) — kept under typical MCP client tool timeouts.
+ *                                        Payment monitoring is NOT this call: agents open /x402/watch SSE
+ *                                        for that. A pending quote after waitMs returns "not arrived yet"
+ *                                        with instructions to watch, never holds the results stream open
+ *                                        through the quote TTL.
  * @param {string|null} [opts.stateFile]  persist quotes + owed sends here (write-then-rename JSON) and
  *                                        restore them at startup — in-flight money survives restarts
  * @param {(event: string, fields: object) => void} [opts.usage]  payments-ledger sink:
@@ -281,6 +282,17 @@ export function createChargeGate({
     const t = now();
     for (const o of [...owed]) {
       if (t < o.at) continue;
+      // An entry is only removed from `owed` AFTER its send resolves, so any
+      // second retryOwed() running during that await sees it as still owed and
+      // sends it again. That is money out the door, once per concurrent pass.
+      // It is reachable: tick() nulls `timer` before awaiting scan(), so every
+      // ensureWatching() during an in-flight send re-enters tick() — and owe()
+      // and waitForPayment() both call ensureWatching(). Observed in production
+      // 2026-07-24: three identical 0.31294478 XNO sends inside one second, same
+      // PID, no restart (blocks 52DEA6AC…, 8CC22CDE…, 58EE40E5…). A local repro
+      // with a slow transfer and four watchers reached 45 sends of one entry.
+      if (o.sending) continue;
+      o.sending = true;
       o.tries++;
       try {
         const hash = await ops.transfer(o.to, o.amountRaw, o.describe);
@@ -298,6 +310,8 @@ export function createChargeGate({
         }
         o.at = t + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
         log(`retry ${o.tries} of ${o.describe} to ${o.to} failed: ${e.message}`);
+      } finally {
+        o.sending = false;
       }
     }
   }
@@ -452,6 +466,16 @@ export function createChargeGate({
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
             : null,
         });
+        // issue #23: q.refunding is a live-only Promise that persistence drops,
+        // so after a restart a restored owed refund retries the send WHILE the
+        // watcher re-scans the same payer block, sees `expired && !q.refunding`,
+        // and starts a second refund(). Both can land — the payer is refunded
+        // twice out of the operator's float. Re-arm the marker for any quote
+        // this queue is already carrying a refund for.
+        if (s.event === "refund" && s.fields && s.fields.paymentId) {
+          const q = quotes.get(s.fields.paymentId);
+          if (q) q.refunding = Promise.resolve(false); // "already in flight", resolved so nothing awaits forever
+        }
       }
       if (quotes.size || owed.length) log(`restored ${quotes.size} quote(s) and ${owed.length} queued send(s) from ${stateFile}`);
     } catch (e) {
@@ -505,11 +529,20 @@ export function createChargeGate({
   // Recently expired quotes stay watched so a payment that arrives too late is
   // noticed and bounced straight back instead of silently kept.
   const LATE_WATCH_MS = 60 * 60 * 1000;
-  const anyWatchable = () => {
+  // Someone is waiting on money to ARRIVE — poll fast, a caller is blocked on it.
+  const anyPaymentWatchable = () => {
     const t = now();
-    return owed.length > 0 || [...quotes.values()].some((q) =>
+    return [...quotes.values()].some((q) =>
       q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS));
   };
+  // Keep ticking for the owed queue too, but that is money going OUT on its own
+  // backoff (OWED_BACKOFF_MS) — it must never pull the receivable poll up to
+  // payment speed. A queued refund used to make anyWatchable() true forever,
+  // which pinned scan() at one `receivable` call every 5s for as long as the
+  // refund kept failing — and since a refund typically fails because the RPC is
+  // throttling, that poll fed the very rate limit that was blocking it. One
+  // failed refund held the loop for 34h and 5,158 calls on 2026-07-23/25.
+  const anyWatchable = () => owed.length > 0 || anyPaymentWatchable();
 
   /**
    * Race cover for pocketed payments: the wallet (same process, other duties)
@@ -559,7 +592,11 @@ export function createChargeGate({
   async function scan() {
     prune();
     await retryOwed();
-    if (!anyWatchable()) return;
+    // Only the owed queue left → retryOwed above is the whole job. Skip the
+    // receivable/history reads: nobody is waiting for an incoming payment, so
+    // asking the node about one is pure load on an endpoint that is usually
+    // already throttling us (that is why the refund is queued at all).
+    if (!anyPaymentWatchable()) return;
     const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true" });
     const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     for (const [hash, v] of blocks) {
@@ -573,15 +610,52 @@ export function createChargeGate({
     if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
       ops.pocket().catch(() => {}); // best-effort; the next tick retries
     }
-    if (anyWatchable()) await scanHistory();
+    if (anyPaymentWatchable()) await scanHistory();
   }
 
+  /*
+   * Consecutive-failure backoff for the scan itself. retryOwed() has had a
+   * backoff since day one; the receivable poll beside it had none, so a node
+   * answering 429 was re-asked at the full poll rate indefinitely. Doubling from
+   * the base interval keeps a genuinely pending payment responsive (a transient
+   * blip costs one or two slow ticks); the 60s ceiling means a sustained outage
+   * settles to 60 receivable calls/hour instead of 720 (ws up, 5s base: 10, 20,
+   * 40, 60…; ws down, 1s base: 2, 4, 8, 16, 32, 60…).
+   */
+  const SCAN_BACKOFF_CAP_MS = 60 * 1000; // a quote only lives ~15min — never go quiet longer than this
+  let scanFails = 0;
+  let scanning = false;
+
   function tick() {
+    // tick() nulls `timer` and then awaits, so for the whole duration of a scan
+    // every ensureWatching() call sees no timer and starts ANOTHER scan on top
+    // of it. That is what let concurrent retryOwed() passes double-send (see the
+    // o.sending guard). Belt and braces: never run two scans at once — the one
+    // in flight schedules the next tick when it finishes.
+    if (scanning) return;
+    scanning = true;
     timer = null;
-    scan().catch((e) => log(`payment scan failed (${e.message}) — will retry`)).then(() => {
+    scan().then(
+      () => { scanFails = 0; },
+      (e) => {
+        scanFails++;
+        // Log the first few, then only every 12th — a stuck endpoint used to
+        // write one line per poll (5,158 in 34h), burying everything else.
+        if (scanFails <= 3 || scanFails % 12 === 0) {
+          log(`payment scan failed (${e.message}) — will retry` +
+            (scanFails > 3 ? ` (${scanFails} consecutive failures)` : ""));
+        }
+      },
+    ).then(() => {
+      scanning = false;
       if (!anyWatchable()) return;
       // With a live websocket the poll is only a safety net — relax it.
-      timer = setTimeout(tick, wsConnected ? Math.max(pollMs, 5000) : pollMs);
+      let delay = wsConnected ? Math.max(pollMs, 5000) : pollMs;
+      // Only back off the tick when a scan actually failed. Owed-only ticks keep
+      // the base cadence on purpose: with the RPC skipped above they are a local
+      // array check costing nothing, so there is no reason to slow the retry.
+      if (scanFails > 0) delay = Math.min(delay * 2 ** Math.min(scanFails, 10), SCAN_BACKOFF_CAP_MS);
+      timer = setTimeout(tick, delay);
       if (timer.unref) timer.unref();
     });
   }
@@ -589,6 +663,21 @@ export function createChargeGate({
   function ensureWatching() {
     connectWs();
     if (!timer) tick();
+  }
+
+  /*
+   * A backed-off timer must not delay a caller who just arrived: their quote has
+   * its own 15-minute life and did not cause the earlier failures. Only the
+   * quote-creation path may do this. Doing it in ensureWatching() instead looks
+   * equivalent and is not: waitForPayment() calls ensureWatching() on every
+   * iteration, and each open /x402/watch stream re-enters it on a 25s ceiling
+   * for the life of the quote (src/http.mjs). That would zero the backoff every
+   * 25s per watcher — continuously, and precisely while the RPC is struggling.
+   */
+  function watchNow() {
+    scanFails = 0;
+    if (timer) { clearTimeout(timer); timer = null; }
+    ensureWatching();
   }
 
   let ws = null;
@@ -630,21 +719,31 @@ export function createChargeGate({
   const payUrl = (q) => `${publicBase}/pay/${q.id}`;
   const nanoUri = (q) => `nano:${address}?amount=${q.amountRaw}`;
 
+  const watchUrl = (q) => `${publicBase}/x402/watch/${q.id}`;
+
   function paymentRequiredResult(q) {
-    // Only user-facing fields belong here — agents relay this object. The
-    // /x402/watch SSE endpoint is deliberately NOT included: it's agent/pay-page
-    // plumbing for watching the payment settle, not a link to hand the user, and
-    // dropping it beside payUrl made agents show it to humans. Agents that want
-    // to watch programmatically get the endpoint from the server instructions.
+    // Three sequential phases — never parallel:
+    //   1) this tools/call HANGS UP with pay instructions (payUrl for the human)
+    //   2) agent opens watchUrl SSE (agent-only) until it closes with paid
+    //   3) agent opens tools/call + _payment_id = the RESULTS stream only
+    // watchUrl rides in structuredContent for the agent; the human-facing text
+    // never mentions it (agents used to relay it next to payUrl — don't).
+    const pUrl = payUrl(q);
+    const wUrl = watchUrl(q);
     const x402 = {
       paymentId: q.id,
-      payUrl: payUrl(q),
-      // Machine-readable "what to do next", so a cautious agent re-calls instead
-      // of pausing for a human "go" after showing the link. `blocking` says the
-      // follow-up call waits; `next` is the imperative that flips ask-permission
-      // into re-call-and-block. Paying is the consent — there's nothing to ask.
-      blocking: true,
-      next: `Call this SAME tool again with identical arguments plus "_payment_id": "${q.id}" NOW — right after showing the user the payUrl, without waiting for them to confirm. That call blocks until the payment confirms (it holds the connection open with heartbeats), then runs and returns the result. Paying IS the consent; do not wait for a human "go".`,
+      payUrl: pUrl,
+      // Agent-only payment-monitor SSE. Open it the moment you have this quote —
+      // never show this URL to the user (they get payUrl only).
+      watchUrl: wUrl,
+      // Sequential phases. blocking:false — do NOT open the results tools/call while
+      // payment is still pending; that used to hold one SSE through pay+run and race
+      // the watch stream in parallel.
+      blocking: false,
+      phases: ["pay", "watch", "results"],
+      // Lead with the watch imperative: agents that only skim `next` must still
+      // open the monitor SSE as soon as they have the payment link.
+      next: `On this payment link: show the user ONLY ${pUrl}, and IMMEDIATELY open the payment-monitor SSE yourself: GET ${wUrl} (Accept: text/event-stream). Never show the watch URL to the user. Wait until that stream CLOSES with status "paid" (done:true + next). ONLY THEN call this SAME tool with identical arguments plus "_payment_id": "${q.id}" — that is the RESULTS stream. Do not open results while the watch is still open. Paying is the consent; do not wait for a human "go".`,
       uri: nanoUri(q),
       address,
       amountRaw: q.amountRaw,
@@ -652,17 +751,22 @@ export function createChargeGate({
       amountUsd: q.usd,
       expiresAt: new Date(q.expiresAt).toISOString(),
     };
-    // Agents relay this text to humans verbatim — "in 15 minutes" is usable
-    // at a glance where a bare ISO timestamp forces timezone math.
+    // Agents relay this text to humans — keep the payUrl line user-safe. The
+    // agent-only watch URL is stated with an explicit "do not show the user"
+    // so the agent has a concrete URL to open without mistaking it for the link
+    // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const text =
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
-      `To proceed:\n` +
-      `1. Show your user ONLY this payment link — it renders a QR code to scan with any Nano wallet and turns into a green check the moment the payment lands. Don't show them any other URL or the wallet address from this response:\n` +
-      `   ${payUrl(q)}\n` +
-      `2. Then IMMEDIATELY call this tool again with the SAME arguments plus "_payment_id": "${q.id}" — right after showing the link, without waiting for the user to say "go" or confirm they paid. That call blocks until the payment lands (about a second), then runs. That is how YOU watch for the payment; paying is the consent, so there is nothing to ask the user first.` +
-      (q.etaMs ? ` Once paid, this tool typically finishes in ~${fmtDur(q.etaMs)}.` : "") + `\n\n` +
+      `This call is done — hang up. On this payment link, do BOTH of these now:\n` +
+      `1. Show your user ONLY this payment link (QR to scan; green check when paid). Do not show them any other URL or the wallet address:\n` +
+      `   ${pUrl}\n` +
+      `2. YOU IMMEDIATELY open and watch this payment-monitor SSE (agent-only — NEVER show this URL to the user):\n` +
+      `   ${wUrl}\n` +
+      `   Wait until that stream CLOSES with status "paid" (done:true + next).\n` +
+      `3. ONLY AFTER the watch stream closes paid: call this tool again with the SAME arguments plus "_payment_id": "${q.id}". That call is the RESULTS stream` +
+      (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : "") + ` — it runs and returns the result. Do not open the results call while still watching for payment.\n\n` +
       `Manual-pay fallback (only if the user can't use the link): send exactly ${rawToXno(q.amountRaw)} XNO (${q.amountRaw} raw) to ${address} — ` +
       `the exact amount is how the payment is recognized (URI: ${nanoUri(q)}).\n` +
       `This quote expires in about ${expMin} minute${expMin === 1 ? "" : "s"} (${x402.expiresAt}). ` +
@@ -674,19 +778,52 @@ export function createChargeGate({
 
   /* ---------------- public surface ---------------- */
 
+  /**
+   * Terminal-state instructions for an agent watching this quote settle
+   * (/x402/watch SSE or /x402/status poll). Pending quotes have no `next` —
+   * the stream is still open. Once settled, the watch SSE closes with these
+   * instructions so the agent knows how to open the result stream (tools/call
+   * with _payment_id) rather than sitting on a bare "paid" with no next step.
+   */
+  function nextFor(q) {
+    if (!q || q.status === "pending") return undefined;
+    if (q.status === "paid" || q.status === "consumed") {
+      return `Payment received — this watch stream is done; hang it up. ` +
+        `NOW open the RESULTS stream: call the SAME tool with identical arguments plus "_payment_id": "${q.id}". ` +
+        `That tools/call runs the workflow (progress heartbeats on a streaming transport) and returns the result. ` +
+        `Do not open a results tools/call before the watch closes, and do not keep this watch open in parallel with the results call.`;
+    }
+    if (q.status === "expired") {
+      return `Quote expired unpaid — call the tool again without _payment_id for a fresh quote.`;
+    }
+    if (q.status === "refunded") {
+      return `Payment was refunded${q.source ? ` to ${q.source}` : ""} — call the tool again without _payment_id to retry.`;
+    }
+    return undefined;
+  }
+
   const gate = {
     address,
 
-    /** Quote/pay state for the HTTP pay page + status endpoint. */
+    /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
       const q = quotes.get(String(id));
       if (!q) return null;
       prune();
-      return {
+      const out = {
         id: q.id, tool: q.tool, status: q.status, usd: q.usd,
         amountRaw: q.amountRaw, amountXno: rawToXno(q.amountRaw),
         address, uri: nanoUri(q), expiresAt: new Date(q.expiresAt).toISOString(),
       };
+      // Terminal states close the watch SSE — package the next-step so an agent
+      // (or any event-loop subscriber) does not sit on a bare "paid" with no path
+      // to the result stream.
+      if (q.status !== "pending") {
+        out.done = true;
+        const next = nextFor(q);
+        if (next) out.next = next;
+      }
+      return out;
     },
 
     /** Resolve when the quote leaves `pending` (paid/expired), or after ms. Returns the status. */
@@ -755,6 +892,18 @@ export function createChargeGate({
       for (const t of registry.tools) {
         const rec = registry.costs && registry.costs[t.name];
         const dep = priceFor(t.name);
+        // No pin, no catalog forecast, no observed cost → this tool quotes the
+        // flat opening deposit, which is a guess, not a price. That is how three
+        // calls on 2026-07-23 took a $0.05 deposit against real costs up to
+        // $0.2455. Say it out loud rather than discovering it in the ledger.
+        const est = registry.estimates && registry.estimates[t.name];
+        if (!pinned.get(t.name) && !est && !(rec && Number.isFinite(rec.usd))) {
+          log(`warning: ${t.name} has no cost forecast (its models are not in the public catalog) and has never run — ` +
+            `it quotes the flat ${fmtUsd(usd)} opening deposit and you eat any overage; pin a price with x402.usd in its graph file`);
+        } else if (est && est.unpriced > 0) {
+          log(`note: ${t.name} forecast covers ${est.priced} of ${est.priced + est.unpriced} priced node(s) — ` +
+            `${fmtUsd(dep)} deposit is a lower bound; pin x402.usd if runs exceed it`);
+        }
         if (rec && typeof rec.usd === "number" && rec.usd * 1.2 > dep) {
           log(`warning: ${t.name} deposit ${fmtUsd(dep)} is below its last observed cost ${fmtUsd(rec.usd)} + 20% — ` +
             `runs may exceed the deposit and you eat the difference; raise x402.usd in its graph file`);
@@ -854,8 +1003,9 @@ export function createChargeGate({
                 _payment_id: {
                   type: "string",
                   description: "Payment id from this tool's previous payment-required response. " +
-                    "First call the tool without it to get a payment link; after the user pays, " +
-                    "call again with the same arguments plus this id.",
+                    "Phase 3 only: after /x402/watch closes with status paid, call again with the " +
+                    "same arguments plus this id to open the RESULTS stream. Do not pass it while " +
+                    "payment is still pending — monitor the watch SSE first.",
                 },
               },
             };
@@ -899,17 +1049,14 @@ export function createChargeGate({
           };
           quotes.set(q.id, q);
           persist();
-          ensureWatching();
+          watchNow();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
-          // The FIRST call always returns the payment-required quote as its tool
-          // RESULT — every MCP client surfaces a result, so the pay link is always
-          // seen. (An earlier build held streaming calls open and pushed the link
-          // as a progress notification instead; clients that don't render progress
-          // messages showed the human nothing and the call hung until timeout —
-          // observed live on talking-avatar. Delivering the link in-band as a
-          // progress message is not reliable, so we don't.) To avoid a re-invoke
-          // after paying, the caller passes _payment_id on the NEXT call and, on a
-          // streaming transport, that call is held open until the payment lands.
+          // Phase 1: this tools/call always HANGS UP with the payment-required
+          // quote as its RESULT — every MCP client surfaces a result, so the pay
+          // link is always seen. (An earlier build held streaming calls open and
+          // pushed the link as progress; clients that don't render progress
+          // showed nothing and hung — observed live on talking-avatar.)
+          // Phase 2 is /x402/watch; phase 3 is tools/call + _payment_id (results).
           return paymentRequiredResult(q);
         } else {
           q = quotes.get(String(_payment_id));
@@ -928,22 +1075,33 @@ export function createChargeGate({
           }
         }
 
+        // Prefer announce (immediate progress event) over report (next heartbeat).
+        const note = (s) => {
+          if (ctx && typeof ctx.announce === "function") ctx.announce(s);
+          else if (ctx && typeof ctx.report === "function") ctx.report(s);
+        };
+
         if (q.status === "pending") {
-          // Streaming callers can afford to wait out the quote — heartbeats keep
-          // their tool timeout at bay. Plain-JSON callers get one short wait, so
-          // OUR "not arrived yet" message always beats their client-side timeout.
-          if (ctx && ctx.report) ctx.report(`waiting for the ${rawToXno(q.amountRaw)} XNO payment to land`);
-          const budget = ctx && ctx.streaming ? Math.max(waitMs, q.expiresAt - now()) : waitMs;
-          const st = await gate.waitForPayment(q.id, budget);
+          // Phase 3 is the RESULTS stream — it must not also be the payment
+          // monitor. A short waitMs covers the race where payment lands as the
+          // agent switches from watch → results; it never holds through the
+          // quote TTL (that used to race a parallel watch SSE and look like a
+          // silent load). Agents still pending should be on /x402/watch.
+          note(`checking payment ${q.id}`);
+          const st = await gate.waitForPayment(q.id, waitMs);
           if (st === "pending") {
-            return errResult(`payment ${q.id} hasn't arrived yet. If your user has the page open at ${payUrl(q)} ` +
-              `it will show a green check when it lands — then call this tool again with the same _payment_id.`);
+            return errResult(
+              `payment ${q.id} hasn't arrived yet — this tools/call is the RESULTS stream, not the payment monitor. ` +
+              `Hang it up. Open the agent-only watch SSE ${watchUrl(q)} (never show that URL to the user), ` +
+              `wait until it closes with status "paid", THEN call again with the same _payment_id. ` +
+              `Do not hold a tools/call open while waiting for payment.`
+            );
           }
           if (st === "expired") {
             return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
           }
         }
-        if (ctx && ctx.report) ctx.report(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
+        note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
         // paid (or consumed): run exactly once, replay the cached outcome afterwards
         if (!q.running) {
           q.status = "consumed";
