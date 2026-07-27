@@ -1130,7 +1130,7 @@ test("landing page links each workflow, states the author cut, and shows self-ho
     assert.match(html, /href="https:\/\/nanoodle\.com\/#g=H4sIAAAAtest">open in editor</);
     assert.match(html, /href="\/graph\/poster\.json">graph JSON</);
     // the money story: deposit → cost + 20%, markup is the author's
-    assert.match(html, /workflow author&#39;s cut|workflow author's cut/);
+    assert.match(html, /20% goes to the <strong>workflow author<\/strong>, not the platform/);
     assert.match(html, /authors earn the 20%/);
     assert.match(html, new RegExp(PAYER)); // per-tool author payout address
     // open source + host your own
@@ -1186,7 +1186,7 @@ test("landing workflow card: title + id, intent, tinted pipeline chips, last-run
     assert.match(html, /last run \$0\.04, ~15s/);
     assert.match(html, /open in editor/);
     // the payment contract is told once above the grid, not inside every card
-    assert.match(html, /settles at the model(?:&#39;|')s actual cost \+ 20%, change returned/);
+    assert.match(html, /settles at the model(?:&#39;|')s actual cost \+ 20%, and returns the change/);
     assert.doesNotMatch(html, /deposit per call, paid in Nano/);
   } finally {
     server.close();
@@ -1367,9 +1367,9 @@ test("landing page states the privacy contract; charged mode adds the ledger lin
     assert.match(html, /held in memory for delivery, not stored/);
     assert.match(html, /the server keeps no request logs/);
     // charge-mode-only ledger claim
-    assert.match(html, /payments ledger: money events that mirror what is already public/);
+    assert.match(html, /payments ledger, for money events already public on the Nano ledger/);
     // the honest NanoGPT caveat + verify-in-source link
-    assert.match(html, /governed by <a href="https:\/\/nano-gpt\.com\/privacy">their privacy policy/);
+    assert.match(html, /falls under <a href="https:\/\/nano-gpt\.com\/privacy">their privacy policy/);
     assert.match(html, /Verify every line in the source/);
   } finally {
     server.close();
