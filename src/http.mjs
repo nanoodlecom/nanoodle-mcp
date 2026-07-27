@@ -276,12 +276,12 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">When a tool needs payment, your agent shows you a link with a QR code — scan it with
       any Nano wallet and the result streams back seconds later. What you pay up front is a
       <strong>deposit</strong>: each run settles at the model's metered cost + 20%, and the difference is
-      returned to your wallet on-chain. The 20% is the <strong>workflow author's cut</strong>, not a platform fee.</p>
+      returned to your wallet on-chain. That 20% goes to the <strong>workflow author</strong>, not the platform.</p>
     </div>` : ""}
     <h2>Workflows (${tools.length})</h2>
     <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
       <a href="https://nanoodle.com">nanoodle editor</a> to see exactly how it works, remix it, or run it
-      on your own key.${charged ? " Costs shown are the last observed run — each call is a small deposit that settles at the model's actual cost + 20%, change returned." : ""}</p>
+      on your own key.${charged ? " Costs shown are from the last observed run. Each call takes a small deposit, settles at the model's actual cost + 20%, and returns the change." : ""}</p>
     <ul class="tools">${cards}</ul>
     <div class="card"><h2>Private by design</h2>
       <p class="muted">Every line here is checkable in the source — nothing to take on faith.</p>
@@ -292,10 +292,10 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         <li>Generated media auto-deletes after 24 hours, served at unguessable URLs until then.</li>
         <li>Results are held in memory for delivery, not stored.</li>
         <li>No analytics, no trackers, no IP logs — the server keeps no request logs.</li>
-        ${charged ? `<li>The only thing written down is a payments ledger: money events that mirror what is already public on the Nano ledger — no run telemetry, no error text.</li>` : ""}
+        ${charged ? `<li>The only thing written down is a payments ledger, for money events already public on the Nano ledger. No run telemetry, no error text.</li>` : ""}
       </ul>
-      <p class="muted">One caveat, stated plainly: generation runs on <a href="https://nano-gpt.com">NanoGPT</a>'s API,
-        so your prompt content in flight is governed by <a href="https://nano-gpt.com/privacy">their privacy policy</a>.</p>
+      <p class="muted">One caveat: generation runs on <a href="https://nano-gpt.com">NanoGPT</a>'s API,
+        so your prompt content in flight falls under <a href="https://nano-gpt.com/privacy">their privacy policy</a>.</p>
       <p class="muted"><a href="https://github.com/nanoodlecom/nanoodle-mcp">Verify every line in the source →</a></p>
     </div>
     ${charged ? `<div class="card"><h2>Workflow authors earn the 20%</h2>
@@ -362,7 +362,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       `  3. ONLY THEN tools/call again with _payment_id — that is the RESULTS stream. Do not open it while still watching for payment.`,
       `- Paying is the consent; do not wait for a human "go". The quote carries payUrl, watchUrl, and a next imperative that says: on this payment link, show payUrl and open watchUrl now (blocking:false).`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
-      `- The 20% is the workflow author's cut, not a platform fee.`,
+      `- That 20% goes to the workflow author, not the platform.`,
       ``,
     );
   }
