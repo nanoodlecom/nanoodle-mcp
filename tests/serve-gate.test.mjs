@@ -107,6 +107,44 @@ const GRAIN = 10n ** 22n; // 1e-8 XNO, the wallet-typeable resolution — mirror
 
 const argOf = (result) => result.structuredContent.x402;
 
+/**
+ * Wait for a CONDITION, never for the clock.
+ *
+ * The gate persists on a debounced promise chain (mkdir → write → rename) and its
+ * owed-queue watchers run on timers. "Sleep 50ms, then look" is therefore a race,
+ * and it is a race this suite loses on a busy machine: 9 of 40 full-suite runs
+ * failed here with every core loaded, always on a persist or a watcher tick.
+ * .github/workflows/test.yml now runs this suite on a shared CI runner, where busy
+ * is the normal condition, so an intermittent red would land on whoever pushed
+ * next. Polling costs a passing run nothing and makes a slow machine wait instead
+ * of fail.
+ *
+ * Only POSITIVE waits move here. A negative assertion ("no change was sent") can
+ * never be established by waiting longer, so those keep their fixed pause.
+ */
+async function until(what, fn, timeoutMs = 15_000) {
+  const t0 = Date.now();
+  for (;;) {
+    let v = false;
+    try { v = await fn(); } catch { v = false; }
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** Wait until the gate's state file parses and satisfies `pred`. Returns the parsed state. */
+async function untilState(stateFile, what, pred) {
+  const { readFile } = await import("node:fs/promises");
+  return until(what, async () => {
+    const data = JSON.parse(await readFile(stateFile, "utf8"));
+    return pred(data) ? data : false;
+  });
+}
+
+/** The quote `id` as the state file currently holds it, or false. */
+const quoteIn = (id) => (data) => (data.quotes || []).find((q) => q.id === id) || false;
+
 test("quote → pay (receivable poll) → run once → replay, with receipt", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
@@ -270,6 +308,7 @@ test("failed run refunds the payer in full", async () => {
   // the FULL upstream error still reaches the caller…
   assert.match(res.content[0].text, /model exploded: PROMPT LEAK abc123/);
   assert.match(res.content[0].text, /refunded to/);
+  await until("the refund send to reach the chain", () => chain.state.transfers.length);
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
 
   // …but the payments ledger records only a categorical refund — no run event,
@@ -542,7 +581,7 @@ test("gate state survives a restart: pending quote pays and settles under the re
   const registry1 = fakeRegistry();
   const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
-  await new Promise((r) => setTimeout(r, 50)); // let the debounced persist land
+  await untilState(stateFile, "the quote to reach the state file", quoteIn(x.paymentId));
 
   // "deploy": a brand-new gate + chain, same state file
   const chain2 = fakeChain();
@@ -553,8 +592,8 @@ test("gate state survives a restart: pending quote pays and settles under the re
   assert.ok(!res.isError, JSON.stringify(res.content));
   assert.equal(registry2.callCount(), 1);
   // settle math still exact after the pair's BigInts round-tripped through JSON
-  await new Promise((r) => setTimeout(r, 50));
-  const change = chain2.state.transfers.find((t) => t.describe === "change:");
+  const change = await until("the change send to reach the chain",
+    () => chain2.state.transfers.find((t) => t.describe === "change:"));
   assert.equal(BigInt(x.amountRaw) - 24n * 10n ** 27n, BigInt(change.amountRaw));
 });
 
@@ -571,7 +610,8 @@ test("gate state survives a restart: completed runs replay, they never run twice
   chain1.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!first.isError);
-  await new Promise((r) => setTimeout(r, 50));
+  await untilState(stateFile, "the completed run's result to reach the state file",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.result; });
 
   const chain2 = fakeChain();
   const registry2 = fakeRegistry();
@@ -597,13 +637,14 @@ test("gate state survives a restart: a queued refund retries under the new proce
   chain1.state.failTransfer = true; // refund bounces → owed queue
   const res = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(res.isError);
-  await new Promise((r) => setTimeout(r, 50));
+  await untilState(stateFile, "the bounced refund to reach the owed queue on disk",
+    (d) => (d.owed || []).length > 0);
 
   const chain2 = fakeChain();
   const gate2 = makeGate(chain2, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5 });
   gate2.wrapRegistry(fakeRegistry());
   t += 31_000; // past the first retry backoff
-  await new Promise((r) => setTimeout(r, 80)); // restored watcher ticks
+  await until("the restored watcher to send the owed refund", () => chain2.state.transfers.length);
   assert.deepEqual(chain2.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }],
     "the customer's refund must land even though the process that owed it died");
 });
@@ -633,7 +674,7 @@ test("restore scrubs legacy free-text refund reasons: no upstream error text rea
   makeGate(chain, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5, usage: (e, f) => events.push([e, f]) })
     .wrapRegistry(fakeRegistry());
   t += 31_000; // past the first retry backoff
-  await new Promise((r) => setTimeout(r, 80)); // restored watcher ticks and sends
+  await until("the restored watcher to send the owed refund", () => chain.state.transfers.length);
 
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: "50000000000000000000000000000", describe: "refunded" }]);
   const refund = events.find(([e, f]) => e === "refund" && f.ok);
@@ -661,7 +702,9 @@ test("a text output never touches disk: state file holds no output text, restart
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!first.isError && first.content.some((c) => c.text === SECRET), "the caller still gets their output in-process");
-  await new Promise((r) => setTimeout(r, 60)); // settle + persist land
+  await until("the first run to settle", () => chain1.state.transfers.some((t) => t.describe === "change:"));
+  await untilState(stateFile, "the settled quote to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled; });
 
   // settle DID run on the first (successful) run: change went back to the payer
   assert.ok(chain1.state.transfers.some((t) => t.describe === "change:"), "the first run settles as normal");
@@ -701,7 +744,8 @@ test("a media-URL result persists and replays after a restart (pointers are safe
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!first.isError);
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the media result to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.result; });
 
   const bytes = await readFile(stateFile, "utf8");
   assert.match(bytes, /out\/poster-image-123\.png/, "the media pointer persists (the file itself dies by --out-ttl)");
@@ -734,7 +778,8 @@ test("a failed paid run persists refund status but no upstream error text; repla
   chain1.state.failTransfer = true;
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(first.isError && first.content[0].text.includes(SECRET), "the caller sees the full error in-process");
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the failed quote's redacted error to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.error; });
 
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /PROMPT-LEAK/, "the upstream error text must not be written to disk");
@@ -789,7 +834,9 @@ test("a legacy state file with a text result + free-text error never re-persists
 
   // Force a fresh persist (a new quote), then inspect the rewritten v2 file.
   await gate.callTool({ name: "poster", arguments: { Text: "new" } });
-  await new Promise((r) => setTimeout(r, 60));
+  // The rewrite prunes the finished legacy quotes, so the fresh pending one is the marker.
+  await untilState(stateFile, "the file to be rewritten in v2 with the fresh quote",
+    (d) => d.v === 2 && d.quotes.some((q) => q.status === "pending"));
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /LEGACY-OUTPUT|LEGACY-ERROR/, "no legacy content may leak into the rewritten state file");
   assert.match(bytes, /"v":2/, "the file is rewritten in the content-stripping era format");
@@ -810,14 +857,16 @@ test("a redacted error survives a SECOND restart: the refund-status sentence is 
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   chain1.state.failTransfer = true; // refund bounces → quote stays consumed with its redacted error
   await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the failed quote's redacted error to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.error; });
 
   // First restart: restore, then force a re-persist (a new quote) so the error round-trips.
   const chain2 = fakeChain();
   chain2.state.failTransfer = true;
   const gate2 = makeGate(chain2, { registry: fakeRegistry({ onCall: async () => { throw new Error(SECRET); } }), stateFile }).wrapRegistry(fakeRegistry());
   await gate2.callTool({ name: "poster", arguments: { Text: "z" } }); // triggers persist
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the second persist to hold both quotes",
+    (d) => d.quotes.length > 1 && d.quotes.some((q) => q.id === x.paymentId && q.error));
 
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /PROMPT-LEAK/, "no upstream text after the second persist");
@@ -850,7 +899,8 @@ test("a re-run after restart reports the FIRST run's settled cost and change, no
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.match(first.content.at(-1).text, /actual cost \$0\.02/);
   assert.match(first.content.at(-1).text, /change returned to your wallet/);
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the first run's settlement to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt; });
 
   // Restart: the SECOND run reports NO cost. Money doesn't move again, and the
   // receipt must still describe the first run's settlement — not claim "whole
