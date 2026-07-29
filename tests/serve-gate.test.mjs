@@ -5,6 +5,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { rawToXno } from "../src/wallet.mjs";
@@ -107,6 +111,44 @@ const GRAIN = 10n ** 22n; // 1e-8 XNO, the wallet-typeable resolution — mirror
 
 const argOf = (result) => result.structuredContent.x402;
 
+/**
+ * Wait for a CONDITION, never for the clock.
+ *
+ * The gate persists on a debounced promise chain (mkdir → write → rename) and its
+ * owed-queue watchers run on timers. "Sleep 50ms, then look" is therefore a race,
+ * and it is a race this suite loses on a busy machine: 9 of 40 full-suite runs
+ * failed here with every core loaded, always on a persist or a watcher tick.
+ * .github/workflows/test.yml now runs this suite on a shared CI runner, where busy
+ * is the normal condition, so an intermittent red would land on whoever pushed
+ * next. Polling costs a passing run nothing and makes a slow machine wait instead
+ * of fail.
+ *
+ * Only POSITIVE waits move here. A negative assertion ("no change was sent") can
+ * never be established by waiting longer, so those keep their fixed pause.
+ */
+async function until(what, fn, timeoutMs = 15_000) {
+  const t0 = Date.now();
+  for (;;) {
+    let v = false;
+    try { v = await fn(); } catch { v = false; }
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** Wait until the gate's state file parses and satisfies `pred`. Returns the parsed state. */
+async function untilState(stateFile, what, pred) {
+  const { readFile } = await import("node:fs/promises");
+  return until(what, async () => {
+    const data = JSON.parse(await readFile(stateFile, "utf8"));
+    return pred(data) ? data : false;
+  });
+}
+
+/** The quote `id` as the state file currently holds it, or false. */
+const quoteIn = (id) => (data) => (data.quotes || []).find((q) => q.id === id) || false;
+
 test("quote → pay (receivable poll) → run once → replay, with receipt", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
@@ -175,6 +217,88 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   const paidEvent = events[1][1];
   assert.equal(paidEvent.source, PAYER);
   assert.equal(typeof paidEvent.settleMs, "number");
+});
+
+/**
+ * A caller awaiting payment must always get an answer.
+ *
+ * waitForPayment() used to unref() the bounded timeout it resolves on, so the
+ * returned promise only ever settled if some UNRELATED handle happened to keep
+ * the event loop alive. Take that handle away and node drains the loop with the
+ * call still inside `await`: no timeout, no poll, no answer, ever.
+ *
+ * The bug hid behind whatever else was running. It never showed in-process here,
+ * because the suite around it always had a handle open — but on node 20 it took
+ * this whole file down (every test after the first: "Promise resolution is still
+ * pending but the event loop has already resolved"). So the guard has to be a
+ * child process that owns nothing else: no server, no listener, no other timer.
+ * If the money path can only answer when something else is holding the loop, this
+ * child hangs and exits non-zero.
+ */
+test("a call awaiting payment answers even when nothing else keeps the loop alive", async () => {
+  const gateUrl = new URL("../src/gate.mjs", import.meta.url).href;
+  const child = `
+import { createChargeGate } from ${JSON.stringify(gateUrl)};
+const chain = { receivable: {}, transfers: [] };
+const ops = {
+  rpc: async (b) => b.action === "receivable"
+    ? { blocks: { ...chain.receivable } }
+    : { history: [] },
+  transfer: async (to, amountRaw, describe) => { chain.transfers.push(describe); return "F".repeat(64); },
+};
+let calls = 0;
+const registry = {
+  tools: [{ name: "poster", x402: null, description: "Make a poster." }],
+  listTools: () => [{ name: "poster", description: "d", inputSchema: { type: "object", properties: { Text: { type: "string" } } } }],
+  prepareCall: async () => ({}),
+  callTool: async () => { calls++; return { content: [{ type: "text", text: "ran" }] }; },
+};
+const gate = createChargeGate({
+  address: ${JSON.stringify(GATE_ADDR)}, ops, usd: 0.05, xnoUsd: 1,
+  validate: (p) => registry.prepareCall(p),
+  publicBase: "http://pay.test", pollMs: 10, waitMs: 200,
+});
+const { callTool } = gate.wrapRegistry(registry);
+const args = { Text: "a lighthouse" };
+const x = (await callTool({ name: "poster", arguments: args })).structuredContent.x402;
+
+// 1. Unpaid. The wait must time out and ANSWER — this is where it used to hang.
+const pending = await callTool({ name: "poster", arguments: { ...args, _payment_id: x.paymentId } });
+if (!pending.isError) throw new Error("unpaid call should be an error");
+console.log("UNPAID_ANSWERED");
+
+// 2. The money lands. The poll must still find it with nothing else ref'd.
+chain.receivable["A".repeat(64)] = { amount: x.amountRaw, source: ${JSON.stringify(PAYER)} };
+const paid = await callTool({ name: "poster", arguments: { ...args, _payment_id: x.paymentId } });
+if (paid.isError) throw new Error("paid call failed: " + JSON.stringify(paid.content));
+if (calls !== 1) throw new Error("expected exactly one run, got " + calls);
+console.log("PAID_AND_RAN");
+`;
+  const dir = await mkdtemp(join(tmpdir(), "gate-liveness-"));
+  const file = join(dir, "liveness.mjs");
+  await writeFile(file, child, "utf8");
+
+  let out = "", err = "", code;
+  try {
+    const proc = spawn(process.execPath, [file], { stdio: ["ignore", "pipe", "pipe"] });
+    proc.stdout.on("data", (d) => { out += d; });
+    proc.stderr.on("data", (d) => { err += d; });
+    code = await new Promise((res, rej) => {
+      // Generous: the child's own waits total well under a second. A timeout here
+      // means it wedged, which is the very failure this test exists to catch.
+      const kill = setTimeout(() => { proc.kill("SIGKILL"); }, 30_000);
+      proc.on("error", (e) => { clearTimeout(kill); rej(e); });
+      proc.on("close", (c) => { clearTimeout(kill); res(c); });
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  assert.match(out, /UNPAID_ANSWERED/,
+    `a tools/call awaiting payment never answered — it hung until the event loop drained.\nstdout: ${out}\nstderr: ${err}`);
+  assert.match(out, /PAID_AND_RAN/,
+    `payment on chain was never detected while the caller waited.\nstdout: ${out}\nstderr: ${err}`);
+  assert.equal(code, 0, `child exited ${code}\nstdout: ${out}\nstderr: ${err}`);
 });
 
 test("quote tracks the up-front cost forecast, not a flat deposit — and covers the real cost", async () => {
@@ -270,6 +394,7 @@ test("failed run refunds the payer in full", async () => {
   // the FULL upstream error still reaches the caller…
   assert.match(res.content[0].text, /model exploded: PROMPT LEAK abc123/);
   assert.match(res.content[0].text, /refunded to/);
+  await until("the refund send to reach the chain", () => chain.state.transfers.length);
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
 
   // …but the payments ledger records only a categorical refund — no run event,
@@ -542,7 +667,7 @@ test("gate state survives a restart: pending quote pays and settles under the re
   const registry1 = fakeRegistry();
   const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
-  await new Promise((r) => setTimeout(r, 50)); // let the debounced persist land
+  await untilState(stateFile, "the quote to reach the state file", quoteIn(x.paymentId));
 
   // "deploy": a brand-new gate + chain, same state file
   const chain2 = fakeChain();
@@ -553,8 +678,8 @@ test("gate state survives a restart: pending quote pays and settles under the re
   assert.ok(!res.isError, JSON.stringify(res.content));
   assert.equal(registry2.callCount(), 1);
   // settle math still exact after the pair's BigInts round-tripped through JSON
-  await new Promise((r) => setTimeout(r, 50));
-  const change = chain2.state.transfers.find((t) => t.describe === "change:");
+  const change = await until("the change send to reach the chain",
+    () => chain2.state.transfers.find((t) => t.describe === "change:"));
   assert.equal(BigInt(x.amountRaw) - 24n * 10n ** 27n, BigInt(change.amountRaw));
 });
 
@@ -571,7 +696,8 @@ test("gate state survives a restart: completed runs replay, they never run twice
   chain1.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!first.isError);
-  await new Promise((r) => setTimeout(r, 50));
+  await untilState(stateFile, "the completed run's result to reach the state file",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.result; });
 
   const chain2 = fakeChain();
   const registry2 = fakeRegistry();
@@ -597,13 +723,14 @@ test("gate state survives a restart: a queued refund retries under the new proce
   chain1.state.failTransfer = true; // refund bounces → owed queue
   const res = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(res.isError);
-  await new Promise((r) => setTimeout(r, 50));
+  await untilState(stateFile, "the bounced refund to reach the owed queue on disk",
+    (d) => (d.owed || []).length > 0);
 
   const chain2 = fakeChain();
   const gate2 = makeGate(chain2, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5 });
   gate2.wrapRegistry(fakeRegistry());
   t += 31_000; // past the first retry backoff
-  await new Promise((r) => setTimeout(r, 80)); // restored watcher ticks
+  await until("the restored watcher to send the owed refund", () => chain2.state.transfers.length);
   assert.deepEqual(chain2.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }],
     "the customer's refund must land even though the process that owed it died");
 });
@@ -633,7 +760,7 @@ test("restore scrubs legacy free-text refund reasons: no upstream error text rea
   makeGate(chain, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5, usage: (e, f) => events.push([e, f]) })
     .wrapRegistry(fakeRegistry());
   t += 31_000; // past the first retry backoff
-  await new Promise((r) => setTimeout(r, 80)); // restored watcher ticks and sends
+  await until("the restored watcher to send the owed refund", () => chain.state.transfers.length);
 
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: "50000000000000000000000000000", describe: "refunded" }]);
   const refund = events.find(([e, f]) => e === "refund" && f.ok);
@@ -661,7 +788,9 @@ test("a text output never touches disk: state file holds no output text, restart
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!first.isError && first.content.some((c) => c.text === SECRET), "the caller still gets their output in-process");
-  await new Promise((r) => setTimeout(r, 60)); // settle + persist land
+  await until("the first run to settle", () => chain1.state.transfers.some((t) => t.describe === "change:"));
+  await untilState(stateFile, "the settled quote to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled; });
 
   // settle DID run on the first (successful) run: change went back to the payer
   assert.ok(chain1.state.transfers.some((t) => t.describe === "change:"), "the first run settles as normal");
@@ -701,7 +830,8 @@ test("a media-URL result persists and replays after a restart (pointers are safe
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!first.isError);
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the media result to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.result; });
 
   const bytes = await readFile(stateFile, "utf8");
   assert.match(bytes, /out\/poster-image-123\.png/, "the media pointer persists (the file itself dies by --out-ttl)");
@@ -734,7 +864,8 @@ test("a failed paid run persists refund status but no upstream error text; repla
   chain1.state.failTransfer = true;
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(first.isError && first.content[0].text.includes(SECRET), "the caller sees the full error in-process");
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the failed quote's redacted error to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.error; });
 
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /PROMPT-LEAK/, "the upstream error text must not be written to disk");
@@ -789,7 +920,9 @@ test("a legacy state file with a text result + free-text error never re-persists
 
   // Force a fresh persist (a new quote), then inspect the rewritten v2 file.
   await gate.callTool({ name: "poster", arguments: { Text: "new" } });
-  await new Promise((r) => setTimeout(r, 60));
+  // The rewrite prunes the finished legacy quotes, so the fresh pending one is the marker.
+  await untilState(stateFile, "the file to be rewritten in v2 with the fresh quote",
+    (d) => d.v === 2 && d.quotes.some((q) => q.status === "pending"));
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /LEGACY-OUTPUT|LEGACY-ERROR/, "no legacy content may leak into the rewritten state file");
   assert.match(bytes, /"v":2/, "the file is rewritten in the content-stripping era format");
@@ -810,14 +943,16 @@ test("a redacted error survives a SECOND restart: the refund-status sentence is 
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   chain1.state.failTransfer = true; // refund bounces → quote stays consumed with its redacted error
   await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the failed quote's redacted error to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.error; });
 
   // First restart: restore, then force a re-persist (a new quote) so the error round-trips.
   const chain2 = fakeChain();
   chain2.state.failTransfer = true;
   const gate2 = makeGate(chain2, { registry: fakeRegistry({ onCall: async () => { throw new Error(SECRET); } }), stateFile }).wrapRegistry(fakeRegistry());
   await gate2.callTool({ name: "poster", arguments: { Text: "z" } }); // triggers persist
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the second persist to hold both quotes",
+    (d) => d.quotes.length > 1 && d.quotes.some((q) => q.id === x.paymentId && q.error));
 
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /PROMPT-LEAK/, "no upstream text after the second persist");
@@ -850,7 +985,8 @@ test("a re-run after restart reports the FIRST run's settled cost and change, no
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.match(first.content.at(-1).text, /actual cost \$0\.02/);
   assert.match(first.content.at(-1).text, /change returned to your wallet/);
-  await new Promise((r) => setTimeout(r, 60));
+  await untilState(stateFile, "the first run's settlement to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt; });
 
   // Restart: the SECOND run reports NO cost. Money doesn't move again, and the
   // receipt must still describe the first run's settlement — not claim "whole
@@ -1129,9 +1265,12 @@ test("landing page links each workflow, states the author cut, and shows self-ho
     // each workflow: a load-in-editor link + its raw graph JSON
     assert.match(html, /href="https:\/\/nanoodle\.com\/#g=H4sIAAAAtest">open in editor</);
     assert.match(html, /href="\/graph\/poster\.json">graph JSON</);
-    // the money story: deposit → cost + 20%, markup is the author's
-    assert.match(html, /20% goes to the <strong>workflow author<\/strong>, not the platform/);
-    assert.match(html, /authors earn the 20%/);
+    // the money story: deposit → cost + 20%, markup is the author's — and this
+    // server's single workflow really does name an address, so it may say so
+    assert.match(html, /20% is the <strong>workflow author's<\/strong> cut/);
+    assert.match(html, /capped by whatever the\s+deposit has left after the model's cost/);
+    assert.match(html, /Every workflow here names one\./);
+    assert.match(html, /Claim the 20% on your own workflow/);
     assert.match(html, new RegExp(PAYER)); // per-tool author payout address
     // open source + host your own
     assert.match(html, /Open source — host your own/);
@@ -1144,6 +1283,84 @@ test("landing page links each workflow, states the author cut, and shows self-ho
     assert.match(graph.headers.get("content-type"), /application\/json/);
     assert.equal(await graph.text(), rawText);
     assert.equal((await fetch(`${base}/graph/nope.json`)).status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+/*
+ * The production state, and the one the old copy lied about.
+ *
+ * settle() in src/gate.mjs routes the 20% markup to the graph's x402.author, and
+ * KEEPS it when there is no such field. Every graph in awesome-noodles is in that
+ * second case, so on mcp.nanoodle.com the markup goes to the wallet running the
+ * server. The landing page and /llms.txt both said, flat out, that the 20% goes to
+ * the workflow author and not the platform. This test holds the copy to the graphs
+ * actually being served.
+ */
+test("no graph names an author: the page says the markup stays with the server, and never claims otherwise", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();                 // x402: null → no author anywhere
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{ name: "poster", x402: null, rawText: "{}", editorUrl: "https://nanoodle.com/#g=abc" }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    const txt = await (await fetch(`${base}/llms.txt`)).text();
+
+    // Says where the money actually goes today.
+    assert.match(html, /None of the workflows here name one yet, so for now the markup stays with this server\./);
+    assert.match(html, /No workflow here claims it yet/);
+    assert.match(txt, /No workflow on this server carries that field, so the markup stays with the operator\./);
+
+    // Never the unconditional claim, in either place.
+    for (const [where, body] of [["landing page", html], ["/llms.txt", txt]]) {
+      assert.doesNotMatch(body, /20% goes to the (<strong>)?workflow author/,
+        `${where} claims the author gets the 20% while no served graph names one`);
+      assert.doesNotMatch(body, /not the platform/,
+        `${where} claims the platform keeps none of the 20% while it keeps all of it`);
+      assert.doesNotMatch(body, /authors earn the 20%/i,
+        `${where} states as fact something no served graph does`);
+    }
+
+    // The genuine feature survives: a graph CAN claim it, and the page says how.
+    assert.match(html, /"x402": \{"author": "nano_…"\}/);
+    assert.match(txt, /x402": \{"author": "nano_…"\}/);
+  } finally {
+    server.close();
+  }
+});
+
+/*
+ * The markup is a CEILING, not a guarantee: settle() takes
+ * min(markup, deposit − cost), so a deposit that cannot cover cost + 20% pays the
+ * author only what is left. Copy that promises "the whole 20%" replaces one
+ * overclaim with another.
+ */
+test("author copy states the deposit ceiling, in both the page and llms.txt", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry({ author: PAYER });
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{ name: "poster", x402: registry.tools[0].x402, rawText: "{}", editorUrl: "https://nanoodle.com/#g=abc" }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    const txt = await (await fetch(`${base}/llms.txt`)).text();
+    assert.match(html, /capped by whatever the\s+deposit has left after the model's cost/);
+    assert.match(html, /as much of it as the\s+deposit leaves after the model's cost/);
+    assert.match(txt, /capped by what the deposit has left after cost/);
+    assert.doesNotMatch(html, /the full 20% markup of every paid run/,
+      "the markup is min(markup, deposit − cost) — never promise the whole of it");
   } finally {
     server.close();
   }
@@ -1339,7 +1556,7 @@ test("free-mode landing page skips the payment story but still shows self-hostin
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const html = await (await fetch(`${base}/`)).text();
-    assert.doesNotMatch(html, /authors earn the 20%/);
+    assert.doesNotMatch(html, /Claim the 20%/);
     assert.doesNotMatch(html, /deposit/i);
     assert.match(html, /open in editor/);
     assert.match(html, /Open source — host your own/);

@@ -190,9 +190,22 @@ const connectCmds = (publicBase) => ({
   grok: `grok mcp add --transport http noodles ${publicBase}/mcp`,
 });
 
+/**
+ * How many of the served workflows actually route the markup to an author.
+ *
+ * The 20% is the author's cut ONLY when a graph carries `"x402": {"author": "nano_…"}`.
+ * With no such field the gate keeps it (src/gate.mjs settle()), so any copy that says
+ * "the 20% goes to the workflow author" full stop is false on a server whose graphs
+ * name nobody — which is every graph in awesome-noodles today. Count first, then write.
+ */
+function authorCount(toolInfo) {
+  return toolInfo.filter((t) => t && t.x402 && typeof t.x402.author === "string" && t.x402.author.trim()).length;
+}
+
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
+  const authored = authorCount(toolInfo);
   const cmds = connectCmds(publicBase);
   const cmd = cmds.claude;
   const cards = tools.map((t) => {
@@ -276,7 +289,13 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">When a tool needs payment, your agent shows you a link with a QR code — scan it with
       any Nano wallet and the result streams back seconds later. What you pay up front is a
       <strong>deposit</strong>: each run settles at the model's metered cost + 20%, and the difference is
-      returned to your wallet on-chain. That 20% goes to the <strong>workflow author</strong>, not the platform.</p>
+      returned to your wallet on-chain. That 20% is the <strong>workflow author's</strong> cut: a graph that
+      names a Nano address in its own JSON is paid the markup on-chain, run by run, capped by whatever the
+      deposit has left after the model's cost. ${authored === 0
+        ? `None of the workflows here name one yet, so for now the markup stays with this server.`
+        : authored === tools.length
+        ? `Every workflow here names one.`
+        : `${authored} of the ${tools.length} workflows here name one; on the rest the markup stays with this server.`}</p>
     </div>` : ""}
     <h2>Workflows (${tools.length})</h2>
     <p class="muted">Every workflow is a plain <code>noodle-graph.json</code> — open it in the
@@ -298,17 +317,29 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         so your prompt content in flight falls under <a href="https://nano-gpt.com/privacy">their privacy policy</a>.</p>
       <p class="muted"><a href="https://github.com/nanoodlecom/nanoodle-mcp">Verify every line in the source →</a></p>
     </div>
-    ${charged ? `<div class="card"><h2>Workflow authors earn the 20%</h2>
+    ${charged ? `<div class="card"><h2>Claim the 20% on your own workflow</h2>
       <p class="muted">A graph that declares a Nano address (<code>"x402": {"author": "nano_…"}</code> in its
-      JSON) receives the full 20% markup of every paid run, paid out on-chain automatically. The public
-      library behind this server is <a href="https://github.com/nanoodlecom/awesome-noodles">awesome-noodles</a> —
+      JSON) has the 20% markup of every paid run sent to it on-chain, automatically — as much of it as the
+      deposit leaves after the model's cost. This server takes no cut of that markup, and Nano charges no
+      fee to move it. ${authored === 0
+        ? `No workflow here claims it yet — the field is unset on all ${tools.length}, so the markup stays with this server.`
+        : authored === tools.length
+        ? `Every workflow here already claims it.`
+        : `${authored} of the ${tools.length} workflows here claim it today.`}
+      The public library behind this server is <a href="https://github.com/nanoodlecom/awesome-noodles">awesome-noodles</a> —
       add your workflow there with your address to get listed and earn on every run.</p>
     </div>` : ""}
     <div class="card"><h2>Open source — host your own</h2>
-      <p class="muted">This whole stack is MIT-licensed: the
+      <p class="muted">MIT-licensed: the
       <a href="https://github.com/nanoodlecom/nanoodle-mcp">server</a>, the
-      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, and every workflow above
-      (grab any graph JSON). One command turns your own folder of graphs into a server exactly like this one:</p>
+      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, and the
+      <a href="https://github.com/nanoodlecom/nanoodle-js">executor</a>. The workflows above are a
+      separate matter — you can grab any graph JSON, but each graph belongs to whoever wrote it and
+      carries whatever licence they give it. One runtime dependency is not MIT either:
+      <a href="https://github.com/marvinroger/nanocurrency-js">nanocurrency</a> is GPL-3.0, and it
+      signs the Nano blocks for the optional x402 wallet
+      (<a href="https://github.com/nanoodlecom/nanoodle-mcp#licensing">details</a>).
+      One command turns your own folder of graphs into a server exactly like this one:</p>
       <pre>npx nanoodle-mcp --graphs ./noodles --serve 8402</pre>
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
@@ -338,6 +369,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
 
 /** The landing page's story as plain text — the version an agent should read. */
 function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] }) {
+  const authored = authorCount(toolInfo);
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const lines = [
@@ -362,7 +394,12 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       `  3. ONLY THEN tools/call again with _payment_id — that is the RESULTS stream. Do not open it while still watching for payment.`,
       `- Paying is the consent; do not wait for a human "go". The quote carries payUrl, watchUrl, and a next imperative that says: on this payment link, show payUrl and open watchUrl now (blocking:false).`,
       `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
-      `- That 20% goes to the workflow author, not the platform.`,
+      `- The 20% is the author's cut, but only when the graph asks for it: a workflow carrying "x402": {"author": "nano_…"} is paid the markup on-chain, capped by what the deposit has left after cost. ` +
+        (authored === 0
+          ? `No workflow on this server carries that field, so the markup stays with the operator.`
+          : authored === tools.length
+          ? `Every workflow on this server carries that field.`
+          : `${authored} of the ${tools.length} workflows here carry it; on the rest the markup stays with the operator.`),
       ``,
     );
   }
@@ -375,7 +412,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     ``,
     `## Privacy`,
     ``,
-    `Relay this to anyone deciding whether to pay — every line is verifiable in the MIT-licensed source.`,
+    `Relay this to anyone deciding whether to pay — every line is verifiable in the published source.`,
     `- No accounts, no API keys, no sign-ins${charged ? " — paying is the only thing that authorizes a call" : ""}.`,
     `- Prompts and inputs are never written to disk or logs.`,
   );
@@ -392,7 +429,9 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     ``,
     `## Source`,
     ``,
-    `MIT-licensed end to end: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, workflow library https://github.com/nanoodlecom/awesome-noodles.`,
+    `MIT-licensed: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, executor https://github.com/nanoodlecom/nanoodle-js.`,
+    `The workflows this server exposes are not covered by that — each graph belongs to whoever wrote it and carries whatever licence they give it.`,
+    `One runtime dependency is GPL-3.0: nanocurrency (https://github.com/marvinroger/nanocurrency-js), which signs the Nano blocks for the optional x402 wallet. Details: https://github.com/nanoodlecom/nanoodle-mcp#licensing`,
     `Self-host: npx nanoodle-mcp --graphs ./noodles --serve 8402`,
     ``,
   );

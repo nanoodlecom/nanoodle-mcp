@@ -19,10 +19,11 @@ agents can pay to run your noodles with no account anywhere.
 No middleman server, no telemetry — and with [wallet mode](#wallet-mode--no-account-no-api-key-x402),
 no account either. The MCP implementation here is hand-rolled (stdio +
 streamable HTTP, JSON-RPC 2.0 — small enough to read). Two runtime dependencies:
-[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
-executor that does all the heavy lifting, and
-[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) for signing
-Nano blocks in wallet mode. Your NanoGPT API key goes straight from your
+[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js) (MIT), the zero-dep
+workflow executor that does all the heavy lifting, and
+[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) (GPL-3.0) for
+signing Nano blocks — loaded only on the x402 paths, see
+[Licensing](#licensing). Your NanoGPT API key goes straight from your
 machine to [nano-gpt.com](https://nano-gpt.com); it is never logged and never
 appears on stdout.
 
@@ -236,8 +237,10 @@ source: an **open in editor** link (a share link minted from the exact graph
 file being served — it loads the workflow in the
 [nanoodle editor](https://nanoodle.com) to inspect, remix, or run on your own
 key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
-out the economics (deposits settle at metered cost + 20%, the markup is the
-workflow author's cut) and how to self-host — this stack is MIT end to end. Generated media is served
+out the economics (deposits settle at metered cost + 20%; the markup is the
+author's cut on graphs that name a payout address, and the operator's on the
+rest, and the page says which of yours do) and how to self-host — this server, the editor, and the
+executor are MIT ([licensing](#licensing)). Generated media is served
 back under unguessable `/out/…` URLs (small images also ride inline in the
 tool result). Runs themselves are **not logged**: free serve mode keeps no
 record of who called what, and charge mode keeps only a payments ledger (money
@@ -354,11 +357,14 @@ graph JSON:
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
 ```
 
-`usd` overrides the deposit. `author` routes **the whole 20% markup of every
+`usd` overrides the deposit. `author` routes **the 20% markup of every
 successful call to that address** — computed on what the run *actually* cost,
-never on the deposit. Nano has no network fees and this server takes no cut
-of it, so creators keep 100% of what their noodle earns. In exact raw, per
-settled call:
+never on the deposit, and capped by whatever the deposit has left once the cost
+is taken out (a deposit too small to cover cost + 20% pays the author only the
+remainder). Nano has no network fees and this server takes no cut of the
+markup, so creators keep 100% of what does get routed. **With no `author`
+field the markup stays with the wallet running the server** — it is opt-in per
+graph, not the default. In exact raw, per settled call:
 
 ```
 cost   = metered model cost, converted at the deposit's own oracle pair, rounded up
@@ -463,7 +469,24 @@ Every readable `*.json` graph in `--graphs` becomes one MCP tool:
 | `description` | the graph's first comment (if any), its node chain in dependency order with node names (e.g. `text:Feature -> llm -> image:Mockup`), a `returns …` contract (output kinds with the sink's model/size and the saved-to-disk note), a spend warning, and — once the tool has run — its last observed cost (`last run $0.018`) |
 | `inputSchema` | one string property per unwired field, exactly like the nanoodle CLI's `inspect`; dropdown fields become `enum`s; only inputs without a baked-in default are `required` |
 | media inputs | image / audio / video inputs take a **file path or https URL** — local files ride inline as base64 |
-| result | text outputs as text blocks; media outputs saved into `--out` (default `./nanoodle-out`) with the absolute path returned; a final text block reports the run's cost |
+| result | text outputs as text blocks; media outputs saved into `--out` (default `./nanoodle-out`) with the absolute path returned; a final text block reports the run's cost; a leading `note:` block whenever the run changed something the caller asked for (see below) |
+
+**When the run does not use your prompt verbatim, the result says so.** Many
+image and video models reject an over-long prompt outright, and in a graph the
+prompt is usually written by an upstream LLM — nobody typed it, so nobody can
+shorten it. `nanoodle` (0.8.0+) trims it to the model's cap at a sentence
+boundary instead of losing the run to a certain 400. That is only defensible if
+the caller is told, so the trim leads the tool result:
+
+```
+note: prompt trimmed for "Poster" (qwen-image-3) — the prompt was 1320 characters
+and this model accepts at most 800, so nanoodle cut it to 791 characters at a
+sentence boundary. The run used the shortened prompt.
+```
+
+It matters most in charge mode, where that run is already paid for. The library
+also emits a `process` warning, but stderr belongs to whoever started the server,
+not to the agent that paid.
 
 Protocol behavior worth knowing: malformed calls (unknown tool, unknown /
 missing / non-string argument) are rejected as JSON-RPC `-32602` **before any
@@ -619,6 +642,17 @@ NanoGPT stub and drives the MCP handshake over stdio:
 npm test
 ```
 
+It also carries release guards: the three release manifests must agree on the
+version, the landing page's chip table may only name node types the `nanoodle`
+library still has, and no startup path may statically import the GPL-3.0
+dependency.
+
+Those guards are offline, so they compare repo files to each other and cannot
+see npm. One more guard needs the network and therefore runs in the publish
+workflow, not in `npm test`: `scripts/assert-npm-version.mjs` fails the registry
+publish unless `server.json`'s version is really on npm. See
+[PUBLISHING.md](PUBLISHING.md).
+
 ## Registry
 
 `server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)
@@ -636,9 +670,49 @@ one-task workflows) cover similar ground without running a server. Running
 graphs in GitHub CI? →
 [run-noodle-action](https://github.com/nanoodlecom/run-noodle-action).
 
-## License
+## Licensing
 
-MIT — see [LICENSE](LICENSE). Not affiliated with NanoGPT or Anthropic. Build
-workflows at [nanoodle.com](https://nanoodle.com); run them from code with
+**MIT:** this server (see [LICENSE](LICENSE)), the
+[nanoodle editor](https://nanoodle.com), and the
+[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js) executor this server
+runs graphs on. The sibling projects — [nanoodle-py](https://github.com/nanoodlecom/nanoodle-py),
+[nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill),
+[noodle-skills](https://github.com/nanoodlecom/noodle-skills) — are MIT too.
+
+**Graphs are not covered by any of that.** A `noodle-graph.json` is its
+author's work. Serving one as a tool, or downloading one from `/graph/<tool>.json`,
+does not place it under this repo's licence. The public library this project
+maintains, [awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), is
+MIT because that repo says so; the graphs on any other server carry whatever
+licence their authors give them.
+
+**GPL-3.0:** one runtime dependency,
+[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js). It derives
+Nano keys, builds and signs blocks, and computes proof-of-work. It is used only
+by the optional x402 Nano wallet: [wallet mode](#wallet-mode--no-account-no-api-key-x402)
+(`NANO_SEED` / `NANO_PRIVATE_KEY`) and [charge mode](#charging-per-call---charge-usd)
+(`--charge-usd`).
+
+Be clear about what that means for you. **Every installer receives it.**
+`npm install nanoodle-mcp` and `npx -y nanoodle-mcp` both download and unpack
+`nanocurrency` onto your disk, whether or not you ever touch x402. Your
+dependency tree contains GPL-3.0 code from the moment you install, and it is
+redistributed with any bundle or image you build from this package.
+
+What the on-demand load changes is narrower, and only that: **which runs
+execute it.** `src/wallet.mjs` and `src/gate.mjs` are the only modules that
+touch `nanocurrency`, and `bin/nanoodle-mcp.mjs` reaches them through
+`await import()` inside the branches that already gate x402. So a BYOK
+(API-key) run never loads or runs GPL-3.0 code — it still has it installed.
+`tests/gpl-boundary.test.mjs` holds that line.
+
+We keep it a normal dependency on purpose. npm installs `optionalDependencies`
+by default, so that would change nothing; the only way to skip it is an
+optional `peerDependency`, and then `npx -y nanoodle-mcp` — the documented
+one-command install — could no longer run wallet or charge mode at all. Correct
+labelling beats a broken accountless install.
+
+Not affiliated with NanoGPT or Anthropic. Build workflows at
+[nanoodle.com](https://nanoodle.com); run them from code with
 [nanoodle-js](https://github.com/nanoodlecom/nanoodle-js) /
 [nanoodle-py](https://github.com/nanoodlecom/nanoodle-py).
