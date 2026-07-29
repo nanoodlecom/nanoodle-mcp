@@ -7,6 +7,13 @@
  * pin that, and pin the failure text, because the failure text is the whole
  * value of the check — it has to tell the release engineer to publish to npm
  * first.
+ *
+ * The MCP registry validates the same thing itself: it fetches
+ * registry.npmjs.org/<name>/<version> and reads mcpName off that exact version,
+ * so an unpublished version 404s and the registry publish is REJECTED
+ * (internal/validators/registries/npm.go). This check therefore buys an earlier
+ * and clearer failure, not a save from a broken registry entry — and the message
+ * must not claim otherwise.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -38,6 +45,11 @@ test("a version npm does NOT have fails, and the message says to publish to npm 
       assert.match(err.message, /npm has: 0\.3\.0, 0\.4\.0/);
       assert.match(err.message, /1\. npm publish/);
       assert.match(err.message, /2\. re-run this workflow/);
+      // The registry runs the same check and rejects the publish. Say that; do
+      // not claim it would happily store a pointer to a tarball that is not there.
+      assert.match(err.message, /the MCP registry will reject this publish/);
+      assert.match(err.message, /registry\.npmjs\.org\/nanoodle-mcp\/0\.6\.0/);
+      assert.doesNotMatch(err.message, /point at a tarball that does not exist/);
       return true;
     },
   );

@@ -2,19 +2,30 @@
 /**
  * Registry-publish preflight — NEEDS NETWORK.
  *
- * Publishing this server is two independent steps: `npm publish` puts the
- * tarball on npm, `mcp-publisher publish` points the MCP registry at that
- * tarball. Nothing ties them together, so the registry can be pointed at a
- * version npm has never seen. That is the live state as this is written: the
- * repo says 0.6.0, npm's latest is 0.4.0, and the registry's latest entry is
- * 0.3.0.
+ * Publishing this server is two steps in a fixed order: `npm publish` puts the
+ * tarball on npm, then `mcp-publisher publish` registers it. Run them the other
+ * way round and the registry REFUSES the entry — it fetches
+ * `registry.npmjs.org/<name>/<version>` and reads `mcpName` off that exact
+ * version, so a version npm has never seen 404s and the publish fails
+ * (`internal/validators/registries/npm.go` in modelcontextprotocol/registry:
+ * "publish version 'X' before registering it"). The registry does not store a
+ * dangling pointer; it just says no.
+ *
+ * So this script does not stop a broken registry entry — the registry already
+ * does that. It fails EARLIER and closer to home: locally or in the workflow,
+ * before mcp-publisher runs at all, naming the exact versions npm holds and the
+ * two commands to run. A publisher error is a Go error about a 404 arriving
+ * after a login round trip; this is a checklist.
+ *
+ * The live state as this is written: the repo says 0.6.0, npm's latest is 0.4.0,
+ * and the registry's latest entry is 0.3.0.
  *
  * tests/manifest-versions.test.mjs cannot catch this. It is offline, and every
  * assertion in it compares repo files to each other. It is happy the moment
  * server.json matches package.json, whether or not that version exists on npm.
  *
- * So this script asks npm. Run it in the publish workflow, before
- * `mcp-publisher publish`, and let a failure fail the job.
+ * Run it in the publish workflow, before `mcp-publisher publish`, and let a
+ * failure fail the job.
  *
  *   node scripts/assert-npm-version.mjs
  */
@@ -43,7 +54,8 @@ export function assertOnNpm({ name, version, versions, latest }) {
   if (versions.includes(version)) return `${name}@${version} is on npm (latest: ${latest ?? "none"})`;
   const have = versions.length ? versions.join(", ") : "nothing — this name has no published versions";
   throw new Error(
-    `${name}@${version} is NOT on npm, so the MCP registry would point at a tarball that does not exist.\n` +
+    `${name}@${version} is NOT on npm, so the MCP registry will reject this publish — it reads mcpName\n` +
+      `off registry.npmjs.org/${name}/${version}, and that version 404s.\n` +
       `  npm has: ${have}\n` +
       `  npm dist-tag latest: ${latest ?? "none"}\n` +
       "\n" +

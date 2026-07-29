@@ -4,6 +4,16 @@ Release order matters — the MCP registry validates that the npm package
 already exists and that its `package.json` proves ownership of the registry
 name.
 
+It checks the **exact version**, not just the name. On publish the registry
+fetches `https://registry.npmjs.org/<name>/<version>` and reads `mcpName` off
+that version's metadata
+([`internal/validators/registries/npm.go`](https://github.com/modelcontextprotocol/registry/blob/main/internal/validators/registries/npm.go)).
+A version npm has never seen returns 404 and the registry **refuses the entry**
+with `publish version 'X' before registering it`. So a wrong-order publish
+cannot leave a dangling registry entry — it just fails. Verified on
+2026-07-28: `registry.npmjs.org/nanoodle-mcp/0.6.0` → 404, while
+`registry.npmjs.org/nanoodle-mcp` → 200.
+
 ## 0. Preconditions (do these first)
 
 1. **Repo is public.** The registry entry links here; directories scrape the
@@ -48,7 +58,13 @@ version.
 **Online — the publish workflow.** `scripts/assert-npm-version.mjs` asks npm
 whether `server.json`'s version is really published, and fails the job if it is
 not. `.github/workflows/publish-mcp-registry.yml` runs it after the offline
-guard and before `mcp-publisher publish`. Run it locally any time:
+guard and before `mcp-publisher publish`.
+
+This does not rescue you from a broken registry entry; the registry's own
+validator already refuses one (above). What it buys is an earlier and plainer
+failure: it runs before `mcp-publisher` and before the login round trip, and it
+prints the versions npm actually holds plus the 2 commands to run, instead of a
+404 from a Go validator. Run it locally any time:
 
 ```bash
 node scripts/assert-npm-version.mjs

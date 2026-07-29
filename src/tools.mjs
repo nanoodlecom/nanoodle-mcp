@@ -447,6 +447,38 @@ export function describeRunFailure(e) {
   return out;
 }
 
+/**
+ * Run-time notices the caller has to see, collected off the library's progress channel.
+ *
+ * `nanoodle` >= 0.8.0 caps prompt length: an image or video prompt over the model's
+ * limit is trimmed at a sentence boundary instead of losing the whole run to a 400
+ * the caller cannot act on (the prompt is usually written by an upstream LLM, so
+ * "please shorten it" names something nobody typed). The library reports every trim
+ * on `onProgress` and on a `process.emitWarning`. An MCP client sees neither — it
+ * reads the tool result, and stderr belongs to whoever launched the server.
+ *
+ * So the trim must reach the result. This call already spent the caller's money, and
+ * in --charge mode it spent their Nano: they paid for a run with a prompt that is not
+ * the one they sent. Trim-and-disclose is the contract; without the disclose half it
+ * is just a silent edit.
+ *
+ * Returns { onProgress, notices } — pass onProgress to wf.run and notices to emitResult.
+ */
+export function runNotices(wf) {
+  const notices = [];
+  const byId = new Map((((wf && wf.graph) || {}).nodes || []).map((n) => [n.id, n]));
+  const onProgress = (evt) => {
+    if (!evt || evt.type !== "prompt-trimmed") return;
+    const node = byId.get(evt.nodeId);
+    const model = node && node.fields && node.fields.model ? ` (${shortModel(node.fields.model)})` : "";
+    notices.push(
+      `note: prompt trimmed for "${evt.name}"${model} — the prompt was ${evt.from} characters and this model ` +
+      `accepts at most ${evt.cap}, so nanoodle cut it to ${evt.to} characters at a sentence boundary. ` +
+      `The run used the shortened prompt.`);
+  };
+  return { onProgress, notices };
+}
+
 /** Small enough to ride inline as an MCP image block alongside its download URL. */
 const INLINE_IMAGE_MAX = 1_500_000;
 const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
@@ -457,9 +489,12 @@ const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: 
  * `publicBase` is set (--serve, remote callers can't read our disk) the file
  * gets an unguessable name, is referenced by its /out/ URL, and small images
  * additionally ride inline so they render right in the caller's terminal.
+ *
+ * `notices` lead the content (see runNotices): a caller who scrolls no further
+ * than the first block still learns the run did not do exactly what they asked.
  */
-async function emitResult(wf, result, prefix, outDir, { publicBase = null } = {}) {
-  const content = [];
+async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
+  const content = notices.map((text) => ({ type: "text", text }));
   // Does any content block carry an actual tool OUTPUT as text (an LLM/text
   // node's result), as opposed to a /out/ URL, a "saved <path>" pointer, or the
   // cost line? Only true text output is the customer's paid content; the gate
@@ -533,8 +568,9 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase 
     throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
   }
   const inputs = await resolveInputs(wf, inputArgs, `run_noodle (${decoded.url})`);
-  const result = await wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
-  return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase });
+  const { onProgress, notices } = runNotices(wf);
+  const result = await wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+  return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices });
 }
 
 /**
@@ -702,9 +738,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();
-      const result = await tool.wf.run(inputs).catch((e) => { throw describeRunFailure(e); });
+      const { onProgress, notices } = runNotices(tool.wf);
+      const result = await tool.wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
-      return emitResult(tool.wf, result, tool.name, outDir, { publicBase });
+      return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
     },
   };
   return registry;

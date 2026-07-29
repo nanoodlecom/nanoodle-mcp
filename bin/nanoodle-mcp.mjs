@@ -386,8 +386,9 @@ async function main() {
       "ONLY THEN call the same tool again with identical arguments plus _payment_id — that tools/call is the RESULTS stream " +
       "(progress heartbeats, then the result). Do not open results while still watching for payment, and do not hold a tools/call open to wait for payment. " +
       "Paying is the consent — nothing to ask the user. " +
-      "The amount paid is a DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup is the " +
-      "workflow author's cut), and the difference is sent back to the paying wallet as change after the run. " +
+      "The amount paid is a DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup goes to the " +
+      "workflow's author when its graph names a payout address, and to the operator when it does not), and the difference " +
+      "is sent back to the paying wallet as change after the run. " +
       "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically.";
   } else {
     // Free serve mode writes NO usage.jsonl — no money moves, so there is no

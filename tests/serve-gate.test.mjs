@@ -1129,9 +1129,12 @@ test("landing page links each workflow, states the author cut, and shows self-ho
     // each workflow: a load-in-editor link + its raw graph JSON
     assert.match(html, /href="https:\/\/nanoodle\.com\/#g=H4sIAAAAtest">open in editor</);
     assert.match(html, /href="\/graph\/poster\.json">graph JSON</);
-    // the money story: deposit → cost + 20%, markup is the author's
-    assert.match(html, /20% goes to the <strong>workflow author<\/strong>, not the platform/);
-    assert.match(html, /authors earn the 20%/);
+    // the money story: deposit → cost + 20%, markup is the author's — and this
+    // server's single workflow really does name an address, so it may say so
+    assert.match(html, /20% is the <strong>workflow author's<\/strong> cut/);
+    assert.match(html, /capped by whatever the\s+deposit has left after the model's cost/);
+    assert.match(html, /Every workflow here names one\./);
+    assert.match(html, /Claim the 20% on your own workflow/);
     assert.match(html, new RegExp(PAYER)); // per-tool author payout address
     // open source + host your own
     assert.match(html, /Open source — host your own/);
@@ -1144,6 +1147,84 @@ test("landing page links each workflow, states the author cut, and shows self-ho
     assert.match(graph.headers.get("content-type"), /application\/json/);
     assert.equal(await graph.text(), rawText);
     assert.equal((await fetch(`${base}/graph/nope.json`)).status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+/*
+ * The production state, and the one the old copy lied about.
+ *
+ * settle() in src/gate.mjs routes the 20% markup to the graph's x402.author, and
+ * KEEPS it when there is no such field. Every graph in awesome-noodles is in that
+ * second case, so on mcp.nanoodle.com the markup goes to the wallet running the
+ * server. The landing page and /llms.txt both said, flat out, that the 20% goes to
+ * the workflow author and not the platform. This test holds the copy to the graphs
+ * actually being served.
+ */
+test("no graph names an author: the page says the markup stays with the server, and never claims otherwise", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();                 // x402: null → no author anywhere
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{ name: "poster", x402: null, rawText: "{}", editorUrl: "https://nanoodle.com/#g=abc" }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    const txt = await (await fetch(`${base}/llms.txt`)).text();
+
+    // Says where the money actually goes today.
+    assert.match(html, /None of the workflows here name one yet, so for now the markup stays with this server\./);
+    assert.match(html, /No workflow here claims it yet/);
+    assert.match(txt, /No workflow on this server carries that field, so the markup stays with the operator\./);
+
+    // Never the unconditional claim, in either place.
+    for (const [where, body] of [["landing page", html], ["/llms.txt", txt]]) {
+      assert.doesNotMatch(body, /20% goes to the (<strong>)?workflow author/,
+        `${where} claims the author gets the 20% while no served graph names one`);
+      assert.doesNotMatch(body, /not the platform/,
+        `${where} claims the platform keeps none of the 20% while it keeps all of it`);
+      assert.doesNotMatch(body, /authors earn the 20%/i,
+        `${where} states as fact something no served graph does`);
+    }
+
+    // The genuine feature survives: a graph CAN claim it, and the page says how.
+    assert.match(html, /"x402": \{"author": "nano_…"\}/);
+    assert.match(txt, /x402": \{"author": "nano_…"\}/);
+  } finally {
+    server.close();
+  }
+});
+
+/*
+ * The markup is a CEILING, not a guarantee: settle() takes
+ * min(markup, deposit − cost), so a deposit that cannot cover cost + 20% pays the
+ * author only what is left. Copy that promises "the whole 20%" replaces one
+ * overclaim with another.
+ */
+test("author copy states the deposit ceiling, in both the page and llms.txt", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry({ author: PAYER });
+  const gate = makeGate(chain, { registry });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const toolInfo = [{ name: "poster", x402: registry.tools[0].x402, rawText: "{}", editorUrl: "https://nanoodle.com/#g=abc" }];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "t", version: "0",
+    listTools, callTool, gate, toolInfo, publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const html = await (await fetch(`${base}/`)).text();
+    const txt = await (await fetch(`${base}/llms.txt`)).text();
+    assert.match(html, /capped by whatever the\s+deposit has left after the model's cost/);
+    assert.match(html, /as much of it as the\s+deposit leaves after the model's cost/);
+    assert.match(txt, /capped by what the deposit has left after cost/);
+    assert.doesNotMatch(html, /the full 20% markup of every paid run/,
+      "the markup is min(markup, deposit − cost) — never promise the whole of it");
   } finally {
     server.close();
   }
@@ -1339,7 +1420,7 @@ test("free-mode landing page skips the payment story but still shows self-hostin
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const html = await (await fetch(`${base}/`)).text();
-    assert.doesNotMatch(html, /authors earn the 20%/);
+    assert.doesNotMatch(html, /Claim the 20%/);
     assert.doesNotMatch(html, /deposit/i);
     assert.match(html, /open in editor/);
     assert.match(html, /Open source — host your own/);
