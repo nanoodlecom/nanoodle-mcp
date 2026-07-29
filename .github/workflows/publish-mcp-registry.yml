@@ -29,6 +29,13 @@ jobs:
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
 
+      # The guard above is offline: every assertion in it compares repo files to
+      # each other, so it passes whenever server.json matches package.json — even
+      # if npm has never published that version. This step asks npm. The registry
+      # entry points at an npm tarball, so the tarball must exist first.
+      - name: Assert the release is published on npm
+        run: node scripts/assert-npm-version.mjs
+
       - name: Install mcp-publisher
         run: |
           curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher

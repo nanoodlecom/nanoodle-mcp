@@ -626,6 +626,12 @@ version, the landing page's chip table may only name node types the `nanoodle`
 library still has, and no startup path may statically import the GPL-3.0
 dependency.
 
+Those guards are offline, so they compare repo files to each other and cannot
+see npm. One more guard needs the network and therefore runs in the publish
+workflow, not in `npm test`: `scripts/assert-npm-version.mjs` fails the registry
+publish unless `server.json`'s version is really on npm. See
+[PUBLISHING.md](PUBLISHING.md).
+
 ## Registry
 
 `server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)
@@ -646,24 +652,38 @@ graphs in GitHub CI? →
 ## Licensing
 
 **MIT:** this server (see [LICENSE](LICENSE)), the
-[nanoodle editor](https://nanoodle.com), the graphs you save from it, and the
+[nanoodle editor](https://nanoodle.com), and the
 [`nanoodle`](https://github.com/nanoodlecom/nanoodle-js) executor this server
-runs them on. The sibling projects — [nanoodle-py](https://github.com/nanoodlecom/nanoodle-py),
+runs graphs on. The sibling projects — [nanoodle-py](https://github.com/nanoodlecom/nanoodle-py),
 [nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill),
 [noodle-skills](https://github.com/nanoodlecom/noodle-skills) — are MIT too.
+
+**Graphs are not covered by any of that.** A `noodle-graph.json` is its
+author's work. Serving one as a tool, or downloading one from `/graph/<tool>.json`,
+does not place it under this repo's licence. The public library this project
+maintains, [awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), is
+MIT because that repo says so; the graphs on any other server carry whatever
+licence their authors give them.
 
 **GPL-3.0:** one runtime dependency,
 [`nanocurrency`](https://github.com/marvinroger/nanocurrency-js). It derives
 Nano keys, builds and signs blocks, and computes proof-of-work. It is used only
 by the optional x402 Nano wallet: [wallet mode](#wallet-mode--no-account-no-api-key-x402)
 (`NANO_SEED` / `NANO_PRIVATE_KEY`) and [charge mode](#charging-per-call---charge-usd)
-(`--charge-usd`). `npm install nanoodle-mcp` installs it, so your dependency
-tree contains GPL-3.0 code even if you never enable x402.
+(`--charge-usd`).
 
-Nothing loads it until you do. `src/wallet.mjs` and `src/gate.mjs` are the only
-modules that touch it, and the server imports them on demand, so a BYOK
-(API-key) run never executes GPL-3.0 code. `tests/gpl-boundary.test.mjs` holds
-that line.
+Be clear about what that means for you. **Every installer receives it.**
+`npm install nanoodle-mcp` and `npx -y nanoodle-mcp` both download and unpack
+`nanocurrency` onto your disk, whether or not you ever touch x402. Your
+dependency tree contains GPL-3.0 code from the moment you install, and it is
+redistributed with any bundle or image you build from this package.
+
+What the on-demand load changes is narrower, and only that: **which runs
+execute it.** `src/wallet.mjs` and `src/gate.mjs` are the only modules that
+touch `nanocurrency`, and `bin/nanoodle-mcp.mjs` reaches them through
+`await import()` inside the branches that already gate x402. So a BYOK
+(API-key) run never loads or runs GPL-3.0 code — it still has it installed.
+`tests/gpl-boundary.test.mjs` holds that line.
 
 We keep it a normal dependency on purpose. npm installs `optionalDependencies`
 by default, so that would change nothing; the only way to skip it is an

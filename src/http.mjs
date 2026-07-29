@@ -307,9 +307,10 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     <div class="card"><h2>Open source — host your own</h2>
       <p class="muted">MIT-licensed: the
       <a href="https://github.com/nanoodlecom/nanoodle-mcp">server</a>, the
-      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, the
-      <a href="https://github.com/nanoodlecom/nanoodle-js">executor</a>, and every workflow above
-      (grab any graph JSON). One runtime dependency is not:
+      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, and the
+      <a href="https://github.com/nanoodlecom/nanoodle-js">executor</a>. The workflows above are a
+      separate matter — you can grab any graph JSON, but each graph belongs to whoever wrote it and
+      carries whatever licence they give it. One runtime dependency is not MIT either:
       <a href="https://github.com/marvinroger/nanocurrency-js">nanocurrency</a> is GPL-3.0, and it
       signs the Nano blocks for the optional x402 wallet
       (<a href="https://github.com/nanoodlecom/nanoodle-mcp#licensing">details</a>).
@@ -397,7 +398,8 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     ``,
     `## Source`,
     ``,
-    `MIT-licensed: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, executor https://github.com/nanoodlecom/nanoodle-js, workflow library https://github.com/nanoodlecom/awesome-noodles.`,
+    `MIT-licensed: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, executor https://github.com/nanoodlecom/nanoodle-js.`,
+    `The workflows this server exposes are not covered by that — each graph belongs to whoever wrote it and carries whatever licence they give it.`,
     `One runtime dependency is GPL-3.0: nanocurrency (https://github.com/marvinroger/nanocurrency-js), which signs the Nano blocks for the optional x402 wallet. Details: https://github.com/nanoodlecom/nanoodle-mcp#licensing`,
     `Self-host: npx nanoodle-mcp --graphs ./noodles --serve 8402`,
     ``,

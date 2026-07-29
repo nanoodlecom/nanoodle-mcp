@@ -1,13 +1,21 @@
 /**
- * Release-manifest guards — fully offline.
+ * Release-manifest guards — INTERNAL CONSISTENCY ONLY, fully offline.
  *
- * A release restates this server's version in several files. Publishing is a
- * two-step (npm, then the MCP registry), so a stale `server.json` does not
- * fail loudly: the registry entry ships metadata for one version while the npm
- * tarball it points at is another. That happened — package.json said 0.6.0 and
- * server.json still said 0.5.0 in both of its version fields.
+ * A release restates this server's version in several files, and they drift.
+ * package.json said 0.6.0 while server.json still said 0.5.0 in both of its
+ * version fields. These tests make that particular drift impossible to commit.
  *
- * These tests make that drift impossible to commit.
+ * Know the limit. Every assertion below compares repo files to each other.
+ * Nothing here talks to npm, so all of it passes the moment server.json matches
+ * package.json — including when that version was never published. On
+ * 2026-07-28 this repo says 0.6.0, npm's latest is 0.4.0, npm has never held a
+ * 0.5.0 or a 0.6.0, and the registry's entry is 0.3.0. Every test in this file
+ * passes on that state.
+ *
+ * The check that catches THAT is scripts/assert-npm-version.mjs. It needs the
+ * network, so it runs in .github/workflows/publish-mcp-registry.yml before
+ * `mcp-publisher publish`, not in `npm test`. Both guards are required; neither
+ * one is sufficient.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";

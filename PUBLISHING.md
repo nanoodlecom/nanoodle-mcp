@@ -36,11 +36,29 @@ bump `version` in **three** places — `package.json`, `server.json` (top-level
 `version` AND `packages[0].version`) — then `npm publish`, then
 `mcp-publisher publish` again.
 
-`npm test` enforces this. `tests/manifest-versions.test.mjs` fails when the
-three version fields disagree, or when `package-lock.json` still records the
-old version or the old dependency set. Run `npm install` after the bump so the
-lockfile follows. A registry publish must never point at an npm tarball with a
-different version.
+Two guards enforce this, and they cover different halves of the problem.
+
+**Offline — `npm test`.** `tests/manifest-versions.test.mjs` fails when the
+three version fields disagree, or when `package-lock.json` still records the old
+version or the old dependency set. Run `npm install` after the bump so the
+lockfile follows. Every assertion in it compares repo files to each other, so it
+is happy the moment the files agree — it cannot tell you whether npm has that
+version.
+
+**Online — the publish workflow.** `scripts/assert-npm-version.mjs` asks npm
+whether `server.json`'s version is really published, and fails the job if it is
+not. `.github/workflows/publish-mcp-registry.yml` runs it after the offline
+guard and before `mcp-publisher publish`. Run it locally any time:
+
+```bash
+node scripts/assert-npm-version.mjs
+```
+
+**Version drift as of 2026-07-28.** This repo says 0.6.0. npm's latest is 0.4.0
+and npm has never held a 0.5.0 or a 0.6.0. The registry's current entry is
+0.3.0. So neither 0.5.0 nor 0.6.0 was ever published anywhere, and the next
+release must run `npm publish` first. The preflight above fails today, on
+purpose, until it does.
 
 ## 2. Optional later: the `com.nanoodle/*` namespace
 
