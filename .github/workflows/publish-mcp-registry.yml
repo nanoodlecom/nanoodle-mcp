@@ -20,6 +20,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # server.json is the registry entry, package.json is what npm published.
+      # If they disagree, the registry lists metadata for a version that is not
+      # the tarball it points at. Stop before the publish, not after.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Guard the release manifests
+        run: node --test tests/manifest-versions.test.mjs
+
       - name: Install mcp-publisher
         run: |
           curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher

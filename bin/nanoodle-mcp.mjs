@@ -34,10 +34,18 @@ import { loadTools, attachEstimates } from "../src/tools.mjs";
 import { warnIfFfmpegMissing } from "../src/ffmpeg-check.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
-import { createChargeGate } from "../src/gate.mjs";
-import { createNanoWallet, resolveWalletKey } from "../src/wallet.mjs";
 import { redactUrl } from "../src/redact.mjs";
 import { startSweeper } from "../src/sweep.mjs";
+/*
+ * src/wallet.mjs and src/gate.mjs are the ONLY modules that reach `nanocurrency`,
+ * and they load on demand (see loadWalletMod / loadGateMod below). `nanocurrency`
+ * is GPL-3.0 while the rest of this stack is MIT, so a BYOK run must not even
+ * execute it — and it is the heaviest import in the tree (a WASM proof-of-work
+ * module plus bignumber.js and blakejs), which a key-only run never needs.
+ * Keep every nanocurrency-touching import behind these two loaders.
+ */
+const loadWalletMod = () => import("../src/wallet.mjs");
+const loadGateMod = () => import("../src/gate.mjs");
 
 function usage(code = 1) {
   console.error(`usage:
@@ -212,6 +220,7 @@ async function main() {
   let wallet = null;
   if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null)) {
     try {
+      const { createNanoWallet, resolveWalletKey } = await loadWalletMod();
       wallet = createNanoWallet({
         secretKey: resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed }),
         rpcUrl: nanoRpcFlag || process.env.NANO_RPC_URL || undefined,
@@ -352,6 +361,7 @@ async function main() {
     const estTimer = setInterval(refreshEstimates, 60 * 60 * 1000);
     if (estTimer.unref) estTimer.unref();
 
+    const { createChargeGate } = await loadGateMod();
     gate = createChargeGate({
       address: wallet.address,
       ops: wallet.ops,

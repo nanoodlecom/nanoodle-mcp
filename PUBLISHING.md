@@ -36,6 +36,12 @@ bump `version` in **three** places — `package.json`, `server.json` (top-level
 `version` AND `packages[0].version`) — then `npm publish`, then
 `mcp-publisher publish` again.
 
+`npm test` enforces this. `tests/manifest-versions.test.mjs` fails when the
+three version fields disagree, or when `package-lock.json` still records the
+old version or the old dependency set. Run `npm install` after the bump so the
+lockfile follows. A registry publish must never point at an npm tarball with a
+different version.
+
 ## 2. Optional later: the `com.nanoodle/*` namespace
 
 `io.github.nanoodlecom/nanoodle-mcp` works today with plain GitHub auth. If we

@@ -19,10 +19,11 @@ agents can pay to run your noodles with no account anywhere.
 No middleman server, no telemetry — and with [wallet mode](#wallet-mode--no-account-no-api-key-x402),
 no account either. The MCP implementation here is hand-rolled (stdio +
 streamable HTTP, JSON-RPC 2.0 — small enough to read). Two runtime dependencies:
-[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js), the zero-dep workflow
-executor that does all the heavy lifting, and
-[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) for signing
-Nano blocks in wallet mode. Your NanoGPT API key goes straight from your
+[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js) (MIT), the zero-dep
+workflow executor that does all the heavy lifting, and
+[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js) (GPL-3.0) for
+signing Nano blocks — loaded only on the x402 paths, see
+[Licensing](#licensing). Your NanoGPT API key goes straight from your
 machine to [nano-gpt.com](https://nano-gpt.com); it is never logged and never
 appears on stdout.
 
@@ -237,7 +238,8 @@ file being served — it loads the workflow in the
 [nanoodle editor](https://nanoodle.com) to inspect, remix, or run on your own
 key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
 out the economics (deposits settle at metered cost + 20%, the markup is the
-workflow author's cut) and how to self-host — this stack is MIT end to end. Generated media is served
+workflow author's cut) and how to self-host — this server, the editor, and the
+executor are MIT ([licensing](#licensing)). Generated media is served
 back under unguessable `/out/…` URLs (small images also ride inline in the
 tool result). Runs themselves are **not logged**: free serve mode keeps no
 record of who called what, and charge mode keeps only a payments ledger (money
@@ -619,6 +621,11 @@ NanoGPT stub and drives the MCP handshake over stdio:
 npm test
 ```
 
+It also carries release guards: the three release manifests must agree on the
+version, the landing page's chip table may only name node types the `nanoodle`
+library still has, and no startup path may statically import the GPL-3.0
+dependency.
+
 ## Registry
 
 `server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)
@@ -636,9 +643,35 @@ one-task workflows) cover similar ground without running a server. Running
 graphs in GitHub CI? →
 [run-noodle-action](https://github.com/nanoodlecom/run-noodle-action).
 
-## License
+## Licensing
 
-MIT — see [LICENSE](LICENSE). Not affiliated with NanoGPT or Anthropic. Build
-workflows at [nanoodle.com](https://nanoodle.com); run them from code with
+**MIT:** this server (see [LICENSE](LICENSE)), the
+[nanoodle editor](https://nanoodle.com), the graphs you save from it, and the
+[`nanoodle`](https://github.com/nanoodlecom/nanoodle-js) executor this server
+runs them on. The sibling projects — [nanoodle-py](https://github.com/nanoodlecom/nanoodle-py),
+[nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill),
+[noodle-skills](https://github.com/nanoodlecom/noodle-skills) — are MIT too.
+
+**GPL-3.0:** one runtime dependency,
+[`nanocurrency`](https://github.com/marvinroger/nanocurrency-js). It derives
+Nano keys, builds and signs blocks, and computes proof-of-work. It is used only
+by the optional x402 Nano wallet: [wallet mode](#wallet-mode--no-account-no-api-key-x402)
+(`NANO_SEED` / `NANO_PRIVATE_KEY`) and [charge mode](#charging-per-call---charge-usd)
+(`--charge-usd`). `npm install nanoodle-mcp` installs it, so your dependency
+tree contains GPL-3.0 code even if you never enable x402.
+
+Nothing loads it until you do. `src/wallet.mjs` and `src/gate.mjs` are the only
+modules that touch it, and the server imports them on demand, so a BYOK
+(API-key) run never executes GPL-3.0 code. `tests/gpl-boundary.test.mjs` holds
+that line.
+
+We keep it a normal dependency on purpose. npm installs `optionalDependencies`
+by default, so that would change nothing; the only way to skip it is an
+optional `peerDependency`, and then `npx -y nanoodle-mcp` — the documented
+one-command install — could no longer run wallet or charge mode at all. Correct
+labelling beats a broken accountless install.
+
+Not affiliated with NanoGPT or Anthropic. Build workflows at
+[nanoodle.com](https://nanoodle.com); run them from code with
 [nanoodle-js](https://github.com/nanoodlecom/nanoodle-js) /
 [nanoodle-py](https://github.com/nanoodlecom/nanoodle-py).

@@ -305,10 +305,15 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       add your workflow there with your address to get listed and earn on every run.</p>
     </div>` : ""}
     <div class="card"><h2>Open source — host your own</h2>
-      <p class="muted">This whole stack is MIT-licensed: the
+      <p class="muted">MIT-licensed: the
       <a href="https://github.com/nanoodlecom/nanoodle-mcp">server</a>, the
-      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, and every workflow above
-      (grab any graph JSON). One command turns your own folder of graphs into a server exactly like this one:</p>
+      <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, the
+      <a href="https://github.com/nanoodlecom/nanoodle-js">executor</a>, and every workflow above
+      (grab any graph JSON). One runtime dependency is not:
+      <a href="https://github.com/marvinroger/nanocurrency-js">nanocurrency</a> is GPL-3.0, and it
+      signs the Nano blocks for the optional x402 wallet
+      (<a href="https://github.com/nanoodlecom/nanoodle-mcp#licensing">details</a>).
+      One command turns your own folder of graphs into a server exactly like this one:</p>
       <pre>npx nanoodle-mcp --graphs ./noodles --serve 8402</pre>
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
@@ -375,7 +380,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     ``,
     `## Privacy`,
     ``,
-    `Relay this to anyone deciding whether to pay — every line is verifiable in the MIT-licensed source.`,
+    `Relay this to anyone deciding whether to pay — every line is verifiable in the published source.`,
     `- No accounts, no API keys, no sign-ins${charged ? " — paying is the only thing that authorizes a call" : ""}.`,
     `- Prompts and inputs are never written to disk or logs.`,
   );
@@ -392,7 +397,8 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     ``,
     `## Source`,
     ``,
-    `MIT-licensed end to end: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, workflow library https://github.com/nanoodlecom/awesome-noodles.`,
+    `MIT-licensed: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, executor https://github.com/nanoodlecom/nanoodle-js, workflow library https://github.com/nanoodlecom/awesome-noodles.`,
+    `One runtime dependency is GPL-3.0: nanocurrency (https://github.com/marvinroger/nanocurrency-js), which signs the Nano blocks for the optional x402 wallet. Details: https://github.com/nanoodlecom/nanoodle-mcp#licensing`,
     `Self-host: npx nanoodle-mcp --graphs ./noodles --serve 8402`,
     ``,
   );

@@ -166,13 +166,18 @@ function typeChain(graph) {
  * Media class per node type, for the landing page's tinted pipeline chips.
  * Classed by what the node produces; a type missing here just renders in the
  * neutral tint, so new node types degrade gracefully.
+ *
+ * Every key must be a live nanoodle NODE_TYPES entry — a retired type here is
+ * dead weight, because loadTools drops any graph whose types the library no
+ * longer knows (it warns, and a warned graph never becomes a tool). The
+ * chip-kinds guard in tests/chip-kinds.test.mjs enforces that.
  */
-const CHIP_KINDS = {
+export const CHIP_KINDS = {
   text: "text", join: "text", choice: "text", transcribe: "text",
   llm: "llm", vision: "llm",
-  image: "image", upload: "image", edit: "image", resize: "image", draw: "image", inpaint: "image", vframes: "image",
-  ivideo: "video", vupload: "video", lipsync: "video", soundtrack: "video", vedit: "video", combine: "video",
-  audio: "audio", music: "audio", tts: "audio", extractaudio: "audio", trim: "audio", remix: "audio",
+  image: "image", upload: "image", edit: "image", resize: "image", inpaint: "image", vframes: "image",
+  tvideo: "video", ivideo: "video", vupload: "video", lipsync: "video", soundtrack: "video", vedit: "video", combine: "video",
+  aupload: "audio", music: "audio", tts: "audio", extractaudio: "audio", trim: "audio", remix: "audio",
 };
 
 /**
