@@ -826,7 +826,29 @@ export function createChargeGate({
       return out;
     },
 
-    /** Resolve when the quote leaves `pending` (paid/expired), or after ms. Returns the status. */
+    /**
+     * Resolve when the quote leaves `pending` (paid/expired), or after ms. Returns the status.
+     *
+     * This timer is deliberately NOT unref'd, and that is the opposite of the
+     * background poll timer in tick(). The two are different jobs:
+     *
+     *   - tick()'s timer is an UNBOUNDED background poll. It must be unref'd, or
+     *     an idle stdio server could never exit.
+     *   - this timer is a BOUNDED wait that a caller is awaiting right now. It is
+     *     the only thing that guarantees the returned promise settles.
+     *
+     * Unref'ing this one made the promise's liveness depend on unrelated handles
+     * elsewhere in the process. With nothing else ref'd, node drained the event
+     * loop while a tools/call sat inside `await waitForPayment(...)`: the timeout
+     * never fired, the poll that would have seen the payment never ran, and the
+     * call never returned an answer of any kind. The whole of tests/serve-gate
+     * died this way on node 20 ("Promise resolution is still pending but the
+     * event loop has already resolved").
+     *
+     * Holding a ref for the wait is correct, not a leak: `ms` is bounded (waitMs,
+     * default 20s), the wait only exists while a call is genuinely in flight, and
+     * a payment arriving early clears the timer through the waiter below.
+     */
     waitForPayment(id, ms) {
       const q = quotes.get(String(id));
       if (!q) return Promise.resolve("unknown");
@@ -834,7 +856,6 @@ export function createChargeGate({
       ensureWatching();
       return new Promise((res) => {
         const t = setTimeout(() => res(q.status), ms);
-        if (t.unref) t.unref();
         q.waiters.push(() => { clearTimeout(t); res(q.status); });
       });
     },

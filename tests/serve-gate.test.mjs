@@ -5,6 +5,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { rawToXno } from "../src/wallet.mjs";
@@ -213,6 +217,88 @@ test("quote → pay (receivable poll) → run once → replay, with receipt", as
   const paidEvent = events[1][1];
   assert.equal(paidEvent.source, PAYER);
   assert.equal(typeof paidEvent.settleMs, "number");
+});
+
+/**
+ * A caller awaiting payment must always get an answer.
+ *
+ * waitForPayment() used to unref() the bounded timeout it resolves on, so the
+ * returned promise only ever settled if some UNRELATED handle happened to keep
+ * the event loop alive. Take that handle away and node drains the loop with the
+ * call still inside `await`: no timeout, no poll, no answer, ever.
+ *
+ * The bug hid behind whatever else was running. It never showed in-process here,
+ * because the suite around it always had a handle open — but on node 20 it took
+ * this whole file down (every test after the first: "Promise resolution is still
+ * pending but the event loop has already resolved"). So the guard has to be a
+ * child process that owns nothing else: no server, no listener, no other timer.
+ * If the money path can only answer when something else is holding the loop, this
+ * child hangs and exits non-zero.
+ */
+test("a call awaiting payment answers even when nothing else keeps the loop alive", async () => {
+  const gateUrl = new URL("../src/gate.mjs", import.meta.url).href;
+  const child = `
+import { createChargeGate } from ${JSON.stringify(gateUrl)};
+const chain = { receivable: {}, transfers: [] };
+const ops = {
+  rpc: async (b) => b.action === "receivable"
+    ? { blocks: { ...chain.receivable } }
+    : { history: [] },
+  transfer: async (to, amountRaw, describe) => { chain.transfers.push(describe); return "F".repeat(64); },
+};
+let calls = 0;
+const registry = {
+  tools: [{ name: "poster", x402: null, description: "Make a poster." }],
+  listTools: () => [{ name: "poster", description: "d", inputSchema: { type: "object", properties: { Text: { type: "string" } } } }],
+  prepareCall: async () => ({}),
+  callTool: async () => { calls++; return { content: [{ type: "text", text: "ran" }] }; },
+};
+const gate = createChargeGate({
+  address: ${JSON.stringify(GATE_ADDR)}, ops, usd: 0.05, xnoUsd: 1,
+  validate: (p) => registry.prepareCall(p),
+  publicBase: "http://pay.test", pollMs: 10, waitMs: 200,
+});
+const { callTool } = gate.wrapRegistry(registry);
+const args = { Text: "a lighthouse" };
+const x = (await callTool({ name: "poster", arguments: args })).structuredContent.x402;
+
+// 1. Unpaid. The wait must time out and ANSWER — this is where it used to hang.
+const pending = await callTool({ name: "poster", arguments: { ...args, _payment_id: x.paymentId } });
+if (!pending.isError) throw new Error("unpaid call should be an error");
+console.log("UNPAID_ANSWERED");
+
+// 2. The money lands. The poll must still find it with nothing else ref'd.
+chain.receivable["A".repeat(64)] = { amount: x.amountRaw, source: ${JSON.stringify(PAYER)} };
+const paid = await callTool({ name: "poster", arguments: { ...args, _payment_id: x.paymentId } });
+if (paid.isError) throw new Error("paid call failed: " + JSON.stringify(paid.content));
+if (calls !== 1) throw new Error("expected exactly one run, got " + calls);
+console.log("PAID_AND_RAN");
+`;
+  const dir = await mkdtemp(join(tmpdir(), "gate-liveness-"));
+  const file = join(dir, "liveness.mjs");
+  await writeFile(file, child, "utf8");
+
+  let out = "", err = "", code;
+  try {
+    const proc = spawn(process.execPath, [file], { stdio: ["ignore", "pipe", "pipe"] });
+    proc.stdout.on("data", (d) => { out += d; });
+    proc.stderr.on("data", (d) => { err += d; });
+    code = await new Promise((res, rej) => {
+      // Generous: the child's own waits total well under a second. A timeout here
+      // means it wedged, which is the very failure this test exists to catch.
+      const kill = setTimeout(() => { proc.kill("SIGKILL"); }, 30_000);
+      proc.on("error", (e) => { clearTimeout(kill); rej(e); });
+      proc.on("close", (c) => { clearTimeout(kill); res(c); });
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  assert.match(out, /UNPAID_ANSWERED/,
+    `a tools/call awaiting payment never answered — it hung until the event loop drained.\nstdout: ${out}\nstderr: ${err}`);
+  assert.match(out, /PAID_AND_RAN/,
+    `payment on chain was never detected while the caller waited.\nstdout: ${out}\nstderr: ${err}`);
+  assert.equal(code, 0, `child exited ${code}\nstdout: ${out}\nstderr: ${err}`);
 });
 
 test("quote tracks the up-front cost forecast, not a flat deposit — and covers the real cost", async () => {
