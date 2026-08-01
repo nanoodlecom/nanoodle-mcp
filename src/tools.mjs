@@ -36,36 +36,140 @@ const CATALOG_PATH = {
   audio: "/api/v1/audio-models",
 };
 
+/** Cached catalog arrays by `${base}|${kind}` — the public catalogs move slowly and every fetch is unauthenticated. */
+const catalogCache = new Map();
+const CATALOG_TTL_MS = 60 * 60 * 1000;
 /**
- * Fetch the public catalog(s) each hosted graph needs and forecast every tool's
- * per-run cost UP FRONT, into `registry.estimates` (name → {usd, exact, priced,
- * unpriced}). The charge gate reads this so the very first quote for a tool that
- * has never run still deposits enough to cover it — instead of a flat guess.
+ * Failure markers by the same key. An endpoint that's down stays down for more
+ * than one call, so one failed round trip covers the next minute instead of
+ * every run paying its own — bounded well under the success TTL so a recovered
+ * endpoint is picked up promptly.
+ */
+const catalogFailures = new Map();
+const CATALOG_FAIL_TTL_MS = 60 * 1000;
+/**
+ * A catalog fetch is a nice-to-have on a path that must stay responsive, and
+ * node's fetch has no total-request timeout (undici's headers timeout is 300s),
+ * so a server that accepts the connection and never answers would otherwise
+ * hang startup and every run behind it.
+ */
+const CATALOG_TIMEOUT_MS = 8000;
+
+/**
+ * Fetch the raw public catalog array for each pricing `kind`, keyed for the
+ * library's opt-in `catalog` option AND for estimateGraphCost — same shape,
+ * one fetch serves both.
+ *
+ * Best-effort by design: a kind that won't load is simply absent from the
+ * result, and both the estimator and every library catalog gate are permissive
+ * about a missing/absent model, so the run behaves exactly as it does today.
+ * Bounded, too: each fetch is abandoned after `timeoutMs`, and a failure is
+ * remembered for CATALOG_FAIL_TTL_MS so an outage costs one round trip a minute
+ * rather than one per call.
+ * `maxAgeMs: 0` forces a refetch (the hourly estimate refresh) and bypasses the
+ * failure marker; anything else serves a cached array younger than that, so a
+ * per-call path (run_noodle) doesn't pay a round trip on every run.
+ * `consequence` is appended to the failure log line, so each caller can name
+ * what its own users lose.
+ */
+export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
+  const base = String(baseUrl).replace(/\/+$/, "");
+  const catalogs = {};
+  // A stale copy still beats nothing: the payload gates and the forecast are both
+  // better off with last hour's catalog than with none — but say so, or an
+  // endpoint that never recovers serves indefinitely-old limits invisibly.
+  const serveStale = (kind, hit, why) => {
+    catalogs[kind] = hit.data;
+    const mins = Math.round((Date.now() - hit.at) / 60000);
+    log(`${kind} catalog refresh failed (${why}) — clamping against the copy cached ${mins} min ago${consequence}`);
+  };
+  await Promise.all([...kinds].map(async (kind) => {
+    if (!CATALOG_PATH[kind]) return;
+    const key = `${base}|${kind}`;
+    const hit = catalogCache.get(key);
+    if (hit && Date.now() - hit.at < maxAgeMs) { catalogs[kind] = hit.data; return; }
+    const failed = catalogFailures.get(key);
+    if (failed && Date.now() - failed.at < Math.min(CATALOG_FAIL_TTL_MS, maxAgeMs)) {
+      if (hit) serveStale(kind, hit, failed.why);
+      return; // already logged when the failure was recorded
+    }
+    try {
+      const r = await fetch(base + CATALOG_PATH[kind], {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()).data;
+      if (Array.isArray(data) && data.length) {
+        catalogs[kind] = data;
+        catalogCache.set(key, { at: Date.now(), data });
+        catalogFailures.delete(key);
+      } else {
+        catalogFailures.set(key, { at: Date.now(), why: "empty" });
+        log(`${kind} catalog came back empty — those graphs run without the model's declared limits${consequence}`);
+      }
+    } catch (e) {
+      const why = e && e.name === "TimeoutError" ? `no response in ${timeoutMs}ms` : e.message;
+      catalogFailures.set(key, { at: Date.now(), why });
+      if (hit) { serveStale(kind, hit, why); return; }
+      log(`could not load ${kind} catalog (${why}) — those graphs run without the model's declared limits${consequence}`);
+    }
+  }));
+  return catalogs;
+}
+
+/**
+ * Hand the public catalog(s) each hosted graph needs to that graph's Workflow,
+ * so the library's catalog-driven payload gates actually apply: variations
+ * clamped to the model's real `max_output_images`, refs to `max_input_images`,
+ * catalog-declared video dim names, audio `max_chars`. Without this the MCP
+ * builds every Workflow catalog-less and sends whatever the graph asked for —
+ * and pays for it.
+ *
+ * `Workflow.catalog` is read at run time, and graphs load from disk before any
+ * network call, so assigning after construction is the shape that works: it
+ * takes effect on the next run, and a periodic re-call swaps in fresh data.
+ * Returns the catalogs (also stashed on `registry.catalogs`) so a caller that
+ * needs them for something else — the cost forecast — doesn't refetch.
+ *
+ * Best-effort: a catalog that won't load leaves those tools unclamped, i.e.
+ * exactly today's behavior, and never blocks startup.
+ */
+export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
+  const needed = new Set();
+  for (const t of registry.tools) for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
+  if (!needed.size) return (registry.catalogs = {});
+  const catalogs = await fetchCatalogs(needed, { baseUrl, fetch, log, maxAgeMs, timeoutMs, consequence });
+  registry.catalogs = catalogs;
+  // Only overwrite a tool's catalog when something loaded — a failed refresh
+  // must not strip the limits an earlier successful one installed.
+  if (Object.keys(catalogs).length) for (const t of registry.tools) t.wf.catalog = catalogs;
+  return catalogs;
+}
+
+/**
+ * Attach those same catalogs (see attachCatalogs) and, from the same fetch,
+ * forecast every tool's per-run cost UP FRONT into
+ * `registry.estimates` (name → {usd, exact, priced, unpriced}). The charge gate
+ * reads the estimates so the very first quote for a tool that has never run
+ * still deposits enough to cover it — instead of a flat guess.
  *
  * Best-effort by design: a catalog that won't load leaves those tools without an
  * estimate (the gate falls back to its flat opening deposit + whatever it later
- * learns from real runs). Pass the same `baseUrl`/`fetch` the runs use so the
- * forecast is priced against the same NanoGPT instance that bills them.
- * Re-callable — a periodic refresh keeps estimates fresh as the catalog changes.
+ * learns from real runs) and unclamped, i.e. today's behavior. Pass the same
+ * `baseUrl`/`fetch` the runs use so the forecast is priced against — and the
+ * gates read from — the same NanoGPT instance that bills them.
+ * Re-callable — a periodic refresh keeps estimates AND catalogs fresh; it
+ * refetches rather than reusing the cached copy a per-call path would take.
  */
 export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {} } = {}) {
-  const base = String(baseUrl).replace(/\/+$/, "");
-  const needed = new Set();
-  for (const t of registry.tools) for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
-  if (!needed.size) return (registry.estimates = {});
-
-  const catalogs = {};
-  await Promise.all([...needed].map(async (kind) => {
-    try {
-      const r = await fetch(base + CATALOG_PATH[kind], { headers: { Accept: "application/json" } });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = (await r.json()).data;
-      if (Array.isArray(data) && data.length) catalogs[kind] = data;
-      else log(`cost forecast: ${kind} catalog came back empty — those tools quote the opening deposit until they've run`);
-    } catch (e) {
-      log(`cost forecast: could not load ${kind} catalog (${e.message}) — those tools quote the opening deposit until they've run`);
-    }
-  }));
+  const catalogs = await attachCatalogs(registry, {
+    baseUrl, fetch, maxAgeMs: 0,
+    consequence: ", and quote the flat opening deposit until they've run",
+    log: (line) => log("catalog: " + line),
+  });
+  // Nothing priceable in any graph, or no catalog loaded at all → nothing to forecast.
+  if (!Object.keys(catalogs).length) return (registry.estimates = {});
 
   const estimates = {};
   for (const t of registry.tools) {
@@ -546,7 +650,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * unknown nodes, or a run failure — throws a plain error the server surfaces as
  * an isError tool result, so the agent gets a readable message, never a crash.
  */
-async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase }) {
+async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }) {
   const args = params.arguments == null ? {} : params.arguments;
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
@@ -562,7 +666,21 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase 
   // Decode: direct #g=/#j=/#a= links are offline; only fragment-less short links
   // fetch, and those are redirect-header reads with no credentials attached.
   const decoded = await decodeShareUrl(args.url.trim(), { fetch: globalThis.fetch });
-  const wf = new Workflow(decoded.graph, { apiKey, payment, baseUrl, quiet: true });
+  // The link is a stranger's graph, so the catalog matters MOST here: it's what
+  // clamps variations to the model's real max_output_images and refs to
+  // max_input_images before anything is billed. Cached, timeout-bounded and
+  // best-effort: a warm cache costs nothing, a cold one at most one round trip,
+  // and a hanging or down endpoint delays the run by the fetch timeout once a
+  // minute at worst (the failure marker covers the calls in between) before the
+  // run proceeds unclamped.
+  const catalog = await fetchCatalogs(graphModelKinds(decoded.graph), {
+    baseUrl: baseUrl || undefined,
+    fetch: globalThis.fetch,
+    log,
+    ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
+    consequence: ", so this link runs with whatever payload it asked for",
+  });
+  const wf = new Workflow(decoded.graph, { apiKey, payment, baseUrl, quiet: true, catalog });
   if (wf.warnings.length) {
     // unknown / browser-only node types: the graph decodes but run() would always refuse
     throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
@@ -581,9 +699,13 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase 
  * (the usedNames dedup below) — a per-project dir listed first shadows a shared
  * library listed after it. Failures and tools carry their source `dir` so the
  * same filename in two directories stays distinguishable in logs.
+ *
+ * `log` receives the run_noodle path's best-effort warnings (a catalog that
+ * wouldn't load, or one being served stale) — stderr by default, since stdio
+ * mode owns stdout. `catalogTimeoutMs` overrides the catalog fetch timeout.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -732,7 +854,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
     async callTool(params) {
       if (params != null && typeof params === "object" && !Array.isArray(params) && params.name === RUN_NOODLE_NAME) {
-        return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase });
+        return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
       }
       const { tool, inputs } = await registry.prepareCall(params);
 
