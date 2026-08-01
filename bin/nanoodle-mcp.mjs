@@ -30,7 +30,7 @@
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
-import { loadTools, attachEstimates } from "../src/tools.mjs";
+import { loadTools, attachEstimates, attachCatalogs } from "../src/tools.mjs";
 import { warnIfFfmpegMissing } from "../src/ffmpeg-check.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
@@ -270,6 +270,24 @@ async function main() {
   // the pure-JS path can't handle. Missing on a server = mid-run failures (auto-refunded
   // in charge mode). Warn once at boot, naming the at-risk tools, instead of per call.
   await warnIfFfmpegMissing(registry.tools);
+  // Hand the public model catalog to every graph's Workflow so the library's
+  // catalog-driven payload limits apply — variations clamped to the model's real
+  // max_output_images, refs to max_input_images — instead of the MCP paying for
+  // whatever the graph asked for. Charge mode gets this from its own hourly
+  // estimate refresh below (same fetch, also priced), so only do it here.
+  // Best-effort: no catalog just means no clamp, exactly as before.
+  if (chargeUsd == null) {
+    const catalogOpts = {
+      baseUrl: process.env.NANOGPT_BASE_URL || undefined,
+      log: (line) => console.error("nanoodle-mcp: " + line),
+    };
+    await attachCatalogs(registry, catalogOpts).catch(() => {});
+    // Long-lived stdio servers shouldn't run all week on boot-time limits.
+    const catTimer = setInterval(
+      () => attachCatalogs(registry, { ...catalogOpts, maxAgeMs: 0 }).catch(() => {}),
+      60 * 60 * 1000);
+    if (catTimer.unref) catTimer.unref();
+  }
   if (wallet) {
     console.error(`nanoodle-mcp: wallet mode (accountless x402) — paying from ${wallet.address}` +
       (maxUsd != null ? `, capped at $${maxUsd}/call` : ", no per-call cap (--max-usd)") +
