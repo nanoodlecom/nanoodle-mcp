@@ -4,7 +4,10 @@
  * for 4 variations from a model that returns 1 was sent (and billed) as n:4.
  *
  * These tests pin the fix on both construction sites: hosted graph tools
- * (attachCatalogs / attachEstimates) and the ad-hoc run_noodle share-link path.
+ * (attachCatalogs / attachEstimates) and the ad-hoc run_noodle share-link path,
+ * plus the two ways the fetch must stay out of the run's way when the endpoint
+ * misbehaves — a hard timeout, and a negative cache so an outage costs one round
+ * trip per minute rather than one per call.
  * Fully offline against a stub NanoGPT — nothing spends money.
  *
  * Each test gets its OWN stub on its own port: the catalog cache is keyed by base
@@ -36,14 +39,18 @@ const graphJson = (variations) => JSON.stringify({
 });
 
 /** Stub NanoGPT: the public image catalog (max_output_images: 1) + image generation. */
-async function startStub({ catalogStatus = 200 } = {}) {
+async function startStub({ catalogStatus = 200, catalogHang = false } = {}) {
   const stub = { imageRequests: [], catalogHits: 0 };
+  const hung = [];
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
 
     if (req.method === "GET" && req.url === "/api/v1/image-models") {
       stub.catalogHits++;
+      // Accept the connection and never answer — the failure mode a plain
+      // `.catch()` doesn't cover and node's fetch has no default deadline for.
+      if (catalogHang) { hung.push(res); return; }
       if (catalogStatus !== 200) { res.writeHead(catalogStatus); res.end("nope"); return; }
       res.writeHead(200, { "content-type": "application/json" });
       // max_output_images: 1 is the whole point — the clamp reads it.
@@ -68,17 +75,25 @@ async function startStub({ catalogStatus = 200 } = {}) {
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   stub.url = `http://127.0.0.1:${server.address().port}`;
-  stub.close = () => new Promise((r) => server.close(r));
+  stub.close = async () => {
+    for (const res of hung) res.destroy(); // never-answered requests: nothing will ever end them
+    const closed = new Promise((r) => server.close(r));
+    server.closeAllConnections?.(); // and keep-alive sockets would hold close() open for keepAliveTimeout
+    await closed;
+  };
   return stub;
 }
 
-/** A temp dir holding one graph file, plus a registry pointed at a fresh stub. */
-async function fixture(variations, opts) {
-  const stub = await startStub(opts);
+/**
+ * A temp dir holding one graph file, plus a registry pointed at a fresh stub.
+ * `catalogTimeoutMs` / `log` go to the registry, everything else to the stub.
+ */
+async function fixture(variations, { catalogTimeoutMs, log, ...stubOpts } = {}) {
+  const stub = await startStub(stubOpts);
   const dir = await mkdtemp(join(tmpdir(), "nd-cat-"));
   const text = graphJson(variations);
   await writeFile(join(dir, "poster.json"), text);
-  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: stub.url, outDir: dir });
+  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: stub.url, outDir: dir, catalogTimeoutMs, log });
   return { dir, text, registry, stub };
 }
 
@@ -134,6 +149,37 @@ test("run_noodle reuses the cached catalog instead of refetching per call", asyn
   await registry.callTool({ name: "run_noodle", arguments: { url } });
   assert.equal(stub.catalogHits, 1, "second call served from cache");
   assert.deepEqual(stub.imageRequests.map((r) => r.n), [1, 1]);
+});
+
+test("run_noodle: a catalog endpoint that never answers can't stall the run", async (t) => {
+  const lines = [];
+  const { registry, text, stub } = await fixture(2, { catalogHang: true, catalogTimeoutMs: 300, log: (l) => lines.push(l) });
+  t.after(() => stub.close());
+
+  const t0 = Date.now();
+  await registry.callTool({ name: "run_noodle", arguments: { url: editorShareUrl(text) } });
+  const ms = Date.now() - t0;
+
+  assert.equal(stub.catalogHits, 1, "the fetch was attempted");
+  assert.ok(ms < 3000, `run finished in ${ms}ms — the fetch is abandoned at the timeout, not left hanging`);
+  assert.equal(stub.imageRequests.length, 1, "the run still happened");
+  assert.equal(stub.imageRequests[0].n, 2, "unclamped, i.e. today's behavior — degraded, not blocked");
+  assert.match(lines.join("\n"), /no response in 300ms/, "and the caller hears why the limits are missing");
+});
+
+test("a failed catalog is negative-cached: a second run inside the TTL refetches nothing", async (t) => {
+  const lines = [];
+  const { registry, text, stub } = await fixture(2, { catalogStatus: 503, log: (l) => lines.push(l) });
+  t.after(() => stub.close());
+
+  const url = editorShareUrl(text);
+  await registry.callTool({ name: "run_noodle", arguments: { url } });
+  assert.equal(stub.catalogHits, 1, "first run paid the failing round trip");
+
+  await registry.callTool({ name: "run_noodle", arguments: { url } });
+  assert.equal(stub.catalogHits, 1, "second run inside the failure TTL didn't retry — an outage isn't billed per call");
+  assert.equal(lines.length, 1, "and doesn't repeat the same warning every run");
+  assert.deepEqual(stub.imageRequests.map((r) => r.n), [2, 2], "both runs completed, unclamped");
 });
 
 test("an unreachable catalog is best-effort: the run still happens, unclamped", async (t) => {

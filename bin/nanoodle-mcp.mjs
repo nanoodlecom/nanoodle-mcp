@@ -281,7 +281,13 @@ async function main() {
       baseUrl: process.env.NANOGPT_BASE_URL || undefined,
       log: (line) => console.error("nanoodle-mcp: " + line),
     };
-    await attachCatalogs(registry, catalogOpts).catch(() => {});
+    // Fire-and-forget: the catalog is an optimization, and Workflow reads
+    // `catalog` at run time, so it can land after the server is already
+    // answering. Awaiting it would put a slow endpoint between the client and
+    // server startup — MCP clients time out a launch long before a fetch does.
+    attachCatalogs(registry, catalogOpts).then(
+      (c) => { if (Object.keys(c).length) console.error(`nanoodle-mcp: model catalog loaded (${Object.keys(c).sort().join(", ")}) — payload limits apply`); },
+      () => {});
     // Long-lived stdio servers shouldn't run all week on boot-time limits.
     const catTimer = setInterval(
       () => attachCatalogs(registry, { ...catalogOpts, maxAgeMs: 0 }).catch(() => {}),
