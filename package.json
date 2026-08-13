@@ -5,7 +5,7 @@
   "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK or accountless x402 (pay per call in Nano), runs on the NanoGPT API",
   "type": "module",
   "bin": {
-    "nanoodle-mcp": "./bin/nanoodle-mcp.mjs"
+    "nanoodle-mcp": "bin/nanoodle-mcp.mjs"
   },
   "engines": {
     "node": ">=20"

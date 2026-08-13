@@ -42,5 +42,11 @@
         }
       ]
     }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.nanoodle.com/mcp"
+    }
   ]
 }

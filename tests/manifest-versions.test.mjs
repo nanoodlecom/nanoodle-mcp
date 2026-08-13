@@ -70,6 +70,13 @@ test("package-lock.json root deps match package.json deps", () => {
   assert.deepEqual(lock.packages[""].dependencies || {}, pkg.dependencies || {});
 });
 
+test("server.json remotes lists the hosted streamable-http endpoint", () => {
+  const remotes = server.remotes || [];
+  const hosted = remotes.find((r) => r.url === "https://mcp.nanoodle.com/mcp");
+  assert.ok(hosted, "server.json remotes must include https://mcp.nanoodle.com/mcp");
+  assert.equal(hosted.type, "streamable-http");
+});
+
 test("plugin.json and marketplace.json agree on the plugin version", () => {
   // The plugin version is deliberately independent of the npm version (it tracks
   // plugin behavior), but the two manifests that declare it must agree — Claude

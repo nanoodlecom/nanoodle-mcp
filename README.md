@@ -136,10 +136,10 @@ Same shape as Cursor/Windsurf, in `claude_desktop_config.json` under
 
 ### ChatGPT
 
-Not reachable: ChatGPT only connects to remote HTTPS MCP servers, and this is
-a local stdio server by design. A hosted endpoint would put a middleman
-between your API key and NanoGPT, which is the opposite of the point — so
-none is planned.
+ChatGPT only connects to remote HTTPS MCP servers. The hosted endpoint is
+already live — add `https://mcp.nanoodle.com/mcp` (paid per call in Nano, no
+API key). Local stdio (`npx nanoodle-mcp --graphs …`) stays BYOK and is not
+reachable from ChatGPT.
 
 ## ⚠️ This spends real money
 
