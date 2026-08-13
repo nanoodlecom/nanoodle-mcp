@@ -42,6 +42,8 @@ mid-session. To add or edit a tool:
 2. Restart the MCP server (in Claude Code: `/mcp` → reconnect, or restart the
    session) to pick it up.
 
-Graphs that use browser-only nodes (resize, combine, trim, extract-audio,
-video-frames, soundtrack) are skipped at startup with a stderr note — the
-headless executor can't run those.
+Local-media graphs (resize, combine, trim, extract-audio, video-frames,
+soundtrack) load and run headlessly — this package depends on nanoodle ≥ 0.4,
+which can execute them. They need ffmpeg on PATH for formats the pure-JS
+path cannot handle. Unknown node types are still skipped at startup with a
+stderr note.

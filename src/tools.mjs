@@ -646,8 +646,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  *
  * Argument-shape problems (missing url, wrong types, unknown input key) throw
  * ParamsError (→ -32602). Everything about the link's *contents* — a bad or
- * truncated link, the internal #ga= handoff, a graph needing browser-only or
- * unknown nodes, or a run failure — throws a plain error the server surfaces as
+ * truncated link, the internal #ga= handoff, a graph needing unknown nodes,
+ * or a run failure — throws a plain error the server surfaces as
  * an isError tool result, so the agent gets a readable message, never a crash.
  */
 async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }) {
@@ -682,7 +682,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
   });
   const wf = new Workflow(decoded.graph, { apiKey, payment, baseUrl, quiet: true, catalog });
   if (wf.warnings.length) {
-    // unknown / browser-only node types: the graph decodes but run() would always refuse
+    // unknown node types: the graph decodes but run() would always refuse
     throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
   }
   const inputs = await resolveInputs(wf, inputArgs, `run_noodle (${decoded.url})`);
@@ -746,7 +746,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         continue;
       }
       if (wf.warnings.length) {
-        // unknown / browser-only node types: the graph loads but run() would always refuse
+        // unknown node types: the graph loads but run() would always refuse
         failures.push({ file, dir, reason: wf.warnings.join("; ") });
         continue;
       }
