@@ -16,6 +16,7 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
+import { workflowExample } from "./workflow-examples.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -359,12 +360,14 @@ function describeOutputs(wf) {
  * `cost` (last observed run) is an optional segment wired in separately — pass it
  * pre-rendered. A comment-only graph has no chain — the intent stands alone.
  */
-function buildDescription(wf, spendSource, { cost } = {}) {
+function buildDescription(wf, spendSource, { cost, name } = {}) {
+  const example = workflowExample(name);
   const intent = graphIntent(wf.graph);
   const chain = typeChain(wf.graph);
   const returns = describeOutputs(wf);
   return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
-    `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.`;
+    `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.` +
+    (example ? ` Example: ${example.title} (${example.play}). ${example.description} Agent skill: ${example.skill}` : "");
 }
 
 /** Milliseconds → compact human duration ("15s", "2m 10s") for ETA copy. */
@@ -770,7 +773,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // Description pieces as data — the landing page lays them out as a card
         // instead of re-parsing the one-line description.
         card: { intent: graphIntent(wf.graph), steps: chainSteps(wf.graph) },
-        description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]) }),
+        description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]), name }),
         inputSchema: buildInputSchema(wf),
       });
     }
@@ -802,7 +805,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     } catch (e) {
       console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
     }
-    const description = buildDescription(tool.wf, spendSource, { cost: renderCost(rec) });
+    const description = buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name });
     if (description !== tool.description) {
       tool.description = description;
       if (registry.onToolsChanged) registry.onToolsChanged();

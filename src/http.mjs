@@ -39,6 +39,7 @@ import { fileURLToPath } from "node:url";
 import { qrModules } from "nanoodle";
 import { createDispatcher } from "./server.mjs";
 import { renderCost } from "./tools.mjs";
+import { workflowExample } from "./workflow-examples.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024; // media inputs may ride inline as data: URLs
 
@@ -165,6 +166,7 @@ const LANDING_CSS = `
   .chip.k-audio{background:rgba(74,222,128,.12);color:#86efac}
   .tool .tfoot{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.25rem .75rem;margin-top:auto}
   .tool .cost{font:.75rem/1.4 ui-monospace,monospace;color:var(--muted);white-space:nowrap}
+  .tool .example{border-top:1px solid var(--edge);margin-top:1rem;padding-top:.5rem;font-size:.85rem}
   .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
   .card h2{margin-top:0}
   footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
@@ -202,6 +204,15 @@ function authorCount(toolInfo) {
   return toolInfo.filter((t) => t && t.x402 && typeof t.x402.author === "string" && t.x402.author.trim()).length;
 }
 
+
+function workflowExampleHtml(name) {
+  const example = workflowExample(name);
+  if (!example) return "";
+  return `<div class="example"><p><strong>Made with this skill: ${esc(example.title)}</strong></p>` +
+    `<p class="muted">${esc(example.description)}</p>` +
+    `<p><a href="${esc(example.play)}">play the game</a> · <a href="${esc(example.skill)}">give your agent the skill</a></p></div>`;
+}
+
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
@@ -218,7 +229,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     // No structured pieces (a bare toolInfo entry) → the one-line description stands in.
     if (!card || !card.intent && !card.steps.length) {
       return `<li class="tool"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
-        `${links ? `<div class="tfoot">${links}</div>` : ""}${author}</li>`;
+        `${links ? `<div class="tfoot">${links}</div>` : ""}${workflowExampleHtml(t.name)}${author}</li>`;
     }
     /*
      * The card lays the description's pieces out as layers instead of one blob:
@@ -234,7 +245,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       `<div class="thead"><span class="tname">${esc(toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
       `<p class="intent">${esc(card.intent || t.description)}</p>` +
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
-      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${author}</li>`;
+      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${workflowExampleHtml(t.name)}${author}</li>`;
   }).join("");
   const tagline = charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
   const desc = charged
@@ -407,6 +418,12 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
   for (const t of tools) {
     lines.push(`- ${t.name}: ${t.description}`);
     if (infoByName.has(t.name)) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
+    const example = workflowExample(t.name);
+    if (example) lines.push(
+      `  outcome example: ${example.title} — ${example.play}`,
+      `  agent skill: ${example.skill}`,
+      `  ${example.description}`,
+    );
   }
   lines.push(
     ``,

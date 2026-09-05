@@ -27,6 +27,34 @@ signing Nano blocks — loaded only on the x402 paths, see
 machine to [nano-gpt.com](https://nano-gpt.com); it is never logged and never
 appears on stdout.
 
+## Example: a description becomes a playable fighter
+
+[Play Iron Verdict](https://nanoodle.com/examples/iron-verdict/): a furnace knight
+with heavy jumps, punches, ground slams and punishing arena combat. A coding
+agent built the game using the
+[character-sprites skill](https://github.com/nanoodlecom/noodle-skills/tree/main/skills/character-sprites).
+
+The `character-sprites` graph turns a humanoid description into a character
+reference and a matching parts sheet. The skill's local rig script turns those
+parts into transparent idle, walk, punch and jump frames with an atlas and
+timing metadata. The coding agent then implements physics, combat and game
+rules. The finished game demonstrates that combination; one MCP call returns
+the reference and parts images, not the complete game.
+
+Mount the [character-sprites graph](https://github.com/nanoodlecom/awesome-noodles/blob/main/graphs/character-sprites.noodle-graph.json)
+in your server's graph folder to expose it as a tool. Use `tools/list` to check
+whether a given server has it mounted and read its input schema before calling.
+For the published graph, the generation step is:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"character-sprites","arguments":{"Character":"A compact furnace knight with an ivory helmet, amber visor, navy armor and brass gauntlets. Outlined 2D platformer art. No weapon or wings."}}}
+```
+
+Install the skill for local extraction and animation (Node 20+ and ffmpeg/ffprobe
+required). A useful agent request is: “Use character-sprites to make an animated
+fighter from my description, inspect the joints and alpha edges, then build a
+small playable arena with heavy gravity and impactful combat.”
+
 ## Install
 
 You need: **Node 20+**, a folder of saved graphs (say `~/noodles` — see

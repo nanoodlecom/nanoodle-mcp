@@ -1,0 +1,69 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { serveHttp } from "../src/http.mjs";
+import { loadTools } from "../src/tools.mjs";
+import { mkdtemp, copyFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+async function pages(toolName, structured) {
+  const tool = { name: toolName, description: "Generate reference and parts images.", inputSchema: { type: "object" } };
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "examples", version: "0",
+    publicBase: "http://example.test", log: () => {},
+    listTools: () => [tool], callTool: async () => { throw new Error("No generation in this test"); },
+    toolInfo: [{ ...tool, rawText: "{}", editorUrl: "https://nanoodle.com/#g=test",
+      ...(structured ? { card: { intent: tool.description, steps: [{ kind: "image", label: "Image", n: 2 }] } } : {}),
+    }],
+  });
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    return await Promise.all(["/", "/llms.txt"].map(async path => {
+      const response = await fetch(base + path);
+      assert.equal(response.status, 200);
+      return response.text();
+    }));
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+}
+
+for (const structured of [true, false]) {
+  test(`mounted character workflow exposes playable outcome and local skill (structured=${structured})`, async () => {
+    const [html, text] = await pages("character-sprites", structured);
+    for (const body of [html, text]) {
+      assert.match(body, /Iron Verdict/);
+      assert.match(body, /https:\/\/nanoodle\.com\/examples\/iron-verdict\//);
+      assert.match(body, /https:\/\/github\.com\/nanoodlecom\/noodle-skills\/tree\/main\/skills\/character-sprites/);
+      assert.match(body, /graph generates a character reference and parts sheet/);
+      assert.match(body, /local skill bakes animated sprites/);
+      assert.match(body, /coding agent adds combat, gravity and game rules/);
+    }
+    assert.match(html, /href="\/graph\/character-sprites\.json"/);
+    assert.match(text, /graph: http:\/\/example\.test\/graph\/character-sprites\.json/);
+  });
+}
+
+test("servers without the character workflow do not imply the example tool is mounted", async () => {
+  for (const name of ["poster", "constructor"]) {
+    for (const body of await pages(name, true)) {
+      assert.doesNotMatch(body, /Iron Verdict|character-sprites|give your agent the skill/);
+    }
+  }
+});
+
+test("MCP tools/list exposes the outcome and local skill beyond the truncated graph comment", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-outcome-"));
+  try {
+    await copyFile(new URL("./fixtures/hello-noodle.json", import.meta.url), join(dir, "character-sprites.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.listTools().find(tool => tool.name === "character-sprites");
+    assert.ok(tool);
+    assert.match(tool.description, /Example: Iron Verdict \(https:\/\/nanoodle\.com\/examples\/iron-verdict\/\)/);
+    assert.match(tool.description, /local skill bakes animated sprites/);
+    assert.match(tool.description, /Agent skill: https:\/\/github\.com\/nanoodlecom\/noodle-skills\/tree\/main\/skills\/character-sprites/);
+    assert.doesNotMatch(registry.listTools().find(tool => tool.name === "run_noodle").description, /Iron Verdict/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
