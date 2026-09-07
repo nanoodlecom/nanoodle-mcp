@@ -367,7 +367,7 @@ function buildDescription(wf, spendSource, { cost, name } = {}) {
   const returns = describeOutputs(wf);
   return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
     `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.` +
-    (example ? ` Example: ${example.title} (${example.play}). ${example.description} Agent skill: ${example.skill}` : "");
+    (example ? ` Example: ${example.title} (${example.play}). ${example.description}` + (example.skill ? ` Agent skill: ${example.skill}` : "") : "");
 }
 
 /** Milliseconds → compact human duration ("15s", "2m 10s") for ETA copy. */
@@ -456,6 +456,17 @@ function buildInputSchema(wf) {
     properties[safe] = prop;
   }
   return { type: "object", properties, ...(required.length ? { required } : {}) };
+}
+
+/** A call using the author's saved inputs, never a claim about generated output. */
+function savedSample(wf) {
+  const inputs = keyedInputs(wf);
+  if (inputs.some(({ optional, hasDef }) => !optional && !hasDef)) return null;
+  const subject = inputs.find(({ inp, optional, hasDef }) => !optional && hasDef && ["text", "textarea"].includes(inp.kind));
+  return {
+    label: subject ? subject.inp.key : "Saved inputs",
+    text: subject ? Array.from(String(subject.inp.def)).slice(0, 400).join("") + (Array.from(String(subject.inp.def)).length > 400 ? "…" : "") : "Uses the inputs included in this graph.",
+  };
 }
 
 let saveSeq = 0;
@@ -772,7 +783,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         editorUrl: editorShareUrl(text),
         // Description pieces as data — the landing page lays them out as a card
         // instead of re-parsing the one-line description.
-        card: { intent: graphIntent(wf.graph), steps: chainSteps(wf.graph) },
+        card: { intent: graphIntent(wf.graph), steps: chainSteps(wf.graph), sample: savedSample(wf) },
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]), name }),
         inputSchema: buildInputSchema(wf),
       });

@@ -167,6 +167,10 @@ const LANDING_CSS = `
   .tool .tfoot{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.25rem .75rem;margin-top:auto}
   .tool .cost{font:.75rem/1.4 ui-monospace,monospace;color:var(--muted);white-space:nowrap}
   .tool .example{border-top:1px solid var(--edge);margin-top:1rem;padding-top:.5rem;font-size:.85rem}
+  .tool .example img{display:block;width:100%;height:auto;border-radius:8px;margin:.6rem 0}
+  .tool .sample{font-size:.85rem;border-top:1px solid var(--edge);margin:.7rem 0;padding-top:.7rem}
+  .tool .sample summary{cursor:pointer;color:var(--accent)}
+  .tool .sample pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
   .card h2{margin-top:0}
   footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
@@ -208,9 +212,23 @@ function authorCount(toolInfo) {
 function workflowExampleHtml(name) {
   const example = workflowExample(name);
   if (!example) return "";
-  return `<div class="example"><p><strong>Made with this skill: ${esc(example.title)}</strong></p>` +
+  return `<div class="example"><p><strong>${example.skill ? "Made with this skill: " : ""}${esc(example.title)}</strong></p>` +
+    (example.preview ? `<a href="${esc(example.play)}"><img src="${esc(example.preview)}" alt="${esc(example.alt || example.title)}" loading="lazy"></a>` : "") +
     `<p class="muted">${esc(example.description)}</p>` +
-    `<p><a href="${esc(example.play)}">play the game</a> · <a href="${esc(example.skill)}">give your agent the skill</a></p></div>`;
+    `<p><a href="${esc(example.play)}">See sample</a>` +
+    (example.skill ? ` · <a href="${esc(example.skill)}">give your agent the skill</a>` : "") + `</p></div>`;
+}
+
+function sampleCall(name) {
+  return { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} } };
+}
+
+function workflowSampleHtml(name, sample) {
+  if (!sample) return "";
+  return `<details class="sample"><summary>Try the included sample</summary>` +
+    `<p><strong>${esc(sample.label)}:</strong> ${esc(sample.text)}</p>` +
+    `<p class="muted">Send this MCP call after connecting. It uses the saved inputs and requests a paid generation.</p>` +
+    `<pre>${esc(JSON.stringify(sampleCall(name), null, 2))}</pre></details>`;
 }
 
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
@@ -228,7 +246,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     const card = info && info.card;
     // No structured pieces (a bare toolInfo entry) → the one-line description stands in.
     if (!card || !card.intent && !card.steps.length) {
-      return `<li class="tool"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
+      return `<li class="tool" id="${esc(t.name)}"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
         `${links ? `<div class="tfoot">${links}</div>` : ""}${workflowExampleHtml(t.name)}${author}</li>`;
     }
     /*
@@ -241,11 +259,11 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       `<span class="chip k-${esc(s.kind)}">${esc(s.n > 1 ? `${s.label}×${s.n}` : s.label)}</span>`
     ).join(`<span class="arr">→</span>`);
     const cost = renderCost(costs[t.name]);
-    return `<li class="tool">` +
+    return `<li class="tool" id="${esc(t.name)}">` +
       `<div class="thead"><span class="tname">${esc(toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
       `<p class="intent">${esc(card.intent || t.description)}</p>` +
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
-      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${workflowExampleHtml(t.name)}${author}</li>`;
+      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${workflowSampleHtml(t.name, card.sample)}${workflowExampleHtml(t.name)}${author}</li>`;
   }).join("");
   const tagline = charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
   const desc = charged
@@ -418,10 +436,15 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
   for (const t of tools) {
     lines.push(`- ${t.name}: ${t.description}`);
     if (infoByName.has(t.name)) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
+    const sample = infoByName.get(t.name)?.card?.sample;
+    if (sample) lines.push(
+      `  included sample (${sample.label}): ${sample.text.replace(/\s+/g, " ")}`,
+      `  example MCP call (uses saved inputs; requests paid generation): ${JSON.stringify(sampleCall(t.name))}`,
+    );
     const example = workflowExample(t.name);
     if (example) lines.push(
       `  outcome example: ${example.title} — ${example.play}`,
-      `  agent skill: ${example.skill}`,
+      ...(example.skill ? [`  agent skill: ${example.skill}`] : []),
       `  ${example.description}`,
     );
   }

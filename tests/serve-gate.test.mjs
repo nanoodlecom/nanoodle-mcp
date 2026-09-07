@@ -1423,7 +1423,7 @@ test("landing workflow card without structured pieces falls back to the one-line
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const html = await (await fetch(`${base}/`)).text();
-    assert.match(html, /<li class="tool"><code>poster<\/code>/);
+    assert.match(html, /<li class="tool" id="poster"><code>poster<\/code>/);
     assert.match(html, /deposit per call, paid in Nano/); // the gated description carries the contract here
     assert.match(html, /open in editor/);
   } finally {
