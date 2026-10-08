@@ -75,7 +75,8 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       }
       if (name === "idea-to-short-film") {
         assert.match(html, /Video sample/);
-        assert.match(text, /shot 2 repeats the launch, the cuts are hard and the film is silent/);
+        assert.match(text, /the same hand lifts it out/);
+        assert.match(text, /a hand flicks through a corner of shot 2/);
       }
     }
   });
@@ -145,10 +146,11 @@ test("idea-to-short-film graph mounts as a tool with its reviewed film sample", 
     const tool = registry.listTools().find(tool => tool.name === "idea-to-short-film");
     assert.ok(tool);
     assert.ok(tool.inputSchema.properties.Film_idea);
-    assert.match(tool.description, /combine:Short film; returns video/);
+    assert.ok(tool.inputSchema.properties.Music_bed);
+    assert.match(tool.description, /combine:Join the shots -> soundtrack:Short film; returns video/);
     assert.match(tool.description, /Example: Video sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#idea-to-short-film\)/);
     const card = registry.tools.find(tool => tool.name === "idea-to-short-film").card;
-    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 1], ["llm", 4], ["tvideo", 3], ["combine", 1]]);
+    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 1], ["music", 1], ["llm", 6], ["join", 4], ["image", 1], ["ivideo", 1], ["vframes", 1], ["ivideo", 1], ["vframes", 1], ["ivideo", 1], ["combine", 1], ["soundtrack", 1]]);
     assert.equal(card.sample.label, "Film idea");
   } finally {
     await rm(dir, { recursive: true, force: true });

@@ -29,7 +29,7 @@ const WORKFLOW_EXAMPLES = {
     title: "Video sample",
   },
   "idea-to-short-film": {
-    ...reviewedSample("idea-to-short-film", "A 15-second, three-shot film of one yellow paper boat: set into a neon-lit gutter, drifting down it, then floating out onto a sunrise harbor. The boat stays the same across shots; shot 2 repeats the launch, the cuts are hard and the film is silent. This thumbnail is one frame.", "Frame from a generated three-shot paper-boat film"),
+    ...reviewedSample("idea-to-short-film", "A 15-second, three-shot film in one rainy-afternoon look: a small red-sleeved hand sets a yellow paper boat into a gutter, the boat drifts to an open drain and tips over the edge, and the same hand lifts it out. Shots 2 and 3 start on the previous shot's last frame, so the cuts continue the action; they are hard cuts, a hand flicks through a corner of shot 2 for about half a second, and the music bed fades about 2 seconds early. This thumbnail is one frame.", "Frame from a generated paper-boat film: a small hand lifts the yellow boat out of the gutter"),
     title: "Video sample",
   },
   "character-sprites": {
