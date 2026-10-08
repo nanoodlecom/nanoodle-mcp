@@ -28,6 +28,10 @@ const WORKFLOW_EXAMPLES = {
     ...reviewedSample("talking-avatar", "A fictional presenter reads a short workshop introduction. Sampled frames preserve the presenter; check precise lip-sync timing in playback. Generation can take several minutes.", "Frame from a fictional presenter's workshop introduction"),
     title: "Video sample",
   },
+  "idea-to-short-film": {
+    ...reviewedSample("idea-to-short-film", "A 15-second, three-shot film of one yellow paper boat: set into a neon-lit gutter, drifting down it, then floating out onto a sunrise harbor. The boat stays the same across shots; shot 2 repeats the launch, the cuts are hard and the film is silent. This thumbnail is one frame.", "Frame from a generated three-shot paper-boat film"),
+    title: "Video sample",
+  },
   "character-sprites": {
     title: "Iron Verdict",
     play: "https://nanoodle.com/examples/iron-verdict/",

@@ -53,7 +53,7 @@ test("servers without the character workflow do not imply the example tool is mo
   }
 });
 
-for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar"]) {
+for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar", "idea-to-short-film"]) {
   test(`reviewed ${name} sample links to evidence without inventing a skill`, async () => {
     for (const structured of [true, false]) {
       const [html, text] = await pages(name, structured);
@@ -72,6 +72,10 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       if (name === "talking-avatar") {
         assert.match(html, /Video sample/);
         assert.match(text, /check precise lip-sync timing in playback/);
+      }
+      if (name === "idea-to-short-film") {
+        assert.match(html, /Video sample/);
+        assert.match(text, /shot 2 repeats the launch, the cuts are hard and the film is silent/);
       }
     }
   });
@@ -128,6 +132,24 @@ test("MCP tools/list exposes the outcome and local skill beyond the truncated gr
     const reviewed = registry.listTools().find(tool => tool.name === "favicon");
     assert.match(reviewed.description, /Example: Reviewed sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#favicon\)/);
     assert.doesNotMatch(reviewed.description, /undefined|Agent skill:/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("idea-to-short-film graph mounts as a tool with its reviewed film sample", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-film-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/idea-to-short-film.noodle-graph.json", import.meta.url), join(dir, "idea-to-short-film.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.listTools().find(tool => tool.name === "idea-to-short-film");
+    assert.ok(tool);
+    assert.ok(tool.inputSchema.properties.Film_idea);
+    assert.match(tool.description, /combine:Short film; returns video/);
+    assert.match(tool.description, /Example: Video sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#idea-to-short-film\)/);
+    const card = registry.tools.find(tool => tool.name === "idea-to-short-film").card;
+    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 1], ["llm", 4], ["tvideo", 3], ["combine", 1]]);
+    assert.equal(card.sample.label, "Film idea");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
