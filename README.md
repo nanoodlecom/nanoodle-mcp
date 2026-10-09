@@ -516,6 +516,17 @@ It matters most in charge mode, where that run is already paid for. The library
 also emits a `process` warning, but stderr belongs to whoever started the server,
 not to the agent that paid.
 
+**A ⚖️ Decide gate that answers no is a result, not an error.** With a
+`nanoodle` that runs the Decide node, a yes/no gate that says no stops its
+branch. The tool result is normal (not `isError`), the decision's tiny cost is
+billed, and nothing behind the gate runs or bills. The result leads with:
+
+```
+gated: "Is it a cat?" answered no (yes 12%), so the run stopped there on purpose — skipped, not billed: "Cat poem". This is a result, not an error.
+Cat poem: skipped — gate "Is it a cat?" answered no
+cost: $0.000003
+```
+
 Protocol behavior worth knowing: malformed calls (unknown tool, unknown /
 missing / non-string argument) are rejected as JSON-RPC `-32602` **before any
 money is spent**; a run that fails (network, model error, missing key) comes
