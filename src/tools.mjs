@@ -597,6 +597,32 @@ export function runNotices(wf) {
   return { onProgress, notices };
 }
 
+/**
+ * ⚖️ Decide gates that closed this run, as lines the caller must see.
+ *
+ * nanoodle (with Decide support) settles a yes/no gate that answered no as node status
+ * "gated" — a deliberate, billed decision, not a failure — and every node behind it as
+ * "skipped" (gatedBy), never run and never billed. run() resolves, so this is a normal
+ * tool result, never isError. Without these lines the caller would see an output simply
+ * missing and could mistake it for a bug. Duck-typed on result.gated / node.gatedBy so an
+ * older library (no gates) yields nothing.
+ */
+export function gateNotices(wf, result) {
+  const gated = result && Array.isArray(result.gated) ? result.gated : [];
+  const byId = new Map((((wf && wf.graph) || {}).nodes || []).map((n) => [n.id, n]));
+  const label = (id) => {
+    const n = byId.get(id);
+    return (n && (n.name || (n.fields && n.fields.name))) || (result.nodes && result.nodes[id] && result.nodes[id].name) || id;
+  };
+  return gated.map((g) => {
+    const yes = typeof g.yes === "number" && Number.isFinite(g.yes) ? ` (yes ${Math.round(g.yes * 100)}%)` : "";
+    const skipped = (g.skipped || []).map((id) => `"${label(id)}"`);
+    return `gated: "${g.name}" answered no${yes}, so the run stopped there on purpose — ` +
+      (skipped.length ? `skipped, not billed: ${skipped.join(", ")}` : "nothing downstream to skip") +
+      ". This is a result, not an error.";
+  });
+}
+
 /** Small enough to ride inline as an MCP image block alongside its download URL. */
 const INLINE_IMAGE_MAX = 1_500_000;
 const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
@@ -613,6 +639,11 @@ const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: 
  */
 async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
   const content = notices.map((text) => ({ type: "text", text }));
+  for (const text of gateNotices(wf, result)) content.push({ type: "text", text });
+  const gateName = (id) => {
+    const g = (result.gated || []).find((x) => x.nodeId === id);
+    return g ? g.name : id;
+  };
   // Does any content block carry an actual tool OUTPUT as text (an LLM/text
   // node's result), as opposed to a /out/ URL, a "saved <path>" pointer, or the
   // cost line? Only true text output is the customer's paid content; the gate
@@ -621,7 +652,14 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   let textOutput = false;
   for (const o of wf.outputs) {
     const value = result.outputs[o.key];
-    if (value === undefined) continue;
+    if (value === undefined) {
+      // an output a closed gate skipped: say so (it is not paid content — textOutput untouched)
+      const rec = result.nodes && result.nodes[o.nodeId];
+      if (rec && rec.status === "skipped" && rec.gatedBy) {
+        content.push({ type: "text", text: `${o.key}: skipped — gate "${gateName(rec.gatedBy)}" answered no` });
+      }
+      continue;
+    }
     if (value instanceof MediaRef) {
       await mkdir(outDir, { recursive: true });
       // bytes() before naming: for hosted media the mime is only known after the fetch
@@ -646,7 +684,9 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
-    content.push({ type: "text", text: `cost: $${result.costUsd.toFixed(4)}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
+    // sub-cent runs (a ⚖️ Decide answer is ~$0.000002) must not read as $0.0000
+    const usd = result.costUsd > 0 && result.costUsd < 0.0001 ? result.costUsd.toFixed(8).replace(/0+$/, "") : result.costUsd.toFixed(4);
+    content.push({ type: "text", text: `cost: $${usd}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput

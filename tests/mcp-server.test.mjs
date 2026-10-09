@@ -46,6 +46,12 @@ before(async () => {
       res.end(JSON.stringify({ data: [{ b64_json: PNG_B64 }], cost: 0.02 }));
       return;
     }
+    if (req.method === "POST" && req.url === "/api/v1/decisions") {
+      // ⚖️ Decide: always "no" (P(yes) 0.12) — a gated yes/no stops its branch
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ answers: { answer: { type: "noul", noul: 0.12 } }, usage: { input_tokens: 30, output_tokens: 0, cost: 0.000003 } }));
+      return;
+    }
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "stub: no route for " + req.method + " " + req.url }));
   });
@@ -747,4 +753,59 @@ test("extForMedia: mime wins; magic bytes rescue octet-stream media", async () =
   assert.equal(extForMedia(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), null), "png");
   assert.equal(extForMedia(new Uint8Array([0xff, 0xd8, 0xff]), ""), "jpg");
   assert.equal(extForMedia(new Uint8Array([1, 2, 3, 4]), null), "bin"); // truly unknown stays bin
+});
+
+test("gateNotices: a closed Decide gate reads as a result, naming what it skipped", async () => {
+  const { gateNotices } = await import("../src/tools.mjs");
+  const wf = { graph: { nodes: [{ id: "g", name: "Is it a cat?" }, { id: "l", name: "Cat poem" }, { id: "j" }] } };
+  const lines = gateNotices(wf, {
+    gated: [{ nodeId: "g", name: "Is it a cat?", yes: 0.12, skipped: ["l", "j"], message: "gate closed — …" }],
+    nodes: { j: { name: "Join" } },
+  });
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^gated: "Is it a cat\?" answered no \(yes 12%\)/);
+  assert.match(lines[0], /skipped, not billed: "Cat poem", "Join"/);
+  assert.match(lines[0], /a result, not an error/);
+  // an older library (no gates on the result) yields nothing
+  assert.deepEqual(gateNotices(wf, { outputs: {}, nodes: {} }), []);
+  assert.deepEqual(gateNotices(wf, null), []);
+});
+
+test("tools/call: a closed ⚖️ Decide gate is a normal result (not isError) when the library supports decide", async (t) => {
+  const { NODE_TYPES } = await import("nanoodle");
+  if (!NODE_TYPES || !NODE_TYPES.decide) return t.skip("installed nanoodle has no decide node yet");
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-gate-"));
+  await writeFile(join(dir, "cat-gate.json"), JSON.stringify({
+    nodes: [
+      { id: "t", type: "text", name: "Caption", x: 0, y: 0, fields: { text: "a dog on a beach" } },
+      { id: "g", type: "decide", name: "Is it a cat?", x: 0, y: 0, fields: { model: "liquid/d1", mode: "yesno", gate: true, question: "Is this about a cat?" } },
+      { id: "l", type: "llm", name: "Cat poem", x: 0, y: 0, fields: { model: "gpt-x", prompt: "write a cat poem" } },
+    ],
+    links: [
+      { id: "l1", from: { node: "t", port: "text" }, to: { node: "g", port: "text" } },
+      { id: "l2", from: { node: "g", port: "text" }, to: { node: "l", port: "system" } },
+    ],
+  }));
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-out-"));
+  const srv = startServer({ graphs: dir, outDir });
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } });
+    srv.notify("notifications/initialized");
+    const list = await srv.request("tools/list");
+    assert.ok(list.result.tools.some((x) => x.name === "cat-gate"), "a graph containing decide is served, not refused");
+    const before = apiRequests.length;
+    const call = await srv.request("tools/call", { name: "cat-gate", arguments: {} });
+    assert.equal(call.error, undefined);
+    assert.notEqual(call.result.isError, true, "a closed gate is not an error");
+    const text = call.result.content.map((c) => c.text).join("\n");
+    assert.match(text, /gated: "Is it a cat\?" answered no \(yes 12%\)/);
+    assert.match(text, /skipped, not billed: "Cat poem"/);
+    assert.match(text, /Cat poem: skipped — gate "Is it a cat\?" answered no/);
+    assert.match(text, /cost: \$0\.000003\b/);
+    const mine = apiRequests.slice(before);
+    assert.ok(mine.some((r) => r.path === "/api/v1/decisions"));
+    assert.ok(!mine.some((r) => r.path === "/api/v1/chat/completions"), "the LLM behind the gate never ran");
+  } finally {
+    await srv.close();
+  }
 });
