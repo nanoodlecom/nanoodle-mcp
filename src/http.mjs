@@ -15,6 +15,7 @@
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
  *                        flows, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
+ *   GET  /version        { name, version, commit } — short git sha, so a deploy can be matched to main
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
  *   GET  /x402/status/:id  quote status JSON; ?wait=1 long-polls up to 25s
@@ -37,7 +38,7 @@ import { createReadStream, existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { qrModules } from "nanoodle";
-import { createDispatcher } from "./server.mjs";
+import { createDispatcher, gitShortSha } from "./server.mjs";
 import { renderCost } from "./tools.mjs";
 import { workflowExample } from "./workflow-examples.mjs";
 
@@ -551,6 +552,8 @@ function payPageHtml(q) {
  * @param {object} opts
  * @param {string} opts.host  bind address (default 127.0.0.1 — use 0.0.0.0 behind a reverse proxy)
  * @param {number} opts.port
+ * @param {string|null} [opts.commit]  short git sha for initialize serverInfo and GET /version.
+ *                                     Omit to read this checkout; null to report commit: null.
  * @param {object|null} [opts.gate]  charge gate (createChargeGate) — null serves free
  * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402/card for the landing page and /graph/:name.json
  * @param {object} [opts.costs]  registry.costs — live last-observed-cost records, shown on the landing cards
@@ -568,6 +571,7 @@ export async function serveHttp({
   port,
   name,
   version,
+  commit,
   listTools,
   callTool,
   instructions,
@@ -580,7 +584,8 @@ export async function serveHttp({
   maxStreams = 4096,
   log = (...a) => console.error(...a),
 }) {
-  const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
+  const sha = commit === undefined ? gitShortSha() : (commit || null);
+  const dispatch = createDispatcher({ name, version, commit: sha, listTools, callTool, instructions, log });
   const graphByName = new Map(toolInfo.filter((t) => t.rawText).map((t) => [t.name, t.rawText]));
 
   // Every held event stream (a streaming tools/call, a /x402/watch subscriber)
@@ -696,6 +701,10 @@ export async function serveHttp({
 
       if (url.pathname === "/llms.txt") {
         return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo }), "text/plain; charset=utf-8");
+      }
+
+      if (url.pathname === "/version") {
+        return send(200, JSON.stringify({ name, version, commit: sha }));
       }
 
       if (ASSETS[url.pathname]) {

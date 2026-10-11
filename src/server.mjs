@@ -1,8 +1,9 @@
 /**
- * Minimal MCP server core — JSON-RPC 2.0, zero dependencies.
+ * Minimal MCP server core — JSON-RPC 2.0, no package dependencies.
  *
  * Protocol surface (the whole point is that this file is small enough to read):
  *   initialize                → protocolVersion + capabilities.tools (listChanged) + serverInfo
+ *                               (serverInfo.commit is the git short sha when this checkout has one)
  *   notifications/initialized → no response (notifications never get one)
  *   ping                      → {}
  *   tools/list                → tools from the registry
@@ -16,15 +17,42 @@
  * stdio mode: stdout carries protocol frames ONLY (one JSON object per line).
  * All logging → stderr.
  */
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 export const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
+
+/** Package root (parent of src/) — `git -C` here, not process.cwd(), so a server started elsewhere still reports its own checkout. */
+const PKG_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+let cachedCommit;
+/**
+ * Short git SHA of this checkout (at least 7 hex digits), or null when git
+ * can't answer (packaged install with no .git). Cached for the process.
+ * Pass `commit` into createDispatcher / serveHttp to override.
+ */
+export function gitShortSha() {
+  if (cachedCommit !== undefined) return cachedCommit;
+  try {
+    const sha = execFileSync("git", ["-C", PKG_ROOT, "rev-parse", "--short=7", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+    cachedCommit = /^[0-9a-f]{7,40}$/.test(sha) ? sha : null;
+  } catch {
+    cachedCommit = null;
+  }
+  return cachedCommit;
+}
 
 /**
  * Build the transport-free message handler.
  * @param {object} opts
  * @param {string} opts.name        serverInfo.name
  * @param {string} opts.version     serverInfo.version
+ * @param {string|null} [opts.commit]  serverInfo.commit — short git sha. Omit to read this checkout; null to suppress.
  * @param {() => Array} opts.listTools
  * @param {(params: object) => Promise<object>} opts.callTool  may throw; err.mcpCode → JSON-RPC error
  * @param {string} [opts.instructions]  server-level guidance surfaced to the client on initialize
@@ -34,7 +62,8 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-1
  *   `ctx` (optional) rides through to callTool — a streaming transport passes { streaming, report }
  *   so long-running tools can surface progress.
  */
-export function createDispatcher({ name, version, listTools, callTool, instructions, log = (...a) => console.error(...a) }) {
+export function createDispatcher({ name, version, commit, listTools, callTool, instructions, log = (...a) => console.error(...a) }) {
+  const sha = commit === undefined ? gitShortSha() : (commit || null);
   const reply = (id, result) => ({ jsonrpc: "2.0", id, result });
   const fail = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
 
@@ -56,7 +85,7 @@ export function createDispatcher({ name, version, listTools, callTool, instructi
         return reply(id, {
           protocolVersion,
           capabilities: { tools: { listChanged: true } },
-          serverInfo: { name, version },
+          serverInfo: { name, version, ...(sha ? { commit: sha } : {}) },
           ...(instructions ? { instructions } : {}),
         });
       }
