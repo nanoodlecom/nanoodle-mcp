@@ -370,6 +370,19 @@ function buildDescription(wf, spendSource, { cost, name } = {}) {
     (example ? ` Example: ${example.title} (${example.play}). ${example.description}` + (example.skill ? ` Agent skill: ${example.skill}` : "") : "");
 }
 
+/**
+ * USD figure shared by the result's `cost: $X` line and the paid receipt's
+ * "settled at actual cost" clause, so the two never disagree.
+ * Four decimal places ($0.0201, $0.0656 — not the deposit line's cent rounding).
+ * A positive cost under $0.0001 keeps up to eight digits: a ⚖️ Decide answer
+ * is ~$0.000002 and must not read as $0.0000.
+ */
+export function formatCostUsd(usd) {
+  const n = Number(usd);
+  if (n > 0 && n < 0.0001) return n.toFixed(8).replace(/0+$/, "");
+  return n.toFixed(4);
+}
+
 /** Milliseconds → compact human duration ("15s", "2m 10s") for ETA copy. */
 export function fmtDur(ms) {
   const s = Math.max(1, Math.round(ms / 1000));
@@ -684,9 +697,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
-    // sub-cent runs (a ⚖️ Decide answer is ~$0.000002) must not read as $0.0000
-    const usd = result.costUsd > 0 && result.costUsd < 0.0001 ? result.costUsd.toFixed(8).replace(/0+$/, "") : result.costUsd.toFixed(4);
-    content.push({ type: "text", text: `cost: $${usd}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
+    content.push({ type: "text", text: `cost: $${formatCostUsd(result.costUsd)}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput
@@ -894,6 +905,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       }
       const tool = byName.get(params.name);
       if (!tool) {
+        // run_noodle is callable on a free server, so it belongs in this list.
+        // The paid gate never reaches here for an unknown name: it answers from
+        // its own tools/list, which has already withdrawn run_noodle.
         const available = [...tools.map((t) => t.name), RUN_NOODLE_NAME].join(", ");
         throw new ParamsError(`unknown tool "${params.name}" — available: ${available}`);
       }

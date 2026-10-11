@@ -5,13 +5,17 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
+import { formatCostUsd } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 import { qrModules } from "nanoodle";
 import { qrDecode, svgToMatrix } from "./qr-decode.mjs";
 
@@ -373,6 +377,31 @@ test("bad arguments are rejected before a quote is ever issued", async () => {
   await assert.rejects(() => callTool({ name: "nope", arguments: {} }), /unknown tool/);
 });
 
+test("unknown tool on the paid server lists only tools that can be called", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  // The real prepareCall always appends run_noodle. Charge mode must not repeat it:
+  // tools/list hides it, and calling it is refused.
+  registry.prepareCall = async (params) => {
+    if (params.name !== "poster") {
+      const e = new Error(`unknown tool "${params.name}" — available: poster, run_noodle`);
+      e.mcpCode = -32602;
+      throw e;
+    }
+  };
+  const { callTool, listTools } = makeGate(chain, { registry }).wrapRegistry(registry);
+  assert.deepEqual(listTools().map((t) => t.name), ["poster"]);
+  await assert.rejects(
+    () => callTool({ name: "nope", arguments: {} }),
+    (err) => {
+      assert.equal(err.mcpCode, -32602);
+      assert.match(err.message, /^unknown tool "nope" — available: poster$/);
+      assert.doesNotMatch(err.message, /run_noodle/);
+      return true;
+    },
+  );
+});
+
 test("run_noodle is withdrawn in charge mode", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
@@ -465,7 +494,7 @@ test("settle: cost + 20% markup to the author, change back to the payer, exact t
   const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!res.isError);
   assert.ok(!("costUsd" in res), "cost sidecar must be stripped from the caller's result");
-  assert.match(res.content.at(-1).text, /settled at actual cost \$0\.02 \+ 20%/);
+  assert.match(res.content.at(-1).text, /settled at actual cost \$0\.0200 \+ 20%/);
   assert.match(res.content.at(-1).text, /markup goes to this noodle's author/);
   // transfers ride the send queue — give the microtask a beat
   await new Promise((r) => setTimeout(r, 50));
@@ -508,6 +537,58 @@ test("settle: markup is capped by what's left after cost", async () => {
   await new Promise((r) => setTimeout(r, 50));
   const remaining = BigInt(x.amountRaw) - 45n * 10n ** 27n;
   assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: remaining.toString(), describe: "author payout:" }]);
+});
+
+test("receipt settled cost uses the cost line's precision, not cent rounding", async () => {
+  // Live mismatch: cost line $0.0201 / $0.0656, receipt $0.02 / $0.07.
+  assert.equal(formatCostUsd(0.0201), "0.0201");
+  assert.equal(formatCostUsd(0.0656), "0.0656");
+  assert.equal(formatCostUsd(0.02), "0.0200");
+  assert.equal(formatCostUsd(0.000002), "0.000002");
+  for (const cost of [0.0201, 0.0656]) {
+    const chain = fakeChain();
+    const figure = formatCostUsd(cost);
+    const registry = fakeRegistry({
+      onCall: async () => ({
+        content: [{ type: "text", text: "ran" }, { type: "text", text: `cost: $${figure}` }],
+        costUsd: cost,
+      }),
+    });
+    const { callTool } = makeGate(chain, { registry, usd: 0.2 }).wrapRegistry(registry);
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+    assert.ok(!res.isError, JSON.stringify(res.content));
+    assert.equal(res.content.find((c) => c.text.startsWith("cost:")).text, `cost: $${figure}`);
+    assert.match(res.content.at(-1).text, new RegExp(`settled at actual cost \\$${figure.replace(".", "\\.")} \\+ 20%`));
+  }
+});
+
+test("rawToXno at 8 decimals truncates; 30 decimals is the exact raw", () => {
+  // 0.0747258679 XNO — the live receipt showed 0.07472586.
+  const raw = 747258679n * 10n ** 20n;
+  assert.equal(rawToXno(raw), "0.07472586");
+  assert.equal(rawToXno(raw, 30), "0.0747258679");
+});
+
+test("receipt change is the exact on-chain raw, not an 8-decimal truncation", async () => {
+  const chain = fakeChain();
+  // $1/XNO keeps change on the 8-decimal grid. A non-integer rate does not.
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.0201 }) });
+  const { callTool } = makeGate(chain, { registry, xnoUsd: 0.87 }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!res.isError, JSON.stringify(res.content));
+  await new Promise((r) => setTimeout(r, 50));
+  const change = chain.state.transfers.find((tr) => tr.describe === "change:");
+  assert.ok(change, "expected a change send");
+  const exact = rawToXno(change.amountRaw, 30);
+  const truncated = rawToXno(change.amountRaw);
+  assert.notEqual(exact, truncated, "fixture must carry digits past 8 decimals");
+  const text = res.content.at(-1).text;
+  assert.match(text, new RegExp(`; ${exact.replace(/\./g, "\\.")} XNO change returned`));
+  assert.doesNotMatch(text, new RegExp(`; ${truncated.replace(/\./g, "\\.")} XNO change returned`));
 });
 
 test("parseUsdNano is string-exact, handles exponents, truncates below 1e-9 USD", () => {
@@ -1068,6 +1149,35 @@ test("hashArgs is order-insensitive and value-sensitive", () => {
 });
 
 /* ---- HTTP surface with a live gate ---- */
+
+test("initialize and /version report the git short sha of this checkout", async () => {
+  const sha = execFileSync("git", ["-C", REPO_ROOT, "rev-parse", "--short=7", "HEAD"], { encoding: "utf8" }).trim();
+  assert.match(sha, /^[0-9a-f]{7,40}$/);
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "nanoodle-mcp", version: "0.6.0",
+    listTools: () => [], callTool: async () => ({ content: [] }),
+    publicBase: "http://pay.test", log: () => {},
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const init = await (await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } },
+      }),
+    })).json();
+    assert.equal(init.result.serverInfo.name, "nanoodle-mcp");
+    assert.equal(init.result.serverInfo.version, "0.6.0");
+    assert.equal(init.result.serverInfo.commit, sha);
+
+    const ver = await (await fetch(`${base}/version`)).json();
+    assert.deepEqual(ver, { name: "nanoodle-mcp", version: "0.6.0", commit: sha });
+  } finally {
+    server.close();
+  }
+});
 
 test("pay page + status endpoint over HTTP", async () => {
   const chain = fakeChain();

@@ -68,11 +68,19 @@ export function isThrottleError(msg) {
   return /^\s*429\s*$/.test(s) || /\b429\b|too many requests|rate[\s_-]?limit/i.test(s);
 }
 
-/** raw → XNO display string (1 XNO = 10^30 raw), trimmed to something readable. */
-export function rawToXno(raw) {
+/**
+ * raw → XNO display string (1 XNO = 10^30 raw), trailing zeros trimmed.
+ * `decimals` defaults to 8 — the resolution wallets display, and quote tags
+ * are whole multiples of it, so a deposit's friendly figure is the exact
+ * payable amount. Pass 30 for a remainder that is not on that grid (change):
+ * every significant digit, so 0.0747258679 is not shown as 0.07472586.
+ */
+export function rawToXno(raw, decimals = 8) {
+  const n = decimals >= 30 ? 30 : Math.max(0, decimals | 0);
   const s = BigInt(raw).toString().padStart(31, "0");
   const whole = s.slice(0, -30);
-  const frac = s.slice(-30, -30 + 8).replace(/0+$/, "");
+  const fracSrc = s.slice(-30);
+  const frac = (n >= 30 ? fracSrc : fracSrc.slice(0, n)).replace(/0+$/, "");
   return whole + (frac ? "." + frac : "");
 }
 

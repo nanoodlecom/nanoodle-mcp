@@ -5,7 +5,7 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import http from "node:http";
 import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -134,6 +134,8 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.deepEqual(init.result.capabilities, { tools: { listChanged: true } });
     assert.equal(init.result.serverInfo.name, "nanoodle-mcp");
     assert.match(init.result.serverInfo.version, /^\d+\.\d+\.\d+/);
+    const sha = execFileSync("git", ["-C", join(here, ".."), "rev-parse", "--short=7", "HEAD"], { encoding: "utf8" }).trim();
+    assert.equal(init.result.serverInfo.commit, sha);
 
     // -- initialized notification: must produce NO response
     const framesBefore = srv.messages.length;
@@ -248,6 +250,8 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     // -- unknown tool / malformed args → -32602
     const badTool = await srv.request("tools/call", { name: "nope", arguments: {} });
     assert.equal(badTool.error.code, -32602);
+    // Free servers still offer run_noodle — only the paid gate drops it from this list.
+    assert.match(badTool.error.message, /available: .*\brun_noodle\b/);
     const badArg = await srv.request("tools/call", { name: "hello-noodle", arguments: { Bogus: "x" } });
     assert.equal(badArg.error.code, -32602);
     const missingArg = await srv.request("tools/call", { name: "hello-noodle", arguments: {} });

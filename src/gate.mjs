@@ -33,7 +33,7 @@ import { writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
-import { fmtDur } from "./tools.mjs";
+import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -1057,6 +1057,13 @@ export function createChargeGate({
         let q;
         if (_payment_id == null) {
           // Never charge for a call that couldn't run: unknown tool / bad args throw here, pre-quote.
+          // validate is registry.prepareCall, whose unknown-tool text always appends
+          // run_noodle. That tool is hidden from tools/list and refused above, so
+          // name only what this paid server will actually run.
+          const offered = listTools();
+          if (!offered.some((t) => t.name === name)) {
+            throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
+          }
           if (validate) await validate({ name, arguments: args });
           const pair = await ratePair();
           q = {
@@ -1155,12 +1162,16 @@ export function createChargeGate({
               q.settled = true;
               const r = q.settleReceipt;
               const rTake = BigInt(r.take), rChange = BigInt(r.change);
+              // Settled cost uses the cost line's precision (formatCostUsd), not the
+              // deposit's cent rounding — $0.0656 must not print as $0.07. Change is
+              // the exact raw remainder (30 decimals); the 8-decimal grain is only
+              // how wallets display a quote, and it clips a sub-grain refund.
               const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
                 (q.payHash ? ` (block ${q.payHash})` : "") +
                 (r.known
-                  ? ` — settled at actual cost ${fmtUsd(r.costUsd)} + 20%` +
+                  ? ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%` +
                     (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
-                    (rChange > 0n ? `; ${rawToXno(rChange)} XNO change returned to your wallet` : "")
+                    (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change returned to your wallet` : "")
                   : " — the model reported no cost, so the whole deposit is being returned to your wallet");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
