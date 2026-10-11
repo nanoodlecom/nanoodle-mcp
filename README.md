@@ -644,6 +644,25 @@ estimated. The server announces the change with a
 `notifications/tools/list_changed` notification, so MCP clients that honor it
 show updated prices mid-session; others catch up on restart.
 
+### Hosted tool: pick the best image
+
+[`tests/fixtures/hosted/pick-best-image.noodle-graph.json`](tests/fixtures/hosted/pick-best-image.noodle-graph.json)
+is the graph for the tool `pick-best-image`: a brief, or a subject plus a style,
+three cheap image variants, then a ⚖️ Decide node in pick mode
+(`perplexity/pplx-decider-v1.1-27b`) chooses the one that best fits the brief.
+The result is the winner, all three candidates, and the pick probabilities.
+
+The hosted graph folder lives on the deploy box, in the directory that server
+already passes to `--graphs`. Copy this file there and restart `nanoodle-mcp`
+to publish the tool. Nothing in this repo's deploy workflow copies graphs, and
+adding the file here does not deploy it.
+
+The graph pins a **$0.05** deposit (`"x402": {"usd": 0.05}`). That is a hold,
+not the price. A run is three image calls — Krea 2 Turbo at $0.002,
+HiDream-I1 Fast at $0.0034, Flux Schnell at $0.0085 — plus two decider calls
+(pick asks forward and reversed). The catalog forecast is about **$0.014**.
+Whatever the deposit does not spend comes back as change.
+
 ## Limitations
 
 Honest list — most of these are inherited from the executor:

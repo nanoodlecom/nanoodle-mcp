@@ -327,19 +327,43 @@ function graphIntent(graph) {
   return /[.!?…]$/.test(text) ? text : text + ".";
 }
 
+/** Pick is the Decide default. choose / score / yesno are the other three modes. */
+function isPickDecide(node) {
+  if (!node || node.type !== "decide") return false;
+  const mode = node.fields && node.fields.mode;
+  return mode !== "choose" && mode !== "score" && mode !== "yesno";
+}
+
+/** img1, img2, … wires into a Decide node, in port order. */
+function wiredImageCandidates(graph, nodeId) {
+  return (graph.links || [])
+    .filter((l) => l.to && l.to.node === nodeId && /^img\d+$/.test(l.to.port))
+    .sort((a, b) => (parseInt(a.to.port.slice(3), 10) || 0) - (parseInt(b.to.port.slice(3), 10) || 0));
+}
+
 /**
  * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
  * size, plus the on-disk contract (media never rides inline in the result).
  * One file per media sink — the run keeps only a sink's primary output, so
  * variations never multiply what the caller receives.
+ *
+ * A pick-mode Decide sink is the exception: its primary port is the text label
+ * ("image 2"), and the tool result also returns the winning image, every
+ * candidate, and the probabilities (see pickDecideReports).
  */
 function describeOutputs(wf) {
   const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
   let mediaFiles = 0;
   const parts = wf.outputs.map((o) => {
+    const node = byId.get(o.nodeId) || {};
+    if (isPickDecide(node)) {
+      const n = wiredImageCandidates(wf.graph, o.nodeId).length;
+      mediaFiles += 1 + n;
+      return `winning image, ${n} candidate image${n === 1 ? "" : "s"}, and pick probabilities`;
+    }
     const kind = (o.ports && o.ports[0] && o.ports[0].type) || o.type; // odd types may declare no ports
     if (kind === "text") return "text";
-    const f = (byId.get(o.nodeId) || {}).fields || {};
+    const f = node.fields || {};
     const details = [];
     if (f.model) details.push(shortModel(f.model));
     if (kind === "image" && f.size && f.size !== "auto") details.push(String(f.size).replace("x", "×"));
@@ -347,6 +371,9 @@ function describeOutputs(wf) {
     return `${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
   });
   if (!parts.length) return "";
+  if (parts.length === 1 && parts[0].includes("pick probabilities")) {
+    return `returns the ${parts[0]} (images saved to disk, file paths in the result)`;
+  }
   const joined = parts.join(" + ");
   if (!mediaFiles) return `returns ${joined}`;
   const pathNote = `(file path${mediaFiles > 1 ? "s" : ""} in result)`;
@@ -641,6 +668,46 @@ const INLINE_IMAGE_MAX = 1_500_000;
 const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 
 /**
+ * What a finished pick-mode ⚖️ Decide node should show the caller, beyond the
+ * sink's primary text (the label "image N").
+ *
+ * The winning image is Decide's secondary `image` port. The probabilities live
+ * on `out.decision.rows`, which is not a port. The candidate images are wired
+ * into img1… so those nodes are not sinks. result.outputs therefore carries
+ * none of them; the tool result has to add them.
+ */
+function pickDecideReports(wf, result) {
+  const graph = (wf && wf.graph) || { nodes: [], links: [] };
+  const byId = new Map((graph.nodes || []).map((n) => [n.id, n]));
+  const nodes = (result && result.nodes) || {};
+  const reports = [];
+  for (const n of graph.nodes || []) {
+    if (!isPickDecide(n)) continue;
+    const rec = nodes[n.id];
+    if (!rec || rec.status !== "done" || !rec.out) continue;
+    const candidates = wiredImageCandidates(graph, n.id).map((l) => {
+      const src = byId.get(l.from.node);
+      const out = nodes[l.from.node] && nodes[l.from.node].out;
+      const name = (src && typeof src.name === "string" && src.name.trim()) || l.to.port;
+      return { key: name, url: out && typeof out.image === "string" ? out.image : "" };
+    });
+    const rows = rec.out.decision && Array.isArray(rec.out.decision.rows) ? rec.out.decision.rows : [];
+    const bits = rows.map((r, i) => {
+      const name = (candidates[i] && candidates[i].key) || r.label || `image ${i + 1}`;
+      const pct = Math.round((Number(r.p) || 0) * 100);
+      return `${name} ${pct}%${r.win ? " (winner)" : ""}`;
+    });
+    reports.push({
+      probabilities: bits.length ? `probabilities: ${bits.join("; ")}` : "",
+      winnerKey: reports.length ? `Winner ${reports.length + 1}` : "Winner",
+      winnerUrl: typeof rec.out.image === "string" ? rec.out.image : "",
+      candidates,
+    });
+  }
+  return reports;
+}
+
+/**
  * Turn a completed run into MCP tool-result content: media saved to disk, text
  * inline, cost line. Locally (stdio) media is referenced by file path; when
  * `publicBase` is set (--serve, remote callers can't read our disk) the file
@@ -663,6 +730,26 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   // uses this flag to keep it off disk (media pointers + receipts are safe to
   // persist, the files themselves die by --out-ttl).
   let textOutput = false;
+  const pushMedia = async (key, value) => {
+    if (!(value instanceof MediaRef)) return;
+    await mkdir(outDir, { recursive: true });
+    // bytes() before naming: for hosted media the mime is only known after the fetch
+    const bytes = await value.bytes();
+    const safeKey = key.replace(/[^\w.-]+/g, "_");
+    const ext = extForMedia(bytes, value.mime);
+    const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
+    const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
+    await writeFile(path, bytes);
+    if (publicBase) {
+      content.push({ type: "text", text: `${key}: ${publicBase}/out/${basename(path)}` });
+      const mime = /^image\//.test(value.mime || "") ? value.mime : EXT_MIME[ext];
+      if (mime && bytes.length <= INLINE_IMAGE_MAX) {
+        content.push({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: mime });
+      }
+    } else {
+      content.push({ type: "text", text: `${key}: saved ${path}` });
+    }
+  };
   for (const o of wf.outputs) {
     const value = result.outputs[o.key];
     if (value === undefined) {
@@ -674,26 +761,22 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
       continue;
     }
     if (value instanceof MediaRef) {
-      await mkdir(outDir, { recursive: true });
-      // bytes() before naming: for hosted media the mime is only known after the fetch
-      const bytes = await value.bytes();
-      const safeKey = o.key.replace(/[^\w.-]+/g, "_");
-      const ext = extForMedia(bytes, value.mime);
-      const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
-      const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
-      await writeFile(path, bytes);
-      if (publicBase) {
-        content.push({ type: "text", text: `${o.key}: ${publicBase}/out/${basename(path)}` });
-        const mime = /^image\//.test(value.mime || "") ? value.mime : EXT_MIME[ext];
-        if (mime && bytes.length <= INLINE_IMAGE_MAX) {
-          content.push({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: mime });
-        }
-      } else {
-        content.push({ type: "text", text: `${o.key}: saved ${path}` });
-      }
+      await pushMedia(o.key, value);
     } else {
       content.push({ type: "text", text: String(value) });
       textOutput = true;
+    }
+  }
+  // Pick-mode Decide: the label above names the winner; these blocks are the
+  // image, the three candidates, and the probabilities the caller asked for.
+  for (const extra of pickDecideReports(wf, result)) {
+    if (extra.probabilities) {
+      content.push({ type: "text", text: extra.probabilities });
+      textOutput = true;
+    }
+    if (extra.winnerUrl) await pushMedia(extra.winnerKey, new MediaRef(extra.winnerUrl));
+    for (const c of extra.candidates) {
+      if (c.url) await pushMedia(c.key, new MediaRef(c.url));
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {

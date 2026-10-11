@@ -1,0 +1,189 @@
+{
+  "v": 1,
+  "x402": {
+    "usd": 0.05
+  },
+  "nodes": [
+    {
+      "id": "c-intent",
+      "type": "comment",
+      "x": 40,
+      "y": -180,
+      "w": 460,
+      "fields": {
+        "text": "Picks the best of three cheap, fast image variants for a brief, or for a subject plus a style.",
+        "color": "yellow"
+      }
+    },
+    {
+      "id": "brief",
+      "type": "text",
+      "x": 40,
+      "y": 40,
+      "w": 280,
+      "name": "Brief",
+      "fields": {
+        "text": "a red paper lantern over a quiet canal at dusk",
+        "optional": true
+      }
+    },
+    {
+      "id": "subject",
+      "type": "text",
+      "x": 40,
+      "y": 220,
+      "w": 280,
+      "name": "Subject",
+      "fields": {
+        "text": "",
+        "optional": true
+      }
+    },
+    {
+      "id": "style",
+      "type": "text",
+      "x": 40,
+      "y": 400,
+      "w": 280,
+      "name": "Style",
+      "fields": {
+        "text": "",
+        "optional": true
+      }
+    },
+    {
+      "id": "j-subject",
+      "type": "join",
+      "x": 400,
+      "y": 300,
+      "w": 240,
+      "name": "Subject and style",
+      "fields": {
+        "sep": "\\n\\n"
+      }
+    },
+    {
+      "id": "j-prompt",
+      "type": "join",
+      "x": 720,
+      "y": 160,
+      "w": 240,
+      "name": "Prompt",
+      "fields": {
+        "sep": "\\n\\n"
+      }
+    },
+    {
+      "id": "img1",
+      "type": "image",
+      "x": 1060,
+      "y": 0,
+      "w": 280,
+      "name": "Candidate 1",
+      "fields": {
+        "model": "krea-2/turbo",
+        "size": "square",
+        "variations": "1",
+        "seed": 101
+      }
+    },
+    {
+      "id": "img2",
+      "type": "image",
+      "x": 1060,
+      "y": 220,
+      "w": 280,
+      "name": "Candidate 2",
+      "fields": {
+        "model": "hidream-i1-fast",
+        "size": "1024x1024",
+        "variations": "1",
+        "seed": 202
+      }
+    },
+    {
+      "id": "img3",
+      "type": "image",
+      "x": 1060,
+      "y": 440,
+      "w": 280,
+      "name": "Candidate 3",
+      "fields": {
+        "model": "flux-schnell",
+        "size": "1024x1024",
+        "variations": "1",
+        "seed": 303
+      }
+    },
+    {
+      "id": "pick",
+      "type": "decide",
+      "x": 1460,
+      "y": 180,
+      "w": 300,
+      "name": "Pick the best",
+      "fields": {
+        "model": "perplexity/pplx-decider-v1.1-27b",
+        "mode": "pick",
+        "question": "Which image best matches the brief?"
+      }
+    }
+  ],
+  "links": [
+    {
+      "id": "l1",
+      "from": { "node": "subject", "port": "text" },
+      "to": { "node": "j-subject", "port": "a" }
+    },
+    {
+      "id": "l2",
+      "from": { "node": "style", "port": "text" },
+      "to": { "node": "j-subject", "port": "b" }
+    },
+    {
+      "id": "l3",
+      "from": { "node": "brief", "port": "text" },
+      "to": { "node": "j-prompt", "port": "a" }
+    },
+    {
+      "id": "l4",
+      "from": { "node": "j-subject", "port": "text" },
+      "to": { "node": "j-prompt", "port": "b" }
+    },
+    {
+      "id": "l5",
+      "from": { "node": "j-prompt", "port": "text" },
+      "to": { "node": "img1", "port": "prompt" }
+    },
+    {
+      "id": "l6",
+      "from": { "node": "j-prompt", "port": "text" },
+      "to": { "node": "img2", "port": "prompt" }
+    },
+    {
+      "id": "l7",
+      "from": { "node": "j-prompt", "port": "text" },
+      "to": { "node": "img3", "port": "prompt" }
+    },
+    {
+      "id": "l8",
+      "from": { "node": "j-prompt", "port": "text" },
+      "to": { "node": "pick", "port": "text" }
+    },
+    {
+      "id": "l9",
+      "from": { "node": "img1", "port": "image" },
+      "to": { "node": "pick", "port": "img1" }
+    },
+    {
+      "id": "l10",
+      "from": { "node": "img2", "port": "image" },
+      "to": { "node": "pick", "port": "img2" }
+    },
+    {
+      "id": "l11",
+      "from": { "node": "img3", "port": "image" },
+      "to": { "node": "pick", "port": "img3" }
+    }
+  ]
+}
