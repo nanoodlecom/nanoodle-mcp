@@ -43,7 +43,10 @@ mid-session. To add or edit a tool:
    session) to pick it up.
 
 Local-media graphs (resize, combine, trim, extract-audio, video-frames,
-soundtrack) load and run headlessly — this package depends on nanoodle ≥ 0.4,
+soundtrack) load and run headlessly — this package depends on nanoodle ≥ 0.9,
 which can execute them. They need ffmpeg on PATH for formats the pure-JS
-path cannot handle. Unknown node types are still skipped at startup with a
-stderr note.
+path cannot handle. Decide, Clean voice (`cleanvoice`), 3D model (`model3d`),
+3D input (`mupload`), and custom endpoint nodes also load and run; they are
+not skipped at startup. A closed Decide gate is a normal result (`gated`),
+not an error. Unknown node types are still skipped at startup with a stderr
+note.

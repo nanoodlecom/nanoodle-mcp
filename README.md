@@ -516,10 +516,11 @@ It matters most in charge mode, where that run is already paid for. The library
 also emits a `process` warning, but stderr belongs to whoever started the server,
 not to the agent that paid.
 
-**A ⚖️ Decide gate that answers no is a result, not an error.** With a
-`nanoodle` that runs the Decide node, a yes/no gate that says no stops its
-branch. The tool result is normal (not `isError`), the decision's tiny cost is
-billed, and nothing behind the gate runs or bills. The result leads with:
+**A ⚖️ Decide gate that answers no is a result, not an error.** `nanoodle`
+0.9.0 runs the Decide node. A yes/no gate that says no settles as status
+`gated` and stops its branch. The tool result is normal (not `isError`), the
+decision's tiny cost is billed, and nothing behind the gate runs or bills. The
+result leads with:
 
 ```
 gated: "Is it a cat?" answered no (yes 12%), so the run stopped there on purpose — skipped, not billed: "Cat poem". This is a result, not an error.
@@ -655,11 +656,14 @@ Honest list — most of these are inherited from the executor:
 - **Graphs load once at startup.** Adding or editing files in `--graphs`
   needs a restart; the tool list doesn't change mid-session (no
   `listChanged` notifications).
-- **Local media nodes need nanoodle ≥ 0.4** (this package's dependency).
-  Graphs using resize, combine, trim, extract-audio, video-frames, or
-  soundtrack run headlessly — pure JS where possible, ffmpeg on `PATH` for
-  the rest (see the [supported-nodes
-  table](https://github.com/nanoodlecom/nanoodle-js#supported-nodes)). A
+- **Headless coverage follows `nanoodle` 0.9.0** (this package's dependency).
+  Local-media graphs (resize, combine, trim, extract-audio, video-frames,
+  soundtrack) run on your machine — pure JS where possible, ffmpeg on `PATH`
+  for the rest. Decide, Clean voice (`cleanvoice`), 3D model (`model3d`),
+  3D input (`mupload`), and custom endpoint nodes also load and run; they are
+  not skipped at startup. A closed Decide gate is a normal `gated` result.
+  See the [supported-nodes
+  table](https://github.com/nanoodlecom/nanoodle-js#supported-nodes). A
   graph with a node type the library doesn't know is still skipped at
   startup with a stderr note.
 - **Media rides inline.** NanoGPT has no upload endpoint, so media inputs are

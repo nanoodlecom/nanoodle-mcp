@@ -613,12 +613,12 @@ export function runNotices(wf) {
 /**
  * ⚖️ Decide gates that closed this run, as lines the caller must see.
  *
- * nanoodle (with Decide support) settles a yes/no gate that answered no as node status
+ * nanoodle >= 0.9.0 settles a yes/no gate that answered no as node status
  * "gated" — a deliberate, billed decision, not a failure — and every node behind it as
  * "skipped" (gatedBy), never run and never billed. run() resolves, so this is a normal
  * tool result, never isError. Without these lines the caller would see an output simply
- * missing and could mistake it for a bug. Duck-typed on result.gated / node.gatedBy so an
- * older library (no gates) yields nothing.
+ * missing and could mistake it for a bug. Duck-typed on result.gated / node.gatedBy so a
+ * result with no gates yields nothing.
  */
 export function gateNotices(wf, result) {
   const gated = result && Array.isArray(result.gated) ? result.gated : [];
