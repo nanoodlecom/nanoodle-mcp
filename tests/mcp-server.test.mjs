@@ -775,9 +775,7 @@ test("gateNotices: a closed Decide gate reads as a result, naming what it skippe
   assert.deepEqual(gateNotices(wf, null), []);
 });
 
-test("tools/call: a closed ⚖️ Decide gate is a normal result (not isError) when the library supports decide", async (t) => {
-  const { NODE_TYPES } = await import("nanoodle");
-  if (!NODE_TYPES || !NODE_TYPES.decide) return t.skip("installed nanoodle has no decide node yet");
+test("tools/call: a closed ⚖️ Decide gate is a normal result (not isError)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-gate-"));
   await writeFile(join(dir, "cat-gate.json"), JSON.stringify({
     nodes: [
@@ -809,6 +807,47 @@ test("tools/call: a closed ⚖️ Decide gate is a normal result (not isError) w
     const mine = apiRequests.slice(before);
     assert.ok(mine.some((r) => r.path === "/api/v1/decisions"));
     assert.ok(!mine.some((r) => r.path === "/api/v1/chat/completions"), "the LLM behind the gate never ran");
+    assert.ok(mine.every((r) => String(r.path).startsWith("/api/")), "the stub is the only host this run talks to");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("Decide and Clean voice graphs load, and so do 3D and custom endpoint", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-headless-"));
+  const writeGraph = (file, nodes, links = []) =>
+    writeFile(join(dir, file), JSON.stringify({ nodes, links }));
+  await writeGraph("yes-no.json", [
+    { id: "g", type: "decide", name: "Is it a cat?", x: 0, y: 0, fields: { model: "liquid/d1", mode: "yesno", gate: true, question: "Is this about a cat?" } },
+  ]);
+  await writeGraph("clean-voice.json", [
+    { id: "c", type: "cleanvoice", name: "Clean", x: 0, y: 0, fields: { url: "https://example.com/clip.mp3" } },
+  ]);
+  await writeGraph("mesh.json", [
+    { id: "m", type: "model3d", name: "Mesh", x: 0, y: 0, fields: { model: "tripo3d/v2.5", prompt: "a chair" } },
+  ]);
+  await writeGraph("model-in.json", [
+    { id: "u", type: "mupload", name: "Model file", x: 0, y: 0, fields: { model: "" } },
+  ]);
+  await writeGraph("hook.json", [
+    { id: "e", type: "endpoint", name: "Hook", x: 0, y: 0, fields: { url: "http://127.0.0.1:9/hook", mode: "text" } },
+  ]);
+  const before = apiRequests.length;
+  const srv = startServer({ graphs: dir });
+  try {
+    await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } });
+    const list = await srv.request("tools/list");
+    const names = list.result.tools.map((t) => t.name);
+    for (const name of ["yes-no", "clean-voice", "mesh", "model-in", "hook"]) {
+      assert.ok(names.includes(name), `${name} should be served, not refused at load: ${names.join(", ")}\n${srv.stderr}`);
+    }
+    assert.doesNotMatch(srv.stderr, /skipping (yes-no|clean-voice|mesh|model-in|hook)/);
+    assert.doesNotMatch(srv.stderr, /unknown node type/);
+    const mine = apiRequests.slice(before);
+    assert.ok(
+      mine.every((r) => r.method === "GET"),
+      "loading these graphs must not POST (no generation, no payment): " + mine.map((r) => `${r.method} ${r.path}`).join(", "),
+    );
   } finally {
     await srv.close();
   }
