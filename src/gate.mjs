@@ -324,25 +324,54 @@ export function createChargeGate({
    * stderr (log()) instead. Any transport-level error attached below
    * (ops.transfer bounced) is operational, not user content.
    */
+  /**
+   * Raw still held from this quote, which is the most a refund may send.
+   *
+   * Unsettled: the whole deposit. Settled: the deposit minus what already left
+   * the wallet — change back to the payer, and the author payout when there was
+   * one. Markup kept by the operator (no author) is still held and can go back.
+   * Refunding the original deposit after change has already moved pays the
+   * change twice.
+   */
+  function heldRaw(q) {
+    const deposit = BigInt(q.amountRaw);
+    const rec = q.settleReceipt;
+    if (!rec) return deposit;
+    const change = BigInt(rec.change || "0");
+    const take = BigInt(rec.take || "0");
+    const sent = change + (rec.author ? take : 0n);
+    return sent >= deposit ? 0n : deposit - sent;
+  }
+
   async function refund(q, reason) {
     reason = REFUND_REASONS.has(reason) ? reason : "run_failed";
     if (q.refunding) return q.refunding;
+    const amount = heldRaw(q);
+    q.refundAmountRaw = amount.toString();
     if (!q.source) {
-      log(`cannot refund ${q.id}: payer account unknown — ${rawToXno(q.amountRaw)} XNO stays in the wallet`);
+      log(`cannot refund ${q.id}: payer account unknown — ${rawToXno(amount.toString())} XNO stays in the wallet`);
       usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: "payer account unknown", reason });
       return false;
     }
     q.refunding = (async () => {
       try {
-        const hash = await ops.transfer(q.source, q.amountRaw, "refunded");
+        // Nothing left to send (the deposit already went back as change). Mark
+        // it refunded so a replay does not try again.
+        if (amount === 0n) {
+          q.status = "refunded";
+          usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: "0", to: q.source, reason });
+          persist();
+          return true;
+        }
+        const hash = await ops.transfer(q.source, amount.toString(), "refunded");
         q.status = "refunded";
-        usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: q.amountRaw, to: q.source, hash, reason });
+        usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: amount.toString(), to: q.source, hash, reason });
         persist();
         return true;
       } catch (e) {
         log(`refund of ${q.id} to ${q.source} failed: ${e.message}`);
         usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: e.message, reason });
-        owe(q.source, q.amountRaw, "refunded", "refund",
+        owe(q.source, amount.toString(), "refunded", "refund",
           { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; });
         return false;
       }
@@ -1199,11 +1228,23 @@ export function createChargeGate({
               // money coming back, safe to retry — then the technical detail.
               // A throttled-RPC failure (all nodes 429) lands here too, so the
               // caller should read "try again," never "payment failed."
-              const payer = refunded
-                ? `The run didn't complete, so your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source} — you were not charged. You can try again in a moment.`
-                : q.source
-                  ? `The run didn't complete, so your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands) — you won't be charged for a run that didn't finish. You can try again shortly.`
-                  : `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`;
+              // A settled quote has already returned change (and maybe an author
+              // payout). The refund is only what is still held, not the original
+              // deposit — saying the whole payment came back would be a lie, and
+              // sending it would pay the change twice.
+              const owed = q.refundAmountRaw != null ? BigInt(q.refundAmountRaw) : BigInt(q.amountRaw);
+              const deposit = BigInt(q.amountRaw);
+              const payer = !q.source
+                ? `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`
+                : owed === deposit
+                  ? (refunded
+                    ? `The run didn't complete, so your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source} — you were not charged. You can try again in a moment.`
+                    : `The run didn't complete, so your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands) — you won't be charged for a run that didn't finish. You can try again shortly.`)
+                  : owed === 0n
+                    ? `The run didn't complete. Your deposit was already settled and the change was returned, so nothing further is held — you were not charged again.`
+                    : (refunded
+                      ? `The run didn't complete. ${rawToXno(owed.toString())} XNO still held after settlement was refunded to ${q.source} — change already returned was not paid again. You can try again in a moment.`
+                      : `The run didn't complete. ${rawToXno(owed.toString())} XNO still held after settlement is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands) — change already returned is not paid again.`);
               q.error = `${payer}\n\nDetails: ${msg}`;
               q.errorPersist = `${payer}\n\nDetails: (error details not retained across restarts)`;
               persist();

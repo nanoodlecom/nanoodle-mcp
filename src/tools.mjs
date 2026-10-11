@@ -334,34 +334,24 @@ function isPickDecide(node) {
   return mode !== "choose" && mode !== "score" && mode !== "yesno";
 }
 
-/** img1, img2, … wires into a Decide node, in port order. */
-function wiredImageCandidates(graph, nodeId) {
-  return (graph.links || [])
-    .filter((l) => l.to && l.to.node === nodeId && /^img\d+$/.test(l.to.port))
-    .sort((a, b) => (parseInt(a.to.port.slice(3), 10) || 0) - (parseInt(b.to.port.slice(3), 10) || 0));
-}
-
 /**
  * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
  * size, plus the on-disk contract (media never rides inline in the result).
- * One file per media sink — the run keeps only a sink's primary output, so
+ * One file per media sink — the run keeps only a sink's declared output, so
  * variations never multiply what the caller receives.
  *
- * A pick-mode Decide sink is the exception: its primary port is the text label
- * ("image 2"), and the tool result also returns the winning image, every
- * candidate, and the probabilities (see pickDecideReports).
+ * A pick-mode Decide sink's primary port is the internal label ("image 2").
+ * The tool returns the image port (the winner) instead, so the description
+ * says image. Candidates and probabilities are not outputs.
  */
 function describeOutputs(wf) {
   const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
   let mediaFiles = 0;
   const parts = wf.outputs.map((o) => {
     const node = byId.get(o.nodeId) || {};
-    if (isPickDecide(node)) {
-      const n = wiredImageCandidates(wf.graph, o.nodeId).length;
-      mediaFiles += 1 + n;
-      return `winning image, ${n} candidate image${n === 1 ? "" : "s"}, and pick probabilities`;
-    }
-    const kind = (o.ports && o.ports[0] && o.ports[0].type) || o.type; // odd types may declare no ports
+    const kind = isPickDecide(node) && (o.ports || []).some((p) => p.type === "image")
+      ? "image"
+      : ((o.ports && o.ports[0] && o.ports[0].type) || o.type); // odd types may declare no ports
     if (kind === "text") return "text";
     const f = node.fields || {};
     const details = [];
@@ -371,9 +361,6 @@ function describeOutputs(wf) {
     return `${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
   });
   if (!parts.length) return "";
-  if (parts.length === 1 && parts[0].includes("pick probabilities")) {
-    return `returns the ${parts[0]} (images saved to disk, file paths in the result)`;
-  }
   const joined = parts.join(" + ");
   if (!mediaFiles) return `returns ${joined}`;
   const pathNote = `(file path${mediaFiles > 1 ? "s" : ""} in result)`;
@@ -584,6 +571,30 @@ async function resolveInputs(wf, args, label) {
 }
 
 /**
+ * pick-best-image: a brief, or a subject plus a style.
+ *
+ * Brief's saved text is the all-defaults sample. It must not be appended when
+ * the caller left Brief empty but did supply a subject or a style — an explicit
+ * empty Brief is what stops the library from backfilling that sample. With no
+ * caller text at all, the sample stays.
+ */
+function normalizePickBestInputs(tool, inputs) {
+  if (!tool || tool.name !== "pick-best-image") return inputs;
+  const keyOf = (nodeId) => {
+    const inp = (tool.wf.inputs || []).find((i) => i.nodeId === nodeId);
+    return inp && inp.key;
+  };
+  const briefKey = keyOf("brief");
+  const subjectKey = keyOf("subject");
+  const styleKey = keyOf("style");
+  if (!briefKey || !subjectKey || !styleKey) return inputs;
+  const text = (k) => (typeof inputs[k] === "string" ? inputs[k].trim() : "");
+  if (text(briefKey)) return inputs;
+  if (text(subjectKey) || text(styleKey)) return { ...inputs, [briefKey]: "" };
+  return inputs;
+}
+
+/**
  * Make a failed run's error lead with the node that actually broke.
  *
  * The library's RunError message names the failed *sink* ("Image→Video":
@@ -668,46 +679,6 @@ const INLINE_IMAGE_MAX = 1_500_000;
 const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 
 /**
- * What a finished pick-mode ⚖️ Decide node should show the caller, beyond the
- * sink's primary text (the label "image N").
- *
- * The winning image is Decide's secondary `image` port. The probabilities live
- * on `out.decision.rows`, which is not a port. The candidate images are wired
- * into img1… so those nodes are not sinks. result.outputs therefore carries
- * none of them; the tool result has to add them.
- */
-function pickDecideReports(wf, result) {
-  const graph = (wf && wf.graph) || { nodes: [], links: [] };
-  const byId = new Map((graph.nodes || []).map((n) => [n.id, n]));
-  const nodes = (result && result.nodes) || {};
-  const reports = [];
-  for (const n of graph.nodes || []) {
-    if (!isPickDecide(n)) continue;
-    const rec = nodes[n.id];
-    if (!rec || rec.status !== "done" || !rec.out) continue;
-    const candidates = wiredImageCandidates(graph, n.id).map((l) => {
-      const src = byId.get(l.from.node);
-      const out = nodes[l.from.node] && nodes[l.from.node].out;
-      const name = (src && typeof src.name === "string" && src.name.trim()) || l.to.port;
-      return { key: name, url: out && typeof out.image === "string" ? out.image : "" };
-    });
-    const rows = rec.out.decision && Array.isArray(rec.out.decision.rows) ? rec.out.decision.rows : [];
-    const bits = rows.map((r, i) => {
-      const name = (candidates[i] && candidates[i].key) || r.label || `image ${i + 1}`;
-      const pct = Math.round((Number(r.p) || 0) * 100);
-      return `${name} ${pct}%${r.win ? " (winner)" : ""}`;
-    });
-    reports.push({
-      probabilities: bits.length ? `probabilities: ${bits.join("; ")}` : "",
-      winnerKey: reports.length ? `Winner ${reports.length + 1}` : "Winner",
-      winnerUrl: typeof rec.out.image === "string" ? rec.out.image : "",
-      candidates,
-    });
-  }
-  return reports;
-}
-
-/**
  * Turn a completed run into MCP tool-result content: media saved to disk, text
  * inline, cost line. Locally (stdio) media is referenced by file path; when
  * `publicBase` is set (--serve, remote callers can't read our disk) the file
@@ -716,8 +687,14 @@ function pickDecideReports(wf, result) {
  *
  * `notices` lead the content (see runNotices): a caller who scrolls no further
  * than the first block still learns the run did not do exactly what they asked.
+ *
+ * Only declared sink outputs are emitted. A pick-mode Decide sink's text port
+ * is an internal label, and its candidate images and probability rows are not
+ * ports — none of those are tool output. The image port (the winner) is.
+ * Leaving the label in the result would set textOutput, and the charge gate
+ * would then discard the paid image on restart.
  */
-async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
+export async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
   const content = notices.map((text) => ({ type: "text", text }));
   for (const text of gateNotices(wf, result)) content.push({ type: "text", text });
   const gateName = (id) => {
@@ -730,6 +707,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   // uses this flag to keep it off disk (media pointers + receipts are safe to
   // persist, the files themselves die by --out-ttl).
   let textOutput = false;
+  const byId = new Map((((wf && wf.graph) || {}).nodes || []).map((n) => [n.id, n]));
   const pushMedia = async (key, value) => {
     if (!(value instanceof MediaRef)) return;
     await mkdir(outDir, { recursive: true });
@@ -751,10 +729,18 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     }
   };
   for (const o of wf.outputs) {
+    const node = byId.get(o.nodeId);
+    const rec = result.nodes && result.nodes[o.nodeId];
+    if (isPickDecide(node)) {
+      const url = rec && rec.out && typeof rec.out.image === "string" ? rec.out.image : "";
+      if (url) {
+        await pushMedia(o.key, new MediaRef(url));
+        continue;
+      }
+    }
     const value = result.outputs[o.key];
     if (value === undefined) {
       // an output a closed gate skipped: say so (it is not paid content — textOutput untouched)
-      const rec = result.nodes && result.nodes[o.nodeId];
       if (rec && rec.status === "skipped" && rec.gatedBy) {
         content.push({ type: "text", text: `${o.key}: skipped — gate "${gateName(rec.gatedBy)}" answered no` });
       }
@@ -765,18 +751,6 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     } else {
       content.push({ type: "text", text: String(value) });
       textOutput = true;
-    }
-  }
-  // Pick-mode Decide: the label above names the winner; these blocks are the
-  // image, the three candidates, and the probabilities the caller asked for.
-  for (const extra of pickDecideReports(wf, result)) {
-    if (extra.probabilities) {
-      content.push({ type: "text", text: extra.probabilities });
-      textOutput = true;
-    }
-    if (extra.winnerUrl) await pushMedia(extra.winnerKey, new MediaRef(extra.winnerUrl));
-    for (const c of extra.candidates) {
-      if (c.url) await pushMedia(c.key, new MediaRef(c.url));
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
@@ -998,7 +972,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (typeof args !== "object" || Array.isArray(args)) {
         throw new ParamsError("tools/call arguments must be an object");
       }
-      const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
+      const inputs = normalizePickBestInputs(tool, await resolveInputs(tool.wf, args, `tool "${tool.name}"`));
       return { tool, inputs };
     },
 

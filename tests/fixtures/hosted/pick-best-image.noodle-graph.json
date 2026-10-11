@@ -11,7 +11,7 @@
       "y": -180,
       "w": 460,
       "fields": {
-        "text": "Picks the best of three cheap, fast image variants for a brief, or for a subject plus a style.",
+        "text": "Picks the best of three cheap images for a brief, or a subject plus a style. Model cost about $0.014, plus 20% markup. $0.05 deposit held; settles at cost plus markup; change returned.",
         "color": "yellow"
       }
     },

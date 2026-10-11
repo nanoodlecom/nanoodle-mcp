@@ -926,6 +926,90 @@ test("a media-URL result persists and replays after a restart (pointers are safe
   assert.equal(registry2.callCount(), 0, "a persisted media result replays — it does not re-run");
 });
 
+test("a failed rerun after settlement refunds only what is still held, not the original deposit", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-held-")), "gate-state.json");
+
+  // Text output is discarded on persist, so a restart re-runs. The first run
+  // already returned change. The re-run then fails.
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({
+    onCall: async () => ({ content: [{ type: "text", text: "image 2" }], costUsd: 0.02, textOutput: true }),
+  });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!first.isError);
+  await until("the first run to send change", () => chain1.state.transfers.some((t) => t.describe === "change:"));
+  await untilState(stateFile, "the settled quote to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt && !q.result; });
+
+  const deposit = BigInt(x.amountRaw);
+  const held = 24n * 10n ** 27n; // $0.02 cost + 20% markup, still in the wallet (no author)
+  const change = chain1.state.transfers.find((t) => t.describe === "change:");
+  assert.equal(BigInt(change.amountRaw), deposit - held);
+
+  const chain2 = fakeChain();
+  const registry2 = fakeRegistry({ onCall: async () => { throw new Error("decider down"); } });
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
+  const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(replay.isError);
+  await until("the capped refund to be sent", () => chain2.state.transfers.some((t) => t.describe === "refunded"));
+  const refund = chain2.state.transfers.find((t) => t.describe === "refunded");
+  assert.equal(refund.amountRaw, held.toString(), "refund what is still held");
+  assert.notEqual(refund.amountRaw, deposit.toString(), "not the original deposit — change already went back");
+  assert.equal(BigInt(change.amountRaw) + BigInt(refund.amountRaw), deposit, "payer is made whole once");
+  assert.match(replay.content[0].text, /still held after settlement was refunded/);
+  assert.doesNotMatch(replay.content[0].text, /your payment of .+ was refunded/);
+});
+
+test("a failed rerun after an author payout does not refund that payout again", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-held-author-")), "gate-state.json");
+
+  const chain1 = fakeChain();
+  const registry1 = fakeRegistry({
+    author: PAYER,
+    onCall: async () => ({ content: [{ type: "text", text: "image 2" }], costUsd: 0.02, textOutput: true }),
+  });
+  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain1.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  await until("author payout and change to land", () =>
+    chain1.state.transfers.some((t) => t.describe === "change:") &&
+    chain1.state.transfers.some((t) => t.describe === "author payout:"));
+  await untilState(stateFile, "the settled quote to persist",
+    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt; });
+
+  const deposit = BigInt(x.amountRaw);
+  const costRaw = 2n * 10n ** 28n;
+  const take = costRaw / 5n;
+  const change = chain1.state.transfers.find((t) => t.describe === "change:");
+  const author = chain1.state.transfers.find((t) => t.describe === "author payout:");
+  assert.equal(BigInt(author.amountRaw), take);
+  assert.equal(BigInt(change.amountRaw), deposit - costRaw - take);
+
+  const chain2 = fakeChain();
+  const registry2 = fakeRegistry({
+    author: PAYER,
+    onCall: async () => { throw new Error("decider down"); },
+  });
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
+  await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  await until("the capped refund to be sent", () => chain2.state.transfers.some((t) => t.describe === "refunded"));
+  const refund = chain2.state.transfers.find((t) => t.describe === "refunded");
+  // Author take already left. Still held is the cost portion, not the deposit.
+  assert.equal(refund.amountRaw, costRaw.toString());
+  assert.notEqual(refund.amountRaw, deposit.toString());
+  assert.equal(BigInt(change.amountRaw) + BigInt(author.amountRaw) + BigInt(refund.amountRaw), deposit);
+});
+
 test("a failed paid run persists refund status but no upstream error text; replay shows the placeholder", async () => {
   const { mkdtemp, readFile } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");

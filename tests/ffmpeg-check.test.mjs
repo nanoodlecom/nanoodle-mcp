@@ -27,6 +27,25 @@ test("toolsNeedingFfmpeg flags only graphs with a local-media node", () => {
   assert.deepEqual(toolsNeedingFfmpeg(tools), ["favicon", "photo-to-video", "sing"]);
 });
 
+test("toolsNeedingFfmpeg flags a Decide node that sees images, not a text-only one", () => {
+  const decide = (id) => ({ id, type: "decide" });
+  const withImages = {
+    name: "pick-best-image",
+    wf: { graph: {
+      nodes: [decide("p"), { id: "i", type: "image" }],
+      links: [{ from: { node: "i", port: "image" }, to: { node: "p", port: "img1" } }],
+    } },
+  };
+  const textOnly = {
+    name: "yes-no",
+    wf: { graph: {
+      nodes: [decide("g"), { id: "t", type: "text" }],
+      links: [{ from: { node: "t", port: "text" }, to: { node: "g", port: "text" } }],
+    } },
+  };
+  assert.deepEqual(toolsNeedingFfmpeg([withImages, textOnly, tool("alt-text", ["vision"])]), ["pick-best-image"]);
+});
+
 test("every flagged type is a real node handler name", () => {
   // Guards against typos drifting from nanoodle-js nodes.mjs.
   for (const t of ["resize", "vframes", "combine", "soundtrack", "trim", "extractaudio"]) {

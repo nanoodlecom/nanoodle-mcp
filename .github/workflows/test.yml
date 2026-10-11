@@ -2,6 +2,8 @@ name: test
 
 # The suite is fully offline: it spawns the real server against a canned local
 # NanoGPT stub. Nothing here spends money or needs a secret.
+# ffmpeg is the one system package: Decide's pick mode shells out to ffprobe
+# and ffmpeg to downsize images, and ubuntu-latest does not ship them.
 on:
   push:
     branches: [main, master]
@@ -17,4 +19,6 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: npm test

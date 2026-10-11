@@ -275,9 +275,9 @@ async function main() {
     console.error("nanoodle-mcp: warning — no NanoGPT API key (NANOGPT_API_KEY / --key / --env-file) " +
       "and no x402 wallet (NANO_SEED / NANO_PRIVATE_KEY); tool calls that hit the API will fail");
   }
-  // Local-media tools (resize/vframes/combine/audio) fall back to ffmpeg for formats
-  // the pure-JS path can't handle. Missing on a server = mid-run failures (auto-refunded
-  // in charge mode). Warn once at boot, naming the at-risk tools, instead of per call.
+  // Local-media tools, and Decide nodes that judge images, need ffmpeg/ffprobe.
+  // Missing on a server = mid-run failures (auto-refunded in charge mode). Warn
+  // once at boot, naming the at-risk tools, instead of per call.
   await warnIfFfmpegMissing(registry.tools);
   // Hand the public model catalog to every graph's Workflow so the library's
   // catalog-driven payload limits apply — variations clamped to the model's real
