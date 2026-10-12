@@ -396,7 +396,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
    * lost-response republish and the one stale-frontier rebuild. Returns the
    * block hash. `describe` labels the log line ("paid", "refunded", …).
    */
-  async function sendFrom(state, to, amount, describe = "sent", extra = "") {
+  async function sendFrom(state, to, amount, describe = "sent", extra = "", onSigned = null) {
     const insufficient = () => new Error(
       `insufficient wallet balance: send is ${rawToXno(amount)} XNO` +
       ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
@@ -415,6 +415,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       block.account = address;
       block.link_as_account = to;
       precomputeWork(hash); // next block's work computes while this one publishes
+      // The hash is the payout's unique link. Callers persist it before process
+      // so a crash cannot confuse this block with an older send of the same amount.
+      if (typeof onSigned === "function") await onSigned(hash);
       try {
         await rpc({ action: "process", json_block: "true", subtype: "send", block });
       } catch (e) {
@@ -536,12 +539,12 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
      */
     ops: {
       rpc,
-      transfer: (to, amountRaw, describe = "sent") => enqueue(async () => {
+      transfer: (to, amountRaw, describe = "sent", onSigned = null) => enqueue(async () => {
         if (!checkAddress(String(to || ""))) throw new Error(`not a valid Nano address: ${to}`);
         // sweep first (a refund's source funds usually ARE a pending receivable),
         // but yield to a waiting payment once this send itself is covered
         const state = await pocketReceivables(false, (s) => urgentWaiting() && BigInt(amountRaw) <= s.balance);
-        return sendFrom(state, to, BigInt(amountRaw), describe);
+        return sendFrom(state, to, BigInt(amountRaw), describe, "", onSigned);
       }),
       pocket: () => enqueue(() => pocketReceivables(false, urgentWaiting)),
       /**

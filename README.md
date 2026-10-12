@@ -714,15 +714,26 @@ success the call settles at the actual metered cost plus the 20% markup, and
 the change (`deposit − cost − take`) is returned on-chain to the payer. A run
 that fails before settlement is refunded in full: the whole deposit goes back
 (`run_failed`). A run that already settled, then fails on a later attempt,
-refunds only what is still held. A payout counts as already returned only after
-that send is **confirmed** on chain — change back to the payer, or an author
-payout. The gate writes a settlement intent (amount, recipient, and state
-`intended`, `sent` with the block hash, or `confirmed`) before it dispatches
-the send. On restart it reconciles an uncertain send against the configured
-Nano RPCs (account history or a block lookup) before subtracting anything from
-what is still held. An intent that was never dispatched is retried once. A send
-that is still pending is not counted and is not sent again. It does not send
-the original deposit again. A run that costs more than the deposit keeps the deposit and
+refunds only what is still held. A confirmed payout — change, or an author
+payout — is money already returned, so it is reserved against that refund.
+A pending or otherwise unknown send is reserved too: it is not refunded again
+and it is not sent again, until a block lookup or a history entry confirms
+**that exact block hash**. An older send with the same recipient and amount
+does not count. A receipt from an older build, with amounts but no payout
+intent, is not treated as money already returned; the refund stays the full
+deposit unless a queued or still-unresolved payout is reserved. The gate
+writes the settlement intent (amount, recipient, and state `intended`, `sent`
+with the block hash, or `confirmed`), fsyncs it, and renames it into place
+before it dispatches. If that write fails, it does not send. On restart one
+process holds `<out>/gate-state.json.lock` and reconciles uncertain sends
+against the configured Nano RPCs. An intent that was never dispatched is
+retried once, and only after a successful chain read that does not show its
+block. An RPC error leaves the send unresolved. Intents are also stored in
+`<out>/gate-state.json.payouts.json`, which an older build does not rewrite.
+Do not delete that sidecar, and do not roll back to a build that rewrites
+`gate-state.json` while a payout is still unresolved: the older process does
+not read the sidecar, so it can send a payout the new process already recorded.
+It does not send the original deposit again. A run that costs more than the deposit keeps the deposit and
 the operator eats the difference. A run whose model reports no cost settles
 at $0 and the whole deposit is returned. The raw formula is the one in
 [wallet mode](#wallet-mode--no-account-no-api-key-x402):

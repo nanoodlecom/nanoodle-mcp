@@ -176,6 +176,8 @@ async function main() {
   // replayable for that 24h, and only while that state file and the --out media both survive.
   // Text results are not stored (a restart re-runs them). A missing state file, media already
   // swept by --out-ttl, or a result that existed only in memory is not replayable.
+  // Payout intents also live in <out>/gate-state.json.payouts.json. Do not delete that
+  // file, and do not roll a deploy back while a payout is still unresolved.
   // Lowering --out-ttl below 24h in charge mode means replayed results may point at deleted files.
   const serveMode = serveSpec !== null;
   let outTtlHours;
