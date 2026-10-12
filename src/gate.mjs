@@ -327,14 +327,23 @@ export function createChargeGate({
   /**
    * Raw still held from this quote, which is the most a refund may send.
    *
-   * Unsettled: the whole deposit. Settled: the deposit minus what already left
-   * the wallet — change back to the payer, and the author payout when there was
-   * one. Markup kept by the operator (no author) is still held and can go back.
-   * Refunding the original deposit after change has already moved pays the
-   * change twice.
+   * Unsettled: the whole deposit. Settled with per-send intents: the deposit
+   * minus payouts whose state is `confirmed` on chain. `intended` (never
+   * dispatched, or dispatched but not yet recorded) and `sent` (hash known,
+   * not confirmed) are still held — subtracting them records money as returned
+   * that may still be in the wallet. Markup kept by the operator (no author
+   * leg) stays held. A quote persisted before intents existed falls back to
+   * its receipt figures.
    */
   function heldRaw(q) {
     const deposit = BigInt(q.amountRaw);
+    if (Array.isArray(q.settlementIntents)) {
+      let sent = 0n;
+      for (const leg of q.settlementIntents) {
+        if (leg && leg.state === "confirmed") sent += BigInt(leg.amountRaw || "0");
+      }
+      return sent >= deposit ? 0n : deposit - sent;
+    }
     const rec = q.settleReceipt;
     if (!rec) return deposit;
     const change = BigInt(rec.change || "0");
@@ -345,6 +354,10 @@ export function createChargeGate({
 
   async function refund(q, reason) {
     reason = REFUND_REASONS.has(reason) ? reason : "run_failed";
+    if (q.refunding) return q.refunding;
+    // A restart may still be matching payout sends to the chain. Subtracting
+    // before that match treats an unconfirmed send as already returned.
+    await reconcileDone;
     if (q.refunding) return q.refunding;
     const amount = heldRaw(q);
     q.refundAmountRaw = amount.toString();
@@ -390,56 +403,97 @@ export function createChargeGate({
    * retry after restart runs it — charged once, delivered once.
    */
   let saveChain = Promise.resolve();
-  let saveQueued = false;
+  let persistGen = 0;
+  let lastWritten = 0;
+  let writing = false;
+  function quoteSnapshot(q) {
+    // What we're willing to write to disk for this quote's outcome:
+    //   - Media-only results persist as today (minus inline image blocks;
+    //     the files live on disk and keep their /out/ URLs). Their text is
+    //     pointers + a cost line + a gate-authored receipt — no user content.
+    //   - Text-output results (LLM/text nodes) hold the customer's paid
+    //     content, so they NEVER hit disk: persist null. With the status
+    //     rule below that demotes the quote back to "paid", so a retry after
+    //     a restart RE-RUNS instead of replaying content from disk. Charged
+    //     once / delivered once still holds; the only cost is one duplicate
+    //     model call in the rare restart-between-run-and-retry window — the
+    //     operator eats it, and privacy wins the trade.
+    //   - Errors persist in their redacted q.errorPersist form (upstream
+    //     text swapped for a placeholder, refund status kept). Its presence
+    //     keeps status "consumed" so the redacted error replays after restart.
+    const result = q.result && !q.textOutput
+      ? { ...q.result, content: (q.result.content || []).filter((c) => c.type !== "image") }
+      : null;
+    const error = q.error ? (q.errorPersist ?? "run failed: (error details not retained across restarts)") : null;
+    const row = {
+      id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
+      pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
+      amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
+      status: q.status === "consumed" && !result && !error ? "paid" : q.status,
+      source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
+      settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
+      settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
+      result,
+      error,
+    };
+    // Live-only `inflight` is dropped. Amount, recipient, and state are the
+    // whole record a restart needs to avoid paying a payout twice.
+    if (Array.isArray(q.settlementIntents)) {
+      row.settlementIntents = q.settlementIntents.map((leg) => ({
+        kind: leg.kind,
+        to: leg.to,
+        amountRaw: String(leg.amountRaw),
+        state: leg.state,
+        hash: leg.hash || null,
+        retried: leg.retried === true,
+      }));
+    }
+    return row;
+  }
+  async function writeSnapshot() {
+    // v:2 is the content-stripping era — its results are provably media-only
+    // (text output is written as null) and its errors are pre-redacted. A
+    // v:1 (or unversioned) file predates this and may hold user content, so
+    // restore treats it as legacy: drop its results, redact its errors.
+    const data = JSON.stringify({
+      v: 2,
+      quotes: [...quotes.values()].map(quoteSnapshot),
+      owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
+    });
+    await mkdir(dirname(stateFile), { recursive: true });
+    const tmp = stateFile + ".tmp";
+    await writeFile(tmp, data);
+    await rename(tmp, stateFile);
+  }
   function persist() {
-    if (!stateFile || saveQueued) return;
-    saveQueued = true;
+    if (!stateFile) return;
+    persistGen++;
+    drainSaves();
+  }
+  function drainSaves() {
+    if (!stateFile || writing) return;
+    writing = true;
     saveChain = saveChain.then(async () => {
-      saveQueued = false; // snapshot at write time — later mutations queue another write
-      const data = JSON.stringify({
-        // v:2 is the content-stripping era — its results are provably media-only
-        // (text output is written as null) and its errors are pre-redacted. A
-        // v:1 (or unversioned) file predates this and may hold user content, so
-        // restore treats it as legacy: drop its results, redact its errors.
-        v: 2,
-        quotes: [...quotes.values()].map((q) => {
-          // What we're willing to write to disk for this quote's outcome:
-          //   - Media-only results persist as today (minus inline image blocks;
-          //     the files live on disk and keep their /out/ URLs). Their text is
-          //     pointers + a cost line + a gate-authored receipt — no user content.
-          //   - Text-output results (LLM/text nodes) hold the customer's paid
-          //     content, so they NEVER hit disk: persist null. With the status
-          //     rule below that demotes the quote back to "paid", so a retry after
-          //     a restart RE-RUNS instead of replaying content from disk. Charged
-          //     once / delivered once still holds; the only cost is one duplicate
-          //     model call in the rare restart-between-run-and-retry window — the
-          //     operator eats it, and privacy wins the trade.
-          //   - Errors persist in their redacted q.errorPersist form (upstream
-          //     text swapped for a placeholder, refund status kept). Its presence
-          //     keeps status "consumed" so the redacted error replays after restart.
-          const result = q.result && !q.textOutput
-            ? { ...q.result, content: (q.result.content || []).filter((c) => c.type !== "image") }
-            : null;
-          const error = q.error ? (q.errorPersist ?? "run failed: (error details not retained across restarts)") : null;
-          return {
-            id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
-            pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
-            amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
-            status: q.status === "consumed" && !result && !error ? "paid" : q.status,
-            source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
-            settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
-            settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
-            result,
-            error,
-          };
-        }),
-        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
-      });
-      await mkdir(dirname(stateFile), { recursive: true });
-      const tmp = stateFile + ".tmp";
-      await writeFile(tmp, data);
-      await rename(tmp, stateFile);
-    }).catch((e) => log(`cannot persist gate state to ${stateFile}: ${e.message}`));
+      try {
+        while (lastWritten !== persistGen) {
+          const target = persistGen;
+          await writeSnapshot(); // snapshot at write time — later mutations queue another write
+          lastWritten = target;
+        }
+      } catch (e) {
+        log(`cannot persist gate state to ${stateFile}: ${e.message}`);
+        lastWritten = persistGen; // don't spin on a broken disk; the next persist() tries again
+      } finally {
+        writing = false;
+        if (lastWritten !== persistGen) drainSaves();
+      }
+    });
+  }
+  /** Durable before the next send. Resolves once a snapshot taken after this call has hit disk. */
+  async function flush() {
+    if (!stateFile) return;
+    persist();
+    await saveChain;
   }
 
   if (stateFile) {
@@ -473,6 +527,20 @@ export function createChargeGate({
         // writes the same redacted string — otherwise it would collapse to the
         // bare fallback and drop the gate-authored refund-status sentence.
         if (q.error && q.errorPersist == null) q.errorPersist = q.error;
+        if (Array.isArray(q.settlementIntents)) {
+          q.settlementIntents = q.settlementIntents.filter((leg) => leg && typeof leg === "object").map((leg) => ({
+            kind: leg.kind === "author_payout" ? "author_payout" : "change",
+            to: typeof leg.to === "string" ? leg.to : "",
+            amountRaw: String(leg.amountRaw ?? "0"),
+            state: leg.state === "confirmed" || leg.state === "sent" || leg.state === "intended"
+              ? leg.state
+              : (leg.hash ? "sent" : "intended"),
+            hash: typeof leg.hash === "string" && leg.hash ? leg.hash : null,
+            retried: leg.retried === true,
+          }));
+        } else {
+          q.settlementIntents = undefined;
+        }
         // A finished run replays its cached outcome; without this, a retry
         // after restart would run (and settle) the same payment twice. A quote
         // whose result we just dropped has neither result nor error, so it is
@@ -509,6 +577,205 @@ export function createChargeGate({
       if (quotes.size || owed.length) log(`restored ${quotes.size} quote(s) and ${owed.length} queued send(s) from ${stateFile}`);
     } catch (e) {
       if (e.code !== "ENOENT") log(`cannot read gate state ${stateFile}: ${e.message} — starting fresh`);
+    }
+  }
+
+  /*
+   * Settlement payouts (change back to the payer, author markup) are recorded
+   * as intents BEFORE the send is dispatched:
+   *   intended  — amount + recipient durable, send not dispatched (or the
+   *               dispatch never returned a hash)
+   *   sent      — dispatch returned a block hash; chain confirmation unknown
+   *   confirmed — account_history or block_info shows that send
+   * Only `confirmed` reduces what a later refund may send. On restart an
+   * `intended` leg that is not already on chain is dispatched once (`retried`);
+   * a `sent` leg stays pending: not counted, not sent again.
+   */
+  let reconcileDone = Promise.resolve();
+
+  function legDescribe(leg) {
+    return leg.kind === "author_payout" ? "author payout:" : "change:";
+  }
+  function legEvent(leg) {
+    return leg.kind === "author_payout" ? "author_payout" : "change";
+  }
+  function historyMatches(entry, leg) {
+    if (!entry || entry.type !== "send") return false;
+    const dest = entry.account || entry.link_as_account;
+    if (dest !== leg.to) return false;
+    try { return BigInt(entry.amount) === BigInt(leg.amountRaw); }
+    catch { return false; }
+  }
+  function blockMatchesLeg(info, leg) {
+    if (!info || typeof info !== "object") return false;
+    const subtype = info.subtype || (info.contents && info.contents.subtype);
+    const dest = (info.contents && info.contents.link_as_account) || info.link_as_account || null;
+    if (subtype !== "send" && !dest) return false;
+    if (subtype && subtype !== "send") return false;
+    if (dest && dest !== leg.to) return false;
+    if (info.amount != null) {
+      try { if (BigInt(info.amount) !== BigInt(leg.amountRaw)) return false; }
+      catch { return false; }
+    }
+    return true;
+  }
+  function confirmationOf(info) {
+    if (!info) return "absent";
+    const c = info.confirmed;
+    if (c === false || c === "false") return "pending";
+    if (c === true || c === "true") return "confirmed";
+    return "unknown";
+  }
+  async function loadHistory() {
+    const entries = [];
+    let head = null;
+    for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
+      let h;
+      try {
+        h = await ops.rpc({
+          action: "account_history", account: address,
+          count: String(HISTORY_PAGE), ...(head ? { head } : {}),
+        });
+      } catch (e) {
+        log(`settlement history lookup failed: ${e.message}`);
+        break;
+      }
+      const batch = Array.isArray(h && h.history) ? h.history : [];
+      entries.push(...batch.filter(Boolean));
+      if (!batch.length) break;
+      const prev = h && typeof h.previous === "string" ? h.previous : null;
+      if (!prev || prev === head) break;
+      head = prev;
+    }
+    return entries;
+  }
+  async function lookupBlock(hash) {
+    try {
+      const info = await ops.rpc({ action: "block_info", json_block: "true", hash });
+      if (!info || info.error) return null;
+      return info;
+    } catch {
+      return null;
+    }
+  }
+  /** One chain read. `confirmed` only when history or block_info says so. Hashless legs match amount + recipient. */
+  async function chainStatus(leg, historyOnce, claimed) {
+    if (leg.hash) {
+      const info = await lookupBlock(leg.hash);
+      const conf = confirmationOf(info);
+      if (conf === "pending") return "pending";
+      if (conf === "confirmed" && blockMatchesLeg(info, leg)) return "confirmed";
+      const history = await historyOnce();
+      const entry = history.find((e) => e.hash === leg.hash);
+      if (entry && historyMatches(entry, leg)) return "confirmed";
+      return conf === "pending" ? "pending" : "absent";
+    }
+    const history = await historyOnce();
+    const entry = history.find((e) => e.hash && !claimed.has(e.hash) && historyMatches(e, leg));
+    if (!entry) return "absent";
+    claimed.add(entry.hash);
+    leg.hash = entry.hash;
+    return "confirmed";
+  }
+  async function promoteIfConfirmed(leg) {
+    if (!leg.hash || leg.state === "confirmed") return false;
+    const info = await lookupBlock(leg.hash);
+    const conf = confirmationOf(info);
+    if (conf === "pending") return false;
+    if (conf === "confirmed" && blockMatchesLeg(info, leg)) {
+      leg.state = "confirmed";
+      persist();
+      return true;
+    }
+    const history = await loadHistory();
+    const entry = history.find((e) => e.hash === leg.hash);
+    if (entry && historyMatches(entry, leg)) {
+      leg.state = "confirmed";
+      persist();
+      return true;
+    }
+    return false;
+  }
+  /**
+   * Publish one payout. The intent is already on disk. A returned hash moves
+   * the leg to `sent`; a chain hit moves it to `confirmed`. A throw on the
+   * live path joins the owed queue (existing bounce retry) and sets `retried`
+   * so a restart does not publish a second copy. A restart retry does not
+   * join that queue — it is the one shot.
+   */
+  async function dispatchLeg(q, toolName, leg, { fromRestart = false, costUsd = null } = {}) {
+    if (!leg || leg.state !== "intended" || leg.inflight) return;
+    if (fromRestart && leg.retried) return;
+    leg.inflight = true;
+    const describe = legDescribe(leg);
+    const event = legEvent(leg);
+    try {
+      if (fromRestart) {
+        leg.retried = true;
+        await flush();
+      }
+      const hash = await ops.transfer(leg.to, leg.amountRaw, describe);
+      leg.state = "sent";
+      leg.hash = hash;
+      persist();
+      const fields = {
+        paymentId: q.id, tool: toolName, ok: true, to: leg.to,
+        amountRaw: String(leg.amountRaw), hash,
+      };
+      if (event === "author_payout") fields.costUsd = costUsd;
+      if (fromRestart) fields.retries = 1;
+      usage(event, fields);
+      await promoteIfConfirmed(leg);
+    } catch (e) {
+      log(`${describe} for ${q.id} (→ ${leg.to}) failed: ${e.message}`);
+      if (fromRestart) {
+        persist();
+        return;
+      }
+      leg.retried = true;
+      owe(leg.to, leg.amountRaw, describe, event, { paymentId: q.id, tool: toolName }, (hash) => {
+        leg.hash = hash;
+        leg.state = "sent";
+        persist();
+        promoteIfConfirmed(leg);
+      });
+    } finally {
+      leg.inflight = false;
+    }
+  }
+  async function reconcileIntents() {
+    try {
+      const rows = [];
+      for (const q of quotes.values()) {
+        if (!Array.isArray(q.settlementIntents)) continue;
+        for (const leg of q.settlementIntents) rows.push({ q, leg });
+      }
+      if (!rows.some(({ leg }) => leg && leg.state !== "confirmed")) return;
+      const claimed = new Set(rows.map(({ leg }) => leg && leg.hash).filter(Boolean));
+      let history = null;
+      const historyOnce = async () => {
+        if (!history) history = await loadHistory();
+        return history;
+      };
+      for (const { q, leg } of rows) {
+        if (!leg || leg.state === "confirmed") continue;
+        try {
+          const st = await chainStatus(leg, historyOnce, claimed);
+          if (st === "confirmed") {
+            leg.state = "confirmed";
+            persist();
+            continue;
+          }
+          // Pending or simply not on chain yet: a dispatched send is never republished.
+          if (leg.state === "sent") continue;
+          if (leg.state !== "intended" || leg.retried) continue;
+          await dispatchLeg(q, q.tool, leg, { fromRestart: true });
+        } catch (e) {
+          log(`settlement reconcile for ${q.id} failed: ${e.message}`);
+        }
+      }
+    } catch (e) {
+      log(`settlement reconcile failed: ${e.message}`);
     }
   }
 
@@ -984,19 +1251,19 @@ export function createChargeGate({
        *   change   = deposit − cost − take       → sent back to the payer
        *
        * A run costing more than its deposit keeps the whole deposit and the
-       * operator eats the rest; take and change are then zero. Transfers are
-       * queued and never block the caller's result. Returns the numbers for
-       * the receipt.
+       * operator eats the rest; take and change are then zero.
        *
-       * `alreadySettled` is set only on the re-run that follows a restart of a
-       * text-output quote (see the persist() note): that quote's change and
-       * author payout went out on the FIRST run, so the re-run recomputes the
-       * receipt numbers but must NOT move money again. Without this the caller
-       * would be paid change twice and the author twice — the demote-and-re-run
-       * trade-off is meant to cost the operator exactly one duplicate model
-       * call, nothing more.
+       * Each payout is an intent (amount, recipient, state) flushed to the
+       * state file BEFORE `ops.transfer`. The caller's result waits until that
+       * publish has been recorded as `sent` (hash in hand) or `confirmed`
+       * (chain lookup), so a restart cannot treat a send that never left as
+       * already returned. A block that is still unconfirmed stays `sent`.
+       *
+       * `alreadySettled`, or a quote that already has intents, recomputes the
+       * receipt numbers and does not dispatch. The restart reconcile owns any
+       * intent that never got a hash. Paying here as well would send twice.
        */
-      function settle(q, name, costUsd, alreadySettled = false) {
+      async function settle(q, name, costUsd, alreadySettled = false) {
         const author = authors.get(name);
         const deposit = BigInt(q.amountRaw);
         const known = Number.isFinite(costUsd);
@@ -1006,35 +1273,39 @@ export function createChargeGate({
         const markup = costRaw0 / 5n;
         const take = markup < remaining ? markup : remaining;
         const change = remaining - take;
+        const numbers = { known, costRaw, take, change, author: !!author };
 
-        // Recompute-only replay after a restart: the money already moved.
-        if (alreadySettled) return { known, costRaw, take, change, author: !!author };
+        // Recompute-only: the first run already recorded the payout intents.
+        if (alreadySettled || Array.isArray(q.settlementIntents)) return numbers;
 
         if (costRaw0 > deposit) {
           log(`call ${q.id} (${name}) cost $${costUsd} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
+        const legs = [];
         if (author && take > 0n) {
-          ops.transfer(author, take.toString(), "author payout:")
-            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? costUsd : null, hash }))
-            .catch((e) => {
-              log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
-              owe(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id, tool: name });
-            });
+          legs.push({ kind: "author_payout", to: author, amountRaw: take.toString(), state: "intended", hash: null, retried: false });
         }
         if (change > 0n) {
           if (q.source) {
-            ops.transfer(q.source, change.toString(), "change:")
-              .then((hash) => usage("change", { paymentId: q.id, tool: name, ok: true, to: q.source, amountRaw: change.toString(), hash }))
-              .catch((e) => {
-                log(`change for ${q.id} (→ ${q.source}) failed: ${e.message}`);
-                owe(q.source, change.toString(), "change:", "change", { paymentId: q.id, tool: name });
-              });
+            legs.push({ kind: "change", to: q.source, amountRaw: change.toString(), state: "intended", hash: null, retried: false });
           } else {
             log(`cannot return ${rawToXno(change)} XNO change for ${q.id}: payer account unknown`);
             usage("change", { paymentId: q.id, tool: name, ok: false, amountRaw: change.toString(), error: "payer account unknown" });
           }
         }
-        return { known, costRaw, take, change, author: !!author };
+        // Durable before any publish. `settled` stays false until the sends
+        // below have been recorded, so a crash here retries an intended leg
+        // once instead of treating the receipt as money already returned.
+        q.settlementIntents = legs;
+        await flush();
+        for (const leg of legs) await dispatchLeg(q, name, leg, { costUsd: known ? costUsd : null });
+        q.settleReceipt = {
+          known, costUsd: known ? costUsd : null,
+          take: take.toString(), change: change.toString(), author: !!author,
+        };
+        q.settled = true;
+        await flush();
+        return numbers;
       }
 
       const listTools = () =>
@@ -1171,10 +1442,10 @@ export function createChargeGate({
               // persist() knows this result must not be written to disk.
               q.textOutput = !!textOutput;
               // q.settled is only ever true here on the re-run of a text-output
-              // quote that was demoted to "paid" across a restart — its money
-              // already moved, so settle() recomputes the numbers without paying
-              // change/author twice.
-              const s = settle(q, name, costUsd, q.settled === true);
+              // quote that was demoted to "paid" across a restart — its payout
+              // intents were recorded on the first run, so settle() recomputes
+              // the numbers without paying change/author twice.
+              const s = await settle(q, name, costUsd, q.settled === true);
               // The receipt must describe the money that ACTUALLY moved, which is
               // the FIRST run's settlement — a post-restart re-run may report a
               // different cost (or none), and the change/payout already went out at
@@ -1258,6 +1529,10 @@ export function createChargeGate({
       return { listTools, callTool };
     },
   };
+  // Match uncertain payouts to the chain before any refund or watcher tick
+  // subtracts them from what is still held. refund() awaits this promise.
+  reconcileDone = reconcileIntents();
+  gate.reconciled = reconcileDone;
   // Restored pending quotes / owed sends need the watcher running from boot,
   // not from the next quote — a payment may land while nobody is calling.
   if (anyWatchable()) ensureWatching();

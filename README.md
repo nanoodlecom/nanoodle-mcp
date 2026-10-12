@@ -284,9 +284,15 @@ defaults to **off** — files you generated locally are yours to keep — but ho
 the flag if you pass it. The sweep only ever removes media artifacts (images,
 video, audio); the operator's own `costs.json`, `gate-state.json`, and
 `usage.jsonl` are never touched. Note the 24h default matches the charge gate's
-replay window: a paid result stays replayable for 24h and references its `/out/`
-URL, so lowering `--out-ttl` below 24h in charge mode means a replayed result
-can point at a file that's already been swept.
+quote lifetime (24 hours). A completed **media** result stays replayable only
+when it was written into the gate state file — `<out>/gate-state.json`, the
+`stateFile` the charge gate was given — for that 24-hour lifetime, and only
+while **both** that state file and the `--out` media it points at are still on
+disk. It does not stay replayable if the state file is missing, if the media
+was removed (`--out-ttl`, including a sweep shorter than 24h), if the result
+was text (text is not stored; a restart re-runs the tool), or if the result
+existed only in memory. Lowering `--out-ttl` below 24h in charge mode means a
+replay can point at a file that has already been swept.
 
 ### Privacy — what your server keeps
 
@@ -308,14 +314,16 @@ your box, every line checkable in this repo:
   money-lifecycle events that mirror the public Nano ledger — no run telemetry,
   no error text. Free serve mode writes no ledger at all.
 
-`gate-state.json` itself never holds customer content. It exists to keep
-in-flight money safe across the restart a deploy causes — quotes and owed sends
-survive — but a paid tool's **text output and any upstream error detail are
-never written to disk**. Media results persist only their `/out/` pointer and a
-receipt; a text result persists as nothing, so a restart between a run and the
-caller's retry simply re-runs the tool (charged once, delivered once — the
-operator eats one duplicate model call) rather than replaying content from disk,
-and a failed run replays a fixed placeholder plus its refund status, never the
+`gate-state.json` (in the `--out` directory) never holds customer content. It
+exists to keep in-flight money safe across the restart a deploy causes — quotes,
+payout intents, and owed sends survive — but a paid tool's **text output and
+any upstream error detail are never written to disk**. A completed media result
+stays replayable only from that file, for 24 hours, and only while the file and
+the `--out` media it points at both survive. A text result persists as nothing,
+so a restart re-runs the tool (charged once, delivered once — the operator eats
+one duplicate model call) rather than replaying content from disk. A result that
+was only in memory, or whose state file or media is gone, is not replayable. A
+failed run replays a fixed placeholder plus its refund status, never the
 original error message.
 
 One caveat, stated plainly: generation runs on [NanoGPT](https://nano-gpt.com)'s
@@ -660,8 +668,10 @@ generated, then a ⚖️ Decide node in pick mode
 The tool returns **the winning image only**. The other two candidates and the
 pick probabilities stay inside the Decide node. They are not declared outputs,
 and publishing them would mark the paid result as text. The charge gate does
-not keep text results on disk, so a restart would throw the image away and
-run the five model calls again.
+not keep text results on disk. The winning image stays replayable only as a
+completed media result in `<out>/gate-state.json`, for 24 hours, and only while
+that state file and the `--out` file it points at both survive. If either is
+gone, a restart does not replay the image.
 
 The hosted graph folder lives on the deploy box, in the directory that server
 already passes to `--graphs`. Copy this file there and restart `nanoodle-mcp`
@@ -704,9 +714,15 @@ success the call settles at the actual metered cost plus the 20% markup, and
 the change (`deposit − cost − take`) is returned on-chain to the payer. A run
 that fails before settlement is refunded in full: the whole deposit goes back
 (`run_failed`). A run that already settled, then fails on a later attempt,
-refunds only what is still held — the deposit minus change already returned,
-and minus an author payout if one was sent. It does not send the original
-deposit again. A run that costs more than the deposit keeps the deposit and
+refunds only what is still held. A payout counts as already returned only after
+that send is **confirmed** on chain — change back to the payer, or an author
+payout. The gate writes a settlement intent (amount, recipient, and state
+`intended`, `sent` with the block hash, or `confirmed`) before it dispatches
+the send. On restart it reconciles an uncertain send against the configured
+Nano RPCs (account history or a block lookup) before subtracting anything from
+what is still held. An intent that was never dispatched is retried once. A send
+that is still pending is not counted and is not sent again. It does not send
+the original deposit again. A run that costs more than the deposit keeps the deposit and
 the operator eats the difference. A run whose model reports no cost settles
 at $0 and the whole deposit is returned. The raw formula is the one in
 [wallet mode](#wallet-mode--no-account-no-api-key-x402):

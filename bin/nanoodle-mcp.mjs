@@ -172,8 +172,10 @@ async function main() {
   // Default differs by mode: a hosted --serve server must not hoard customers' generations, so
   // it defaults to 24h; a local stdio user saved those files to their own disk on purpose, so
   // it defaults OFF (but honors the flag if they pass it). 24h is deliberately the same window
-  // as the charge gate's RETAIN_MS: a paid quote's cached result references /out/ URLs and is
-  // replayable for 24h, so keeping media 24h keeps replay links alive exactly that long.
+  // as the charge gate's RETAIN_MS. A completed media result in <out>/gate-state.json is
+  // replayable for that 24h, and only while that state file and the --out media both survive.
+  // Text results are not stored (a restart re-runs them). A missing state file, media already
+  // swept by --out-ttl, or a result that existed only in memory is not replayable.
   // Lowering --out-ttl below 24h in charge mode means replayed results may point at deleted files.
   const serveMode = serveSpec !== null;
   let outTtlHours;
