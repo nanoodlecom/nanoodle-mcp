@@ -53,7 +53,7 @@ test("servers without the character workflow do not imply the example tool is mo
   }
 });
 
-for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar"]) {
+for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar", "mix-the-references"]) {
   test(`reviewed ${name} sample links to evidence without inventing a skill`, async () => {
     for (const structured of [true, false]) {
       const [html, text] = await pages(name, structured);
@@ -72,6 +72,11 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       if (name === "talking-avatar") {
         assert.match(html, /Video sample/);
         assert.match(text, /check precise lip-sync timing in playback/);
+      }
+      if (name === "mix-the-references") {
+        assert.match(html, /Composite sample/);
+        assert.match(text, /names each image by number/);
+        assert.match(text, /paper boats from the place reference mostly drop out/);
       }
     }
   });
@@ -128,6 +133,26 @@ test("MCP tools/list exposes the outcome and local skill beyond the truncated gr
     const reviewed = registry.listTools().find(tool => tool.name === "favicon");
     assert.match(reviewed.description, /Example: Reviewed sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#favicon\)/);
     assert.doesNotMatch(reviewed.description, /undefined|Agent skill:/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mix-the-references graph mounts as a tool with its reviewed composite sample", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-mix-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/mix-the-references.noodle-graph.json", import.meta.url), join(dir, "mix-the-references.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.listTools().find(tool => tool.name === "mix-the-references");
+    assert.ok(tool);
+    for (const input of ["Who_character", "What_they_wear_outfit", "What_they_hold_prop", "Where_place", "Mix_instruction_names_each_image"]) {
+      assert.ok(tool.inputSchema.properties[input], input);
+    }
+    assert.match(tool.description, /edit:Mix · FLUX\.3 Klein Edit; returns image \(flux-3\/klein\/edit-image, 1024×1024\) saved to disk \(file path in result\)/);
+    assert.match(tool.description, /Example: Composite sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#mix-the-references\)/);
+    const card = registry.tools.find(tool => tool.name === "mix-the-references").card;
+    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 5], ["image", 4], ["edit", 1]]);
+    assert.equal(card.sample.label, "Who · character");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
