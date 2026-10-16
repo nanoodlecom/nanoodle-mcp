@@ -333,12 +333,25 @@ export function createChargeGate({
    * still-queued payouts are reserved — a refund must not pay them out again
    * on top of a send that is in flight or might already have landed. An
    * intended leg is reserved too until a successful chain read shows it was
-   * never published. Markup kept by the operator (no leg) stays refundable.
+   * never published. A `not_sent` leg is known never to have been signed or
+   * published (its intent write failed, or dispatch failed before a block was
+   * signed), so it reserves nothing. Markup kept by the operator (no leg)
+   * stays refundable.
    */
   function legReserves(leg) {
     if (!leg) return false;
+    if (leg.state === "not_sent" && !leg.hash) return false;
     if (leg.chainAbsent === true && leg.state === "intended" && !leg.hash) return false;
     return true;
+  }
+  /**
+   * Terminal "definitely never went out". Only for a leg with no signed block:
+   * a hash means a publish may have been attempted, and that is `unknown`.
+   */
+  function markNotSent(leg) {
+    if (!leg || leg.state === "confirmed" || leg.hash) return;
+    leg.state = "not_sent";
+    leg.chainAbsent = false;
   }
   function reservedRaw(q) {
     let reserved = 0n;
@@ -577,7 +590,7 @@ export function createChargeGate({
     }
   }
 
-  const INTENT_STATES = new Set(["confirmed", "sent", "unknown", "intended"]);
+  const INTENT_STATES = new Set(["confirmed", "sent", "unknown", "intended", "not_sent"]);
   function normalizeIntents(raw) {
     if (!Array.isArray(raw)) return undefined;
     return raw.filter((leg) => leg && typeof leg === "object").map((leg) => ({
@@ -591,9 +604,11 @@ export function createChargeGate({
     }));
   }
   function intentRank(leg) {
-    if (leg.state === "confirmed") return 4;
-    if (leg.state === "sent") return 3;
-    if (leg.state === "unknown") return 2;
+    if (leg.state === "confirmed") return 5;
+    if (leg.state === "sent") return 4;
+    if (leg.state === "unknown") return 3;
+    // Terminal: a stale `intended` copy must not revive a leg we know never left.
+    if (leg.state === "not_sent") return 2;
     return 1;
   }
   function mergeIntents(main, side) {
@@ -735,6 +750,12 @@ export function createChargeGate({
    *               dispatch never returned a hash)
    *   sent      — dispatch returned a block hash; chain confirmation unknown
    *   confirmed — account_history or block_info shows that send
+   *   unknown   — a publish was attempted (block signed, hash persisted) but
+   *               its outcome is uncertain: an error or timeout after the
+   *               hash, or a chain read that could not resolve it
+   *   not_sent  — terminal: definitely never signed or published. The intent
+   *               write failed before dispatch, or dispatch failed before the
+   *               wallet signed a block. Reserves nothing; never dispatched.
    * Confirmed, pending, and unknown legs are reserved against a refund. A
    * hashless `intended` leg is dispatched once only after a successful chain
    * read fails to find ITS block. An RPC error leaves it unresolved: reserved,
@@ -972,22 +993,36 @@ export function createChargeGate({
     } catch (e) {
       log(`${describe} for ${q.id} (→ ${leg.to}) failed: ${e.message}`);
       if (e.persistFailed) {
-        // The snapshot did not land, so publish did not run. Leave the leg
-        // unsent in memory; do not queue another send.
+        // The snapshot did not land, so publish did not run (the wallet calls
+        // onSigned before `process`). The leg definitely never went out:
+        // mark it `not_sent` so a refund does not hold its amount back, and
+        // do not queue another send.
         if (leg.state !== "confirmed") {
           leg.hash = null;
-          leg.state = "intended";
           leg.retried = false;
+          markNotSent(leg);
         }
+        persist();
         throw e;
       }
-      // A hash means publish was attempted. Leave it unresolved — do not send
-      // a second block, and do not owe() a different one.
-      if (fromRestart || leg.hash) {
-        if (leg.hash && leg.state !== "confirmed") leg.state = "sent";
+      // A hash means publish was attempted. Its on-chain outcome is uncertain:
+      // keep it reserved (`unknown`), do not send a second block, and do not
+      // owe() a different one.
+      if (leg.hash) {
+        if (leg.state !== "confirmed") leg.state = "unknown";
         persist();
         return;
       }
+      // No hash: the wallet failed before signing (balance, work, frontier),
+      // so no block was published. The restart path has no retry queue — this
+      // was its one shot — so the leg definitely never went out.
+      if (fromRestart) {
+        markNotSent(leg);
+        persist();
+        return;
+      }
+      // Live path, no hash: the owed queue retries this exact send, so the leg
+      // stays `intended` (retried) and reserved until that send lands.
       leg.retried = true;
       owe(leg.to, leg.amountRaw, describe, event, { paymentId: q.id, tool: toolName }, (okHash) => {
         leg.hash = okHash;
@@ -1007,7 +1042,7 @@ export function createChargeGate({
         if (!Array.isArray(q.settlementIntents)) continue;
         for (const leg of q.settlementIntents) rows.push({ q, leg });
       }
-      if (!rows.some(({ leg }) => leg && leg.state !== "confirmed")) return;
+      if (!rows.some(({ leg }) => leg && leg.state !== "confirmed" && leg.state !== "not_sent")) return;
       // Two processes restoring the same file must not both publish the change.
       // The loser returns without dispatching and without writing state.
       if (stateFile) {
@@ -1015,7 +1050,8 @@ export function createChargeGate({
         if (!locked) return;
       }
       for (const { q, leg } of rows) {
-        if (!leg || leg.state === "confirmed") continue;
+        // `not_sent` is terminal: never signed, never dispatched, nothing to match.
+        if (!leg || leg.state === "confirmed" || (leg.state === "not_sent" && !leg.hash)) continue;
         try {
           const st = await chainStatus(leg);
           if (st === "confirmed") {
@@ -1537,7 +1573,9 @@ export function createChargeGate({
        * publish has been recorded as `sent` (hash in hand) or `confirmed`
        * (chain lookup), so a restart cannot treat a send that never left as
        * already returned. A block that is still unconfirmed stays `sent` and
-       * is reserved against a refund. If the intent write fails, nothing is sent.
+       * is reserved against a refund. If the intent write fails, nothing is sent
+       * and every leg is marked `not_sent`, so the refund that follows returns
+       * the full held amount instead of reserving payouts that never left.
        *
        * `alreadySettled`, or a quote that already has intents, recomputes the
        * receipt numbers and does not dispatch. The restart reconcile owns any
@@ -1577,8 +1615,26 @@ export function createChargeGate({
         // below have been recorded, so a crash here retries an intended leg
         // once instead of treating the receipt as money already returned.
         q.settlementIntents = legs;
-        await flush();
-        for (const leg of legs) await dispatchLeg(q, name, leg, { costUsd: known ? costUsd : null });
+        try {
+          await flush();
+        } catch (e) {
+          // The intents never became durable, so nothing was dispatched. Every
+          // leg definitely never went out: a refund must not hold them back.
+          for (const leg of legs) markNotSent(leg);
+          persist(); // best effort; the refund that follows persists again
+          throw e;
+        }
+        for (let i = 0; i < legs.length; i++) {
+          try {
+            await dispatchLeg(q, name, legs[i], { costUsd: known ? costUsd : null });
+          } catch (e) {
+            // dispatchLeg already marked the failing leg. The legs after it
+            // were never attempted, so they never went out either.
+            for (const leg of legs.slice(i + 1)) if (leg.state === "intended" && !leg.inflight) markNotSent(leg);
+            persist();
+            throw e;
+          }
+        }
         q.settleReceipt = {
           known, costUsd: known ? costUsd : null,
           take: take.toString(), change: change.toString(), author: !!author,
