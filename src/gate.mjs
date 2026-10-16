@@ -379,6 +379,18 @@ export function createChargeGate({
     return reserved >= deposit ? 0n : deposit - reserved;
   }
 
+  /*
+   * A refund is an intent too, recorded BEFORE ops.transfer, the same way as
+   * a payout leg:
+   *   intended — amount + recipient durable, no block signed yet
+   *   sent     — the wallet signed the block and its hash is durable
+   *   unknown  — a block was signed but the publish errored or timed out
+   *   queued   — failed before signing; the owed queue owns the retry
+   * The same snapshot carries every planned payout leg as `not_sent`, so a
+   * restart that finds the refund intent never dispatches a payout beside it.
+   * If that snapshot does not land, nothing is sent and the deposit stays in
+   * the wallet, reserved. A signed refund is never sent a second time.
+   */
   async function refund(q, reason) {
     reason = REFUND_REASONS.has(reason) ? reason : "run_failed";
     if (q.refunding) return q.refunding;
@@ -386,37 +398,96 @@ export function createChargeGate({
     // before that match treats an unconfirmed send as already returned.
     await reconcileDone;
     if (q.refunding) return q.refunding;
-    const amount = heldRaw(q);
-    q.refundAmountRaw = amount.toString();
-    if (!q.source) {
-      log(`cannot refund ${q.id}: payer account unknown — ${rawToXno(amount.toString())} XNO stays in the wallet`);
-      usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: "payer account unknown", reason });
-      return false;
-    }
-    q.refunding = (async () => {
-      try {
-        // Nothing left to send (the deposit already went back as change). Mark
-        // it refunded so a replay does not try again.
-        if (amount === 0n) {
-          q.status = "refunded";
-          usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: "0", to: q.source, reason });
-          persist();
-          return true;
-        }
-        const hash = await ops.transfer(q.source, amount.toString(), "refunded");
-        q.status = "refunded";
-        usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: amount.toString(), to: q.source, hash, reason });
-        persist();
-        return true;
-      } catch (e) {
-        log(`refund of ${q.id} to ${q.source} failed: ${e.message}`);
-        usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: e.message, reason });
-        owe(q.source, amount.toString(), "refunded", "refund",
-          { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; });
+    let ri = q.refundIntent;
+    // A signed (or queued) refund is never sent again from here.
+    if (ri && ri.state !== "intended") return false;
+    if (!ri) {
+      // Committing to a refund means never dispatching a payout that has not
+      // started. Mark those legs first so the amount below includes them.
+      for (const leg of Array.isArray(q.settlementIntents) ? q.settlementIntents : []) {
+        if (leg.state === "intended" && !leg.hash && !leg.retried && !leg.inflight) markNotSent(leg);
+      }
+      const amount = heldRaw(q);
+      q.refundAmountRaw = amount.toString();
+      if (!q.source) {
+        log(`cannot refund ${q.id}: payer account unknown — ${rawToXno(amount.toString())} XNO stays in the wallet`);
+        usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: "payer account unknown", reason });
         return false;
       }
+      // Nothing left to send (the deposit already went back as change). Mark
+      // it refunded so a replay does not try again.
+      if (amount === 0n) {
+        q.status = "refunded";
+        usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: "0", to: q.source, reason });
+        persist();
+        return true;
+      }
+      ri = q.refundIntent = { amountRaw: amount.toString(), to: q.source, reason, state: "intended", hash: null };
+    }
+    q.refundAmountRaw = ri.amountRaw;
+    const run = (async () => {
+      try {
+        // Durable before any publish: the refund intent, the quote, and its
+        // not_sent legs in one snapshot.
+        await flush();
+      } catch (e) {
+        refundHeld(q, e);
+        return false;
+      }
+      return sendRefund(q);
     })();
-    return q.refunding;
+    // `run` always yields before it can clear this (flush is async), so a
+    // held refund's reset in refundHeld() lands after this assignment.
+    q.refunding = run;
+    return run;
+  }
+  function refundHeld(q, e) {
+    log(`refund of ${q.id} held: cannot record the refund intent (${e.message}) — nothing sent; the deposit stays in the wallet until the intent is durable`);
+    usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: "refund intent not durable", reason: q.refundIntent.reason });
+    q.refundIntent.hash = null;
+    q.refundIntent.state = "intended";
+    q.refundHeldAt = Date.now();
+    // Not in flight: a later trigger (or a restart that finds the intent on
+    // disk) may try again with this same intent.
+    q.refunding = null;
+  }
+  /** Publish the recorded refund intent once. Its hash is durable before publish. */
+  async function sendRefund(q, { fromRestart = false } = {}) {
+    const ri = q.refundIntent;
+    const fields = { paymentId: q.id, tool: q.tool, reason: ri.reason };
+    try {
+      const hash = await ops.transfer(ri.to, ri.amountRaw, "refunded", async (preHash) => {
+        ri.hash = preHash;
+        ri.state = "sent";
+        await flush(); // a failed snapshot throws here and the block is never published
+      });
+      if (!ri.hash) ri.hash = hash;
+      ri.state = "sent";
+      q.refundHeldAt = null;
+      q.status = "refunded";
+      usage("refund", { ...fields, ok: true, amountRaw: ri.amountRaw, to: ri.to, hash: ri.hash, ...(fromRestart ? { retries: 1 } : {}) });
+      persist();
+      return true;
+    } catch (e) {
+      if (e.persistFailed) { refundHeld(q, e); return false; }
+      log(`refund of ${q.id} to ${ri.to} failed: ${e.message}`);
+      usage("refund", { ...fields, ok: false, error: e.message });
+      if (ri.hash) {
+        // Signed, then the publish failed or timed out: it may have landed.
+        // Stay reserved; never sign a second refund block.
+        ri.state = "unknown";
+        persist();
+        return false;
+      }
+      // Failed before signing: nothing was published. The owed queue retries it.
+      ri.state = "queued";
+      owe(ri.to, ri.amountRaw, "refunded", "refund", fields, (okHash) => {
+        ri.hash = okHash;
+        ri.state = "sent";
+        q.status = "refunded";
+      });
+      return false;
+    }
   }
 
   /* ---------------- durable state ---------------- */
@@ -456,7 +527,9 @@ export function createChargeGate({
       id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
       pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
       amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
-      status: q.status === "consumed" && !result && !error ? "paid" : q.status,
+      // A quote with a recorded refund intent never demotes to "paid": a
+      // restart must finish that refund, not re-run (and re-settle) the call.
+      status: q.status === "consumed" && !result && !error && !q.refundIntent ? "paid" : q.status,
       source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
       settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
       settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
@@ -468,7 +541,11 @@ export function createChargeGate({
     if (Array.isArray(q.settlementIntents)) {
       row.settlementIntents = q.settlementIntents.map(intentRecord);
     }
+    if (q.refundIntent) row.refundIntent = refundRecord(q.refundIntent);
     return row;
+  }
+  function refundRecord(ri) {
+    return { amountRaw: String(ri.amountRaw), to: ri.to, reason: ri.reason, state: ri.state, hash: ri.hash || null };
   }
   function intentRecord(leg) {
     return {
@@ -536,11 +613,17 @@ export function createChargeGate({
         owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
       });
       const intents = {};
+      const refunds = {};
       for (const q of quotes.values()) {
         if (Array.isArray(q.settlementIntents)) intents[q.id] = q.settlementIntents.map(intentRecord);
+        if (q.refundIntent) refunds[q.id] = refundRecord(q.refundIntent);
       }
+      // The main file lands first and is atomic on its own: once it holds a
+      // refund intent it also holds every not_sent leg. A sidecar that then
+      // fails to write is stale, and the merge below never lets a stale
+      // `intended` leg outrank `not_sent` or a refund intent disappear.
       await durableWrite(stateFile, data);
-      await durableWrite(payoutSidecarPath(), JSON.stringify({ v: 1, intents }));
+      await durableWrite(payoutSidecarPath(), JSON.stringify({ v: 1, intents, refunds }));
       await syncDir(dir);
     } finally {
       if (!held) await releaseRecoveryLock();
@@ -603,6 +686,23 @@ export function createChargeGate({
       retried: leg.retried === true,
     }));
   }
+  const REFUND_STATES = new Set(["intended", "sent", "unknown", "queued"]);
+  function normalizeRefund(raw) {
+    if (!raw || typeof raw !== "object" || !/^\d+$/.test(String(raw.amountRaw ?? ""))) return undefined;
+    return {
+      amountRaw: String(raw.amountRaw),
+      to: typeof raw.to === "string" ? raw.to : "",
+      reason: REFUND_REASONS.has(raw.reason) ? raw.reason : "run_failed",
+      state: REFUND_STATES.has(raw.state) ? raw.state : (raw.hash ? "unknown" : "intended"),
+      hash: typeof raw.hash === "string" && raw.hash ? raw.hash : null,
+    };
+  }
+  function mergeRefund(main, side) {
+    if (!side) return main;
+    if (!main) return side;
+    const rank = (r) => (r.hash ? 3 : r.state === "queued" ? 2 : 1);
+    return rank(side) > rank(main) ? side : main;
+  }
   function intentRank(leg) {
     if (leg.state === "confirmed") return 5;
     if (leg.state === "sent") return 4;
@@ -662,6 +762,7 @@ export function createChargeGate({
         // bare fallback and drop the gate-authored refund-status sentence.
         if (q.error && q.errorPersist == null) q.errorPersist = q.error;
         q.settlementIntents = normalizeIntents(q.settlementIntents);
+        q.refundIntent = normalizeRefund(q.refundIntent);
         // A finished run replays its cached outcome; without this, a retry
         // after restart would run (and settle) the same payment twice. A quote
         // whose result we just dropped has neither result nor error, so it is
@@ -682,6 +783,28 @@ export function createChargeGate({
           const q = quotes.get(id);
           if (!q) continue;
           q.settlementIntents = mergeIntents(q.settlementIntents, normalizeIntents(legs));
+        }
+      }
+      const sideRefunds = side && side.refunds && typeof side.refunds === "object" ? side.refunds : null;
+      if (sideRefunds) {
+        for (const [id, r] of Object.entries(sideRefunds)) {
+          const q = quotes.get(id);
+          if (q) q.refundIntent = mergeRefund(q.refundIntent, normalizeRefund(r));
+        }
+      }
+      for (const q of quotes.values()) {
+        if (!q.refundIntent || q.status === "refunded") continue;
+        // A recorded refund owns this quote: it replays, never re-runs, and no
+        // second refund starts (watcher or rerun) while reconcile finishes it.
+        q.refunding = Promise.resolve(false);
+        if (!q.running) {
+          if (q.status === "paid") q.status = "consumed";
+          if (q.status === "consumed") {
+            if (!q.error) {
+              q.error = q.errorPersist = `The run didn't complete, so ${rawToXno(q.refundIntent.amountRaw)} XNO is being refunded to ${q.refundIntent.to} — you won't be charged for a run that didn't finish.\n\nDetails: (error details not retained across restarts)`;
+            }
+            q.running = Promise.resolve();
+          }
         }
       }
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
@@ -1034,6 +1157,29 @@ export function createChargeGate({
       leg.inflight = false;
     }
   }
+  /**
+   * Finish a refund whose intent was durable before a restart. A signed block
+   * (hash on disk) is matched to the chain and never re-sent; only a hashless
+   * intent — never signed, so never published — is sent, once.
+   */
+  async function reconcileRefund(q) {
+    const ri = q.refundIntent;
+    if (ri.hash) {
+      const st = await chainStatus({ to: ri.to, amountRaw: ri.amountRaw, hash: ri.hash });
+      if (st === "confirmed") {
+        ri.state = "sent";
+        q.status = "refunded";
+      } else {
+        ri.state = st === "pending" ? "sent" : "unknown";
+      }
+      persist();
+      return;
+    }
+    if (owed.some((o) => o.event === "refund" && o.fields && o.fields.paymentId === q.id)) return;
+    const run = sendRefund(q, { fromRestart: true });
+    q.refunding = run;
+    await run;
+  }
   async function reconcileIntents() {
     let locked = false;
     try {
@@ -1042,7 +1188,8 @@ export function createChargeGate({
         if (!Array.isArray(q.settlementIntents)) continue;
         for (const leg of q.settlementIntents) rows.push({ q, leg });
       }
-      if (!rows.some(({ leg }) => leg && leg.state !== "confirmed" && leg.state !== "not_sent")) return;
+      const refundRows = [...quotes.values()].filter((q) => q.refundIntent && q.status !== "refunded" && q.refundIntent.state !== "queued");
+      if (!refundRows.length && !rows.some(({ leg }) => leg && leg.state !== "confirmed" && leg.state !== "not_sent")) return;
       // Two processes restoring the same file must not both publish the change.
       // The loser returns without dispatching and without writing state.
       if (stateFile) {
@@ -1081,10 +1228,20 @@ export function createChargeGate({
             persist();
             continue;
           }
+          // A recorded refund already returned this leg's amount. Never pay it too.
+          if (q.refundIntent) {
+            markNotSent(leg);
+            persist();
+            continue;
+          }
           await dispatchLeg(q, q.tool, leg, { fromRestart: true });
         } catch (e) {
           log(`settlement reconcile for ${q.id} failed: ${e.message}`);
         }
+      }
+      for (const q of refundRows) {
+        try { await reconcileRefund(q); }
+        catch (e) { log(`refund reconcile for ${q.id} failed: ${e.message}`); }
       }
       if (stateFile && !saveError) await flush();
     } catch (e) {
@@ -1843,6 +2000,8 @@ export function createChargeGate({
               const deposit = BigInt(q.amountRaw);
               const payer = !q.source
                 ? `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`
+                : q.refundHeldAt && !refunded
+                  ? `The run didn't complete. ${rawToXno(owed.toString())} XNO is held in the server's wallet for your refund to ${q.source} — the server could not record the refund safely, so it has not been sent yet; it goes out once it can be recorded. You won't be charged for a run that didn't finish.`
                 : owed === deposit
                   ? (refunded
                     ? `The run didn't complete, so your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source} — you were not charged. You can try again in a moment.`
