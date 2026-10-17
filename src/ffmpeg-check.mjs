@@ -46,12 +46,29 @@ export async function detectFfmpeg() {
   return { ffprobe, ffmpeg, ok: ffprobe && ffmpeg };
 }
 
-/** Names of tools whose graph contains at least one local-media node type. */
+const DECIDE_IMG_PORT = /^img\d+$/;
+
+/**
+ * A Decide node that receives images always downsizes them through ffprobe and
+ * ffmpeg (fitImageJpeg) before the decision call. Text-only Decide does not.
+ */
+function decideSeesImages(graph, node) {
+  if (!node || node.type !== "decide") return false;
+  return (graph.links || []).some((l) => l.to && l.to.node === node.id && DECIDE_IMG_PORT.test(l.to.port));
+}
+
+function graphNeedsFfmpeg(graph) {
+  if (!graph) return false;
+  const nodes = graph.nodes || [];
+  if (nodes.some((n) => LOCAL_MEDIA_TYPES.has(n.type))) return true;
+  return nodes.some((n) => decideSeesImages(graph, n));
+}
+
+/** Names of tools whose graph needs ffprobe/ffmpeg (local-media, or Decide with images). */
 export function toolsNeedingFfmpeg(tools) {
   const names = [];
   for (const t of tools) {
-    const nodes = t?.wf?.graph?.nodes || [];
-    if (nodes.some((n) => LOCAL_MEDIA_TYPES.has(n.type))) names.push(t.name);
+    if (graphNeedsFfmpeg(t?.wf?.graph)) names.push(t.name);
   }
   return names;
 }
@@ -69,10 +86,10 @@ export async function warnIfFfmpegMissing(tools, log = (m) => console.error(m)) 
   if (ffprobe && ffmpeg) return [];
   const missing = [!ffprobe && "ffprobe", !ffmpeg && "ffmpeg"].filter(Boolean).join(" and ");
   log(
-    `nanoodle-mcp: warning — ${missing} not on PATH. ${at.length} tool(s) use local-media ` +
-    `nodes and will fail for common formats (JPEG/WebP resize, video frames, compressed audio): ` +
+    `nanoodle-mcp: warning — ${missing} not on PATH. ${at.length} tool(s) need ffmpeg ` +
+    `(local-media nodes, or a Decide node that judges images) and will fail without it: ` +
     `${at.join(", ")}. Install ffmpeg (e.g. \`apt install ffmpeg\`) to enable them; pure ` +
-    `image/LLM/vision tools are unaffected.`
+    `image/LLM/vision tools and text-only Decide are unaffected.`
   );
   return at;
 }

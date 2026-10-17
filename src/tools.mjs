@@ -327,19 +327,33 @@ function graphIntent(graph) {
   return /[.!?…]$/.test(text) ? text : text + ".";
 }
 
+/** Pick is the Decide default. choose / score / yesno are the other three modes. */
+function isPickDecide(node) {
+  if (!node || node.type !== "decide") return false;
+  const mode = node.fields && node.fields.mode;
+  return mode !== "choose" && mode !== "score" && mode !== "yesno";
+}
+
 /**
  * "returns …" segment from wf.outputs: text plainly; media with the sink's model /
  * size, plus the on-disk contract (media never rides inline in the result).
- * One file per media sink — the run keeps only a sink's primary output, so
+ * One file per media sink — the run keeps only a sink's declared output, so
  * variations never multiply what the caller receives.
+ *
+ * A pick-mode Decide sink's primary port is the internal label ("image 2").
+ * The tool returns the image port (the winner) instead, so the description
+ * says image. Candidates and probabilities are not outputs.
  */
 function describeOutputs(wf) {
   const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
   let mediaFiles = 0;
   const parts = wf.outputs.map((o) => {
-    const kind = (o.ports && o.ports[0] && o.ports[0].type) || o.type; // odd types may declare no ports
+    const node = byId.get(o.nodeId) || {};
+    const kind = isPickDecide(node) && (o.ports || []).some((p) => p.type === "image")
+      ? "image"
+      : ((o.ports && o.ports[0] && o.ports[0].type) || o.type); // odd types may declare no ports
     if (kind === "text") return "text";
-    const f = (byId.get(o.nodeId) || {}).fields || {};
+    const f = node.fields || {};
     const details = [];
     if (f.model) details.push(shortModel(f.model));
     if (kind === "image" && f.size && f.size !== "auto") details.push(String(f.size).replace("x", "×"));
@@ -557,6 +571,30 @@ async function resolveInputs(wf, args, label) {
 }
 
 /**
+ * pick-best-image: a brief, or a subject plus a style.
+ *
+ * Brief's saved text is the all-defaults sample. It must not be appended when
+ * the caller left Brief empty but did supply a subject or a style — an explicit
+ * empty Brief is what stops the library from backfilling that sample. With no
+ * caller text at all, the sample stays.
+ */
+function normalizePickBestInputs(tool, inputs) {
+  if (!tool || tool.name !== "pick-best-image") return inputs;
+  const keyOf = (nodeId) => {
+    const inp = (tool.wf.inputs || []).find((i) => i.nodeId === nodeId);
+    return inp && inp.key;
+  };
+  const briefKey = keyOf("brief");
+  const subjectKey = keyOf("subject");
+  const styleKey = keyOf("style");
+  if (!briefKey || !subjectKey || !styleKey) return inputs;
+  const text = (k) => (typeof inputs[k] === "string" ? inputs[k].trim() : "");
+  if (text(briefKey)) return inputs;
+  if (text(subjectKey) || text(styleKey)) return { ...inputs, [briefKey]: "" };
+  return inputs;
+}
+
+/**
  * Make a failed run's error lead with the node that actually broke.
  *
  * The library's RunError message names the failed *sink* ("Image→Video":
@@ -649,8 +687,14 @@ const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: 
  *
  * `notices` lead the content (see runNotices): a caller who scrolls no further
  * than the first block still learns the run did not do exactly what they asked.
+ *
+ * Only declared sink outputs are emitted. A pick-mode Decide sink's text port
+ * is an internal label, and its candidate images and probability rows are not
+ * ports — none of those are tool output. The image port (the winner) is.
+ * Leaving the label in the result would set textOutput, and the charge gate
+ * would then discard the paid image on restart.
  */
-async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
+export async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
   const content = notices.map((text) => ({ type: "text", text }));
   for (const text of gateNotices(wf, result)) content.push({ type: "text", text });
   const gateName = (id) => {
@@ -663,34 +707,47 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   // uses this flag to keep it off disk (media pointers + receipts are safe to
   // persist, the files themselves die by --out-ttl).
   let textOutput = false;
+  const byId = new Map((((wf && wf.graph) || {}).nodes || []).map((n) => [n.id, n]));
+  const pushMedia = async (key, value) => {
+    if (!(value instanceof MediaRef)) return;
+    await mkdir(outDir, { recursive: true });
+    // bytes() before naming: for hosted media the mime is only known after the fetch
+    const bytes = await value.bytes();
+    const safeKey = key.replace(/[^\w.-]+/g, "_");
+    const ext = extForMedia(bytes, value.mime);
+    const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
+    const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
+    await writeFile(path, bytes);
+    if (publicBase) {
+      content.push({ type: "text", text: `${key}: ${publicBase}/out/${basename(path)}` });
+      const mime = /^image\//.test(value.mime || "") ? value.mime : EXT_MIME[ext];
+      if (mime && bytes.length <= INLINE_IMAGE_MAX) {
+        content.push({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: mime });
+      }
+    } else {
+      content.push({ type: "text", text: `${key}: saved ${path}` });
+    }
+  };
   for (const o of wf.outputs) {
+    const node = byId.get(o.nodeId);
+    const rec = result.nodes && result.nodes[o.nodeId];
+    if (isPickDecide(node)) {
+      const url = rec && rec.out && typeof rec.out.image === "string" ? rec.out.image : "";
+      if (url) {
+        await pushMedia(o.key, new MediaRef(url));
+        continue;
+      }
+    }
     const value = result.outputs[o.key];
     if (value === undefined) {
       // an output a closed gate skipped: say so (it is not paid content — textOutput untouched)
-      const rec = result.nodes && result.nodes[o.nodeId];
       if (rec && rec.status === "skipped" && rec.gatedBy) {
         content.push({ type: "text", text: `${o.key}: skipped — gate "${gateName(rec.gatedBy)}" answered no` });
       }
       continue;
     }
     if (value instanceof MediaRef) {
-      await mkdir(outDir, { recursive: true });
-      // bytes() before naming: for hosted media the mime is only known after the fetch
-      const bytes = await value.bytes();
-      const safeKey = o.key.replace(/[^\w.-]+/g, "_");
-      const ext = extForMedia(bytes, value.mime);
-      const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
-      const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
-      await writeFile(path, bytes);
-      if (publicBase) {
-        content.push({ type: "text", text: `${o.key}: ${publicBase}/out/${basename(path)}` });
-        const mime = /^image\//.test(value.mime || "") ? value.mime : EXT_MIME[ext];
-        if (mime && bytes.length <= INLINE_IMAGE_MAX) {
-          content.push({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: mime });
-        }
-      } else {
-        content.push({ type: "text", text: `${o.key}: saved ${path}` });
-      }
+      await pushMedia(o.key, value);
     } else {
       content.push({ type: "text", text: String(value) });
       textOutput = true;
@@ -915,7 +972,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (typeof args !== "object" || Array.isArray(args)) {
         throw new ParamsError("tools/call arguments must be an object");
       }
-      const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
+      const inputs = normalizePickBestInputs(tool, await resolveInputs(tool.wf, args, `tool "${tool.name}"`));
       return { tool, inputs };
     },
 

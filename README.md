@@ -68,7 +68,9 @@ key at all with a Nano wallet, see
 common case but fall back to `ffmpeg`/`ffprobe` for formats it can't handle —
 JPEG/WebP resize, reading video frames, compressed audio. Without ffmpeg those
 runs fail (and auto-refund in charge mode); the server prints a warning at
-startup naming the affected tools. Pure image/LLM/vision tools don't need it.
+startup naming the affected tools. A Decide node that judges images is included:
+it always downsizes them through `ffprobe`/`ffmpeg`, and the same warning names
+that tool. Pure image/LLM/vision tools, and text-only Decide, don't need it.
 Install with `apt install ffmpeg` (Debian/Ubuntu) / `brew install ffmpeg`.
 
 ### Claude Code
@@ -282,9 +284,15 @@ defaults to **off** — files you generated locally are yours to keep — but ho
 the flag if you pass it. The sweep only ever removes media artifacts (images,
 video, audio); the operator's own `costs.json`, `gate-state.json`, and
 `usage.jsonl` are never touched. Note the 24h default matches the charge gate's
-replay window: a paid result stays replayable for 24h and references its `/out/`
-URL, so lowering `--out-ttl` below 24h in charge mode means a replayed result
-can point at a file that's already been swept.
+quote lifetime (24 hours). A completed **media** result stays replayable only
+when it was written into the gate state file — `<out>/gate-state.json`, the
+`stateFile` the charge gate was given — for that 24-hour lifetime, and only
+while **both** that state file and the `--out` media it points at are still on
+disk. It does not stay replayable if the state file is missing, if the media
+was removed (`--out-ttl`, including a sweep shorter than 24h), if the result
+was text (text is not stored; a restart re-runs the tool), or if the result
+existed only in memory. Lowering `--out-ttl` below 24h in charge mode means a
+replay can point at a file that has already been swept.
 
 ### Privacy — what your server keeps
 
@@ -306,14 +314,16 @@ your box, every line checkable in this repo:
   money-lifecycle events that mirror the public Nano ledger — no run telemetry,
   no error text. Free serve mode writes no ledger at all.
 
-`gate-state.json` itself never holds customer content. It exists to keep
-in-flight money safe across the restart a deploy causes — quotes and owed sends
-survive — but a paid tool's **text output and any upstream error detail are
-never written to disk**. Media results persist only their `/out/` pointer and a
-receipt; a text result persists as nothing, so a restart between a run and the
-caller's retry simply re-runs the tool (charged once, delivered once — the
-operator eats one duplicate model call) rather than replaying content from disk,
-and a failed run replays a fixed placeholder plus its refund status, never the
+`gate-state.json` (in the `--out` directory) never holds customer content. It
+exists to keep in-flight money safe across the restart a deploy causes — quotes,
+payout intents, and owed sends survive — but a paid tool's **text output and
+any upstream error detail are never written to disk**. A completed media result
+stays replayable only from that file, for 24 hours, and only while the file and
+the `--out` media it points at both survive. A text result persists as nothing,
+so a restart re-runs the tool (charged once, delivered once — the operator eats
+one duplicate model call) rather than replaying content from disk. A result that
+was only in memory, or whose state file or media is gone, is not replayable. A
+failed run replays a fixed placeholder plus its refund status, never the
 original error message.
 
 One caveat, stated plainly: generation runs on [NanoGPT](https://nano-gpt.com)'s
@@ -644,6 +654,97 @@ estimated. The server announces the change with a
 `notifications/tools/list_changed` notification, so MCP clients that honor it
 show updated prices mid-session; others catch up on restart.
 
+### Hosted tool: pick the best image
+
+[`tests/fixtures/hosted/pick-best-image.noodle-graph.json`](tests/fixtures/hosted/pick-best-image.noodle-graph.json)
+is the graph for the tool `pick-best-image`. Pass a **Brief**, or a
+**Subject** and a **Style**. If Brief is left empty and the caller supplied a
+subject or a style, the prompt is only those inputs — the saved sample is not
+appended. With no caller text at all, the sample brief ("a red paper lantern
+over a quiet canal at dusk") is the prompt. Three cheap image variants are
+generated, then a ⚖️ Decide node in pick mode
+(`perplexity/pplx-decider-v1.1-27b`) chooses the one that best fits.
+
+The tool returns **the winning image only**. The other two candidates and the
+pick probabilities stay inside the Decide node. They are not declared outputs,
+and publishing them would mark the paid result as text. The charge gate does
+not keep text results on disk. The winning image stays replayable only as a
+completed media result in `<out>/gate-state.json`, for 24 hours, and only while
+that state file and the `--out` file it points at both survive. If either is
+gone, a restart does not replay the image.
+
+The hosted graph folder lives on the deploy box, in the directory that server
+already passes to `--graphs`. Copy this file there and restart `nanoodle-mcp`
+to publish the tool. Nothing in this repo's deploy workflow copies graphs, and
+adding the file here does not deploy it.
+
+**ffmpeg on the deploy box is a prerequisite for this flow.** Pick mode
+downsizes every candidate with `ffprobe` and `ffmpeg` before the decider call.
+Without them the run fails at "Pick the best". A first-run failure refunds the
+deposit; the startup warning names this tool when those binaries are missing.
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) only SSHs in and
+runs the forced command `nanoodle-mcp`. It does not install packages, and no
+setup script in this repo installs ffmpeg on the box. Install it there
+(`apt install ffmpeg`) before publishing the tool.
+
+Three different numbers apply. They are not the same thing.
+
+**Model cost** is what NanoGPT meters, about **$0.014** for one run:
+
+- Krea 2 Turbo, `square`: $0.002
+- HiDream-I1 Fast, `1024x1024`: $0.0034
+- Flux Schnell, `1024x1024`: $0.0085
+- two decider calls (pick asks forward, then reversed) on
+  `perplexity/pplx-decider-v1.1-27b`: a fraction of a cent
+
+The public-catalog forecast for this graph is $0.01396316. Image prices above
+are the catalog's per-image rates; the decider's share of that forecast is the
+library's token estimate, not a flat fee.
+
+**20% markup** is the existing nanoodle markup, on top of that metered cost and
+separate from it: `markup = cost / 5` (integer floor in raw), computed on what
+the run actually cost, never on the deposit. This graph sets no `x402.author`,
+so the markup stays with the operator wallet rather than being paid out to an
+author.
+
+**x402 deposit, settle, and refund.** `"x402": {"usd": 0.05}` pins a **$0.05
+deposit**. That is a hold, not the price. The caller pays it up front — the
+quote amount, including the dust that makes the amount unique on-chain. On
+success the call settles at the actual metered cost plus the 20% markup, and
+the change (`deposit − cost − take`) is returned on-chain to the payer. A run
+that fails before settlement is refunded in full: the whole deposit goes back
+(`run_failed`). A run that already settled, then fails on a later attempt,
+refunds only what is still held. A confirmed payout — change, or an author
+payout — is money already returned, so it is reserved against that refund.
+A pending or otherwise unknown send is reserved too: it is not refunded again
+and it is not sent again, until a block lookup or a history entry confirms
+**that exact block hash**. An older send with the same recipient and amount
+does not count. A receipt from an older build, with amounts but no payout
+intent, is not treated as money already returned; the refund stays the full
+deposit unless a queued or still-unresolved payout is reserved. The gate
+writes the settlement intent (amount, recipient, and state `intended`, `sent`
+with the block hash, or `confirmed`), fsyncs it, and renames it into place
+before it dispatches. If that write fails, it does not send. On restart one
+process holds `<out>/gate-state.json.lock` and reconciles uncertain sends
+against the configured Nano RPCs. An intent that was never dispatched is
+retried once, and only after a successful chain read that does not show its
+block. An RPC error leaves the send unresolved. Intents are also stored in
+`<out>/gate-state.json.payouts.json`, which an older build does not rewrite.
+Do not delete that sidecar, and do not roll back to a build that rewrites
+`gate-state.json` while a payout is still unresolved: the older process does
+not read the sidecar, so it can send a payout the new process already recorded.
+It does not send the original deposit again. A run that costs more than the deposit keeps the deposit and
+the operator eats the difference. A run whose model reports no cost settles
+at $0 and the whole deposit is returned. The raw formula is the one in
+[wallet mode](#wallet-mode--no-account-no-api-key-x402):
+
+```
+cost   = metered model cost, converted at the deposit's own oracle pair, rounded up
+markup = cost / 5                    (20%, integer floor)
+take   = min(markup, deposit − cost) → author (or kept, if no author field)
+change = deposit − cost − take       → back to the payer
+```
+
 ## Limitations
 
 Honest list — most of these are inherited from the executor:
@@ -659,7 +760,8 @@ Honest list — most of these are inherited from the executor:
 - **Headless coverage follows `nanoodle` 0.9.0** (this package's dependency).
   Local-media graphs (resize, combine, trim, extract-audio, video-frames,
   soundtrack) run on your machine — pure JS where possible, ffmpeg on `PATH`
-  for the rest. Decide, Clean voice (`cleanvoice`), 3D model (`model3d`),
+  for the rest. Pick-mode Decide also needs ffmpeg on `PATH` (it downsizes
+  images before the decision call). Decide, Clean voice (`cleanvoice`), 3D model (`model3d`),
   3D input (`mupload`), and custom endpoint nodes also load and run; they are
   not skipped at startup. A closed Decide gate is a normal `gated` result.
   See the [supported-nodes
