@@ -272,8 +272,15 @@ export function createChargeGate({
   const owed = []; // { to, amountRaw, describe, event, fields, onOk, tries, at }
   const OWED_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
   const OWED_MAX_TRIES = 100; // ≈16h at the 10-min cap — after that it needs a human
-  function owe(to, amountRaw, describe, event, fields, onOk) {
-    owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, tries: 0, at: now() + OWED_BACKOFF_MS[0] });
+  /*
+   * `rec` is the durable record this send belongs to (a refund intent or a
+   * payout leg). Like the direct paths, a retry saves the signed block hash
+   * (on the entry and on `rec`) BEFORE publish. A retry that signed and then
+   * failed may have landed: it leaves the queue for good, `rec` goes to
+   * `unknown` (reserved), and only a chain read resolves it.
+   */
+  function owe(to, amountRaw, describe, event, fields, onOk, rec = null) {
+    owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, rec, hash: null, tries: 0, at: now() + OWED_BACKOFF_MS[0] });
     log(`${describe} ${rawToXno(amountRaw)} XNO to ${to} failed — queued for retry`);
     persist();
     ensureWatching();
@@ -292,15 +299,42 @@ export function createChargeGate({
       // PID, no restart (blocks 52DEA6AC…, 8CC22CDE…, 58EE40E5…). A local repro
       // with a slow transfer and four watchers reached 45 sends of one entry.
       if (o.sending) continue;
+      // Signed on an earlier attempt: never publish a second block for it.
+      if (o.hash) continue;
       o.sending = true;
       o.tries++;
+      const rec = o.rec || null;
+      const prev = rec ? { state: rec.state, hash: rec.hash } : null;
       try {
-        const hash = await ops.transfer(o.to, o.amountRaw, o.describe);
+        const sent = await ops.transfer(o.to, o.amountRaw, o.describe, async (preHash) => {
+          o.hash = preHash;
+          if (rec && rec.state !== "confirmed") { rec.hash = preHash; rec.state = "sent"; }
+          await flush(); // a failed snapshot throws here and the block is never published
+        });
+        const hash = o.hash || sent;
         owed.splice(owed.indexOf(o), 1);
         usage(o.event, { ...o.fields, ok: true, to: o.to, amountRaw: o.amountRaw, hash, retries: o.tries });
         persist();
         if (o.onOk) o.onOk(hash);
       } catch (e) {
+        if (e.persistFailed) {
+          // The hash never became durable, so nothing was published. Still owed.
+          o.hash = null;
+          if (rec && prev && rec.state !== "confirmed") { rec.hash = prev.hash; rec.state = prev.state; }
+          o.at = t + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
+          log(`retry ${o.tries} of ${o.describe} to ${o.to} not sent: ${e.message}`);
+          continue;
+        }
+        if (o.hash) {
+          // Signed, then the publish errored or timed out: it may have landed.
+          // Out of the retry queue for good; reserved until the chain says.
+          owed.splice(owed.indexOf(o), 1);
+          if (rec && rec.state !== "confirmed") { rec.hash = o.hash; rec.state = "unknown"; }
+          log(`retry ${o.tries} of ${o.describe} to ${o.to} failed after signing block ${o.hash} (${e.message}) — not retried; held until the chain shows it`);
+          usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw, hash: o.hash, error: e.message, retries: o.tries, uncertain: true });
+          persist();
+          continue;
+        }
         if (o.tries >= OWED_MAX_TRIES) {
           owed.splice(owed.indexOf(o), 1);
           log(`GIVING UP on ${o.describe} ${rawToXno(o.amountRaw)} XNO to ${o.to} after ${o.tries} tries (${e.message}) — refund manually`);
@@ -485,7 +519,7 @@ export function createChargeGate({
         ri.hash = okHash;
         ri.state = "sent";
         q.status = "refunded";
-      });
+      }, ri);
       return false;
     }
   }
@@ -610,7 +644,7 @@ export function createChargeGate({
       const data = JSON.stringify({
         v: 2,
         quotes: [...quotes.values()].map(quoteSnapshot),
-        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
+        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries, hash: o.hash || null })),
       });
       const intents = {};
       const refunds = {};
@@ -819,6 +853,21 @@ export function createChargeGate({
         let onOk = s.event === "refund" && fields && fields.paymentId
           ? () => { const q = quotes.get(fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
           : null;
+        // The durable record this queued send belongs to.
+        let rec = null;
+        if (s.event === "refund" && fields && fields.paymentId) {
+          const q = quotes.get(fields.paymentId);
+          if (q) {
+            if (!q.refundIntent) {
+              q.refundIntent = {
+                amountRaw: String(s.amountRaw), to: s.to,
+                reason: REFUND_REASONS.has(fields.reason) ? fields.reason : "run_failed",
+                state: "queued", hash: null,
+              };
+            }
+            rec = q.refundIntent;
+          }
+        }
         // A queued change or author payout is money still leaving. Reserve it
         // on the quote so a refund of the original deposit cannot land beside it.
         if ((s.event === "change" || s.event === "author_payout") && fields && fields.paymentId) {
@@ -838,6 +887,7 @@ export function createChargeGate({
               leg.retried = true;
             }
             const bound = leg;
+            rec = leg;
             const prev = onOk;
             onOk = (hash) => {
               bound.hash = hash;
@@ -848,7 +898,20 @@ export function createChargeGate({
             };
           }
         }
-        owed.push({ ...s, fields, at: now() + OWED_BACKOFF_MS[0], onOk });
+        // Signed on an earlier attempt (the hash was saved before publish): it
+        // may have landed. Never re-send it; reconcile verifies it on chain.
+        const signed = (typeof s.hash === "string" && s.hash) || (rec && rec.hash) || null;
+        if (signed) {
+          if (rec && rec.state !== "confirmed") { rec.hash = signed; rec.state = "unknown"; }
+          log(`queued ${s.describe} ${rawToXno(String(s.amountRaw))} XNO to ${s.to} was already signed (block ${signed}) — verifying on chain, not re-sending` +
+            (rec ? "" : "; no record to reconcile it against — check that block and settle it by hand"));
+          if (s.event === "refund" && fields && fields.paymentId) {
+            const q = quotes.get(fields.paymentId);
+            if (q) q.refunding = Promise.resolve(false);
+          }
+          continue;
+        }
+        owed.push({ ...s, fields, at: now() + OWED_BACKOFF_MS[0], onOk, rec, hash: null });
         // issue #23: q.refunding is a live-only Promise that persistence drops,
         // so after a restart a restored owed refund retries the send WHILE the
         // watcher re-scans the same payer block, sees `expired && !q.refunding`,
@@ -1152,7 +1215,7 @@ export function createChargeGate({
         if (leg.state !== "confirmed") leg.state = "sent";
         persist();
         promoteIfConfirmed(leg);
-      });
+      }, leg);
     } finally {
       leg.inflight = false;
     }
@@ -1188,7 +1251,8 @@ export function createChargeGate({
         if (!Array.isArray(q.settlementIntents)) continue;
         for (const leg of q.settlementIntents) rows.push({ q, leg });
       }
-      const refundRows = [...quotes.values()].filter((q) => q.refundIntent && q.status !== "refunded" && q.refundIntent.state !== "queued");
+      // reconcileRefund leaves a hashless refund the owed queue still carries to that queue.
+      const refundRows = [...quotes.values()].filter((q) => q.refundIntent && q.status !== "refunded");
       if (!refundRows.length && !rows.some(({ leg }) => leg && leg.state !== "confirmed" && leg.state !== "not_sent")) return;
       // Two processes restoring the same file must not both publish the change.
       // The loser returns without dispatching and without writing state.

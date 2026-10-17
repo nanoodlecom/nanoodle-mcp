@@ -32,7 +32,10 @@ const PAYER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3
  * receivables into history the way wallet housekeeping does.
  */
 function fakeChain() {
-  const state = { receivable: {}, history: [], blocks: {}, transfers: [], failTransfer: false };
+  // `signed` lists every send that got as far as signing a block.
+  // `timeoutAfterSign` publishes the block (onPublish) and then loses the
+  // response, like a process RPC that times out after broadcast.
+  const state = { receivable: {}, history: [], blocks: {}, transfers: [], failTransfer: false, signed: [], timeoutAfterSign: false };
   let seq = 0;
   return {
     state,
@@ -69,7 +72,9 @@ function fakeChain() {
         seq += 1;
         const hash = seq.toString(16).padStart(64, "0");
         if (typeof onSigned === "function") await onSigned(hash);
+        state.signed.push({ to, amountRaw: String(amountRaw), describe, hash });
         if (state.onPublish) state.onPublish({ to, amountRaw: String(amountRaw), describe, hash });
+        if (state.timeoutAfterSign) throw new Error("Nano RPC process: timed out");
         const amount = String(amountRaw);
         state.transfers.push({ to, amountRaw: amount, describe });
         state.history.unshift({ type: "send", account: to, amount, hash, confirmed: "true" });
@@ -1747,6 +1752,98 @@ test("a crash after the refund is published but before 'refunded' is saved never
   const ri = quoteIn(id)(data).refundIntent;
   assert.ok(ri && ri.hash, "the refund's block hash was durable before publish");
   assert.equal(ri.hash, chain1.state.history.find((h) => h.amount === x.amountRaw && h.type === "send").hash);
+});
+
+/* ---- owed-queue retries: the signed hash is durable before publish ---- */
+
+/** A run that fails while the first refund bounces before signing → one queued refund. */
+async function queuedRefund(prefix) {
+  const { mkdtemp } = await import("node:fs/promises");
+  const stateFile = join(await mkdtemp(join(tmpdir(), prefix)), "gate-state.json");
+  const clock = { t: 9_000_000 };
+  const chain = fakeChain();
+  let id = null;
+  const registry = fakeRegistry({
+    onCall: async () => {
+      await untilState(stateFile, "the paid quote to persist", (d) => quoteIn(id)(d).status === "paid");
+      throw new Error("decider down");
+    },
+  });
+  const gate = makeGate(chain, { registry, stateFile, now: () => clock.t, pollMs: 5 }).wrapRegistry(registry);
+  const x = argOf(await gate.callTool({ name: "poster", arguments: { Text: "a" } }));
+  id = x.paymentId;
+  chain.state.receivable["7".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  chain.state.failTransfer = true; // fails before signing → the owed queue
+  const res = await gate.callTool({ name: "poster", arguments: { Text: "a", _payment_id: id } });
+  assert.ok(res.isError);
+  await untilState(stateFile, "the queued refund to persist", (d) => (d.owed || []).some((o) => o.event === "refund"));
+  assert.equal(chain.state.signed.length, 0, "nothing was signed yet");
+  chain.state.failTransfer = false;
+  return { stateFile, clock, chain, id, x };
+}
+
+/** Let the watcher run through every owed backoff step, with real time for it to act. */
+async function advancePastBackoff(clock) {
+  for (let i = 0; i < 6; i++) {
+    clock.t += 700_000;
+    await new Promise((r) => setTimeout(r, 30));
+  }
+}
+
+test("a queued refund retry that publishes and then crashes is not sent again on restart", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { stateFile, clock, chain, id, x } = await queuedRefund("gate-owed-crash-");
+  const crashFile = join(await mkdtemp(join(tmpdir(), "gate-owed-crash-img-")), "gate-state.json");
+  // The process dies the instant the retry publishes — before its post-publish save.
+  chain.state.onPublish = (tr) => { if (tr.describe === "refunded") crashImage(stateFile, crashFile); };
+  clock.t += 31_000;
+  await until("the queued retry to publish", () => chain.state.signed.some((s) => s.describe === "refunded"));
+  const signed = chain.state.signed.find((s) => s.describe === "refunded");
+  assert.equal(signed.amountRaw, x.amountRaw);
+
+  // Restart from the crash image. The node does not know the block yet.
+  const chain2 = fakeChain();
+  const clock2 = { t: clock.t };
+  const registry2 = fakeRegistry({ onCall: async () => { throw new Error("decider down"); } });
+  const gate2 = makeGate(chain2, { registry: registry2, stateFile: crashFile, now: () => clock2.t, pollMs: 5 });
+  await gate2.reconciled;
+  const replay = await gate2.wrapRegistry(registry2).callTool({ name: "poster", arguments: { Text: "a", _payment_id: id } });
+  assert.ok(replay.isError);
+  await advancePastBackoff(clock2);
+  assert.equal(chain2.state.signed.length, 0, "no second refund after the restart");
+  assert.equal(registry2.callCount(), 0);
+  const data = await untilState(crashFile, "the signed refund to be held for a chain check",
+    (d) => (d.owed || []).length === 0 && quoteIn(id)(d).refundIntent && quoteIn(id)(d).refundIntent.state === "unknown");
+  assert.equal(quoteIn(id)(data).refundIntent.hash, signed.hash, "the retry's hash was durable before publish");
+  assert.notEqual(quoteIn(id)(data).status, "refunded", "not confirmed on chain, so not marked refunded");
+});
+
+test("a queued refund retry that times out after broadcast is never retried, live or after a restart", async () => {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { stateFile, clock, chain, id } = await queuedRefund("gate-owed-timeout-");
+  chain.state.timeoutAfterSign = true;
+  clock.t += 31_000;
+  await until("the queued retry to sign and time out", () => chain.state.signed.some((s) => s.describe === "refunded"));
+  await advancePastBackoff(clock);
+  const attempts = chain.state.signed.filter((s) => s.describe === "refunded");
+  assert.equal(attempts.length, 1, "no live retry of a refund that may have landed");
+  const data = await untilState(stateFile, "the uncertain refund to be held",
+    (d) => (d.owed || []).length === 0 && quoteIn(id)(d).refundIntent && quoteIn(id)(d).refundIntent.state === "unknown");
+  assert.equal(quoteIn(id)(data).refundIntent.hash, attempts[0].hash);
+  assert.notEqual(quoteIn(id)(data).status, "refunded", "reserved: not marked refunded");
+
+  // Restart (from a copy, so the first process cannot overwrite it).
+  const restartFile = join(await mkdtemp(join(tmpdir(), "gate-owed-timeout-restart-")), "gate-state.json");
+  crashImage(stateFile, restartFile);
+  const chain2 = fakeChain();
+  const clock2 = { t: clock.t };
+  const gate2 = makeGate(chain2, { registry: fakeRegistry(), stateFile: restartFile, now: () => clock2.t, pollMs: 5 });
+  await gate2.reconciled;
+  gate2.wrapRegistry(fakeRegistry());
+  await advancePastBackoff(clock2);
+  assert.equal(chain2.state.signed.length, 0, "nothing is re-sent after the restart");
+  const after = JSON.parse(readFileSync(restartFile, "utf8"));
+  assert.equal(quoteIn(id)(after).refundIntent.state, "unknown", "still reserved, awaiting the chain");
 });
 
 test("a legacy receipt with no payout intent refunds the full deposit", async () => {
