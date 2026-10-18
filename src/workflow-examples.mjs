@@ -35,6 +35,11 @@ const WORKFLOW_EXAMPLES = {
     ...reviewedSample("talking-avatar", "A fictional presenter reads a short workshop introduction. Sampled frames preserve the presenter; check precise lip-sync timing in playback. Generation can take several minutes.", "Frame from a fictional presenter's workshop introduction"),
     title: "Video sample",
   },
+  "idea-to-3d-model": {
+    ...reviewedSample("idea-to-3d-model", "One line becomes a textured 3D model: a teal-and-cream wind-up toy submarine with a brass periscope, portholes, a wind-up key and a striped tail. GLM writes the concept, Muse paints it, and TRELLIS.2 turns that one picture into a GLB that holds up from every side. The viewer shades it flatter than the concept, and the thin key and propeller blades go soft at some angles.", "Concept render and 3D turntable of a teal wind-up toy submarine"),
+    preview: "https://media.nanoodle.com/mcp/examples/idea-to-3d-model.webp",
+    title: "3D sample",
+  },
   "character-sprites": {
     title: "Iron Verdict",
     play: "https://nanoodle.com/examples/iron-verdict/",
