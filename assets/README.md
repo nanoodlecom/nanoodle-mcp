@@ -15,3 +15,11 @@ this server hosts:
 To regenerate, run the favicon graph with your own brand text and resize the
 result (e.g. `magick icon.jpg -resize 48x48 favicon.png`,
 `magick icon.jpg -define icon:auto-resize=48,32,16 favicon.ico`).
+
+## Sample previews (`examples/`)
+
+Served at `/examples/<file>` as the landing page's sample thumbnails. They are
+copies of the reviewed nanoodle.com samples (`examples/iron-verdict/screenshot.png`
+and `examples/gallery/<slug>/preview.webp`). nanoodle.com sends
+`Cross-Origin-Resource-Policy: same-origin`, so browsers block those URLs when
+hotlinked from this host; the landing page must use these same-origin copies.
