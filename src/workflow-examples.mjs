@@ -40,6 +40,11 @@ const WORKFLOW_EXAMPLES = {
     preview: "https://media.nanoodle.com/mcp/examples/idea-to-3d-model.webp",
     title: "3D sample",
   },
+  "mix-the-references": {
+    ...reviewedSample("mix-the-references", "Four separate references become one picture: a paper-craft fox (image 1) wears a yellow knitted raincoat (image 2), holds one red paper lantern (image 3) and stands on a cardboard pier at dusk (image 4). FLUX.3 Klein Edit gets them in port order and the instruction names each image by number. Flaws in the saved run: the paper boats from the place reference mostly drop out and the coat comes out longer than its flat-lay reference.", "Paper-craft fox in a yellow knitted raincoat holding a red paper lantern on a cardboard pier"),
+    preview: "https://media.nanoodle.com/mcp/examples/mix-the-references.webp",
+    title: "Composite sample",
+  },
   "character-sprites": {
     title: "Iron Verdict",
     play: "https://nanoodle.com/examples/iron-verdict/",
