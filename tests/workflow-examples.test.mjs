@@ -40,7 +40,7 @@ for (const structured of [true, false]) {
       assert.match(body, /coding agent adds combat, gravity and game rules/);
     }
     assert.match(html, /href="\/graph\/character-sprites\.json"/);
-    assert.match(html, /src="https:\/\/nanoodle\.com\/examples\/iron-verdict\/screenshot.png"/);
+    assert.match(html, /src="https:\/\/media\.nanoodle\.com\/mcp\/examples\/iron-verdict\.png"/);
     assert.match(text, /graph: http:\/\/example\.test\/graph\/character-sprites\.json/);
   });
 }
@@ -64,6 +64,7 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       assert.match(html, />See sample<\/a>/);
       assert.ok(html.includes(`id="${name}"`));
       if (["deslop", "sing"].includes(name)) assert.ok(!html.includes(`examples/gallery/${name}/preview`));
+      else if (["image-model-arena", "photo-to-video", "talking-avatar"].includes(name)) assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else assert.ok(html.includes(`https://nanoodle.com/examples/gallery/${name}/preview.webp`));
       if (name === "sing") {
         assert.match(html, /Audio sample/);
