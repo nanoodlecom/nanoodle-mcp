@@ -40,7 +40,7 @@ for (const structured of [true, false]) {
       assert.match(body, /coding agent adds combat, gravity and game rules/);
     }
     assert.match(html, /href="\/graph\/character-sprites\.json"/);
-    assert.match(html, /src="https:\/\/nanoodle\.com\/examples\/iron-verdict\/screenshot.png"/);
+    assert.match(html, /src="https:\/\/media\.nanoodle\.com\/mcp\/examples\/iron-verdict\.png"/);
     assert.match(text, /graph: http:\/\/example\.test\/graph\/character-sprites\.json/);
   });
 }
@@ -53,7 +53,7 @@ test("servers without the character workflow do not imply the example tool is mo
   }
 });
 
-for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar"]) {
+for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar", "idea-to-3d-model", "mix-the-references"]) {
   test(`reviewed ${name} sample links to evidence without inventing a skill`, async () => {
     for (const structured of [true, false]) {
       const [html, text] = await pages(name, structured);
@@ -64,6 +64,9 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       assert.match(html, />See sample<\/a>/);
       assert.ok(html.includes(`id="${name}"`));
       if (["deslop", "sing"].includes(name)) assert.ok(!html.includes(`examples/gallery/${name}/preview`));
+      else if (["image-model-arena", "photo-to-video", "talking-avatar"].includes(name)) assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
+      else if (name === "idea-to-3d-model") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
+      else if (name === "mix-the-references") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else assert.ok(html.includes(`https://nanoodle.com/examples/gallery/${name}/preview.webp`));
       if (name === "sing") {
         assert.match(html, /Audio sample/);
@@ -72,6 +75,16 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       if (name === "talking-avatar") {
         assert.match(html, /Video sample/);
         assert.match(text, /check precise lip-sync timing in playback/);
+      }
+      if (name === "idea-to-3d-model") {
+        assert.match(html, /3D sample/);
+        assert.match(text, /holds up from every side/);
+        assert.match(text, /go soft at some angles/);
+      }
+      if (name === "mix-the-references") {
+        assert.match(html, /Composite sample/);
+        assert.match(text, /names each image by number/);
+        assert.match(text, /paper boats from the place reference mostly drop out/);
       }
     }
   });
@@ -128,6 +141,44 @@ test("MCP tools/list exposes the outcome and local skill beyond the truncated gr
     const reviewed = registry.listTools().find(tool => tool.name === "favicon");
     assert.match(reviewed.description, /Example: Reviewed sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#favicon\)/);
     assert.doesNotMatch(reviewed.description, /undefined|Agent skill:/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("idea-to-3d-model graph mounts as a tool with its reviewed 3D sample", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-3d-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/idea-to-3d-model.noodle-graph.json", import.meta.url), join(dir, "idea-to-3d-model.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.listTools().find(tool => tool.name === "idea-to-3d-model");
+    assert.ok(tool);
+    assert.ok(tool.inputSchema.properties.Object_idea);
+    assert.match(tool.description, /model3d:TRELLIS\.2 → GLB; returns model3d \(trellis-2\/image-to-3d\) saved to disk \(file path in result\)/);
+    assert.match(tool.description, /Example: 3D sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#idea-to-3d-model\)/);
+    const card = registry.tools.find(tool => tool.name === "idea-to-3d-model").card;
+    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 2], ["llm", 1], ["join", 1], ["image", 1], ["model3d", 1]]);
+    assert.equal(card.sample.label, "Object idea");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mix-the-references graph mounts as a tool with its reviewed composite sample", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-mix-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/mix-the-references.noodle-graph.json", import.meta.url), join(dir, "mix-the-references.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.listTools().find(tool => tool.name === "mix-the-references");
+    assert.ok(tool);
+    for (const input of ["Who_character", "What_they_wear_outfit", "What_they_hold_prop", "Where_place", "Mix_instruction_names_each_image"]) {
+      assert.ok(tool.inputSchema.properties[input], input);
+    }
+    assert.match(tool.description, /edit:Mix · FLUX\.3 Klein Edit; returns image \(flux-3\/klein\/edit-image, 1024×1024\) saved to disk \(file path in result\)/);
+    assert.match(tool.description, /Example: Composite sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#mix-the-references\)/);
+    const card = registry.tools.find(tool => tool.name === "mix-the-references").card;
+    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 5], ["image", 4], ["edit", 1]]);
+    assert.equal(card.sample.label, "Who · character");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
