@@ -5,7 +5,8 @@ import { serveHttp } from "../src/http.mjs";
 // nanoodle.com sends Cross-Origin-Resource-Policy: same-origin, so a browser on the
 // mcp host blocks any image hotlinked from it. Every landing-page <img> must come
 // from this server or from nanoodle's media host.
-const LIVE_TOOLS = ["character-sprites", "image-model-arena", "photo-to-video", "talking-avatar", "sing", "storyboard-relay"];
+// The 10 tools the hosted server mounts (mcp.nanoodle.com tools/list).
+const LIVE_TOOLS = ["character-sprites", "image-model-arena", "neon-shrine-duel", "photo-to-video", "sing", "storyboard-relay", "talking-avatar", "tiny-world-film", "idea-to-3d-model", "mix-the-references"];
 const PUBLIC_BASE = "https://mcp.nanoodle.com";
 const MEDIA_ORIGIN = "https://media.nanoodle.com";
 // The media check makes real (free) HEAD requests. Set NANOODLE_OFFLINE=1 to skip it.
@@ -40,8 +41,9 @@ async function landingImgSrcs() {
 
 test("landing page images are same-origin or on media.nanoodle.com", async () => {
   const { html, srcs, local } = await landingImgSrcs();
-  // favicon + the four sample previews (sing has no preview, storyboard-relay no example)
-  assert.equal(srcs.length, 5, `expected 5 <img>, got ${JSON.stringify(srcs)}`);
+  // favicon + six sample previews (sing has no preview; neon-shrine-duel,
+  // storyboard-relay and tiny-world-film have no example)
+  assert.equal(srcs.length, 7, `expected 7 <img>, got ${JSON.stringify(srcs)}`);
   for (const src of srcs) {
     const origin = new URL(src, PUBLIC_BASE + "/").origin;
     assert.ok(origin === PUBLIC_BASE || origin === MEDIA_ORIGIN, `${src} is neither same-origin nor on ${MEDIA_ORIGIN}`);
@@ -56,7 +58,7 @@ test("landing page images are same-origin or on media.nanoodle.com", async () =>
 test("landing page media images return 200, an image type and no same-origin CORP", { skip: OFFLINE && "NANOODLE_OFFLINE=1" }, async () => {
   const { srcs } = await landingImgSrcs();
   const media = srcs.filter(src => new URL(src, PUBLIC_BASE + "/").origin === MEDIA_ORIGIN);
-  assert.equal(media.length, 4, `expected 4 media images, got ${JSON.stringify(media)}`);
+  assert.equal(media.length, 6, `expected 6 media images, got ${JSON.stringify(media)}`);
   for (const src of media) {
     const res = await fetch(src, { method: "HEAD", headers: { Origin: PUBLIC_BASE }, signal: AbortSignal.timeout(15000) });
     assert.equal(res.status, 200, `${src} -> ${res.status}`);
