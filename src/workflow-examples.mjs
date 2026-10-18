@@ -1,9 +1,16 @@
+// Preview images live on nanoodle's media host (R2 bucket nanoodle-media), not
+// nanoodle.com: nanoodle.com sends Cross-Origin-Resource-Policy: same-origin, so a
+// browser on the mcp host blocks images hotlinked from it.
+const MEDIA_EXAMPLES = "https://media.nanoodle.com/mcp/examples";
+const MEDIA_PREVIEWS = new Set(["image-model-arena", "photo-to-video", "talking-avatar"]);
+
 // Only link reviewed, published samples; a call template is not output evidence.
 function reviewedSample(slug, description, alt) {
+  const preview = MEDIA_PREVIEWS.has(slug) ? `${MEDIA_EXAMPLES}/${slug}.webp` : `https://nanoodle.com/examples/gallery/${slug}/preview.webp`;
   return {
     title: "Reviewed sample",
     play: `https://nanoodle.com/examples/gallery/#${slug}`,
-    ...(alt ? { preview: `https://nanoodle.com/examples/gallery/${slug}/preview.webp`, alt } : {}),
+    ...(alt ? { preview, alt } : {}),
     description,
   };
 }
@@ -31,7 +38,7 @@ const WORKFLOW_EXAMPLES = {
   "character-sprites": {
     title: "Iron Verdict",
     play: "https://nanoodle.com/examples/iron-verdict/",
-    preview: "https://nanoodle.com/examples/iron-verdict/screenshot.png",
+    preview: `${MEDIA_EXAMPLES}/iron-verdict.png`,
     alt: "Iron Verdict gameplay screenshot",
     skill: "https://github.com/nanoodlecom/noodle-skills/tree/main/skills/character-sprites",
     description: "A playable fighting game built with character-sprites. This graph generates a character reference and parts sheet; the local skill bakes animated sprites, and a coding agent adds combat, gravity and game rules.",
