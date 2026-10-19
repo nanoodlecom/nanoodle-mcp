@@ -53,7 +53,7 @@ test("servers without the character workflow do not imply the example tool is mo
   }
 });
 
-for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar", "idea-to-3d-model", "mix-the-references"]) {
+for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "image-model-arena", "edit-a-photo", "combine-images", "photo-to-video", "omni-flash-turntable", "deslop", "render-a-mockup", "sing", "talking-avatar", "idea-to-3d-model", "mix-the-references", "day-to-night"]) {
   test(`reviewed ${name} sample links to evidence without inventing a skill`, async () => {
     for (const structured of [true, false]) {
       const [html, text] = await pages(name, structured);
@@ -66,6 +66,7 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       if (["deslop", "sing"].includes(name)) assert.ok(!html.includes(`examples/gallery/${name}/preview`));
       else if (["image-model-arena", "photo-to-video", "talking-avatar"].includes(name)) assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else if (name === "idea-to-3d-model") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
+      else if (name === "day-to-night") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else if (name === "mix-the-references") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else assert.ok(html.includes(`https://nanoodle.com/examples/gallery/${name}/preview.webp`));
       if (name === "sing") {
@@ -80,6 +81,11 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
         assert.match(html, /3D sample/);
         assert.match(text, /holds up from every side/);
         assert.match(text, /go soft at some angles/);
+      }
+      if (name === "day-to-night") {
+        assert.match(html, /Video sample/);
+        assert.match(text, /start frame/);
+        assert.match(text, /paper waves turn into glossy water/);
       }
       if (name === "mix-the-references") {
         assert.match(html, /Composite sample/);
@@ -179,6 +185,29 @@ test("mix-the-references graph mounts as a tool with its reviewed composite samp
     const card = registry.tools.find(tool => tool.name === "mix-the-references").card;
     assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 5], ["image", 4], ["edit", 1]]);
     assert.equal(card.sample.label, "Who · character");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("day-to-night graph mounts as a tool with its start + end frame video sample", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-daynight-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/day-to-night.noodle-graph.json", import.meta.url), join(dir, "day-to-night.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.listTools().find(tool => tool.name === "day-to-night");
+    assert.ok(tool);
+    for (const input of ["Day_keyframe_prompt", "Night_keyframe_instruction", "Transition_motion_prompt"]) {
+      assert.ok(tool.inputSchema.properties[input], input);
+    }
+    assert.match(tool.description, /ivideo:Day → night · H3 Max \(start \+ end frame\); returns video \(h3-max\) saved to disk \(file path in result\)/);
+    assert.match(tool.description, /Example: Video sample \(https:\/\/nanoodle\.com\/examples\/gallery\/#day-to-night\)/);
+    const card = registry.tools.find(tool => tool.name === "day-to-night").card;
+    assert.deepEqual(card.steps.map(step => [step.label, step.n]), [["text", 3], ["image", 1], ["edit", 1], ["ivideo", 1]]);
+    assert.equal(card.sample.label, "Day keyframe · prompt");
+    const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/day-to-night.noodle-graph.json", import.meta.url), "utf8"));
+    assert.equal(graph.nodes.find(node => node.id === "clip").fields.model, "minimax/h3-max");
+    assert.ok(graph.links.some(link => link.from.node === "night" && link.to.node === "clip" && link.to.port === "endframe"), "night still rides the end-frame port");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
