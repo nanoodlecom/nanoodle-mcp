@@ -183,3 +183,26 @@ test("mix-the-references graph mounts as a tool with its reviewed composite samp
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("humanize-comment graph mounts as a text tool with a pinned deposit and no sample card", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    assert.deepEqual(registry.failures, []);
+    const tool = registry.listTools().find(tool => tool.name === "humanize-comment");
+    assert.ok(tool);
+    assert.deepEqual(tool.inputSchema.required, ["Draft", "Context"]);
+    assert.match(tool.inputSchema.properties.Guidance.description, /default: "a friendly, specific reply"; optional/);
+    assert.match(tool.description, /llm:Decider \(GLM-5\.3\); returns text/);
+    // no reviewed, published sample yet, so no example line or card
+    assert.doesNotMatch(tool.description, /Example:/);
+    const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
+    // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
+    assert.deepEqual(mounted.x402, { usd: 0.015 });
+    assert.deepEqual(mounted.card.steps.map(step => [step.label, step.n]), [["text", 8], ["join", 4], ["llm", 4], ["join", 8], ["llm", 1]]);
+    assert.equal(mounted.card.sample, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

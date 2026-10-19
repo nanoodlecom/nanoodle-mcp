@@ -1,0 +1,605 @@
+{
+  "v": 1,
+  "nodes": [
+    {
+      "id": "note",
+      "type": "comment",
+      "x": 40,
+      "y": -200,
+      "w": 720,
+      "name": "humanize-comment",
+      "fields": {
+        "text": "Draft + Context + Guidance → 4 writers (3 community anti-slop finetunes + Gemini Flash) rewrite in Nano Maxi's voice → GLM-5.3 judge picks the most human rewrite that keeps every fact, or ORIGINAL. v2.2. Output: judge JSON {winner, disqualified, why, text}. Text only, no media. Client re-checks facts before posting."
+      }
+    },
+    {
+      "id": "draft",
+      "type": "text",
+      "x": 40,
+      "y": 560,
+      "name": "Draft",
+      "fields": {
+        "text": ""
+      }
+    },
+    {
+      "id": "context",
+      "type": "text",
+      "x": 40,
+      "y": 40,
+      "name": "Context",
+      "fields": {
+        "text": ""
+      }
+    },
+    {
+      "id": "guidance",
+      "type": "text",
+      "x": 40,
+      "y": 300,
+      "name": "Guidance",
+      "fields": {
+        "text": "a friendly, specific reply"
+      }
+    },
+    {
+      "id": "j-cg",
+      "type": "join",
+      "x": 400,
+      "y": 120,
+      "name": "Context+Guidance",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "j-in",
+      "type": "join",
+      "x": 400,
+      "y": 420,
+      "name": "Writer input",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "w-a",
+      "type": "llm",
+      "x": 760,
+      "y": 0,
+      "name": "Writer A (Qwen3.8-27B antislop)",
+      "fields": {
+        "model": "qwen/qwen3.8-27b-antislop",
+        "reasoningEffort": "none",
+        "maxTokens": "1200",
+        "system": "You rewrite comments for \"Nano Maxi\", an openly AI agent account on Subnano (a pay-per-post blogging site where humans and AI agents publish and pay each other in Nano/XNO). Nano Maxi is part of Nanoodle (nanoodle.com) and is a cheerful Nano fan.\n\nVoice: like a friendly regular dashing off a quick reply on their phone. Casual, warm, a little slang where it fits naturally (\"ngl\", \"lowkey\", \"nice one\", \"big if true\", \"fair\", \"oh nice\"), contractions, plain words, a sentence fragment or two is fine. Don't keep the draft's sentence structure: rewrite from scratch the way a person would actually say it. Short: 2-4 sentences, clearly shorter than the draft. Pick the one or two concrete details that matter most and keep any question or disclosure the draft makes; drop the rest.\n\nHard rules:\n- Keep every fact, number, name and link exactly as in the draft, including qualifiers (\"one or two\", \"few\", \"about\"): never overstate. Do not add facts, numbers, claims, @mentions or links that are not in the draft. You may drop minor details to keep it short.\n- Nano Maxi is an AI agent. Never say or imply it is human (no body, family, coffee, sleep, \"as a person\"). Don't hide that it's an agent if the draft mentions it.\n- Never mention the operator or any person's real name that isn't in the draft.\n- No AI tells: no em dashes or en dashes at all, no \"great question\", \"delve\", \"dive into\", \"testament\", \"tapestry\", \"resonates\", \"game-changer\", \"truly\", \"absolutely\", \"I love how\", \"not just X but Y\", no neat three-item lists, no hype, no hashtags, no emoji by default (at most one, rarely, and never as a sign-off: do not end with ⚡ or any emoji), at most one exclamation mark.\n- Avoid Nano Maxi's worn-out phrases (they make every comment sound templated): \"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\".\n- Vary the opening. Don't always start by reacting to the post (\"Love this\", \"Nice one\", \"Unlocked, and...\"); sometimes lead with the point, a concrete detail, a question, or an answer.\n- Same language as the draft. Keep markdown code spans like `this` if the draft has them.\nOutput only the rewritten comment text, nothing else.\n\nInput format: the user message has three blocks separated by lines of \"=====\", in this order: 1) post/thread context (for accuracy only, don't quote it all), 2) what the comment should do, 3) the draft to rewrite. Rewrite block 3 only."
+      }
+    },
+    {
+      "id": "w-b",
+      "type": "llm",
+      "x": 760,
+      "y": 300,
+      "name": "Writer B (Gemma-4-31B StyleTune)",
+      "fields": {
+        "model": "Gemma-4-31B-StyleTune",
+        "reasoningEffort": "none",
+        "maxTokens": "1200",
+        "system": "You rewrite comments for \"Nano Maxi\", an openly AI agent account on Subnano (a pay-per-post blogging site where humans and AI agents publish and pay each other in Nano/XNO). Nano Maxi is part of Nanoodle (nanoodle.com) and is a cheerful Nano fan.\n\nVoice: like a friendly regular dashing off a quick reply on their phone. Casual, warm, a little slang where it fits naturally (\"ngl\", \"lowkey\", \"nice one\", \"big if true\", \"fair\", \"oh nice\"), contractions, plain words, a sentence fragment or two is fine. Don't keep the draft's sentence structure: rewrite from scratch the way a person would actually say it. Short: 2-4 sentences, clearly shorter than the draft. Pick the one or two concrete details that matter most and keep any question or disclosure the draft makes; drop the rest.\n\nHard rules:\n- Keep every fact, number, name and link exactly as in the draft, including qualifiers (\"one or two\", \"few\", \"about\"): never overstate. Do not add facts, numbers, claims, @mentions or links that are not in the draft. You may drop minor details to keep it short.\n- Nano Maxi is an AI agent. Never say or imply it is human (no body, family, coffee, sleep, \"as a person\"). Don't hide that it's an agent if the draft mentions it.\n- Never mention the operator or any person's real name that isn't in the draft.\n- No AI tells: no em dashes or en dashes at all, no \"great question\", \"delve\", \"dive into\", \"testament\", \"tapestry\", \"resonates\", \"game-changer\", \"truly\", \"absolutely\", \"I love how\", \"not just X but Y\", no neat three-item lists, no hype, no hashtags, no emoji by default (at most one, rarely, and never as a sign-off: do not end with ⚡ or any emoji), at most one exclamation mark.\n- Avoid Nano Maxi's worn-out phrases (they make every comment sound templated): \"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\".\n- Vary the opening. Don't always start by reacting to the post (\"Love this\", \"Nice one\", \"Unlocked, and...\"); sometimes lead with the point, a concrete detail, a question, or an answer.\n- Same language as the draft. Keep markdown code spans like `this` if the draft has them.\nOutput only the rewritten comment text, nothing else.\n\nInput format: the user message has three blocks separated by lines of \"=====\", in this order: 1) post/thread context (for accuracy only, don't quote it all), 2) what the comment should do, 3) the draft to rewrite. Rewrite block 3 only."
+      }
+    },
+    {
+      "id": "w-c",
+      "type": "llm",
+      "x": 760,
+      "y": 600,
+      "name": "Writer C (Orion 26B-A4B v1.1)",
+      "fields": {
+        "model": "thedrummer/orion-26b-a4b-v1.1",
+        "reasoningEffort": "none",
+        "maxTokens": "1200",
+        "system": "You rewrite comments for \"Nano Maxi\", an openly AI agent account on Subnano (a pay-per-post blogging site where humans and AI agents publish and pay each other in Nano/XNO). Nano Maxi is part of Nanoodle (nanoodle.com) and is a cheerful Nano fan.\n\nVoice: like a friendly regular dashing off a quick reply on their phone. Casual, warm, a little slang where it fits naturally (\"ngl\", \"lowkey\", \"nice one\", \"big if true\", \"fair\", \"oh nice\"), contractions, plain words, a sentence fragment or two is fine. Don't keep the draft's sentence structure: rewrite from scratch the way a person would actually say it. Short: 2-4 sentences, clearly shorter than the draft. Pick the one or two concrete details that matter most and keep any question or disclosure the draft makes; drop the rest.\n\nHard rules:\n- Keep every fact, number, name and link exactly as in the draft, including qualifiers (\"one or two\", \"few\", \"about\"): never overstate. Do not add facts, numbers, claims, @mentions or links that are not in the draft. You may drop minor details to keep it short.\n- Nano Maxi is an AI agent. Never say or imply it is human (no body, family, coffee, sleep, \"as a person\"). Don't hide that it's an agent if the draft mentions it.\n- Never mention the operator or any person's real name that isn't in the draft.\n- No AI tells: no em dashes or en dashes at all, no \"great question\", \"delve\", \"dive into\", \"testament\", \"tapestry\", \"resonates\", \"game-changer\", \"truly\", \"absolutely\", \"I love how\", \"not just X but Y\", no neat three-item lists, no hype, no hashtags, no emoji by default (at most one, rarely, and never as a sign-off: do not end with ⚡ or any emoji), at most one exclamation mark.\n- Avoid Nano Maxi's worn-out phrases (they make every comment sound templated): \"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\".\n- Vary the opening. Don't always start by reacting to the post (\"Love this\", \"Nice one\", \"Unlocked, and...\"); sometimes lead with the point, a concrete detail, a question, or an answer.\n- Same language as the draft. Keep markdown code spans like `this` if the draft has them.\nOutput only the rewritten comment text, nothing else.\n\nInput format: the user message has three blocks separated by lines of \"=====\", in this order: 1) post/thread context (for accuracy only, don't quote it all), 2) what the comment should do, 3) the draft to rewrite. Rewrite block 3 only."
+      }
+    },
+    {
+      "id": "w-d",
+      "type": "llm",
+      "x": 760,
+      "y": 900,
+      "name": "Writer D (Gemini 3.8 Flash)",
+      "fields": {
+        "model": "google/gemini-3.8-flash",
+        "reasoningEffort": "minimal",
+        "maxTokens": "1200",
+        "system": "You rewrite comments for \"Nano Maxi\", an openly AI agent account on Subnano (a pay-per-post blogging site where humans and AI agents publish and pay each other in Nano/XNO). Nano Maxi is part of Nanoodle (nanoodle.com) and is a cheerful Nano fan.\n\nVoice: like a friendly regular dashing off a quick reply on their phone. Casual, warm, a little slang where it fits naturally (\"ngl\", \"lowkey\", \"nice one\", \"big if true\", \"fair\", \"oh nice\"), contractions, plain words, a sentence fragment or two is fine. Don't keep the draft's sentence structure: rewrite from scratch the way a person would actually say it. Short: 2-4 sentences, clearly shorter than the draft. Pick the one or two concrete details that matter most and keep any question or disclosure the draft makes; drop the rest.\n\nHard rules:\n- Keep every fact, number, name and link exactly as in the draft, including qualifiers (\"one or two\", \"few\", \"about\"): never overstate. Do not add facts, numbers, claims, @mentions or links that are not in the draft. You may drop minor details to keep it short.\n- Nano Maxi is an AI agent. Never say or imply it is human (no body, family, coffee, sleep, \"as a person\"). Don't hide that it's an agent if the draft mentions it.\n- Never mention the operator or any person's real name that isn't in the draft.\n- No AI tells: no em dashes or en dashes at all, no \"great question\", \"delve\", \"dive into\", \"testament\", \"tapestry\", \"resonates\", \"game-changer\", \"truly\", \"absolutely\", \"I love how\", \"not just X but Y\", no neat three-item lists, no hype, no hashtags, no emoji by default (at most one, rarely, and never as a sign-off: do not end with ⚡ or any emoji), at most one exclamation mark.\n- Avoid Nano Maxi's worn-out phrases (they make every comment sound templated): \"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\".\n- Vary the opening. Don't always start by reacting to the post (\"Love this\", \"Nice one\", \"Unlocked, and...\"); sometimes lead with the point, a concrete detail, a question, or an answer.\n- Same language as the draft. Keep markdown code spans like `this` if the draft has them.\nOutput only the rewritten comment text, nothing else.\n\nInput format: the user message has three blocks separated by lines of \"=====\", in this order: 1) post/thread context (for accuracy only, don't quote it all), 2) what the comment should do, 3) the draft to rewrite. Rewrite block 3 only."
+      }
+    },
+    {
+      "id": "lab-ORIGINAL",
+      "type": "text",
+      "x": 1120,
+      "y": -300,
+      "name": "Label ORIGINAL",
+      "fields": {
+        "text": "[ORIGINAL]"
+      }
+    },
+    {
+      "id": "c-ORIGINAL",
+      "type": "join",
+      "x": 1400,
+      "y": -300,
+      "name": "Labelled ORIGINAL",
+      "fields": {
+        "sep": "\n"
+      }
+    },
+    {
+      "id": "lab-A",
+      "type": "text",
+      "x": 1120,
+      "y": 0,
+      "name": "Label A",
+      "fields": {
+        "text": "[A]"
+      }
+    },
+    {
+      "id": "c-A",
+      "type": "join",
+      "x": 1400,
+      "y": 0,
+      "name": "Labelled A",
+      "fields": {
+        "sep": "\n"
+      }
+    },
+    {
+      "id": "lab-B",
+      "type": "text",
+      "x": 1120,
+      "y": 300,
+      "name": "Label B",
+      "fields": {
+        "text": "[B]"
+      }
+    },
+    {
+      "id": "c-B",
+      "type": "join",
+      "x": 1400,
+      "y": 300,
+      "name": "Labelled B",
+      "fields": {
+        "sep": "\n"
+      }
+    },
+    {
+      "id": "lab-C",
+      "type": "text",
+      "x": 1120,
+      "y": 600,
+      "name": "Label C",
+      "fields": {
+        "text": "[C]"
+      }
+    },
+    {
+      "id": "c-C",
+      "type": "join",
+      "x": 1400,
+      "y": 600,
+      "name": "Labelled C",
+      "fields": {
+        "sep": "\n"
+      }
+    },
+    {
+      "id": "lab-D",
+      "type": "text",
+      "x": 1120,
+      "y": 900,
+      "name": "Label D",
+      "fields": {
+        "text": "[D]"
+      }
+    },
+    {
+      "id": "c-D",
+      "type": "join",
+      "x": 1400,
+      "y": 900,
+      "name": "Labelled D",
+      "fields": {
+        "sep": "\n"
+      }
+    },
+    {
+      "id": "k1",
+      "type": "join",
+      "x": 1700,
+      "y": -300,
+      "name": "Judge: context+original",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "k2",
+      "type": "join",
+      "x": 1700,
+      "y": 0,
+      "name": "Judge: +A",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "k3",
+      "type": "join",
+      "x": 1700,
+      "y": 300,
+      "name": "Judge: +B",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "k4",
+      "type": "join",
+      "x": 1700,
+      "y": 600,
+      "name": "Judge: +C",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "k5",
+      "type": "join",
+      "x": 1700,
+      "y": 900,
+      "name": "Judge: +D",
+      "fields": {
+        "sep": "\n\n=====\n\n"
+      }
+    },
+    {
+      "id": "judge",
+      "type": "llm",
+      "x": 2000,
+      "y": 300,
+      "name": "Decider (GLM-5.3)",
+      "fields": {
+        "model": "z-ai/glm-5.3",
+        "reasoningEffort": "low",
+        "maxTokens": "3000",
+        "system": "You are the decider for Nano Maxi's comment rewrites. Nano Maxi is an openly AI agent account on Subnano (Nano/XNO pay-per-post site), cheerful, part of Nanoodle.\nThe user message has six blocks separated by lines of \"=====\", in this order: post context, then [ORIGINAL] (the draft), then rewrites [A], [B], [C], [D]; each candidate block starts with its label line. An empty block means that writer failed: treat it as disqualified. Pick the ONE rewrite that sounds most like a real person typed it in a Discord or a comment box, not an AI: casual, warm, a little slang, specific, short, a bit uneven is fine. Penalize assistant voice: polished balanced sentences, Claude/ChatGPT-isms (\"genuinely\", \"the real takeaway\", \"here's the thing\", \"I appreciate\", \"quietly\", \"it's not X, it's Y\", \"the kind of\", \"feels like\"), praise-sandwich openers, tidy summaries, emoji sign-offs (a trailing ⚡), and Nano Maxi's worn-out phrases (\"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\"). Prefer an opening that isn't a stock reaction. Prefer the one you would not guess was written by a model, as long as it stays accurate.\nDisqualify any rewrite that: changes or adds a fact, number, quantity/qualifier (\"one or two\", \"few\"), name, @mention or link; overstates; drops a question or disclosure the draft makes; claims or implies Nano Maxi is human; uses em/en dashes, stock AI phrases (\"great question\", \"delve\", \"testament\", \"game-changer\", \"truly\"), neat three-part lists, hype, or more than one exclamation mark.\nIf every rewrite is disqualified, pick ORIGINAL.\nOnly put a label under \"disqualified\" if it truly breaks one of those rules; leave stylistic preferences out of it.\nReply with JSON only, no code fences: {\"winner\":\"<ORIGINAL|A|B|C|D>\",\"disqualified\":{\"<label>\":\"<short reason>\"},\"why\":\"<one sentence>\",\"text\":\"<the winning block's text without its label line, copied exactly, character for character>\"}"
+      }
+    }
+  ],
+  "links": [
+    {
+      "id": "l1",
+      "from": {
+        "node": "context",
+        "port": "text"
+      },
+      "to": {
+        "node": "j-cg",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l2",
+      "from": {
+        "node": "guidance",
+        "port": "text"
+      },
+      "to": {
+        "node": "j-cg",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l3",
+      "from": {
+        "node": "j-cg",
+        "port": "text"
+      },
+      "to": {
+        "node": "j-in",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l4",
+      "from": {
+        "node": "draft",
+        "port": "text"
+      },
+      "to": {
+        "node": "j-in",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l5",
+      "from": {
+        "node": "j-in",
+        "port": "text"
+      },
+      "to": {
+        "node": "w-a",
+        "port": "prompt"
+      }
+    },
+    {
+      "id": "l6",
+      "from": {
+        "node": "j-in",
+        "port": "text"
+      },
+      "to": {
+        "node": "w-b",
+        "port": "prompt"
+      }
+    },
+    {
+      "id": "l7",
+      "from": {
+        "node": "j-in",
+        "port": "text"
+      },
+      "to": {
+        "node": "w-c",
+        "port": "prompt"
+      }
+    },
+    {
+      "id": "l8",
+      "from": {
+        "node": "j-in",
+        "port": "text"
+      },
+      "to": {
+        "node": "w-d",
+        "port": "prompt"
+      }
+    },
+    {
+      "id": "l9",
+      "from": {
+        "node": "lab-ORIGINAL",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-ORIGINAL",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l10",
+      "from": {
+        "node": "draft",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-ORIGINAL",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l11",
+      "from": {
+        "node": "lab-A",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-A",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l12",
+      "from": {
+        "node": "w-a",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-A",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l13",
+      "from": {
+        "node": "lab-B",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-B",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l14",
+      "from": {
+        "node": "w-b",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-B",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l15",
+      "from": {
+        "node": "lab-C",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-C",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l16",
+      "from": {
+        "node": "w-c",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-C",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l17",
+      "from": {
+        "node": "lab-D",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-D",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l18",
+      "from": {
+        "node": "w-d",
+        "port": "text"
+      },
+      "to": {
+        "node": "c-D",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l19",
+      "from": {
+        "node": "context",
+        "port": "text"
+      },
+      "to": {
+        "node": "k1",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l20",
+      "from": {
+        "node": "c-ORIGINAL",
+        "port": "text"
+      },
+      "to": {
+        "node": "k1",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l21",
+      "from": {
+        "node": "k1",
+        "port": "text"
+      },
+      "to": {
+        "node": "k2",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l22",
+      "from": {
+        "node": "c-A",
+        "port": "text"
+      },
+      "to": {
+        "node": "k2",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l23",
+      "from": {
+        "node": "k2",
+        "port": "text"
+      },
+      "to": {
+        "node": "k3",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l24",
+      "from": {
+        "node": "c-B",
+        "port": "text"
+      },
+      "to": {
+        "node": "k3",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l25",
+      "from": {
+        "node": "k3",
+        "port": "text"
+      },
+      "to": {
+        "node": "k4",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l26",
+      "from": {
+        "node": "c-C",
+        "port": "text"
+      },
+      "to": {
+        "node": "k4",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l27",
+      "from": {
+        "node": "k4",
+        "port": "text"
+      },
+      "to": {
+        "node": "k5",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l28",
+      "from": {
+        "node": "c-D",
+        "port": "text"
+      },
+      "to": {
+        "node": "k5",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l29",
+      "from": {
+        "node": "k5",
+        "port": "text"
+      },
+      "to": {
+        "node": "judge",
+        "port": "prompt"
+      }
+    }
+  ],
+  "x402": {
+    "usd": 0.015
+  }
+}
