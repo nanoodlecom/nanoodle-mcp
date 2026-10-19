@@ -45,6 +45,11 @@ const WORKFLOW_EXAMPLES = {
     preview: "https://media.nanoodle.com/mcp/examples/mix-the-references.webp",
     title: "Composite sample",
   },
+  "day-to-night": {
+    ...reviewedSample("day-to-night", "A paper-craft seaside village goes from midday to night in one locked-off clip. MiniMax H3 Max gets the day still as its start frame and a Muse Edit night still as its end frame, so the sunset, lit windows and lighthouse lamp all land on the night keyframe. Flaws in the saved run: the paper waves turn into glossy water and the moon and stars pop in during the last second. Generation can take a few minutes.", "Paper-craft seaside village half at midday, half at night"),
+    preview: "https://media.nanoodle.com/mcp/examples/day-to-night.webp",
+    title: "Video sample",
+  },
   "character-sprites": {
     title: "Iron Verdict",
     play: "https://nanoodle.com/examples/iron-verdict/",
