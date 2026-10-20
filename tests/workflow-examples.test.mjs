@@ -183,3 +183,84 @@ test("mix-the-references graph mounts as a tool with its reviewed composite samp
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("humanize-comment graph mounts as a text tool with a pinned deposit, locked prompts and no sample card", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    assert.deepEqual(registry.failures, []);
+    const tool = registry.listTools().find(tool => tool.name === "humanize-comment");
+    assert.ok(tool);
+    // writers + decider carry fields.locked and the labels live in join separators:
+    // only the three author-facing inputs are args, no system prompts or labels
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance"]);
+    assert.deepEqual(tool.inputSchema.required, ["Draft", "Context"]);
+    for (const k of Object.keys(tool.inputSchema.properties)) assert.doesNotMatch(k, /system|label|writer|decider/i);
+    assert.match(tool.inputSchema.properties.Guidance.description, /default: "a friendly, specific reply"; optional/);
+    assert.match(tool.description, /llm:Decider \(GLM-5\.3\); returns text/);
+    // no reviewed, published sample yet, so no example line or card
+    assert.doesNotMatch(tool.description, /Example:/);
+    const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
+    // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
+    assert.deepEqual(mounted.x402, { usd: 0.0133 });
+    assert.equal(mounted.card.sample, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("humanize-comment: a failed writer is skipped and the decider still returns a result", async (t) => {
+  const { createServer } = await import("node:http");
+  const judgePrompts = [];
+  const srv = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      if (req.method !== "POST" || !req.url.includes("/chat/completions")) { res.writeHead(404); return res.end(); }
+      const body = JSON.parse(raw);
+      if (body.model === "deepseek/deepseek-v4.1-flash-1017") { // writer B's host rejects the call
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "bad request" }));
+      }
+      let content = "rewrite by " + body.model;
+      if (body.model === "z-ai/glm-5.3") {
+        judgePrompts.push(body.messages[body.messages.length - 1].content);
+        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", faithful: true, disqualified: true, reason: "banned phrase" }, { writer: "B", faithful: false, disqualified: true, reason: "missing" }] });
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  t.after(() => srv.close());
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-run-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+    const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+    assert.notEqual(result.isError, true);
+    const text = result.content.map((c) => c.text || "").join("\n");
+    assert.match(text, /"winner":"A"/);
+    // v2.5 decider output: the ranked list with per-rewrite faithful flags passes through the text output intact
+    const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
+    // single JSON object {winner, text, why, ranked}; ranked always lists all five writers, a skipped one as missing
+    assert.deepEqual(Object.keys(json).sort(), ["ranked", "text", "why", "winner"]);
+    assert.deepEqual(json.ranked.map((r) => [r.writer, r.faithful, r.disqualified]), [["A", true, false], ["C", true, false], ["E", true, false], ["D", true, true], ["B", false, true]]);
+    assert.equal(json.ranked.find((r) => r.writer === "B").reason, "missing");
+    // eligible first: no disqualified:false entry may follow a disqualified one
+    const firstDq = json.ranked.findIndex((r) => r.disqualified);
+    assert.ok(firstDq === -1 || json.ranked.slice(firstDq).every((r) => r.disqualified), "an eligible entry follows a disqualified one");
+    assert.equal(json.ranked.find((r) => r.writer === json.winner).disqualified, false);
+    assert.equal(judgePrompts.length, 1);
+    assert.match(judgePrompts[0], /\[ORIGINAL\]\nThanks for sharing this\./);
+    assert.match(judgePrompts[0], /\[A\]\nrewrite by qwen\/qwen3\.8-27b-novelist/);
+    assert.doesNotMatch(judgePrompts[0], /\[B\]/, "the failed writer's block is missing");
+    assert.match(judgePrompts[0], /\[C\]\nrewrite by gemma-4-12b-it-starry-ocean/);
+    assert.match(judgePrompts[0], /\[D\]\nrewrite by qwen\/qwen3\.8-27b-antislop/);
+    assert.match(judgePrompts[0], /\[E\]\nrewrite by inception\/mercury-3/);
+    assert.equal(json.ranked.length, 5);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

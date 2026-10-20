@@ -22,7 +22,7 @@
   ],
   "dependencies": {
     "nanocurrency": "^2.5.0",
-    "nanoodle": "^0.9.0"
+    "nanoodle": "file:vendor/nanoodle-0.9.0-7a57f9b.tgz"
   },
   "keywords": [
     "mcp",
