@@ -219,14 +219,14 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     req.on("end", () => {
       if (req.method !== "POST" || !req.url.includes("/chat/completions")) { res.writeHead(404); return res.end(); }
       const body = JSON.parse(raw);
-      if (body.model === "Gemma-4-31B-StyleTune") { // writer B's host rejects the call
+      if (body.model === "deepseek/deepseek-v4.1-flash-1017") { // writer B's host rejects the call
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: "bad request" }));
       }
       let content = "rewrite by " + body.model;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompts.push(body.messages[body.messages.length - 1].content);
-        content = JSON.stringify({ winner: "A", disqualified: {}, why: "most human", text: "rewrite by qwen/qwen3.8-27b-antislop" });
+        content = JSON.stringify({ winner: "A", ranked: [{ label: "A", faithful: true, note: "most human" }, { label: "C", faithful: true, note: "ok" }, { label: "D", faithful: true, note: "flat" }, { label: "B", faithful: false, note: "missing" }], disqualified: { B: "writer failed" }, why: "most human", text: "rewrite by qwen/qwen3.8-27b-novelist" });
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -242,12 +242,15 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.notEqual(result.isError, true);
     const text = result.content.map((c) => c.text || "").join("\n");
     assert.match(text, /"winner":"A"/);
+    // v2.5 decider output: the ranked list with per-rewrite faithful flags passes through the text output intact
+    const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
+    assert.deepEqual(json.ranked.map((r) => [r.label, r.faithful]), [["A", true], ["C", true], ["D", true], ["B", false]]);
     assert.equal(judgePrompts.length, 1);
     assert.match(judgePrompts[0], /\[ORIGINAL\]\nThanks for sharing this\./);
-    assert.match(judgePrompts[0], /\[A\]\nrewrite by qwen/);
+    assert.match(judgePrompts[0], /\[A\]\nrewrite by qwen\/qwen3\.8-27b-novelist/);
     assert.doesNotMatch(judgePrompts[0], /\[B\]/, "the failed writer's block is missing");
-    assert.match(judgePrompts[0], /\[C\]\nrewrite by thedrummer/);
-    assert.match(judgePrompts[0], /\[D\]\nrewrite by google/);
+    assert.match(judgePrompts[0], /\[C\]\nrewrite by gemma-4-12b-it-starry-ocean/);
+    assert.match(judgePrompts[0], /\[D\]\nrewrite by qwen\/qwen3\.8-27b-antislop/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
