@@ -226,7 +226,7 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
       let content = "rewrite by " + body.model;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompts.push(body.messages[body.messages.length - 1].content);
-        content = JSON.stringify({ winner: "A", ranked: [{ label: "A", faithful: true, note: "most human" }, { label: "C", faithful: true, note: "ok" }, { label: "D", faithful: true, note: "flat" }, { label: "B", faithful: false, note: "missing" }], disqualified: { B: "writer failed" }, why: "most human", text: "rewrite by qwen/qwen3.8-27b-novelist" });
+        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", faithful: true, disqualified: true, reason: "banned phrase" }, { writer: "B", faithful: false, disqualified: true, reason: "missing" }] });
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -244,7 +244,11 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.match(text, /"winner":"A"/);
     // v2.5 decider output: the ranked list with per-rewrite faithful flags passes through the text output intact
     const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
-    assert.deepEqual(json.ranked.map((r) => [r.label, r.faithful]), [["A", true], ["C", true], ["D", true], ["B", false]]);
+    // single JSON object {winner, text, why, ranked}; ranked always lists all four writers, a skipped one as missing
+    assert.deepEqual(Object.keys(json).sort(), ["ranked", "text", "why", "winner"]);
+    assert.deepEqual(json.ranked.map((r) => [r.writer, r.faithful, r.disqualified]), [["A", true, false], ["C", true, false], ["D", true, true], ["B", false, true]]);
+    assert.equal(json.ranked.find((r) => r.writer === "B").reason, "missing");
+    assert.equal(json.ranked.find((r) => r.writer === json.winner).disqualified, false);
     assert.equal(judgePrompts.length, 1);
     assert.match(judgePrompts[0], /\[ORIGINAL\]\nThanks for sharing this\./);
     assert.match(judgePrompts[0], /\[A\]\nrewrite by qwen\/qwen3\.8-27b-novelist/);
