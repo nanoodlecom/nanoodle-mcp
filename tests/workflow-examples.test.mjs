@@ -204,6 +204,18 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
     assert.deepEqual(mounted.x402, { usd: 0.0133 });
+    // the decider cap keeps the full-maxTokens worst case (max Draft + Context, every
+    // writer at 600 tokens, decider at its cap, 3 chars/token) plus the 20% markup under the pin.
+    // GLM-5.3 $0.60/$1.10 per M; writers $0.05-$0.10 in, $0.25-$0.60 out per M (NanoGPT, 20 Oct 2026).
+    const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
+    const judge = graph.nodes.find((n) => n.id === "judge");
+    assert.equal(judge.fields.maxTokens, "4300");
+    const writerIn = (3200 + 1500 + 3500 + 60) / 3;
+    const writers = [[0.1, 0.6], [0.1, 0.6], [0.05, 0.25], [0.1, 0.6], [0.1, 0.35]]
+      .reduce((sum, [p, c]) => sum + writerIn * p + 600 * c, 0);
+    const judgeIn = (3774 + 3500 + 1500 + 60 + 300) / 3 + 5 * 600;
+    const worst = (writers + judgeIn * 0.6 + Number(judge.fields.maxTokens) * 1.1) / 1e6;
+    assert.ok(worst * 1.2 <= mounted.x402.usd, `worst case ${(worst * 1.2).toFixed(5)} > pin`);
     assert.equal(mounted.card.sample, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
