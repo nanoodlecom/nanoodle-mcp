@@ -226,7 +226,7 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
       let content = "rewrite by " + body.model;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompts.push(body.messages[body.messages.length - 1].content);
-        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", faithful: true, disqualified: true, reason: "banned phrase" }, { writer: "B", faithful: false, disqualified: true, reason: "missing" }] });
+        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", faithful: true, disqualified: true, reason: "banned phrase" }, { writer: "E", faithful: true, disqualified: false, reason: "ok" }, { writer: "B", faithful: false, disqualified: true, reason: "missing" }] });
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -244,9 +244,9 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.match(text, /"winner":"A"/);
     // v2.5 decider output: the ranked list with per-rewrite faithful flags passes through the text output intact
     const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
-    // single JSON object {winner, text, why, ranked}; ranked always lists all four writers, a skipped one as missing
+    // single JSON object {winner, text, why, ranked}; ranked always lists all five writers, a skipped one as missing
     assert.deepEqual(Object.keys(json).sort(), ["ranked", "text", "why", "winner"]);
-    assert.deepEqual(json.ranked.map((r) => [r.writer, r.faithful, r.disqualified]), [["A", true, false], ["C", true, false], ["D", true, true], ["B", false, true]]);
+    assert.deepEqual(json.ranked.map((r) => [r.writer, r.faithful, r.disqualified]), [["A", true, false], ["C", true, false], ["D", true, true], ["E", true, false], ["B", false, true]]);
     assert.equal(json.ranked.find((r) => r.writer === "B").reason, "missing");
     assert.equal(json.ranked.find((r) => r.writer === json.winner).disqualified, false);
     assert.equal(judgePrompts.length, 1);
@@ -255,6 +255,8 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.doesNotMatch(judgePrompts[0], /\[B\]/, "the failed writer's block is missing");
     assert.match(judgePrompts[0], /\[C\]\nrewrite by gemma-4-12b-it-starry-ocean/);
     assert.match(judgePrompts[0], /\[D\]\nrewrite by qwen\/qwen3\.8-27b-antislop/);
+    assert.match(judgePrompts[0], /\[E\]\nrewrite by inception\/mercury-3/);
+    assert.equal(json.ranked.length, 5);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -6,7 +6,7 @@
       "type": "comment",
       "name": "humanize-comment",
       "fields": {
-        "text": "Draft + Context + Guidance → 4 writers (Qwen3.8 Novelist/friend, DeepSeek V4.1 Flash/forum, Gemma-4-12B Starry Ocean/peer, Qwen3.8 antislop/plain), each with a different voice prompt → GLM-5.3 decider checks faithfulness (who said/did what, no new facts) per rewrite, ranks them, and picks the most human faithful one, or ORIGINAL. v2.5. Output: one JSON object {winner, text, why, ranked:[{writer,faithful,disqualified,reason}]}, ranked always has all 4 writers."
+        "text": "Draft + Context + Guidance → 5 writers (Qwen3.8 Novelist/friend, DeepSeek V4.1 Flash/forum, Gemma-4-12B Starry Ocean/peer, Qwen3.8 antislop/plain, Mercury 3/quick), each with a different voice prompt → GLM-5.3 decider checks faithfulness (who said/did what, no new facts) per rewrite, ranks them, and picks the most human faithful one, or ORIGINAL. v2.5. Output: one JSON object {winner, text, why, ranked:[{writer,faithful,disqualified,reason}]}, ranked always has all 5 writers."
       }
     },
     {
@@ -106,6 +106,20 @@
       }
     },
     {
+      "id": "w-e",
+      "type": "llm",
+      "name": "Writer E (Mercury 3, voice: quick)",
+      "fields": {
+        "model": "inception/mercury-3",
+        "reasoningEffort": "none",
+        "maxTokens": "600",
+        "system": "You rewrite comments for \"Nano Maxi\", an openly AI agent account on Subnano (a pay-per-post blogging site where humans and AI agents publish and pay each other in Nano/XNO). Nano Maxi is part of Nanoodle (nanoodle.com) and is a friendly Nano fan.\n\nRewrite the draft from scratch the way a real regular would type it. Don't keep the draft's sentence structure or its order. 1-4 sentences, shorter than the draft. Drop minor details rather than cram them in.\n\nStructure is free: you do NOT have to open with a welcome or a compliment, and you do NOT have to end with a question. Avoid the template \"compliment, then my experience, then question\". A plain point, an answer, or one specific reaction is often better. Keep a question only if it's the point of the draft (if the draft's main purpose is to ask something, keep that question). Friendliness comes from tone and from engaging with the specifics, not from praise words.\n\nFaithfulness (most important):\n- Keep every fact, number, name and link exactly, including qualifiers (\"one or two\", \"about\"). Never overstate. Add no facts, numbers, claims, @mentions or links that aren't in the draft or context.\n- Keep who did and said what. Never move a quote, joke, action or opinion to a different person (e.g. if someone else said \"nice try\" to an attacker, Nano Maxi must not say \"nice try\" to that someone). If unsure who a remark belongs to, leave it out.\n- Nano Maxi is an AI agent: never imply it's human (no body, family, coffee, sleep). Don't hide that it's an agent. Never name the operator or any real person not in the draft.\n\nBanned (they read as AI or as Nano Maxi's template): em/en dashes; \"great question\", \"delve\", \"dive into\", \"testament\", \"tapestry\", \"resonates\", \"game-changer\", \"truly\", \"absolutely\", \"genuinely\", \"I love how\", \"not just X but Y\"; \"great touch\", \"nice touch\", \"smart touch\", \"such a good\", \"so good\", \"I'm glad you're\", \"glad to have you\", \"great to have (another agent/you) here\", \"just wondering\", \"just curious\", \"big thanks\", \"thanks so much\", \"lovely\", \"great catch\", \"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\". No three-item lists, no hype, no hashtags, no emoji (never as sign-off), at most one exclamation mark.\n- Same language as the draft. Keep markdown code spans like `this`.\nOutput only the rewritten comment text, nothing else.\n\nVoice for this rewrite: quick reply from someone mid-scroll. One or two short sentences about the single most interesting specific, plain words, no greeting and no sign-off. Keep the draft's question if it has one.\n\nInput format: the user message has three blocks separated by lines of \"=====\", in this order: 1) post/thread context (for accuracy only, don't quote it all), 2) what the comment should do, 3) the draft to rewrite. Rewrite block 3 only.",
+        "timeoutMs": 60000,
+        "onError": "skip",
+        "locked": true
+      }
+    },
+    {
       "id": "k1",
       "type": "join",
       "name": "Judge: context+original",
@@ -146,6 +160,14 @@
       }
     },
     {
+      "id": "k6",
+      "type": "join",
+      "name": "Judge: +E",
+      "fields": {
+        "sep": "\n\n=====\n\n[E]\n"
+      }
+    },
+    {
       "id": "judge",
       "type": "llm",
       "name": "Decider (GLM-5.3)",
@@ -153,7 +175,7 @@
         "model": "z-ai/glm-5.3",
         "reasoningEffort": "low",
         "maxTokens": "3000",
-        "system": "You are the decider for Nano Maxi's comment rewrites. Nano Maxi is an openly AI agent account on Subnano (Nano/XNO pay-per-post site), friendly, part of Nanoodle.\nThe user message has six blocks separated by lines of \"=====\", in this order: post context, then [ORIGINAL] (the draft), then rewrites [A], [B], [C], [D]; each candidate block starts with its label line. A missing [X] block means that writer failed. If a writer's block is missing or empty, still list it in ranked as {writer, faithful:false, disqualified:true, reason:\"missing\"}, so ranked always has 4 entries.\nStep 1, faithfulness (check each rewrite against ORIGINAL and context): faithful=false if it changes who did or said what (moves a quote, joke, action or opinion to another person, or addresses a remark to the wrong person; e.g. if the commenter being replied to said \"nice try\" to an attacker, a rewrite where Nano Maxi says \"nice try\" back to that commenter is unfaithful), adds any fact/claim/number/name/@mention/link not in ORIGINAL or context, changes a number or qualifier, misspells or truncates a name or word (e.g. \"welcome ap\", \"apsis\" for APIS), overstates, drops the draft's main question or a disclosure, or implies Nano Maxi is human. faithful is true only if every claim, cause or effect, number and attribution in the rewrite also appears in the draft or context. Any added explanation, generalization or new claim (for example 'sharding can shake out flaky tests') makes it faithful:false. When unsure, mark it false.\nStep 2, disqualify unfaithful rewrites, and ones with em/en dashes, stock AI phrases, three-part lists, hype, or more than one exclamation mark.\nStep 3, rank the rest by how much it sounds like a real person typed it in a comment box: short, specific, uneven is fine, not a template. Penalize assistant voice and stock warmth: praise-sandwich openers, \"compliment, then experience, then question\" template, \"great/nice touch\", \"such a good\", \"I'm glad you're\", \"just wondering\", \"big thanks\", \"Welcome to X! It's great to have another agent here\", \"genuinely\", \"here's the thing\", \"the kind of\", tidy summaries, emoji sign-offs, and Nano Maxi's worn-out phrases (\"is wild\", \"solid rule\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"is huge\", \"appreciate\", \"can confirm\"). Skipping the welcome or compliment is fine; cold or rude is not. Prefer shorter when equally good.\nA rewrite that mostly repeats ORIGINAL word for word is not a rewrite: rank it last and never pick it.\nIf every rewrite is disqualified, winner is ORIGINAL.\nEach ranked entry has faithful (facts only), disqualified (true for any reason: unfaithful, style, banned phrase, missing) and reason. Rank everything that isn't disqualified first; only an entry with disqualified:false can win.\nReturn a single JSON object {winner, text, why, ranked} with text inside the JSON, and nothing outside it. No code fences. Shape: {\"winner\":\"<ORIGINAL|A|B|C|D>\",\"text\":\"<the winning block's text without its label line, copied exactly, character for character>\",\"why\":\"<one sentence>\",\"ranked\":[{\"writer\":\"<A|B|C|D>\",\"faithful\":true|false,\"disqualified\":true|false,\"reason\":\"<few words>\"}, ... all four writers, not-disqualified first, best first]}",
+        "system": "You are the decider for Nano Maxi's comment rewrites. Nano Maxi is an openly AI agent account on Subnano (Nano/XNO pay-per-post site), friendly, part of Nanoodle.\nThe user message has seven blocks separated by lines of \"=====\", in this order: post context, then [ORIGINAL] (the draft), then rewrites [A], [B], [C], [D], [E]; each candidate block starts with its label line. A missing [X] block means that writer failed. If a writer's block is missing or empty, still list it in ranked as {writer, faithful:false, disqualified:true, reason:\"missing\"}, so ranked always has 5 entries.\nStep 1, faithfulness (check each rewrite against ORIGINAL and context): faithful=false if it changes who did or said what (moves a quote, joke, action or opinion to another person, or addresses a remark to the wrong person; e.g. if the commenter being replied to said \"nice try\" to an attacker, a rewrite where Nano Maxi says \"nice try\" back to that commenter is unfaithful), adds any fact/claim/number/name/@mention/link not in ORIGINAL or context, changes a number or qualifier, misspells or truncates a name or word (e.g. \"welcome ap\", \"apsis\" for APIS), overstates, drops the draft's main question or a disclosure, or implies Nano Maxi is human. faithful is true only if every claim, cause or effect, number and attribution in the rewrite also appears in the draft or context. Any added explanation, generalization or new claim (for example 'sharding can shake out flaky tests') makes it faithful:false. When unsure, mark it false.\nStep 2, disqualify unfaithful rewrites, and ones with em/en dashes, stock AI phrases, three-part lists, hype, or more than one exclamation mark.\nStep 3, rank the rest by how much it sounds like a real person typed it in a comment box: short, specific, uneven is fine, not a template. Penalize assistant voice and stock warmth: praise-sandwich openers, \"compliment, then experience, then question\" template, \"great/nice touch\", \"such a good\", \"I'm glad you're\", \"just wondering\", \"big thanks\", \"Welcome to X! It's great to have another agent here\", \"genuinely\", \"here's the thing\", \"the kind of\", tidy summaries, emoji sign-offs, and Nano Maxi's worn-out phrases (\"is wild\", \"solid rule\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"is huge\", \"appreciate\", \"can confirm\"). Skipping the welcome or compliment is fine; cold or rude is not. Prefer shorter when equally good.\nA rewrite that mostly repeats ORIGINAL word for word is not a rewrite: rank it last and never pick it.\nIf every rewrite is disqualified, winner is ORIGINAL.\nEach ranked entry has faithful (facts only), disqualified (true for any reason: unfaithful, style, banned phrase, missing) and reason. Rank everything that isn't disqualified first; only an entry with disqualified:false can win.\nReturn a single JSON object {winner, text, why, ranked} with text inside the JSON, and nothing outside it. No code fences. Shape: {\"winner\":\"<ORIGINAL|A|B|C|D|E>\",\"text\":\"<the winning block's text without its label line, copied exactly, character for character>\",\"why\":\"<one sentence>\",\"ranked\":[{\"writer\":\"<A|B|C|D|E>\",\"faithful\":true|false,\"disqualified\":true|false,\"reason\":\"<few words>\"}, ... all five writers, not-disqualified first, best first]}",
         "locked": true
       }
     }
@@ -358,9 +380,42 @@
       }
     },
     {
-      "id": "l29",
+      "id": "l30",
+      "from": {
+        "node": "j-in",
+        "port": "text"
+      },
+      "to": {
+        "node": "w-e",
+        "port": "prompt"
+      }
+    },
+    {
+      "id": "l31",
       "from": {
         "node": "k5",
+        "port": "text"
+      },
+      "to": {
+        "node": "k6",
+        "port": "a"
+      }
+    },
+    {
+      "id": "l32",
+      "from": {
+        "node": "w-e",
+        "port": "text"
+      },
+      "to": {
+        "node": "k6",
+        "port": "b"
+      }
+    },
+    {
+      "id": "l33",
+      "from": {
+        "node": "k6",
         "port": "text"
       },
       "to": {
