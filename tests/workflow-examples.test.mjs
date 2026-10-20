@@ -226,7 +226,7 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
       let content = "rewrite by " + body.model;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompts.push(body.messages[body.messages.length - 1].content);
-        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", faithful: true, disqualified: true, reason: "banned phrase" }, { writer: "B", faithful: false, disqualified: true, reason: "missing" }] });
+        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", model: "qwen/qwen3.8-27b-novelist", text: "rewrite by qwen/qwen3.8-27b-novelist", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", model: "gemma-4-12b-it-starry-ocean", text: "rewrite by gemma-4-12b-it-starry-ocean", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", model: "inception/mercury-3", text: "rewrite by inception/mercury-3", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", model: "qwen/qwen3.8-27b-antislop", text: "rewrite by qwen/qwen3.8-27b-antislop", faithful: true, disqualified: true, reason: "near-copy" }, { writer: "B", model: "deepseek/deepseek-v4.1-flash-1017", text: "", faithful: false, disqualified: true, reason: "missing" }] });
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -254,12 +254,18 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.equal(json.ranked.find((r) => r.writer === json.winner).disqualified, false);
     assert.equal(judgePrompts.length, 1);
     assert.match(judgePrompts[0], /\[ORIGINAL\]\nThanks for sharing this\./);
-    assert.match(judgePrompts[0], /\[A\]\nrewrite by qwen\/qwen3\.8-27b-novelist/);
+    assert.match(judgePrompts[0], /\[A\] qwen\/qwen3\.8-27b-novelist\nrewrite by qwen\/qwen3\.8-27b-novelist/);
     assert.doesNotMatch(judgePrompts[0], /\[B\]/, "the failed writer's block is missing");
-    assert.match(judgePrompts[0], /\[C\]\nrewrite by gemma-4-12b-it-starry-ocean/);
-    assert.match(judgePrompts[0], /\[D\]\nrewrite by qwen\/qwen3\.8-27b-antislop/);
-    assert.match(judgePrompts[0], /\[E\]\nrewrite by inception\/mercury-3/);
+    assert.match(judgePrompts[0], /\[C\] gemma-4-12b-it-starry-ocean\nrewrite by gemma-4-12b-it-starry-ocean/);
+    assert.match(judgePrompts[0], /\[D\] qwen\/qwen3\.8-27b-antislop\nrewrite by qwen\/qwen3\.8-27b-antislop/);
+    assert.match(judgePrompts[0], /\[E\] inception\/mercury-3\nrewrite by inception\/mercury-3/);
     assert.equal(json.ranked.length, 5);
+    // every ranked entry carries its model name and full text; the decider copies them from the labelled blocks
+    for (const r of json.ranked) {
+      assert.equal(typeof r.model, "string"); assert.equal(typeof r.text, "string");
+      if (r.reason !== "missing") assert.equal(r.text, "rewrite by " + r.model);
+    }
+    assert.equal(json.ranked.find((r) => r.writer === "E").model, "inception/mercury-3");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
