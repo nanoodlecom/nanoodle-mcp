@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
+import { HUMANIZE_INPUT_CAPS } from "../src/humanize.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -204,19 +205,111 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
     assert.deepEqual(mounted.x402, { usd: 0.0133 });
-    // the decider cap keeps the full-maxTokens worst case (max Draft + Context, every
-    // writer at 600 tokens, decider at its cap, 3 chars/token) plus the 20% markup under the pin.
+    // ESTIMATE, not a hard bound: worst case at the ENFORCED input caps (src/humanize.mjs), every
+    // writer at its 600-token cap, the decider at its 4300-token cap, the judge re-reading five
+    // full 600-token rewrites, and inputs + system prompts at 3 characters per token. That is
+    // typical for English; a true bound (1 token per UTF-8 byte) is $0.0206 for ASCII and about
+    // $0.040 for 4-byte scripts, above the pin, and is not reachable without crippling inputs.
+    // When a run would cost more than the deposit, the deposit caps the charge.
     // GLM-5.3 $0.60/$1.10 per M; writers $0.05-$0.10 in, $0.25-$0.60 out per M (NanoGPT, 20 Oct 2026).
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
-    const judge = graph.nodes.find((n) => n.id === "judge");
+    const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+    const judge = byId.get("judge");
     assert.equal(judge.fields.maxTokens, "4300");
-    const writerIn = (3200 + 1500 + 3500 + 60) / 3;
-    const writers = [[0.1, 0.6], [0.1, 0.6], [0.05, 0.25], [0.1, 0.6], [0.1, 0.35]]
-      .reduce((sum, [p, c]) => sum + writerIn * p + 600 * c, 0);
-    const judgeIn = (3774 + 3500 + 1500 + 60 + 300) / 3 + 5 * 600;
-    const worst = (writers + judgeIn * 0.6 + Number(judge.fields.maxTokens) * 1.1) / 1e6;
-    assert.ok(worst * 1.2 <= mounted.x402.usd, `worst case ${(worst * 1.2).toFixed(5)} > pin`);
+    const price = { "w-a": [0.1, 0.6], "w-b": [0.1, 0.6], "w-c": [0.05, 0.25], "w-d": [0.1, 0.6], "w-e": [0.1, 0.35] };
+    const bytes = (s) => Buffer.byteLength(s, "utf8");
+    const { Draft, Context, Guidance } = HUMANIZE_INPUT_CAPS;
+    const CPT = 3; // characters per token (estimate)
+    let worst = 0;
+    for (const [id, [p, c]] of Object.entries(price)) {
+      const n = byId.get(id);
+      assert.equal(n.fields.maxTokens, "600");
+      worst += ((bytes(n.fields.system) + Draft + Context + Guidance + 2 * bytes(byId.get("j-in").fields.sep)) / CPT) * p + 600 * c;
+    }
+    const seps = ["k1", "k2", "k3", "k4", "k5", "k6"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
+    worst += ((bytes(judge.fields.system) + Draft + Context + seps) / CPT + 5 * 600) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
+    worst /= 1e6;
+    assert.ok(worst * 1.2 <= mounted.x402.usd, `estimated worst case ${(worst * 1.2).toFixed(5)} > pin`);
+    // the caps are enforced before any money moves and advertised in the schema
+    assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
+    assert.equal(tool.inputSchema.properties.Context.maxLength, Context);
+    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance);
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "x".repeat(Draft + 1), Context: "c" } }),
+      (e) => e.mcpCode === -32602 && /"Draft" is 1501 characters; humanize-comment accepts at most 1500/.test(e.message));
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c".repeat(Context + 1) } }), /"Context" is 3501 characters.*at most 3500/);
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), /"Guidance" is 301 characters/);
+    // caps count code points, so a 1500-emoji draft is allowed and 1501 is not
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft), Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) } });
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft + 1), Context: "c" } }), /"Draft" is 1501 characters/);
     assert.equal(mounted.card.sample, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("humanize-comment: model credit and texts come from the writers by id, not from the decider's copy", async (t) => {
+  const { createServer } = await import("node:http");
+  // exact writer outputs, with characters an LLM likes to "fix" (curly quote, double space, trailing newline)
+  const outputs = {
+    "qwen/qwen3.8-27b-novelist": "Hey \u2014 that\u2019s  a big win, 14 to 6!\n",
+    "gemma-4-12b-it-starry-ocean": "Nice cut. What changed first?",
+    "qwen/qwen3.8-27b-antislop": "Good work on the CI time.",
+    "inception/mercury-3": "14 \u2192 6 min, love it.",
+  };
+  let judgeCalls = 0;
+  const srv = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      if (body.model === "deepseek/deepseek-v4.1-flash-1017") { // writer B really fails and is skipped (onError: skip)
+        res.writeHead(503, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "unavailable" }));
+      }
+      let content = outputs[body.model];
+      if (body.model === "z-ai/glm-5.3") {
+        judgeCalls++;
+        // the decider shifts model credit as if the labels slid up past the missing B block,
+        // paraphrases texts, ranks a missing writer as eligible and drops E entirely
+        content = JSON.stringify({ winner: "C", text: "Nice cut! What changed first?", why: "most human", ranked: [
+          { writer: "C", model: "qwen/qwen3.8-27b-antislop", text: "Nice cut! What changed first?", faithful: true, disqualified: false, reason: "fresh" },
+          { writer: "A", model: "deepseek/deepseek-v4.1-flash-1017", text: "Hey - that's a big win, 14 to 6!", faithful: true, disqualified: false, reason: "warm" },
+          { writer: "B", model: "gemma-4-12b-it-starry-ocean", text: "invented text", faithful: true, disqualified: false, reason: "ok" },
+          { writer: "D", model: "inception/mercury-3", text: "Good work on CI time.", faithful: true, disqualified: true, reason: "near-copy" },
+        ] });
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  t.after(() => srv.close());
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-credit-"));
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+    const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+    assert.notEqual(result.isError, true);
+    assert.equal(judgeCalls, 1);
+    const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
+    assert.deepEqual(Object.keys(json), ["winner", "text", "why", "ranked"]);
+    assert.equal(json.winner, "C");
+    assert.equal(json.text, outputs["gemma-4-12b-it-starry-ocean"], "top-level text is the winner's exact output");
+    const by = Object.fromEntries(json.ranked.map((r) => [r.writer, r]));
+    assert.deepEqual(json.ranked.map((r) => r.writer), ["C", "A", "B", "D", "E"]);
+    assert.deepEqual(Object.fromEntries(json.ranked.map((r) => [r.writer, r.model])), {
+      A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "gemma-4-12b-it-starry-ocean",
+      D: "qwen/qwen3.8-27b-antislop", E: "inception/mercury-3",
+    });
+    assert.equal(by.A.text, outputs["qwen/qwen3.8-27b-novelist"], "byte-exact, not the decider's paraphrase");
+    assert.equal(by.C.text, outputs["gemma-4-12b-it-starry-ocean"]);
+    assert.equal(by.D.text, outputs["qwen/qwen3.8-27b-antislop"]);
+    assert.equal(by.E.text, outputs["inception/mercury-3"], "a writer the decider dropped is still listed with its text");
+    assert.equal(by.E.disqualified, true);
+    // the skipped writer is missing no matter what the decider claimed
+    assert.deepEqual([by.B.text, by.B.faithful, by.B.disqualified, by.B.reason], ["", false, true, "missing"]);
+    // decider judgements kept where the writer exists
+    assert.deepEqual([by.C.disqualified, by.A.disqualified, by.D.disqualified, by.D.reason], [false, false, true, "near-copy"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
