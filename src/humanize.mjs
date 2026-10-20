@@ -11,8 +11,9 @@
  * 3. Exact ranked text. After the decider, every ranked entry's model and text
  *    (and the top-level text) are rebuilt from the writers' own outputs by id;
  *    the decider's copy is discarded. A writer with no output gets text "" and is
- *    forced to disqualified/missing. The decider still decides winner, why,
- *    order, faithful, disqualified and reason.
+ *    forced to disqualified/missing. The decider proposes winner, why, order,
+ *    faithful, disqualified and reason; rebuildHumanizeResult below lists the
+ *    exact rules that override it.
  */
 import { ParamsError } from "./tools.mjs";
 
@@ -50,18 +51,43 @@ export function checkHumanizeInputs(args) {
   }
 }
 
-/** Rewrite the decider's JSON in result.outputs in place. Returns a notice string or null. */
+/**
+ * Rewrite the decider's JSON in result.outputs in place. Returns a notice string or null.
+ *
+ * Guarantees of the rebuilt object {winner, text, why, ranked}:
+ *  - ranked lists A..E exactly once each; model always from the writer record, text always the
+ *    writer's own output ("" when it produced none). Eligible entries first, decider order kept.
+ *  - a writer with no output: faithful false, disqualified true, reason "missing".
+ *  - an entry with faithful !== true is forced to disqualified true, so it can never win.
+ *  - a writer the decider left out is added as disqualified.
+ *  - winner: the decider's pick if it is ORIGINAL or an eligible entry (faithful, not disqualified,
+ *    has text); otherwise the first eligible entry in ranked order (why then says so);
+ *    otherwise ORIGINAL.
+ *    text is the winner's exact output, or the draft for ORIGINAL.
+ *  - if the decider's reply is not valid JSON or has no ranked array, nothing of it is passed
+ *    through: winner ORIGINAL with the draft as text, every writer listed with its real text as
+ *    disqualified ("not judged: decider reply unusable", or "missing"), and a notice says so.
+ */
 export function rebuildHumanizeResult(wf, result, record) {
   const out = wf.outputs.find((o) => o.nodeId === "judge");
   if (!out || typeof result.outputs[out.key] !== "string") return null;
-  let j;
-  try { j = JSON.parse(result.outputs[out.key]); } catch { return "note: the decider's reply was not valid JSON, so it is returned as is (texts not rebuilt)."; }
-  if (!j || typeof j !== "object" || !Array.isArray(j.ranked)) return "note: the decider's reply had no ranked list, so it is returned as is (texts not rebuilt).";
   const textOf = (letter) => {
     const rec = result.nodes && result.nodes[record[letter].nodeId];
     const t = rec && rec.status === "done" && rec.out ? rec.out.text : undefined;
     return typeof t === "string" && t.trim() ? t : null;
   };
+  const draftRec = result.nodes && result.nodes.draft && result.nodes.draft.out;
+  const draft = draftRec && typeof draftRec.text === "string" ? draftRec.text : "";
+  let j = null;
+  try { j = JSON.parse(result.outputs[out.key]); } catch { j = null; }
+  if (!j || typeof j !== "object" || Array.isArray(j) || !Array.isArray(j.ranked)) {
+    const ranked = LETTERS.map((letter) => {
+      const text = textOf(letter);
+      return { writer: letter, model: record[letter].model, text: text ?? "", faithful: false, disqualified: true, reason: text == null ? "missing" : "not judged: decider reply unusable" };
+    });
+    result.outputs[out.key] = JSON.stringify({ winner: "ORIGINAL", text: draft, why: "The decider's reply was not usable, so the original draft is returned unchanged.", ranked });
+    return "note: the decider's reply was not valid JSON with a ranked list, so humanize-comment returned the original draft as the winner; the five rewrites are listed with their real texts, unjudged.";
+  }
   const seen = new Set();
   const ranked = [];
   for (const r of j.ranked) {
@@ -69,24 +95,30 @@ export function rebuildHumanizeResult(wf, result, record) {
     if (!record[letter] || seen.has(letter)) continue;
     seen.add(letter);
     const text = textOf(letter);
+    if (text == null) { ranked.push({ writer: letter, model: record[letter].model, text: "", faithful: false, disqualified: true, reason: "missing" }); continue; }
+    const faithful = r.faithful === true;
+    const reason = String(r.reason ?? "");
     ranked.push({
-      writer: letter, model: record[letter].model, text: text ?? "",
-      faithful: text == null ? false : r.faithful === true,
-      disqualified: text == null ? true : r.disqualified !== false,
-      reason: text == null ? "missing" : String(r.reason ?? ""),
+      writer: letter, model: record[letter].model, text, faithful,
+      disqualified: !faithful || r.disqualified !== false,
+      reason: !faithful && r.disqualified === false ? `unfaithful${reason ? ": " + reason : ""}` : reason,
     });
   }
   for (const letter of LETTERS) if (!seen.has(letter)) {
     const text = textOf(letter);
     ranked.push({ writer: letter, model: record[letter].model, text: text ?? "", faithful: false, disqualified: true, reason: text == null ? "missing" : "not ranked by the decider" });
   }
-  // eligible first, decider order kept within each group
   ranked.sort((a, b) => Number(a.disqualified) - Number(b.disqualified));
-  let winner = typeof j.winner === "string" ? j.winner.trim().toUpperCase() : "";
-  const win = ranked.find((r) => r.writer === winner);
-  if (!win || win.disqualified) winner = "ORIGINAL";
-  const draft = result.nodes && result.nodes.draft && result.nodes.draft.out ? result.nodes.draft.out.text : undefined;
-  const text = winner === "ORIGINAL" ? (typeof draft === "string" ? draft : String(j.text ?? "")) : win.text;
-  result.outputs[out.key] = JSON.stringify({ winner, text, why: String(j.why ?? ""), ranked });
+  const eligible = (r) => r && r.faithful && !r.disqualified && r.text !== "";
+  const picked = typeof j.winner === "string" ? j.winner.trim().toUpperCase() : "";
+  let winner = picked;
+  let why = String(j.why ?? "");
+  if (winner !== "ORIGINAL" && !eligible(ranked.find((r) => r.writer === winner))) {
+    const best = ranked.find(eligible);
+    winner = best ? best.writer : "ORIGINAL";
+    why = `The decider picked ${picked || "no winner"}, which is not eligible (unfaithful, disqualified, missing or unknown), so ${best ? "the best faithful, non-disqualified rewrite, " + winner + "," : "the original draft"} is used instead.`;
+  }
+  const text = winner === "ORIGINAL" ? draft : ranked.find((r) => r.writer === winner).text;
+  result.outputs[out.key] = JSON.stringify({ winner, text, why, ranked });
   return null;
 }

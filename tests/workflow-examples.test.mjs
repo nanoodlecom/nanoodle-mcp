@@ -208,9 +208,12 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // ESTIMATE, not a hard bound: worst case at the ENFORCED input caps (src/humanize.mjs), every
     // writer at its 600-token cap, the decider at its 4300-token cap, the judge re-reading five
     // full 600-token rewrites, and inputs + system prompts at 3 characters per token. That is
-    // typical for English; a true bound (1 token per UTF-8 byte) is $0.0206 for ASCII and about
-    // $0.040 for 4-byte scripts, above the pin, and is not reachable without crippling inputs.
-    // When a run would cost more than the deposit, the deposit caps the charge.
+    // typical for English. Result: $0.01325068 after markup, only $0.00004932 under the pin.
+    // Counting 1 token per UTF-8 byte gives $0.02062404 (ASCII) and $0.04001004 (4-byte scripts),
+    // both above the pin. Even those assume the judge sees about 3000 tokens of rewrites (5 x 600),
+    // which is not proven for multilingual text and not enforced in code.
+    // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
+    // pays no change or author payout, and the operator absorbs the provider cost above it.
     // GLM-5.3 $0.60/$1.10 per M; writers $0.05-$0.10 in, $0.25-$0.60 out per M (NanoGPT, 20 Oct 2026).
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
@@ -230,6 +233,7 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     worst += ((bytes(judge.fields.system) + Draft + Context + seps) / CPT + 5 * 600) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     worst /= 1e6;
     assert.ok(worst * 1.2 <= mounted.x402.usd, `estimated worst case ${(worst * 1.2).toFixed(5)} > pin`);
+    assert.equal((worst * 1.2).toFixed(8), "0.01325068", "the docs quote this exact estimate");
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);
@@ -313,6 +317,64 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+async function runHumanizeWith(t, judgeContent) {
+  const { createServer } = await import("node:http");
+  const srv = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      const content = body.model === "z-ai/glm-5.3" ? judgeContent : "rewrite by " + body.model;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  t.after(() => srv.close());
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-fb-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+  assert.notEqual(result.isError, true);
+  const block = result.content.find((c) => /^\{"winner"/.test(c.text || ""));
+  return { json: JSON.parse(block.text), texts: result.content.map((c) => c.text || "") };
+}
+const HC_MODELS = { A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "gemma-4-12b-it-starry-ocean", D: "qwen/qwen3.8-27b-antislop", E: "inception/mercury-3" };
+
+test("humanize-comment: an unusable decider reply is never passed through; ORIGINAL wins with real writer texts", async (t) => {
+  for (const bad of ['{"winner":"A","text":"oops", "ranked":[{"writer":"A"', '{"winner":"A","text":"made up","why":"x"}', "[]", "Sure! Here is my ranking: A"]) {
+    const { json, texts } = await runHumanizeWith(t, bad);
+    assert.deepEqual(Object.keys(json), ["winner", "text", "why", "ranked"]);
+    assert.equal(json.winner, "ORIGINAL");
+    assert.equal(json.text, "Thanks for sharing this.");
+    assert.deepEqual(json.ranked.map((r) => [r.writer, r.model, r.text, r.faithful, r.disqualified]),
+      Object.entries(HC_MODELS).map(([w, m]) => [w, m, "rewrite by " + m, false, true]));
+    assert.ok(json.ranked.every((r) => r.reason === "not judged: decider reply unusable"));
+    assert.ok(texts.some((x) => /^note: the decider's reply was not valid JSON with a ranked list/.test(x)), "a clear note leads the result");
+    assert.ok(!texts.some((x) => x.includes("made up") || x.includes("Sure!")), "nothing of the bad reply is passed through");
+  }
+});
+
+test("humanize-comment: an entry with faithful:false never wins, even if the decider picks it", async (t) => {
+  const e = (w, faithful, disqualified, reason = "ok") => ({ writer: w, model: HC_MODELS[w], text: "x", faithful, disqualified, reason });
+  // A is picked but unfaithful (and wrongly not disqualified) → best faithful eligible entry, C, wins
+  let { json } = await runHumanizeWith(t, JSON.stringify({ winner: "A", text: "x", why: "most human", ranked: [e("A", false, false, "adds a fact"), e("B", false, false), e("C", true, false), e("D", true, false), e("E", true, true, "near-copy")] }));
+  assert.equal(json.winner, "C");
+  assert.equal(json.text, "rewrite by " + HC_MODELS.C);
+  assert.match(json.why, /picked A, which is not eligible/);
+  assert.deepEqual(json.ranked.map((r) => [r.writer, r.faithful, r.disqualified]), [["C", true, false], ["D", true, false], ["A", false, true], ["B", false, true], ["E", true, true]]);
+  assert.equal(json.ranked.find((r) => r.writer === "A").reason, "unfaithful: adds a fact");
+  // a non-boolean faithful counts as unfaithful too; with nothing eligible left, ORIGINAL wins
+  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "B", text: "x", why: "w", ranked: [e("B", "true", false), e("A", false, false), e("C", true, true), e("D", true, true), e("E", true, true)] })));
+  assert.equal(json.winner, "ORIGINAL");
+  assert.equal(json.text, "Thanks for sharing this.");
+  assert.ok(json.ranked.every((r) => r.disqualified));
+  // the decider's own ORIGINAL pick stands
+  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: ["A", "B", "C", "D", "E"].map((w) => e(w, true, false)) })));
+  assert.deepEqual([json.winner, json.text, json.why], ["ORIGINAL", "Thanks for sharing this.", "all near-copies"]);
 });
 
 test("humanize-comment: a failed writer is skipped and the decider still returns a result", async (t) => {
