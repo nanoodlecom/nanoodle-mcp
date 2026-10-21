@@ -437,9 +437,9 @@ export function checkHumanizeInputs(args) {
  *  - a writer with no output: faithful false, disqualified true, reason "missing".
  *  - an entry with faithful !== true is forced to disqualified true, so it can never win.
  *  - a writer the decider left out is added as disqualified.
- *  - winner: the decider's pick if it is ORIGINAL or an eligible entry (faithful, not disqualified,
- *    has text); otherwise the first eligible entry in ranked order (why then says so);
- *    otherwise ORIGINAL.
+ *  - winner: the decider's pick if it is an eligible entry (faithful, not disqualified, has text);
+ *    otherwise (including a decider pick of ORIGINAL) the first eligible entry in ranked order
+ *    (why then says so); ORIGINAL only when every rewrite is ineligible.
  *    text is the winner's exact output, or the draft for ORIGINAL.
  *  - if the decider's reply is not valid JSON or has no ranked array, nothing of it is passed
  *    through: winner ORIGINAL with the draft as text, every writer listed with its real text as
@@ -491,10 +491,15 @@ export function rebuildHumanizeResult(wf, result, record, answered = {}) {
   const picked = typeof j.winner === "string" ? j.winner.trim().toUpperCase() : "";
   let winner = picked;
   let why = String(j.why ?? "");
-  if (winner !== "ORIGINAL" && !eligible(ranked.find((r) => r.writer === winner))) {
-    const best = ranked.find(eligible);
+  const best = ranked.find(eligible);
+  if (winner === "ORIGINAL") {
+    if (best) {
+      winner = best.writer;
+      why = `The decider chose the original; overridden to the first eligible rewrite, ${winner}, because a rewrite has to survive while any is eligible.${why ? " Decider's reason: " + why : ""}`;
+    }
+  } else if (!eligible(ranked.find((r) => r.writer === winner))) {
     winner = best ? best.writer : "ORIGINAL";
-    why = `The decider picked ${picked || "no winner"}, which is not eligible (unfaithful, disqualified, missing or unknown), so ${best ? "the best faithful, non-disqualified rewrite, " + winner + "," : "the original draft"} is used instead.`;
+    why = `The decider picked ${picked || "no winner"}, which is not eligible (unfaithful, disqualified, missing or unknown), so ${best ? "the best faithful, non-disqualified rewrite, " + winner + "," : "the original draft, since every rewrite is ruled out,"} is used instead.`;
   }
   const text = winner === "ORIGINAL" ? draft : ranked.find((r) => r.writer === winner).text;
   result.outputs[out.key] = JSON.stringify({ winner, text, why, ranked });

@@ -387,9 +387,16 @@ test("humanize-comment: an entry with faithful:false never wins, even if the dec
   assert.equal(json.winner, "ORIGINAL");
   assert.equal(json.text, "Thanks for sharing this.");
   assert.ok(json.ranked.every((r) => r.disqualified));
-  // the decider's own ORIGINAL pick stands
-  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: ["A", "B", "C", "D", "E"].map((w) => e(w, true, false)) })));
+  // a decider ORIGINAL pick is overridden while any rewrite is eligible: the first eligible ranked rewrite wins
+  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: [e("A", true, true, "near-copy"), e("B", true, false), e("C", true, false), e("D", false, false), e("E", true, true)] })));
+  assert.equal(json.winner, "B");
+  assert.equal(json.text, "rewrite by " + HC_MODELS.B);
+  assert.match(json.why, /decider chose the original; overridden to the first eligible rewrite, B/);
+  assert.match(json.why, /all near-copies/);
+  // ORIGINAL only when every rewrite is ineligible, even if the decider picked ORIGINAL
+  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: [e("A", true, true), e("B", false, false), e("C", true, true), e("D", "true", false), e("E", true, true)] })));
   assert.deepEqual([json.winner, json.text, json.why], ["ORIGINAL", "Thanks for sharing this.", "all near-copies"]);
+  assert.ok(json.ranked.every((r) => r.disqualified));
 });
 
 test("humanize-comment v2.7: C falls back on 429 and is credited, dashes are fixed and a near-copy is re-asked before the decider", async (t) => {
