@@ -98,6 +98,14 @@ const usdOf = (j, r) => {
   return isNaN(h) ? null : h;
 };
 
+/** A request error that provably happened before the request was written (so nothing was billed). */
+const BEFORE_SEND = new Set(["ENOTFOUND", "EAI_AGAIN", "EAI_NONAME", "ECONNREFUSED", "ERR_INVALID_URL", "UND_ERR_INVALID_ARG"]);
+export function failedBeforeSend(e, signal) {
+  if (signal && signal.aborted && e === signal.reason && e && e.beforeSend === true) return true;
+  for (let x = e, i = 0; x && i < 4; x = x.cause, i++) if (x.code && BEFORE_SEND.has(x.code)) return true;
+  return false;
+}
+
 /**
  * Per-run fetch wrapper for humanize-comment writer calls (see 4. above).
  * Returns { fetch, state }: state.answered[letter] = model that answered,
@@ -138,6 +146,19 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     signal.addEventListener("abort", on, { once: true });
     p.then((v) => { signal.removeEventListener("abort", on); res(v); }, (e) => { signal.removeEventListener("abort", on); rej(e); });
   });
+  /**
+   * Cost of an attempt that ended without a usable answer: a known payment counts; a started but
+   * unconfirmed payment is unknown; an x402 request that was never paid is free; a keyed request
+   * is free only when it provably failed before being sent, otherwise it may have been billed (unknown).
+   */
+  const failCost = (rec, x402) => {
+    if (!rec) return 0;
+    if (rec.paid) { rec.counted = true; return rec.usd; }
+    if (rec.paymentStarted) return null;
+    if (rec.status !== "request error" && rec.status != null && rec.usd != null) return rec.usd;
+    if (x402) return 0;
+    return rec.beforeSend ? 0 : null;
+  };
   const jsonResponse = (j, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
 
   const wrapped = async (url, init = {}) => {
@@ -163,7 +184,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       mine.push(rec);
       state.attempts.push(rec);
       const req = { ...init, signal, body: bodyStr };
-      let r = await fetch(url, req);
+      let r;
+      if (signal && signal.aborted) { rec.status = "request error"; rec.beforeSend = true; throw signal.reason; } // never sent
+      try { r = await fetch(url, req); }
+      catch (e) { rec.status = "request error"; rec.beforeSend = failedBeforeSend(e, signal); throw e; }
       if (r.status === 402 && x402) {
         const raw = await r.text();
         let inv = null;
@@ -181,7 +205,18 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         // proves nothing was sent (an error carrying paymentNotSent === true)
         rec.paymentStarted = true;
         try {
-          await raceAbort(Promise.resolve().then(() => payment(inv)), signal);
+          const paying = Promise.resolve().then(() => payment(inv));
+          // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
+          paying.then(() => {
+            if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
+            rec.paid = true; rec.paymentAmbiguous = false; rec.usd = inv.amountUsd; rec.counted = true;
+            if (Number.isFinite(inv.amountUsd)) state.unreportedUsd += inv.amountUsd; else state.costUnknown = true;
+            const c = state.reconcile.find((x) => x.paymentId === inv.paymentId);
+            if (c) { c.ambiguous = false; c.status = "paid after the writer stopped waiting; its result was not used"; c.late = true; }
+            if (state.paidFailed[letter] && state.paidFailed[letter].paymentId === inv.paymentId) state.paidFailed[letter].ambiguous = false;
+            if (typeof state.onLate === "function") state.onLate(c || { letter, kind, paymentId: inv.paymentId, amountUsd: inv.amountUsd });
+          }, () => {});
+          await raceAbort(paying, signal);
         } catch (e) {
           if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
           rec.paymentAmbiguous = true;
@@ -253,15 +288,14 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           if (res.r.status === 429 || res.r.status >= 500) reason = `HTTP ${res.r.status}`;
         } catch (e) {
           const rec = lastMine();
+          addCost(failCost(rec, x402)); // unknown (lower bound) unless provably free or a known payment
           if (rec && (rec.paid || rec.paymentStarted)) {
-            addCost(rec.paid ? rec.usd : null); // ambiguous: not charged, total marked as a lower bound
             state.paidFailed[letter] = { model: body.model, status: rec.status, paymentId: rec.paymentId, ambiguous: !rec.paid };
             throw e;
           }
           if (init.signal && init.signal.aborted) throw e;
           if (e && e.code && /^x402/.test(e.code)) throw e;
           reason = ac.signal.aborted ? `no answer in ${Math.round(primaryTimeoutMs / 1000)} s` : "request error";
-          if (ac.signal.aborted && !x402) usdKnown = false; // an abandoned keyed request may still be billed
         } finally {
           clearTimeout(timer);
           if (init.signal) init.signal.removeEventListener("abort", onOuter);
@@ -276,8 +310,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           try {
             res = await attempt({ ...body, model: fb }, "fallback", init.signal);
           } catch (e) {
-            const rec = lastMine();
-            if (rec) addCost(rec.paymentStarted && !rec.paid ? null : rec.usd);
+            addCost(failCost(lastMine(), x402));
             state.fallback[letter].failed = "request error";
             throw e;
           }
@@ -286,7 +319,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         }
       } else {
         try { res = await attempt(body, "primary", init.signal); }
-        catch (e) { const rec = lastMine(); if (rec) addCost(rec.paymentStarted && !rec.paid ? null : rec.usd); throw e; }
+        catch (e) { addCost(failCost(lastMine(), x402)); throw e; }
         addCost(res.rec.usd);
       }
     } catch (e) { lose(); throw e; }
@@ -328,12 +361,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           text = t2;
         } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
       } catch (e) {
-        if (init.signal && init.signal.aborted) { lose(); throw e; }
         const rec = lastMine();
-        if (rec && rec.kind === "reask") {
-          if (rec.paid) addCost(rec.usd);
-          else if (rec.paymentStarted) usdKnown = false; // ambiguous payment: lower bound
-          else if (ac.signal.aborted && !x402) usdKnown = false;
+        // cost first, on every exit (outer cancel included): known payments stay in the totals,
+        // unconfirmed ones flag the total as a lower bound and stay in state.reconcile
+        if (rec && rec.kind === "reask") addCost(failCost(rec, x402));
+        if (init.signal && init.signal.aborted) {
+          state.reasked[letter] = { ratio, after: null, failed: "cancelled" };
+          lose(); throw e;
         }
         state.reasked[letter] = { ratio, after: null, failed: ac.signal.aborted ? `no answer within ${Math.round(reaskEndMs / 1000)} s of the writer call` : "request error" };
       } finally {

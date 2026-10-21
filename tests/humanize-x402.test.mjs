@@ -294,3 +294,92 @@ test("cost flag through tools: an ambiguous writer payment makes the tool's cost
   assert.ok(texts.some((x) => /^cost: \$0\.0005 \(a lower bound/.test(x)), texts.find((x) => /^cost/.test(x)));
   assert.ok(texts.some((x) => /Reconcile that invoice/.test(x)));
 });
+
+// ---- round 5 ----
+const keyed = (model, messages = [{ role: "user", content: "hi" }]) => ({ method: "POST", headers: { Authorization: "Bearer k" }, body: JSON.stringify({ model, messages }) });
+const fetchFailed = (code) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(code), { code }) });
+
+test("keyed mode: a reset after send flags the cost as uncertain; a refused-before-write failure is free", async () => {
+  const { humanizeFetch } = await import("../src/humanize.mjs");
+  let hf = humanizeFetch({ record: REC, draft: "", fetch: async () => { throw fetchFailed("ECONNRESET"); } });
+  await assert.rejects(hf.fetch(CHAT, keyed("d")), /fetch failed/);
+  assert.equal(hf.state.costUnknown, true, "ECONNRESET after send: may have been billed");
+  hf = humanizeFetch({ record: REC, draft: "", fetch: async () => { throw fetchFailed("ECONNREFUSED"); } });
+  await assert.rejects(hf.fetch(CHAT, keyed("d")), /fetch failed/);
+  assert.equal(hf.state.costUnknown, false, "refused before the write: provably not billed");
+  hf = humanizeFetch({ record: REC, draft: "", fetch: async () => { throw fetchFailed("ENOTFOUND"); } });
+  await assert.rejects(hf.fetch(CHAT, keyed("d")), /fetch failed/);
+  assert.equal(hf.state.costUnknown, false, "DNS failure: never sent");
+  // a reset on the Cydonia primary: falls back (nothing paid), but the total is a lower bound
+  hf = humanizeFetch({ record: REC, draft: "", fetch: async (u, init) => { if (JSON.parse(init.body).model === CYD) throw fetchFailed("ECONNRESET"); return okRes("from starry"); } });
+  const r = await hf.fetch(CHAT, keyed(CYD));
+  assert.equal(r.status, 200);
+  assert.equal(hf.state.answered.C, STARRY);
+  const j = await r.json();
+  assert.equal(j.x_nanogpt_pricing, undefined, "no exact price claimed");
+  assert.equal(hf.state.costUnknown, true);
+  assert.ok(near(hf.state.unreportedUsd, PRICE), "Starry's known price still counted");
+  // a reset during a keyed re-ask keeps the first answer and flags the cost
+  hf = humanizeFetch({ record: REC, draft: "one two three four five six", fetch: async (u, init) => { if (JSON.parse(init.body).messages.length > 1) throw fetchFailed("ECONNRESET"); return okRes("one two three four five six"); } });
+  const r2 = await hf.fetch(CHAT, keyed("d"));
+  assert.equal((await r2.json()).choices[0].message.content, "one two three four five six");
+  assert.equal(hf.state.reasked.D.failed, "request error");
+  assert.equal(hf.state.costUnknown, true);
+  assert.ok(near(hf.state.unreportedUsd, PRICE));
+});
+
+test("outer cancel during a paid re-ask: its payment stays in the totals and the reconcile is reported", async () => {
+  const ac = new AbortController();
+  let completes = 0;
+  const hf = humanizeFetch({ record: REC, draft: "one two three four five six", pollMs: 5, payment: async () => {}, fetch: async (u, init) => {
+    if (/complete\/pay1/.test(u)) return okRes("one two three four five six");
+    if (/complete\/payR/.test(u)) { if (++completes === 3) ac.abort(new Error("node timeout")); return new Response("{}", { status: 402 }); }
+    return inv402(JSON.parse(init.body).messages.length > 1 ? "payR" : "pay1");
+  } });
+  await assert.rejects(hf.fetch(CHAT, { ...xreq("d"), signal: ac.signal }), /node timeout/);
+  assert.ok(near(hf.state.unreportedUsd, 2 * PRICE), "first call + paid re-ask both kept: " + hf.state.unreportedUsd);
+  assert.equal(hf.state.costUnknown, false);
+  assert.deepEqual(hf.state.reconcile.map((c) => [c.kind, c.paymentId, c.ambiguous, c.status]), [["reask", "payR", false, "aborted after payment"]]);
+  assert.equal(hf.state.reasked.D.failed, "cancelled");
+  const { humanizeRunNotes } = await import("../src/humanize.mjs");
+  assert.ok(humanizeRunNotes(hf.state).some((n) => /writer D's reask payment payR needs reconciling \(aborted after payment\)/.test(n)));
+});
+
+test("late settlement after the deadline or a cancel: recorded once, never lost or double-counted", async () => {
+  const late = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const hf = humanizeFetch({ record: REC, draft: "one two three four five six", reaskEndMs: 40, payment: (inv) => (inv.paymentId === "payR" ? gate : Promise.resolve()), fetch: async (u, init) => {
+    if (/complete\/pay1/.test(u)) return okRes("one two three four five six");
+    if (/complete\/payR/.test(u)) throw new Error("complete must not be polled after giving up");
+    return inv402(JSON.parse(init.body).messages.length > 1 ? "payR" : "pay1");
+  } });
+  hf.state.onLate = (c) => late.push(c.paymentId);
+  const r = await hf.fetch(CHAT, xreq("d"));
+  assert.equal((await r.json()).choices[0].message.content, "one two three four five six", "first answer kept");
+  assert.equal(hf.state.reconcile[0].ambiguous, true);
+  const before = hf.state.unreportedUsd;
+  release(); await new Promise((r2) => setTimeout(r2, 20));
+  release(); await new Promise((r2) => setTimeout(r2, 20)); // a second resolve is a no-op
+  assert.deepEqual(late, ["payR"], "reported exactly once");
+  assert.ok(near(hf.state.unreportedUsd - before, PRICE), "the late payment is added exactly once");
+  assert.equal(hf.state.reconcile.length, 1);
+  assert.equal(hf.state.reconcile[0].ambiguous, false);
+  assert.equal(hf.state.reconcile[0].late, true);
+  assert.match(hf.state.reconcile[0].status, /paid after the writer stopped waiting/);
+  // after a cancel too: a primary whose wallet call is still pending when the node is cancelled
+  const ac = new AbortController();
+  let rel2; const g2 = new Promise((r3) => { rel2 = r3; });
+  const seen = [];
+  const hf2 = humanizeFetch({ record: REC, draft: "", payment: () => g2, fetch: async (u, init) => { seen.push(JSON.parse(init.body).model); return inv402("payC"); } });
+  const p = hf2.fetch(CHAT, { ...xreq(CYD), signal: ac.signal });
+  await new Promise((r3) => setTimeout(r3, 10));
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(p, /cancelled/);
+  assert.deepEqual(seen, [CYD], "no fallback while the payment is unresolved");
+  assert.equal(hf2.state.paidFailed.C.ambiguous, true);
+  const b2 = hf2.state.unreportedUsd;
+  rel2(); await new Promise((r3) => setTimeout(r3, 20));
+  assert.ok(near(hf2.state.unreportedUsd - b2, PRICE));
+  assert.equal(hf2.state.paidFailed.C.ambiguous, false);
+});

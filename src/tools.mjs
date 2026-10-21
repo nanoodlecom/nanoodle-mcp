@@ -948,6 +948,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(args[dk]) : "", payment: apiKey ? null : payment, baseUrl: baseUrl || "https://nano-gpt.com" });
+        // a writer payment that settles after its writer stopped waiting: the operator log keeps it
+        hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
         runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
       }
       const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
