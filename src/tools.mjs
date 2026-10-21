@@ -17,7 +17,7 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
-import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult } from "./humanize.mjs";
+import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes } from "./humanize.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -939,9 +939,19 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();
       const { onProgress, notices } = runNotices(tool.wf);
-      const result = await tool.wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
+      // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
+      let runWf = tool.wf, hf = null;
       if (tool.humanize) {
-        const note = rebuildHumanizeResult(tool.wf, result, tool.humanize);
+        const args = params.arguments || {};
+        const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
+        hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(args[dk]) : "" });
+        runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
+      }
+      const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      if (tool.humanize) {
+        notices.push(...humanizeRunNotes(hf.state));
+        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
         if (note) notices.push(note);
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
