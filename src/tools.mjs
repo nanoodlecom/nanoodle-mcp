@@ -698,13 +698,14 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
-    content.push({ type: "text", text: `cost: $${formatCostUsd(result.costUsd)}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
+    content.push({ type: "text", text: `cost: $${formatCostUsd(result.costUsd)}${result.costExact === false ? " (a lower bound — some calls did not report a price, so the actual cost may be higher)" : ""}` });
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput
   // tells persist() this result holds paid content that must never hit disk.
   // Every serving layer strips BOTH before replying to an MCP client.
-  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, textOutput };
+  // costExact rides along so the gate can label a lower-bound total as one instead of as the actual cost
+  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, costExact: result.costExact !== false, textOutput };
 }
 
 /**

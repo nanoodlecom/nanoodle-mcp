@@ -35,7 +35,13 @@
  *    - x402 (keyless wallet mode): writer 402 invoices are settled here, not by the
  *      nanoodle client, so the dash fix, re-asks and fallback credit apply to paid
  *      calls too. One invoice per attempt, paid at most once, replayed only with the
- *      body it was issued for; no fallback after a primary was paid.
+ *      body it was issued for; no fallback after a primary's payment STARTED (it is
+ *      marked before the wallet call, since a wallet can send and still throw), unless
+ *      the wallet error carries paymentNotSent === true. An unconfirmed payment goes to
+ *      state.reconcile (invoice id, ambiguous) and the run notes, and its amount is left
+ *      out of the cost, which is then flagged as a lower bound. Each writer call keeps
+ *      its own attempt records, so concurrent writers never read each other's state.
+ *      The re-ask's payment wait is bounded by the same 55 s deadline.
  *    - Cost: every attempt's cost is kept. Attempts whose answer never reaches the
  *      engine (a failed fallback, a paid call that failed, an abandoned re-ask) go
  *      into state.unreportedUsd, which tools.mjs adds to the run's total before the
@@ -109,7 +115,7 @@ const usdOf = (j, r) => {
  * paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
 export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS }) {
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, paidFailed: {}, attempts: [], paidIds: new Set(), unreportedUsd: 0, costUnknown: false };
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, costUnknown: false };
   let reasksLeft = maxReasks;
   const byModel = new Map();
   const dupes = new Set();
@@ -124,6 +130,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const t = setTimeout(() => { if (signal) signal.removeEventListener("abort", on); res(); }, ms);
     const on = () => { clearTimeout(t); rej(signal.reason); };
     if (signal) signal.addEventListener("abort", on, { once: true });
+  });
+  // a wallet call that ignores signals still can't hold the writer past its deadline
+  const raceAbort = (p, signal) => !signal ? p : new Promise((res, rej) => {
+    if (signal.aborted) return rej(signal.reason);
+    const on = () => rej(signal.reason);
+    signal.addEventListener("abort", on, { once: true });
+    p.then((v) => { signal.removeEventListener("abort", on); res(v); }, (e) => { signal.removeEventListener("abort", on); rej(e); });
   });
   const jsonResponse = (j, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
 
@@ -142,9 +155,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
      * One attempt = one request body, sent once and (under x402) paid at most once.
      * Returns { r, j, paid, rec }. `commit` runs just before a payment (the caller stops its fallback timer).
      */
+    const mine = []; // this writer call's own attempts; concurrent writers never read each other's
+    const lastMine = () => mine[mine.length - 1];
     const attempt = async (b, kind, signal, commit) => {
       const bodyStr = JSON.stringify(b);
-      const rec = { letter, kind, model: b.model, status: null, paid: false, paymentId: null, usd: null };
+      const rec = { letter, kind, model: b.model, status: null, paymentStarted: false, paid: false, paymentAmbiguous: false, paymentId: null, usd: null };
+      mine.push(rec);
       state.attempts.push(rec);
       const req = { ...init, signal, body: bodyStr };
       let r = await fetch(url, req);
@@ -160,7 +176,19 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         if (commit) commit();
         rec.paymentId = inv.paymentId;
         state.paidIds.add(inv.paymentId);
-        await payment(inv); // the only payment for this body; a throw here means nothing was replayed
+        // marked BEFORE the wallet call: a wallet can send and still throw, so from here on this
+        // attempt counts as possibly paid and is never followed by a fallback, unless the wallet
+        // proves nothing was sent (an error carrying paymentNotSent === true)
+        rec.paymentStarted = true;
+        try {
+          await raceAbort(Promise.resolve().then(() => payment(inv)), signal);
+        } catch (e) {
+          if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
+          rec.paymentAmbiguous = true;
+          rec.status = signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed";
+          state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: true, status: rec.status });
+          throw e;
+        }
         rec.paid = true;
         rec.usd = inv.amountUsd;
         const deadline = inv.expiresAt || now() + 15 * 60 * 1000;
@@ -168,7 +196,11 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           let cr;
           try {
             cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}", signal });
-          } catch (e) { rec.status = "aborted after payment"; throw e; }
+          } catch (e) {
+            rec.status = "aborted after payment";
+            state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: false, status: rec.status });
+            throw e;
+          }
           if (cr.ok) {
             let cj = null;
             try { cj = await cr.json(); } catch { cj = null; }
@@ -185,15 +217,20 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           if (cr.status !== 402) { r = cr; break; }
           await cr.text().catch(() => {});
           if (now() >= deadline) { rec.status = "x402 expired"; const e = new Error(`payment window expired for ${inv.paymentId}`); e.code = "x402-expired"; throw e; }
-          await wait(pollMs, signal);
+          try { await wait(pollMs, signal); } catch (e) {
+            rec.status = "aborted after payment";
+            state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: false, status: rec.status });
+            throw e;
+          }
         }
       }
       rec.status = r.status;
       let j = null;
-      if (r.ok) { try { j = await r.clone().json(); } catch { j = null; } }
-      const reported = r.ok ? usdOf(j, r) : null;
+      try { j = await r.clone().json(); } catch { j = null; }
+      const reported = usdOf(j, r); // error answers can carry a price too (kept, not dropped)
       if (reported != null) rec.usd = reported;
-      else if (!rec.paid) rec.usd = r.ok ? null : 0; // an HTTP error answer is not billed (key mode)
+      else if (!rec.paid) rec.usd = r.ok ? null : 0; // an error answer with no price is not billed
+      if (!r.ok) j = null;
       return { r, j, rec };
     };
     const lose = () => { // the logical call ends without an answer for the engine: keep its cost
@@ -215,8 +252,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           addCost(res.rec.usd);
           if (res.r.status === 429 || res.r.status >= 500) reason = `HTTP ${res.r.status}`;
         } catch (e) {
-          const rec = state.attempts[state.attempts.length - 1];
-          if (rec && rec.paid) { addCost(rec.usd); state.paidFailed[letter] = { model: body.model, status: rec.status }; throw e; }
+          const rec = lastMine();
+          if (rec && (rec.paid || rec.paymentStarted)) {
+            addCost(rec.paid ? rec.usd : null); // ambiguous: not charged, total marked as a lower bound
+            state.paidFailed[letter] = { model: body.model, status: rec.status, paymentId: rec.paymentId, ambiguous: !rec.paid };
+            throw e;
+          }
           if (init.signal && init.signal.aborted) throw e;
           if (e && e.code && /^x402/.test(e.code)) throw e;
           reason = ac.signal.aborted ? `no answer in ${Math.round(primaryTimeoutMs / 1000)} s` : "request error";
@@ -225,7 +266,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           clearTimeout(timer);
           if (init.signal) init.signal.removeEventListener("abort", onOuter);
         }
-        if (reason && res && res.rec.paid) {
+        if (reason && res && (res.rec.paid || res.rec.paymentStarted)) {
           // paid for the primary and it still failed: no fallback, so one logical call is never paid twice
           state.paidFailed[letter] = { model: body.model, status: res.r.status };
           reason = null;
@@ -235,8 +276,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           try {
             res = await attempt({ ...body, model: fb }, "fallback", init.signal);
           } catch (e) {
-            const rec = state.attempts[state.attempts.length - 1];
-            if (rec) addCost(rec.usd);
+            const rec = lastMine();
+            if (rec) addCost(rec.paymentStarted && !rec.paid ? null : rec.usd);
             state.fallback[letter].failed = "request error";
             throw e;
           }
@@ -245,7 +286,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         }
       } else {
         try { res = await attempt(body, "primary", init.signal); }
-        catch (e) { const rec = state.attempts[state.attempts.length - 1]; if (rec) addCost(rec.usd); throw e; }
+        catch (e) { const rec = lastMine(); if (rec) addCost(rec.paymentStarted && !rec.paid ? null : rec.usd); throw e; }
         addCost(res.rec.usd);
       }
     } catch (e) { lose(); throw e; }
@@ -288,8 +329,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
       } catch (e) {
         if (init.signal && init.signal.aborted) { lose(); throw e; }
-        const rec = state.attempts[state.attempts.length - 1];
-        if (rec && rec.kind === "reask") { if (rec.paid) addCost(rec.usd); else if (ac.signal.aborted && !x402) usdKnown = false; }
+        const rec = lastMine();
+        if (rec && rec.kind === "reask") {
+          if (rec.paid) addCost(rec.usd);
+          else if (rec.paymentStarted) usdKnown = false; // ambiguous payment: lower bound
+          else if (ac.signal.aborted && !x402) usdKnown = false;
+        }
         state.reasked[letter] = { ratio, after: null, failed: ac.signal.aborted ? `no answer within ${Math.round(reaskEndMs / 1000)} s of the writer call` : "request error" };
       } finally {
         clearTimeout(timer);
@@ -311,7 +356,10 @@ export function humanizeRunNotes(state) {
   for (const [l, f] of Object.entries(state.fallback)) notes.push(f.ok
     ? `note: writer ${l} (${f.from}) did not answer (${f.reason}), so ${f.to} wrote ${l}'s rewrite and is credited for it.`
     : `note: writer ${l} (${f.from}) did not answer (${f.reason}), and the fallback ${f.to} also failed (${f.failed || "no answer"}), so writer ${l} has no rewrite this run.`);
-  for (const [l, p] of Object.entries(state.paidFailed)) notes.push(`note: writer ${l} (${p.model}) was paid for but did not return a rewrite (${p.status}); no fallback was tried, so the call was not paid twice.`);
+  for (const [l, p] of Object.entries(state.paidFailed)) notes.push(p.ambiguous
+    ? `note: writer ${l} (${p.model}): the payment for invoice ${p.paymentId} was started but not confirmed (${p.status}); no fallback was tried, so the call cannot have been paid twice. Reconcile that invoice; its amount is not in the cost.`
+    : `note: writer ${l} (${p.model}) was paid for but did not return a rewrite (${p.status}); no fallback was tried, so the call was not paid twice.`);
+  for (const c of state.reconcile) if (!(state.paidFailed[c.letter] && state.paidFailed[c.letter].paymentId === c.paymentId)) notes.push(`note: writer ${c.letter}'s ${c.kind} payment ${c.paymentId} needs reconciling (${c.status}${c.ambiguous ? ", may or may not have been sent" : ""}).`);
   for (const [l, r] of Object.entries(state.reasked)) notes.push(`note: writer ${l}'s first rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}), so it was re-asked once` + (r.failed ? ` (the re-ask failed: ${r.failed}; its first rewrite was kept)` : r.after != null ? ` (overlap now ${r.after.toFixed(2)})` : "") + ".");
   for (const [l, r] of Object.entries(state.skippedReask)) notes.push(`note: writer ${l}'s rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}) but was not re-asked (${r.why}); the decider judged it as is.`);
   return notes;

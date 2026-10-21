@@ -68,19 +68,22 @@ async function stub(t, { plan, settleOnly = () => false }) {
     const rec = invoices.get(inv.paymentId);
     assert.ok(rec, "paying a known invoice");
     assert.equal(rec.paid, false, "an invoice is never paid twice");
+    if (hook) await hook(inv, rec);
     rec.paid = true;
   };
   const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-x402-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
   const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  let hook = null;
   const run = async () => {
     const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
     const texts = result.content.map((c) => c.text || "");
     const jt = texts.find((x) => /^\{"winner"/.test(x));
     return { result, texts, json: jt ? JSON.parse(jt) : null };
   };
-  return { run, paid, invoices, log };
+  const runWith = async (h) => { hook = h; try { return await run(); } finally { hook = null; } };
+  return { run, runWith, paid, invoices, log };
 }
 
 const judge = (winner = "A") => JSON.stringify({ winner, text: "x", why: "warm", ranked: ["A", "B", "C", "D", "E"].map((w) => ({ writer: w, faithful: true, disqualified: false, reason: "ok" })) });
@@ -190,10 +193,104 @@ test("key mode: a failed fallback's billed cost still reaches the run total, and
   } });
   const r = await hf.fetch("http://x/api/v1/chat/completions", { method: "POST", body: JSON.stringify({ model: CYD, messages: [] }) });
   assert.equal(r.status, 502);
+  assert.ok(near(hf.state.unreportedUsd, 0.0003), "the priced 502 is counted, not dropped: " + hf.state.unreportedUsd);
+  assert.equal(hf.state.costUnknown, false);
   assert.equal(hf.state.fallback.C.ok, false);
   assert.equal(hf.state.fallback.C.failed, "HTTP 502");
   const hf2 = humanizeFetch({ record, draft: "", payment: null, fetch: () => Promise.resolve(new Response("{}", { status: 402 })) });
   const r2 = await hf2.fetch("http://x/api/v1/chat/completions", { method: "POST", headers: { Authorization: "Bearer k" }, body: JSON.stringify({ model: CYD, messages: [] }) });
   assert.equal(r2.status, 402);
   assert.deepEqual(hf2.state.fallback, {});
+});
+
+// ---- round 4 ----
+const REC = { A: { model: "a" }, B: { model: "b" }, C: { model: CYD, fallbackModel: STARRY }, D: { model: "d" }, E: { model: "e" } };
+const CHAT = "http://x/api/v1/chat/completions";
+const inv402 = (id) => new Response(JSON.stringify({ payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: PRICE, completeUrl: "http://x/api/x402/complete/" + id }] } }), { status: 402 });
+const okRes = (content, usd = PRICE) => new Response(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: usd } }), { status: 200 });
+const xreq = (model, messages = [{ role: "user", content: "hi" }]) => ({ method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: JSON.stringify({ model, messages }) });
+const defer = () => { let res; const p = new Promise((r) => { res = r; }); return { p, res }; };
+
+test("concurrent writers: C paid then failed while D's unpaid attempt is the newest → C never falls back", async () => {
+  const dStarted = defer(), dFailed = defer();
+  const seen = [];
+  const paid = [];
+  const hf = humanizeFetch({ record: REC, draft: "", payment: async (inv) => { paid.push(inv.paymentId); await dStarted.p; }, fetch: async (u, init) => {
+    if (/complete\/payC/.test(u)) { await dFailed.p; throw new Error("socket hang up"); } // C fails after paying
+    const m = JSON.parse(init.body).model;
+    seen.push(m);
+    if (m === CYD) return inv402("payC");
+    if (m === "d") { dStarted.res(); await new Promise((r) => setTimeout(r, 5)); dFailed.res(); throw new Error("ECONNRESET"); }
+    return okRes("from " + m);
+  } });
+  const [c, d] = await Promise.allSettled([hf.fetch(CHAT, xreq(CYD)), hf.fetch(CHAT, xreq("d"))]);
+  assert.equal(c.status, "rejected"); assert.equal(d.status, "rejected");
+  assert.ok(!seen.includes(STARRY), "no fallback after C's payment");
+  assert.deepEqual(paid, ["payC"]);
+  assert.equal(hf.state.fallback.C, undefined);
+  assert.equal(hf.state.paidFailed.C.paymentId, "payC");
+  assert.equal(hf.state.paidFailed.D, undefined, "D's error path never read C's record");
+  assert.ok(near(hf.state.unreportedUsd, PRICE), "C's payment counted once; D's unpaid error adds nothing: " + hf.state.unreportedUsd);
+  const attempts = hf.state.attempts.map((a) => a.letter + ":" + a.kind + ":" + a.paid);
+  assert.deepEqual(attempts.sort(), ["C:primary:true", "D:primary:false"]);
+});
+
+test("ambiguous payment: the wallet call throws after sending → no fallback, reconcile state reported, cost a lower bound", async (t) => {
+  const seen = [];
+  const hf = humanizeFetch({ record: REC, draft: "", payment: async () => { throw new Error("RPC timed out after publish"); }, fetch: async (u, init) => {
+    seen.push(JSON.parse(init.body).model);
+    return inv402("payAmb");
+  } });
+  await assert.rejects(hf.fetch(CHAT, xreq(CYD)), /RPC timed out/);
+  assert.deepEqual(seen, [CYD], "no Starry request");
+  assert.deepEqual(hf.state.reconcile, [{ letter: "C", kind: "primary", model: CYD, paymentId: "payAmb", amountUsd: PRICE, ambiguous: true, status: "payment call failed" }]);
+  assert.equal(hf.state.paidFailed.C.ambiguous, true);
+  assert.equal(hf.state.costUnknown, true);
+  const { humanizeRunNotes } = await import("../src/humanize.mjs");
+  assert.ok(humanizeRunNotes(hf.state).some((n) => /payment for invoice payAmb was started but not confirmed \(payment call failed\); no fallback was tried.*Reconcile that invoice/.test(n)));
+  // a wallet error that proves nothing was sent does allow the fallback
+  const seen2 = [];
+  const hf2 = humanizeFetch({ record: REC, draft: "", payment: async (inv) => { if (inv.paymentId === "payN") { const e = new Error("insufficient balance"); e.paymentNotSent = true; throw e; } }, fetch: async (u, init) => {
+    if (/complete\//.test(u)) return okRes("from starry");
+    const m = JSON.parse(init.body).model; seen2.push(m);
+    return inv402(m === CYD ? "payN" : "payS");
+  } });
+  const r2 = await hf2.fetch(CHAT, xreq(CYD));
+  assert.equal((await r2.json()).choices[0].message.content, "from starry");
+  assert.deepEqual(seen2, [CYD, STARRY]);
+  assert.equal(hf2.state.fallback.C.ok, true);
+  assert.equal(hf2.state.answered.C, STARRY);
+  assert.deepEqual(hf2.state.reconcile, []);
+  assert.equal(hf2.state.costUnknown, false);
+});
+
+test("slow payment past the re-ask deadline: the wait is bounded and the first answer is kept", async () => {
+  let calls = 0;
+  const hf = humanizeFetch({ record: REC, draft: "one two three four five six", reaskEndMs: 80, payment: (inv) => (inv.paymentId === "payR" ? new Promise(() => {}) : Promise.resolve()), fetch: async (u, init) => {
+    if (/complete\/pay1/.test(u)) return okRes("one two three four five six");
+    calls++;
+    return inv402(JSON.parse(init.body).messages.length > 1 ? "payR" : "pay1");
+  } });
+  const t0 = Date.now();
+  const r = await hf.fetch(CHAT, xreq("d"));
+  assert.ok(Date.now() - t0 < 2000, "bounded by the 55 s-style re-ask deadline, not the 60 s node timeout");
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).choices[0].message.content, "one two three four five six");
+  assert.equal(calls, 2);
+  assert.equal(hf.state.reconcile[0].paymentId, "payR");
+  assert.equal(hf.state.reconcile[0].status, "payment still pending at the deadline");
+  assert.equal(hf.state.costUnknown, true, "the re-ask may have been paid: the total is a lower bound");
+});
+
+test("cost flag through tools: an ambiguous writer payment makes the tool's cost a labelled lower bound with costExact false", async (t) => {
+  const s = await stub(t, { plan: (b) => ({ content: b.model === "z-ai/glm-5.3" ? judge("A") : "rewrite by " + b.model }) });
+  // swap in a wallet that throws after "sending" for Cydonia only
+  const { result, texts } = await (async () => {
+    const r = await s.runWith(async (inv, rec) => { if (rec.model === CYD) throw new Error("publish result unknown"); });
+    return r;
+  })();
+  assert.notEqual(result.isError, true, texts.join("\n"));
+  assert.equal(result.costExact, false);
+  assert.ok(texts.some((x) => /^cost: \$0\.0005 \(a lower bound/.test(x)), texts.find((x) => /^cost/.test(x)));
+  assert.ok(texts.some((x) => /Reconcile that invoice/.test(x)));
 });

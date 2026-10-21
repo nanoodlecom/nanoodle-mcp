@@ -1136,7 +1136,7 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args });
+              const { costUsd, costExact, textOutput, ...result } = await registry.callTool({ name, arguments: args });
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.
@@ -1156,7 +1156,7 @@ export function createChargeGate({
               // settled on restore but carrying no stored figures — falls back to
               // this recompute-only run's numbers rather than reading undefined.
               if (!q.settleReceipt) {
-                q.settleReceipt = { known: s.known, costUsd: s.known ? costUsd : null,
+                q.settleReceipt = { known: s.known, costUsd: s.known ? costUsd : null, exact: costExact !== false,
                   take: s.take.toString(), change: s.change.toString(), author: s.author };
               }
               q.settled = true;
@@ -1169,7 +1169,10 @@ export function createChargeGate({
               const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
                 (q.payHash ? ` (block ${q.payHash})` : "") +
                 (r.known
-                  ? ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%` +
+                  ? (r.exact === false
+                    // some calls reported no price: the total is a lower bound, not the actual cost
+                    ? ` — settled at estimated cost $${formatCostUsd(r.costUsd)} (a lower bound: some calls did not report a price) + 20%`
+                    : ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%`) +
                     (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
                     (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change returned to your wallet` : "")
                   : " — the model reported no cost, so the whole deposit is being returned to your wallet");

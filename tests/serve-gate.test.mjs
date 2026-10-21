@@ -482,6 +482,19 @@ test("a bounced change send is retried too", async () => {
   assert.ok(events.find(([e, f]) => e === "change" && f.ok && f.retries === 1));
 });
 
+test("settle: a lower-bound cost (costExact false) is labelled an estimate and lower bound, never the actual cost", async () => {
+  const chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.02, costExact: false }) });
+  const { callTool } = makeGate(chain, { registry }).wrapRegistry(registry);
+  const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["F".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+  const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+  assert.ok(!res.isError);
+  assert.ok(!("costUsd" in res) && !("costExact" in res), "sidecars stripped");
+  assert.match(res.content.at(-1).text, /settled at estimated cost \$0\.0200 \(a lower bound: some calls did not report a price\) \+ 20%/);
+  assert.doesNotMatch(res.content.at(-1).text, /actual cost/);
+});
+
 test("settle: cost + 20% markup to the author, change back to the payer, exact to the raw", async () => {
   const chain = fakeChain();
   // $0.05 deposit at $1/XNO; the run meters $0.02 → cost 0.02 XNO, markup 0.004 XNO, rest is change
