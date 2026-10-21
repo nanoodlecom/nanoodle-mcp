@@ -27,7 +27,8 @@
  *      the draft is above NEAR_COPY_RATIO, the same model is re-asked once (the
  *      same messages plus its own answer and REASK_TEXT) and the second answer
  *      replaces the first. No re-ask after REASK_DEADLINE_MS, so the writer's
- *      60 s node timeout is not put at risk. Both calls' costs are reported.
+ *      60 s node timeout is not put at risk, and at most MAX_REASKS (3) re-asks
+ *      happen per run, first come first served. Both calls' costs are reported.
  *    Texts in the result are these post-processed writer outputs, exactly what
  *    the decider read.
  */
@@ -42,6 +43,8 @@ export const HUMANIZE_FALLBACKS = Object.freeze({ "TheDrummer/Cydonia-24B-v4.3":
 export const NEAR_COPY_RATIO = 0.6;
 export const PRIMARY_TIMEOUT_MS = 30000;
 export const REASK_DEADLINE_MS = 35000;
+/** At most this many near-copy re-asks per run (first come, first served); keeps the cost estimate under the pin. */
+export const MAX_REASKS = 3;
 export const REASK_TEXT = "Your last attempt copied the draft. Rewrite it in your own words: same facts, same meaning, but your own sentences, and never more than five words in a row from the draft. Output only the rewritten comment text.";
 
 /** Deterministic dash fix applied to writer outputs before judging. */
@@ -81,8 +84,9 @@ const usdOf = (j, r) => {
  * state.fallback[letter] = { from, to, reason }, state.reasked[letter] = { ratio, after },
  * state.dashes[letter] = true when a dash was replaced.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS }) {
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {} };
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, maxReasks = MAX_REASKS }) {
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {} };
+  let reasksLeft = maxReasks;
   const byModel = new Map();
   const dupes = new Set();
   for (const l of LETTERS) {
@@ -136,7 +140,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = D
     if (text !== msg.content) state.dashes[letter] = true;
     let usd = usdOf(j, r);
     const ratio = copyRatio(text, draft);
-    if (ratio > NEAR_COPY_RATIO && now() - t0 < reaskDeadlineMs) {
+    if (ratio > NEAR_COPY_RATIO && (reasksLeft <= 0 || now() - t0 >= reaskDeadlineMs)) {
+      state.skippedReask[letter] = { ratio, why: reasksLeft <= 0 ? `the ${maxReasks}-re-ask limit for this run was reached` : "too late in the writer's time budget" };
+    } else if (ratio > NEAR_COPY_RATIO) {
+      reasksLeft--;
       try {
         const r2 = await send({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: msg.content }, { role: "user", content: REASK_TEXT }] });
         if (r2.ok) {
@@ -171,6 +178,7 @@ export function humanizeRunNotes(state) {
   const notes = [];
   for (const [l, f] of Object.entries(state.fallback)) notes.push(`note: writer ${l} (${f.from}) did not answer (${f.reason}), so ${f.to} wrote ${l}'s rewrite and is credited for it.`);
   for (const [l, r] of Object.entries(state.reasked)) notes.push(`note: writer ${l}'s first rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}), so it was re-asked once` + (r.failed ? ` (the re-ask failed: ${r.failed}; its first rewrite was kept)` : r.after != null ? ` (overlap now ${r.after.toFixed(2)})` : "") + ".");
+  for (const [l, r] of Object.entries(state.skippedReask)) notes.push(`note: writer ${l}'s rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}) but was not re-asked (${r.why}); the decider judged it as is.`);
   return notes;
 }
 

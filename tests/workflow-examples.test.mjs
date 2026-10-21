@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS } from "../src/humanize.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,13 +207,13 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.deepEqual(mounted.x402, { usd: 0.0133 });
     // ESTIMATE, not a hard bound (v2.7): worst case at the ENFORCED input caps (src/humanize.mjs),
     // every writer at its 600-token cap, inputs + system prompts at 3 characters per token,
-    // the decider (which now also reads the Guidance) re-reading five 600-token rewrites and
-    // replying at its 4300-token cap. Writer C is counted at the worse of Cydonia alone or a
-    // billed-but-timed-out Cydonia call plus the Starry Ocean fallback. A near-copy re-ask
-    // resends the writer's input plus its 600-token answer plus REASK_TEXT, at most once per writer.
-    // Result: $0.01397524 with no re-ask and $0.01782845 with all five re-asked, after the 20%
-    // markup. Both are ABOVE the $0.0133 pin; the pin was deliberately left unchanged
-    // (minimum that covers the estimate: $0.0179). See the docs for options.
+    // the decider (which reads the Guidance and five 600-token rewrites but no longer copies
+    // them: ids, flags, reasons and the winner's text only) replying at its 1600-token cap.
+    // Writer C is counted at the worse of Cydonia alone or a billed-but-timed-out Cydonia call
+    // plus the Starry Ocean fallback. Near-copy re-asks (writer input + its 600-token answer +
+    // REASK_TEXT) are capped at MAX_REASKS (3) per run; the three most expensive are counted.
+    // Result: $0.01304480 after the 20% markup, $0.00025520 (about 1.9%) under the $0.0133 pin;
+    // $0.01047080 with no re-ask.
     // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
     // pays no change or author payout, and the operator absorbs the provider cost above it.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
@@ -221,12 +221,14 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
     const judge = byId.get("judge");
-    assert.equal(judge.fields.maxTokens, "4300");
+    assert.equal(judge.fields.maxTokens, "1600");
+    assert.equal(MAX_REASKS, 3);
     const PRICE = { "qwen/qwen3.8-27b-novelist": [0.1, 0.6], "deepseek/deepseek-v4.1-flash-1017": [0.1, 0.6], "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15], "gemma-4-12b-it-starry-ocean": [0.05, 0.25], "qwen/qwen3.8-27b-antislop": [0.1, 0.6], "inception/mercury-3": [0.1, 0.35] };
     const bytes = (s) => Buffer.byteLength(s, "utf8");
     const { Draft, Context, Guidance } = HUMANIZE_INPUT_CAPS;
     const CPT = 3, W = 600; // characters per token (estimate), writer output cap
-    let base = 0, reask = 0;
+    let base = 0;
+    const reasks = [];
     for (const id of ["w-a", "w-b", "w-c", "w-d", "w-e"]) {
       const n = byId.get(id);
       assert.equal(n.fields.maxTokens, String(W));
@@ -235,16 +237,18 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
       const re = (pc) => call(pc, W + bytes(REASK_TEXT) / CPT);
       const P = PRICE[n.fields.model];
       const fb = HUMANIZE_FALLBACKS[n.fields.model];
-      if (fb) { base += Math.max(call(P), call(P) + call(PRICE[fb])); reask += Math.max(re(P), re(PRICE[fb])); }
-      else { base += call(P); reask += re(P); }
+      if (fb) { base += Math.max(call(P), call(P) + call(PRICE[fb])); reasks.push(Math.max(re(P), re(PRICE[fb]))); }
+      else { base += call(P); reasks.push(re(P)); }
     }
+    const reask = reasks.sort((a, b) => b - a).slice(0, MAX_REASKS).reduce((a, b) => a + b, 0);
     const seps = ["k1", "k2", "k3", "k4", "k5", "k6", "j-cg"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
     const judgeUsd = ((bytes(judge.fields.system) + Draft + Context + Guidance + seps) / CPT + 5 * W) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
-    assert.equal(est(base + judgeUsd), "0.01397524", "the docs quote this exact estimate (no re-ask)");
-    assert.equal(est(base + reask + judgeUsd), "0.01782845", "the docs quote this exact estimate (all five re-asked)");
-    assert.equal(mounted.x402.usd, 0.0133, "price unchanged on purpose; the estimate does not fit it");
-    assert.ok(Number(est(base + reask + judgeUsd)) <= 0.0179, "minimum covering pin quoted in the docs");
+    assert.equal(est(base + judgeUsd), "0.01047080", "the docs quote this exact estimate (no re-ask)");
+    assert.equal(est(base + reask + judgeUsd), "0.01304480", "the docs quote this exact estimate (3 re-asks)");
+    assert.equal(mounted.x402.usd, 0.0133);
+    assert.ok((base + reask + judgeUsd) / 1e6 * 1.2 <= mounted.x402.usd, "estimate fits the pin");
+    assert.equal((mounted.x402.usd - (base + reask + judgeUsd) / 1e6 * 1.2).toFixed(8), "0.00025520", "margin quoted in the docs");
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);
@@ -482,6 +486,46 @@ test("humanizeFetch: timeout fallback, no fallback on 402, no re-ask after the d
   await hf.fetch("http://x/api/v1/models", { method: "GET" });
   assert.equal(n, 2);
   assert.deepEqual(hf.state.answered, {});
+});
+
+test("humanize-comment v2.7: at most 3 re-asks per run; a decider reply with ids only still gets exact texts and models", async (t) => {
+  const { createServer } = await import("node:http");
+  const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
+  const calls = [];
+  const srv = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      const reask = body.messages.length > 2;
+      calls.push(body.model + (reask ? " (re-ask)" : ""));
+      let content = reask ? "Fresh words from " + body.model + " about your CI cut." : DRAFT; // every writer copies the draft
+      if (body.model === "z-ai/glm-5.3") content = JSON.stringify({ winner: "B", text: "paraphrase", why: "warm", ranked: ["B", "A", "C", "D", "E"].map((w) => ({ writer: w, faithful: true, disqualified: false, reason: "ok" })) });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  t.after(() => srv.close());
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-cap-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
+  const texts = result.content.map((c) => c.text || "");
+  assert.equal(calls.filter((c) => /re-ask/.test(c)).length, 3, "re-asks are capped at 3 per run");
+  assert.equal(texts.filter((x) => /so it was re-asked once/.test(x)).length, 3);
+  assert.equal(texts.filter((x) => /was not re-asked \(the 3-re-ask limit for this run was reached\)/.test(x)).length, 2);
+  const json = JSON.parse(texts.find((x) => /^\{"winner"/.test(x)));
+  // the decider sent no texts or models: the rebuild fills both from the writers
+  assert.equal(json.ranked.length, 5);
+  for (const r of json.ranked) {
+    assert.equal(typeof r.model, "string");
+    assert.ok(r.text === DRAFT || r.text === "Fresh words from " + r.model + " about your CI cut.", r.text);
+  }
+  assert.equal(json.text, json.ranked.find((r) => r.writer === "B").text, "top-level text is B's exact output, not the decider's paraphrase");
+  // 5 writers + 3 re-asks + decider
+  assert.ok(texts.includes("cost: $0.0009"), texts.find((x) => /^cost/.test(x)));
 });
 
 test("humanize-comment: a failed writer is skipped and the decider still returns a result", async (t) => {
