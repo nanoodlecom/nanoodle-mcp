@@ -207,7 +207,7 @@ export function checkHumanizeInputs(args) {
  * Rewrite the decider's JSON in result.outputs in place. Returns a notice string or null.
  *
  * Guarantees of the rebuilt object {winner, text, why, ranked}:
- *  - ranked lists A..E exactly once each; model always from the writer record, text always the
+ *  - ranked lists A..E exactly once each; model from the writer record (with a fallback, the model that answered), text always the
  *    writer's own output ("" when it produced none). Eligible entries first, decider order kept.
  *  - a writer with no output: faithful false, disqualified true, reason "missing".
  *  - an entry with faithful !== true is forced to disqualified true, so it can never win.
