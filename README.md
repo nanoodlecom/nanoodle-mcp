@@ -472,8 +472,13 @@ Preserve unrelated Node flags, remove conflicting `--use-bundled-ca` or
 Those additive options do not remove compromised roots. Keep certificate
 verification enabled. For macOS/Windows, update OS trust and the Node runtime,
 then verify the actual runtime's trust policy; these Linux paths are not portable.
-A patched Node release is sufficient only after its release notes and live
-probes confirm the fix. Existing long-running MCP processes must be restarted.
+The [2026-10-21 Node security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
+provides native fixes in 22.23.4/24.22.1/26.12.1. The live Netcup runtime is
+22.17.0 and still accepted all twelve incident chains. Update `/opt/node22` to a
+verified supported fixed release after establishing installer trust, and retain
+the exclusive OS policy. Verify the actual binary with the probes; a source or
+workflow version declaration alone does not prove the running service changed.
+Existing long-running MCP processes must be restarted.
 
 The Netcup `mcp.nanoodle.com` deployment uses `/opt/node22/bin/node`; the system
 Node executable is a different runtime. Its launcher and installer policy live

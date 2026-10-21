@@ -37,6 +37,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          check-latest: true
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
 
