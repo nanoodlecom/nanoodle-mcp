@@ -15,9 +15,20 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      NODE_OPTIONS: --use-openssl-ca
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      SSL_CERT_DIR: /etc/ssl/certs
+      npm_config_cafile: /etc/ssl/certs/ca-certificates.crt
+      npm_config_strict_ssl: "true"
     steps:
+      - name: Patch system trust before dependency or release downloads
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --only-upgrade ca-certificates
+          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
       - uses: actions/checkout@v4
 
       # server.json is the registry entry, package.json is what npm published.
@@ -25,7 +36,7 @@ jobs:
       # the tarball it points at. Stop before the publish, not after.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
 
