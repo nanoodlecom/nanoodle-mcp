@@ -466,7 +466,7 @@ test("humanizeFetch: timeout fallback, no fallback on 402, no re-ask after the d
   } });
   let r = await hf.fetch(url, req("TheDrummer/Cydonia-24B-v4.3"));
   assert.equal((await r.json()).choices[0].message.content, "from gemma-4-12b-it-starry-ocean");
-  assert.deepEqual(hf.state.fallback.C, { from: "TheDrummer/Cydonia-24B-v4.3", to: "gemma-4-12b-it-starry-ocean", reason: "no answer in 0 s" });
+  assert.deepEqual(hf.state.fallback.C, { from: "TheDrummer/Cydonia-24B-v4.3", to: "gemma-4-12b-it-starry-ocean", reason: "no answer in 0 s", ok: true });
   assert.equal(hf.state.answered.C, "gemma-4-12b-it-starry-ocean");
   // 402 (x402 payment flow) passes straight through: no fallback
   hf = humanizeFetch({ record, draft: "", fetch: () => Promise.resolve(reply("", 402)) });

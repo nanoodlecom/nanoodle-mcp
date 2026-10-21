@@ -19,8 +19,9 @@
  *    wrapper only touches chat calls whose model is a writer's.
  *    - Fallback: a writer with a fallback model (C: Cydonia → Starry Ocean) is
  *      retried once on the fallback when the primary answers 429 or 5xx, the
- *      request errors, or it has not answered within PRIMARY_TIMEOUT_MS. The
- *      model that actually answered is credited in ranked[].
+ *      request errors, or it has not answered within PRIMARY_TIMEOUT_MS, as long
+ *      as nothing was paid for the primary. The model that actually answered is
+ *      credited in ranked[]; if the fallback fails too, the note says so.
  *    - Dashes: " — ", " – " and " - " become ", " and any other em/en dash
  *      becomes ", " in every writer output, before the decider sees it.
  *    - Near-copy: if the share of the rewrite's word trigrams that also occur in
@@ -28,11 +29,22 @@
  *      same messages plus its own answer and REASK_TEXT) and the second answer
  *      replaces the first. No re-ask after REASK_DEADLINE_MS, so the writer's
  *      60 s node timeout is not put at risk, and at most MAX_REASKS (3) re-asks
- *      happen per run, first come first served. Both calls' costs are reported.
+ *      happen per run, first come first served. A re-ask has its own deadline: it
+ *      must finish within REASK_END_MS (55 s) of the writer call starting, or it is
+ *      abandoned and the first answer is kept. Both calls' costs are reported.
+ *    - x402 (keyless wallet mode): writer 402 invoices are settled here, not by the
+ *      nanoodle client, so the dash fix, re-asks and fallback credit apply to paid
+ *      calls too. One invoice per attempt, paid at most once, replayed only with the
+ *      body it was issued for; no fallback after a primary was paid.
+ *    - Cost: every attempt's cost is kept. Attempts whose answer never reaches the
+ *      engine (a failed fallback, a paid call that failed, an abandoned re-ask) go
+ *      into state.unreportedUsd, which tools.mjs adds to the run's total before the
+ *      gate's refund and payout math.
  *    Texts in the result are these post-processed writer outputs, exactly what
  *    the decider read.
  */
 import { ParamsError } from "./tools.mjs";
+import { parseNanoInvoice } from "nanoodle";
 
 export const HUMANIZE_TOOL = "humanize-comment";
 /** Hard caps in Unicode code points ([...s].length). */
@@ -45,6 +57,8 @@ export const PRIMARY_TIMEOUT_MS = 30000;
 export const REASK_DEADLINE_MS = 35000;
 /** At most this many near-copy re-asks per run (first come, first served); keeps the cost estimate under the pin. */
 export const MAX_REASKS = 3;
+/** A re-ask must finish within this long of its writer call starting (writer node timeout is 60 s), or the first answer is kept. */
+export const REASK_END_MS = 55000;
 export const REASK_TEXT = "Your last attempt copied the draft. Rewrite it in your own words: same facts, same meaning, but your own sentences, and never more than five words in a row from the draft. Output only the rewritten comment text.";
 
 /** Deterministic dash fix applied to writer outputs before judging. */
@@ -81,11 +95,21 @@ const usdOf = (j, r) => {
 /**
  * Per-run fetch wrapper for humanize-comment writer calls (see 4. above).
  * Returns { fetch, state }: state.answered[letter] = model that answered,
- * state.fallback[letter] = { from, to, reason }, state.reasked[letter] = { ratio, after },
- * state.dashes[letter] = true when a dash was replaced.
+ * state.fallback[letter] = { from, to, reason, ok, failed? }, state.reasked[letter] = { ratio, after, failed? },
+ * state.dashes[letter] = true when a dash was replaced, state.paidFailed[letter] = { model, status },
+ * state.unreportedUsd / state.costUnknown = cost of attempts whose answer never reached the engine
+ * (added to the run's total in tools.mjs so refund and payout math sees every billed attempt).
+ *
+ * x402 (keyless, `payment` callback): the nanoodle client's _paidFetch settles a 402 through the
+ * invoice's complete URL, and that replayed result never passes back through a chat-completions
+ * fetch. So for writer calls this wrapper settles the 402 itself, with the same callback, and hands
+ * the client a finished 200 (the client then has nothing to pay). Every attempt (primary, fallback,
+ * re-ask) is its own logical call with its own invoice, paid at most once, and replayed only with the
+ * exact body that invoice was issued for. Once a primary's invoice is paid there is no fallback: a
+ * paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, maxReasks = MAX_REASKS }) {
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {} };
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS }) {
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, paidFailed: {}, attempts: [], paidIds: new Set(), unreportedUsd: 0, costUnknown: false };
   let reasksLeft = maxReasks;
   const byModel = new Map();
   const dupes = new Set();
@@ -94,6 +118,15 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = D
     if (byModel.has(m)) dupes.add(m); else byModel.set(m, l);
   }
   for (const m of dupes) byModel.delete(m); // two writers on one model can't be told apart: leave them alone
+  const hdr = (h, k) => { if (!h) return null; if (typeof h.get === "function") return h.get(k); const e = Object.entries(h).find(([n]) => n.toLowerCase() === k); return e ? e[1] : null; };
+  const wait = (ms, signal) => new Promise((res, rej) => {
+    if (signal && signal.aborted) return rej(signal.reason);
+    const t = setTimeout(() => { if (signal) signal.removeEventListener("abort", on); res(); }, ms);
+    const on = () => { clearTimeout(t); rej(signal.reason); };
+    if (signal) signal.addEventListener("abort", on, { once: true });
+  });
+  const jsonResponse = (j, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
+
   const wrapped = async (url, init = {}) => {
     if (!/\/api\/v1\/chat\/completions(\?|$)/.test(String(url)) || !init || typeof init.body !== "string") return fetch(url, init);
     let body;
@@ -101,74 +134,173 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = D
     const letter = body && byModel.get(body.model);
     if (!letter) return fetch(url, init);
     const t0 = now();
-    const send = (b, signal = init.signal) => fetch(url, { ...init, signal, body: JSON.stringify(b) });
+    const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
+    let usd = 0, usdKnown = true; // this logical call: every attempt's cost
+    const addCost = (v) => { if (v == null || !isFinite(v)) usdKnown = false; else usd += Number(v); };
+
+    /**
+     * One attempt = one request body, sent once and (under x402) paid at most once.
+     * Returns { r, j, paid, rec }. `commit` runs just before a payment (the caller stops its fallback timer).
+     */
+    const attempt = async (b, kind, signal, commit) => {
+      const bodyStr = JSON.stringify(b);
+      const rec = { letter, kind, model: b.model, status: null, paid: false, paymentId: null, usd: null };
+      state.attempts.push(rec);
+      const req = { ...init, signal, body: bodyStr };
+      let r = await fetch(url, req);
+      if (r.status === 402 && x402) {
+        const raw = await r.text();
+        let inv = null;
+        try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+        if (!inv || !inv.paymentId || !inv.completeUrl || state.paidIds.has(inv.paymentId)) {
+          rec.status = 402;
+          const e = new Error(inv && state.paidIds.has(inv.paymentId) ? `x402 invoice ${inv.paymentId} was already paid; not paying it again` : "payment required, but the 402 response offered no usable Nano option");
+          e.code = "x402"; throw e;
+        }
+        if (commit) commit();
+        rec.paymentId = inv.paymentId;
+        state.paidIds.add(inv.paymentId);
+        await payment(inv); // the only payment for this body; a throw here means nothing was replayed
+        rec.paid = true;
+        rec.usd = inv.amountUsd;
+        const deadline = inv.expiresAt || now() + 15 * 60 * 1000;
+        for (;;) {
+          let cr;
+          try {
+            cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}", signal });
+          } catch (e) { rec.status = "aborted after payment"; throw e; }
+          if (cr.ok) {
+            let cj = null;
+            try { cj = await cr.json(); } catch { cj = null; }
+            if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { r = jsonResponse(cj); break; }
+            // settle-only receipt: replay THIS attempt's exact body, stamped with its own payment id
+            r = await fetch(url, { ...req, headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId } });
+            if (r.status === 402) {
+              rec.status = 402;
+              const e = new Error(`payment ${inv.paymentId} settled, but the API still answered 402 on replay; not paying again`);
+              e.code = "x402"; throw e;
+            }
+            break;
+          }
+          if (cr.status !== 402) { r = cr; break; }
+          await cr.text().catch(() => {});
+          if (now() >= deadline) { rec.status = "x402 expired"; const e = new Error(`payment window expired for ${inv.paymentId}`); e.code = "x402-expired"; throw e; }
+          await wait(pollMs, signal);
+        }
+      }
+      rec.status = r.status;
+      let j = null;
+      if (r.ok) { try { j = await r.clone().json(); } catch { j = null; } }
+      const reported = r.ok ? usdOf(j, r) : null;
+      if (reported != null) rec.usd = reported;
+      else if (!rec.paid) rec.usd = r.ok ? null : 0; // an HTTP error answer is not billed (key mode)
+      return { r, j, rec };
+    };
+    const lose = () => { // the logical call ends without an answer for the engine: keep its cost
+      if (usdKnown) state.unreportedUsd += usd; else { state.unreportedUsd += usd; state.costUnknown = true; }
+    };
+
     let model = body.model;
-    let r;
-    const fb = record[letter].fallbackModel;
-    if (fb) {
-      let reason = null;
-      // a ref'd timer (AbortSignal.timeout is unref'd), cleared as soon as the primary settles
-      const ac = new AbortController();
-      const timer = setTimeout(() => { const e = new Error("primary timed out"); e.name = "TimeoutError"; ac.abort(e); }, primaryTimeoutMs);
-      const onOuter = () => ac.abort(init.signal.reason);
-      if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
-      try {
-        r = await send(body, ac.signal);
-        if (r.status === 429 || r.status >= 500) reason = `HTTP ${r.status}`;
-      } catch (e) {
-        if (init.signal && init.signal.aborted) throw e;
-        reason = ac.signal.aborted ? `no answer in ${Math.round(primaryTimeoutMs / 1000)} s` : "request error";
-      } finally {
-        clearTimeout(timer);
-        if (init.signal) init.signal.removeEventListener("abort", onOuter);
+    let res;
+    try {
+      const fb = record[letter].fallbackModel;
+      if (fb) {
+        let reason = null;
+        const ac = new AbortController();
+        const timer = setTimeout(() => { const e = new Error("primary timed out"); e.name = "TimeoutError"; ac.abort(e); }, primaryTimeoutMs);
+        const onOuter = () => ac.abort(init.signal.reason);
+        if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
+        try {
+          res = await attempt(body, "primary", ac.signal, () => clearTimeout(timer));
+          addCost(res.rec.usd);
+          if (res.r.status === 429 || res.r.status >= 500) reason = `HTTP ${res.r.status}`;
+        } catch (e) {
+          const rec = state.attempts[state.attempts.length - 1];
+          if (rec && rec.paid) { addCost(rec.usd); state.paidFailed[letter] = { model: body.model, status: rec.status }; throw e; }
+          if (init.signal && init.signal.aborted) throw e;
+          if (e && e.code && /^x402/.test(e.code)) throw e;
+          reason = ac.signal.aborted ? `no answer in ${Math.round(primaryTimeoutMs / 1000)} s` : "request error";
+          if (ac.signal.aborted && !x402) usdKnown = false; // an abandoned keyed request may still be billed
+        } finally {
+          clearTimeout(timer);
+          if (init.signal) init.signal.removeEventListener("abort", onOuter);
+        }
+        if (reason && res && res.rec.paid) {
+          // paid for the primary and it still failed: no fallback, so one logical call is never paid twice
+          state.paidFailed[letter] = { model: body.model, status: res.r.status };
+          reason = null;
+        } else if (reason) {
+          model = fb;
+          state.fallback[letter] = { from: body.model, to: fb, reason, ok: false };
+          try {
+            res = await attempt({ ...body, model: fb }, "fallback", init.signal);
+          } catch (e) {
+            const rec = state.attempts[state.attempts.length - 1];
+            if (rec) addCost(rec.usd);
+            state.fallback[letter].failed = "request error";
+            throw e;
+          }
+          addCost(res.rec.usd);
+          if (res.r.ok) state.fallback[letter].ok = true; else state.fallback[letter].failed = `HTTP ${res.r.status}`;
+        }
+      } else {
+        try { res = await attempt(body, "primary", init.signal); }
+        catch (e) { const rec = state.attempts[state.attempts.length - 1]; if (rec) addCost(rec.usd); throw e; }
+        addCost(res.rec.usd);
       }
-      if (reason) {
-        model = fb;
-        state.fallback[letter] = { from: body.model, to: fb, reason };
-        r = await send({ ...body, model: fb });
-      }
-    } else {
-      r = await send(body);
-    }
-    if (!r.ok) return r;
-    let j;
-    try { j = await r.clone().json(); } catch { return r; }
+    } catch (e) { lose(); throw e; }
+
+    const { r, j } = res;
     const msg = j && j.choices && j.choices[0] && j.choices[0].message;
-    if (!msg || typeof msg.content !== "string") return r;
+    if (!r.ok || !msg || typeof msg.content !== "string") {
+      if (state.fallback[letter] && !state.fallback[letter].failed && !(msg && typeof msg.content === "string")) state.fallback[letter].failed = r.ok ? "no text in the answer" : `HTTP ${r.status}`;
+      if (state.fallback[letter] && state.fallback[letter].failed) state.fallback[letter].ok = false;
+      if (!r.ok) { lose(); return r; } // the engine reads no cost from an error answer
+      // ok but unreadable: the engine reports r's own price; earlier attempts are carried here
+      const own = res.rec.usd || 0;
+      if (usd - own > 0) state.unreportedUsd += usd - own;
+      if (!usdKnown) state.costUnknown = true;
+      return r;
+    }
     state.answered[letter] = model;
     let text = normalizeDashes(msg.content);
     if (text !== msg.content) state.dashes[letter] = true;
-    let usd = usdOf(j, r);
     const ratio = copyRatio(text, draft);
     if (ratio > NEAR_COPY_RATIO && (reasksLeft <= 0 || now() - t0 >= reaskDeadlineMs)) {
       state.skippedReask[letter] = { ratio, why: reasksLeft <= 0 ? `the ${maxReasks}-re-ask limit for this run was reached` : "too late in the writer's time budget" };
     } else if (ratio > NEAR_COPY_RATIO) {
       reasksLeft--;
+      // its own deadline: the re-ask must finish by reaskEndMs after the writer call began, or the
+      // first answer is kept (so the writer's 60 s node timeout never eats a usable rewrite)
+      const left = Math.max(0, t0 + reaskEndMs - now());
+      const ac = new AbortController();
+      const timer = setTimeout(() => { const e = new Error("re-ask timed out"); e.name = "TimeoutError"; ac.abort(e); }, left);
+      const onOuter = () => ac.abort(init.signal.reason);
+      if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
       try {
-        const r2 = await send({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: msg.content }, { role: "user", content: REASK_TEXT }] });
-        if (r2.ok) {
-          const j2 = await r2.json();
-          const m2 = j2 && j2.choices && j2.choices[0] && j2.choices[0].message;
-          const u2 = usdOf(j2, r2);
-          usd = usd != null && u2 != null ? usd + u2 : null;
-          if (m2 && typeof m2.content === "string" && m2.content.trim()) {
-            const t2 = normalizeDashes(m2.content);
-            state.reasked[letter] = { ratio, after: copyRatio(t2, draft) };
-            text = t2;
-          } else state.reasked[letter] = { ratio, after: null };
-        } else {
-          state.reasked[letter] = { ratio, after: null, failed: `HTTP ${r2.status}` };
-        }
+        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: msg.content }, { role: "user", content: REASK_TEXT }] }, "reask", ac.signal);
+        addCost(r2.rec.usd);
+        const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
+        if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
+          const t2 = normalizeDashes(m2.content);
+          state.reasked[letter] = { ratio, after: copyRatio(t2, draft) };
+          text = t2;
+        } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
       } catch (e) {
-        if (init.signal && init.signal.aborted) throw e;
-        state.reasked[letter] = { ratio, after: null, failed: "request error" };
+        if (init.signal && init.signal.aborted) { lose(); throw e; }
+        const rec = state.attempts[state.attempts.length - 1];
+        if (rec && rec.kind === "reask") { if (rec.paid) addCost(rec.usd); else if (ac.signal.aborted && !x402) usdKnown = false; }
+        state.reasked[letter] = { ratio, after: null, failed: ac.signal.aborted ? `no answer within ${Math.round(reaskEndMs / 1000)} s of the writer call` : "request error" };
+      } finally {
+        clearTimeout(timer);
+        if (init.signal) init.signal.removeEventListener("abort", onOuter);
       }
     }
-    if (text === msg.content && model === body.model && !state.reasked[letter]) return r;
     const out = { ...j, choices: [{ ...j.choices[0], message: { ...msg, content: text } }] };
     delete out.cost; delete out.metadata;
-    if (usd != null) out.x_nanogpt_pricing = { costUsd: usd }; else delete out.x_nanogpt_pricing;
-    return new Response(JSON.stringify(out), { status: 200, headers: { "content-type": "application/json" } });
+    if (usdKnown) out.x_nanogpt_pricing = { costUsd: usd };
+    else { delete out.x_nanogpt_pricing; state.unreportedUsd += usd; state.costUnknown = true; }
+    return jsonResponse(out);
   };
   return { fetch: wrapped, state };
 }
@@ -176,7 +308,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, now = D
 /** Notes for the tool result about fallbacks and re-asks this run. */
 export function humanizeRunNotes(state) {
   const notes = [];
-  for (const [l, f] of Object.entries(state.fallback)) notes.push(`note: writer ${l} (${f.from}) did not answer (${f.reason}), so ${f.to} wrote ${l}'s rewrite and is credited for it.`);
+  for (const [l, f] of Object.entries(state.fallback)) notes.push(f.ok
+    ? `note: writer ${l} (${f.from}) did not answer (${f.reason}), so ${f.to} wrote ${l}'s rewrite and is credited for it.`
+    : `note: writer ${l} (${f.from}) did not answer (${f.reason}), and the fallback ${f.to} also failed (${f.failed || "no answer"}), so writer ${l} has no rewrite this run.`);
+  for (const [l, p] of Object.entries(state.paidFailed)) notes.push(`note: writer ${l} (${p.model}) was paid for but did not return a rewrite (${p.status}); no fallback was tried, so the call was not paid twice.`);
   for (const [l, r] of Object.entries(state.reasked)) notes.push(`note: writer ${l}'s first rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}), so it was re-asked once` + (r.failed ? ` (the re-ask failed: ${r.failed}; its first rewrite was kept)` : r.after != null ? ` (overlap now ${r.after.toFixed(2)})` : "") + ".");
   for (const [l, r] of Object.entries(state.skippedReask)) notes.push(`note: writer ${l}'s rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}) but was not re-asked (${r.why}); the decider judged it as is.`);
   return notes;

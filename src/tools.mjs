@@ -945,7 +945,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (tool.humanize) {
         const args = params.arguments || {};
         const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
-        hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(args[dk]) : "" });
+        // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
+        hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(args[dk]) : "", payment: apiKey ? null : payment, baseUrl: baseUrl || "https://nano-gpt.com" });
         runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
       }
       const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
@@ -953,6 +954,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         notices.push(...humanizeRunNotes(hf.state));
         const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
         if (note) notices.push(note);
+        // attempts whose answer never reached the engine (failed fallbacks, paid-but-failed calls,
+        // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
+        if (hf.state.unreportedUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + hf.state.unreportedUsd;
+        if (hf.state.costUnknown) result.costExact = false;
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
