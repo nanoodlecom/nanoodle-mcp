@@ -17,6 +17,7 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
+import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult } from "./humanize.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -838,10 +839,18 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         card: { intent: graphIntent(wf.graph), steps: chainSteps(wf.graph), sample: savedSample(wf) },
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]), name }),
         inputSchema: buildInputSchema(wf),
+        // humanize-comment: input caps + writer record + exact ranked texts (src/humanize.mjs)
+        humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph) : null,
       });
     }
   }
 
+  for (const t of tools) if (t.humanize) {
+    for (const [k, cap] of Object.entries(HUMANIZE_INPUT_CAPS)) {
+      const p = t.inputSchema.properties[k];
+      if (p) { p.maxLength = cap; p.description = `${p.description ? p.description + "; " : ""}at most ${cap} characters`; }
+    }
+  }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
@@ -916,6 +925,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (typeof args !== "object" || Array.isArray(args)) {
         throw new ParamsError("tools/call arguments must be an object");
       }
+      if (tool.humanize) checkHumanizeInputs(args);
       const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
       return { tool, inputs };
     },
@@ -931,6 +941,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const t0 = Date.now();
       const { onProgress, notices } = runNotices(tool.wf);
       const result = await tool.wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      if (tool.humanize) {
+        const note = rebuildHumanizeResult(tool.wf, result, tool.humanize);
+        if (note) notices.push(note);
+      }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
     },
