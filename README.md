@@ -446,6 +446,57 @@ jq 'select(.event=="paid") | .usd' usage.jsonl | jq -s add                      
 jq -r 'select(.event=="refund") | .reason' usage.jsonl | sort | uniq -c         # refunds by category
 ```
 
+### TLS trust prerequisite (2026-10-21)
+
+The [eMudhra intermediate-key compromise](https://emudhra.we-have-a-problem.com/)
+affects outbound HTTPS and WSS from this Node process: NanoGPT requests, Nano
+RPC/work services, authenticated wallet websocket connections, media downloads,
+and share links. Both hosted and local MCP clients need patched certificate
+trust. Updating a browser does not update Node's bundled roots.
+
+On Debian 13, install `ca-certificates >= 20250419+deb13u1`; on Ubuntu 24.04,
+install `>= 20260816ubuntu0.24.04.1`. Before **npm/npx installs and server startup**,
+select only the patched OpenSSL store on those Linux hosts:
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export SSL_CERT_DIR=/etc/ssl/certs
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--use-openssl-ca"
+export npm_config_cafile="$SSL_CERT_FILE"
+export npm_config_strict_ssl=true
+# Now run npm ci, npx, or your normal server command in this environment.
+```
+
+Preserve unrelated Node flags, remove conflicting `--use-bundled-ca` or
+`--use-system-ca`, and remove `NODE_EXTRA_CA_CERTS` while applying this policy.
+Those additive options do not remove compromised roots. Keep certificate
+verification enabled. For macOS/Windows, update OS trust and the Node runtime,
+then verify the actual runtime's trust policy; these Linux paths are not portable.
+The [2026-10-21 Node security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
+provides native fixes in 22.23.4/24.22.1/26.12.1. The live Netcup runtime is
+22.17.0 and still accepted all twelve incident chains. Update `/opt/node22` to a
+verified supported fixed release after establishing installer trust, and retain
+the exclusive OS policy. Verify the actual binary with the probes; a source or
+workflow version declaration alone does not prove the running service changed.
+Existing long-running MCP processes must be restarted.
+
+The Netcup `mcp.nanoodle.com` deployment uses `/opt/node22/bin/node`; the system
+Node executable is a different runtime. Its launcher and installer policy live
+in [255labs infrastructure](https://github.com/255BITS/deploy/tree/master/255labs).
+Install those host prerequisites before merging this PR because `main` deploys
+automatically. The CI jobs also patch Ubuntu trust before downloads and select
+exclusive OpenSSL trust, while testing on Node 22 to match production.
+
+Verify ordinary HTTPS succeeds and **all twelve** incident probe handshakes fail
+with certificate errors, including AAA cross-sign variants. Use the shared
+`tools/check-tls-trust.py` in the deploy repository with `--client node --node
+/opt/node22/bin/node` through `with-system-trust` on Netcup. Repeat with the
+Node executable actually used by each local `npx`/editor MCP installation.
+Test authenticated WSS and read-only RPC connectivity separately; avoid a paid
+run or wallet transfer as a health check. Review unexpected spend or wallet/API
+activity and rotate exposed credentials if misuse or interception is suspected.
+Merging this source is not evidence that external clients are patched.
+
 ### Hosting checklist
 
 - **Reverse proxy / tunnel**: bind localhost, put Caddy/nginx/cloudflared in
