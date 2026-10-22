@@ -9,6 +9,7 @@ import data from "./receipts.json" with { type: "json" };
 
 export const PROFILE = data.profile;
 export const INTRO = data.intro;
+export const HEADING = "Real runs, written up";
 export const ARTICLES = data.articles;
 export const GUIDES = data.guides;
 
@@ -58,7 +59,7 @@ export function receiptsHtml() {
     `<span class="k">guide</span><span class="title">${esc(guide.title)}</span><span class="arr" aria-hidden="true">→</span>`)).join("");
   return `<section class="receipts" id="real-runs" aria-labelledby="real-runs-title">` +
     `<p class="eyebrow">See it run</p>` +
-    `<h2 id="real-runs-title">Real runs, real receipts</h2>` +
+    `<h2 id="real-runs-title">${esc(HEADING)}</h2>` +
     `<p class="lead">${esc(INTRO)}</p>` +
     ext(hero.url, "hero", shot +
       `<span class="copy">` +
@@ -82,7 +83,7 @@ export function receiptsLines() {
   if (!articles.length) return [];
   const [hero] = articles;
   const lines = [
-    `## Real runs, real receipts`,
+    `## ${HEADING}`,
     ``,
     INTRO,
     `Open in Subnano: ${hero.url}`,

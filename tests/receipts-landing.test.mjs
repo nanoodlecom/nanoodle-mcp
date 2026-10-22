@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
-import { ARTICLES, GUIDES, INTRO, PROFILE, orderedArticles, pageThumb } from "../src/receipts.mjs";
+import { ARTICLES, GUIDES, HEADING, INTRO, PROFILE, orderedArticles, pageThumb } from "../src/receipts.mjs";
 
 async function withServer(charged, fn) {
   const tools = [{ name: "poster", description: "poster workflow" }];
@@ -28,6 +28,16 @@ function section(html) {
   return html.slice(start, end);
 }
 
+// The agent is named Nano Maxi. The currency is not part of this story:
+// several of these runs were paid in NanoGPT dollars, not Nano.
+function assertNoPaymentRail(text, where) {
+  const stripped = text.replaceAll("Nano Maxi", "").replaceAll("nano_maxi", "");
+  assert.doesNotMatch(stripped, /\bNano\b/, `${where} names Nano outside the agent`);
+  assert.doesNotMatch(text, /cents of Nano/i, where);
+  assert.doesNotMatch(text, /pays in Nano/, where);
+  assert.doesNotMatch(text, /real receipts/i, where);
+}
+
 test("page thumbs stay on the media host", () => {
   for (const article of ARTICLES) {
     const thumb = pageThumb(article);
@@ -42,11 +52,12 @@ test("page thumbs stay on the media host", () => {
 test("landing receipts sit between the flow strip and the cost card", async () => {
   const html = await withServer(true, async (base) => await (await fetch(`${base}/`)).text());
   const flow = html.indexOf("No tab, no tip, no signup.");
-  const runs = html.indexOf("Real runs, real receipts");
+  const runs = html.indexOf(HEADING);
   const cost = html.indexOf("What a call costs");
   assert.ok(flow >= 0 && runs > flow && cost > runs, "section is out of order");
 
   const block = section(html);
+  assertNoPaymentRail(block, "landing section");
   assert.ok(block.includes(INTRO));
   assert.ok(block.includes("Open in Subnano →"));
   assert.ok(block.includes(`Read all of Nano Maxi's notes →`));
@@ -84,7 +95,7 @@ test("free-mode landing still shows receipts and skips the payment story", async
   assert.doesNotMatch(html, /What a call costs/);
   assert.doesNotMatch(html, /deposit/i);
   const steps = html.indexOf("paste the command");
-  const runs = html.indexOf("Real runs, real receipts");
+  const runs = html.indexOf(HEADING);
   const workflows = html.indexOf("Workflows (");
   assert.ok(steps >= 0 && runs > steps && workflows > runs);
   assert.ok(section(html).includes(INTRO));
@@ -92,9 +103,10 @@ test("free-mode landing still shows receipts and skips the payment story", async
 
 test("llms.txt carries a short receipts version ahead of the tool list", async () => {
   const txt = await withServer(true, async (base) => await (await fetch(`${base}/llms.txt`)).text());
-  const runs = txt.indexOf("## Real runs, real receipts");
+  const runs = txt.indexOf(`## ${HEADING}`);
   const tools = txt.indexOf("## Tools");
   assert.ok(runs >= 0 && tools > runs);
+  assertNoPaymentRail(txt.slice(runs, tools), "llms.txt");
   assert.ok(txt.includes(INTRO));
   assert.ok(txt.includes(`Open in Subnano: ${orderedArticles()[0].url}`));
   assert.ok(txt.includes(`Read all of Nano Maxi's notes: ${PROFILE}`));

@@ -13,7 +13,7 @@
  *                        opens GET /x402/watch/:id until paid closes it; (3) tools/call
  *                        with _payment_id is the RESULTS stream only.
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
- *                        flows, real-run receipts, tool list w/ per-workflow editor links, self-hosting + author-payout story
+ *                        flows, daily run write-ups, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
  *   GET  /version        { name, version, commit } — short git sha, so a deploy can be matched to main
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
