@@ -13,7 +13,7 @@
  *                        opens GET /x402/watch/:id until paid closes it; (3) tools/call
  *                        with _payment_id is the RESULTS stream only.
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
- *                        flows, tool list w/ per-workflow editor links, self-hosting + author-payout story
+ *                        flows, daily run write-ups, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       the same story as plain text, written for agents
  *   GET  /version        { name, version, commit } — short git sha, so a deploy can be matched to main
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
@@ -40,6 +40,7 @@ import { fileURLToPath } from "node:url";
 import { qrModules } from "nanoodle";
 import { createDispatcher, gitShortSha } from "./server.mjs";
 import { renderCost } from "./tools.mjs";
+import { receiptsHtml, receiptsLines, RECEIPTS_CSS } from "./receipts.mjs";
 import { workflowExample } from "./workflow-examples.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024; // media inputs may ride inline as data: URLs
@@ -175,6 +176,7 @@ const LANDING_CSS = `
   .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
   .card h2{margin-top:0}
   footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
+  ${RECEIPTS_CSS}
 `;
 
 const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
@@ -314,8 +316,9 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     </div>
     ${charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>402 payment quote</span>
       <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
-    <p class="tagline">No tab, no tip, no signup.</p>
-    <div class="card"><h2>What a call costs</h2>
+    <p class="tagline">No tab, no tip, no signup.</p>` : ""}
+    ${receiptsHtml()}
+    ${charged ? `<div class="card"><h2>What a call costs</h2>
       <p class="muted">When a tool needs payment, your agent shows you a link with a QR code — scan it with
       any Nano wallet and the result streams back seconds later. What you pay up front is a
       <strong>deposit</strong>: each run settles at the model's metered cost + 20%, and the difference is
@@ -433,6 +436,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       ``,
     );
   }
+  lines.push(...receiptsLines(), ``);
   lines.push(`## Tools`, ``);
   for (const t of tools) {
     lines.push(`- ${t.name}: ${t.description}`);

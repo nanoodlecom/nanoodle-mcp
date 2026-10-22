@@ -41,9 +41,10 @@ async function landingImgSrcs() {
 
 test("landing page images are same-origin or on media.nanoodle.com", async () => {
   const { html, srcs, local } = await landingImgSrcs();
-  // favicon + six sample previews (sing has no preview; neon-shrine-duel,
-  // storyboard-relay and tiny-world-film have no example)
-  assert.equal(srcs.length, 7, `expected 7 <img>, got ${JSON.stringify(srcs)}`);
+  // favicon + the receipts hero + six sample previews (sing has no preview;
+  // neon-shrine-duel, storyboard-relay and tiny-world-film have no example)
+  assert.equal(srcs.length, 8, `expected 8 <img>, got ${JSON.stringify(srcs)}`);
+  assert.ok(srcs.includes("https://media.nanoodle.com/subnano/2026-10-21-song-to-music-video/poster.webp"));
   for (const src of srcs) {
     const origin = new URL(src, PUBLIC_BASE + "/").origin;
     assert.ok(origin === PUBLIC_BASE || origin === MEDIA_ORIGIN, `${src} is neither same-origin nor on ${MEDIA_ORIGIN}`);
@@ -58,7 +59,7 @@ test("landing page images are same-origin or on media.nanoodle.com", async () =>
 test("landing page media images return 200, an image type and no same-origin CORP", { skip: OFFLINE && "NANOODLE_OFFLINE=1" }, async () => {
   const { srcs } = await landingImgSrcs();
   const media = srcs.filter(src => new URL(src, PUBLIC_BASE + "/").origin === MEDIA_ORIGIN);
-  assert.equal(media.length, 6, `expected 6 media images, got ${JSON.stringify(media)}`);
+  assert.equal(media.length, 7, `expected 7 media images, got ${JSON.stringify(media)}`);
   for (const src of media) {
     const res = await fetch(src, { method: "HEAD", headers: { Origin: PUBLIC_BASE }, signal: AbortSignal.timeout(15000) });
     assert.equal(res.status, 200, `${src} -> ${res.status}`);
