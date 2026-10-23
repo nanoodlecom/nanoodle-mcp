@@ -18,6 +18,10 @@ import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes } from "./humanize.mjs";
+import {
+  NSFW_OPT_IN_NOTE, NSFW_PROPERTY, applyNsfwPolicy, bindNsfwArgs, effectiveNsfw,
+  graphArguments, modelUsedWhenNsfwOff, spicyBlockedMessage,
+} from "./nsfw.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -343,7 +347,8 @@ function describeOutputs(wf) {
     if (kind === "text") return "text";
     const f = (byId.get(o.nodeId) || {}).fields || {};
     const details = [];
-    if (f.model) details.push(shortModel(f.model));
+    // Advertise the model the default (NSFW off) run actually sends.
+    if (f.model) details.push(shortModel(modelUsedWhenNsfwOff(f.model)));
     if (kind === "image" && f.size && f.size !== "auto") details.push(String(f.size).replace("x", "×"));
     mediaFiles += 1;
     return `${kind}${details.length ? ` (${details.join(", ")})` : ""}`;
@@ -369,7 +374,8 @@ function buildDescription(wf, spendSource, { cost, name } = {}) {
   const returns = describeOutputs(wf);
   return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
     `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.` +
-    (example ? ` Example: ${example.title} (${example.play}). ${example.description}` + (example.skill ? ` Agent skill: ${example.skill}` : "") : "");
+    (example ? ` Example: ${example.title} (${example.play}). ${example.description}` + (example.skill ? ` Agent skill: ${example.skill}` : "") : "") +
+    ` ${NSFW_OPT_IN_NOTE}`;
 }
 
 /**
@@ -429,10 +435,14 @@ function authorOptional(wf, inp) {
 }
 
 /** Derived inputs paired with schema-safe keys ("System prompt" → "System_prompt"), deduped. */
+/** `nsfw` is the opt-in flag, never a workflow input. */
+const RESERVED_ARG_KEYS = new Set(["nsfw"]);
+
 function keyedInputs(wf) {
   const used = new Map();
   return wf.inputs.map((inp) => {
     let safe = schemaKey(inp.key);
+    if (RESERVED_ARG_KEYS.has(safe.toLowerCase())) safe = `${safe.slice(0, 58)}_input`;
     const count = (used.get(safe) || 0) + 1;
     used.set(safe, count);
     if (count > 1) safe = `${safe.slice(0, 61)}_${count}`;
@@ -470,6 +480,8 @@ function buildInputSchema(wf) {
     if (bits.length) prop.description = bits.join("; ");
     properties[safe] = prop;
   }
+  // Reserved flag, present on every tool. Not required — omitted means off.
+  properties.nsfw = NSFW_PROPERTY;
   return { type: "object", properties, ...(required.length ? { required } : {}) };
 }
 
@@ -500,7 +512,8 @@ const runNoodleTool = (spendSource) => ({
     "nanoodle.com/play.html#a=… app link, or a da.gd/TinyURL short link to one. Pass the link " +
     "as `url` and any workflow inputs as `inputs`. Runs on NanoGPT — every call spends real " +
     `credit from ${spendSource}. Direct share links decode locally; only fragment-less ` +
-    "short links trigger a network read, and it carries no credentials.",
+    "short links trigger a network read, and it carries no credentials. " +
+    NSFW_OPT_IN_NOTE,
   inputSchema: {
     type: "object",
     properties: {
@@ -515,9 +528,10 @@ const runNoodleTool = (spendSource) => ({
         description:
           'Workflow inputs keyed by their friendly names — the same keys the graph would take, ' +
           'e.g. { "Text": "a lighthouse at dawn" }. Media inputs take a file path or https URL. ' +
-          "Omit to run the graph with its saved defaults.",
+          "Omit to run the graph with its saved defaults. A value inside this object never enables NSFW mode.",
         additionalProperties: { type: "string" },
       },
+      nsfw: NSFW_PROPERTY,
     },
     required: ["url"],
   },
@@ -718,22 +732,52 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * or a run failure — throws a plain error the server surfaces as
  * an isError tool result, so the agent gets a readable message, never a crash.
  */
-async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }) {
+/**
+ * A Workflow whose stored fields already reflect the NSFW policy.
+ * Copies the base client's transport knobs so a swapped graph polls the same way.
+ * `fetch` overrides the client (humanize-comment's per-run wrapper).
+ */
+function workflowWithGraph(baseWf, graph, fetch) {
+  return new Workflow(graph, {
+    apiKey: baseWf.client.apiKey,
+    payment: baseWf.client.payment,
+    baseUrl: baseWf.client.baseUrl,
+    quiet: true,
+    catalog: baseWf.catalog,
+    fetch: fetch || baseWf.client.fetch,
+    pollIntervals: baseWf.client.pollIntervals,
+    timeouts: baseWf.client.timeouts,
+  });
+}
+
+/** Refuse, before any spend, when NSFW is off and a spicy model has no safe variant. */
+function assertNsfwAllowed(policy, label) {
+  if (policy.blocked.length) throw new ParamsError(spicyBlockedMessage(label, policy.blocked));
+}
+
+async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }, ctx) {
   const args = params.arguments == null ? {} : params.arguments;
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
   }
-  if (typeof args.url !== "string" || !args.url.trim()) {
+  const nsfw = effectiveNsfw(params, ctx);
+  const bound = bindNsfwArgs(args, !!(ctx && ctx.sessionNsfw === true), Object.prototype.hasOwnProperty.call(params, "nsfw") ? params.nsfw : undefined);
+  const callArgs = graphArguments(bound);
+  if (typeof callArgs.url !== "string" || !callArgs.url.trim()) {
     throw new ParamsError('run_noodle needs a "url" — a nanoodle share link (nanoodle.com/#g=…, /play.html#a=…, or a da.gd/TinyURL short link)');
   }
-  const inputArgs = args.inputs == null ? {} : args.inputs;
+  const inputArgs = callArgs.inputs == null ? {} : callArgs.inputs;
   if (typeof inputArgs !== "object" || Array.isArray(inputArgs)) {
     throw new ParamsError('run_noodle "inputs" must be an object of workflow inputs, e.g. { "Text": "a lighthouse" }');
   }
 
   // Decode: direct #g=/#j=/#a= links are offline; only fragment-less short links
   // fetch, and those are redirect-header reads with no credentials attached.
-  const decoded = await decodeShareUrl(args.url.trim(), { fetch: globalThis.fetch });
+  const decoded = await decodeShareUrl(callArgs.url.trim(), { fetch: globalThis.fetch });
+  // Refuse a spicy model with no safe variant before the catalog fetch, so a
+  // link that cannot run spends nothing and waits on nothing.
+  const policy = applyNsfwPolicy(decoded.graph, { nsfw });
+  assertNsfwAllowed(policy, `run_noodle (${decoded.url})`);
   // The link is a stranger's graph, so the catalog matters MOST here: it's what
   // clamps variations to the model's real max_output_images and refs to
   // max_input_images before anything is billed. Cached, timeout-bounded and
@@ -741,20 +785,21 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
   // and a hanging or down endpoint delays the run by the fetch timeout once a
   // minute at worst (the failure marker covers the calls in between) before the
   // run proceeds unclamped.
-  const catalog = await fetchCatalogs(graphModelKinds(decoded.graph), {
+  const catalog = await fetchCatalogs(graphModelKinds(policy.changed ? policy.graph : decoded.graph), {
     baseUrl: baseUrl || undefined,
     fetch: globalThis.fetch,
     log,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so this link runs with whatever payload it asked for",
   });
-  const wf = new Workflow(decoded.graph, { apiKey, payment, baseUrl, quiet: true, catalog });
+  const wf = new Workflow(policy.changed ? policy.graph : decoded.graph, { apiKey, payment, baseUrl, quiet: true, catalog });
   if (wf.warnings.length) {
     // unknown node types: the graph decodes but run() would always refuse
     throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
   }
   const inputs = await resolveInputs(wf, inputArgs, `run_noodle (${decoded.url})`);
   const { onProgress, notices } = runNotices(wf);
+  notices.push(...policy.notices);
   const result = await wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
   return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices });
 }
@@ -910,7 +955,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
      * rejected before the caller is ever asked to pay. run_noodle is excluded
      * (its validation is inseparable from decoding the link).
      */
-    async prepareCall(params) {
+    async prepareCall(params, ctx = null) {
       if (params == null || typeof params !== "object" || Array.isArray(params)) {
         throw new ParamsError("tools/call expects a params object with { name, arguments }");
       }
@@ -926,33 +971,52 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (typeof args !== "object" || Array.isArray(args)) {
         throw new ParamsError("tools/call arguments must be an object");
       }
-      if (tool.humanize) checkHumanizeInputs(args);
-      const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
-      return { tool, inputs };
+      const nsfw = effectiveNsfw({ ...params, arguments: args }, ctx);
+      const bound = bindNsfwArgs(args, !!(ctx && ctx.sessionNsfw === true), Object.prototype.hasOwnProperty.call(params, "nsfw") ? params.nsfw : undefined);
+      const graphArgs = graphArguments(bound);
+      const policy = applyNsfwPolicy(tool.wf.graph, { nsfw });
+      assertNsfwAllowed(policy, `tool "${tool.name}"`);
+      if (tool.humanize) checkHumanizeInputs(graphArgs);
+      const inputs = await resolveInputs(tool.wf, graphArgs, `tool "${tool.name}"`);
+      return { tool, inputs, nsfw, policy };
     },
 
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
-    async callTool(params) {
+    async callTool(params, ctx = null) {
       if (params != null && typeof params === "object" && !Array.isArray(params) && params.name === RUN_NOODLE_NAME) {
-        return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
+        return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }, ctx);
       }
-      const { tool, inputs } = await registry.prepareCall(params);
+      const { tool, inputs, policy } = await registry.prepareCall(params, ctx);
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();
-      const { onProgress, notices } = runNotices(tool.wf);
       // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
       // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
       let runWf = tool.wf, hf = null;
+      let runPolicy = policy;
       if (tool.humanize) {
-        const args = params.arguments || {};
-        const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
+        const graphArgs = graphArguments(bindNsfwArgs(
+          params.arguments || {},
+          !!(ctx && ctx.sessionNsfw === true),
+          params && Object.prototype.hasOwnProperty.call(params, "nsfw") ? params.nsfw : undefined,
+        ));
+        const dk = Object.keys(graphArgs).find((k) => k.trim().toLowerCase() === "draft");
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
-        hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(args[dk]) : "", payment: apiKey ? null : payment, baseUrl: baseUrl || "https://nano-gpt.com" });
+        hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(graphArgs[dk]) : "", payment: apiKey ? null : payment, baseUrl: baseUrl || "https://nano-gpt.com" });
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
         hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
-        runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
+        // rawText is the file the writers were read from. Apply the same policy so a
+        // fresh Workflow cannot put a spicy model back.
+        const rawGraph = JSON.parse(tool.rawText);
+        runPolicy = applyNsfwPolicy(rawGraph, { nsfw: effectiveNsfw(params, ctx) });
+        assertNsfwAllowed(runPolicy, `tool "${tool.name}"`);
+        const source = runPolicy.changed ? runPolicy.graph : rawGraph;
+        runWf = Workflow.fromJSON(source, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
+      } else if (policy.changed) {
+        runWf = workflowWithGraph(tool.wf, policy.graph);
       }
+      const { onProgress, notices } = runNotices(runWf);
+      notices.push(...runPolicy.notices);
       const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
       if (tool.humanize) {
         notices.push(...humanizeRunNotes(hf.state));
@@ -964,7 +1028,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         if (hf.state.costUnknown) result.costExact = false;
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
-      return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
+      return emitResult(runWf, result, tool.name, outDir, { publicBase, notices });
     },
   };
   return registry;

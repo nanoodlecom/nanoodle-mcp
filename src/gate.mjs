@@ -34,6 +34,7 @@ import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
+import { bindNsfwArgs } from "./nsfw.mjs";
 import { redactUrl } from "./redact.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -1042,14 +1043,19 @@ export function createChargeGate({
 
       async function callTool(params, ctx = null) {
         // Malformed shells fall through to the registry for its usual ParamsError texts.
-        if (params == null || typeof params !== "object" || Array.isArray(params)) return registry.callTool(params);
+        if (params == null || typeof params !== "object" || Array.isArray(params)) return registry.callTool(params, ctx);
         if (params.name === runNoodleName) {
           return errResult("run_noodle is not available on this paid server — arbitrary share links can't be " +
             "priced up front. Use the listed tools, or run your own nanoodle-mcp (npx nanoodle-mcp) to run any link.");
         }
         const rawArgs = params.arguments == null ? {} : params.arguments;
-        if (typeof rawArgs !== "object" || Array.isArray(rawArgs)) return registry.callTool(params);
-        const { _payment_id, ...args } = rawArgs;
+        if (typeof rawArgs !== "object" || Array.isArray(rawArgs)) return registry.callTool(params, ctx);
+        const { _payment_id, ...sent } = rawArgs;
+        // Bake the explicit flag into the hashed arguments. A quote issued while
+        // NSFW is off cannot be replayed as an NSFW run, and a session opt-in
+        // is part of the call the payment is bound to. Prompt text is not.
+        const paramsNsfw = Object.prototype.hasOwnProperty.call(params, "nsfw") ? params.nsfw : undefined;
+        const args = bindNsfwArgs(sent, !!(ctx && ctx.sessionNsfw === true), paramsNsfw);
         const name = params.name;
         const argsHash = hashArgs(name, args);
         const price = priceFor(name);
@@ -1064,7 +1070,7 @@ export function createChargeGate({
           if (!offered.some((t) => t.name === name)) {
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
-          if (validate) await validate({ name, arguments: args });
+          if (validate) await validate({ name, arguments: args }, ctx);
           const pair = await ratePair();
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
@@ -1136,7 +1142,7 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, costExact, textOutput, ...result } = await registry.callTool({ name, arguments: args });
+              const { costUsd, costExact, textOutput, ...result } = await registry.callTool({ name, arguments: args }, ctx);
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.

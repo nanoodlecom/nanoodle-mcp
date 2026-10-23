@@ -31,6 +31,7 @@ import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
 import { loadTools, attachEstimates, attachCatalogs } from "../src/tools.mjs";
+import { NSFW_INSTRUCTIONS } from "../src/nsfw.mjs";
 import { warnIfFfmpegMissing } from "../src/ffmpeg-check.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
@@ -330,9 +331,11 @@ async function main() {
     const srv = serveMcp({
       name: "nanoodle-mcp",
       version: pkg.version,
+      instructions: NSFW_INSTRUCTIONS,
       listTools: () => registry.listTools(),
-      // strip the gate-facing sidecars (costUsd, costExact, textOutput) — stdio clients get pure MCP content
-      callTool: (params) => registry.callTool(params).then(({ costUsd, costExact, textOutput, ...r }) => r),
+      // strip the gate-facing sidecars (costUsd, costExact, textOutput) — stdio clients get pure MCP content.
+      // ctx carries the session NSFW latch (initialize nsfw: true on this stdio connection).
+      callTool: (params, ctx) => registry.callTool(params, ctx).then(({ costUsd, costExact, textOutput, ...r }) => r),
     });
     // A run's observed cost lands in the tool's description — tell the client to re-list.
     registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
@@ -390,7 +393,7 @@ async function main() {
       address: wallet.address,
       ops: wallet.ops,
       usd: chargeUsd,
-      validate: (p) => registry.prepareCall(p),
+      validate: (p, ctx) => registry.prepareCall(p, ctx),
       xnoUsd,
       oracleBase: process.env.NANOGPT_BASE_URL || undefined,
       wsUrl: nanoWs,
@@ -413,13 +416,15 @@ async function main() {
       "The amount paid is a DEPOSIT: the real price is the run's actual metered model cost + 20% (the markup goes to the " +
       "workflow's author when its graph names a payout address, and to the operator when it does not), and the difference " +
       "is sent back to the paying wallet as change after the run. " +
-      "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically.";
+      "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically. " +
+      NSFW_INSTRUCTIONS;
   } else {
     // Free serve mode writes NO usage.jsonl — no money moves, so there is no
     // payments ledger, and we deliberately don't log run telemetry either
     // (which tool ran, or upstream error text that can quote user content).
     // Strip the gate-facing sidecars (costUsd, costExact, textOutput) so HTTP clients get pure MCP.
-    callTool = (params) => registry.callTool(params).then(({ costUsd, costExact, textOutput, ...r }) => r);
+    callTool = (params, ctx) => registry.callTool(params, ctx).then(({ costUsd, costExact, textOutput, ...r }) => r);
+    instructions = NSFW_INSTRUCTIONS;
   }
 
   await serveHttp({

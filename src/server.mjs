@@ -19,6 +19,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { explicitNsfwFlag } from "./nsfw.mjs";
 
 export const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
@@ -47,6 +48,22 @@ export function gitShortSha() {
   return cachedCommit;
 }
 
+/** Mcp-Session-Id, or "" when missing / not a single short string. */
+function sessionIdOf(ctx) {
+  const raw = ctx && ctx.sessionId;
+  const s = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof s !== "string") return "";
+  const t = s.trim();
+  if (!t || t.length > 200) return "";
+  return t;
+}
+
+/** params.nsfw when the key was sent, else undefined (so a missing key is not a flag). */
+function paramsNsfw(params) {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return undefined;
+  return Object.prototype.hasOwnProperty.call(params, "nsfw") ? params.nsfw : undefined;
+}
+
 /**
  * Build the transport-free message handler.
  * @param {object} opts
@@ -54,18 +71,31 @@ export function gitShortSha() {
  * @param {string} opts.version     serverInfo.version
  * @param {string|null} [opts.commit]  serverInfo.commit — short git sha. Omit to read this checkout; null to suppress.
  * @param {() => Array} opts.listTools
- * @param {(params: object) => Promise<object>} opts.callTool  may throw; err.mcpCode → JSON-RPC error
+ * @param {(params: object, ctx?: object|null) => Promise<object>} opts.callTool  may throw; err.mcpCode → JSON-RPC error
  * @param {string} [opts.instructions]  server-level guidance surfaced to the client on initialize
+ * @param {boolean} [opts.rememberSessionNsfw]  stdio only. initialize params.nsfw === true opts this
+ *   one connection in. Leave false on a shared HTTP dispatcher — one caller's initialize must not
+ *   enable NSFW for every later caller. HTTP sessions are keyed by ctx.sessionId instead.
  * @param {(...args) => void} [opts.log]
  * @returns {(msg: any, ctx?: object|null) => Promise<object|null>} resolves to a JSON-RPC response,
  *   or null when the message is a notification (or a malformed non-request) and gets no reply.
  *   `ctx` (optional) rides through to callTool — a streaming transport passes { streaming, report }
- *   so long-running tools can surface progress.
+ *   so long-running tools can surface progress. The dispatcher sets ctx.sessionNsfw from the
+ *   explicit session latch; a caller-supplied sessionNsfw is overwritten.
  */
-export function createDispatcher({ name, version, commit, listTools, callTool, instructions, log = (...a) => console.error(...a) }) {
+export function createDispatcher({ name, version, commit, listTools, callTool, instructions, rememberSessionNsfw = false, log = (...a) => console.error(...a) }) {
   const sha = commit === undefined ? gitShortSha() : (commit || null);
   const reply = (id, result) => ({ jsonrpc: "2.0", id, result });
   const fail = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
+  // Stdio is one caller. HTTP must not use this latch — it shares one dispatcher.
+  let connectionNsfw = false;
+  /** sessionId → true, only after initialize with an explicit nsfw: true. */
+  const sessionNsfw = new Map();
+
+  const sessionOn = (ctx) => {
+    const sid = sessionIdOf(ctx);
+    return (rememberSessionNsfw && connectionNsfw) || (sid !== "" && sessionNsfw.get(sid) === true);
+  };
 
   return async function dispatch(msg, ctx = null) {
     if (msg === null || typeof msg !== "object" || Array.isArray(msg) || msg.jsonrpc !== "2.0") {
@@ -80,6 +110,19 @@ export function createDispatcher({ name, version, commit, listTools, callTool, i
 
     try {
       if (method === "initialize") {
+        // Only the explicit flag. clientInfo, a prompt, or a spicy model name cannot opt the session in.
+        const flag = explicitNsfwFlag(paramsNsfw(params));
+        const sid = sessionIdOf(ctx);
+        if (flag === true && sid) {
+          if (sessionNsfw.size >= 1024) sessionNsfw.delete(sessionNsfw.keys().next().value);
+          sessionNsfw.set(sid, true);
+        } else if (flag === false && sid) {
+          sessionNsfw.delete(sid);
+        }
+        if (rememberSessionNsfw) {
+          if (flag === true) connectionNsfw = true;
+          else if (flag === false) connectionNsfw = false;
+        }
         const requested = params && params.protocolVersion;
         const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : LATEST_PROTOCOL_VERSION;
         return reply(id, {
@@ -94,7 +137,8 @@ export function createDispatcher({ name, version, commit, listTools, callTool, i
       if (method === "tools/list") return reply(id, { tools: listTools() });
       if (method === "tools/call") {
         try {
-          return reply(id, await callTool(params, ctx));
+          const nextCtx = { ...(ctx && typeof ctx === "object" ? ctx : {}), sessionNsfw: sessionOn(ctx) };
+          return reply(id, await callTool(params, nextCtx));
         } catch (e) {
           if (e && e.mcpCode) return fail(id, e.mcpCode, e.message); // malformed args → -32602
           // the tool ran and failed (RunError, missing key, network, ...) → tool-level error result
@@ -132,7 +176,8 @@ export function serveMcp({
   onClose = () => process.exit(0),
 }) {
   const write = (msg) => output.write(JSON.stringify(msg) + "\n");
-  const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
+  // One stdio connection is one caller, so initialize nsfw: true may stick for this process.
+  const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, rememberSessionNsfw: true, log });
   const handle = async (msg) => {
     const response = await dispatch(msg);
     if (response) write(response);
