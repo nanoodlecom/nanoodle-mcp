@@ -148,6 +148,11 @@ export function placeholderBudget() {
 
 const overlaps = (a, b) => a.start < b.end && b.start < a.end;
 
+/** Joke marks come out as their trimmed inner text. The same rule builds cleanDraft and span text. */
+function unwrapJokes(s) {
+  return String(s ?? "").replace(/\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi, (_, inner) => String(inner).trim());
+}
+
 /** Union ranges that cross or overlap. Ranges that only touch stay separate. */
 function mergeRanges(ranges) {
   const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
@@ -167,14 +172,16 @@ function mergeRanges(ranges) {
  * keep text left as written.
  *
  * Every keep match is taken from the original draft, before any placeholder
- * exists. Overlapping or crossing matches merge into one span whose text is the
- * original slice covering all of them, so neither keep is dropped. Placeholders
- * are written in one left-to-right pass.
+ * exists. Overlapping or crossing matches merge into one span. The span's text
+ * is that slice with joke marks unwrapped, so a keep inside [[joke]]…[[/joke]]
+ * protects the plain words and the markers never come back. Placeholders are
+ * written in one left-to-right pass. This span list is what protection,
+ * restore, and the maxChars check all use.
  */
 export function collectSpans(draft, keep) {
   const raw = String(draft ?? "");
   const jokePattern = () => /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
-  const cleanDraft = raw.replace(jokePattern(), (_, inner) => String(inner).trim());
+  const cleanDraft = unwrapJokes(raw);
   const jokes = [];
   for (const m of raw.matchAll(jokePattern())) {
     const text = String(m[1]).trim();
@@ -209,7 +216,10 @@ export function collectSpans(draft, keep) {
     if (grew) merged = mergeRanges(merged);
   }
   const chosen = [
-    ...merged.map((m) => ({ start: m.start, end: m.end, text: raw.slice(m.start, m.end), source: "keep" })),
+    ...merged.map((m) => {
+      const text = unwrapJokes(raw.slice(m.start, m.end));
+      return { start: m.start, end: m.end, text, source: text ? "keep" : "blank" };
+    }),
     ...jokes.filter((j) => !absorbed.has(j)),
   ];
   chosen.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -1249,9 +1259,11 @@ export function checkHumanizeInputs(args) {
 }
 
 /**
- * Reject a keep span that is not in the draft, a maxChars that cannot hold every
- * occurrence of the protected text, or a repeat that blows the placeholder draft
- * past the draft cap. Runs from prepareCall, before a quote and before any model call.
+ * Reject a keep span that is not in the draft, a maxChars smaller than the
+ * merged protected text, or a repeat that blows the placeholder draft past the
+ * draft cap. Length is the unwrapped span list from collectSpans, the same list
+ * the run protects and restores. Runs from prepareCall, before a quote and
+ * before any model call.
  */
 function placeholderMarker(s) {
   const m = String(s ?? "").match(/\[\[k\d+\]\]/);
@@ -1268,32 +1280,6 @@ function assertKeepPossible(draft, keep, maxChars) {
   }
   for (const s of keep || []) {
     if (!raw.includes(s)) throw new ParamsError(`input "keep" has a span that is not in the draft. Nothing was charged.`);
-  }
-  // Every copy counts. A 1-character keep that fits maxChars once still cannot
-  // fit ten copies, and that refusal has to land here — before a quote — rather
-  // than after the writers, the retries, and the decider have already run.
-  if (maxChars != null) {
-    let combined = 0;
-    for (const s of keep || []) {
-      const text = String(s);
-      if (!text) continue;
-      let from = 0;
-      while (from < raw.length) {
-        const i = raw.indexOf(text, from);
-        if (i < 0) break;
-        combined += codePoints(text);
-        from = i + text.length;
-      }
-    }
-    const seenJoke = new Set((keep || []).map((s) => String(s)));
-    const jokeRe = /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
-    let m;
-    while ((m = jokeRe.exec(raw))) {
-      const inner = String(m[1]).trim();
-      if (!inner || seenJoke.has(inner)) continue;
-      combined += codePoints(inner);
-    }
-    if (combined > maxChars) throw new ParamsError(`input "maxChars" is ${maxChars}, smaller than the protected text (${combined} characters). Nothing was charged.`);
   }
   const { writerDraft, spans } = collectSpans(raw, keep);
   const cap = HUMANIZE_INPUT_CAPS.Draft;

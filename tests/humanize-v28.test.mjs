@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -435,6 +435,40 @@ test("crossing keeps are merged so cdef is not dropped", async (t) => {
   assert.equal(json.text.includes("cdef"), true, json.text);
   assert.notEqual(json.text, "Changed abcd.");
   assert.equal(seen.filter((s) => s.reask).length, 0);
+});
+
+test("a keep inside a joke mark is restored without the joke wrappers", async (t) => {
+  const draft = "[[joke]]Funny.[[/joke]]";
+  const { writerDraft, spans } = collectSpans(draft, ["Funny."]);
+  assert.equal(writerDraft, "[[k1]]");
+  assert.deepEqual(spans.map((s) => s.text), ["Funny."]);
+  const { json, seen, judgePrompt } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return "Changed [[k1]]";
+  }, { Draft: draft, Context: "a note", keep: ["Funny."] });
+  assert.equal(json.text, "Changed Funny.");
+  assert.equal(json.text.includes("[[joke]]"), false, json.text);
+  assert.equal(json.text.includes("[[/joke]]"), false, json.text);
+  assert.equal(judgePrompt.includes("[[joke]]"), false);
+  assert.equal(seen.length, 6);
+});
+
+test("crossing keeps are measured by the merged span, so maxChars 6 is allowed", async (t) => {
+  const draft = "abcdef";
+  const keep = ["abcd", "cdef"];
+  const { spans } = collectSpans(draft, keep);
+  assert.equal(spans.map((s) => s.text).join(""), "abcdef");
+  assert.equal(codePoints(spans.map((s) => s.text).join("")), 6);
+  assert.doesNotThrow(() => checkHumanizeInputs({ Draft: draft, Context: "a note", keep, maxChars: 6 }));
+  let hits = 0;
+  const { json } = await runHumanize(t, (body, ctx) => {
+    hits++;
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return "[[k1]]";
+  }, { Draft: draft, Context: "a note", keep, maxChars: 6 });
+  assert.equal(hits, 6, "the merged 6 characters must not be refused before any model call");
+  assert.equal(json.text, "abcdef");
+  assert.equal(json.text.includes("cdef"), true);
 });
 
 test("a draft marker [[k2]] is restored in one pass and refused before quoting", async (t) => {
