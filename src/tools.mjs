@@ -36,6 +36,7 @@ const CATALOG_PATH = {
   image: "/api/v1/image-models",
   video: "/api/v1/video-models",
   audio: "/api/v1/audio-models",
+  model3d: "/api/v1/3d-models",
 };
 
 /** Cached catalog arrays by `${base}|${kind}` — the public catalogs move slowly and every fetch is unauthenticated. */
