@@ -215,7 +215,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     await srv.waitFor((m) => m.method === "notifications/tools/list_changed" && m.id === undefined);
     const relist = await srv.request("tools/list");
     assert.match(relist.result.tools.find((t) => t.name === "hello-noodle").description,
-      /balance; last run \$0\.0012\.$/);
+      /balance; last run \$0\.0012\./);
     const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
     assert.equal(sidecar["hello-noodle"].usd, 0.0012);
 
@@ -657,14 +657,15 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
     return load();
   };
 
-  assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\.$/);       // 0.0200 → trailing zeros trimmed
-  assert.match(await withRec({ usd: 0.1, at }), /; last run \$0\.10\.$/);        // …but never past cents
-  assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\.$/);
-  assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\.$/); // under-reported runs
-  assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\.$/); // sub-basis-point runs
+  // The cost sentence is followed by the NSFW opt-in note. These match the cost token.
+  assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\./);       // 0.0200 → trailing zeros trimmed
+  assert.match(await withRec({ usd: 0.1, at }), /; last run \$0\.10\./);        // …but never past cents
+  assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\./);
+  assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\./); // under-reported runs
+  assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\./); // sub-basis-point runs
   // inexact figures are floors — "<$0.0001" would overclaim, so the "+" form wins
-  assert.match(await withRec({ usd: 0.00005, at, exact: false }), /; last run \$0\.0001\+\.$/);
-  assert.match(await withRec({ usd: 0, at, exact: false }), /; last run \$0\.00\+\.$/); // all calls unpriced
+  assert.match(await withRec({ usd: 0.00005, at, exact: false }), /; last run \$0\.0001\+\./);
+  assert.match(await withRec({ usd: 0, at, exact: false }), /; last run \$0\.00\+\./); // all calls unpriced
 
   // corrupt or junk sidecars are ignored, never fatal
   await writeFile(join(outDir, "costs.json"), "{not json");

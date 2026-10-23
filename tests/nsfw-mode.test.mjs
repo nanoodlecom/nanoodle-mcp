@@ -734,6 +734,9 @@ test("a quote issued while NSFW is off cannot be replayed as an NSFW run", async
     xnoUsd: 1,
     publicBase: "http://pay.test",
     pollMs: 60_000,
+    // A hash match on a still-pending quote waits this long before saying so.
+    // The mismatch path returns immediately, so this only covers the match.
+    waitMs: 40,
     log: () => {},
   });
   const { callTool } = gate.wrapRegistry(registry);

@@ -137,7 +137,12 @@ export function createDispatcher({ name, version, commit, listTools, callTool, i
       if (method === "tools/list") return reply(id, { tools: listTools() });
       if (method === "tools/call") {
         try {
-          const nextCtx = { ...(ctx && typeof ctx === "object" ? ctx : {}), sessionNsfw: sessionOn(ctx) };
+          // Keep the caller's ctx object. Streaming HTTP heartbeats read ctx.status,
+          // and report/announce set it through `this` — a copy would detach them.
+          // sessionNsfw is overwritten here so a caller cannot inject the latch.
+          const on = sessionOn(ctx);
+          const nextCtx = (ctx && typeof ctx === "object" && !Array.isArray(ctx)) ? ctx : {};
+          nextCtx.sessionNsfw = on;
           return reply(id, await callTool(params, nextCtx));
         } catch (e) {
           if (e && e.mcpCode) return fail(id, e.mcpCode, e.message); // malformed args → -32602
