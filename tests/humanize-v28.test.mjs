@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -377,6 +377,34 @@ test("an unpriced review is unknown on the call and in the total, and an explici
   assert.equal(recM.priceKnown, false);
   assert.equal(missing.costUnknown, true);
   assert.equal(missing.reviewUsd, 0);
+});
+
+test("a later keep that swallows placeholders stays inside the priced note and retry", () => {
+  // 87 "k"s, then keep "[[k" twice. Each later pass matches inside the placeholders
+  // the previous pass just wrote. Before the swallowed records were dropped, the
+  // writer note and the guard retry each ran 600 characters over the 201-placeholder allowance.
+  const draft = "k".repeat(87);
+  const keep = ["k", "[[k", "[[k"];
+  const { writerDraft, spans } = collectSpans(draft, keep);
+  const budget = placeholderBudget();
+  const note = writerNote(spans, "keep_last", MAX_CHARS_LIMIT);
+  const guard = guardRetryPrompt(["keep"], { spans });
+  const tokens = writerDraft.match(/\[\[k\d+\]\]/g) || [];
+  assert.equal(spans.length, tokens.length, "every surviving record is a placeholder still in the draft");
+  for (const s of spans) assert.ok(tokens.includes(`[[k${s.id}]]`), `[[k${s.id}]] was swallowed`);
+  assert.ok(codePoints(note) <= codePoints(budget.note), `note is ${codePoints(note)} chars, priced allowance is ${codePoints(budget.note)}`);
+  assert.ok(codePoints(guard) <= codePoints(budget.guard), `retry is ${codePoints(guard)} chars, priced allowance is ${codePoints(budget.guard)}`);
+  assert.ok(codePoints(writerDraft) <= HUMANIZE_INPUT_CAPS.Draft);
+});
+
+test("maxChars counts every copy of a keep span and refuses before any model call", async (t) => {
+  let hits = 0;
+  const piece = "z";
+  await assert.rejects(
+    runHumanize(t, () => { hits++; return piece; }, { Draft: piece.repeat(10), Context: "a note", keep: [piece], maxChars: 1 }),
+    (e) => e.mcpCode === -32602 && /smaller than the protected text \(10 characters\)/.test(e.message) && /Nothing was charged/.test(e.message),
+  );
+  assert.equal(hits, 0, "ten copies must not reach the 5 writers, 3 retries, and the judge");
 });
 
 test("a keep span repeated through the whole draft is refused before any model call", async (t) => {

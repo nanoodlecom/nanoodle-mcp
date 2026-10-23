@@ -176,7 +176,15 @@ export function collectSpans(draft, keep) {
       idx += tok.length;
     }
   }
-  return { cleanDraft, writerDraft, spans };
+  // A later keep can match inside a placeholder it just created (`k` inside
+  // [[kN]], or `[[k` across one). That overwrites the earlier token. The span
+  // record must go with it, or the writer note and the guard retry list
+  // placeholders the draft no longer contains and the priced 201-placeholder
+  // payload is no longer the real one. Merging means the surviving token is
+  // the only record: the swallowed ids are dropped.
+  const present = new Set();
+  for (const m of writerDraft.matchAll(/\[\[k\d+\]\]/g)) present.add(m[0]);
+  return { cleanDraft, writerDraft, spans: spans.filter((s) => present.has(tokenOf(s.id))) };
 }
 
 /** Problems with placeholders in a writer reply. Empty when every span is present once and unaltered. */
@@ -471,7 +479,7 @@ export function humanizeExtraProperties() {
       type: "integer",
       minimum: 1,
       maximum: MAX_CHARS_LIMIT,
-      description: `optional; hard cap on the rewrite length in characters (1 to ${MAX_CHARS_LIMIT}). Over-length rewrites are rejected and that writer is asked once more.`,
+      description: `optional; hard cap on the rewrite length in characters (1 to ${MAX_CHARS_LIMIT}). Every copy of a keep span counts toward the cap. Over-length rewrites are rejected and that writer is asked once more.`,
     },
     title: {
       type: "boolean",
@@ -518,7 +526,7 @@ export function humanizeCallOpts(args) {
   };
 }
 
-function writerNote(spans, ending, maxChars) {
+export function writerNote(spans, ending, maxChars) {
   const bits = [];
   if (spans && spans.length) {
     const toks = spans.map((s) => tokenOf(s.id)).join(", ");
@@ -1189,14 +1197,40 @@ export function checkHumanizeInputs(args) {
 }
 
 /**
- * Reject a keep span that is not in the draft, a maxChars that cannot hold the
- * protected text, or a repeat that blows the placeholder draft past the draft cap.
- * Runs from prepareCall, before a quote and before any model call.
+ * Reject a keep span that is not in the draft, a maxChars that cannot hold every
+ * occurrence of the protected text, or a repeat that blows the placeholder draft
+ * past the draft cap. Runs from prepareCall, before a quote and before any model call.
  */
 function assertKeepPossible(draft, keep, maxChars) {
   const raw = String(draft ?? "");
   for (const s of keep || []) {
     if (!raw.includes(s)) throw new ParamsError(`input "keep" has a span that is not in the draft. Nothing was charged.`);
+  }
+  // Every copy counts. A 1-character keep that fits maxChars once still cannot
+  // fit ten copies, and that refusal has to land here — before a quote — rather
+  // than after the writers, the retries, and the decider have already run.
+  if (maxChars != null) {
+    let combined = 0;
+    for (const s of keep || []) {
+      const text = String(s);
+      if (!text) continue;
+      let from = 0;
+      while (from < raw.length) {
+        const i = raw.indexOf(text, from);
+        if (i < 0) break;
+        combined += codePoints(text);
+        from = i + text.length;
+      }
+    }
+    const seenJoke = new Set((keep || []).map((s) => String(s)));
+    const jokeRe = /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
+    let m;
+    while ((m = jokeRe.exec(raw))) {
+      const inner = String(m[1]).trim();
+      if (!inner || seenJoke.has(inner)) continue;
+      combined += codePoints(inner);
+    }
+    if (combined > maxChars) throw new ParamsError(`input "maxChars" is ${maxChars}, smaller than the protected text (${combined} characters). Nothing was charged.`);
   }
   const { writerDraft, spans } = collectSpans(raw, keep);
   const cap = HUMANIZE_INPUT_CAPS.Draft;
@@ -1206,16 +1240,9 @@ function assertKeepPossible(draft, keep, maxChars) {
     const n = Math.max(expanded, protectedChars);
     throw new ParamsError(`input "keep" repeats in the draft until the placeholders are ${n} characters, above the ${cap}-character cap. Nothing was charged.`);
   }
-  if (maxChars == null) return;
-  const pieces = [...(keep || [])];
-  const jokeRe = /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
-  let m;
-  while ((m = jokeRe.exec(raw))) {
-    const inner = String(m[1]).trim();
-    if (inner && !pieces.includes(inner)) pieces.push(inner);
+  if (maxChars != null && protectedChars > maxChars) {
+    throw new ParamsError(`input "maxChars" is ${maxChars}, smaller than the protected text (${protectedChars} characters). Nothing was charged.`);
   }
-  const combined = pieces.reduce((n, s) => n + codePoints(s), 0);
-  if (combined > maxChars) throw new ParamsError(`input "maxChars" is ${maxChars}, smaller than the protected text (${combined} characters). Nothing was charged.`);
 }
 
 /** The decider's verdict on one repaired rewrite. Faithful and not disqualified, and the winner is that rewrite. */
