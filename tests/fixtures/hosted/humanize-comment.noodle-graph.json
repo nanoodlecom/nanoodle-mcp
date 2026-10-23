@@ -6,7 +6,7 @@
       "type": "comment",
       "name": "humanize-comment",
       "fields": {
-        "text": "Draft + Context + Guidance → 5 writers (Qwen3.8 Novelist/friend, DeepSeek V4.1 Flash/forum, Cydonia-24B v4.3/peer (Starry Ocean fallback on mcp), Qwen3.8 antislop/plain, Mercury 3/quick), each with a different voice prompt → GLM-5.3 decider (also sees the Guidance) checks faithfulness (who said/did what, no new facts) per rewrite, ranks them, and picks the most human faithful one, or ORIGINAL. v2.7. Output: one JSON object {winner, text (the winning rewrite), why, ranked:[{writer,faithful,disqualified,reason}]}, ranked always has all 5 writers (mcp.nanoodle.com adds each writer's model and exact text)."
+        "text": "Draft + Context + Guidance → 5 writers (Qwen3.8 Novelist/friend, DeepSeek V4.1 Flash/forum, Cydonia-24B v4.3/peer (Starry Ocean fallback on mcp), Qwen3.8 antislop/plain, Mercury 3/quick), each with a different voice prompt → GLM-5.3 decider (also sees the Guidance) checks faithfulness (who said/did what, no new facts) per rewrite, ranks them, and picks the most human faithful one, or ORIGINAL. v2.8: optional keep (verbatim spans, put back exactly), ending (question, keep_last, or any), maxChars, Guidance at most 600 characters with a leading one-thread prefix not counted, and writer replies that echo the guidance are dropped. Output: one JSON object {winner, text (the winning rewrite), why, ranked:[{writer,faithful,disqualified,reason}]}, ranked always has all 5 writers (mcp.nanoodle.com adds each writer's model and exact text)."
       }
     },
     {

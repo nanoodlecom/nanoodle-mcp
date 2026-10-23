@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS, ONE_THREAD_PREFIX } from "../src/humanize.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -195,7 +195,7 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.ok(tool);
     // writers + decider carry fields.locked and the labels live in join separators:
     // only the three author-facing inputs are args, no system prompts or labels
-    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance"]);
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance", "ending", "keep", "maxChars"]);
     assert.deepEqual(tool.inputSchema.required, ["Draft", "Context"]);
     for (const k of Object.keys(tool.inputSchema.properties)) assert.doesNotMatch(k, /system|label|writer|decider/i);
     assert.match(tool.inputSchema.properties.Guidance.description, /default: "a friendly, specific reply"; optional/);
@@ -212,8 +212,11 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // Writer C is counted at the worse of Cydonia alone or a billed-but-timed-out Cydonia call
     // plus the Starry Ocean fallback. Near-copy re-asks (writer input + its 600-token answer +
     // REASK_TEXT) are capped at MAX_REASKS (3) per run; the three most expensive are counted.
-    // Result: $0.01304480 after the 20% markup, $0.00025520 (about 1.9%) under the $0.0133 pin;
-    // $0.01047080 with no re-ask.
+    // Result at the counted Guidance cap (600; v2.8, was 300): $0.01322120 after the
+    // 20% markup, $0.00007880 under the $0.0133 pin; $0.01061120 with no re-ask.
+    // A leading one-thread prefix is not counted, so a caller can send that prefix
+    // plus 600 characters. That extreme is about $0.000006 over the pin; the gate
+    // still charges the customer at most the pin and the operator absorbs the rest.
     // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
     // pays no change or author payout, and the operator absorbs the provider cost above it.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
@@ -244,19 +247,23 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const seps = ["k1", "k2", "k3", "k4", "k5", "k6", "j-cg"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
     const judgeUsd = ((bytes(judge.fields.system) + Draft + Context + Guidance + seps) / CPT + 5 * W) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
-    assert.equal(est(base + judgeUsd), "0.01047080", "the docs quote this exact estimate (no re-ask)");
-    assert.equal(est(base + reask + judgeUsd), "0.01304480", "the docs quote this exact estimate (3 re-asks)");
+    assert.equal(est(base + judgeUsd), "0.01061120", "the docs quote this exact estimate (no re-ask)");
+    assert.equal(est(base + reask + judgeUsd), "0.01322120", "the docs quote this exact estimate (3 re-asks)");
     assert.equal(mounted.x402.usd, 0.0133);
     assert.ok((base + reask + judgeUsd) / 1e6 * 1.2 <= mounted.x402.usd, "estimate fits the pin");
-    assert.equal((mounted.x402.usd - (base + reask + judgeUsd) / 1e6 * 1.2).toFixed(8), "0.00025520", "margin quoted in the docs");
+    assert.equal((mounted.x402.usd - (base + reask + judgeUsd) / 1e6 * 1.2).toFixed(8), "0.00007880", "margin quoted in the docs");
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);
-    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance);
+    // Guidance maxLength includes the uncounted one-thread prefix; the counted cap is Guidance
+    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance + [...ONE_THREAD_PREFIX].length);
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "x".repeat(Draft + 1), Context: "c" } }),
       (e) => e.mcpCode === -32602 && /"Draft" is 1501 characters; humanize-comment accepts at most 1500/.test(e.message));
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c".repeat(Context + 1) } }), /"Context" is 3501 characters.*at most 3500/);
-    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), /"Guidance" is 301 characters/);
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), new RegExp(`"Guidance" is ${Guidance + 1} characters`));
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance) } });
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: ONE_THREAD_PREFIX + "g".repeat(Guidance) } });
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: ONE_THREAD_PREFIX + "g".repeat(Guidance + 1) } }), new RegExp(`"Guidance" is ${Guidance + 1} characters`));
     // caps count code points, so a 1500-emoji draft is allowed and 1501 is not
     await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft), Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) } });
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft + 1), Context: "c" } }), /"Draft" is 1501 characters/);
