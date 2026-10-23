@@ -25,7 +25,7 @@ jobs:
       # the tarball it points at. Stop before the publish, not after.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "24.22.1"
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
 
