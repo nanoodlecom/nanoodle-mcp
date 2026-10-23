@@ -209,12 +209,60 @@ export function forceRepair(raw, spans) {
 }
 
 const CLOSING_QUOTE = new Set(['"', "'", "\u201D", "\u2019"]);
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+const isWordChar = (c) => WORD_CHAR.test(c || "");
 
 /**
- * Split on . ! ? . A closing quote stays with the sentence it finishes
- * (`here."`, `?'`), including when that quote is the end of the text.
- * A quote that opens the next sentence (`He left. "Hello`) stays with that sentence.
- * A dot before a digit is a decimal, not a boundary.
+ * True when `quote` (the next character) closes an opener still open in `before`.
+ * Straight quotes toggle. An apostrophe between letters (`Don't`) is not a quote.
+ * Curly quotes pair opener to closer.
+ */
+function closesUnmatchedQuote(before, quote) {
+  if (quote === '"') {
+    let open = false;
+    for (const c of before) if (c === '"') open = !open;
+    return open;
+  }
+  if (quote === "'") {
+    let open = false;
+    for (let i = 0; i < before.length; i++) {
+      if (before[i] !== "'") continue;
+      if (isWordChar(before[i - 1]) && isWordChar(before[i + 1])) continue;
+      open = !open;
+    }
+    return open;
+  }
+  if (quote === "\u201D") {
+    let n = 0;
+    for (const c of before) {
+      if (c === "\u201C") n++;
+      else if (c === "\u201D" && n > 0) n--;
+    }
+    return n > 0;
+  }
+  if (quote === "\u2019") {
+    let n = 0;
+    for (let i = 0; i < before.length; i++) {
+      const c = before[i];
+      if (c === "\u2018") n++;
+      else if (c === "\u2019") {
+        if (isWordChar(before[i - 1]) && isWordChar(before[i + 1])) continue;
+        if (n > 0) n--;
+      }
+    }
+    return n > 0;
+  }
+  return false;
+}
+
+/**
+ * Split on . ! ? . A closing quote stays with the sentence it finishes, including
+ * when the next sentence is capitalized (`He asked "Ready?" Then shipped.`).
+ * A quote with no matching opener stays attached only at the end of the text or
+ * when what follows is not a new sentence (`here."`, `?'`). A quote that opens
+ * the next sentence (`He left. "Hello`) stays with that sentence.
+ * A dot before a digit is a decimal, not a boundary. An apostrophe between
+ * letters is not a quote.
  */
 export function sentencesOf(text) {
   const t = String(text ?? "").trim();
@@ -229,11 +277,14 @@ export function sentencesOf(text) {
       let end = i + 1;
       while (end < t.length && (t[end] === "." || t[end] === "!" || t[end] === "?")) end++;
       let q = end;
-      while (q < t.length && CLOSING_QUOTE.has(t[q])) q++;
-      if (q > end) {
-        const after = t.slice(q).trimStart();
-        if (!after || !/^[A-Z]/.test(after)) end = q;
+      while (q < t.length && CLOSING_QUOTE.has(t[q]) && closesUnmatchedQuote(t.slice(start, q), t[q])) q++;
+      let q2 = q;
+      while (q2 < t.length && CLOSING_QUOTE.has(t[q2])) q2++;
+      if (q2 > q) {
+        const after = t.slice(q2).trimStart();
+        if (!after || !/^[A-Z]/.test(after)) q = q2;
       }
+      end = q;
       const sentence = t.slice(start, end).trim();
       if (sentence) parts.push(sentence);
       start = end;
@@ -487,11 +538,17 @@ function spanScore(raw, spans) {
   return n;
 }
 
+/** Every hard constraint a rewrite must still meet before it can be delivered. */
 function acceptableDelivery(text, state) {
   const t = String(text ?? "");
   if (!t.trim()) return false;
   if (state.maxChars && codePoints(t) > state.maxChars) return false;
+  if (state.title && isParagraphOutput(t, state.spans)) return false;
   if (state.ending === "question" && !isQuestion(t)) return false;
+  if (state.ending === "keep_last") {
+    const last = state.spans && state.spans.length ? state.spans[state.spans.length - 1].text : finalSentence(state.draft);
+    if (last && !t.trim().endsWith(last)) return false;
+  }
   if (state.spans && state.spans.length) {
     const want = new Map();
     for (const s of state.spans) want.set(s.text, (want.get(s.text) || 0) + 1);
@@ -565,6 +622,27 @@ const usdOf = (j, r) => {
   const h = r && r.headers && r.headers.get ? parseFloat(r.headers.get("x-cost") || r.headers.get("x-nano-cost") || "") : NaN;
   return isNaN(h) ? null : h;
 };
+
+/**
+ * Price of one decider re-check. A reported price, including an explicit 0, is exact.
+ * A missing price is unknown on that call (usd null, not 0) and on the run: costUnknown
+ * so the total is not exact. A paid invoice is added only as a lower bound, never as
+ * a stand-in that keeps the total exact.
+ */
+export function recordReviewPrice(state, rec, result) {
+  const reported = result && result.known && result.usd != null && isFinite(Number(result.usd));
+  if (!reported) {
+    state.costUnknown = true;
+    rec.priceKnown = false;
+    rec.usd = null;
+    const paid = result && result.paidUsd;
+    if (paid != null && isFinite(Number(paid)) && Number(paid) > 0) state.reviewUsd += Number(paid);
+    return;
+  }
+  rec.priceKnown = true;
+  rec.usd = Number(result.usd);
+  state.reviewUsd += rec.usd;
+}
 
 /** A request error that provably happened before the request was written (so nothing was billed). */
 const BEFORE_SEND = new Set(["ENOTFOUND", "EAI_AGAIN", "EAI_NONAME", "ECONNREFUSED", "ERR_INVALID_URL", "UND_ERR_INVALID_ARG"]);
@@ -927,7 +1005,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   /** One chat call for the decider re-check, settled the same way as a writer call when the run is on a wallet. */
   const paidChat = async (url, headers, body, rec) => {
     const init = { method: "POST", headers: headerCopy(headers), body: JSON.stringify(body) };
+    const chatPrice = (j, r, paidUsd) => {
+      const usd = usdOf(j, r);
+      if (usd == null || !isFinite(Number(usd))) return { known: false, usd: null, paidUsd: paidUsd ?? null };
+      return { known: true, usd: Number(usd), paidUsd: paidUsd ?? null };
+    };
     let r = await fetch(url, init);
+    let paidUsd = null;
     const x402 = !!payment && String(hget(init.headers, "x-x402")) === "true" && !hget(init.headers, "authorization");
     if (r.status === 402 && x402) {
       const raw = await r.text();
@@ -943,6 +1027,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       await payment(inv);
       rec.paid = true;
       rec.usd = inv.amountUsd;
+      paidUsd = inv.amountUsd;
       const deadline = inv.expiresAt || now() + 15 * 60 * 1000;
       for (;;) {
         const cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}" });
@@ -951,7 +1036,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           try { cj = await cr.json(); } catch { cj = null; }
           if (cj && typeof cj === "object" && cj.choices) {
             const content = cj.choices[0] && cj.choices[0].message && cj.choices[0].message.content;
-            return { status: 200, content: typeof content === "string" ? content : "", usd: inv.amountUsd };
+            return { status: 200, content: typeof content === "string" ? content : "", ...chatPrice(cj, cr, paidUsd) };
           }
           r = await fetch(url, { ...init, headers: { ...init.headers, "x-x402-payment-id": inv.paymentId } });
           break;
@@ -965,9 +1050,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     rec.status = r.status;
     let j = null;
     try { j = await r.json(); } catch { j = null; }
-    const usd = usdOf(j, r);
     const content = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    return { status: r.status, content: typeof content === "string" ? content : "", usd };
+    return { status: r.status, content: typeof content === "string" ? content : "", ...chatPrice(j, r, paidUsd) };
   };
 
   /**
@@ -993,10 +1077,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const rec = { letter, kind: "review", model: body.model, status: null, paid: false, paymentStarted: false, usd: null };
     state.attempts.push(rec);
     const result = await paidChat(req.url, req.headers, body, rec);
-    if (result.usd != null && isFinite(Number(result.usd))) {
-      rec.usd = Number(result.usd);
-      state.reviewUsd += rec.usd;
-    }
+    recordReviewPrice(state, rec, result);
     if (!result.status || result.status !== 200 || !result.content) return { ok: false };
     return parseRepairVerdict(result.content, letter);
   };
@@ -1244,6 +1325,7 @@ export async function applyHumanizeFallback(wf, result, record, state) {
       return { error: failureMessage(state, "the decider could not check the repaired text.") };
     }
     if (!verdict.ok) return { error: failureMessage(state, "the repaired text failed the decider's faithfulness and safety check.") };
+    if (!acceptableDelivery(text, state)) return { error: failureMessage(state) };
     const ranked = LETTERS.map((letter) => {
       if (letter === best.letter) {
         return { writer: letter, model: best.model || record[letter].model, text, faithful: true, disqualified: false, reason: "protected spans restored; decider confirmed faithful" };
@@ -1274,7 +1356,7 @@ export async function applyHumanizeFallback(wf, result, record, state) {
       result.outputs[out.key] = JSON.stringify(parsed);
     }
   }
-  const constrained = !!(state.maxChars || state.ending === "question" || (state.spans && state.spans.length));
+  const constrained = !!(state.maxChars || state.title || state.ending === "question" || state.ending === "keep_last" || (state.spans && state.spans.length));
   if (constrained && !acceptableDelivery(text, state)) return { error: failureMessage(state) };
   return null;
 }

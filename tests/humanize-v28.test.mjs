@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -253,6 +253,11 @@ test("keep_last keeps a final sentence that ends with a closing quote", () => {
   assert.equal(finalSentence('Please read the note here."'), 'Please read the note here."');
   assert.deepEqual(sentencesOf("Did you see it?'"), ["Did you see it?'"]);
   assert.deepEqual(sentencesOf('He left. "Hello there."'), ["He left.", '"Hello there."']);
+  const asked = 'He asked "Ready?" Then shipped.';
+  assert.deepEqual(sentencesOf(asked), ['He asked "Ready?"', "Then shipped."]);
+  assert.equal(ensureEnding(asked, "question", [], asked), 'Then shipped. He asked "Ready?"');
+  assert.deepEqual(sentencesOf("Don't stop. Go on."), ["Don't stop.", "Go on."]);
+  assert.deepEqual(sentencesOf('He said "Go." She left.'), ['He said "Go."', "She left."]);
   const out = ensureEnding("Appreciate the writeup.", "keep_last", [], 'Thanks for the writeup. Please read the note here."');
   assert.ok(out.endsWith('here."'), out);
   assert.equal(out.includes('Please read the note here."'), true);
@@ -322,6 +327,89 @@ test("a repaired rewrite that adds an accusation is rejected by the decider and 
   );
   assert.ok(judgeUsers.some((u) => u.includes(ACCUSATION)), "the decider was shown the repaired accusation");
   assert.equal(judgeUsers.filter((u) => u.includes(ACCUSATION)).length, 1);
+});
+
+test("ending question keeps a closing quote attached to its question", async (t) => {
+  const asked = 'He asked "Ready?" Then shipped.';
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return asked;
+  }, { Draft: asked, Context: "a line", ending: "question" });
+  assert.equal(json.text, 'Then shipped. He asked "Ready?"');
+});
+
+test("a title dropped for length is not repaired into a delivery", async (t) => {
+  const span = "0123456789abcde";
+  assert.equal(TITLE_OUTPUT_MAX + [...span].length, 235);
+  const long = "x".repeat(305);
+  await assert.rejects(
+    runHumanize(t, (body, ctx) => {
+      if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+      return long;
+    }, { Draft: `A point worth making. ${span}`, Context: "a point", keep: [span], title: true }),
+    (e) => {
+      assert.equal(e.message.includes(long), false);
+      assert.doesNotMatch(e.message, /you were not charged/);
+      return true;
+    },
+  );
+});
+
+test("an unpriced review is unknown on the call and in the total, and an explicit 0 stays exact", () => {
+  const state = { reviewUsd: 0, costUnknown: false };
+  const rec = { usd: 0.004, paid: true, priceKnown: true };
+  recordReviewPrice(state, rec, { known: false, usd: null, paidUsd: 0.004 });
+  assert.equal(rec.usd, null);
+  assert.equal(rec.priceKnown, false);
+  assert.equal(state.costUnknown, true);
+  assert.equal(state.reviewUsd, 0.004);
+  const zero = { reviewUsd: 0, costUnknown: false };
+  const rec0 = { usd: null, priceKnown: false };
+  recordReviewPrice(zero, rec0, { known: true, usd: 0, paidUsd: 0.004 });
+  assert.equal(rec0.usd, 0);
+  assert.equal(rec0.priceKnown, true);
+  assert.equal(zero.costUnknown, false);
+  assert.equal(zero.reviewUsd, 0);
+  const missing = { reviewUsd: 0, costUnknown: false };
+  const recM = { usd: 0, priceKnown: true };
+  recordReviewPrice(missing, recM, { known: false, usd: null, paidUsd: null });
+  assert.equal(recM.usd, null);
+  assert.equal(recM.priceKnown, false);
+  assert.equal(missing.costUnknown, true);
+  assert.equal(missing.reviewUsd, 0);
+});
+
+test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { Workflow } = await import("nanoodle");
+  const graphText = await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8");
+  const lines = {
+    "qwen/qwen3.8-27b-novelist": "NOVELIST-LINE",
+    "deepseek/deepseek-v4.1-flash-1017": "DEEPSEEK-LINE",
+    "TheDrummer/Cydonia-24B-v4.3": "CYDONIA-LINE",
+    "qwen/qwen3.8-27b-antislop": "ANTISLOP-LINE",
+    "inception/mercury-3": "MERCURY-LINE",
+  };
+  const labels = {
+    "qwen/qwen3.8-27b-novelist": "A",
+    "deepseek/deepseek-v4.1-flash-1017": "B",
+    "TheDrummer/Cydonia-24B-v4.3": "C",
+    "qwen/qwen3.8-27b-antislop": "D",
+    "inception/mercury-3": "E",
+  };
+  let judgeUser = "";
+  const fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const user = (body.messages || []).filter((m) => m.role === "user").map((m) => m.content).join("\n");
+    if (body.model === "z-ai/glm-5.3") judgeUser = user;
+    const content = lines[body.model] || "{\"winner\":\"A\"}";
+    return new Response(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const wf = Workflow.fromJSON(graphText, { apiKey: "test-key", baseUrl: "http://nano.test", fetch });
+  await wf.run({ Draft: "Draft line.", Context: "Context line.", Guidance: "Guidance line." });
+  for (const [model, line] of Object.entries(lines)) {
+    assert.ok(judgeUser.includes(`[${labels[model]}] ${model}\n${line}`), `${model} missing from decider prompt`);
+  }
 });
 
 test("a wallet caller who already paid is not told they were not charged", async (t) => {
