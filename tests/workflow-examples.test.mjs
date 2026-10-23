@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS, ONE_THREAD_PREFIX, placeholderBudget } from "../src/humanize.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -194,8 +194,8 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const tool = registry.listTools().find(tool => tool.name === "humanize-comment");
     assert.ok(tool);
     // writers + decider carry fields.locked and the labels live in join separators:
-    // only the three author-facing inputs are args, no system prompts or labels
-    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance"]);
+    // graph inputs stay Draft, Context, Guidance; keep, ending, maxChars and title are tool-level
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance", "ending", "keep", "maxChars", "title"]);
     assert.deepEqual(tool.inputSchema.required, ["Draft", "Context"]);
     for (const k of Object.keys(tool.inputSchema.properties)) assert.doesNotMatch(k, /system|label|writer|decider/i);
     assert.match(tool.inputSchema.properties.Guidance.description, /default: "a friendly, specific reply"; optional/);
@@ -204,16 +204,25 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.doesNotMatch(tool.description, /Example:/);
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
-    assert.deepEqual(mounted.x402, { usd: 0.0133 });
-    // ESTIMATE, not a hard bound (v2.7): worst case at the ENFORCED input caps (src/humanize.mjs),
-    // every writer at its 600-token cap, inputs + system prompts at 3 characters per token,
-    // the decider (which reads the Guidance and five 600-token rewrites but no longer copies
-    // them: ids, flags, reasons and the winner's text only) replying at its 1600-token cap.
-    // Writer C is counted at the worse of Cydonia alone or a billed-but-timed-out Cydonia call
-    // plus the Starry Ocean fallback. Near-copy re-asks (writer input + its 600-token answer +
-    // REASK_TEXT) are capped at MAX_REASKS (3) per run; the three most expensive are counted.
-    // Result: $0.01304480 after the 20% markup, $0.00025520 (about 1.9%) under the $0.0133 pin;
-    // $0.01047080 with no re-ask.
+    assert.equal(mounted.x402.usd.toFixed(8), "0.01963166");
+    // The runtime deposit is the bounded worst case, read from this graph's x402.usd.
+    // Every writer at its 600-token cap, inputs + system prompts at 3 characters per token.
+    // The first decider reads the Guidance and five 600-token rewrites and replies at its
+    // 1600-token cap. Writer C is the worse of Cydonia alone or a billed-but-timed-out
+    // Cydonia call plus the Starry Ocean fallback. Near-copy re-asks and guard retries
+    // share MAX_REASKS (3); the three most expensive are counted. With the placeholder
+    // cap, the guard prompt that lists every [[kN]] is longer than REASK_TEXT, so that
+    // prompt is the retry that is priced.
+    // Keep matches and [[joke]] marks each become a placeholder. The placeholder draft
+    // is refused before quoting once it would pass the draft cap, so the priced note is
+    // the longest list that still fits (not one placeholder per keep entry).
+    // The repair path pays a second GLM-5.3 decider: the same system prompt, context,
+    // guidance and draft, the longest writer label, one 600-token candidate, protected
+    // text appended up to the draft cap, and a 1600-token reply.
+    // At the counted Guidance cap with no keep and no repair: $0.01061120 with no re-ask
+    // and $0.01322120 with 3 re-asks, after the 20% markup.
+    // The deposit equals the extreme: uncounted one-thread prefix, the capped placeholder
+    // note, 3 guard retries, both deciders. That is $0.01963166.
     // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
     // pays no change or author payout, and the operator absorbs the provider cost above it.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
@@ -244,19 +253,47 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const seps = ["k1", "k2", "k3", "k4", "k5", "k6", "j-cg"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
     const judgeUsd = ((bytes(judge.fields.system) + Draft + Context + Guidance + seps) / CPT + 5 * W) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
-    assert.equal(est(base + judgeUsd), "0.01047080", "the docs quote this exact estimate (no re-ask)");
-    assert.equal(est(base + reask + judgeUsd), "0.01304480", "the docs quote this exact estimate (3 re-asks)");
-    assert.equal(mounted.x402.usd, 0.0133);
-    assert.ok((base + reask + judgeUsd) / 1e6 * 1.2 <= mounted.x402.usd, "estimate fits the pin");
-    assert.equal((mounted.x402.usd - (base + reask + judgeUsd) / 1e6 * 1.2).toFixed(8), "0.00025520", "margin quoted in the docs");
+    assert.equal(est(base + judgeUsd), "0.01061120", "the docs quote this exact estimate (no re-ask)");
+    assert.equal(est(base + reask + judgeUsd), "0.01322120", "the docs quote this exact estimate (3 re-asks, no repair, no keep)");
+    // bounded worst case: prefix + every placeholder the draft cap can hold + 3 retries + both deciders
+    const budget = placeholderBudget();
+    assert.ok(budget.count > 8, "repeats, not the 8-entry keep list, set the placeholder cap");
+    assert.equal(budget.writerDraftChars <= Draft, true);
+    const gExtreme = Guidance + [...ONE_THREAD_PREFIX].length;
+    const extra = 2 + bytes(budget.note);
+    const retryText = bytes(budget.guard) > bytes(REASK_TEXT) ? budget.guard : REASK_TEXT;
+    let baseX = 0;
+    const reasksX = [];
+    for (const id of ["w-a", "w-b", "w-c", "w-d", "w-e"]) {
+      const n = byId.get(id);
+      const inTok = (bytes(n.fields.system) + Draft + Context + gExtreme + 2 * bytes(byId.get("j-in").fields.sep) + extra) / CPT;
+      const call = ([p, c], more = 0) => (inTok + more) * p + W * c;
+      const re = (pc) => call(pc, W + bytes(retryText) / CPT);
+      const P = PRICE[n.fields.model];
+      const fb = HUMANIZE_FALLBACKS[n.fields.model];
+      if (fb) { baseX += Math.max(call(P), call(P) + call(PRICE[fb])); reasksX.push(Math.max(re(P), re(PRICE[fb]))); }
+      else { baseX += call(P); reasksX.push(re(P)); }
+    }
+    const reaskX = reasksX.sort((a, b) => b - a).slice(0, MAX_REASKS).reduce((a, b) => a + b, 0);
+    const judgeX = ((bytes(judge.fields.system) + Draft + Context + gExtreme + seps) / CPT + 5 * W) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
+    const longLabel = Math.max(...["k2", "k3", "k4", "k5", "k6"].map((k) => bytes(byId.get(k).fields.sep)));
+    const reviewX = ((bytes(judge.fields.system) + Draft + Context + gExtreme + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel) / CPT + W + Draft / CPT) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
+    const worst = (baseX + reaskX + judgeX + reviewX) / 1e6 * 1.2;
+    assert.equal(worst.toFixed(8), "0.01963166", "the bounded worst case");
+    assert.equal(mounted.x402.usd.toFixed(8), worst.toFixed(8), "the runtime deposit equals the bounded worst case");
+    assert.ok(worst <= mounted.x402.usd + 1e-12, `worst case $${worst} exceeds the deposit`);
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);
-    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance);
+    // Guidance maxLength includes the uncounted one-thread prefix; the counted cap is Guidance
+    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance + [...ONE_THREAD_PREFIX].length);
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "x".repeat(Draft + 1), Context: "c" } }),
       (e) => e.mcpCode === -32602 && /"Draft" is 1501 characters; humanize-comment accepts at most 1500/.test(e.message));
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c".repeat(Context + 1) } }), /"Context" is 3501 characters.*at most 3500/);
-    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), /"Guidance" is 301 characters/);
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), new RegExp(`"Guidance" is ${Guidance + 1} characters`));
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance) } });
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: ONE_THREAD_PREFIX + "g".repeat(Guidance) } });
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: ONE_THREAD_PREFIX + "g".repeat(Guidance + 1) } }), new RegExp(`"Guidance" is ${Guidance + 1} characters`));
     // caps count code points, so a 1500-emoji draft is allowed and 1501 is not
     await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft), Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) } });
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft + 1), Context: "c" } }), /"Draft" is 1501 characters/);
