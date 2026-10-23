@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -18,7 +18,7 @@ function judge(winner, order, why = "ok") {
   });
 }
 
-async function runHumanize(t, reply, args) {
+async function runHumanize(t, reply, args, opts = {}) {
   const { createServer } = await import("node:http");
   const seen = [];
   let judgePrompt = "";
@@ -44,7 +44,14 @@ async function runHumanize(t, reply, args) {
   const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-v28-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
-  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  const registry = await loadTools({
+    dirs: [dir],
+    apiKey: opts.wallet ? undefined : "test-key",
+    payment: opts.wallet || undefined,
+    baseUrl: "http://127.0.0.1:" + srv.address().port,
+    outDir: join(dir, "out"),
+    log: () => {},
+  });
   const result = await registry.callTool({ name: "humanize-comment", arguments: args });
   const texts = result.content.map((c) => c.text || "");
   const block = texts.find((x) => /^\{"winner"/.test(x));
@@ -60,6 +67,8 @@ test("v2.8 schema: keep, ending, maxChars, and a 600-character guidance cap", as
     assert.deepEqual(tool.inputSchema.properties.keep, humanizeExtraProperties().keep);
     assert.deepEqual(tool.inputSchema.properties.ending, humanizeExtraProperties().ending);
     assert.deepEqual(tool.inputSchema.properties.maxChars, humanizeExtraProperties().maxChars);
+    assert.deepEqual(tool.inputSchema.properties.title, humanizeExtraProperties().title);
+    assert.equal(tool.inputSchema.properties.title.default, false);
     assert.equal(tool.inputSchema.properties.ending.default, "any");
     assert.deepEqual(tool.inputSchema.properties.ending.enum, ["question", "keep_last", "any"]);
     assert.equal(HUMANIZE_INPUT_CAPS.Guidance, 600);
@@ -162,7 +171,7 @@ test("the guidance-wrapper echo is never picked, and a title paragraph is droppe
     if (body.model === MODELS[0]) return echo;
     if (body.model === MODELS[2]) return paragraph;
     return "CI cut, nice.";
-  }, { Draft: "CI cut", Context: "a title", Guidance: "Rewrite the title." });
+  }, { Draft: "CI cut", Context: "a title", Guidance: "Rewrite the title.", title: true });
   assert.equal(json.text, "CI cut, nice.");
   assert.equal(json.winner !== "A" && json.winner !== "C", true);
   const blob = texts.join("\n") + "\n" + judgePrompt;
@@ -185,6 +194,9 @@ test("an old-style call is unchanged: same shape, same text, no new prompt, same
   assert.equal(json.ranked.length, 5);
   for (const row of json.ranked) assert.equal(row.text, "rewrite by " + row.model);
   assert.ok(texts.includes("cost: $0.0006"), texts.find((x) => /^cost/.test(x)));
+  assert.equal(seen.length, 6, "old-style call is 5 writers + the decider, the same 6 paid calls as #72");
+  assert.equal(json.text, "rewrite by " + MODELS[0]);
+  assert.equal(seen.filter((s) => s.messages.length > 2).length, 0, "no retry turn on an old-style call");
   const writers = seen.filter((s) => s.model !== "z-ai/glm-5.3");
   assert.equal(writers.length, 5, "no guard retry and no re-ask on an old-style call");
   for (const s of writers) {
@@ -226,18 +238,105 @@ test("when every writer drops a span, one retry runs and the closest reply is re
   assert.notEqual(result.isError, true);
   assert.ok(json.text.includes(span), json.text);
   assert.equal(json.text.split(span).length - 1, 1);
-  assert.ok(texts.some((x) => /protected span/.test(x) && /put back/.test(x)));
-  for (const model of MODELS) assert.equal(seen.filter((s) => s.model === model).length, 2, model);
+  assert.ok(texts.some((x) => /protected span/.test(x) && /put back/.test(x) && /decider confirmed/.test(x)));
+  const writerCalls = seen.filter((s) => s.model !== "z-ai/glm-5.3");
+  const retries = writerCalls.filter((s) => s.reask);
+  assert.equal(retries.length, 3, "span retries share the 3-call re-ask budget");
+  assert.equal(writerCalls.length, 8);
+  const judges = seen.filter((s) => s.model === "z-ai/glm-5.3");
+  assert.equal(judges.length, 2, "the repaired text is sent back to the decider");
+  assert.ok(judges[1].user.includes(span));
 });
 
-test("a repair that cannot meet maxChars throws and does not deliver", async (t) => {
-  const span = "Keep this joke exactly as written please.";
-  assert.ok([...span].length > 10);
+test("keep_last keeps a final sentence that ends with a closing quote", () => {
+  assert.deepEqual(sentencesOf('Please read the note here."'), ['Please read the note here."']);
+  assert.equal(finalSentence('Please read the note here."'), 'Please read the note here."');
+  assert.deepEqual(sentencesOf("Did you see it?'"), ["Did you see it?'"]);
+  assert.deepEqual(sentencesOf('He left. "Hello there."'), ["He left.", '"Hello there."']);
+  const out = ensureEnding("Appreciate the writeup.", "keep_last", [], 'Thanks for the writeup. Please read the note here."');
+  assert.ok(out.endsWith('here."'), out);
+  assert.equal(out.includes('Please read the note here."'), true);
+  const q = ensureEnding("Nice post.", "keep_last", [], "First line. Did you see it?'");
+  assert.ok(q.endsWith("Did you see it?'"), q);
+});
+
+test("keep_last through the tool keeps a closing quote on the final sentence", async (t) => {
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return "Appreciate the writeup.";
+  }, { Draft: 'Thanks for the writeup. Please read the note here."', Context: "a note", ending: "keep_last" });
+  assert.ok(json.text.endsWith('here."'), json.text);
+  assert.equal(json.text.includes('Please read the note here."'), true);
+  const { json: asked } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("B", ["B", "A", "C", "D", "E"]);
+    return "Nice post.";
+  }, { Draft: "First line. Did you see it?'", Context: "a note", ending: "keep_last" });
+  assert.ok(asked.text.endsWith("Did you see it?'"), asked.text);
+});
+
+test("impossible keep constraints are rejected before any paid call", async (t) => {
+  let hits = 0;
+  await assert.rejects(
+    runHumanize(t, () => { hits++; return "x"; }, { Draft: "hello there", Context: "a note", keep: ["missing-span-xyz"] }),
+    (e) => e.mcpCode === -32602 && /not in the draft/.test(e.message) && /Nothing was charged/.test(e.message) && !/you were not charged/.test(e.message),
+  );
+  assert.equal(hits, 0);
+  hits = 0;
+  await assert.rejects(
+    runHumanize(t, () => { hits++; return "x"; }, { Draft: "alpha and beta are here", Context: "a note", keep: ["alpha", "beta"], maxChars: 8 }),
+    (e) => e.mcpCode === -32602 && /smaller than the protected text \(9 characters\)/.test(e.message) && /Nothing was charged/.test(e.message),
+  );
+  assert.equal(hits, 0);
+});
+
+const ACCUSATION = "You stole $100000 from your employer.";
+
+function unfaithful(letter) {
+  return JSON.stringify({
+    winner: "ORIGINAL",
+    text: "original",
+    why: "adds an accusation",
+    ranked: ["A", "B", "C", "D", "E"].map((w) => ({ writer: w, faithful: w === letter ? false : true, disqualified: true, reason: w === letter ? "adds a claim" : "missing" })),
+  });
+}
+
+test("a repaired rewrite that adds an accusation is rejected by the decider and not delivered", async (t) => {
+  const span = "Keep this joke.";
+  const judgeUsers = [];
   await assert.rejects(
     runHumanize(t, (body, ctx) => {
-      if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
-      return "No token here, just a long aside about the work.";
-    }, { Draft: `A point. ${span}`, Context: "a point", keep: [span], maxChars: 10 }),
-    /not charged/,
+      if (ctx.judge) {
+        judgeUsers.push(ctx.user);
+        if (ctx.user.includes(ACCUSATION)) return unfaithful("A");
+        return judge("A", ["A", "B", "C", "D", "E"]);
+      }
+      return ACCUSATION;
+    }, { Draft: `A point worth making. ${span}`, Context: "a point", keep: [span] }),
+    (e) => {
+      assert.match(e.message, /faithfulness and safety check/);
+      assert.match(e.message, /API key/);
+      assert.doesNotMatch(e.message, /you were not charged/);
+      assert.equal(e.message.includes(ACCUSATION), false);
+      return true;
+    },
+  );
+  assert.ok(judgeUsers.some((u) => u.includes(ACCUSATION)), "the decider was shown the repaired accusation");
+  assert.equal(judgeUsers.filter((u) => u.includes(ACCUSATION)).length, 1);
+});
+
+test("a wallet caller who already paid is not told they were not charged", async (t) => {
+  const span = "Keep this joke.";
+  await assert.rejects(
+    runHumanize(t, (body, ctx) => {
+      if (ctx.judge) return ctx.user.includes(ACCUSATION) ? unfaithful("A") : judge("A", ["A", "B", "C", "D", "E"]);
+      return ACCUSATION;
+    }, { Draft: `A point worth making. ${span}`, Context: "a point", keep: [span] }, { wallet: async () => {} }),
+    (e) => {
+      assert.match(e.message, /wallet/);
+      assert.match(e.message, /not refunded/);
+      assert.doesNotMatch(e.message, /you were not charged/);
+      assert.doesNotMatch(e.message, /API key/);
+      return true;
+    },
   );
 });

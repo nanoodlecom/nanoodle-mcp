@@ -194,8 +194,8 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const tool = registry.listTools().find(tool => tool.name === "humanize-comment");
     assert.ok(tool);
     // writers + decider carry fields.locked and the labels live in join separators:
-    // only the three author-facing inputs are args, no system prompts or labels
-    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance", "ending", "keep", "maxChars"]);
+    // graph inputs stay Draft, Context, Guidance; keep, ending, maxChars and title are tool-level
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance", "ending", "keep", "maxChars", "title"]);
     assert.deepEqual(tool.inputSchema.required, ["Draft", "Context"]);
     for (const k of Object.keys(tool.inputSchema.properties)) assert.doesNotMatch(k, /system|label|writer|decider/i);
     assert.match(tool.inputSchema.properties.Guidance.description, /default: "a friendly, specific reply"; optional/);

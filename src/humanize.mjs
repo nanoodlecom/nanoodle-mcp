@@ -52,9 +52,12 @@
  *    the draft) is swapped for a [[kN]] placeholder before any writer sees the
  *    draft, then put back after. A rewrite that drops, duplicates, or changes a
  *    placeholder or span is dropped before the decider sees it. Each such writer
- *    is asked once more. If every rewrite is still rejected, the closest one is
- *    repaired and the spans are put back; if that cannot be delivered, the call
- *    throws so the charge gate refunds and the caller is not charged.
+ *    is asked once more, and that retry counts toward the same MAX_REASKS budget
+ *    as a near-copy re-ask. If every rewrite is still rejected, the closest one
+ *    is repaired and the spans are put back, then the decider's faithfulness and
+ *    safety check runs on that repaired text. A failed check throws. The charge
+ *    gate refunds the deposit. A caller on their own key or wallet has already
+ *    paid for the model calls, and the error says so.
  * 6. `ending` (v2.8): "question" makes the rewrite end with a question,
  *    "keep_last" makes it end with the last keep span or, when there is no keep
  *    span, the draft's final sentence, and "any" (the default) leaves the ending
@@ -65,9 +68,11 @@
  *    writer is asked once more.
  * 8. Writer echo (v2.8). A rewrite that contains the one-thread prefix, a
  *    <comment> wrapper, or a long overlap with the guidance or the instructions
- *    is dropped before the decider sees it (one retry first). Title-style drafts
- *    also drop a paragraph-length rewrite. Callers who omit keep, ending, and
- *    maxChars keep the previous result shape and the previous price.
+ *    is dropped before the decider sees it (one retry first, inside the same
+ *    MAX_REASKS budget). Paragraph-length rewrites are dropped only when the
+ *    caller passes title: true. Callers who omit keep, ending, maxChars, and
+ *    title keep the previous result shape, the same six paid calls, and the
+ *    previous price.
  */
 import { ParamsError } from "./tools.mjs";
 import { parseNanoInvoice } from "nanoodle";
@@ -81,9 +86,7 @@ export const HUMANIZE_INPUT_CAPS = { Draft: 1500, Context: 3500, Guidance: 600 }
  * 600 characters are theirs).
  */
 export const ONE_THREAD_PREFIX = "One thread: ONE main point, each sentence follows the last, 2-4 sentences <450 chars, <=1 hash/address, <=1 question at end, no 'Catch:' labels. ";
-/** A draft at most this long, one line, at most one sentence end, is title-style. */
-export const TITLE_DRAFT_MAX = 120;
-/** A title-style rewrite longer than this (plus any protected spans) is a paragraph and is dropped. */
+/** A title rewrite (only when the caller passes title: true) longer than this, plus any protected spans, is a paragraph and is dropped. */
 export const TITLE_OUTPUT_MAX = 220;
 export const KEEP_MAX_ITEMS = 8;
 export const KEEP_MAX_CHARS = 500;
@@ -137,15 +140,10 @@ export function collectSpans(draft, keep) {
     const text = String(rawSpan);
     if (!text.trim()) continue;
     let idx = 0;
-    let found = false;
     while ((idx = writerDraft.indexOf(text, idx)) >= 0) {
-      found = true;
       const tok = take(text, "keep");
       writerDraft = writerDraft.slice(0, idx) + tok + writerDraft.slice(idx + text.length);
       idx += tok.length;
-    }
-    if (!found && !spans.some((s) => s.text === text)) {
-      writerDraft = writerDraft.replace(/\s*$/, "") + (writerDraft.trim() ? " " : "") + take(text, "keep");
     }
   }
   return { cleanDraft, writerDraft, spans };
@@ -210,14 +208,48 @@ export function forceRepair(raw, spans) {
   return t.replace(/[ \t]{2,}/g, " ").trim();
 }
 
+const CLOSING_QUOTE = new Set(['"', "'", "\u201D", "\u2019"]);
+
+/**
+ * Split on . ! ? . A closing quote stays with the sentence it finishes
+ * (`here."`, `?'`), including when that quote is the end of the text.
+ * A quote that opens the next sentence (`He left. "Hello`) stays with that sentence.
+ * A dot before a digit is a decimal, not a boundary.
+ */
 export function sentencesOf(text) {
   const t = String(text ?? "").trim();
   if (!t) return [];
-  const parts = t.match(/(?:[^.!?]|\.(?=\d))+[.!?]+/g);
-  if (!parts) return [t];
-  const consumed = parts.reduce((n, p) => n + p.length, 0);
-  const rest = t.slice(consumed).trim();
-  return parts.map((s) => s.trim()).concat(rest ? [rest] : []);
+  const parts = [];
+  let i = 0;
+  let start = 0;
+  while (i < t.length) {
+    const ch = t[i];
+    const decimal = ch === "." && i + 1 < t.length && t[i + 1] >= "0" && t[i + 1] <= "9";
+    if ((ch === "." || ch === "!" || ch === "?") && !decimal) {
+      let end = i + 1;
+      while (end < t.length && (t[end] === "." || t[end] === "!" || t[end] === "?")) end++;
+      let q = end;
+      while (q < t.length && CLOSING_QUOTE.has(t[q])) q++;
+      if (q > end) {
+        const after = t.slice(q).trimStart();
+        if (!after || !/^[A-Z]/.test(after)) end = q;
+      }
+      const sentence = t.slice(start, end).trim();
+      if (sentence) parts.push(sentence);
+      start = end;
+      i = end;
+      continue;
+    }
+    i++;
+  }
+  const rest = t.slice(start).trim();
+  if (rest) parts.push(rest);
+  return parts.length ? parts : [t];
+}
+
+/** A sentence is a question when its terminator is ?, ignoring a closing quote after it. */
+export function isQuestion(text) {
+  return /\?["'\u201D\u2019]*$/.test(String(text ?? "").trim());
 }
 
 export function finalSentence(text) {
@@ -229,7 +261,7 @@ export function finalSentence(text) {
 export function moveQuestionToEnd(text) {
   const s = sentencesOf(text);
   let last = -1;
-  for (let i = 0; i < s.length; i++) if (s[i].endsWith("?")) last = i;
+  for (let i = 0; i < s.length; i++) if (isQuestion(s[i])) last = i;
   if (last < 0) return String(text ?? "").trim();
   if (last === s.length - 1) return s.join(" ");
   const q = s.splice(last, 1)[0];
@@ -262,9 +294,9 @@ export function ensureEnding(text, ending, spans, draft) {
   }
   if (ending === "question") {
     const moved = moveQuestionToEnd(text);
-    if (/\?\s*$/.test(moved)) return moved;
+    if (isQuestion(moved)) return moved;
     const q = finalSentence(draft);
-    if (q.endsWith("?")) return endWith(moved, q);
+    if (isQuestion(q)) return endWith(moved, q);
     return moved;
   }
   return text;
@@ -295,16 +327,6 @@ export function echoesInstruction(text, guidance, system) {
   return false;
 }
 
-export function isTitleStyle(draft, guidance) {
-  const raw = String(draft ?? "");
-  if (!raw.trim() || raw.includes("\n")) return false;
-  const t = raw.replace(/\s+/g, " ").trim();
-  const n = codePoints(t);
-  const stops = (t.match(/[.!?]/g) || []).length;
-  if (/\btitles?\b/i.test(String(guidance || "")) && n <= 180 && stops <= 2) return true;
-  return n <= TITLE_DRAFT_MAX && stops <= 1;
-}
-
 export function isParagraphOutput(text, spans) {
   const body = String(text ?? "").replace(/\n+$/, "");
   if (body.includes("\n")) return true;
@@ -321,7 +343,7 @@ export function assessWriterOutput(raw, { spans = [], ending = "any", draft = ""
   let text = problems.length ? null : reinsertSpans(raw, spans);
   if (text != null && ending && ending !== "any") {
     text = ensureEnding(text, ending, spans, draft);
-    if (ending === "question" && !/\?\s*$/.test(String(text).trim())) reasons.push("question");
+    if (ending === "question" && !isQuestion(text)) reasons.push("question");
   }
   const shown = text != null ? text : String(raw ?? "");
   if (title && isParagraphOutput(shown, spans)) reasons.push("title");
@@ -370,10 +392,15 @@ export function humanizeExtraProperties() {
       maximum: MAX_CHARS_LIMIT,
       description: `optional; hard cap on the rewrite length in characters (1 to ${MAX_CHARS_LIMIT}). Over-length rewrites are rejected and that writer is asked once more.`,
     },
+    title: {
+      type: "boolean",
+      default: false,
+      description: "optional; when true, a paragraph-length rewrite is rejected and that writer is asked once more. Default false: a short draft is not treated as a title on its own.",
+    },
   };
 }
 
-const HUMANIZE_EXTRA_KEYS = new Set(["keep", "ending", "maxchars"]);
+const HUMANIZE_EXTRA_KEYS = new Set(["keep", "ending", "maxchars", "title"]);
 
 /** Tool arguments with the humanize-only keys removed, so the graph resolver does not see them. */
 export function humanizeGraphArgs(args) {
@@ -399,10 +426,12 @@ export function humanizeCallOpts(args) {
   const maxChars = typeof maxRaw === "number" ? maxRaw : null;
   const guidance = find("guidance");
   const draft = find("draft");
+  const title = find("title") === true;
   return {
     ending,
     keep,
     maxChars,
+    title,
     guidance: guidance == null ? "" : String(guidance),
     draft: draft == null ? "" : String(draft),
   };
@@ -462,7 +491,7 @@ function acceptableDelivery(text, state) {
   const t = String(text ?? "");
   if (!t.trim()) return false;
   if (state.maxChars && codePoints(t) > state.maxChars) return false;
-  if (state.ending === "question" && !/\?\s*$/.test(t.trim())) return false;
+  if (state.ending === "question" && !isQuestion(t)) return false;
   if (state.spans && state.spans.length) {
     const want = new Map();
     for (const s of state.spans) want.set(s.text, (want.get(s.text) || 0) + 1);
@@ -472,12 +501,38 @@ function acceptableDelivery(text, state) {
   return true;
 }
 
-function refundMessage(state) {
-  if (state.spans && state.spans.length && state.maxChars) return "humanize-comment could not return a rewrite that keeps the protected text within the length cap, so nothing is returned and you were not charged.";
-  if (state.spans && state.spans.length) return "humanize-comment could not return a rewrite that keeps the protected text, so nothing is returned and you were not charged.";
-  if (state.maxChars) return `humanize-comment could not return a rewrite within ${state.maxChars} characters, so nothing is returned and you were not charged.`;
-  if (state.ending === "question") return "humanize-comment could not return a rewrite that ends with a question, so nothing is returned and you were not charged.";
-  return "humanize-comment could not return a rewrite, so nothing is returned and you were not charged.";
+/** True when this run already paid for a model call on the caller's key or wallet. */
+function incurredSpend(state) {
+  if (!state) return false;
+  if (state.costUnknown || state.unreportedUsd > 0 || state.reviewUsd > 0) return true;
+  for (const a of state.attempts || []) {
+    if (!a) continue;
+    if (a.paid || a.paymentStarted || (typeof a.usd === "number" && a.usd > 0)) return true;
+    if (state.billing !== "wallet" && a.status === 200) return true;
+  }
+  return false;
+}
+
+/**
+ * Why a constrained run is not delivered. A run that already paid model calls
+ * does not say the caller was not charged: a key was billed, or a wallet
+ * payment already stands. The charge gate adds its own refund sentence when
+ * it returns the deposit. No spend yet says nothing was charged.
+ */
+export function failureMessage(state, why) {
+  const reason = why || (
+    state && state.spans && state.spans.length && state.maxChars ? "the protected text would not fit the length cap."
+    : state && state.spans && state.spans.length ? "the protected text did not survive."
+    : state && state.maxChars ? `no rewrite fit within ${state.maxChars} characters.`
+    : state && state.ending === "question" ? "no rewrite ended with a question."
+    : "no rewrite could be delivered."
+  );
+  const money = !incurredSpend(state)
+    ? "Nothing was charged."
+    : state && state.billing === "wallet"
+      ? "The model calls already paid from your wallet stand and are not refunded by this error."
+      : "The model calls already made were billed to the API key funding this run.";
+  return `humanize-comment could not return a rewrite: ${reason} ${money}`;
 }
 
 /** Deterministic dash fix applied to writer outputs before judging. */
@@ -536,7 +591,7 @@ export function failedBeforeSend(e, signal) {
  * paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
 export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false }) {
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, stash: [], dropped: {} };
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null };
   let reasksLeft = maxReasks;
   const byModel = new Map();
   const dupes = new Set();
@@ -579,7 +634,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     let body;
     try { body = JSON.parse(init.body); } catch { return fetch(url, init); }
     const letter = body && byModel.get(body.model);
-    if (!letter) return fetch(url, init);
+    if (!letter) {
+      if (body && body.model === "z-ai/glm-5.3" && !state.judgeReq) {
+        const user = (body.messages || []).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).join("\n");
+        state.judgeReq = { url: String(url), headers: init.headers, body, user };
+      }
+      return fetch(url, init);
+    }
     const note = writerNote(state.spans, state.ending, state.maxChars);
     const seenDraft = writerDraft || draft;
     if (note || (writerDraft && writerDraft !== draft)) body = annotateWriterBody(body, draft, seenDraft, note);
@@ -795,7 +856,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const system = (body.messages || []).filter((m) => m.role === "system" && typeof m.content === "string").map((m) => m.content).join("\n");
     const guardOpts = { spans: state.spans, ending: state.ending, draft, guidance: state.guidance, system, maxChars: state.maxChars, title: state.title };
     let assessment = assessWriterOutput(text, guardOpts);
-    if (!assessment.ok && now() - t0 < reaskDeadlineMs) {
+    // Guard retries share the near-copy budget, so a run cannot pay for more than maxReasks extra writer calls.
+    const guardAllowed = !assessment.ok && reasksLeft > 0 && now() - t0 < reaskDeadlineMs;
+    if (!assessment.ok && !guardAllowed) {
+      state.skippedGuard[letter] = reasksLeft <= 0 ? `the ${maxReasks}-re-ask limit for this run was reached` : "too late in the writer's time budget";
+    }
+    if (guardAllowed) {
+      reasksLeft--;
       const left = Math.max(0, t0 + reaskEndMs - now());
       const ac = new AbortController();
       const timer = setTimeout(() => { const e = new Error("guard retry timed out"); e.name = "TimeoutError"; ac.abort(e); }, left);
@@ -843,6 +910,97 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     else { delete out.x_nanogpt_pricing; state.unreportedUsd += usd; state.costUnknown = true; }
     return jsonResponse(out);
   };
+
+  const headerCopy = (h) => {
+    const o = {};
+    if (!h) return o;
+    if (typeof h.forEach === "function") { h.forEach((v, k) => { o[k] = v; }); return o; }
+    return { ...h };
+  };
+  const hget = (h, k) => {
+    if (!h) return null;
+    if (typeof h.get === "function") return h.get(k);
+    const e = Object.entries(h).find(([n]) => n.toLowerCase() === k);
+    return e ? e[1] : null;
+  };
+
+  /** One chat call for the decider re-check, settled the same way as a writer call when the run is on a wallet. */
+  const paidChat = async (url, headers, body, rec) => {
+    const init = { method: "POST", headers: headerCopy(headers), body: JSON.stringify(body) };
+    let r = await fetch(url, init);
+    const x402 = !!payment && String(hget(init.headers, "x-x402")) === "true" && !hget(init.headers, "authorization");
+    if (r.status === 402 && x402) {
+      const raw = await r.text();
+      let inv = null;
+      try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+      if (!inv || !inv.paymentId || !inv.completeUrl || state.paidIds.has(inv.paymentId)) {
+        rec.status = 402;
+        throw new Error("decider review could not be paid");
+      }
+      state.paidIds.add(inv.paymentId);
+      rec.paymentId = inv.paymentId;
+      rec.paymentStarted = true;
+      await payment(inv);
+      rec.paid = true;
+      rec.usd = inv.amountUsd;
+      const deadline = inv.expiresAt || now() + 15 * 60 * 1000;
+      for (;;) {
+        const cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}" });
+        if (cr.ok) {
+          let cj = null;
+          try { cj = await cr.json(); } catch { cj = null; }
+          if (cj && typeof cj === "object" && cj.choices) {
+            const content = cj.choices[0] && cj.choices[0].message && cj.choices[0].message.content;
+            return { status: 200, content: typeof content === "string" ? content : "", usd: inv.amountUsd };
+          }
+          r = await fetch(url, { ...init, headers: { ...init.headers, "x-x402-payment-id": inv.paymentId } });
+          break;
+        }
+        if (cr.status !== 402) { r = cr; break; }
+        await cr.text().catch(() => {});
+        if (now() >= deadline) throw new Error("decider review payment window expired");
+        await new Promise((res) => setTimeout(res, pollMs));
+      }
+    }
+    rec.status = r.status;
+    let j = null;
+    try { j = await r.json(); } catch { j = null; }
+    const usd = usdOf(j, r);
+    const content = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    return { status: r.status, content: typeof content === "string" ? content : "", usd };
+  };
+
+  /**
+   * Ask the same decider whether a repaired rewrite is faithful and safe.
+   * Returns { ok }. A missing decider call, an unusable reply, or a rejection is not ok.
+   */
+  state.reviewRepair = async (candidate, letter, modelName) => {
+    const req = state.judgeReq;
+    if (!req) return { ok: false };
+    const model = modelName || (record[letter] && record[letter].model) || "";
+    const user = reviewUserMessage(req.user, letter, model, candidate);
+    const messages = Array.isArray(req.body.messages) ? req.body.messages.map((m) => ({ ...m })) : [];
+    let replaced = false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && typeof messages[i].content === "string") {
+        messages[i] = { ...messages[i], content: user };
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) return { ok: false };
+    const body = { ...req.body, messages };
+    const rec = { letter, kind: "review", model: body.model, status: null, paid: false, paymentStarted: false, usd: null };
+    state.attempts.push(rec);
+    const result = await paidChat(req.url, req.headers, body, rec);
+    if (result.usd != null && isFinite(Number(result.usd))) {
+      rec.usd = Number(result.usd);
+      state.reviewUsd += rec.usd;
+    }
+    if (!result.status || result.status !== 200 || !result.content) return { ok: false };
+    return parseRepairVerdict(result.content, letter);
+  };
+
   return { fetch: wrapped, state };
 }
 
@@ -859,7 +1017,8 @@ export function humanizeRunNotes(state) {
   for (const [l, r] of Object.entries(state.reasked)) notes.push(`note: writer ${l}'s first rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}), so it was re-asked once` + (r.failed ? ` (the re-ask failed: ${r.failed}; its first rewrite was kept)` : r.after != null ? ` (overlap now ${r.after.toFixed(2)})` : "") + ".");
   for (const [l, r] of Object.entries(state.skippedReask)) notes.push(`note: writer ${l}'s rewrite copied the draft (trigram overlap ${r.ratio.toFixed(2)}) but was not re-asked (${r.why}); the decider judged it as is.`);
   for (const [l, d] of Object.entries(state.dropped || {})) {
-    const again = state.guarded && state.guarded[l] ? " It was asked once more, and that reply was dropped too." : "";
+    const again = state.guarded && state.guarded[l] ? " It was asked once more, and that reply was dropped too."
+      : state.skippedGuard && state.skippedGuard[l] ? ` It was not asked again (${state.skippedGuard[l]}).` : "";
     notes.push(`note: writer ${l}'s rewrite was dropped before the decider (${d.why}).${again}`);
   }
   return notes;
@@ -912,6 +1071,60 @@ export function checkHumanizeInputs(args) {
       throw new ParamsError(`input "maxChars" must be an integer from 1 to ${MAX_CHARS_LIMIT}. Nothing was charged.`);
     }
   }
+  if (find("title") != null && typeof args[find("title")] !== "boolean") {
+    throw new ParamsError(`input "title" must be a boolean. Nothing was charged.`);
+  }
+  assertKeepPossible(opts.draft, opts.keep, opts.maxChars);
+}
+
+/** Reject a keep span that is not in the draft, or a maxChars that cannot hold the protected text. No model call has been made. */
+function assertKeepPossible(draft, keep, maxChars) {
+  const raw = String(draft ?? "");
+  for (const s of keep || []) {
+    if (!raw.includes(s)) throw new ParamsError(`input "keep" has a span that is not in the draft. Nothing was charged.`);
+  }
+  if (maxChars == null) return;
+  const pieces = [...(keep || [])];
+  const jokeRe = /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
+  let m;
+  while ((m = jokeRe.exec(raw))) {
+    const inner = String(m[1]).trim();
+    if (inner && !pieces.includes(inner)) pieces.push(inner);
+  }
+  const combined = pieces.reduce((n, s) => n + codePoints(s), 0);
+  if (combined > maxChars) throw new ParamsError(`input "maxChars" is ${maxChars}, smaller than the protected text (${combined} characters). Nothing was charged.`);
+}
+
+/** The decider's verdict on one repaired rewrite. Faithful and not disqualified, and the winner is that rewrite. */
+export function parseRepairVerdict(content, letter) {
+  const raw = String(content ?? "").trim();
+  let j = null;
+  try { j = JSON.parse(raw); } catch { j = null; }
+  if (!j || typeof j !== "object" || Array.isArray(j)) {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (m) { try { j = JSON.parse(m[0]); } catch { j = null; } }
+  }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return { ok: false };
+  const want = String(letter || "").toUpperCase();
+  const winner = typeof j.winner === "string" ? j.winner.trim().toUpperCase() : "";
+  const row = Array.isArray(j.ranked) ? j.ranked.find((r) => r && typeof r.writer === "string" && r.writer.trim().toUpperCase() === want) : null;
+  if (j.safe === false || (row && row.safe === false)) return { ok: false };
+  const ok = !!(row && row.faithful === true && row.disqualified === false && winner === want);
+  return { ok };
+}
+
+/** Context, guidance, and the original draft, then the one repaired candidate. */
+function reviewUserMessage(user, letter, model, text) {
+  const mark = "\n\n=====\n\n[ORIGINAL]\n";
+  const src = String(user || "");
+  const i = src.indexOf(mark);
+  let head = src;
+  if (i >= 0) {
+    const after = i + mark.length;
+    const next = src.indexOf("\n\n=====\n\n[", after);
+    head = next < 0 ? src : src.slice(0, next);
+  }
+  return `${head}\n\n=====\n\n[${letter}] ${model}\n${text}`;
 }
 
 /**
@@ -996,10 +1209,11 @@ export function rebuildHumanizeResult(wf, result, record, answered = {}) {
  * After rebuildHumanizeResult. Repairs a run where every rewrite was rejected
  * for a protected span, and refuses a delivery that misses a hard constraint
  * (maxChars, a required question, a protected span). A returned `error` must be
- * thrown by the caller so the charge gate refunds. `note` is a user-facing line.
- * Returns null when the rebuilt result already stands.
+ * thrown by the caller. On the charge gate that refunds the deposit. A key or
+ * wallet that already paid keeps that spend, and the error says so.
+ * `note` is a user-facing line. Returns null when the rebuilt result already stands.
  */
-export function applyHumanizeFallback(wf, result, record, state) {
+export async function applyHumanizeFallback(wf, result, record, state) {
   if (!state) return null;
   const out = wf.outputs.find((o) => o.nodeId === "judge");
   if (!out || typeof result.outputs[out.key] !== "string") return null;
@@ -1022,23 +1236,28 @@ export function applyHumanizeFallback(wf, result, record, state) {
   if (!answered && state.spans && state.spans.length && state.stash && state.stash.length) {
     const best = [...state.stash].sort((a, b) => b.score - a.score || a.letter.charCodeAt(0) - b.letter.charCodeAt(0))[0];
     const text = ensureEnding(forceRepair(best.raw, state.spans), state.ending, state.spans, state.draft);
-    if (acceptableDelivery(text, state)) {
-      const ranked = LETTERS.map((letter) => {
-        if (letter === best.letter) {
-          return { writer: letter, model: best.model || record[letter].model, text, faithful: true, disqualified: false, reason: "protected spans restored" };
-        }
-        const d = state.dropped && state.dropped[letter];
-        return { writer: letter, model: record[letter].model, text: "", faithful: false, disqualified: true, reason: d ? d.why : "missing" };
-      });
-      result.outputs[out.key] = JSON.stringify({
-        winner: best.letter,
-        text,
-        why: "Every rewrite dropped or changed a protected span, so the closest one was repaired and the spans were put back.",
-        ranked,
-      });
-      return { note: "note: every rewrite dropped or changed a protected span, so the closest one was repaired and the spans were put back." };
+    if (!acceptableDelivery(text, state)) return { error: failureMessage(state) };
+    let verdict = { ok: false };
+    try {
+      verdict = typeof state.reviewRepair === "function" ? await state.reviewRepair(text, best.letter, best.model) : { ok: false };
+    } catch {
+      return { error: failureMessage(state, "the decider could not check the repaired text.") };
     }
-    return { error: refundMessage(state) };
+    if (!verdict.ok) return { error: failureMessage(state, "the repaired text failed the decider's faithfulness and safety check.") };
+    const ranked = LETTERS.map((letter) => {
+      if (letter === best.letter) {
+        return { writer: letter, model: best.model || record[letter].model, text, faithful: true, disqualified: false, reason: "protected spans restored; decider confirmed faithful" };
+      }
+      const d = state.dropped && state.dropped[letter];
+      return { writer: letter, model: record[letter].model, text: "", faithful: false, disqualified: true, reason: d ? d.why : "missing" };
+    });
+    result.outputs[out.key] = JSON.stringify({
+      winner: best.letter,
+      text,
+      why: "Every rewrite dropped or changed a protected span, so the closest one was repaired, the spans were put back, and the decider confirmed it is faithful.",
+      ranked,
+    });
+    return { note: "note: every rewrite dropped or changed a protected span, so the closest one was repaired, the spans were put back, and the decider confirmed it is faithful." };
   }
   try { parsed = JSON.parse(result.outputs[out.key]); } catch { parsed = null; }
   if (!parsed || typeof parsed.text !== "string") return null;
@@ -1056,6 +1275,6 @@ export function applyHumanizeFallback(wf, result, record, state) {
     }
   }
   const constrained = !!(state.maxChars || state.ending === "question" || (state.spans && state.spans.length));
-  if (constrained && !acceptableDelivery(text, state)) return { error: refundMessage(state) };
+  if (constrained && !acceptableDelivery(text, state)) return { error: failureMessage(state) };
   return null;
 }

@@ -21,9 +21,10 @@ files at startup and serves **each file as one MCP tool**.
   (base64) — there is a ~4 MB cap, checked before any money is spent.
   `humanize-comment` is the exception: `keep` is an array of strings (verbatim
   spans that must survive exactly), `ending` is `question`, `keep_last`, or
-  `any` (default `any`), and `maxChars` is an integer hard cap on the rewrite.
+  `any` (default `any`), `maxChars` is an integer hard cap on the rewrite, and
+  `title` is a boolean (default false) that rejects a paragraph-length rewrite.
   `Guidance` is at most 600 characters; a leading one-thread prefix is not counted.
-  Omit `keep`, `ending`, and `maxChars` and the call behaves as before.
+  Omit `keep`, `ending`, `maxChars`, and `title` and the call behaves as before.
 - **Text outputs** come back as text blocks. **Media outputs** are saved to the
   server's output directory and the result block gives the absolute saved path
   (e.g. `Image: saved /path/to/poster-Image-....png`). Read or open that file
