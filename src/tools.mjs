@@ -17,7 +17,7 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
-import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult } from "./humanize.mjs";
+import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes } from "./humanize.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -699,13 +699,14 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     }
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
-    content.push({ type: "text", text: `cost: $${formatCostUsd(result.costUsd)}${result.costExact === false ? " (or more — some calls did not report a price)" : ""}` });
+    content.push({ type: "text", text: `cost: $${formatCostUsd(result.costUsd)}${result.costExact === false ? " (a lower bound — some calls did not report a price, so the actual cost may be higher)" : ""}` });
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput
   // tells persist() this result holds paid content that must never hit disk.
   // Every serving layer strips BOTH before replying to an MCP client.
-  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, textOutput };
+  // costExact rides along so the gate can label a lower-bound total as one instead of as the actual cost
+  return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, costExact: result.costExact !== false, textOutput };
 }
 
 /**
@@ -940,10 +941,27 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();
       const { onProgress, notices } = runNotices(tool.wf);
-      const result = await tool.wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
+      // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
+      let runWf = tool.wf, hf = null;
       if (tool.humanize) {
-        const note = rebuildHumanizeResult(tool.wf, result, tool.humanize);
+        const args = params.arguments || {};
+        const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
+        // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
+        hf = humanizeFetch({ record: tool.humanize, draft: dk ? String(args[dk]) : "", payment: apiKey ? null : payment, baseUrl: baseUrl || "https://nano-gpt.com" });
+        // a writer payment that settles after its writer stopped waiting: the operator log keeps it
+        hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
+        runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
+      }
+      const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      if (tool.humanize) {
+        notices.push(...humanizeRunNotes(hf.state));
+        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
         if (note) notices.push(note);
+        // attempts whose answer never reached the engine (failed fallbacks, paid-but-failed calls,
+        // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
+        if (hf.state.unreportedUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + hf.state.unreportedUsd;
+        if (hf.state.costUnknown) result.costExact = false;
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
