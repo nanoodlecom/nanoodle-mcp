@@ -380,21 +380,45 @@ test("an unpriced review is unknown on the call and in the total, and an explici
 });
 
 test("a later keep that swallows placeholders stays inside the priced note and retry", () => {
-  // 87 "k"s, then keep "[[k" twice. Each later pass matches inside the placeholders
-  // the previous pass just wrote. Before the swallowed records were dropped, the
-  // writer note and the guard retry each ran 600 characters over the 201-placeholder allowance.
+  // 87 "k"s, then keep "[[k" twice. "[[k" is not in the original draft, so it must
+  // not match inside the [[kN]] placeholders, and none of the 87 "k"s may be dropped.
+  // Matching inside those placeholders used to push the note and the retry 600
+  // characters over the 201-placeholder allowance.
   const draft = "k".repeat(87);
   const keep = ["k", "[[k", "[[k"];
   const { writerDraft, spans } = collectSpans(draft, keep);
   const budget = placeholderBudget();
   const note = writerNote(spans, "keep_last", MAX_CHARS_LIMIT);
   const guard = guardRetryPrompt(["keep"], { spans });
-  const tokens = writerDraft.match(/\[\[k\d+\]\]/g) || [];
-  assert.equal(spans.length, tokens.length, "every surviving record is a placeholder still in the draft");
-  for (const s of spans) assert.ok(tokens.includes(`[[k${s.id}]]`), `[[k${s.id}]] was swallowed`);
+  assert.equal(spans.length, 87);
+  assert.ok(spans.every((s) => s.text === "k" && s.source === "keep"));
+  assert.equal(writerDraft, spans.map((s) => `[[k${s.id}]]`).join(""));
+  assert.equal(spans.some((s) => s.text === "[[k"), false);
   assert.ok(codePoints(note) <= codePoints(budget.note), `note is ${codePoints(note)} chars, priced allowance is ${codePoints(budget.note)}`);
   assert.ok(codePoints(guard) <= codePoints(budget.guard), `retry is ${codePoints(guard)} chars, priced allowance is ${codePoints(budget.guard)}`);
   assert.ok(codePoints(writerDraft) <= HUMANIZE_INPUT_CAPS.Draft);
+});
+
+test("keep \"1\" does not match inside [[k1]] or drop the disclosure", async (t) => {
+  const disclosure = "I am an AI agent.";
+  const draft = "I am an AI agent. Version 1.";
+  const { writerDraft, spans } = collectSpans(draft, [disclosure, "1"]);
+  assert.equal(writerDraft, "[[k1]] Version [[k2]].");
+  assert.deepEqual(spans.map((s) => s.text), [disclosure, "1"]);
+  const { json, seen, judgePrompt } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return "Released as [[k1]] Version [[k2]].";
+  }, { Draft: draft, Context: "a release note", keep: [disclosure, "1"] });
+  assert.equal(json.text.includes(disclosure), true, json.text);
+  assert.equal(json.text.includes("Version 1."), true, json.text);
+  assert.equal(json.text.includes("[[k"), false, json.text);
+  for (const s of seen.filter((s) => s.model !== "z-ai/glm-5.3" && !s.reask)) {
+    assert.match(s.user, /\[\[k1\]\] Version \[\[k2\]\]\./);
+    assert.equal(s.user.includes(disclosure), false);
+    assert.equal(s.user.includes("[[k[[k"), false);
+  }
+  assert.equal(judgePrompt.includes(disclosure), true);
+  assert.equal(judgePrompt.includes("[[k"), false);
 });
 
 test("maxChars counts every copy of a keep span and refuses before any model call", async (t) => {

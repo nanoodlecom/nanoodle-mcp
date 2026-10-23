@@ -151,40 +151,56 @@ export function placeholderBudget() {
  * each `keep` string become [[kN]] placeholders in `writerDraft`. `cleanDraft`
  * is the draft writers' faithfulness is judged against: joke marks unwrapped,
  * keep text left as written.
+ *
+ * Every keep match is taken from the original draft, before any placeholder
+ * exists. Ranges that overlap lose to the longer one, and to the earlier one
+ * when the lengths are equal. Placeholders are written in one left-to-right
+ * pass, so a later keep cannot match inside [[kN]] or erase an earlier span.
  */
 export function collectSpans(draft, keep) {
-  const spans = [];
-  const take = (text, source) => {
-    const id = spans.length + 1;
-    spans.push({ id, text, source });
-    return tokenOf(id);
-  };
   const raw = String(draft ?? "");
-  const jokeRe = /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
-  const cleanDraft = raw.replace(jokeRe, (_, inner) => String(inner).trim());
-  let writerDraft = raw.replace(jokeRe, (_, inner) => {
-    const text = String(inner).trim();
-    return text ? take(text, "joke") : " ";
-  });
+  const jokePattern = () => /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
+  const cleanDraft = raw.replace(jokePattern(), (_, inner) => String(inner).trim());
+  const ranges = [];
+  for (const m of raw.matchAll(jokePattern())) {
+    const text = String(m[1]).trim();
+    ranges.push({ start: m.index, end: m.index + m[0].length, text, source: text ? "joke" : "blank", len: codePoints(m[0]) });
+  }
   for (const rawSpan of keep || []) {
     const text = String(rawSpan);
     if (!text.trim()) continue;
-    let idx = 0;
-    while ((idx = writerDraft.indexOf(text, idx)) >= 0) {
-      const tok = take(text, "keep");
-      writerDraft = writerDraft.slice(0, idx) + tok + writerDraft.slice(idx + text.length);
-      idx += tok.length;
+    const len = codePoints(text);
+    let from = 0;
+    while (from < raw.length) {
+      const i = raw.indexOf(text, from);
+      if (i < 0) break;
+      ranges.push({ start: i, end: i + text.length, text, source: "keep", len });
+      from = i + 1;
     }
   }
-  // A later keep can match inside a placeholder it just created (`k` inside
-  // [[kN]], or `[[k` across one). That overwrites the earlier token. The span
-  // record must go with it, or the writer note and the guard retry list
-  // placeholders the draft no longer contains and the priced 201-placeholder
-  // payload is no longer the real one. Merging means the surviving token is
-  // the only record: the swallowed ids are dropped.
-  const present = new Set();
-  for (const m of writerDraft.matchAll(/\[\[k\d+\]\]/g)) present.add(m[0]);
-  return { cleanDraft, writerDraft, spans: spans.filter((s) => present.has(tokenOf(s.id))) };
+  ranges.sort((a, b) => b.len - a.len || a.start - b.start || (a.source === "joke" ? -1 : b.source === "joke" ? 1 : 0));
+  const chosen = [];
+  const overlaps = (a, b) => a.start < b.end && b.start < a.end;
+  for (const r of ranges) {
+    if (chosen.some((c) => overlaps(c, r))) continue;
+    chosen.push(r);
+  }
+  chosen.sort((a, b) => a.start - b.start);
+  const spans = [];
+  let writerDraft = "";
+  let cursor = 0;
+  for (const r of chosen) {
+    writerDraft += raw.slice(cursor, r.start);
+    if (r.source === "blank") writerDraft += " ";
+    else {
+      const id = spans.length + 1;
+      spans.push({ id, text: r.text, source: r.source });
+      writerDraft += tokenOf(id);
+    }
+    cursor = r.end;
+  }
+  writerDraft += raw.slice(cursor);
+  return { cleanDraft, writerDraft, spans };
 }
 
 /** Problems with placeholders in a writer reply. Empty when every span is present once and unaltered. */
