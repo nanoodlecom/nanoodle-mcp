@@ -14,8 +14,9 @@ const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean
 const PRICE = 0.0001;
 delete process.env.NANOGPT_API_KEY; // keyless runs only: never fall back to an ambient key
 
-/** Stub NanoGPT speaking x402. `plan(body, phase)` → { status } to fail, or { content }. */
-async function stub(t, { plan, settleOnly = () => false }) {
+/** Stub NanoGPT speaking x402. `plan(body, phase)` → { status } to fail, or { content }.
+ * `priceOf(body)` null omits a price. `invoiceUsd(body)` is the 402 amount. */
+async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRICE, priceOf = () => PRICE }) {
   const invoices = new Map(); // paymentId → { body (exact string), paid, completed }
   const log = { chat: [], complete: [], replays: [] };
   let n = 0;
@@ -28,7 +29,10 @@ async function stub(t, { plan, settleOnly = () => false }) {
         const b = JSON.parse(bodyStr);
         const p = plan(b, "result");
         if (p.status) return send(p.status, { error: "upstream failed" });
-        return send(200, { model: b.model, choices: [{ message: { content: p.content } }], x_nanogpt_pricing: { costUsd: PRICE } });
+        const payload = { model: b.model, choices: [{ message: { content: p.content } }] };
+        const usd = priceOf(b);
+        if (usd != null) payload.x_nanogpt_pricing = { costUsd: usd };
+        return send(200, payload);
       };
       const m = req.url.match(/^\/api\/x402\/complete\/(.+)$/);
       if (m) {
@@ -56,8 +60,9 @@ async function stub(t, { plan, settleOnly = () => false }) {
       const pre = plan(b, "pre");
       if (pre && pre.status) return send(pre.status, { error: "overloaded" });
       const id = "pay" + (++n);
-      invoices.set(id, { body: raw, paid: false, model: b.model });
-      return send(402, { payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: PRICE, completeUrl: "/api/x402/complete/" + id }] } });
+      const quoted = invoiceUsd(b);
+      invoices.set(id, { body: raw, paid: false, model: b.model, usd: quoted });
+      return send(402, { payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: quoted, completeUrl: "/api/x402/complete/" + id }] } });
     });
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -76,8 +81,8 @@ async function stub(t, { plan, settleOnly = () => false }) {
   await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
   const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
   let hook = null;
-  const run = async () => {
-    const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
+  const run = async (args) => {
+    const result = await registry.callTool({ name: "humanize-comment", arguments: args || { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
     const texts = result.content.map((c) => c.text || "");
     const jt = texts.find((x) => /^\{"winner"/.test(x));
     return { result, texts, json: jt ? JSON.parse(jt) : null };
@@ -382,4 +387,66 @@ test("late settlement after the deadline or a cancel: recorded once, never lost 
   rel2(); await new Promise((r3) => setTimeout(r3, 20));
   assert.ok(near(hf2.state.unreportedUsd - b2, PRICE));
   assert.equal(hf2.state.paidFailed.C.ambiguous, false);
+});
+
+test("a paid review whose replay has no price is unknown, and a 10-call run is not an exact $0.0009", async (t) => {
+  const GLM = "z-ai/glm-5.3";
+  let glmInvoices = 0;
+  let glmAnswers = 0;
+  const span = "Keep this joke.";
+  const s = await stub(t, {
+    plan: (b) => ({ content: b.model === GLM ? judge("A") : "No token in this reply at all." }),
+    settleOnly: (b) => b.model === GLM && glmInvoices >= 2,
+    invoiceUsd: (b) => {
+      if (b.model !== GLM) return PRICE;
+      glmInvoices++;
+      return glmInvoices === 2 ? 0.004 : PRICE;
+    },
+    priceOf: (b) => {
+      if (b.model !== GLM) return PRICE;
+      glmAnswers++;
+      return glmAnswers === 1 ? PRICE : null;
+    },
+  });
+  const { result, texts, json } = await s.run({ Draft: `A point worth making. ${span}`, Context: "a point", keep: [span] });
+  assert.notEqual(result.isError, true, texts.join("\n"));
+  assert.ok(json.text.includes(span), json.text);
+  assert.equal(s.paid.length, 10, "5 writers + 3 retries + first decider + repair review");
+  assert.equal(glmAnswers, 2, "the review replay is the unpriced call");
+  const review = [...s.invoices.values()].find((i) => i.model === GLM && i.usd === 0.004);
+  assert.ok(review && review.paid, "the $0.004 review invoice was paid");
+  assert.equal(result.costExact, false);
+  const costLine = texts.find((x) => x.startsWith("cost:"));
+  assert.match(costLine, /lower bound/);
+  assert.notEqual(costLine, "cost: $0.0009");
+  assert.ok(near(result.costUsd, 0.0009 + 0.004), String(result.costUsd) + " " + costLine);
+});
+
+test("review replay with no price records the call as unknown, not $0", async () => {
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "draft",
+    payment: async () => {},
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ status: "paid" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (!hf.state.attempts.some((a) => a.kind === "review" && a.paid)) {
+        return new Response(JSON.stringify({ payment: { paymentId: "payRev", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: 0.004, completeUrl: "http://x/api/x402/complete/payRev" }] } }), { status: 402, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ winner: "A", ranked: [{ writer: "A", faithful: true, disqualified: false }] }) } }] }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  hf.state.judgeReq = {
+    url: "http://x/api/v1/chat/completions",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: { model: "z-ai/glm-5.3", messages: [{ role: "user", content: "ctx\n\n=====\n\n[ORIGINAL]\ndraft\n\n=====\n\n[A] m\nold" }] },
+    user: "ctx\n\n=====\n\n[ORIGINAL]\ndraft\n\n=====\n\n[A] m\nold",
+  };
+  const verdict = await hf.state.reviewRepair("repaired text", "A", "qwen/qwen3.8-27b-novelist");
+  assert.equal(verdict.ok, true);
+  const rec = hf.state.attempts.find((a) => a.kind === "review");
+  assert.equal(rec.paid, true);
+  assert.equal(rec.usd, null);
+  assert.equal(rec.priceKnown, false);
+  assert.equal(hf.state.costUnknown, true);
+  assert.ok(near(hf.state.reviewUsd, 0.004));
 });
