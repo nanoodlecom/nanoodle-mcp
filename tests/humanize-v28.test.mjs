@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -246,6 +246,39 @@ test("when every writer drops a span, one retry runs and the closest reply is re
   const judges = seen.filter((s) => s.model === "z-ai/glm-5.3");
   assert.equal(judges.length, 2, "the repaired text is sent back to the decider");
   assert.ok(judges[1].user.includes(span));
+});
+
+test("protected text Ready?  Still waiting. stays byte for byte through repair and question moving", async () => {
+  // Two spaces after the question mark. Collapsing them makes the final check miss the span.
+  const span = "Ready?  Still waiting.";
+  const spans = [{ id: 1, text: span }];
+  assert.notEqual(span, span.replace(/ {2,}/g, " "));
+  assert.equal(forceRepair(span, spans), span);
+  assert.equal(forceRepair("  Hello  [[k1]]  there.  ", spans), `Hello ${span} there.`);
+  assert.equal(moveQuestionToEnd(span, spans), span);
+  assert.equal(moveQuestionToEnd(`Hello. ${span} Ship it now?`, spans), `Hello. ${span} Ship it now?`);
+  assert.equal(ensureEnding(`Hello. ${span} Ship it now?`, "question", spans, `See this. ${span}`), `Hello. ${span} Ship it now?`);
+
+  const record = Object.fromEntries(["A", "B", "C", "D", "E"].map((l) => [l, { model: l.toLowerCase() }]));
+  const wf = { outputs: [{ nodeId: "judge", key: "out" }] };
+  const text = `Hello. ${span} Ship it now?`;
+  const delivered = { outputs: { out: JSON.stringify({ winner: "A", text, why: "ok", ranked: [{ writer: "A", model: "a", text, faithful: true, disqualified: false, reason: "ok" }] }) } };
+  const kept = await applyHumanizeFallback(wf, delivered, record, {
+    ending: "question", spans, draft: `See this. ${span}`, answered: { A: "a" }, dropped: {}, stash: [], guidance: "",
+  });
+  assert.equal(kept, null);
+  assert.equal(JSON.parse(delivered.outputs.out).text.includes(span), true);
+
+  let reviewed = null;
+  const repaired = { outputs: { out: JSON.stringify({ winner: "ORIGINAL", text: "draft", why: "none", ranked: [] }) } };
+  const fb = await applyHumanizeFallback(wf, repaired, record, {
+    ending: "question", spans, draft: `See this. ${span}`, answered: {}, dropped: {}, guidance: "",
+    stash: [{ letter: "A", model: "a", raw: "Hello [[k1]] Ship it now?", score: 2 }],
+    reviewRepair: async (candidate) => { reviewed = candidate; return { ok: true }; },
+  });
+  assert.equal(fb && fb.error, undefined, fb && fb.error);
+  assert.equal(reviewed.includes(span), true, reviewed);
+  assert.equal(JSON.parse(repaired.outputs.out).text.includes(span), true);
 });
 
 test("keep_last keeps a final sentence that ends with a closing quote", () => {

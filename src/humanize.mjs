@@ -55,9 +55,12 @@
  *    is asked once more, and that retry counts toward the same MAX_REASKS budget
  *    as a near-copy re-ask. If every rewrite is still rejected, the closest one
  *    is repaired and the spans are put back, then the decider's faithfulness and
- *    safety check runs on that repaired text. A failed check throws. The charge
- *    gate refunds the deposit. A caller on their own key or wallet has already
- *    paid for the model calls, and the error says so.
+ *    safety check runs on that repaired text. Repair and question-moving keep
+ *    each protected span byte for byte. The check uses the run's abort signal
+ *    and the same deadline as a writer retry, so a cancel or a timeout stops it
+ *    before another paid call. A failed check throws. The charge gate refunds
+ *    the deposit. A caller on their own key or wallet has already paid for the
+ *    model calls, and the error says so.
  * 6. `ending` (v2.8): "question" makes the rewrite end with a question,
  *    "keep_last" makes it end with the last keep span or, when there is no keep
  *    span, the draft's final sentence, and "any" (the default) leaves the ending
@@ -270,7 +273,45 @@ export function reinsertSpans(raw, spans) {
   return String(raw ?? "").replace(/\[\[k\d+\]\]/g, (tok) => (map.has(tok) ? map.get(tok) : tok));
 }
 
-/** Last-resort repair: restore every span once, even if the reply mangled its placeholder. */
+const SPAN_MARK_RE = /\uE000(\d+)\uE001/g;
+const spanMark = (i) => `\uE000${i}\uE001`;
+
+/**
+ * Run `fn` on `text` with every protected span lifted out, then put those bytes
+ * back unchanged. Longest spans are lifted first so a shorter one cannot eat
+ * part of a longer one. Whitespace normalization inside `fn` only sees the rest.
+ */
+function protectingSpans(text, spans, fn) {
+  const unique = [];
+  const seen = new Set();
+  for (const s of spans || []) {
+    const span = s && s.text;
+    if (!span || seen.has(span)) continue;
+    seen.add(span);
+    unique.push(span);
+  }
+  unique.sort((a, b) => b.length - a.length);
+  const holes = [];
+  let masked = String(text ?? "");
+  for (const span of unique) {
+    let out = "";
+    let rest = masked;
+    while (rest.length) {
+      const i = rest.indexOf(span);
+      if (i < 0) { out += rest; break; }
+      holes.push(span);
+      out += rest.slice(0, i) + spanMark(holes.length - 1);
+      rest = rest.slice(i + span.length);
+    }
+    masked = out;
+  }
+  const next = fn(masked);
+  if (!holes.length) return next;
+  return String(next).replace(SPAN_MARK_RE, (_, i) => holes[Number(i)]);
+}
+
+/** Last-resort repair: restore every span once, even if the reply mangled its placeholder.
+ *  Span text is kept byte for byte. Only whitespace outside those spans is collapsed. */
 export function forceRepair(raw, spans) {
   const list = spans || [];
   const map = new Map(list.map((s) => [tokenOf(s.id), s.text]));
@@ -286,7 +327,9 @@ export function forceRepair(raw, spans) {
   t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => holes[Number(i)]);
   for (const s of list) {
     if (used.has(tokenOf(s.id))) continue;
-    if (!t.includes(s.text)) t = `${t.trim()} ${s.text}`.trim();
+    if (!s.text || t.includes(s.text)) continue;
+    const body = t.trim();
+    t = body ? `${body} ${s.text}` : s.text;
   }
   const want = new Map();
   for (const s of spans || []) want.set(s.text, (want.get(s.text) || 0) + 1);
@@ -305,7 +348,7 @@ export function forceRepair(raw, spans) {
     }
     t = out;
   }
-  return t.replace(/[ \t]{2,}/g, " ").trim();
+  return protectingSpans(t, list, (masked) => masked.replace(/[ \t]{2,}/g, " ").trim());
 }
 
 const CLOSING_QUOTE = new Set(['"', "'", "\u201D", "\u2019"]);
@@ -408,16 +451,23 @@ export function finalSentence(text) {
   return s.length ? s[s.length - 1] : "";
 }
 
-/** Move the last question sentence to the end. Text with no question is returned trimmed, joined the same way. */
-export function moveQuestionToEnd(text) {
-  const s = sentencesOf(text);
-  let last = -1;
-  for (let i = 0; i < s.length; i++) if (isQuestion(s[i])) last = i;
-  if (last < 0) return String(text ?? "").trim();
-  if (last === s.length - 1) return s.join(" ");
-  const q = s.splice(last, 1)[0];
-  s.push(q);
-  return s.join(" ");
+/**
+ * Move the last question sentence to the end. Text with no question is returned
+ * trimmed, joined the same way. Protected spans stay byte for byte, including
+ * spaces and a question mark inside the span, so sentence splitting cannot
+ * rewrite them.
+ */
+export function moveQuestionToEnd(text, spans) {
+  return protectingSpans(text, spans, (masked) => {
+    const s = sentencesOf(masked);
+    let last = -1;
+    for (let i = 0; i < s.length; i++) if (isQuestion(s[i])) last = i;
+    if (last < 0) return String(masked ?? "").trim();
+    if (last === s.length - 1) return s.join(" ");
+    const q = s.splice(last, 1)[0];
+    s.push(q);
+    return s.join(" ");
+  });
 }
 
 function endWith(text, span) {
@@ -444,7 +494,7 @@ export function ensureEnding(text, ending, spans, draft) {
     return last ? endWith(text, last) : String(text ?? "").trim();
   }
   if (ending === "question") {
-    const moved = moveQuestionToEnd(text);
+    const moved = moveQuestionToEnd(text, spans);
     if (isQuestion(moved)) return moved;
     const q = finalSentence(draft);
     if (isQuestion(q)) return endWith(moved, q);
@@ -815,7 +865,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (!letter) {
       if (body && body.model === "z-ai/glm-5.3" && !state.judgeReq) {
         const user = (body.messages || []).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).join("\n");
-        state.judgeReq = { url: String(url), headers: init.headers, body, user };
+        state.judgeReq = { url: String(url), headers: init.headers, body, user, signal: init.signal || null };
       }
       return fetch(url, init);
     }
@@ -1102,15 +1152,28 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     return e ? e[1] : null;
   };
 
-  /** One chat call for the decider re-check, settled the same way as a writer call when the run is on a wallet. */
-  const paidChat = async (url, headers, body, rec) => {
-    const init = { method: "POST", headers: headerCopy(headers), body: JSON.stringify(body) };
+  const reviewReconcile = (rec, inv, status) => {
+    rec.status = status;
+    state.reconcile.push({ letter: rec.letter, kind: rec.kind, model: rec.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: !rec.paid, status });
+  };
+
+  /**
+   * One chat call for the decider re-check, settled the same way as a writer call
+   * when the run is on a wallet. `signal` is the retry-style controller: it fires
+   * on cancel and when the review deadline passes, and it is passed to the chat
+   * request, the wallet call, the complete poll, and the wait between polls.
+   */
+  const paidChat = async (url, headers, body, rec, signal) => {
+    const init = { method: "POST", headers: headerCopy(headers), body: JSON.stringify(body), signal };
     const chatPrice = (j, r, paidUsd) => {
       const usd = usdOf(j, r);
       if (usd == null || !isFinite(Number(usd))) return { known: false, usd: null, paidUsd: paidUsd ?? null };
       return { known: true, usd: Number(usd), paidUsd: paidUsd ?? null };
     };
-    let r = await fetch(url, init);
+    if (signal && signal.aborted) { rec.status = "request error"; rec.beforeSend = true; throw signal.reason; }
+    let r;
+    try { r = await fetch(url, init); }
+    catch (e) { rec.status = "request error"; rec.beforeSend = failedBeforeSend(e, signal); throw e; }
     let paidUsd = null;
     const x402 = !!payment && String(hget(init.headers, "x-x402")) === "true" && !hget(init.headers, "authorization");
     if (r.status === 402 && x402) {
@@ -1124,13 +1187,36 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       state.paidIds.add(inv.paymentId);
       rec.paymentId = inv.paymentId;
       rec.paymentStarted = true;
-      await payment(inv);
+      try {
+        const paying = Promise.resolve().then(() => payment(inv));
+        // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
+        paying.then(() => {
+          if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
+          rec.paid = true; rec.paymentAmbiguous = false; rec.usd = inv.amountUsd; rec.counted = true;
+          if (Number.isFinite(inv.amountUsd)) state.unreportedUsd += inv.amountUsd; else state.costUnknown = true;
+          const c = state.reconcile.find((x) => x.paymentId === inv.paymentId);
+          if (c) { c.ambiguous = false; c.status = "paid after the review stopped waiting; its result was not used"; c.late = true; }
+          if (typeof state.onLate === "function") state.onLate(c || { letter: rec.letter, kind: rec.kind, paymentId: inv.paymentId, amountUsd: inv.amountUsd });
+        }, () => {});
+        await raceAbort(paying, signal);
+      } catch (e) {
+        if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
+        rec.paymentAmbiguous = true;
+        reviewReconcile(rec, inv, signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed");
+        throw e;
+      }
       rec.paid = true;
       rec.usd = inv.amountUsd;
       paidUsd = inv.amountUsd;
       const deadline = inv.expiresAt || now() + 15 * 60 * 1000;
       for (;;) {
-        const cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}" });
+        let cr;
+        try {
+          cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}", signal });
+        } catch (e) {
+          reviewReconcile(rec, inv, "aborted after payment");
+          throw e;
+        }
         if (cr.ok) {
           let cj = null;
           try { cj = await cr.json(); } catch { cj = null; }
@@ -1144,7 +1230,11 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         if (cr.status !== 402) { r = cr; break; }
         await cr.text().catch(() => {});
         if (now() >= deadline) throw new Error("decider review payment window expired");
-        await new Promise((res) => setTimeout(res, pollMs));
+        try { await wait(pollMs, signal); }
+        catch (e) {
+          reviewReconcile(rec, inv, "aborted after payment");
+          throw e;
+        }
       }
     }
     rec.status = r.status;
@@ -1157,6 +1247,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   /**
    * Ask the same decider whether a repaired rewrite is faithful and safe.
    * Returns { ok }. A missing decider call, an unusable reply, or a rejection is not ok.
+   * The decider's abort signal and a deadline of reaskEndMs (the same bound as a
+   * writer retry) are combined into one signal and passed through paidChat.
+   * Cancel throws. A deadline with no answer throws, so nothing else is paid.
    */
   state.reviewRepair = async (candidate, letter, modelName) => {
     const req = state.judgeReq;
@@ -1176,10 +1269,32 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const body = { ...req.body, messages };
     const rec = { letter, kind: "review", model: body.model, status: null, paid: false, paymentStarted: false, usd: null };
     state.attempts.push(rec);
-    const result = await paidChat(req.url, req.headers, body, rec);
-    recordReviewPrice(state, rec, result);
-    if (!result.status || result.status !== 200 || !result.content) return { ok: false };
-    return parseRepairVerdict(result.content, letter);
+    const outer = req.signal || null;
+    const t0 = now();
+    const left = Math.max(0, t0 + reaskEndMs - now());
+    const ac = new AbortController();
+    const timer = setTimeout(() => {
+      const e = new Error("repair review timed out");
+      e.name = "TimeoutError";
+      ac.abort(e);
+    }, left);
+    const onOuter = () => ac.abort(outer.reason);
+    if (outer) { if (outer.aborted) onOuter(); else outer.addEventListener("abort", onOuter, { once: true }); }
+    try {
+      const result = await paidChat(req.url, req.headers, body, rec, ac.signal);
+      recordReviewPrice(state, rec, result);
+      if (!result.status || result.status !== 200 || !result.content) return { ok: false };
+      return parseRepairVerdict(result.content, letter);
+    } catch (e) {
+      const x402 = !!payment && String(hget(req.headers, "x-x402")) === "true" && !hget(req.headers, "authorization");
+      const c = failCost(rec, x402);
+      if (c == null) state.costUnknown = true;
+      else state.unreportedUsd += c;
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (outer) outer.removeEventListener("abort", onOuter);
+    }
   };
 
   return { fetch: wrapped, state };

@@ -450,3 +450,81 @@ test("review replay with no price records the call as unknown, not $0", async ()
   assert.equal(hf.state.costUnknown, true);
   assert.ok(near(hf.state.reviewUsd, 0.004));
 });
+
+const reviewUser = "ctx\n\n=====\n\n[ORIGINAL]\ndraft\n\n=====\n\n[A] m\nold";
+const judgeBody = () => ({ model: "z-ai/glm-5.3", messages: [{ role: "user", content: reviewUser }] });
+
+test("cancelling mid repair-review aborts without further paid calls", async () => {
+  const ac = new AbortController();
+  const seen = [];
+  let payments = 0;
+  let phase = "judge";
+  let started;
+  const startedP = new Promise((r) => { started = r; });
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "draft",
+    pollMs: 10000,
+    payment: async () => { payments++; },
+    fetch: (url, init) => {
+      if (phase === "judge") {
+        phase = "review";
+        return Promise.resolve(okRes("{}"));
+      }
+      seen.push(String(url));
+      if (!init || !init.signal) return Promise.reject(new Error("repair review dropped the abort signal"));
+      if (String(url).includes("/complete/")) return Promise.reject(new Error("complete after cancel"));
+      started();
+      return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(init.signal.reason)));
+    },
+  });
+  await hf.fetch(CHAT, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, signal: ac.signal, body: JSON.stringify(judgeBody()) });
+  assert.equal(hf.state.judgeReq.signal, ac.signal, "the decider abort signal is kept for the review");
+  const p = hf.state.reviewRepair("repaired text", "A", "qwen/qwen3.8-27b-novelist");
+  await startedP;
+  ac.abort(new Error("cancelled"));
+  const t0 = Date.now();
+  await Promise.race([
+    assert.rejects(p, /cancelled/),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("review did not abort")), 2000)),
+  ]);
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(payments, 0, "cancel before the wallet call does not pay");
+  assert.deepEqual(seen, [CHAT], "no complete poll and no replay after cancel");
+});
+
+test("repair review deadline: a slow payment stops without another paid call", async () => {
+  const seen = [];
+  let payments = 0;
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "draft",
+    pollMs: 10000,
+    reaskEndMs: 50,
+    payment: () => { payments++; return new Promise(() => {}); },
+    fetch: async (url, init) => {
+      seen.push(String(url));
+      if (!init || !init.signal) throw new Error("repair review dropped the abort signal");
+      if (String(url).includes("/complete/")) throw new Error("complete after the deadline");
+      return inv402("payRev");
+    },
+  });
+  hf.state.judgeReq = {
+    url: CHAT,
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: judgeBody(),
+    user: reviewUser,
+  };
+  const t0 = Date.now();
+  await Promise.race([
+    assert.rejects(hf.state.reviewRepair("repaired text", "A", "qwen/qwen3.8-27b-novelist"), /repair review timed out/),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("review ignored its deadline")), 2000)),
+  ]);
+  assert.ok(Date.now() - t0 < 2000, "bounded by the review deadline, not the invoice window");
+  assert.equal(payments, 1, "the in-flight payment is not followed by another");
+  assert.deepEqual(seen, [CHAT]);
+  assert.equal(hf.state.reconcile[0].paymentId, "payRev");
+  assert.equal(hf.state.reconcile[0].status, "payment still pending at the deadline");
+  assert.equal(hf.state.reconcile[0].ambiguous, true);
+  assert.equal(hf.state.costUnknown, true);
+});
