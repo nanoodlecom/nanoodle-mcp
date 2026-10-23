@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -419,6 +419,33 @@ test("keep \"1\" does not match inside [[k1]] or drop the disclosure", async (t)
   }
   assert.equal(judgePrompt.includes(disclosure), true);
   assert.equal(judgePrompt.includes("[[k"), false);
+});
+
+test("crossing keeps are merged so cdef is not dropped", async (t) => {
+  const draft = "abcdef";
+  const { writerDraft, spans } = collectSpans(draft, ["abcd", "cdef"]);
+  assert.equal(writerDraft, "[[k1]]");
+  assert.equal(spans.length, 1);
+  assert.equal(spans[0].text, "abcdef");
+  const { json, seen } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return "Changed [[k1]].";
+  }, { Draft: draft, Context: "a note", keep: ["abcd", "cdef"] });
+  assert.equal(json.text, "Changed abcdef.");
+  assert.equal(json.text.includes("cdef"), true, json.text);
+  assert.notEqual(json.text, "Changed abcd.");
+  assert.equal(seen.filter((s) => s.reask).length, 0);
+});
+
+test("a draft marker [[k2]] is restored in one pass and refused before quoting", async (t) => {
+  const spans = [{ id: 1, text: "[[k2]]" }, { id: 2, text: "x" }];
+  assert.equal(reinsertSpans("Changed [[k1]] [[k2]].", spans), "Changed [[k2]] x.");
+  let hits = 0;
+  await assert.rejects(
+    runHumanize(t, () => { hits++; return "Changed [[k1]] [[k2]]."; }, { Draft: "[[k2]] x", Context: "a note", keep: ["[[k2]]", "x"] }),
+    (e) => e.mcpCode === -32602 && /placeholder marker \[\[k2\]\]/.test(e.message) && /Nothing was charged/.test(e.message),
+  );
+  assert.equal(hits, 0, "the marker collision must not reach 5 writers and the judge");
 });
 
 test("maxChars counts every copy of a keep span and refuses before any model call", async (t) => {

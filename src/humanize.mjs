@@ -146,6 +146,20 @@ export function placeholderBudget() {
   };
 }
 
+const overlaps = (a, b) => a.start < b.end && b.start < a.end;
+
+/** Union ranges that cross or overlap. Ranges that only touch stay separate. */
+function mergeRanges(ranges) {
+  const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
+  const out = [];
+  for (const r of sorted) {
+    const cur = out[out.length - 1];
+    if (cur && overlaps(cur, r)) cur.end = Math.max(cur.end, r.end);
+    else out.push({ start: r.start, end: r.end });
+  }
+  return out;
+}
+
 /**
  * Pull protected spans out of a draft. [[joke]]…[[/joke]] marks (inner text) and
  * each `keep` string become [[kN]] placeholders in `writerDraft`. `cleanDraft`
@@ -153,39 +167,52 @@ export function placeholderBudget() {
  * keep text left as written.
  *
  * Every keep match is taken from the original draft, before any placeholder
- * exists. Ranges that overlap lose to the longer one, and to the earlier one
- * when the lengths are equal. Placeholders are written in one left-to-right
- * pass, so a later keep cannot match inside [[kN]] or erase an earlier span.
+ * exists. Overlapping or crossing matches merge into one span whose text is the
+ * original slice covering all of them, so neither keep is dropped. Placeholders
+ * are written in one left-to-right pass.
  */
 export function collectSpans(draft, keep) {
   const raw = String(draft ?? "");
   const jokePattern = () => /\[\[joke\]\]([\s\S]*?)\[\[\/joke\]\]/gi;
   const cleanDraft = raw.replace(jokePattern(), (_, inner) => String(inner).trim());
-  const ranges = [];
+  const jokes = [];
   for (const m of raw.matchAll(jokePattern())) {
     const text = String(m[1]).trim();
-    ranges.push({ start: m.index, end: m.index + m[0].length, text, source: text ? "joke" : "blank", len: codePoints(m[0]) });
+    jokes.push({ start: m.index, end: m.index + m[0].length, text, source: text ? "joke" : "blank" });
   }
+  const keeps = [];
   for (const rawSpan of keep || []) {
     const text = String(rawSpan);
     if (!text.trim()) continue;
-    const len = codePoints(text);
     let from = 0;
     while (from < raw.length) {
       const i = raw.indexOf(text, from);
       if (i < 0) break;
-      ranges.push({ start: i, end: i + text.length, text, source: "keep", len });
+      keeps.push({ start: i, end: i + text.length });
       from = i + 1;
     }
   }
-  ranges.sort((a, b) => b.len - a.len || a.start - b.start || (a.source === "joke" ? -1 : b.source === "joke" ? 1 : 0));
-  const chosen = [];
-  const overlaps = (a, b) => a.start < b.end && b.start < a.end;
-  for (const r of ranges) {
-    if (chosen.some((c) => overlaps(c, r))) continue;
-    chosen.push(r);
+  let merged = mergeRanges(keeps);
+  const absorbed = new Set();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const j of jokes) {
+      if (absorbed.has(j)) continue;
+      const hit = merged.find((m) => overlaps(m, j));
+      if (!hit) continue;
+      hit.start = Math.min(hit.start, j.start);
+      hit.end = Math.max(hit.end, j.end);
+      absorbed.add(j);
+      grew = true;
+    }
+    if (grew) merged = mergeRanges(merged);
   }
-  chosen.sort((a, b) => a.start - b.start);
+  const chosen = [
+    ...merged.map((m) => ({ start: m.start, end: m.end, text: raw.slice(m.start, m.end), source: "keep" })),
+    ...jokes.filter((j) => !absorbed.has(j)),
+  ];
+  chosen.sort((a, b) => a.start - b.start || a.end - b.end);
   const spans = [];
   let writerDraft = "";
   let cursor = 0;
@@ -224,24 +251,33 @@ export function spanProblems(raw, spans) {
   return [...new Set(problems)];
 }
 
-/** Put the protected text back. The caller has already checked each placeholder is present once. */
+/**
+ * Put the protected text back in one pass. A span's own text may itself look
+ * like [[kN]]; a second scan would replace that restored text.
+ */
 export function reinsertSpans(raw, spans) {
-  let t = String(raw ?? "");
-  for (const s of spans || []) t = t.split(tokenOf(s.id)).join(s.text);
-  return t;
+  const map = new Map((spans || []).map((s) => [tokenOf(s.id), s.text]));
+  return String(raw ?? "").replace(/\[\[k\d+\]\]/g, (tok) => (map.has(tok) ? map.get(tok) : tok));
 }
 
 /** Last-resort repair: restore every span once, even if the reply mangled its placeholder. */
 export function forceRepair(raw, spans) {
-  let t = String(raw ?? "");
-  for (const s of spans || []) {
-    const tok = tokenOf(s.id);
-    const parts = t.split(tok);
-    if (parts.length === 1) {
-      if (!t.includes(s.text)) t = `${t.trim()} ${s.text}`.trim();
-    } else t = parts[0] + s.text + parts.slice(1).join("");
-  }
+  const list = spans || [];
+  const map = new Map(list.map((s) => [tokenOf(s.id), s.text]));
+  const used = new Set();
+  const holes = [];
+  let t = String(raw ?? "").replace(/\[\[k\d+\]\]/g, (tok) => {
+    if (!map.has(tok) || used.has(tok)) return "";
+    used.add(tok);
+    holes.push(map.get(tok));
+    return `\u0000${holes.length - 1}\u0000`;
+  });
   t = t.replace(/\[\[[^\]]*\]\]/g, "");
+  t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => holes[Number(i)]);
+  for (const s of list) {
+    if (used.has(tokenOf(s.id))) continue;
+    if (!t.includes(s.text)) t = `${t.trim()} ${s.text}`.trim();
+  }
   const want = new Map();
   for (const s of spans || []) want.set(s.text, (want.get(s.text) || 0) + 1);
   for (const [span, n] of want) {
@@ -483,7 +519,7 @@ export function humanizeExtraProperties() {
       type: "array",
       items: { type: "string", minLength: 1 },
       maxItems: KEEP_MAX_ITEMS,
-      description: `optional; verbatim spans (a joke, a closing line) that must survive exactly. Each span is swapped for a placeholder before the rewrite and put back after. Every match in the draft counts, and the placeholder draft must stay within the draft cap. A rewrite that drops, duplicates, or changes a span is rejected. At most ${KEEP_MAX_ITEMS} spans, each at most ${KEEP_MAX_CHARS} characters.`,
+      description: `optional; verbatim spans (a joke, a closing line) that must survive exactly. Each span is swapped for a placeholder before the rewrite and put back after. Every match in the draft counts, and the placeholder draft must stay within the draft cap. Overlapping keeps are protected together so each one survives. A rewrite that drops, duplicates, or changes a span is rejected. At most ${KEEP_MAX_ITEMS} spans, each at most ${KEEP_MAX_CHARS} characters.`,
     },
     ending: {
       type: "string",
@@ -1217,8 +1253,19 @@ export function checkHumanizeInputs(args) {
  * occurrence of the protected text, or a repeat that blows the placeholder draft
  * past the draft cap. Runs from prepareCall, before a quote and before any model call.
  */
+function placeholderMarker(s) {
+  const m = String(s ?? "").match(/\[\[k\d+\]\]/);
+  return m ? m[0] : "";
+}
+
 function assertKeepPossible(draft, keep, maxChars) {
   const raw = String(draft ?? "");
+  const draftMarker = placeholderMarker(raw);
+  if (draftMarker) throw new ParamsError(`input "Draft" contains the placeholder marker ${draftMarker}. Nothing was charged.`);
+  for (const s of keep || []) {
+    const marker = placeholderMarker(s);
+    if (marker) throw new ParamsError(`input "keep" contains the placeholder marker ${marker}. Nothing was charged.`);
+  }
   for (const s of keep || []) {
     if (!raw.includes(s)) throw new ParamsError(`input "keep" has a span that is not in the draft. Nothing was charged.`);
   }
