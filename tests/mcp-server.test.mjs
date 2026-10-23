@@ -11,6 +11,7 @@ import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NSFW_OPT_IN_NOTE } from "../src/nsfw.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = join(here, "..", "bin", "nanoodle-mcp.mjs");
@@ -136,6 +137,8 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.match(init.result.serverInfo.version, /^\d+\.\d+\.\d+/);
     const sha = execFileSync("git", ["-C", join(here, ".."), "rev-parse", "--short=7", "HEAD"], { encoding: "utf8" }).trim();
     assert.equal(init.result.serverInfo.commit, sha);
+    assert.match(init.result.instructions, /NSFW mode is off for every caller/);
+    assert.match(init.result.instructions, /nsfw: true/);
 
     // -- initialized notification: must produce NO response
     const framesBefore = srv.messages.length;
@@ -185,6 +188,10 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
       for (const key of Object.keys(t.inputSchema.properties)) {
         assert.match(key, /^[a-zA-Z0-9_.-]{1,64}$/, `tool ${t.name} advertises invalid key "${key}"`);
       }
+      assert.equal(t.inputSchema.properties.nsfw.type, "boolean", t.name);
+      assert.equal(t.inputSchema.properties.nsfw.default, false, t.name);
+      assert.ok(!t.inputSchema.required || !t.inputSchema.required.includes("nsfw"), t.name);
+      assert.match(t.description, /NSFW mode is off/);
     }
 
     // -- tools/call (text output): stubbed chat completion + cost line
@@ -208,7 +215,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     await srv.waitFor((m) => m.method === "notifications/tools/list_changed" && m.id === undefined);
     const relist = await srv.request("tools/list");
     assert.match(relist.result.tools.find((t) => t.name === "hello-noodle").description,
-      /balance; last run \$0\.0012\.$/);
+      /balance; last run \$0\.0012\./);
     const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
     assert.equal(sidecar["hello-noodle"].usd, 0.0012);
 
@@ -515,16 +522,16 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
   assert.equal(desc.named,
     "text:Feature -> text:Style guide -> join -> llm -> image:Mockup; " +
     "returns image (nano-banana-2-lite, 1024×1024) saved to disk (file path in result). " +
-    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+    "Runs on NanoGPT — every call spends real credit from your API key's balance. " + NSFW_OPT_IN_NOTE);
   assert.equal(desc.collapse,
     "text×2 -> join -> llm; returns text. " +
-    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+    "Runs on NanoGPT — every call spends real credit from your API key's balance. " + NSFW_OPT_IN_NOTE);
   assert.equal(desc.variants,
     "text -> image; returns image (test-img) saved to disk (file path in result). " +
-    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+    "Runs on NanoGPT — every call spends real credit from your API key's balance. " + NSFW_OPT_IN_NOTE);
   assert.equal(desc.mixed,
     "text -> llm -> image; returns text + image (img-model); media saved to disk (file path in result). " +
-    "Runs on NanoGPT — every call spends real credit from your API key's balance.");
+    "Runs on NanoGPT — every call spends real credit from your API key's balance. " + NSFW_OPT_IN_NOTE);
 });
 
 test("tool descriptions: the first comment node leads as the tool's intent", async () => {
@@ -536,7 +543,7 @@ test("tool descriptions: the first comment node leads as the tool's intent", asy
   const llm = (id) => ({ id, type: "llm", x: 0, y: 0, fields: { model: "m" } });
   const link = (id, from, to) => ({ id, from: { node: from[0], port: from[1] }, to: { node: to[0], port: to[1] } });
   const wire = [link("l1", ["n1", "text"], ["n2", "prompt"])];
-  const TAIL = "Runs on NanoGPT — every call spends real credit from your API key's balance.";
+  const TAIL = "Runs on NanoGPT — every call spends real credit from your API key's balance. " + NSFW_OPT_IN_NOTE;
 
   // comment leads; missing terminal punctuation gets a period; comment stays out of the chain
   await writeFile(join(dir, "commented.json"), graph([comment("c1", "Draft a tagline from a product idea"), t("n1"), llm("n2")], wire));
@@ -589,7 +596,7 @@ test("cost sidecar: a run records its price, re-renders the description, and not
 
   await reg.callTool({ name: "chat", arguments: {} }); // stub charges $0.0012
   assert.equal(notified, 1);
-  assert.match(reg.tools[0].description, /balance; last run \$0\.0012\.$/);
+  assert.match(reg.tools[0].description, /balance; last run \$0\.0012\. NSFW mode is off/);
   assert.match(reg.listTools().find((t) => t.name === "chat").description, /last run \$0\.0012/);
   const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
   assert.equal(sidecar.chat.usd, 0.0012);
@@ -601,7 +608,7 @@ test("cost sidecar: a run records its price, re-renders the description, and not
 
   // a fresh registry picks the recorded cost up at startup
   const reg2 = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: apiUrl, outDir });
-  assert.match(reg2.tools[0].description, /last run \$0\.0012\.$/);
+  assert.match(reg2.tools[0].description, /last run \$0\.0012\. NSFW mode is off/);
 });
 
 test("cost sidecar: a cheaper run keeps the worst cost on record as hiUsd", async () => {
@@ -650,14 +657,15 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
     return load();
   };
 
-  assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\.$/);       // 0.0200 → trailing zeros trimmed
-  assert.match(await withRec({ usd: 0.1, at }), /; last run \$0\.10\.$/);        // …but never past cents
-  assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\.$/);
-  assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\.$/); // under-reported runs
-  assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\.$/); // sub-basis-point runs
+  // The cost sentence is followed by the NSFW opt-in note. These match the cost token.
+  assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\./);       // 0.0200 → trailing zeros trimmed
+  assert.match(await withRec({ usd: 0.1, at }), /; last run \$0\.10\./);        // …but never past cents
+  assert.match(await withRec({ usd: 0.1234, at }), /; last run \$0\.1234\./);
+  assert.match(await withRec({ usd: 0.0234, at, exact: false }), /; last run \$0\.0234\+\./); // under-reported runs
+  assert.match(await withRec({ usd: 0.00005, at }), /; last run <\$0\.0001\./); // sub-basis-point runs
   // inexact figures are floors — "<$0.0001" would overclaim, so the "+" form wins
-  assert.match(await withRec({ usd: 0.00005, at, exact: false }), /; last run \$0\.0001\+\.$/);
-  assert.match(await withRec({ usd: 0, at, exact: false }), /; last run \$0\.00\+\.$/); // all calls unpriced
+  assert.match(await withRec({ usd: 0.00005, at, exact: false }), /; last run \$0\.0001\+\./);
+  assert.match(await withRec({ usd: 0, at, exact: false }), /; last run \$0\.00\+\./); // all calls unpriced
 
   // corrupt or junk sidecars are ignored, never fatal
   await writeFile(join(outDir, "costs.json"), "{not json");

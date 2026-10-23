@@ -42,6 +42,7 @@ import { createDispatcher, gitShortSha } from "./server.mjs";
 import { renderCost } from "./tools.mjs";
 import { receiptsHtml, receiptsLines, RECEIPTS_CSS } from "./receipts.mjs";
 import { workflowExample } from "./workflow-examples.mjs";
+import { nsfwLlmsLines } from "./nsfw.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024; // media inputs may ride inline as data: URLs
 
@@ -417,6 +418,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
     `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
     ``,
   ];
+  lines.push(...nsfwLlmsLines());
   if (charged) {
     lines.push(
       `## Payment (x402, Nano/XNO)`,
@@ -589,7 +591,13 @@ export async function serveHttp({
   log = (...a) => console.error(...a),
 }) {
   const sha = commit === undefined ? gitShortSha() : (commit || null);
-  const dispatch = createDispatcher({ name, version, commit: sha, listTools, callTool, instructions, log });
+  // Shared across every HTTP caller. Do not remember initialize nsfw on the dispatcher
+  // itself — that would turn the mode on for strangers. A Mcp-Session-Id opts in only that id.
+  const dispatch = createDispatcher({ name, version, commit: sha, listTools, callTool, instructions, rememberSessionNsfw: false, log });
+  const headerSessionId = (req) => {
+    const raw = req.headers["mcp-session-id"];
+    return Array.isArray(raw) ? raw[0] : raw;
+  };
   const graphByName = new Map(toolInfo.filter((t) => t.rawText).map((t) => [t.name, t.rawText]));
 
   // Every held event stream (a streaming tools/call, a /x402/watch subscriber)
@@ -670,6 +678,7 @@ export async function serveHttp({
            */
           const ctx = {
             streaming: true,
+            sessionId: headerSessionId(req),
             status: "working",
             report(s) { this.status = s; },
             announce(s) { this.status = s; return emitProgress(s); },
@@ -692,7 +701,7 @@ export async function serveHttp({
           return;
         }
 
-        const response = await dispatch(msg);
+        const response = await dispatch(msg, { sessionId: headerSessionId(req) });
         if (!response) { res.writeHead(202, { "Access-Control-Allow-Origin": "*" }); return res.end(); }
         return send(200, JSON.stringify(response));
       }

@@ -29,6 +29,14 @@ files at startup and serves **each file as one MCP tool**.
   anything is spent.
 - Inputs with a baked-in default can be omitted; only inputs listed in the
   tool's `required` array must be provided.
+- **NSFW mode is off unless you opt in.** Every tool schema has `nsfw`
+  (boolean, default false). Pass `nsfw: true` only when the user explicitly
+  asked for a spicy or uncensored model. Prompt wording and the graph's model
+  id never turn it on. While it is off, spicy/uncensored model variants are
+  replaced with the non-spicy variant, safety filtering stays on, and a spicy
+  model with no safe variant is refused before any money is spent. A session
+  can opt in with `initialize` `nsfw: true` (stdio, or HTTP calls that repeat
+  the same `Mcp-Session-Id`).
 
 # Adding or changing noodles
 

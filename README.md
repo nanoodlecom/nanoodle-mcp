@@ -180,6 +180,36 @@ it only at graphs you're happy to have run, and keep an eye on your balance.
 Each result ends with a `cost: $X.XXXX` line so the agent (and you) can see
 what a call cost.
 
+## NSFW mode — off unless the caller opts in
+
+NSFW mode is **off for every caller and every tool**. A run uses a spicy or
+uncensored model variant only when the caller sets it on purpose. Prompt
+wording, the model id in the graph, and any other field never turn it on.
+There is no server-wide switch: an operator cannot flip it for every caller.
+
+Opt in per call by passing `nsfw: true` (boolean, or the string `"true"`) on
+`tools/call`. `nsfw: false` forces that call off. Any other value (`yes`, `1`,
+`on`, `spicy`, `True`) is not an opt-in. The property is on every tool schema,
+including `run_noodle`, with `"default": false`, and it is not a workflow input.
+
+Opt in per session by sending `initialize` with `nsfw: true`. A stdio server
+is one caller, so that sticks for the process. On HTTP the server is shared:
+the opt-in sticks only for later calls that send the same `Mcp-Session-Id`.
+An initialize with no session id does not enable the mode for anyone else.
+
+While the mode is off:
+
+- a model id that carries `spicy`, `nsfw`, or `uncensored` as its own token is
+  replaced with the non-spicy variant (the token is removed;
+  `minimax-h3/image-to-video-spicy` runs as
+  `minimax-h3-singularity/image-to-video`, the non-spicy image-to-video sibling)
+- safety checkers a graph turned off are turned back on
+- a spicy model with no safe variant is refused before any money is spent
+
+While the mode is on, those models run as the graph authored them. A safe
+model is not upgraded to a spicy one. The tool result says which choice the
+run made.
+
 ## Wallet mode — no account, no API key (x402)
 
 NanoGPT supports [x402 accountless payments](https://docs.nano-gpt.com/api-reference/miscellaneous/x402):
