@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -379,10 +379,20 @@ test("an unpriced review is unknown on the call and in the total, and an explici
   assert.equal(missing.reviewUsd, 0);
 });
 
+test("a keep span repeated through the whole draft is refused before any model call", async (t) => {
+  let hits = 0;
+  await assert.rejects(
+    runHumanize(t, () => { hits++; return "x"; }, { Draft: "x".repeat(1500), Context: "a note", keep: ["x"] }),
+    (e) => e.mcpCode === -32602 && /placeholders are \d+ characters, above the 1500-character cap/.test(e.message) && /Nothing was charged/.test(e.message),
+  );
+  assert.equal(hits, 0, "5 writers, retries, and ranking must not run before the refusal");
+});
+
 test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)", async () => {
   const { readFile } = await import("node:fs/promises");
   const { Workflow } = await import("nanoodle");
   const graphText = await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8");
+  const graph = JSON.parse(graphText);
   const lines = {
     "qwen/qwen3.8-27b-novelist": "NOVELIST-LINE",
     "deepseek/deepseek-v4.1-flash-1017": "DEEPSEEK-LINE",
@@ -397,18 +407,43 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
     "qwen/qwen3.8-27b-antislop": "D",
     "inception/mercury-3": "E",
   };
+  const nodes = { A: "w-a", B: "w-b", C: "w-c", D: "w-d", E: "w-e" };
+  const rankedIds = {
+    winner: "C",
+    text: "decider paraphrase, not a writer line",
+    why: "ranked by id",
+    ranked: ["C", "A", "B", "D", "E"].map((w) => ({ writer: w, faithful: true, disqualified: false, reason: "ok" })),
+  };
   let judgeUser = "";
   const fetch = async (_url, init) => {
     const body = JSON.parse(init.body);
     const user = (body.messages || []).filter((m) => m.role === "user").map((m) => m.content).join("\n");
     if (body.model === "z-ai/glm-5.3") judgeUser = user;
-    const content = lines[body.model] || "{\"winner\":\"A\"}";
+    const content = lines[body.model] || JSON.stringify(rankedIds);
     return new Response(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }), { status: 200, headers: { "content-type": "application/json" } });
   };
   const wf = Workflow.fromJSON(graphText, { apiKey: "test-key", baseUrl: "http://nano.test", fetch });
-  await wf.run({ Draft: "Draft line.", Context: "Context line.", Guidance: "Guidance line." });
+  const result = await wf.run({ Draft: "Draft line.", Context: "Context line.", Guidance: "Guidance line." });
   for (const [model, line] of Object.entries(lines)) {
     assert.ok(judgeUser.includes(`[${labels[model]}] ${model}\n${line}`), `${model} missing from decider prompt`);
+  }
+  const returned = JSON.parse(result.get("Decider (GLM-5.3)"));
+  assert.deepEqual(returned, rankedIds, "the graph returns the decider's ranked ids, not copied writer text");
+  for (const row of returned.ranked) assert.equal(row.text, undefined);
+  for (const [model, line] of Object.entries(lines)) {
+    const id = nodes[labels[model]];
+    assert.equal(result.nodes[id].status, "done");
+    assert.equal(result.nodes[id].out.text, line, `${id} keeps the writer's own text`);
+  }
+  const record = humanizeWriterRecord(graph);
+  assert.equal(rebuildHumanizeResult(wf, result, record), null);
+  const adapted = JSON.parse(result.get("Decider (GLM-5.3)"));
+  assert.equal(adapted.winner, "C");
+  assert.equal(adapted.text, "CYDONIA-LINE", "the consumer adapter attaches the winning writer's text");
+  for (const [letter, id] of Object.entries(nodes)) {
+    const row = adapted.ranked.find((r) => r.writer === letter);
+    assert.equal(row.text, result.nodes[id].out.text);
+    assert.equal(row.model, record[letter].model);
   }
 });
 

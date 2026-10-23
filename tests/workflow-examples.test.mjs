@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS, ONE_THREAD_PREFIX } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS, ONE_THREAD_PREFIX, placeholderBudget } from "../src/humanize.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -204,22 +204,25 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.doesNotMatch(tool.description, /Example:/);
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
-    assert.deepEqual(mounted.x402, { usd: 0.0188 });
-    // ESTIMATE of the true worst case the code can bill, at the enforced input caps.
+    assert.equal(mounted.x402.usd.toFixed(8), "0.01963166");
+    // The runtime deposit is the bounded worst case, read from this graph's x402.usd.
     // Every writer at its 600-token cap, inputs + system prompts at 3 characters per token.
     // The first decider reads the Guidance and five 600-token rewrites and replies at its
     // 1600-token cap. Writer C is the worse of Cydonia alone or a billed-but-timed-out
     // Cydonia call plus the Starry Ocean fallback. Near-copy re-asks and guard retries
-    // share MAX_REASKS (3); the three most expensive are counted. A near-copy re-ask is
-    // the dearer of the two (REASK_TEXT is longer than the longest guard prompt).
+    // share MAX_REASKS (3); the three most expensive are counted. With the placeholder
+    // cap, the guard prompt that lists every [[kN]] is longer than REASK_TEXT, so that
+    // prompt is the retry that is priced.
+    // Keep matches and [[joke]] marks each become a placeholder. The placeholder draft
+    // is refused before quoting once it would pass the draft cap, so the priced note is
+    // the longest list that still fits (not one placeholder per keep entry).
     // The repair path pays a second GLM-5.3 decider: the same system prompt, context,
     // guidance and draft, the longest writer label, one 600-token candidate, protected
-    // text appended from the draft (up to the draft cap), and a 1600-token reply.
-    // At the counted Guidance cap with no repair: $0.01061120 with no re-ask and
-    // $0.01322120 with 3 re-asks, after the 20% markup.
-    // The deposit also covers a caller who sends the uncounted one-thread prefix plus
-    // 600 characters, and the longest keep / keep_last / maxChars writer note, together
-    // with that repair decider. That extreme is $0.01877196, under the $0.0188 pin.
+    // text appended up to the draft cap, and a 1600-token reply.
+    // At the counted Guidance cap with no keep and no repair: $0.01061120 with no re-ask
+    // and $0.01322120 with 3 re-asks, after the 20% markup.
+    // The deposit equals the extreme: uncounted one-thread prefix, the capped placeholder
+    // note, 3 guard retries, both deciders. That is $0.01963166.
     // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
     // pays no change or author payout, and the operator absorbs the provider cost above it.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
@@ -251,19 +254,21 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const judgeUsd = ((bytes(judge.fields.system) + Draft + Context + Guidance + seps) / CPT + 5 * W) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
     assert.equal(est(base + judgeUsd), "0.01061120", "the docs quote this exact estimate (no re-ask)");
-    assert.equal(est(base + reask + judgeUsd), "0.01322120", "the docs quote this exact estimate (3 re-asks, no repair)");
-    // true worst case: prefix + longest writer note + 3 retries + both deciders
+    assert.equal(est(base + reask + judgeUsd), "0.01322120", "the docs quote this exact estimate (3 re-asks, no repair, no keep)");
+    // bounded worst case: prefix + every placeholder the draft cap can hold + 3 retries + both deciders
+    const budget = placeholderBudget();
+    assert.ok(budget.count > 8, "repeats, not the 8-entry keep list, set the placeholder cap");
+    assert.equal(budget.writerDraftChars <= Draft, true);
     const gExtreme = Guidance + [...ONE_THREAD_PREFIX].length;
-    const note = "Protected placeholders: " + [1, 2, 3, 4, 5, 6, 7, 8].map((n) => `[[k${n}]]`).join(", ")
-      + ". Copy each one exactly once, unchanged. Do not drop, duplicate, or edit them. The rewrite must end with the last placeholder. Stay under 5000 characters.";
-    const extra = 2 + bytes(note);
+    const extra = 2 + bytes(budget.note);
+    const retryText = bytes(budget.guard) > bytes(REASK_TEXT) ? budget.guard : REASK_TEXT;
     let baseX = 0;
     const reasksX = [];
     for (const id of ["w-a", "w-b", "w-c", "w-d", "w-e"]) {
       const n = byId.get(id);
       const inTok = (bytes(n.fields.system) + Draft + Context + gExtreme + 2 * bytes(byId.get("j-in").fields.sep) + extra) / CPT;
       const call = ([p, c], more = 0) => (inTok + more) * p + W * c;
-      const re = (pc) => call(pc, W + bytes(REASK_TEXT) / CPT);
+      const re = (pc) => call(pc, W + bytes(retryText) / CPT);
       const P = PRICE[n.fields.model];
       const fb = HUMANIZE_FALLBACKS[n.fields.model];
       if (fb) { baseX += Math.max(call(P), call(P) + call(PRICE[fb])); reasksX.push(Math.max(re(P), re(PRICE[fb]))); }
@@ -274,10 +279,9 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const longLabel = Math.max(...["k2", "k3", "k4", "k5", "k6"].map((k) => bytes(byId.get(k).fields.sep)));
     const reviewX = ((bytes(judge.fields.system) + Draft + Context + gExtreme + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel) / CPT + W + Draft / CPT) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     const worst = (baseX + reaskX + judgeX + reviewX) / 1e6 * 1.2;
-    assert.equal(mounted.x402.usd, 0.0188);
-    assert.ok(worst <= mounted.x402.usd, `worst case $${worst} exceeds the deposit`);
-    assert.equal(worst.toFixed(8), "0.01877196", "the docs quote this exact worst case");
-    assert.equal((mounted.x402.usd - worst).toFixed(8), "0.00002804", "margin under the pin");
+    assert.equal(worst.toFixed(8), "0.01963166", "the bounded worst case");
+    assert.equal(mounted.x402.usd.toFixed(8), worst.toFixed(8), "the runtime deposit equals the bounded worst case");
+    assert.ok(worst <= mounted.x402.usd + 1e-12, `worst case $${worst} exceeds the deposit`);
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);

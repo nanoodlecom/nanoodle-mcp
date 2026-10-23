@@ -117,6 +117,36 @@ export function guidanceUnits(s) {
 const tokenOf = (id) => `[[k${id}]]`;
 
 /**
+ * The most [[kN]] placeholders that can be sent without passing the draft cap.
+ * Occurrences are packed back to back (`[[k1]][[k2]]…`); one more token would
+ * make the placeholder draft longer than Draft, which is refused before quoting.
+ */
+export function maxPlaceholderSpans() {
+  const spans = [];
+  let used = 0;
+  const cap = HUMANIZE_INPUT_CAPS.Draft;
+  for (let id = 1; ; id++) {
+    const tok = tokenOf(id);
+    if (used + codePoints(tok) > cap) break;
+    used += codePoints(tok);
+    spans.push({ id, text: "x", source: "keep" });
+  }
+  return spans;
+}
+
+/** Writer note and guard retry at that occurrence cap (keep_last + maxChars, the longer pair). */
+export function placeholderBudget() {
+  const spans = maxPlaceholderSpans();
+  return {
+    spans,
+    count: spans.length,
+    writerDraftChars: spans.reduce((n, s) => n + codePoints(tokenOf(s.id)), 0),
+    note: writerNote(spans, "keep_last", MAX_CHARS_LIMIT),
+    guard: guardRetryPrompt(["keep"], { spans }),
+  };
+}
+
+/**
  * Pull protected spans out of a draft. [[joke]]…[[/joke]] marks (inner text) and
  * each `keep` string become [[kN]] placeholders in `writerDraft`. `cleanDraft`
  * is the draft writers' faithfulness is judged against: joke marks unwrapped,
@@ -429,7 +459,7 @@ export function humanizeExtraProperties() {
       type: "array",
       items: { type: "string", minLength: 1 },
       maxItems: KEEP_MAX_ITEMS,
-      description: `optional; verbatim spans (a joke, a closing line) that must survive exactly. Each span is swapped for a placeholder before the rewrite and put back after. A rewrite that drops, duplicates, or changes a span is rejected. At most ${KEEP_MAX_ITEMS} spans, each at most ${KEEP_MAX_CHARS} characters.`,
+      description: `optional; verbatim spans (a joke, a closing line) that must survive exactly. Each span is swapped for a placeholder before the rewrite and put back after. Every match in the draft counts, and the placeholder draft must stay within the draft cap. A rewrite that drops, duplicates, or changes a span is rejected. At most ${KEEP_MAX_ITEMS} spans, each at most ${KEEP_MAX_CHARS} characters.`,
     },
     ending: {
       type: "string",
@@ -1158,11 +1188,23 @@ export function checkHumanizeInputs(args) {
   assertKeepPossible(opts.draft, opts.keep, opts.maxChars);
 }
 
-/** Reject a keep span that is not in the draft, or a maxChars that cannot hold the protected text. No model call has been made. */
+/**
+ * Reject a keep span that is not in the draft, a maxChars that cannot hold the
+ * protected text, or a repeat that blows the placeholder draft past the draft cap.
+ * Runs from prepareCall, before a quote and before any model call.
+ */
 function assertKeepPossible(draft, keep, maxChars) {
   const raw = String(draft ?? "");
   for (const s of keep || []) {
     if (!raw.includes(s)) throw new ParamsError(`input "keep" has a span that is not in the draft. Nothing was charged.`);
+  }
+  const { writerDraft, spans } = collectSpans(raw, keep);
+  const cap = HUMANIZE_INPUT_CAPS.Draft;
+  const expanded = codePoints(writerDraft);
+  const protectedChars = spans.reduce((n, s) => n + codePoints(s.text), 0);
+  if (expanded > cap || protectedChars > cap) {
+    const n = Math.max(expanded, protectedChars);
+    throw new ParamsError(`input "keep" repeats in the draft until the placeholders are ${n} characters, above the ${cap}-character cap. Nothing was charged.`);
   }
   if (maxChars == null) return;
   const pieces = [...(keep || [])];
