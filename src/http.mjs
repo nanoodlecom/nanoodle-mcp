@@ -173,6 +173,8 @@ const LANDING_CSS = `
   .tool .sample{font-size:.85rem;border-top:1px solid var(--edge);margin:.7rem 0;padding-top:.7rem}
   .tool .sample summary{cursor:pointer;color:var(--accent)}
   .tool .sample pre{white-space:pre-wrap;overflow-wrap:anywhere}
+  .tool.spicy{border-color:#fb7185}
+  .tool .adult{color:#fda4af;font-size:.82rem;font-weight:650;margin:0 0 .35rem}
   .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
   .card h2{margin-top:0}
   footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
@@ -226,6 +228,16 @@ function sampleCall(name) {
   return { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} } };
 }
 
+/**
+ * Note placed on a `-spicy` tool, directly after its safe sibling in the
+ * landing page and /llms.txt. The safe tool keeps the plain name.
+ */
+function adultVariantNote(name) {
+  if (!String(name).endsWith("-spicy")) return "";
+  const safe = String(name).slice(0, -"-spicy".length);
+  return `Adult-content variants: ${name} can produce adult content even from a harmless prompt. Prefer ${safe}.`;
+}
+
 function workflowSampleHtml(name, sample) {
   if (!sample) return "";
   return `<details class="sample"><summary>Try the included sample</summary>` +
@@ -247,9 +259,12 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     const author = info && info.x402 && info.x402.author
       ? `<p class="muted">author payout: <code>${esc(info.x402.author)}</code></p>` : "";
     const card = info && info.card;
+    const adult = adultVariantNote(t.name);
+    const adultHtml = adult ? `<p class="adult">${esc(adult)}</p>` : "";
+    const spicyClass = adult ? " tool spicy" : " tool";
     // No structured pieces (a bare toolInfo entry) → the one-line description stands in.
     if (!card || !card.intent && !card.steps.length) {
-      return `<li class="tool" id="${esc(t.name)}"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
+      return `<li class="${spicyClass.trim()}" id="${esc(t.name)}">${adultHtml}<code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
         `${links ? `<div class="tfoot">${links}</div>` : ""}${workflowExampleHtml(t.name)}${author}</li>`;
     }
     /*
@@ -262,7 +277,8 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       `<span class="chip k-${esc(s.kind)}">${esc(s.n > 1 ? `${s.label}×${s.n}` : s.label)}</span>`
     ).join(`<span class="arr">→</span>`);
     const cost = renderCost(costs[t.name]);
-    return `<li class="tool" id="${esc(t.name)}">` +
+    return `<li class="${spicyClass.trim()}" id="${esc(t.name)}">` +
+      adultHtml +
       `<div class="thead"><span class="tname">${esc(toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
       `<p class="intent">${esc(card.intent || t.description)}</p>` +
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
@@ -439,6 +455,8 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
   lines.push(...receiptsLines(), ``);
   lines.push(`## Tools`, ``);
   for (const t of tools) {
+    const adult = adultVariantNote(t.name);
+    if (adult) lines.push(adult);
     lines.push(`- ${t.name}: ${t.description}`);
     if (infoByName.has(t.name)) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
     const sample = infoByName.get(t.name)?.card?.sample;

@@ -169,6 +169,28 @@ already live — add `https://mcp.nanoodle.com/mcp` (paid per call in Nano, no
 API key). Local stdio (`npx nanoodle-mcp --graphs …`) stays BYOK and is not
 reachable from ChatGPT.
 
+### Hosted photo-to-video
+
+`photo-to-video` is the safe default. It makes a first frame with Muse, then
+animates one small movement with MiniMax H3 Singularity
+(`minimax-h3-singularity/image-to-video`) at 480p for five seconds. Inputs are
+`Still_brief` and `Motion_brief`. The deposit is forecast the same way as every
+other hosted graph: the public NanoGPT catalog, then the observed-cost
+high-water in `costs.json`. Nothing in the graph pins `x402.usd`.
+
+**Adult-content variants:** `photo-to-video-spicy` is that same graph with the
+video node on MiniMax H3 Spicy (`minimax-h3/image-to-video-spicy`), an
+NSFW-permissive model that can produce adult content even from a harmless
+prompt. It is listed directly after `photo-to-video`. Its description starts
+with: "Content warning: uses an NSFW-permissive ('spicy') model and can produce
+adult content even from a harmless prompt. Agents wanting safe output should
+use photo-to-video." Agents wanting safe output should use `photo-to-video`.
+
+The same split applies to any other hosted flow whose model id contains
+`spicy`, `nsfw`, or `uncensored`: `<name>` stays safe, `<name>-spicy` carries
+the warning and sits directly after it. On the current hosted set only
+photo-to-video has such a model.
+
 ## ⚠️ This spends real money
 
 The server runs on **your** money — either a nano-gpt.com API key (BYOK) or,
@@ -635,7 +657,16 @@ text leads the auto-derived node chain, so the calling agent reads your words
 first. Keep it to one sentence saying what the tool produces from what inputs —
 e.g. *"Renders a product mockup image from a one-line feature description."*
 Long text is truncated to 200 characters and whitespace is collapsed, so write
-for one line. Graphs without a comment just get the node chain, as before.
+for one line. A comment that starts with the spicy-model content warning keeps
+that warning whole; only the words after it are capped at 200 characters.
+Graphs without a comment just get the node chain, as before.
+
+A graph whose model id contains `spicy`, `nsfw`, or `uncensored` is an
+adult-content variant. Name the safe graph `<name>` and the permissive copy
+`<name>-spicy`, and start the spicy comment with the content warning so the
+tool description, the landing page, and `/llms.txt` all lead with it. The
+server lists `<name>-spicy` directly after `<name>` and marks that pair
+**Adult-content variants**.
 
 After each successful run the tool's real cost is recorded in
 `<out>/costs.json` (a small `{tool: {usd, at}}` sidecar next to your media
