@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChargeGate } from "../src/gate.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { humanizeFetch, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
+import { humanizeFetch, failureMessage, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
 import {
   humanizeChargeUsd, humanizeDepositUsd, humanizeCeilingDepositUsd, humanizePriceTable, humanizeStageBudget,
   depositFromCharge, settledChargeUsd, HUMANIZE_DEPOSIT_FLOOR_USD, HUMANIZE_DEPOSIT_MARGIN, HUMANIZE_MODEL_PRICES,
@@ -123,7 +123,10 @@ test("the quote shown to the caller is the deposit that is collected", async () 
     const listed = listTools().find((t) => t.name === "humanize-comment");
     assert.match(listed.description, /a deposit is quoted for each request from its length and maxChars and caps what the customer pays/);
     assert.match(listed.description, /the operator absorbs any overrun/);
-    assert.doesNotMatch(listed.description, /paid in Nano|x402|0\.0196|proven/);
+    assert.match(listed.description, /When Cydonia fails and the Starry Ocean fallback runs, both calls are charged/);
+    assert.match(listed.description, /This refund and cap apply to hosted payments/);
+    assert.match(listed.description, /Direct-wallet spending has no cap/);
+    assert.doesNotMatch(listed.description, /paid in Nano|x402|0\.0196|proven|only one is billed|not both/);
 
     const quote = async (args) => {
       const result = await callTool({ name: "humanize-comment", arguments: args });
@@ -346,4 +349,70 @@ test("the run stops before the next paid step once metered spend would pass the 
   assert.equal(repair.ok, false);
   assert.ok(hf3.state.skippedForBudget.some((s) => s.kind === "review"));
   assert.equal(settledChargeUsd(hf3.state.meteredUsd, budgetUsd), budgetUsd);
+});
+
+test("copy says both fallback calls are charged, and the refund and cap are hosted-only", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const deposit = await readFile(new URL("../src/humanize-deposit.mjs", import.meta.url), "utf8");
+  for (const text of [readme, deposit]) {
+    assert.doesNotMatch(text, /only one is billed/i);
+    assert.doesNotMatch(text, /One of the two is billed/);
+    assert.doesNotMatch(text, /not both/);
+    assert.match(text, /When Cydonia fails and the Starry Ocean fallback runs,[\s*]*both calls are charged/);
+    assert.match(text, /Direct-wallet spending has no cap/);
+  }
+  assert.match(readme, /This refund and cap apply to hosted payments/);
+  const wallet = failureMessage({ billing: "wallet", attempts: [{ paid: true, usd: 0.01 }] });
+  assert.match(wallet, /not refunded/);
+  assert.match(wallet, /Direct-wallet spending has no cap/);
+});
+
+test("a hosted run refuses an invoice the quote cannot cover, and a direct wallet pays it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-cap-"));
+  const prevKey = process.env.NANOGPT_API_KEY;
+  const prevFetch = globalThis.fetch;
+  delete process.env.NANOGPT_API_KEY;
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const run = async (hosted) => {
+      let payments = 0;
+      let n = 0;
+      globalThis.fetch = async (url, init) => {
+        const u = String(url);
+        if (u.includes("/complete/")) {
+          return new Response(JSON.stringify({ choices: [{ message: { content: "a short rewrite" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        const headers = init && init.headers;
+        const pid = headers && (headers["x-x402-payment-id"] || (typeof headers.get === "function" && headers.get("x-x402-payment-id")));
+        if (pid) {
+          return new Response(JSON.stringify({ choices: [{ message: { content: "a short rewrite" } }], x_nanogpt_pricing: { costUsd: 0.0001 } }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        n += 1;
+        const id = (hosted ? "h" : "w") + n;
+        return new Response(JSON.stringify({
+          payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: 0.01, completeUrl: "http://x/api/x402/complete/" + id }] },
+        }), { status: 402, headers: { "content-type": "application/json" } });
+      };
+      const registry = await loadTools({
+        dirs: [dir],
+        payment: async () => { payments += 1; },
+        baseUrl: "http://x",
+        outDir: join(dir, "out"),
+        log: () => {},
+        hosted,
+      });
+      try {
+        await registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks.", Context: "We cut CI." } });
+      } catch { /* the payment count is the assertion */ }
+      return payments;
+    };
+    assert.equal(await run(true), 0, "hosted refuses the $0.01 invoice");
+    const walletPayments = await run(false);
+    assert.ok(walletPayments > 0, "direct-wallet spending has no cap, payments=" + walletPayments);
+  } finally {
+    globalThis.fetch = prevFetch;
+    if (prevKey === undefined) delete process.env.NANOGPT_API_KEY;
+    else process.env.NANOGPT_API_KEY = prevKey;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

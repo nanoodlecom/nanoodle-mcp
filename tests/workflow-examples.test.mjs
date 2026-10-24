@@ -208,8 +208,9 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // less when its own draft, context, guidance, and maxChars cost less.
     assert.equal(mounted.x402.usd.toFixed(8), "0.04719701");
     // Tokens are bytes / 3.5. Writer output is the draft length plus a small slack,
-    // and the decider adds room for its ranking JSON. A fallback is the more
-    // expensive of the two calls, not both. The quote prices HUMANIZE_PRICED_REASKS
+    // and the decider adds room for its ranking JSON. When Cydonia fails and the
+    // Starry fallback runs, both calls are charged. This figure reserves the larger
+    // of those two rates. The quote prices HUMANIZE_PRICED_REASKS
     // extra writer calls; the run may still attempt MAX_REASKS and stops when the
     // next one would pass the deposit. At the counted Guidance cap, with no keep
     // and no repair, that charge is $0.00842604 after the 20% markup.

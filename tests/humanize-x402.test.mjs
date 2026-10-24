@@ -7,7 +7,8 @@ import { mkdtemp, rm, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { humanizeFetch } from "../src/humanize.mjs";
+import { humanizeFetch, requestOutputTokenCap } from "../src/humanize.mjs";
+import { HUMANIZE_MODEL_PRICES } from "../src/humanize-deposit.mjs";
 
 const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
 const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop";
@@ -656,6 +657,168 @@ test("cancelling during the guard invoice read never pays", async () => {
     },
     call: (hf, ac) => hf.fetch(CHAT, { ...xreq("d"), signal: ac.signal }),
   });
+});
+
+const pricedRecord = {
+  A: { model: "qwen/qwen3.8-27b-novelist" },
+  B: { model: "deepseek/deepseek-v4.1-flash-1017" },
+  C: { model: CYD, fallbackModel: STARRY },
+  D: { model: "qwen/qwen3.8-27b-antislop" },
+  E: { model: "inception/mercury-3" },
+};
+const invoiceOf = (id, usd) => new Response(JSON.stringify({
+  payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: usd, completeUrl: "http://x/api/x402/complete/" + id }] },
+}), { status: 402, headers: { "content-type": "application/json" } });
+
+test("paid retry resends the billed 306-token request, not the original 1600-token request", async () => {
+  const draft = "hello";
+  assert.equal(requestOutputTokenCap(null, draft, { judge: true }), 306);
+  const original = JSON.stringify({
+    model: "z-ai/glm-5.3",
+    messages: [{ role: "user", content: draft }],
+    temperature: 0.8,
+    max_tokens: 1600,
+  });
+  const seen = [];
+  let payments = 0;
+  const hf = humanizeFetch({
+    record: REC,
+    draft,
+    payment: async () => { payments += 1; },
+    fetch: async (url, init) => {
+      const raw = typeof init.body === "string" ? init.body : "";
+      seen.push(raw);
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ status: "paid" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (init.headers && init.headers["x-x402-payment-id"]) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }], x_nanogpt_pricing: { costUsd: 0 } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return invoiceOf("payJudge", 0.0001);
+    },
+  });
+  const settled = await hf.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: original,
+  });
+  assert.equal(settled.status, 200);
+  assert.equal(payments, 1);
+  const chats = seen.filter((s) => s.includes("glm-5.3"));
+  assert.equal(chats.length, 2, "the billed request and the settle-only replay");
+  assert.equal(chats[0], chats[1], "the replay body is the billed body, byte for byte");
+  assert.equal(JSON.parse(chats[0]).max_tokens, 306);
+  assert.equal(JSON.parse(chats[1]).max_tokens, 306);
+  assert.equal(JSON.parse(original).max_tokens, 1600);
+  assert.notEqual(chats[0], original);
+
+  // The nanoodle client retries by calling the wrapper again with the original body plus the payment id.
+  const seen2 = [];
+  const hf2 = humanizeFetch({
+    record: REC,
+    draft,
+    payment: null,
+    fetch: async (_url, init) => {
+      seen2.push(init.body);
+      if (seen2.length === 1) return invoiceOf("payRetry", 0.0001);
+      return new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const first = await hf2.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: original,
+  });
+  assert.equal(first.status, 402);
+  const second = await hf2.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true", "x-x402-payment-id": "payRetry" },
+    body: original,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(seen2.length, 2);
+  assert.equal(seen2[0], seen2[1]);
+  assert.equal(JSON.parse(seen2[0]).max_tokens, 306);
+  assert.equal(JSON.parse(seen2[1]).max_tokens, 306);
+});
+
+test("an invoice of $0.01 is not paid against a $0.001 budget", async () => {
+  let payments = 0;
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.001,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async () => { payments += 1; },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return new Response("{}", { status: 200 });
+      return invoiceOf("payBig", 0.01);
+    },
+  });
+  const r = await hf.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: JSON.stringify({ model: pricedRecord.A.model, max_tokens: 600, messages: [{ role: "user", content: "hello" }] }),
+  });
+  assert.equal(payments, 0);
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.x_nanogpt_pricing.costUsd, 0);
+  assert.ok(hf.state.skippedForBudget.some((s) => s.kind === "primary"));
+
+  let open = 0;
+  const wallet = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    payment: async () => { open += 1; },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (init.headers && init.headers["x-x402-payment-id"]) return okRes("ok");
+      return invoiceOf("payOpen", 0.01);
+    },
+  });
+  const paid = await wallet.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: JSON.stringify({ model: pricedRecord.A.model, max_tokens: 600, messages: [{ role: "user", content: "hello" }] }),
+  });
+  assert.equal(paid.status, 200);
+  assert.equal(open, 1, "a run with no budget pays the invoice");
+});
+
+test("a paid check of the draft counts, so a repair invoice is not paid once the budget is used", async () => {
+  const payments = [];
+  let n = 0;
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.02,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { payments.push(inv.amountUsd); },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ status: "paid" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (init.headers && init.headers["x-x402-payment-id"]) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }], x_nanogpt_pricing: { costUsd: 0 } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      n += 1;
+      return invoiceOf("pay" + n, 0.01);
+    },
+  });
+  const judged = await hf.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: JSON.stringify({ model: "z-ai/glm-5.3", messages: [{ role: "user", content: "rank" }], max_tokens: 1600 }),
+  });
+  assert.equal(judged.status, 200);
+  assert.deepEqual(payments, [0.01]);
+  assert.ok(hf.state.meteredUsd + 1e-12 >= 0.01, "the invoice counts even though the response meter is 0");
+  const verdict = await hf.state.reviewRepair("fixed hello", "A", pricedRecord.A.model);
+  assert.equal(verdict.ok, false);
+  assert.deepEqual(payments, [0.01], "the repair invoice is refused");
 });
 
 test("cancelling during the decider invoice read never pays", async () => {

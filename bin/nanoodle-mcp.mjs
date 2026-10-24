@@ -255,6 +255,7 @@ async function main() {
     baseUrl: process.env.NANOGPT_BASE_URL || undefined,
     outDir: resolvedOut,
     publicBase: serveSpec !== null ? publicBase : null,
+    hosted: chargeUsd != null,
   });
 
   // With several dirs in play, a bare filename is ambiguous — qualify it with its dir.

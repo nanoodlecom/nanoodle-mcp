@@ -1,21 +1,23 @@
 /**
  * Per-request deposit for humanize-comment.
  *
- * The quote caps what the customer pays for this request. Settlement charges
- * the customer the lesser of the metered cost plus 20% and this deposit.
- * A provider can still meter more. The operator absorbs any overrun, including
- * on a call that was already in flight. The run also stops before the next
- * paid step when that step would pass the deposit.
+ * On a hosted payment the quote caps what the customer pays for this request.
+ * Settlement charges the customer the lesser of the metered cost plus 20% and
+ * this deposit, and the difference is returned. A provider can still meter
+ * more. The operator absorbs any overrun, including on a call that was already
+ * in flight. A hosted run also stops before the next paid step, and refuses an
+ * invoice, when that step would pass the deposit. This refund and cap apply
+ * to hosted payments. Direct-wallet spending has no cap and is not refunded.
  *
  * The priced worst case is only a little above a typical run: one call per
- * writer (a fallback is the more expensive of the two, not both), one extra
- * retry, the decider, and a repair review when a protected span can be
- * repaired. Output tokens are sized from the request (maxChars, or the draft
- * length) plus a small slack, not from the model's output cap. Token counts
- * are a realistic estimate, bytes / 3.5. The deposit is that charge times
- * HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up, and never below
- * the charge. Prices are USD per million tokens: the public catalog when it
- * has a rate, otherwise the table below (NanoGPT, 20 Oct 2026).
+ * writer, one extra retry, the decider, and a repair review when a protected
+ * span can be repaired. When Cydonia fails and the Starry Ocean fallback runs,
+ * both calls are charged. Output tokens are sized from the request (maxChars,
+ * or the draft length) plus a small slack, not from the model's output cap.
+ * Token counts are a realistic estimate, bytes / 3.5. The deposit is that
+ * charge times HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up, and
+ * never below the charge. Prices are USD per million tokens: the public
+ * catalog when it has a rate, otherwise the table below (NanoGPT, 20 Oct 2026).
  */
 import {
   HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, HUMANIZE_PRICED_REASKS, HUMANIZE_SETTLE_MARKUP,
@@ -161,8 +163,9 @@ function stageCalls(graph, spec, prices) {
     const primaryCall = priced(n.fields.model, primary, inTok);
     const primaryRetry = priced(n.fields.model, primary, retryTok);
     if (fb) {
-      // One of the two is billed. A paid primary is never followed by a fallback,
-      // and a second call that would pass the deposit is not started.
+      // The quote reserves the larger of these two rates. When Cydonia fails and
+      // Starry runs, both calls are charged. A hosted run refuses an invoice that
+      // does not fit the remaining deposit. Direct-wallet spending has no cap.
       const fbCall = priced(fbModel, fb, inTok);
       const fbRetry = priced(fbModel, fb, retryTok);
       calls.push(callUsd(fbCall) > callUsd(primaryCall) ? fbCall : primaryCall);

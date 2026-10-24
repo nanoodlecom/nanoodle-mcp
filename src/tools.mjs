@@ -774,7 +774,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
  * mode owns stdout. `catalogTimeoutMs` overrides the catalog fetch timeout.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -978,7 +978,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           const dk = Object.keys(inputs).find((k) => k.trim().toLowerCase() === "draft");
           if (dk) inputs[dk] = cleanDraft;
         }
-        // The quote caps what the customer pays. The wrapper stops before a paid step that would pass it. The operator absorbs a provider overrun.
+        // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
+        // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
         const prices = humanizePriceTable(registry.catalogs);
         const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
         const pin = tool.x402 && Number(tool.x402.usd);
@@ -994,7 +995,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           title: opts.title === true,
           payment: apiKey ? null : payment,
           baseUrl: baseUrl || "https://nano-gpt.com",
-          budgetUsd: quoted ?? (Number.isFinite(pin) && pin > 0 ? pin : null),
+          budgetUsd: hosted ? (quoted ?? (Number.isFinite(pin) && pin > 0 ? pin : null)) : null,
           prices,
         });
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
