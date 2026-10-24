@@ -91,7 +91,7 @@
  *    when a hosted step is skipped.
  */
 import { ParamsError } from "./tools.mjs";
-import { knownUsd } from "./usd.mjs";
+import { budgetCap, knownUsd } from "./usd.mjs";
 import { parseNanoInvoice } from "nanoodle";
 
 export const HUMANIZE_TOOL = "humanize-comment";
@@ -1117,8 +1117,10 @@ export function failedBeforeSend(e, signal) {
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
 export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null }) {
-  const budget = knownUsd(budgetUsd);
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget != null && budget > 0 ? budget : null, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [] };
+  // null is "no cap". An explicit amount, including 0, stays that amount.
+  // A value that does not parse throws here, so it cannot become "no cap".
+  const budget = budgetCap(budgetUsd);
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [] };
   // paymentId → the exact request string that invoice was issued for. A paid retry,
   // including one that re-enters this wrapper with the caller's original body, sends this string.
   const billedBodies = new Map();

@@ -13,6 +13,7 @@ import {
   humanizeChargeUsd, humanizeDepositUsd, humanizeCeilingDepositUsd, humanizePriceTable, humanizeStageBudget,
   depositFromCharge, settledChargeUsd, HUMANIZE_DEPOSIT_FLOOR_USD, HUMANIZE_DEPOSIT_MARGIN, HUMANIZE_MODEL_PRICES,
 } from "../src/humanize-deposit.mjs";
+import { budgetCap, knownUsd } from "../src/usd.mjs";
 
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
 const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
@@ -36,6 +37,44 @@ function covers(args) {
   assert.ok(deposit + 1e-12 >= charge * (1 + HUMANIZE_DEPOSIT_MARGIN) || deposit === HUMANIZE_DEPOSIT_FLOOR_USD);
   return deposit;
 }
+
+test("known USD amounts accept an exponent and a leading dot, and reject garbage", () => {
+  assert.equal(knownUsd("1e-3"), 0.001);
+  assert.equal(knownUsd(".001"), 0.001);
+  assert.equal(knownUsd("0.001"), 0.001);
+  assert.equal(knownUsd(0.001), 0.001);
+  assert.equal(knownUsd("1e-7"), 1e-7);
+  assert.equal(knownUsd("2.5e-3"), 0.0025);
+  assert.equal(knownUsd("  1E-3  "), 0.001);
+  assert.equal(knownUsd("0"), 0);
+  assert.equal(knownUsd(0), 0);
+  for (const raw of ["", "   ", false, [], null, undefined, NaN, Infinity, -1, "-0.01", "nope", "1e-7xyz"]) {
+    assert.equal(knownUsd(raw), null, JSON.stringify(raw));
+  }
+  assert.equal(budgetCap(null), null);
+  assert.equal(budgetCap("1e-3"), 0.001);
+  assert.equal(budgetCap(0), 0);
+  assert.throws(() => budgetCap("nope"), /usable USD/);
+  assert.throws(() => budgetCap(""), /usable USD/);
+});
+
+test("quotes and settlement accept an exponent and a leading dot", () => {
+  assert.equal(depositFromCharge("1e-3"), depositFromCharge(0.001));
+  assert.equal(depositFromCharge(".001"), depositFromCharge(0.001));
+  assert.throws(() => depositFromCharge("nope"), /non-negative/);
+  assert.equal(settledChargeUsd("1e-7", ".001"), 1e-7 * 1.2);
+  assert.equal(settledChargeUsd(0.05, "1e-3"), 0.001);
+  assert.equal(settledChargeUsd("1e-7", null), 1e-7 * 1.2);
+  assert.throws(() => settledChargeUsd(0.05, "nope"), /usable USD/);
+  const prices = humanizePriceTable({
+    chat: [{ id: "qwen/qwen3.8-27b-novelist", pricing: { prompt: "1e-3", completion: ".5" } }],
+  });
+  assert.deepEqual(prices["qwen/qwen3.8-27b-novelist"], [0.001, 0.5]);
+  const kept = humanizePriceTable({
+    chat: [{ id: "qwen/qwen3.8-27b-novelist", pricing: { prompt: "nope", completion: ".5" } }],
+  });
+  assert.deepEqual(kept["qwen/qwen3.8-27b-novelist"], HUMANIZE_MODEL_PRICES["qwen/qwen3.8-27b-novelist"]);
+});
 
 test("the margin is 12% with a $0.001 floor, and a tiny charge still clears the floor", () => {
   assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);

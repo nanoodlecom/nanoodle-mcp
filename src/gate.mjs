@@ -87,6 +87,11 @@ export function parseUsdNano(v) {
   } else {
     throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
   }
+  // Same numeric text knownUsd accepts: optional sign, a leading dot, a
+  // trailing dot. The digits stay in the string so the nano conversion is exact.
+  s = s.replace(/^([+-])?\./, (_, sign) => (sign === "-" ? "-0." : "0."));
+  if (/^\d+\.$/.test(s)) s = s.slice(0, -1);
+  if (s.startsWith("+")) s = s.slice(1);
   const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
   if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
   const digits = m[2] + (m[3] || "");
@@ -996,8 +1001,10 @@ export function createChargeGate({
       function settle(q, name, costUsd, alreadySettled = false) {
         const author = authors.get(name);
         const deposit = BigInt(q.amountRaw);
-        const known = Number.isFinite(costUsd);
-        const costRaw0 = known ? usdToRaw(costUsd, q.pair, "ceil") : 0n;
+        // "1e-7" and ".001" are that cost. Text knownUsd rejects stays unknown.
+        const parsed = knownUsd(costUsd);
+        const known = parsed != null;
+        const costRaw0 = known ? usdToRaw(parsed, q.pair, "ceil") : 0n;
         const costRaw = costRaw0 > deposit ? deposit : costRaw0;
         const remaining = deposit - costRaw;
         const markup = costRaw0 / 5n;
@@ -1005,14 +1012,14 @@ export function createChargeGate({
         const change = remaining - take;
 
         // Recompute-only replay after a restart: the money already moved.
-        if (alreadySettled) return { known, costRaw, take, change, author: !!author };
+        if (alreadySettled) return { known, costRaw, take, change, author: !!author, costUsd: known ? parsed : null };
 
         if (costRaw0 > deposit) {
-          log(`call ${q.id} (${name}) cost $${costUsd} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
+          log(`call ${q.id} (${name}) cost $${parsed} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
         if (author && take > 0n) {
           ops.transfer(author, take.toString(), "author payout:")
-            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? costUsd : null, hash }))
+            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? parsed : null, hash }))
             .catch((e) => {
               log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
               owe(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id, tool: name });
@@ -1031,7 +1038,7 @@ export function createChargeGate({
             usage("change", { paymentId: q.id, tool: name, ok: false, amountRaw: change.toString(), error: "payer account unknown" });
           }
         }
-        return { known, costRaw, take, change, author: !!author };
+        return { known, costRaw, take, change, author: !!author, costUsd: known ? parsed : null };
       }
 
       const listTools = () =>
@@ -1191,7 +1198,7 @@ export function createChargeGate({
               // settled on restore but carrying no stored figures — falls back to
               // this recompute-only run's numbers rather than reading undefined.
               if (!q.settleReceipt) {
-                q.settleReceipt = { known: s.known, costUsd: s.known ? costUsd : null, exact: costExact !== false,
+                q.settleReceipt = { known: s.known, costUsd: s.known ? s.costUsd : null, exact: costExact !== false,
                   take: s.take.toString(), change: s.change.toString(), author: s.author };
               }
               q.settled = true;

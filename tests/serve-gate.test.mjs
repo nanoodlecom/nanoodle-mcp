@@ -351,6 +351,44 @@ test("a forecast with unpriceable nodes never quotes below the opening deposit",
   assert.match(listTools()[0].description, /\$0\.05 deposit per call/);
 });
 
+test("a graph pin of 1e-3 or .001 is the quote, and a failed run refunds that amount", async () => {
+  for (const usd of ["1e-3", ".001", "0.001", 0.001]) {
+    const chain = fakeChain();
+    const registry = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
+    registry.tools[0].x402 = { usd };
+    const { listTools, callTool } = makeGate(chain, { registry, usd: 0.05 }).wrapRegistry(registry);
+    assert.match(listTools()[0].description, /\$0\.001 deposit per call/, `${JSON.stringify(usd)} fell through to the opening deposit`);
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    assert.equal(x.amountUsd, 0.001);
+    chain.state.receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+    assert.ok(res.isError);
+    assert.match(res.content[0].text, /refunded to/);
+    await until("the refund send to reach the chain", () => chain.state.transfers.length);
+    assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+  }
+});
+
+test("settlement reads a string cost of 1e-7 or .001 and returns only the remainder", async () => {
+  for (const costUsd of ["1e-7", ".001"]) {
+    const chain = fakeChain();
+    const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd }) });
+    const { callTool } = makeGate(chain, { registry, usd: 0.05 }).wrapRegistry(registry);
+    const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+    chain.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
+    assert.ok(!res.isError, JSON.stringify(res.content));
+    await until("change to be sent", () => chain.state.transfers.some((t) => t.describe === "change:"));
+    const change = chain.state.transfers.find((t) => t.describe === "change:");
+    const deposit = BigInt(x.amountRaw);
+    const costRaw = costUsd === "1e-7" ? 10n ** 23n : 10n ** 27n;
+    const markup = costRaw / 5n;
+    assert.equal(BigInt(change.amountRaw), deposit - costRaw - markup, `${costUsd} was not settled as that cost`);
+    assert.notEqual(BigInt(change.amountRaw), deposit, `${costUsd} was treated as an unknown cost and the whole deposit came back`);
+    assert.match(res.content.at(-1).text, /settled at actual cost/);
+  }
+});
+
 test("no forecast and never run → the flat opening deposit (unchanged behavior)", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
@@ -558,6 +596,8 @@ test("receipt settled cost uses the cost line's precision, not cent rounding", a
   assert.equal(formatCostUsd(0.0656), "0.0656");
   assert.equal(formatCostUsd(0.02), "0.0200");
   assert.equal(formatCostUsd(0.000002), "0.000002");
+  assert.equal(formatCostUsd("1e-7"), "0.0000001");
+  assert.equal(formatCostUsd(".001"), "0.0010");
   for (const cost of [0.0201, 0.0656]) {
     const chain = fakeChain();
     const figure = formatCostUsd(cost);
@@ -611,6 +651,12 @@ test("parseUsdNano is string-exact, handles exponents, truncates below 1e-9 USD"
   assert.equal(parseUsdNano("12"), 12000000000n);
   assert.equal(parseUsdNano(1e-7), 100n);
   assert.equal(parseUsdNano("2.5e-3"), 2500000n);
+  assert.equal(parseUsdNano("1e-3"), 1000000n);
+  assert.equal(parseUsdNano(".001"), parseUsdNano("0.001"));
+  assert.equal(parseUsdNano(".001"), 1000000n);
+  assert.equal(parseUsdNano("+.5"), 500000000n);
+  assert.equal(parseUsdNano("1."), parseUsdNano(1));
+  assert.throws(() => parseUsdNano("-.5"));
   assert.equal(parseUsdNano("0.0000000001"), 0n); // 1e-10 USD truncates
   assert.throws(() => parseUsdNano("-1"));
   assert.throws(() => parseUsdNano("abc"));

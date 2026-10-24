@@ -112,8 +112,9 @@ export function settledChargeUsd(meteredUsd, depositUsd) {
   const metered = knownUsd(meteredUsd);
   if (metered == null || metered <= 0) return 0;
   const marked = metered * HUMANIZE_SETTLE_MARKUP;
+  if (depositUsd == null) return marked;
   const deposit = knownUsd(depositUsd);
-  if (deposit == null) return marked;
+  if (deposit == null) throw new Error("deposit is not a usable USD amount");
   return Math.min(marked, deposit);
 }
 

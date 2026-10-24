@@ -1012,6 +1012,101 @@ test("a missing USD field does not start payment", async () => {
   await assertMalformedUsdRefused("missing", undefined, false);
 });
 
+test("an explicit budget of 1e-3, .001, 0.001, or numeric 0.001 refuses a $0.01 invoice before payment", async () => {
+  for (const budgetUsd of ["1e-3", ".001", "0.001", 0.001]) {
+    const payments = [];
+    const hf = humanizeFetch({
+      record: pricedRecord,
+      draft: "hello",
+      budgetUsd,
+      prices: HUMANIZE_MODEL_PRICES,
+      payment: async () => { payments.push("paid"); },
+      fetch: async (url) => {
+        if (String(url).includes("/complete/")) return okRes("should not settle");
+        return invoiceOf("payOver", 0.01);
+      },
+    });
+    assert.equal(hf.state.budgetUsd, 0.001, `${JSON.stringify(budgetUsd)} is a $0.001 cap, not an unlimited budget`);
+    const r = await hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody(pricedRecord.A.model, "hello") });
+    assert.equal(payments.length, 0, `${JSON.stringify(budgetUsd)}: payment() is never called`);
+    assert.equal(r.status, 200);
+    assert.equal(hf.state.paidIds.has("payOver"), false);
+    assert.equal(hf.state.meteredUsd, 0);
+    assert.equal(hf.state.committedUsd, 0);
+    assert.equal(hf.state.reservedUsd, 0);
+    const rec = hf.state.attempts.find((a) => a.kind === "primary");
+    assert.equal(rec.budgetRefused, true, String(budgetUsd));
+    assert.equal(rec.paymentStarted, false);
+    assert.notEqual(rec.priceUnknown, true);
+  }
+});
+
+test("an explicit budget that does not parse is rejected before any payment", () => {
+  let payments = 0;
+  for (const budgetUsd of ["nope", "", "   ", false, [], "NaN", "Infinity", -1, Infinity, NaN]) {
+    assert.throws(() => humanizeFetch({
+      record: pricedRecord,
+      draft: "hello",
+      budgetUsd,
+      prices: HUMANIZE_MODEL_PRICES,
+      payment: () => { payments += 1; },
+      fetch: async () => invoiceOf("pay", 0.01),
+    }), /usable USD/, `budget ${JSON.stringify(budgetUsd)}`);
+  }
+  assert.equal(payments, 0);
+  const open = humanizeFetch({ record: pricedRecord, draft: "hello", budgetUsd: null, prices: HUMANIZE_MODEL_PRICES });
+  assert.equal(open.state.budgetUsd, null, "an omitted budget is still no cap");
+});
+
+test("x-cost, x-nano-cost, and the other reported costs keep an exponent or a leading dot", async () => {
+  const cases = [
+    { label: "x-cost", body: { choices: [{ message: { content: "ok" } }] }, headers: { "x-cost": "1e-7" }, usd: 1e-7 },
+    { label: "x-nano-cost", body: { choices: [{ message: { content: "ok" } }] }, headers: { "x-nano-cost": "1e-7" }, usd: 1e-7 },
+    { label: "cost", body: { cost: "1e-7", choices: [{ message: { content: "ok" } }] }, headers: {}, usd: 1e-7 },
+    { label: "pricing.costUsd", body: { x_nanogpt_pricing: { costUsd: ".001" }, choices: [{ message: { content: "ok" } }] }, headers: {}, usd: 0.001 },
+    { label: "pricing.cost", body: { x_nanogpt_pricing: { cost: "1e-3" }, choices: [{ message: { content: "ok" } }] }, headers: {}, usd: 0.001 },
+    { label: "metadata.cost", body: { metadata: { cost: "2.5e-3" }, choices: [{ message: { content: "ok" } }] }, headers: {}, usd: 0.0025 },
+  ];
+  for (const c of cases) {
+    const hf = humanizeFetch({
+      record: pricedRecord,
+      draft: "hello",
+      budgetUsd: 1,
+      prices: HUMANIZE_MODEL_PRICES,
+      fetch: async () => new Response(JSON.stringify(c.body), { status: 200, headers: { "content-type": "application/json", ...c.headers } }),
+    });
+    const r = await hf.fetch(CHAT, { method: "POST", headers: { Authorization: "Bearer k" }, body: chatBody(pricedRecord.A.model, "hello") });
+    const reported = (await r.json()).x_nanogpt_pricing.costUsd;
+    assert.equal(reported, c.usd, `${c.label} was not read as ${c.usd}`);
+    assert.ok(near(hf.state.meteredUsd, c.usd), `${c.label} metered ${hf.state.meteredUsd}, not the catalog hold`);
+    assert.equal(hf.state.reservedUsd, 0, `${c.label} left the catalog reservation in place`);
+    assert.equal(hf.state.costUnknown, false, c.label);
+  }
+});
+
+test("an invoice amount in exponent or leading-dot form is a real price and can be paid", async () => {
+  for (const usd of ["1e-3", ".001", "1e-7"]) {
+    const payments = [];
+    const expected = usd === "1e-7" ? 1e-7 : 0.001;
+    const hf = humanizeFetch({
+      record: pricedRecord,
+      draft: "hello",
+      budgetUsd: 1,
+      prices: HUMANIZE_MODEL_PRICES,
+      payment: async (inv) => { payments.push(inv.amountUsd); },
+      fetch: async (url) => {
+        if (String(url).includes("/complete/")) return new Response(JSON.stringify({ choices: [{ message: { content: "priced" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+        return invoiceRawUsd("payForm", usd);
+      },
+    });
+    const r = await hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody(pricedRecord.A.model, "hello") });
+    assert.deepEqual(payments, [expected], `${usd} was not paid at ${expected}`);
+    assert.equal((await r.json()).choices[0].message.content, "priced");
+    assert.equal(hf.state.paidIds.has("payForm"), true);
+    assert.equal(hf.state.costUnknown, false);
+  }
+});
+
 test("a known USD price of zero is still payable", async () => {
   const payments = [];
   const hf = humanizeFetch({
