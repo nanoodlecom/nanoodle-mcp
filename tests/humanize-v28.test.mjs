@@ -281,6 +281,49 @@ test("protected text Ready?  Still waiting. stays byte for byte through repair a
   assert.equal(JSON.parse(repaired.outputs.out).text.includes(span), true);
 });
 
+test("a kept phrase of 0 cannot eat an internal marker or drop another phrase", () => {
+  const first = "Alpha  Beta";
+  const spans = [{ id: 1, text: first }, { id: 2, text: "0" }];
+  const repaired = forceRepair("Hello [[k1]] and [[k2]] there.", spans);
+  assert.equal(repaired.includes(first), true, repaired);
+  assert.equal(repaired.includes("0"), true, repaired);
+  assert.equal(/[\u0000\uE000-\uF8FF]|\[\[k/.test(repaired), false, repaired);
+  assert.equal(repaired.split(first).length - 1, 1);
+  const moved = moveQuestionToEnd(`Hello ${first} and 0 end?`, spans);
+  assert.equal(moved.includes(first), true, moved);
+  assert.equal(/[\uE000-\uF8FF]/.test(moved), false, moved);
+});
+
+test("keep_last and forceRepair keep protected spacing byte for byte, so delivery still succeeds", async () => {
+  const spaced = "Ship  it.";
+  const last = "Ready?  Still waiting.";
+  const spans = [{ id: 1, text: spaced }, { id: 2, text: last }];
+  assert.notEqual(spaced, spaced.replace(/ {2,}/g, " "));
+  const repaired = forceRepair("  Note  [[k1]]  then  [[k2]]  ", spans);
+  assert.equal(repaired.includes(spaced), true, repaired);
+  assert.equal(repaired.includes(last), true, repaired);
+  assert.equal(repaired.includes("Ship it."), false, repaired);
+  const ended = ensureEnding(`Hello ${spaced} tail`, "keep_last", spans, `draft ${last}`);
+  assert.ok(ended.endsWith(last), ended);
+  assert.equal(ended.includes(spaced), true, ended);
+  assert.equal(ended.includes("Ship it."), false, ended);
+
+  const record = Object.fromEntries(["A", "B", "C", "D", "E"].map((l) => [l, { model: l.toLowerCase() }]));
+  const wf = { outputs: [{ nodeId: "judge", key: "out" }] };
+  const delivered = { outputs: { out: JSON.stringify({ winner: "ORIGINAL", text: "draft", why: "none", ranked: [] }) } };
+  const fb = await applyHumanizeFallback(wf, delivered, record, {
+    ending: "keep_last", spans, draft: `See ${spaced} ${last}`, answered: {}, dropped: {}, guidance: "",
+    billing: "wallet", attempts: [{ paid: true, usd: 0.01, status: 200 }],
+    stash: [{ letter: "A", model: "a", raw: "Note [[k1]] and [[k2]]", score: 4 }],
+    reviewRepair: async () => ({ ok: true }),
+  });
+  assert.equal(fb && fb.error, undefined, fb && fb.error);
+  const text = JSON.parse(delivered.outputs.out).text;
+  assert.equal(text.includes(spaced), true, text);
+  assert.equal(text.includes(last), true, text);
+  assert.ok(text.endsWith(last), text);
+});
+
 test("keep_last keeps a final sentence that ends with a closing quote", () => {
   assert.deepEqual(sentencesOf('Please read the note here."'), ['Please read the note here."']);
   assert.equal(finalSentence('Please read the note here."'), 'Please read the note here."');

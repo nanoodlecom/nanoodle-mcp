@@ -124,6 +124,84 @@ export function writerOutputTokenCap(graphCap, maxChars) {
   return Math.max(1, Math.min(cap, Math.ceil(limit)));
 }
 
+/**
+ * Enforced size of a writer completion before a later paid call sees it.
+ * Output tokens are already capped by max_tokens. A token can be several
+ * bytes, so the text is also cut to this many bytes. Four is one UTF-8 code
+ * point per token: long enough for the short comments this tool asks for,
+ * and short enough that the next stage's byte count is a proven token cap.
+ */
+export const HUMANIZE_MAX_BYTES_PER_TOKEN = 4;
+
+/** One token per byte. A byte-level tokenizer cannot split a byte, so this is an upper bound. */
+export function tokenUpperBound(text) {
+  return Buffer.byteLength(String(text ?? ""), "utf8");
+}
+
+/** Bytes a writer completion is cut to before it is echoed, restored, or judged. */
+export function writerForwardByteCap(tokenCap) {
+  return Math.max(1, Math.floor(Number(tokenCap) || 1)) * HUMANIZE_MAX_BYTES_PER_TOKEN;
+}
+
+/**
+ * Bytes an ending can append that are not already inside a protected phrase.
+ * keep_last with spans only moves the last phrase. Otherwise at most the
+ * draft's final sentence is appended, and only when that sentence is not
+ * already inside a phrase.
+ */
+export function endingAppendBytes(draft, ending, spans) {
+  if (ending !== "keep_last" && ending !== "question") return 0;
+  if (ending === "keep_last" && spans && spans.length) return 0;
+  const sentence = finalSentence(draft);
+  if (!sentence) return 0;
+  if (ending === "question" && !isQuestion(sentence)) return 0;
+  if (spans && spans.some((s) => s && s.text && s.text.includes(sentence))) return 0;
+  return tokenUpperBound(sentence);
+}
+
+/**
+ * Bytes of one candidate after placeholders are restored and an ending is applied.
+ * The raw completion is at most writerForwardByteCap. Each protected phrase can
+ * be written back in full, and the ending can append one more sentence.
+ */
+export function candidateByteCap(tokenCap, spans, { ending = "any", draft = "" } = {}) {
+  let n = writerForwardByteCap(tokenCap);
+  for (const s of spans || []) n += tokenUpperBound(s && s.text);
+  n += endingAppendBytes(draft, ending, spans);
+  return n;
+}
+
+/** Cut `text` to at most `maxBytes` without splitting a UTF-8 code point. */
+export function capUtf8(text, maxBytes) {
+  const s = String(text ?? "");
+  const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
+  if (tokenUpperBound(s) <= limit) return s;
+  let out = "";
+  let n = 0;
+  for (const ch of s) {
+    const b = tokenUpperBound(ch);
+    if (n + b > limit) break;
+    out += ch;
+    n += b;
+  }
+  return out;
+}
+
+/**
+ * Shorten `text` to `maxBytes` without cutting a protected phrase. Phrases are
+ * lifted first, so the cut only removes bytes outside them. `liftSpans` is
+ * defined below; this runs only after a model reply, so the binding exists.
+ */
+function capPreservingSpans(text, spans, maxBytes) {
+  const s = String(text ?? "");
+  if (tokenUpperBound(s) <= maxBytes) return s;
+  const lifted = liftSpans(s, spans);
+  const kept = lifted.holes.reduce((n, h) => n + tokenUpperBound(h), 0);
+  const room = maxBytes - kept;
+  if (room < 0) return s;
+  return lifted.restore(capUtf8(lifted.masked, room));
+}
+
 /** Guidance length toward the cap: a leading ONE_THREAD_PREFIX is not counted. */
 export function guidanceUnits(s) {
   const t = String(s ?? "");
@@ -287,15 +365,73 @@ export function reinsertSpans(raw, spans) {
   return String(raw ?? "").replace(/\[\[k\d+\]\]/g, (tok) => (map.has(tok) ? map.get(tok) : tok));
 }
 
-const SPAN_MARK_RE = /\uE000(\d+)\uE001/g;
-const spanMark = (i) => `\uE000${i}\uE001`;
-
 /**
- * Run `fn` on `text` with every protected span lifted out, then put those bytes
- * back unchanged. Longest spans are lifted first so a shorter one cannot eat
- * part of a longer one. Whitespace normalization inside `fn` only sees the rest.
+ * Markers whose code points occur in neither `parts` nor each other, so a kept
+ * phrase such as "0" cannot match inside one. Substitution restores only a
+ * whole marker (opener, digits, closer), never a piece of it.
  */
-function protectingSpans(text, spans, fn) {
+function markerCodec(parts) {
+  const used = new Set();
+  for (const p of parts) for (const ch of String(p ?? "")) used.add(ch.codePointAt(0));
+  const reserved = [];
+  const ranges = [[0xE000, 0xF8FF], [0xF0000, 0xFFFFD], [0x100000, 0x10FFFD]];
+  for (const [lo, hi] of ranges) {
+    for (let cp = lo; reserved.length < 16 && cp <= hi; cp++) if (!used.has(cp)) reserved.push(cp);
+    if (reserved.length >= 16) break;
+  }
+  if (reserved.length < 3) throw new Error("humanize: no room for a collision-proof marker");
+  const open = reserved[0];
+  const close = reserved[1];
+  const digits = reserved.slice(2);
+  const base = digits.length;
+  const mark = (i) => {
+    const pcs = [open];
+    if (base === 1) {
+      for (let k = 0; k <= i; k++) pcs.push(digits[0]);
+    } else if (i === 0) pcs.push(digits[0]);
+    else {
+      const rev = [];
+      let n = i;
+      while (n > 0) { rev.push(digits[n % base]); n = Math.floor(n / base); }
+      for (let k = rev.length - 1; k >= 0; k--) pcs.push(rev[k]);
+    }
+    pcs.push(close);
+    return String.fromCodePoint(...pcs);
+  };
+  const restore = (text, holes) => {
+    const s = String(text ?? "");
+    const digitAt = new Map(digits.map((cp, n) => [cp, n]));
+    let out = "";
+    for (let i = 0; i < s.length; ) {
+      const cp = s.codePointAt(i);
+      const w = cp > 0xFFFF ? 2 : 1;
+      if (cp !== open) { out += s.slice(i, i + w); i += w; continue; }
+      let j = i + w;
+      const pcs = [];
+      let closed = false;
+      while (j < s.length) {
+        const c2 = s.codePointAt(j);
+        const w2 = c2 > 0xFFFF ? 2 : 1;
+        if (c2 === close) { closed = pcs.length > 0; j += w2; break; }
+        if (!digitAt.has(c2)) break;
+        pcs.push(c2);
+        j += w2;
+      }
+      if (!closed) { out += s.slice(i, i + w); i += w; continue; }
+      let idx = 0;
+      if (base === 1) idx = pcs.length - 1;
+      else for (const d of pcs) idx = idx * base + digitAt.get(d);
+      // Whole marker only. An index we did not issue is left untouched.
+      if (idx >= 0 && idx < holes.length && holes[idx] != null) out += holes[idx];
+      else out += s.slice(i, j);
+      i = j;
+    }
+    return out;
+  };
+  return { mark, restore };
+}
+
+function uniqueSpanTexts(spans) {
   const unique = [];
   const seen = new Set();
   for (const s of spans || []) {
@@ -305,6 +441,13 @@ function protectingSpans(text, spans, fn) {
     unique.push(span);
   }
   unique.sort((a, b) => b.length - a.length);
+  return unique;
+}
+
+/** Lift every protected phrase into a whole marker, longest first. */
+function liftSpans(text, spans) {
+  const unique = uniqueSpanTexts(spans);
+  const codec = markerCodec([text, ...unique]);
   const holes = [];
   let masked = String(text ?? "");
   for (const span of unique) {
@@ -314,54 +457,84 @@ function protectingSpans(text, spans, fn) {
       const i = rest.indexOf(span);
       if (i < 0) { out += rest; break; }
       holes.push(span);
-      out += rest.slice(0, i) + spanMark(holes.length - 1);
+      out += rest.slice(0, i) + codec.mark(holes.length - 1);
       rest = rest.slice(i + span.length);
     }
     masked = out;
   }
-  const next = fn(masked);
-  if (!holes.length) return next;
-  return String(next).replace(SPAN_MARK_RE, (_, i) => holes[Number(i)]);
+  return {
+    masked,
+    holes,
+    mark: codec.mark,
+    restore: (next) => (holes.length ? codec.restore(next, holes) : String(next ?? "")),
+  };
+}
+
+/**
+ * Run `fn` on `text` with every protected span lifted out, then put those bytes
+ * back unchanged. Longest spans are lifted first so a shorter one cannot eat
+ * part of a longer one. A kept phrase cannot match inside a marker, and only
+ * a whole marker is substituted back. Whitespace normalization inside `fn`
+ * only sees the rest.
+ */
+function protectingSpans(text, spans, fn) {
+  const lifted = liftSpans(text, spans);
+  return lifted.restore(fn(lifted.masked));
+}
+
+/** Drop extra copies of a protected phrase without eating a copy that sits inside a longer one. */
+function omitExtraSpans(text, spans) {
+  const want = new Map();
+  for (const s of spans || []) if (s && s.text) want.set(s.text, (want.get(s.text) || 0) + 1);
+  const unique = [...want.keys()].sort((a, b) => b.length - a.length);
+  if (!unique.length) return String(text ?? "");
+  const codec = markerCodec([text, ...unique]);
+  const holes = [];
+  let masked = String(text ?? "");
+  for (const span of unique) {
+    const n = want.get(span);
+    let seen = 0;
+    let out = "";
+    let rest = masked;
+    while (rest.length) {
+      const i = rest.indexOf(span);
+      if (i < 0) { out += rest; break; }
+      out += rest.slice(0, i);
+      seen++;
+      if (seen <= n) {
+        holes.push(span);
+        out += codec.mark(holes.length - 1);
+      }
+      rest = rest.slice(i + span.length);
+    }
+    masked = out;
+  }
+  return codec.restore(masked, holes);
 }
 
 /** Last-resort repair: restore every span once, even if the reply mangled its placeholder.
  *  Span text is kept byte for byte. Only whitespace outside those spans is collapsed. */
 export function forceRepair(raw, spans) {
   const list = spans || [];
-  const map = new Map(list.map((s) => [tokenOf(s.id), s.text]));
+  const codec = markerCodec([raw, ...list.map((s) => s && s.text)]);
+  const map = new Map(list.map((s) => [tokenOf(s.id), s]));
   const used = new Set();
   const holes = [];
   let t = String(raw ?? "").replace(/\[\[k\d+\]\]/g, (tok) => {
     if (!map.has(tok) || used.has(tok)) return "";
     used.add(tok);
-    holes.push(map.get(tok));
-    return `\u0000${holes.length - 1}\u0000`;
+    holes.push(map.get(tok).text);
+    return codec.mark(holes.length - 1);
   });
   t = t.replace(/\[\[[^\]]*\]\]/g, "");
-  t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => holes[Number(i)]);
+  t = codec.restore(t, holes);
   for (const s of list) {
     if (used.has(tokenOf(s.id))) continue;
     if (!s.text || t.includes(s.text)) continue;
     const body = t.trim();
     t = body ? `${body} ${s.text}` : s.text;
   }
-  const want = new Map();
-  for (const s of spans || []) want.set(s.text, (want.get(s.text) || 0) + 1);
-  for (const [span, n] of want) {
-    if (!span) continue;
-    let seen = 0;
-    let out = "";
-    let rest = t;
-    while (rest.length) {
-      const i = rest.indexOf(span);
-      if (i < 0) { out += rest; break; }
-      out += rest.slice(0, i);
-      seen++;
-      if (seen <= n) out += span;
-      rest = rest.slice(i + span.length);
-    }
-    t = out;
-  }
+  t = omitExtraSpans(t, list);
   return protectingSpans(t, list, (masked) => masked.replace(/[ \t]{2,}/g, " ").trim());
 }
 
@@ -484,15 +657,33 @@ export function moveQuestionToEnd(text, spans) {
   });
 }
 
-function endWith(text, span) {
-  const trimmed = String(text ?? "").trim();
-  if (!span) return trimmed;
+function endWith(text, span, spans) {
+  const raw = String(text ?? "");
+  if (!span) return raw.trim();
+  const trimmed = raw.trim();
+  // Already the ending. trim() does not touch bytes inside the phrase.
   if (trimmed.endsWith(span)) return trimmed;
-  const idx = trimmed.lastIndexOf(span);
-  let body = trimmed;
-  if (idx >= 0) body = (trimmed.slice(0, idx) + " " + trimmed.slice(idx + span.length)).replace(/\s+/g, " ").trim();
-  if (!body) return span;
-  return `${body} ${span}`;
+  const pieces = [];
+  const seen = new Set();
+  for (const s of spans || []) {
+    if (!s || !s.text || seen.has(s.text)) continue;
+    seen.add(s.text);
+    pieces.push({ text: s.text });
+  }
+  if (!seen.has(span)) pieces.push({ text: span });
+  const lifted = liftSpans(raw, pieces);
+  const idxs = [];
+  lifted.holes.forEach((h, i) => { if (h === span) idxs.push(i); });
+  if (!idxs.length) {
+    const body = lifted.restore(lifted.masked.replace(/\s+/g, " ").trim());
+    return body ? `${body} ${span}` : span;
+  }
+  // Move the last whole marker to the end. Collapse only the text outside markers.
+  const written = lifted.mark(idxs[idxs.length - 1]);
+  const pos = lifted.masked.lastIndexOf(written);
+  const masked = pos < 0 ? lifted.masked : lifted.masked.slice(0, pos) + " " + lifted.masked.slice(pos + written.length);
+  const body = masked.replace(/\s+/g, " ").trim();
+  return lifted.restore(body ? `${body} ${written}` : written);
 }
 
 /**
@@ -505,13 +696,13 @@ export function ensureEnding(text, ending, spans, draft) {
   if (!ending || ending === "any") return text;
   if (ending === "keep_last") {
     const last = spans && spans.length ? spans[spans.length - 1].text : finalSentence(draft);
-    return last ? endWith(text, last) : String(text ?? "").trim();
+    return last ? endWith(text, last, spans) : String(text ?? "").trim();
   }
   if (ending === "question") {
     const moved = moveQuestionToEnd(text, spans);
     if (isQuestion(moved)) return moved;
     const q = finalSentence(draft);
-    if (isQuestion(q)) return endWith(moved, q);
+    if (isQuestion(q)) return endWith(moved, q, spans);
     return moved;
   }
   return text;
@@ -886,8 +1077,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const note = writerNote(state.spans, state.ending, state.maxChars);
     const seenDraft = writerDraft || draft;
     if (note || (writerDraft && writerDraft !== draft)) body = annotateWriterBody(body, draft, seenDraft, note);
-    // The deposit prices this cap. Sending it keeps a short maxChars from being billed at the graph's 600-token max.
-    if (state.maxChars) body = { ...body, max_tokens: writerOutputTokenCap(body.max_tokens, state.maxChars) };
+    // The deposit prices the graph's 600-token writer cap (lower when maxChars is set).
+    // Never send a higher max_tokens than that, or the completion can be billed past the quote.
+    const tokenCap = writerOutputTokenCap(600, state.maxChars);
+    const requested = Number(body.max_tokens);
+    body = { ...body, max_tokens: requested > 0 ? Math.min(requested, tokenCap) : tokenCap };
+    const forwardCap = writerForwardByteCap(tokenCap);
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
     let usd = 0, usdKnown = true; // this logical call: every attempt's cost
@@ -1057,8 +1252,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (!usdKnown) state.costUnknown = true;
       return r;
     }
-    let text = normalizeDashes(msg.content);
-    if (text !== msg.content) state.dashes[letter] = true;
+    const normalized = normalizeDashes(msg.content);
+    if (normalized !== msg.content) state.dashes[letter] = true;
+    let text = capUtf8(normalized, forwardCap);
     // With protected spans, "copied the draft" means the placeholder draft the writer was shown.
     const copySource = state.spans.length && writerDraft ? writerDraft : draft;
     const ratio = copyRatio(text, copySource);
@@ -1074,11 +1270,11 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       const onOuter = () => ac.abort(init.signal.reason);
       if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
       try {
-        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: msg.content }, { role: "user", content: REASK_TEXT }] }, "reask", ac.signal);
+        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: text }, { role: "user", content: REASK_TEXT }] }, "reask", ac.signal);
         addCost(r2.rec.usd);
         const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
         if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
-          const t2 = normalizeDashes(m2.content);
+          const t2 = capUtf8(normalizeDashes(m2.content), forwardCap);
           state.reasked[letter] = { ratio, after: copyRatio(t2, copySource) };
           text = t2;
         } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
@@ -1114,11 +1310,11 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
       const prompt = guardRetryPrompt(assessment.reasons, guardOpts);
       try {
-        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: text }, { role: "user", content: prompt }] }, "guard", ac.signal);
+        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: capUtf8(text, forwardCap) }, { role: "user", content: prompt }] }, "guard", ac.signal);
         addCost(r2.rec.usd);
         const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
         if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
-          text = normalizeDashes(m2.content);
+          text = capUtf8(normalizeDashes(m2.content), forwardCap);
           assessment = assessWriterOutput(text, guardOpts);
           state.guarded = state.guarded || {};
           state.guarded[letter] = { reasons: assessment.ok ? [] : assessment.reasons, ok: assessment.ok };
@@ -1145,7 +1341,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       }
       text = "";
     } else {
-      text = assessment.text;
+      text = capPreservingSpans(assessment.text, state.spans, candidateByteCap(tokenCap, state.spans, { ending: state.ending, draft: state.draft }));
       if (text) state.answered[letter] = model;
     }
     const out = { ...j, choices: [{ ...j.choices[0], message: { ...msg, content: text } }] };
@@ -1200,11 +1396,28 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         rec.status = 402;
         throw new Error("decider review could not be paid");
       }
-      state.paidIds.add(inv.paymentId);
+      // A cancel during the invoice read must not pay. Check again inside the
+      // queued callback: the signal can flip in the gap before that microtask runs.
+      const notSent = () => {
+        const reason = signal && signal.reason;
+        const err = new Error(reason && reason.message ? reason.message : "cancelled");
+        if (reason && reason.name) err.name = reason.name;
+        err.paymentNotSent = true;
+        return err;
+      };
+      if (signal && signal.aborted) {
+        rec.paymentStarted = false;
+        rec.status = "payment not sent";
+        throw notSent();
+      }
       rec.paymentId = inv.paymentId;
-      rec.paymentStarted = true;
       try {
-        const paying = Promise.resolve().then(() => payment(inv));
+        const paying = Promise.resolve().then(() => {
+          if (signal && signal.aborted) throw notSent();
+          state.paidIds.add(inv.paymentId);
+          rec.paymentStarted = true;
+          return payment(inv);
+        });
         // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
         paying.then(() => {
           if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
@@ -1271,7 +1484,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const req = state.judgeReq;
     if (!req) return { ok: false };
     const model = modelName || (record[letter] && record[letter].model) || "";
-    const user = reviewUserMessage(req.user, letter, model, candidate);
+    const tokenCap = writerOutputTokenCap(600, state.maxChars);
+    const cappedCandidate = capPreservingSpans(candidate, state.spans, candidateByteCap(tokenCap, state.spans, { ending: state.ending, draft: state.draft }));
+    const user = reviewUserMessage(req.user, letter, model, cappedCandidate);
     const messages = Array.isArray(req.body.messages) ? req.body.messages.map((m) => ({ ...m })) : [];
     let replaced = false;
     for (let i = messages.length - 1; i >= 0; i--) {

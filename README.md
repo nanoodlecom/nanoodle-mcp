@@ -390,9 +390,13 @@ The quote is built from the draft, context, and guidance actually sent, and
 from `maxChars` (the model's own output cap, when `maxChars` is omitted). It
 includes every writer, the fallback that can still be billed, up to three
 retries, the decider, and a second decider pass when a protected span can be
-repaired, priced at those models' per-token rates. That worst case plus the
-20% markup is the maximum charge for the request. The deposit is 12% above
-that charge, at least $0.001, rounded up, and it is never below the charge.
+repaired, priced at those models' per-token rates. Each input is capped and
+counted as one token per byte, each output is the max_tokens actually sent,
+and the decider is reserved for the size of a rewrite after protected phrases
+are put back, so the figure is an upper bound on the charge rather than a
+guess. That worst case plus the 20% markup is the maximum charge for the
+request. The deposit is 12% above that charge, at least $0.001, rounded up,
+and it is never below the charge.
 A short comment is not asked for the longest comment's hold. The figure in
 the quote is the deposit taken for that call; the run still settles at the
 metered cost plus 20%, and the difference is returned. The graph's `usd` is

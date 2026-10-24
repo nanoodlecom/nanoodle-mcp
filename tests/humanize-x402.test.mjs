@@ -493,6 +493,39 @@ test("cancelling mid repair-review aborts without further paid calls", async () 
   assert.deepEqual(seen, [CHAT], "no complete poll and no replay after cancel");
 });
 
+test("cancelling during the invoice read never pays", async () => {
+  const ac = new AbortController();
+  let payments = 0;
+  let markStarted;
+  const startedP = new Promise((r) => { markStarted = r; });
+  let finishRead;
+  const readP = new Promise((r) => { finishRead = r; });
+  const invoice = JSON.stringify({ payment: { paymentId: "payLate", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: 0.004, completeUrl: "http://x/api/x402/complete/payLate" }] } });
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "draft",
+    payment: async () => { payments++; },
+    fetch: () => ({ status: 402, text: () => { markStarted(); return readP; } }),
+  });
+  hf.state.judgeReq = {
+    url: CHAT,
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: judgeBody(),
+    user: reviewUser,
+    signal: ac.signal,
+  };
+  const before = hf.state.unreportedUsd;
+  const p = hf.state.reviewRepair("repaired text", "A", "qwen/qwen3.8-27b-novelist");
+  await startedP;
+  ac.abort(new Error("cancelled"));
+  finishRead(invoice);
+  await assert.rejects(p, /cancelled/);
+  assert.equal(payments, 0, "a cancel during the invoice read does not call payment");
+  assert.equal(hf.state.unreportedUsd, before, "no late $0.004 charge is recorded");
+  const rec = hf.state.attempts.find((a) => a.kind === "review");
+  assert.equal(rec.paymentStarted, false);
+});
+
 test("repair review deadline: a slow payment stops without another paid call", async () => {
   const seen = [];
   let payments = 0;

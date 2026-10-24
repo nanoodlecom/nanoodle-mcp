@@ -9,13 +9,19 @@
  * times HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up. It is never
  * below the charge, so the operator is not left covering a successful run.
  *
- * Token counts use the same 3 characters per token estimate as the published
- * worst case. Prices are USD per million tokens: the public catalog when it
- * has a rate, otherwise the table below (NanoGPT, 20 Oct 2026).
+ * Token counts are a proven upper bound, not a guess. Each input is capped
+ * and counted as one token per byte (a byte-level tokenizer cannot split a
+ * byte). Each output is capped by the max_tokens actually sent. Writer text
+ * is cut to HUMANIZE_MAX_BYTES_PER_TOKEN bytes per output token before a
+ * later call sees it, and the judge reserve is the size of that text after
+ * protected phrases are restored. Prices are USD per million tokens: the
+ * public catalog when it has a rate, otherwise the table below (NanoGPT,
+ * 20 Oct 2026).
  */
 import {
   HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, MAX_CHARS_LIMIT, MAX_REASKS,
-  ONE_THREAD_PREFIX, REASK_TEXT, collectSpans, guardRetryPrompt, placeholderBudget, writerNote, writerOutputTokenCap,
+  ONE_THREAD_PREFIX, REASK_TEXT, candidateByteCap, collectSpans, endingAppendBytes, guardRetryPrompt, placeholderBudget,
+  tokenUpperBound, writerForwardByteCap, writerNote, writerOutputTokenCap,
 } from "./humanize.mjs";
 
 /** USD per million tokens, [input, output]. Catalog rates override these when present. */
@@ -29,8 +35,6 @@ export const HUMANIZE_MODEL_PRICES = Object.freeze({
   "z-ai/glm-5.3": [0.6, 1.1],
 });
 
-/** Characters per token in the worst-case estimate. Three over-counts ordinary English. */
-export const HUMANIZE_CHARS_PER_TOKEN = 3;
 /** The gate keeps metered cost plus this markup. The deposit has to cover it. */
 export const HUMANIZE_SETTLE_MARKUP = 1.2;
 /** Extra hold above the maximum charge. 12% sits inside the 10–15% band. */
@@ -38,7 +42,7 @@ export const HUMANIZE_DEPOSIT_MARGIN = 0.12;
 /** Smallest deposit, in USD. A request whose charge is already above this is unaffected. */
 export const HUMANIZE_DEPOSIT_FLOOR_USD = 0.001;
 
-const bytes = (s) => Buffer.byteLength(String(s ?? ""), "utf8");
+const bytes = (s) => tokenUpperBound(s);
 
 function findArg(args, name) {
   if (!args || typeof args !== "object") return undefined;
@@ -113,8 +117,16 @@ function longestRetry(spans, maxChars, ending, title) {
 /**
  * Worst-case metered cost (USD, before the 20% markup) for one fully specified
  * request shape. `spec` carries byte lengths, not the caller's raw strings.
+ * Every input token count is a byte length. Every output token count is the
+ * max_tokens that call sends. `candidateBytes` is the post-restore size.
  */
 function providerUsd(graph, spec, prices) {
+  const built = stageCalls(graph, spec, prices);
+  if (!built) return null;
+  return built.units / 1e6;
+}
+
+function stageCalls(graph, spec, prices) {
   const byId = new Map((graph.nodes || []).map((n) => [n.id, n]));
   const judge = byId.get("judge");
   const jin = byId.get("j-in");
@@ -122,9 +134,8 @@ function providerUsd(graph, spec, prices) {
   const judgeRate = rate(prices, judge.fields.model);
   if (!judgeRate) return null;
   const sep = bytes(jin.fields.sep);
-  const CPT = HUMANIZE_CHARS_PER_TOKEN;
   const judgeMax = Math.max(1, Math.floor(Number(judge.fields.maxTokens) || 1600));
-  let units = 0;
+  const calls = [];
   const retries = [];
   for (const id of ["w-a", "w-b", "w-c", "w-d", "w-e"]) {
     const n = byId.get(id);
@@ -132,55 +143,108 @@ function providerUsd(graph, spec, prices) {
     const primary = rate(prices, n.fields.model);
     if (!primary) return null;
     const outTok = writerOutputTokenCap(n.fields.maxTokens, spec.maxChars);
-    const inTok = (bytes(n.fields.system) + spec.writerBytes + spec.contextBytes + spec.guidanceBytes + 2 * sep + spec.noteExtraBytes) / CPT;
-    const call = (pc, more = 0) => (inTok + more) * pc[0] + outTok * pc[1];
-    const again = (pc) => call(pc, outTok + bytes(spec.retryText) / CPT);
+    const inTok = bytes(n.fields.system) + spec.writerBytes + spec.contextBytes + spec.guidanceBytes + 2 * sep + spec.noteExtraBytes;
+    const echoed = writerForwardByteCap(outTok);
+    const call = (model, pc, more = 0) => ({ model, inTokens: inTok + more, outTokens: outTok, rate: pc });
+    const again = (model, pc) => call(model, pc, echoed + bytes(spec.retryText));
     const fbModel = HUMANIZE_FALLBACKS[n.fields.model];
     const fb = fbModel ? rate(prices, fbModel) : null;
     if (fbModel && !fb) return null;
     if (fb) {
-      units += Math.max(call(primary), call(primary) + call(fb));
-      retries.push(Math.max(again(primary), again(fb)));
+      // A timed-out primary can still be billed, and then the fallback is billed too.
+      calls.push(call(n.fields.model, primary), call(fbModel, fb));
+      const rePrimary = again(n.fields.model, primary);
+      const reFb = again(fbModel, fb);
+      retries.push(callUsd(reFb) > callUsd(rePrimary) ? reFb : rePrimary);
     } else {
-      units += call(primary);
-      retries.push(again(primary));
+      calls.push(call(n.fields.model, primary));
+      retries.push(again(n.fields.model, primary));
     }
   }
-  units += retries.sort((a, b) => b - a).slice(0, MAX_REASKS).reduce((a, b) => a + b, 0);
+  retries.sort((a, b) => callUsd(b) - callUsd(a));
+  calls.push(...retries.slice(0, MAX_REASKS));
   const seps = ["k1", "k2", "k3", "k4", "k5", "k6", "j-cg"].reduce((a, id) => {
     const n = byId.get(id);
     return a + (n ? bytes(n.fields.sep) : 0);
   }, 0);
   const writerOut = writerOutputTokenCap(byId.get("w-a").fields.maxTokens, spec.maxChars);
-  const judgeIn = (bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes + seps) / CPT + 5 * writerOut;
-  units += judgeIn * judgeRate[0] + judgeMax * judgeRate[1];
+  // Same sum as candidateByteCap: forwarded completion, each protected phrase, and a final sentence when the ending can append one.
+  const candidateBytes = spec.spans
+    ? candidateByteCap(writerOut, spec.spans, { ending: spec.ending, draft: spec.draftText })
+    : writerForwardByteCap(writerOut) + spec.spanBytes + spec.endingExtra;
+  const judgeIn = bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes + seps + 5 * candidateBytes;
+  calls.push({ model: judge.fields.model, inTokens: judgeIn, outTokens: judgeMax, rate: judgeRate });
   if (spec.repair) {
     const longLabel = Math.max(...["k2", "k3", "k4", "k5", "k6"].map((id) => bytes(byId.get(id).fields.sep)));
-    const reviewIn = (bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes
-      + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel) / CPT
-      + writerOut + spec.repairExtraBytes / CPT;
-    units += reviewIn * judgeRate[0] + judgeMax * judgeRate[1];
+    const reviewIn = bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes
+      + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel
+      + candidateBytes;
+    calls.push({ model: judge.fields.model, inTokens: reviewIn, outTokens: judgeMax, rate: judgeRate });
   }
-  return units / 1e6;
+  const units = calls.reduce((a, c) => a + c.inTokens * c.rate[0] + c.outTokens * c.rate[1], 0);
+  return { calls, units, candidateBytes };
 }
 
-/** The published extreme: every cap, the one-thread prefix, the longest placeholder note, three retries, both deciders. */
-export function humanizeCeilingSpec() {
+function callUsd(call) {
+  return call.inTokens * call.rate[0] + call.outTokens * call.rate[1];
+}
+
+/** Code points at the input cap, each the longest UTF-8 sequence (4 bytes). */
+function capBytes(codePoints) {
+  return codePoints * 4;
+}
+
+/**
+ * The shapes a legal request can take at the input caps. The ceiling is the
+ * most expensive of them: dense text with no spans, and the same text with
+ * every byte protected so the judge sees the restored size.
+ */
+export function humanizeCeilingSpecs() {
   const budget = placeholderBudget();
   const { Draft, Context, Guidance } = HUMANIZE_INPUT_CAPS;
-  const guidance = Guidance + [...ONE_THREAD_PREFIX].length;
-  const retryText = bytes(budget.guard) > bytes(REASK_TEXT) ? budget.guard : REASK_TEXT;
-  return {
-    contextBytes: Context,
-    guidanceBytes: guidance,
-    draftBytes: Draft,
-    writerBytes: Draft,
-    noteExtraBytes: 2 + bytes(budget.note),
-    maxChars: MAX_CHARS_LIMIT,
-    retryText,
-    repair: true,
-    repairExtraBytes: Draft,
-  };
+  const guidanceBytes = bytes(ONE_THREAD_PREFIX) + capBytes(Guidance);
+  const contextBytes = capBytes(Context);
+  const draftBytes = capBytes(Draft);
+  const plainRetry = longestRetry([], MAX_CHARS_LIMIT, "question", true);
+  const keepRetry = bytes(budget.guard) > bytes(plainRetry) ? budget.guard : plainRetry;
+  const plainNote = writerNote([], "keep_last", MAX_CHARS_LIMIT);
+  const shared = { contextBytes, guidanceBytes, draftBytes, maxChars: MAX_CHARS_LIMIT };
+  // Restored phrases and an appended final sentence partition the draft, so the
+  // candidate grows by the draft's bytes once, not twice. The two shapes below
+  // are that growth with and without a repair pass.
+  return [
+    {
+      ...shared,
+      writerBytes: draftBytes,
+      noteExtraBytes: 2 + bytes(plainNote),
+      retryText: plainRetry,
+      repair: false,
+      spanBytes: 0,
+      endingExtra: draftBytes,
+    },
+    {
+      ...shared,
+      writerBytes: budget.writerDraftChars,
+      noteExtraBytes: 2 + bytes(budget.note),
+      retryText: keepRetry,
+      repair: true,
+      spanBytes: draftBytes,
+      endingExtra: 0,
+    },
+  ];
+}
+
+/** The published extreme: the more expensive of the capped shapes above. */
+export function humanizeCeilingSpec(graph = null, prices = HUMANIZE_MODEL_PRICES) {
+  const specs = humanizeCeilingSpecs();
+  if (!graph) return specs[specs.length - 1];
+  let best = specs[0];
+  let bestUsd = -1;
+  for (const spec of specs) {
+    const usd = providerUsd(graph, spec, prices);
+    if (usd != null && usd > bestUsd) { bestUsd = usd; best = spec; }
+  }
+  return best;
 }
 
 function specFromArgs(graph, args) {
@@ -199,7 +263,8 @@ function specFromArgs(graph, args) {
   const title = findArg(args, "title") === true;
   const { cleanDraft, writerDraft, spans } = collectSpans(draftText, keep);
   const note = writerNote(spans, ending, maxChars);
-  const protectedBytes = spans.reduce((n, s) => n + bytes(s.text), 0);
+  const spanBytes = spans.reduce((n, s) => n + bytes(s.text), 0);
+  const endingExtra = endingAppendBytes(draftText, ending, spans);
   return {
     contextBytes: bytes(contextText),
     guidanceBytes: bytes(guidanceText),
@@ -209,7 +274,11 @@ function specFromArgs(graph, args) {
     maxChars,
     retryText: longestRetry(spans, maxChars, ending, title),
     repair: spans.length > 0,
-    repairExtraBytes: protectedBytes,
+    spanBytes,
+    endingExtra,
+    spans,
+    ending,
+    draftText,
   };
 }
 
@@ -218,10 +287,33 @@ function specFromArgs(graph, args) {
  * Null when a model has no price — the caller then keeps the pinned ceiling.
  */
 export function humanizeChargeUsd(graph, args, { prices = HUMANIZE_MODEL_PRICES, ceiling = false } = {}) {
-  const spec = ceiling ? humanizeCeilingSpec() : specFromArgs(graph, args);
-  const provider = providerUsd(graph, spec, prices);
-  if (provider == null) return null;
-  return provider * HUMANIZE_SETTLE_MARKUP;
+  if (!ceiling) {
+    const provider = providerUsd(graph, specFromArgs(graph, args), prices);
+    if (provider == null) return null;
+    return provider * HUMANIZE_SETTLE_MARKUP;
+  }
+  let best = null;
+  for (const spec of humanizeCeilingSpecs()) {
+    const provider = providerUsd(graph, spec, prices);
+    if (provider == null) return null;
+    const charge = provider * HUMANIZE_SETTLE_MARKUP;
+    if (best == null || charge > best) best = charge;
+  }
+  return best;
+}
+
+/** Per-call token caps for a request. Tests recompute the charge from these. */
+export function humanizeStageBudget(graph, args, opts = {}) {
+  const prices = opts.prices || HUMANIZE_MODEL_PRICES;
+  const spec = opts.ceiling ? humanizeCeilingSpec(graph, prices) : specFromArgs(graph, args);
+  const built = stageCalls(graph, spec, prices);
+  if (!built) return null;
+  return {
+    calls: built.calls.map((c) => ({ model: c.model, inTokens: c.inTokens, outTokens: c.outTokens, rate: c.rate })),
+    candidateBytes: built.candidateBytes,
+    providerUsd: built.units / 1e6,
+    chargeUsd: built.units / 1e6 * HUMANIZE_SETTLE_MARKUP,
+  };
 }
 
 /** Deposit for one call. Never below humanizeChargeUsd for the same arguments. */
