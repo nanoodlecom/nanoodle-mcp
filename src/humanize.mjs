@@ -37,7 +37,9 @@
  *      calls too. One invoice per attempt, paid at most once, replayed only with the
  *      body it was issued for; no fallback after a primary's payment STARTED (it is
  *      marked before the wallet call, since a wallet can send and still throw), unless
- *      the wallet error carries paymentNotSent === true. An unconfirmed payment goes to
+ *      the wallet error carries paymentNotSent === true. A cancel that lands while the
+ *      402 body is being read is checked before payment is queued and again inside that
+ *      callback, so the queued callback does not pay. An unconfirmed payment goes to
  *      state.reconcile (invoice id, ambiguous) and the run notes, and its amount is left
  *      out of the cost, which is then flagged as a lower bound. Each writer call keeps
  *      its own attempt records, so concurrent writers never read each other's state.
@@ -47,7 +49,10 @@
  *      into state.unreportedUsd, which tools.mjs adds to the run's total before the
  *      gate's refund and payout math.
  *    Texts in the result are these post-processed writer outputs, exactly what
- *    the decider read.
+ *    the decider read. Each writer text, including a re-ask that replaces the
+ *    first answer, is clipped before a later stage reads it. A caller that
+ *    sizes the run passes that clip and the completion caps; otherwise the
+ *    clip is maxTokens × WRITER_BYTES_PER_TOKEN.
  */
 import { ParamsError } from "./tools.mjs";
 import { parseNanoInvoice } from "nanoodle";
@@ -66,6 +71,57 @@ export const MAX_REASKS = 3;
 /** A re-ask must finish within this long of its writer call starting (writer node timeout is 60 s), or the first answer is kept. */
 export const REASK_END_MS = 55000;
 export const REASK_TEXT = "Your last attempt copied the draft. Rewrite it in your own words: same facts, same meaning, but your own sentences, and never more than five words in a row from the draft. Output only the rewritten comment text.";
+
+/**
+ * UTF-8 bytes forwarded per writer output token. The API bills at most maxTokens
+ * completion tokens; the text those tokens become is clipped to this many bytes
+ * before any later stage reads it. 16 bytes/token is far above a comment, so
+ * normal rewrites are unchanged, and the next stage's input has a hard size.
+ */
+export const WRITER_BYTES_PER_TOKEN = 16;
+
+export function writerOutBytes(maxTokens) {
+  const n = Number(maxTokens);
+  const tokens = Number.isFinite(n) && n > 0 ? Math.floor(n) : 600;
+  return tokens * WRITER_BYTES_PER_TOKEN;
+}
+
+/** Cut to a UTF-8 byte cap without splitting a code point. */
+export function clipUtf8(s, maxBytes) {
+  const str = String(s ?? "");
+  const cap = Number(maxBytes);
+  if (!(cap >= 0)) return str;
+  if (Buffer.byteLength(str) <= cap) return str;
+  let out = "";
+  let used = 0;
+  for (const ch of str) {
+    const n = Buffer.byteLength(ch);
+    if (used + n > cap) break;
+    out += ch;
+    used += n;
+  }
+  return out;
+}
+
+/**
+ * Queue `pay` only if `signal` is still live, and check again inside the
+ * callback. A cancel during the invoice read (before this is called, or in the
+ * microtask gap before the callback runs) must not send.
+ * The sync throw is the caller's signal.reason. The callback throw carries
+ * paymentNotSent so the caller does not treat it as money that may have moved.
+ */
+export function beginPayment(signal, pay) {
+  if (signal && signal.aborted) throw signal.reason;
+  return Promise.resolve().then(() => {
+    if (signal && signal.aborted) {
+      const e = new Error("cancelled before payment");
+      e.paymentNotSent = true;
+      e.cause = signal.reason;
+      throw e;
+    }
+    return pay();
+  });
+}
 
 /** Deterministic dash fix applied to writer outputs before judging. */
 export function normalizeDashes(text) {
@@ -122,7 +178,10 @@ export function failedBeforeSend(e, signal) {
  * exact body that invoice was issued for. Once a primary's invoice is paid there is no fallback: a
  * paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS }) {
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, maxTokens = 0, judgeMaxTokens = 0, clipBytes = 0 }) {
+  const writerCap = Number(maxTokens) > 0 ? Math.floor(Number(maxTokens)) : 0;
+  const judgeCap = Number(judgeMaxTokens) > 0 ? Math.floor(Number(judgeMaxTokens)) : 0;
+  const clipAt = Number(clipBytes) > 0 ? Math.floor(Number(clipBytes)) : 0;
   const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, costUnknown: false };
   let reasksLeft = maxReasks;
   const byModel = new Map();
@@ -166,7 +225,16 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     let body;
     try { body = JSON.parse(init.body); } catch { return fetch(url, init); }
     const letter = body && byModel.get(body.model);
-    if (!letter) return fetch(url, init);
+    if (!letter) {
+      // The decider is not a writer. Cap its completion the same way when the
+      // caller sized this run, and leave every other chat call untouched.
+      if (judgeCap > 0 && body && Number(body.max_tokens) > judgeCap) {
+        body.max_tokens = judgeCap;
+        return fetch(url, { ...init, body: JSON.stringify(body) });
+      }
+      return fetch(url, init);
+    }
+    if (writerCap > 0 && Number(body.max_tokens) > writerCap) body.max_tokens = writerCap;
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
     let usd = 0, usdKnown = true; // this logical call: every attempt's cost
@@ -197,15 +265,20 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           const e = new Error(inv && state.paidIds.has(inv.paymentId) ? `x402 invoice ${inv.paymentId} was already paid; not paying it again` : "payment required, but the 402 response offered no usable Nano option");
           e.code = "x402"; throw e;
         }
-        if (commit) commit();
-        rec.paymentId = inv.paymentId;
-        state.paidIds.add(inv.paymentId);
-        // marked BEFORE the wallet call: a wallet can send and still throw, so from here on this
-        // attempt counts as possibly paid and is never followed by a fallback, unless the wallet
-        // proves nothing was sent (an error carrying paymentNotSent === true)
-        rec.paymentStarted = true;
+        // Checked before the callback is queued, and again inside it. A cancel during
+        // r.text() above is already visible here; a cancel in the microtask gap is
+        // visible inside beginPayment. Neither path calls payment().
         try {
-          const paying = Promise.resolve().then(() => payment(inv));
+          const paying = beginPayment(signal, () => {
+            if (commit) commit();
+            rec.paymentId = inv.paymentId;
+            state.paidIds.add(inv.paymentId);
+            // marked BEFORE the wallet call returns: a wallet can send and still throw,
+            // so from here on this attempt counts as possibly paid and is never followed
+            // by a fallback, unless the wallet error carries paymentNotSent === true
+            rec.paymentStarted = true;
+            return payment(inv);
+          });
           // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
           paying.then(() => {
             if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
@@ -218,7 +291,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           }, () => {});
           await raceAbort(paying, signal);
         } catch (e) {
-          if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
+          // Not started, or the wallet proved nothing was sent: do not reconcile it as paid.
+          if ((e && e.paymentNotSent === true) || !rec.paymentStarted) {
+            rec.paymentStarted = false;
+            rec.status = "payment not sent";
+            if (!(e && e.paymentNotSent === true) && e instanceof Error) e.paymentNotSent = true;
+            throw e;
+          }
           rec.paymentAmbiguous = true;
           rec.status = signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed";
           state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: true, status: rec.status });
@@ -339,6 +418,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     state.answered[letter] = model;
     let text = normalizeDashes(msg.content);
     if (text !== msg.content) state.dashes[letter] = true;
+    text = clipUtf8(text, clipAt || writerOutBytes(record[letter].maxTokens));
     const ratio = copyRatio(text, draft);
     if (ratio > NEAR_COPY_RATIO && (reasksLeft <= 0 || now() - t0 >= reaskDeadlineMs)) {
       state.skippedReask[letter] = { ratio, why: reasksLeft <= 0 ? `the ${maxReasks}-re-ask limit for this run was reached` : "too late in the writer's time budget" };
@@ -352,11 +432,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       const onOuter = () => ac.abort(init.signal.reason);
       if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
       try {
-        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: msg.content }, { role: "user", content: REASK_TEXT }] }, "reask", ac.signal);
+        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: text }, { role: "user", content: REASK_TEXT }] }, "reask", ac.signal);
         addCost(r2.rec.usd);
         const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
         if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
-          const t2 = normalizeDashes(m2.content);
+          let t2 = normalizeDashes(m2.content);
+          if (t2 !== m2.content) state.dashes[letter] = true;
+          t2 = clipUtf8(t2, clipAt || writerOutBytes(record[letter].maxTokens));
           state.reasked[letter] = { ratio, after: copyRatio(t2, draft) };
           text = t2;
         } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
@@ -411,7 +493,7 @@ export function humanizeWriterRecord(graph) {
     const w = link && nodes.get(link.from.node);
     if (!w || w.type !== "llm") return null;
     if (w.fields.model !== m[2]) throw new Error(`humanize-comment: join ${n.id} labels [${m[1]}] ${m[2]} but its writer ${w.id} runs ${w.fields.model}`);
-    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, fallbackModel: HUMANIZE_FALLBACKS[w.fields.model] || null });
+    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, maxTokens: Number(w.fields.maxTokens) || 600, fallbackModel: HUMANIZE_FALLBACKS[w.fields.model] || null });
   }
   return LETTERS.every((l) => record[l]) && nodes.has("judge") && nodes.has("draft") ? Object.freeze(record) : null;
 }

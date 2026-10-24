@@ -146,7 +146,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(srv.messages.length, framesBefore + 1, "notifications/initialized must not be answered");
     const tools = list.result.tools;
     // one tool per fixture graph, plus the always-present run_noodle share-link tool
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "poster", "restyle", "run_noodle"]);
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "poster", "restyle", "run_noodle", "sfw_check", "subnano_comment"]);
 
     // media-typed input advertises "file path or https URL"
     const restyle = tools.find((t) => t.name === "restyle");
@@ -687,7 +687,7 @@ test("multiple --graphs dirs merge into one tool set, each tool tagged with its 
 
   const reg = await loadTools({ dirs: [a, b], apiKey: "test-key", outDir: a });
   assert.deepEqual(reg.failures, []);
-  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta"]);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta", "sfw_check", "subnano_comment"]);
   // each tool remembers which dir it came from (keeps same-named files distinguishable)
   assert.equal(reg.tools.find((t) => t.name === "alpha").dir, a);
   assert.equal(reg.tools.find((t) => t.name === "beta").dir, b);
@@ -716,7 +716,7 @@ test("single --graphs dir behaves exactly as before (bare names, no suffixes)", 
   await writeGraph(dir, "two.json");
 
   const reg = await loadTools({ dirs: [dir], apiKey: "test-key", outDir: dir });
-  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "two"]);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "sfw_check", "subnano_comment", "two"]);
 });
 
 test("an unreadable --graphs dir is a hard error naming the specific dir", async () => {

@@ -7,7 +7,7 @@ import { mkdtemp, rm, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { humanizeFetch } from "../src/humanize.mjs";
+import { beginPayment, clipUtf8, humanizeFetch, writerOutBytes } from "../src/humanize.mjs";
 
 const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
 const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop";
@@ -382,4 +382,72 @@ test("late settlement after the deadline or a cancel: recorded once, never lost 
   rel2(); await new Promise((r3) => setTimeout(r3, 20));
   assert.ok(near(hf2.state.unreportedUsd - b2, PRICE));
   assert.equal(hf2.state.paidFailed.C.ambiguous, false);
+});
+
+test("cancel during the 402 invoice read does not queue payment", async () => {
+  const ac = new AbortController();
+  const reason = new Error("cancelled");
+  let paid = 0;
+  const payload = JSON.stringify({ payment: { paymentId: "payC", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: PRICE, completeUrl: "http://x/api/x402/complete/payC" }] } });
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "",
+    payment: () => { paid += 1; },
+    fetch: async () => new Response(new ReadableStream({
+      pull(controller) {
+        ac.abort(reason);
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    }), { status: 402, headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(hf.fetch(CHAT, { ...xreq(CYD), signal: ac.signal }), (e) => e === reason || /cancelled/.test(String(e && e.message)));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(paid, 0);
+  assert.equal(hf.state.attempts.at(-1).paymentStarted, false);
+  assert.equal(hf.state.paidIds.size, 0);
+});
+
+test("beginPayment checks cancellation again inside the callback", async () => {
+  const ac = new AbortController();
+  let paid = 0;
+  const pending = beginPayment(ac.signal, () => { paid += 1; });
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(pending, (e) => e && e.paymentNotSent === true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(paid, 0);
+});
+
+test("writer text over the output byte cap is clipped before a later stage can read it", async () => {
+  const cap = writerOutBytes(600);
+  const huge = "x".repeat(cap + 40) + "🙂";
+  assert.ok(Buffer.byteLength(huge) > cap);
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "short draft",
+    fetch: async () => okRes(huge),
+  });
+  const r = await hf.fetch(CHAT, keyed("d"));
+  const text = (await r.json()).choices[0].message.content;
+  assert.equal(Buffer.byteLength(text), cap);
+  assert.equal(text, clipUtf8(huge, cap));
+  assert.equal(text.includes("🙂"), false);
+});
+
+test("a re-ask over the output byte cap is clipped before a later stage can read it", async () => {
+  const cap = writerOutBytes(600);
+  const draft = "one two three four five six seven eight nine";
+  const huge = "z".repeat(cap + 50) + "🙂";
+  let n = 0;
+  const hf = humanizeFetch({
+    record: REC,
+    draft,
+    fetch: async () => okRes(n++ === 0 ? draft : huge),
+  });
+  const r = await hf.fetch(CHAT, keyed("d"));
+  const text = (await r.json()).choices[0].message.content;
+  assert.equal(n, 2);
+  assert.equal(Buffer.byteLength(text), cap);
+  assert.equal(text, clipUtf8(huge, cap));
+  assert.equal(text.includes("🙂"), false);
 });

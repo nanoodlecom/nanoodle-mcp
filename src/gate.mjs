@@ -103,6 +103,8 @@ export function hashArgs(name, args) {
 }
 
 const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\.\d\d\d*?)0+$/, "$1");
+/** Per-request quotes are collected at this exact figure, so the sentence must not round to cents. */
+const exactUsd = (n) => "$" + Number(n).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
 
 /**
  * @param {object} opts
@@ -757,7 +759,7 @@ export function createChargeGate({
     // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const text =
-      `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
+      `PAYMENT REQUIRED — this tool takes a ${(q.perRequest ? exactUsd(q.usd) : fmtUsd(q.usd))} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
       `This call is done — hang up. On this payment link, do BOTH of these now:\n` +
       `1. Show your user ONLY this payment link (QR to scan; green check when paid). Do not show them any other URL or the wallet address:\n` +
@@ -878,13 +880,18 @@ export function createChargeGate({
        * the operator eats the difference (see settle()).
        *
        * Precedence:
-       *   1. A graph's own x402.usd is pinned and always wins.
-       *   2. Otherwise quote off the largest of two cost signals — an UP-FRONT
+       *   1. A per-request quote (registry.quoteDeposit) when the caller passed
+       *      arguments. That quote is the most this request can cost, plus a
+       *      small margin. A throw or a non-positive result falls through to
+       *      the pin below. tools/list calls priceFor with no arguments, so a
+       *      priced-per-request tool advertises the pin's sentence, not one dollar.
+       *   2. A graph's own x402.usd is pinned and always wins over a forecast.
+       *   3. Otherwise quote off the largest of two cost signals — an UP-FRONT
        *      catalog forecast (registry.estimates, valid before the tool has ever
        *      run) and the worst metered cost actually seen (registry.costs, a live
        *      high-water mark) — times a safety multiplier for run-to-run variance:
        *      1.25× when the cost is deterministic (image only), 2× otherwise.
-       *   3. With no signal at all (never run, uncatalogued), fall back to the flat
+       *   4. With no signal at all (never run, uncatalogued), fall back to the flat
        *      --charge-usd opening deposit.
        *
        * --charge-usd is the cold-start deposit, NOT a ceiling: expensive graphs
@@ -1008,14 +1015,38 @@ export function createChargeGate({
         return { known, costRaw, take, change, author: !!author };
       }
 
+      /**
+       * Deposit for this call. Per-request tools quote from the arguments after
+       * they have been validated. Everyone else uses priceFor (pin, forecast, or
+       * the flat opening deposit).
+       */
+      const quotedPrice = (name, args) => {
+        if (args && typeof registry.quoteDeposit === "function") {
+          try {
+            const q = registry.quoteDeposit(name, args);
+            if (q == null) { /* not priced per request */ }
+            else if (Number.isFinite(q) && q > 0) return { usd: q, perRequest: true };
+            else log(`warning: ${name} per-request quote was not a positive amount — using the pinned deposit`);
+          } catch (e) {
+            log(`warning: ${name} per-request quote failed (${e && e.message ? e.message : "failed"}) — using the pinned deposit`);
+          }
+        }
+        return { usd: priceFor(name), perRequest: false };
+      };
+
       const listTools = () =>
         registry.listTools()
           .filter((t) => t.name !== runNoodleName)
           .map((t) => {
             const price = priceFor(t.name);
+            // The humanize v2.8 sentence, kept for any tool that sets pricedPerRequest
+            // and does not bring its own note. Per-request tools do not advertise one dollar.
+            const perRequest = t.pricedPerRequest
+              ? (t.depositNote || "a deposit is quoted for each request from its length and maxChars and covers the most that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned")
+              : null;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
-              `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
+              perRequest || `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
               (authors.get(t.name) ? " The 20% markup goes to the graph's author." : "");
             const inputSchema = {
               ...t.inputSchema,
@@ -1052,7 +1083,6 @@ export function createChargeGate({
         const { _payment_id, ...args } = rawArgs;
         const name = params.name;
         const argsHash = hashArgs(name, args);
-        const price = priceFor(name);
 
         let q;
         if (_payment_id == null) {
@@ -1065,12 +1095,13 @@ export function createChargeGate({
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
           if (validate) await validate({ name, arguments: args });
+          const price = quotedPrice(name, args);
           const pair = await ratePair();
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
-            tool: name, argsHash, usd: price,
+            tool: name, argsHash, usd: price.usd, perRequest: price.perRequest,
             pair, // settle math must use the exact pair the deposit was priced at
-            amountRaw: tagAmount(price, pair),
+            amountRaw: tagAmount(price.usd, pair),
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
             etaMs: etaOf(name),
