@@ -18,6 +18,7 @@ import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes } from "./humanize.mjs";
+import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -140,13 +141,21 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
  */
 export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const needed = new Set();
-  for (const t of registry.tools) for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
-  if (!needed.size) return (registry.catalogs = {});
+  for (const t of registry.tools) {
+    if (!t.wf) continue; // built-ins (subnano_comment, sfw_check) have no graph
+    for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
+  }
+  if (!needed.size) {
+    registry.catalogs = {};
+    refreshBuiltinDeposits(registry);
+    return registry.catalogs;
+  }
   const catalogs = await fetchCatalogs(needed, { baseUrl, fetch, log, maxAgeMs, timeoutMs, consequence });
   registry.catalogs = catalogs;
   // Only overwrite a tool's catalog when something loaded — a failed refresh
   // must not strip the limits an earlier successful one installed.
-  if (Object.keys(catalogs).length) for (const t of registry.tools) t.wf.catalog = catalogs;
+  if (Object.keys(catalogs).length) for (const t of registry.tools) if (t.wf) t.wf.catalog = catalogs;
+  refreshBuiltinDeposits(registry);
   return catalogs;
 }
 
@@ -176,6 +185,7 @@ export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.co
 
   const estimates = {};
   for (const t of registry.tools) {
+    if (!t.wf) continue;
     try {
       const e = estimateGraphCost(t.wf.graph, catalogs);
       if (e.priced > 0) estimates[t.name] = e;
@@ -408,6 +418,17 @@ export function renderCost(rec) {
   if (rec.usd < 0.0001 && rec.exact !== false) return `last run <$0.0001${dur}`;
   const usd = rec.usd.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
   return `last run $${usd}${rec.exact === false ? "+" : ""}${dur}`;
+}
+
+/**
+ * Drop a previous "last run …" segment and insert the new one before the period,
+ * matching buildDescription. Built-ins have no graph to rebuild the sentence from.
+ */
+function withObservedCost(description, rec) {
+  const cost = renderCost(rec);
+  const stripped = String(description).replace(/; last run [^.]*/, "");
+  if (!cost) return stripped;
+  return stripped.replace(/(every call spends real credit from [^.;]+)/, `$1; ${cost}`);
 }
 
 /** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
@@ -787,7 +808,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   const failures = [];
   // Seed the reserved run_noodle name so a file that sanitizes to it gets suffixed, not shadowed.
   // Shared across every dir, so the first-scanned occurrence of a name wins it.
-  const usedNames = new Map([[RUN_NOODLE_NAME, 1]]);
+  // Built-in tool names are reserved the same way as run_noodle: a graph file
+  // that sanitizes to one of them is suffixed (-2), it does not replace the tool.
+  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [SUBNANO_TOOL, 1], [SFW_TOOL, 1]]);
 
   for (const dir of dirs) {
     let entries;
@@ -852,6 +875,12 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (p) { p.maxLength = cap; p.description = `${p.description ? p.description + "; " : ""}at most ${cap} characters`; }
     }
   }
+  // Built-ins ship in the package so a deploy does not need a new graph file.
+  // They stay off an empty directory: with no graph loaded there is nothing to serve.
+  if (tools.length) {
+    const humanize = tools.find((t) => t.name === HUMANIZE_TOOL);
+    for (const b of builtinTools({ spendSource, humanize })) tools.push(b);
+  }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
@@ -878,7 +907,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     } catch (e) {
       console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
     }
-    const description = buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name });
+    const description = tool.wf
+      ? buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name })
+      : withObservedCost(tool.description, rec);
     if (description !== tool.description) {
       tool.description = description;
       if (registry.onToolsChanged) registry.onToolsChanged();
@@ -897,10 +928,28 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
 
     listTools() {
       // run_noodle is always available, alongside one tool per saved graph.
+      // pricedPerRequest / depositNote let the charge gate describe a deposit
+      // that is quoted per call instead of a single pinned dollar figure.
       return [
-        ...tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+        ...tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema,
+          ...(t.pricedPerRequest ? { pricedPerRequest: true, depositNote: t.depositNote } : {}),
+        })),
         runNoodleTool(spendSource),
       ];
+    },
+
+    /**
+     * Per-request deposit in USD, or null when this tool is not priced per call.
+     * Throws when the request cannot be priced; the charge gate then keeps the
+     * tool's pinned x402.usd (the cold ceiling) and logs the warning.
+     */
+    quoteDeposit(name, args) {
+      const tool = byName.get(name);
+      if (!tool || typeof tool.quote !== "function") return null;
+      return tool.quote(args, { catalogs: registry.catalogs, humanize: byName.get(HUMANIZE_TOOL) });
     },
 
     /**
@@ -926,6 +975,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (typeof args !== "object" || Array.isArray(args)) {
         throw new ParamsError("tools/call arguments must be an object");
       }
+      if (tool.builtin) {
+        await tool.prepare(args, { humanize: byName.get(HUMANIZE_TOOL), catalogs: registry.catalogs });
+        return { tool, inputs: null };
+      }
       if (tool.humanize) checkHumanizeInputs(args);
       const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
       return { tool, inputs };
@@ -937,6 +990,16 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
       }
       const { tool, inputs } = await registry.prepareCall(params);
+      if (tool.builtin) {
+        const t0 = Date.now();
+        const result = await tool.run(params.arguments || {}, {
+          apiKey, payment, baseUrl, registry,
+          humanize: byName.get(HUMANIZE_TOOL),
+          catalogs: registry.catalogs,
+        });
+        await recordCost(tool, result, Date.now() - t0);
+        return result;
+      }
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();

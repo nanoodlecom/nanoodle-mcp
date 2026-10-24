@@ -604,6 +604,28 @@ just `./noodles`, since `~` is not expanded in MCP args). Cursor
 (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`) take the same `args` in
 the config shapes shown under [Install](#install).
 
+## Hosted subnano tools
+
+When at least one graph is loaded, the server also exposes two built-in tools
+(they are not graph files, and an empty `--graphs` directory still refuses to
+start):
+
+- **`subnano_comment`** — one call that rewrites a draft with `liquid/lfm-2.5-2.6b`
+  (Liquid d1 is a decision model and cannot write the comment), runs the mounted
+  `humanize-comment` graph on that rewrite, then asks `liquid/d1` whether the
+  result is safe to post and how funny it is. Needs `humanize-comment` in
+  `--graphs`. A "no" from the gate is returned with the comment; it does not
+  discard it.
+- **`sfw_check`** — one yes/no safe-for-work decision per still image and per
+  evenly sampled video frame (`perplexity/pplx-decider-v1.2`). The check passes
+  only when every picture is yes. There is no argument that turns it off.
+  Sampling a video needs ffmpeg; checking a still image does not.
+
+In charge mode the deposit for each of these is quoted from that request before
+payment: the most the request can still cost, plus the 20% settle markup, plus
+a 12% margin. The run then settles at the metered cost plus 20% and the
+difference is returned.
+
 ## Run any share link
 
 Every nanoodle share link is an executable tool. Alongside your saved graphs the
