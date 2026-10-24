@@ -52,8 +52,8 @@
  *    the decider read.
  */
 import { ParamsError } from "./tools.mjs";
-import { parseNanoInvoice } from "nanoodle";
-import { beginPayment, reserveInvoice, releaseInvoice } from "./pay-guard.mjs";
+import { parseNanoInvoice, strictUsd } from "nanoodle";
+import { beginPayment, callPayment, reserveInvoice, releaseInvoice } from "./pay-guard.mjs";
 
 export const HUMANIZE_TOOL = "humanize-comment";
 /** Hard caps in Unicode code points ([...s].length). */
@@ -93,12 +93,14 @@ const usdOf = (j, r) => {
   const p = j && j.x_nanogpt_pricing;
   const pUsd = p && (p.costUsd != null ? p.costUsd : p.cost != null ? p.cost : p.amount);
   const mUsd = j && j.metadata && j.metadata.cost;
-  if (j && typeof j.cost === "number" && j.cost > 0) return j.cost;
-  if (pUsd != null && isFinite(Number(pUsd))) return Number(pUsd);
-  if (mUsd != null && isFinite(Number(mUsd))) return Number(mUsd);
-  if (j && typeof j.cost === "number") return j.cost;
-  const h = r && r.headers && r.headers.get ? parseFloat(r.headers.get("x-cost") || r.headers.get("x-nano-cost") || "") : NaN;
-  return isNaN(h) ? null : h;
+  if (j && typeof j.cost === "number" && j.cost > 0) return strictUsd(j.cost);
+  if (pUsd != null) return strictUsd(pUsd);
+  if (mUsd != null) return strictUsd(mUsd);
+  if (j && typeof j.cost === "number") return strictUsd(j.cost);
+  if (!r || !r.headers || !r.headers.get) return null;
+  const costHeader = r.headers.get("x-cost");
+  const costText = costHeader != null && String(costHeader).trim() !== "" ? costHeader : r.headers.get("x-nano-cost");
+  return costText == null ? null : strictUsd(costText);
 };
 
 /** A request error that provably happened before the request was written (so nothing was billed). */
@@ -179,7 +181,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
     let usd = 0, usdKnown = true; // this logical call: every attempt's cost
-    const addCost = (v) => { if (v == null || !isFinite(v)) usdKnown = false; else usd += Number(v); };
+    const addCost = (v) => { const n = strictUsd(v); if (n == null) usdKnown = false; else usd += n; };
 
     /**
      * One attempt = one request body, sent once and (under x402) paid at most once.
@@ -223,7 +225,15 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
             // and is never followed by a fallback, unless the wallet error carries
             // paymentNotSent === true
             rec.paymentStarted = true;
-            return payment(inv);
+            // Same release for a synchronous throw and a rejected promise.
+            return callPayment(payment, inv).then((v) => v, (e) => {
+              if (e && e.paymentNotSent === true && reserved) {
+                releaseInvoice({ id: reserved.id, usd: reserved.committed, paidIds: state.paidIds, budget: null });
+                reserved = null;
+                rec.paymentStarted = false;
+              }
+              throw e;
+            });
           });
           // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
           paying.then(() => {
@@ -239,7 +249,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         } catch (e) {
           // Not started, or the wallet proved nothing was sent: do not reconcile it as paid.
           if ((e && e.paymentNotSent === true) || !rec.paymentStarted) {
-            if (reserved) releaseInvoice({ id: reserved.id, usd: 0, paidIds: state.paidIds, budget: null });
+            if (reserved) releaseInvoice({ id: reserved.id, usd: reserved.committed, paidIds: state.paidIds, budget: null });
             rec.paymentStarted = false;
             rec.status = "payment not sent";
             if (!(e && e.paymentNotSent === true) && e instanceof Error) e.paymentNotSent = true;
@@ -259,6 +269,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           try {
             cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}", signal });
           } catch (e) {
+            // payment() already returned, so the reservation stays even if this error says paymentNotSent.
             rec.status = "aborted after payment";
             state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: false, status: rec.status });
             throw e;
@@ -281,6 +292,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           await cr.text().catch(() => {});
           if (now() >= deadline) { rec.status = "x402 expired"; const e = new Error(`payment window expired for ${inv.paymentId}`); e.code = "x402-expired"; throw e; }
           try { await wait(pollMs, signal); } catch (e) {
+            // payment() already returned, so the reservation stays even if this error says paymentNotSent.
             rec.status = "aborted after payment";
             state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: false, status: rec.status });
             throw e;
@@ -359,8 +371,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (state.fallback[letter] && state.fallback[letter].failed) state.fallback[letter].ok = false;
       if (!r.ok) { lose(); return r; } // the engine reads no cost from an error answer
       // ok but unreadable: the engine reports r's own price; earlier attempts are carried here
-      const own = res.rec.usd || 0;
-      if (usd - own > 0) state.unreportedUsd += usd - own;
+      const own = strictUsd(res.rec.usd);
+      if (own == null) usdKnown = false;
+      else if (usd - own > 0) state.unreportedUsd += usd - own;
       if (!usdKnown) state.costUnknown = true;
       return r;
     }

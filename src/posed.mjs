@@ -11,10 +11,10 @@
  * Keyless 402s are settled here so a cancel after the invoice read, or inside
  * the queued payment callback, never sends.
  */
-import { MediaRef, parseNanoInvoice } from "nanoodle";
+import { MediaRef, parseNanoInvoice, strictUsd } from "nanoodle";
 import { ParamsError } from "./tools.mjs";
 import {
-  SETTLE_MARKUP, depositFromCharge, chatCallUsd, beginPayment, openBudget,
+  SETTLE_MARKUP, depositFromCharge, chatCallUsd, beginPayment, callPayment, openBudget,
   reserveInvoice, releaseInvoice, noteUncertainPayment,
 } from "./pay-guard.mjs";
 
@@ -46,9 +46,9 @@ function catalogModel(catalogs, kind, id) {
 function chatRates(catalogs) {
   const row = catalogModel(catalogs, "chat", GLM_MODEL);
   const p = row && row.pricing;
-  const pin = p && Number(p.prompt);
-  const pout = p && Number(p.completion);
-  if (pin > 0 && pout > 0) return [pin, pout];
+  const pin = strictUsd(p && p.prompt);
+  const pout = strictUsd(p && p.completion);
+  if (pin != null && pout != null && pin > 0 && pout > 0) return [pin, pout];
   return FALLBACK_CHAT;
 }
 
@@ -56,10 +56,13 @@ function perImage(catalogs, id, size, fallback) {
   const row = catalogModel(catalogs, "image", id);
   const per = row && row.pricing && row.pricing.per_image;
   if (per && typeof per === "object") {
-    if (Number(per[size]) > 0) return Number(per[size]);
+    const exact = strictUsd(per[size]);
+    if (exact != null && exact > 0) return exact;
     const short = String(size).split("x")[0];
-    if (short && Number(per[short]) > 0) return Number(per[short]);
-    if (size === "auto" && Number(per.auto) > 0) return Number(per.auto);
+    const shortUsd = short ? strictUsd(per[short]) : null;
+    if (shortUsd != null && shortUsd > 0) return shortUsd;
+    const auto = strictUsd(per.auto);
+    if (size === "auto" && auto != null && auto > 0) return auto;
   }
   return fallback;
 }
@@ -73,8 +76,10 @@ function perImage(catalogs, id, size, fallback) {
 function rodinUsd(catalogs) {
   const row = catalogModel(catalogs, "model3d", RODIN_MODEL);
   const by = row && row.pricing && row.pricing.per_run_by_variant;
-  if (by && Number(by.standard) > 0) return Number(by.standard);
-  if (row && row.pricing && Number(row.pricing.per_run) > 0) return Number(row.pricing.per_run);
+  const standard = by && strictUsd(by.standard);
+  if (standard != null && standard > 0) return standard;
+  const perRun = row && row.pricing && strictUsd(row.pricing.per_run);
+  if (perRun != null && perRun > 0) return perRun;
   return FALLBACK_RODIN;
 }
 
@@ -146,11 +151,11 @@ function usdOf(j) {
   if (!j || typeof j !== "object") return null;
   const p = j.x_nanogpt_pricing;
   const pUsd = p && (p.costUsd != null ? p.costUsd : p.cost != null ? p.cost : p.amount);
-  if (typeof j.cost === "number" && j.cost > 0) return j.cost;
-  if (pUsd != null && Number.isFinite(Number(pUsd))) return Number(pUsd);
+  if (typeof j.cost === "number" && j.cost > 0) return strictUsd(j.cost);
+  if (pUsd != null) return strictUsd(pUsd);
   const mUsd = j.metadata && j.metadata.cost;
-  if (mUsd != null && Number.isFinite(Number(mUsd))) return Number(mUsd);
-  if (typeof j.cost === "number") return j.cost;
+  if (mUsd != null) return strictUsd(mUsd);
+  if (typeof j.cost === "number") return strictUsd(j.cost);
   return null;
 }
 
@@ -238,13 +243,32 @@ async function settle402({ r, signal, payment, fetch, url, init, baseUrl, budget
   let reserved = null;
   try {
     // After the invoice read, and again inside the queued callback before reserveInvoice pays.
+    // callPayment turns a synchronous throw into the same rejection as an async one,
+    // so a paymentNotSent failure releases the commit either way.
     await beginPayment(signal, () => {
       reserved = reserveInvoice({
         signal, inv, bodyStr: init.body, paidIds: ledger.paidIds, bodies: ledger.bodies,
         budget, stageLabel,
       });
-      return payment(inv);
+      return callPayment(payment, inv).then((v) => v, (e) => {
+        if (e && e.paymentNotSent === true && reserved) {
+          releaseInvoice({ id: reserved.id, usd: reserved.committed, paidIds: ledger.paidIds, budget });
+          reserved = null;
+        }
+        throw e;
+      });
     });
+  } catch (e) {
+    // Nothing was reserved, or the wallet proved it did not send: not an uncertain payment.
+    if (!reserved || (e && e.paymentNotSent === true)) {
+      if (reserved) releaseInvoice({ id: reserved.id, usd: reserved.committed, paidIds: ledger.paidIds, budget });
+      throw e;
+    }
+    const status = signal && signal.aborted ? "aborted after payment" : "payment outcome uncertain";
+    noteUncertainPayment(ledger, inv, status);
+    throw e;
+  }
+  try {
     const cr = await fetch(inv.completeUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-x402": "true" },
@@ -284,11 +308,8 @@ async function settle402({ r, signal, payment, fetch, url, init, baseUrl, budget
     }
     return jsonResponse(result || {});
   } catch (e) {
-    // Nothing was reserved, or the wallet proved it did not send: not an uncertain payment.
-    if (!reserved || (e && e.paymentNotSent === true)) {
-      if (reserved) releaseInvoice({ id: reserved.id, usd: reserved.committed, paidIds: ledger.paidIds, budget });
-      throw e;
-    }
+    // payment() already returned. A later error keeps the reservation even when
+    // it carries paymentNotSent: the wallet call completed, so the spend is uncertain.
     const status = signal && signal.aborted ? "aborted after payment" : "payment outcome uncertain";
     noteUncertainPayment(ledger, inv, status);
     throw e;

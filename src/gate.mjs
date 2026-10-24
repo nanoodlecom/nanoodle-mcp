@@ -34,7 +34,7 @@ import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
-import { paidDeposit } from "./pay-guard.mjs";
+import { paidDeposit, knownInvoiceUsd } from "./pay-guard.mjs";
 import { redactUrl } from "./redact.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -78,7 +78,12 @@ const GRAIN = 10n ** 22n;
  * with an explicit floor/ceil.
  */
 export function parseUsdNano(v) {
-  const s = String(v).trim();
+  if (typeof v !== "number" && typeof v !== "string") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  if (typeof v === "number" && !Number.isFinite(v)) throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  let s = String(v).trim();
+  // ".001" is the same amount as "0.001". A bare dot is still unusable.
+  if (s.startsWith(".")) s = "0" + s;
+  else if (s.startsWith("-.")) s = "-0" + s.slice(1);
   const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
   if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
   const digits = m[2] + (m[3] || "");
@@ -875,8 +880,8 @@ export function createChargeGate({
      */
     wrapRegistry(registry, { runNoodleName = "run_noodle" } = {}) {
       const pinned = new Map(registry.tools.map((t) => {
-        const v = t.x402 && Number(t.x402.usd);
-        return [t.name, Number.isFinite(v) && v > 0 ? v : null];
+        const v = t.x402 && knownInvoiceUsd(t.x402.usd);
+        return [t.name, v != null && v > 0 ? v : null];
       }));
       /**
        * Deposit for a tool as of right now. The deposit is a HOLD, not the price:
@@ -903,8 +908,8 @@ export function createChargeGate({
        */
       const depositCap = (name) => {
         const caps = registry.depositCaps;
-        const v = caps && Number(caps[name]);
-        return Number.isFinite(v) && v > 0 ? v : null;
+        const v = caps && knownInvoiceUsd(caps[name]);
+        return v != null && v > 0 ? v : null;
       };
       toolDepositIsCap = (name) => depositCap(name) != null;
       const priceFor = (name) => {

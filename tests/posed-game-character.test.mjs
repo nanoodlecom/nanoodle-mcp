@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools, attachEstimates } from "../src/tools.mjs";
 import { createChargeGate } from "../src/gate.mjs";
-import { paidDeposit, depositFromCharge, SETTLE_MARKUP, openBudget } from "../src/pay-guard.mjs";
+import { paidDeposit, depositFromCharge, SETTLE_MARKUP, openBudget, settledCharge, meteredWithinQuote } from "../src/pay-guard.mjs";
 import {
   POSED_TOOL, POSED_SENTENCE_CAP, posedQuoteUsd, posedWorstUsd, posedStageUsd,
   posedFetch, enforceSfwBody, GLM_MODEL, FLUX_MODEL, BRIA_MODEL, RODIN_MODEL,
@@ -420,38 +420,101 @@ test("posed fetch does not pay when cancelled inside the queued payment callback
 
 const x402Headers = { "content-type": "application/json", "x-x402": "true" };
 
-test("an invoice with no USD price is refused before payment and is not treated as free", async () => {
-  let paid = 0;
-  const budget = openBudget(2);
-  const fetchImpl = posedFetch({
-    stages: { mesh: 0.48 },
-    budget,
-    payment: () => { paid += 1; },
-    fetch: async () => new Response(JSON.stringify({
-      payment: { paymentId: "payU", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", completeUrl: "http://x/api/x402/complete/payU" }] },
-    }), { status: 402, headers: { "content-type": "application/json" } }),
-  });
-  await assert.rejects(fetchImpl("http://x/api/generate-video", {
-    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
-  }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true && e.code !== "budget-skip");
-  assert.equal(paid, 0);
-  assert.equal(budget.metered, 0);
-  assert.equal(fetchImpl.ledger.unreportedUsd, 0);
-  for (const bad of ["", "  ", "nope"]) {
-    const again = posedFetch({
-      stages: { mesh: 0.48 },
-      budget: openBudget(2),
+const ONE_XNO = "1" + "0".repeat(30);
+const BAD_USD = [
+  ["''", ""],
+  ["whitespace", "   "],
+  ["false", false],
+  ["[]", []],
+  ["null", null],
+  ["missing", undefined],
+];
+
+function rawInvoice(id, usd) {
+  const accepted = {
+    scheme: "nano",
+    payTo: "nano_1stub",
+    maxAmountRequired: ONE_XNO,
+    completeUrl: "http://x/api/x402/complete/" + id,
+  };
+  if (usd !== undefined) accepted.maxAmountRequiredUSD = usd;
+  return { payment: { paymentId: id, accepted: [accepted] } };
+}
+
+test("a malformed USD price is not paid, even for a 1 XNO invoice on a tiny budget", async () => {
+  for (const [label, usd] of BAD_USD) {
+    let paid = 0;
+    const budget = openBudget(0.01);
+    const fetchImpl = posedFetch({
+      stages: { mesh: 0.001 },
+      budget,
       payment: () => { paid += 1; },
-      fetch: async () => new Response(JSON.stringify({
-        payment: { paymentId: "payBlank", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: bad, completeUrl: "http://x/api/x402/complete/payBlank" }] },
-      }), { status: 402, headers: { "content-type": "application/json" } }),
+      fetch: async () => new Response(JSON.stringify(rawInvoice("pay-" + label, usd)), {
+        status: 402, headers: { "content-type": "application/json" },
+      }),
     });
-    await assert.rejects(again("http://x/api/generate-video", {
+    await assert.rejects(fetchImpl("http://x/api/generate-video", {
       method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
-    }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true);
-    assert.equal(again.ledger.paidIds.size, 0);
+    }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true && e.code !== "budget-skip");
+    assert.equal(paid, 0, label);
+    assert.equal(budget.metered, 0, label);
+    assert.equal(fetchImpl.ledger.paidIds.size, 0, label);
+    assert.equal(fetchImpl.ledger.unreportedUsd, 0, label);
   }
-  assert.equal(paid, 0, "a blank or non-numeric price is not a free invoice");
+});
+
+test("an explicit budget parses, and a $0.01 invoice is refused before payment", async () => {
+  for (const budgetUsd of ["1e-3", ".001", "0.001", 0.001]) {
+    let paid = 0;
+    const budget = openBudget(budgetUsd);
+    assert.equal(budget.quote, 0.001, String(budgetUsd));
+    assert.equal(settledCharge(1, budgetUsd), 0.001, String(budgetUsd));
+    assert.ok(Math.abs(meteredWithinQuote(1, budgetUsd) - 0.001 / 1.2) < 1e-12, String(budgetUsd));
+    const fetchImpl = posedFetch({
+      stages: { mesh: 0.0001 },
+      budget,
+      payment: () => { paid += 1; },
+      fetch: async () => new Response(JSON.stringify(invoice("payCap", 0.01)), {
+        status: 402, headers: { "content-type": "application/json" },
+      }),
+    });
+    await assert.rejects(fetchImpl("http://x/api/generate-video", {
+      method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+    }), (e) => e && e.budgetRefused === true && e.paymentNotSent === true && e.unknownPrice !== true);
+    assert.equal(paid, 0, String(budgetUsd));
+    assert.equal(budget.metered, 0, String(budgetUsd));
+    assert.equal(fetchImpl.ledger.paidIds.size, 0, String(budgetUsd));
+    assert.equal(fetchImpl.ledger.unreportedUsd, 0, String(budgetUsd));
+  }
+  assert.throws(() => openBudget("nope"), (e) => e && e.budgetRefused === true);
+  assert.throws(() => settledCharge(1, "nope"), (e) => e && e.budgetRefused === true);
+  assert.equal(settledCharge(1, null), 1.2);
+});
+
+test("an explicit USD 0 is a known price and is paid", async () => {
+  for (const usd of [0, "0", "0.00"]) {
+    let paid = 0;
+    const fetchImpl = posedFetch({
+      stages: { mesh: 0.001 },
+      budget: openBudget(0.01),
+      payment: () => { paid += 1; },
+      fetch: async (url) => {
+        if (String(url).includes("/complete/")) {
+          return new Response(JSON.stringify({ runId: "ok", x_nanogpt_pricing: { costUsd: 0 } }), {
+            status: 200, headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(rawInvoice("payZero", usd)), {
+          status: 402, headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const r = await fetchImpl("http://x/api/generate-video", {
+      method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+    });
+    assert.equal(r.status, 200, String(usd));
+    assert.equal(paid, 1, String(usd));
+  }
 });
 
 test("an invoice that does not fit at the 1.2 markup is refused, and an accepted invoice counts immediately", async () => {
@@ -482,6 +545,50 @@ test("an invoice that does not fit at the 1.2 markup is refused, and an accepted
   assert.equal(paid, 1);
   release();
   await first;
+});
+
+test("two invoices that each fit the budget alone cannot both be paid", async () => {
+  let paid = 0;
+  let releasePay;
+  const payGate = new Promise((r) => { releasePay = r; });
+  let arrived = 0;
+  let releaseFetch;
+  const fetchGate = new Promise((r) => { releaseFetch = r; });
+  const budget = openBudget(0.10);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.01, image: 0.01 },
+    budget,
+    payment: () => { paid += 1; return payGate; },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ runId: "run-1", x_nanogpt_pricing: { costUsd: 0.05 } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      arrived += 1;
+      if (arrived === 2) releaseFetch();
+      else await fetchGate;
+      const model = JSON.parse(init.body).model;
+      const id = model === RODIN_MODEL ? "payA" : "payB";
+      return new Response(JSON.stringify(invoice(id, 0.05)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  const mesh = fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+  });
+  const image = fetchImpl("http://x/v1/images/generations", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: FLUX_MODEL }),
+  });
+  const settledP = Promise.allSettled([mesh, image]);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(paid, 1);
+  assert.ok(Math.abs(budget.metered - 0.05) < 1e-9, `committed ${budget.metered}`);
+  releasePay();
+  const settled = await settledP;
+  const rejected = settled.filter((s) => s.status === "rejected");
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.budgetRefused, true);
+  assert.equal(paid, 1);
 });
 
 test("a paid replay resends the exact billed body, and a later retry cannot replace it", async () => {
@@ -540,6 +647,112 @@ test("the same paymentId is reserved once, and a second request cannot overwrite
   assert.equal(fetchImpl.ledger.bodies.get("payOnce"), firstBody);
   release();
   await first;
+});
+
+test("a synchronous paymentNotSent throw restores the budget so a later stage can pay", async () => {
+  let paid = 0;
+  const budget = openBudget(0.10);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.01, image: 0.01 },
+    budget,
+    payment(inv) {
+      if (inv.paymentId === "paySync") {
+        const e = new Error("wallet refused");
+        e.paymentNotSent = true;
+        throw e;
+      }
+      paid += 1;
+    },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ runId: "ok", x_nanogpt_pricing: { costUsd: 0.05 } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      const model = JSON.parse(init.body).model;
+      const id = model === RODIN_MODEL ? "paySync" : "payLater";
+      return new Response(JSON.stringify(invoice(id, 0.05)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  await assert.rejects(fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+  }), (e) => e && e.paymentNotSent === true && /wallet refused/.test(e.message));
+  assert.equal(paid, 0);
+  assert.equal(budget.metered, 0);
+  assert.equal(fetchImpl.ledger.paidIds.size, 0);
+  assert.equal(fetchImpl.ledger.unreportedUsd, 0);
+  assert.equal(fetchImpl.ledger.reconcile.length, 0);
+  assert.equal(fetchImpl.ledger.costUnknown, false);
+  const r = await fetchImpl("http://x/v1/images/generations", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: FLUX_MODEL }),
+  });
+  assert.equal(r.status, 200);
+  assert.equal(paid, 1);
+  assert.ok(Math.abs(budget.metered - 0.05) < 1e-9);
+});
+
+test("a synchronous throw without paymentNotSent keeps the reservation", async () => {
+  let paid = 0;
+  const budget = openBudget(0.10);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.01, image: 0.01 },
+    budget,
+    payment(inv) {
+      if (inv.paymentId === "payAmb") throw new Error("rpc down");
+      paid += 1;
+    },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ runId: "ok", x_nanogpt_pricing: { costUsd: 0.05 } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      const model = JSON.parse(init.body).model;
+      const id = model === RODIN_MODEL ? "payAmb" : "payNext";
+      return new Response(JSON.stringify(invoice(id, 0.05)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  await assert.rejects(fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+  }), /rpc down/);
+  assert.equal(fetchImpl.ledger.paidIds.has("payAmb"), true);
+  assert.equal(fetchImpl.ledger.costUnknown, true);
+  assert.ok(fetchImpl.ledger.unreportedUsd > 0);
+  assert.ok(Math.abs(budget.metered - 0.05) < 1e-9);
+  await assert.rejects(fetchImpl("http://x/v1/images/generations", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: FLUX_MODEL }),
+  }), (e) => e && e.budgetRefused === true && e.paymentNotSent === true);
+  assert.equal(paid, 0);
+  assert.equal(fetchImpl.ledger.paidIds.has("payAmb"), true);
+});
+
+test("an error after payment returns keeps the reservation even with paymentNotSent", async () => {
+  const budget = openBudget(0.10);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.01, image: 0.01 },
+    budget,
+    payment: () => {},
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        const e = new Error("complete failed");
+        e.paymentNotSent = true;
+        throw e;
+      }
+      const model = JSON.parse(init.body).model;
+      const id = model === RODIN_MODEL ? "paySent" : "payNext";
+      return new Response(JSON.stringify(invoice(id, 0.05)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  await assert.rejects(fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+  }), (e) => e && e.paymentNotSent === true && /complete failed/.test(e.message));
+  assert.equal(fetchImpl.ledger.paidIds.has("paySent"), true);
+  assert.equal(fetchImpl.ledger.costUnknown, true);
+  assert.ok(fetchImpl.ledger.unreportedUsd > 0);
+  assert.ok(Math.abs(budget.metered - 0.05) < 1e-9);
+  await assert.rejects(fetchImpl("http://x/v1/images/generations", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: FLUX_MODEL }),
+  }), (e) => e && e.budgetRefused === true);
 });
 
 test("a payment error records the invoice and costUnknown before it rejects", async () => {

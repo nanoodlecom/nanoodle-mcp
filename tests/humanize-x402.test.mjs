@@ -450,6 +450,41 @@ test("humanize checks cancellation inside the queued payment callback", async ()
   assert.equal(hf.state.attempts.at(-1).paymentStarted, false);
 });
 
+test("a malformed USD price never calls payment, and an explicit 0 does", async () => {
+  const bad = [
+    ["''", ""],
+    ["whitespace", "   "],
+    ["false", false],
+    ["[]", []],
+    ["null", null],
+    ["missing", undefined],
+  ];
+  for (const [label, usd] of bad) {
+    let paid = 0;
+    const accepted = { scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1" + "0".repeat(30), completeUrl: "http://x/api/x402/complete/payBad" };
+    if (usd !== undefined) accepted.maxAmountRequiredUSD = usd;
+    const hf = humanizeFetch({
+      record: REC, draft: "", payment: () => { paid += 1; },
+      fetch: async () => new Response(JSON.stringify({ payment: { paymentId: "payBad", accepted: [accepted] } }), { status: 402, headers: { "content-type": "application/json" } }),
+    });
+    await assert.rejects(hf.fetch(CHAT, xreq("a")), (e) => e && e.unknownPrice === true && e.paymentNotSent === true);
+    assert.equal(paid, 0, label);
+    assert.equal(hf.state.paidIds.size, 0, label);
+    assert.equal(hf.state.costUnknown, false, label);
+  }
+  let paid = 0;
+  const hf = humanizeFetch({
+    record: REC, draft: "", payment: async () => { paid += 1; },
+    fetch: async (u) => {
+      if (/complete\//.test(u)) return okRes("from a", 0);
+      return new Response(JSON.stringify({ payment: { paymentId: "pay0", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: 0, completeUrl: "http://x/api/x402/complete/pay0" }] } }), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  const r = await hf.fetch(CHAT, xreq("a"));
+  assert.equal((await r.json()).choices[0].message.content, "from a");
+  assert.equal(paid, 1);
+});
+
 test("an invoice with no USD price is refused before payment and does not fall back", async () => {
   const seen = [];
   let paid = 0;
@@ -533,6 +568,52 @@ test("the same paymentId is reserved once, and a second request cannot overwrite
   });
   assert.notEqual(seen[0], JSON.stringify({ model: "a", messages: [{ role: "user", content: "CHANGED" }] }));
   assert.ok(seen[0] === firstBody || seen[0] === secondBody);
+});
+
+test("an x-cost of 1e-7 is a known price, and a leading-dot cost is too", async () => {
+  for (const [header, expectUsd] of [["1e-7", 1e-7], [".001", 0.001], ["0.001", 0.001]]) {
+    const hf = humanizeFetch({
+      record: REC, draft: "",
+      fetch: async () => new Response(JSON.stringify({ choices: [{ message: { content: "hi" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json", "x-cost": header },
+      }),
+    });
+    const r = await hf.fetch(CHAT, xreq("a"));
+    assert.equal(r.status, 200, header);
+    assert.equal(hf.state.attempts.at(-1).usd, expectUsd, header);
+    assert.equal(hf.state.costUnknown, false, header);
+  }
+});
+
+test("a synchronous paymentNotSent throw releases the paymentId and a later attempt can pay", async () => {
+  let paid = 0;
+  const hf = humanizeFetch({
+    record: REC, draft: "",
+    payment() {
+      paid += 1;
+      if (paid === 1) {
+        const e = new Error("wallet refused");
+        e.paymentNotSent = true;
+        throw e;
+      }
+    },
+    fetch: async (u) => {
+      if (/complete\//.test(String(u))) return okRes("from a");
+      return inv402("paySync");
+    },
+  });
+  await assert.rejects(hf.fetch(CHAT, xreq("a")), (e) => e && e.paymentNotSent === true && /wallet refused/.test(e.message));
+  assert.equal(paid, 1);
+  assert.equal(hf.state.paidIds.size, 0);
+  assert.equal(hf.state.costUnknown, false);
+  assert.equal(hf.state.unreportedUsd, 0);
+  assert.deepEqual(hf.state.reconcile, []);
+  const r = await hf.fetch(CHAT, xreq("a"));
+  assert.equal((await r.json()).choices[0].message.content, "from a");
+  assert.equal(paid, 2);
+  assert.equal(hf.state.paidIds.has("paySync"), true);
+  assert.equal(hf.state.costUnknown, false);
 });
 
 test("a payment error records the invoice and costUnknown before it rejects", async () => {

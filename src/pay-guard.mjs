@@ -7,6 +7,7 @@
  * and again inside the microtask, before payment() runs.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { strictUsd } from "nanoodle";
 
 /** Slack on top of worst-case cost × 1.2. The quote is ceil(charge × 1.12) to 1e-8 USD. */
 export const DEPOSIT_MARGIN = 0.12;
@@ -37,11 +38,31 @@ export function depositFromCharge(charge) {
   return ceilUsd(charge * (1 + DEPOSIT_MARGIN));
 }
 
+/**
+ * An explicit budget. null/undefined means no budget was set.
+ * A value that does not parse is refused — it is not "no limit".
+ * Returns the same non-negative number Number() would have produced for a
+ * decimal or exponent, including 0.
+ */
+function readBudget(quote) {
+  if (quote == null) return null;
+  const n = strictUsd(quote);
+  if (n == null) {
+    const e = new Error("budget is not a usable USD amount");
+    e.code = "budget-skip";
+    e.paymentNotSent = true;
+    e.budgetRefused = true;
+    throw e;
+  }
+  return n;
+}
+
 /** What the payer is charged. Metered × 1.2, and never more than the quoted deposit. */
 export function settledCharge(metered, quote) {
-  const raw = (Number(metered) > 0 && Number.isFinite(Number(metered)) ? Number(metered) : 0) * SETTLE_MARKUP;
-  const cap = Number(quote);
-  if (!(cap > 0) || !Number.isFinite(cap)) return raw;
+  const m = strictUsd(metered);
+  const raw = (m == null ? 0 : m) * SETTLE_MARKUP;
+  const cap = readBudget(quote);
+  if (cap == null || !(cap > 0)) return raw;
   return Math.min(raw, cap);
 }
 
@@ -51,22 +72,26 @@ export function settledCharge(metered, quote) {
  * would exceed it; clamping here makes the charge min(metered × 1.2, quote).
  */
 export function meteredWithinQuote(metered, quote) {
-  const m = Number(metered) > 0 && Number.isFinite(Number(metered)) ? Number(metered) : 0;
-  const cap = Number(quote);
-  if (!(cap > 0) || !Number.isFinite(cap)) return m;
-  return Math.min(m, cap / SETTLE_MARKUP);
+  const m = strictUsd(metered);
+  const known = m == null ? 0 : m;
+  const cap = readBudget(quote);
+  if (cap == null || !(cap > 0)) return known;
+  return Math.min(known, cap / SETTLE_MARKUP);
 }
 
 /** Remaining deposit while a run is in flight. `fits` is the pre-stage check. */
 export function openBudget(quote) {
   let metered = 0;
-  const cap = Number(quote) > 0 && Number.isFinite(Number(quote)) ? Number(quote) : 0;
+  // An explicit budgetUsd that does not parse throws. It does not become an unlimited cap.
+  const parsed = readBudget(quote);
+  const cap = parsed != null && parsed > 0 ? parsed : 0;
   return {
     quote: cap,
     get metered() { return metered; },
     remaining() { return cap - metered * SETTLE_MARKUP; },
     fits(stageSettled) {
-      const need = Number(stageSettled) > 0 ? Number(stageSettled) : 0;
+      const need = strictUsd(stageSettled);
+      if (need == null) return false;
       return need <= this.remaining() + 1e-9;
     },
     add(usd) {
@@ -80,16 +105,22 @@ export function openBudget(quote) {
 }
 
 /**
- * A known invoice price, in USD. Null, a blank, and a non-finite value are
- * unknown. They are not zero: a missing price must not look free.
+ * A known invoice price, in USD. The raw type is checked before conversion.
+ * A finite number, or trimmed decimal / exponent text (including a leading
+ * dot), is a price. A blank, whitespace, false, an array, null, a missing
+ * value, NaN, Infinity, and a negative are unknown, not 0. An explicit 0 is known.
  */
 export function knownInvoiceUsd(amount) {
-  if (typeof amount === "number") return Number.isFinite(amount) && amount >= 0 ? amount : null;
-  if (typeof amount === "string" && amount.trim() !== "") {
-    const n = Number(amount);
-    return Number.isFinite(n) && n >= 0 ? n : null;
-  }
-  return null;
+  return strictUsd(amount);
+}
+
+/**
+ * Run payment(inv) so a synchronous throw and a rejected promise reject the
+ * same promise. Promise.resolve(payment(inv)) does not: the throw happens
+ * before Promise.resolve, and a rejection handler never sees it.
+ */
+export function callPayment(payment, inv) {
+  return Promise.resolve().then(() => payment(inv));
 }
 
 /**

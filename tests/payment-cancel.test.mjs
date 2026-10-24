@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { NanoClient, parseNanoInvoice } from "nanoodle";
+import { NanoClient, parseNanoInvoice, strictUsd } from "nanoodle";
 import { beginPayment } from "../src/pay-guard.mjs";
 
 const INVOICE = {
@@ -106,34 +106,85 @@ test("NanoClient still pays a live invoice exactly once", async () => {
 });
 
 function invoiceBody(id, usd) {
-  const accepted = { scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", completeUrl: "http://x/api/x402/complete/" + id };
+  const accepted = {
+    scheme: "nano",
+    payTo: "nano_1stub",
+    maxAmountRequired: "1" + "0".repeat(30),
+    completeUrl: "http://x/api/x402/complete/" + id,
+  };
   if (usd !== undefined) accepted.maxAmountRequiredUSD = usd;
   return { payment: { paymentId: id, accepted: [accepted] } };
 }
 
-test("a blank or missing USD price is unknown, and an explicit 0 is not", () => {
-  assert.equal(parseNanoInvoice(invoiceBody("a"), "http://x").amountUsd, null);
-  assert.equal(parseNanoInvoice(invoiceBody("b", ""), "http://x").amountUsd, null);
-  assert.equal(parseNanoInvoice(invoiceBody("c", "  "), "http://x").amountUsd, null);
-  assert.equal(parseNanoInvoice(invoiceBody("d", "nope"), "http://x").amountUsd, null);
-  assert.equal(parseNanoInvoice(invoiceBody("e", 0), "http://x").amountUsd, 0);
-  assert.equal(parseNanoInvoice(invoiceBody("f", "0.48"), "http://x").amountUsd, 0.48);
+const BAD_USD = [
+  ["''", ""],
+  ["whitespace", "   "],
+  ["false", false],
+  ["[]", []],
+  ["null", null],
+  ["missing", undefined],
+];
+
+test("a malformed USD price stays unknown, and an explicit 0 stays 0", () => {
+  for (const [label, usd] of BAD_USD) {
+    assert.equal(parseNanoInvoice(invoiceBody("bad-" + label, usd), "http://x").amountUsd, null, label);
+    assert.equal(strictUsd(usd), null, label);
+  }
+  assert.equal(parseNanoInvoice(invoiceBody("z", 0), "http://x").amountUsd, 0);
+  assert.equal(parseNanoInvoice(invoiceBody("z0", "0"), "http://x").amountUsd, 0);
+  assert.equal(parseNanoInvoice(invoiceBody("z00", "0.00"), "http://x").amountUsd, 0);
+  assert.equal(parseNanoInvoice(invoiceBody("ok", "  0.48  "), "http://x").amountUsd, 0.48);
+  for (const [text, n] of [["1e-3", 0.001], [".001", 0.001], ["0.001", 0.001], ["1e-7", 1e-7], ["2.5e-3", 0.0025], ["  1E-7 ", 1e-7]]) {
+    assert.equal(strictUsd(text), n, text);
+    assert.equal(parseNanoInvoice(invoiceBody("exp", text), "http://x").amountUsd, n, text);
+  }
+  assert.equal(strictUsd(0.001), 0.001);
+  for (const bad of [NaN, Infinity, -Infinity, -1, "-1", "-1e-3", "1abc", "abc", "0x10", "1e", ".", "Infinity", "NaN", true, {}]) {
+    assert.equal(strictUsd(bad), null, JSON.stringify(bad));
+  }
 });
 
-test("NanoClient refuses an invoice with no USD price before paying", async () => {
+test("NanoClient does not pay a 1 XNO invoice whose USD price is malformed", async () => {
+  for (const [label, usd] of BAD_USD) {
+    let paid = 0;
+    const client = new NanoClient({
+      baseUrl: "http://x",
+      payment: () => { paid += 1; },
+      fetch: async () => new Response(JSON.stringify(invoiceBody("pay-" + label, usd)), {
+        status: 402, headers: { "content-type": "application/json" },
+      }),
+    });
+    await assert.rejects(client._paidFetch("http://x/api/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-x402": "true" },
+      body: "{\"model\":\"m\"}",
+    }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true && e.costUnknown !== true);
+    assert.equal(paid, 0, label);
+    assert.equal(client._paidIds.size, 0, label);
+  }
+});
+
+test("NanoClient pays an explicit USD 0", async () => {
   let paid = 0;
   const client = new NanoClient({
     baseUrl: "http://x",
-    payment: () => { paid += 1; },
-    fetch: async () => new Response(JSON.stringify(invoiceBody("payU", "")), { status: 402, headers: { "content-type": "application/json" } }),
+    payment: async () => { paid += 1; },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(invoiceBody("pay0", 0)), { status: 402, headers: { "content-type": "application/json" } });
+    },
   });
-  await assert.rejects(client._paidFetch("http://x/api/v1/chat/completions", {
+  const r = await client._paidFetch("http://x/api/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json", "x-x402": "true" },
     body: "{\"model\":\"m\"}",
-  }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true && e.costUnknown !== true);
-  assert.equal(paid, 0);
-  assert.equal(client._paidIds.size, 0);
+  });
+  assert.equal(r.status, 200);
+  assert.equal(paid, 1);
 });
 
 test("NanoClient resends the exact billed body on a paid retry", async () => {
@@ -204,6 +255,62 @@ test("NanoClient reserves one paymentId inside the payment callback and keeps th
   assert.match(rejected[0].reason.message, /already paid/);
   assert.equal(client._billedBodies.get("payOnce"), stored);
   assert.equal(paid, 1);
+});
+
+test("NanoClient releases a paymentId when payment throws immediately with paymentNotSent", async () => {
+  let paid = 0;
+  const client = new NanoClient({
+    baseUrl: "http://x",
+    payment() {
+      paid += 1;
+      if (paid === 1) {
+        const e = new Error("wallet refused");
+        e.paymentNotSent = true;
+        throw e;
+      }
+    },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(invoiceBody("paySync", 0.01)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  const headers = { "content-type": "application/json", "x-x402": "true" };
+  const body = "{\"model\":\"m\"}";
+  await assert.rejects(client._paidFetch("http://x/api/v1/chat/completions", { method: "POST", headers, body }), (e) => {
+    assert.equal(e.paymentNotSent, true);
+    assert.notEqual(e.costUnknown, true);
+    return /wallet refused/.test(e.message);
+  });
+  assert.equal(paid, 1);
+  assert.equal(client._paidIds.size, 0);
+  const r = await client._paidFetch("http://x/api/v1/chat/completions", { method: "POST", headers, body });
+  assert.equal(r.status, 200);
+  assert.equal(paid, 2);
+  assert.equal(client._paidIds.has("paySync"), true);
+});
+
+test("a complete error after payment keeps the NanoClient reservation even with paymentNotSent", async () => {
+  const client = new NanoClient({
+    baseUrl: "http://x",
+    payment: () => {},
+    fetch: async () => {
+      const e = new Error("complete failed");
+      e.paymentNotSent = true;
+      throw e;
+    },
+  });
+  const response = new Response(JSON.stringify(invoiceBody("payKeep", 0.01)), { status: 402, headers: { "content-type": "application/json" } });
+  await assert.rejects(client._settle402(response, undefined, "{\"model\":\"m\"}"), (e) => {
+    assert.equal(e.paymentNotSent, true);
+    assert.equal(e.costUnknown, true);
+    assert.equal(e.reconcile.paymentId, "payKeep");
+    return /complete failed/.test(e.message);
+  });
+  assert.equal(client._paidIds.has("payKeep"), true);
 });
 
 test("NanoClient records costUnknown and the invoice before a payment error rejects", async () => {

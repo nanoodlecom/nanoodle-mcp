@@ -610,10 +610,24 @@ test("parseUsdNano is string-exact, handles exponents, truncates below 1e-9 USD"
   assert.equal(parseUsdNano(0.05), 50000000n);
   assert.equal(parseUsdNano("12"), 12000000000n);
   assert.equal(parseUsdNano(1e-7), 100n);
+  assert.equal(parseUsdNano("1e-7"), 100n);
   assert.equal(parseUsdNano("2.5e-3"), 2500000n);
+  assert.equal(parseUsdNano("1e-3"), parseUsdNano(0.001));
+  assert.equal(parseUsdNano(".001"), parseUsdNano("0.001"));
+  assert.equal(parseUsdNano(".001"), parseUsdNano(0.001));
+  assert.throws(() => parseUsdNano(NaN));
+  assert.throws(() => parseUsdNano(Infinity));
+  assert.throws(() => parseUsdNano("-1e-3"));
   assert.equal(parseUsdNano("0.0000000001"), 0n); // 1e-10 USD truncates
   assert.throws(() => parseUsdNano("-1"));
   assert.throws(() => parseUsdNano("abc"));
+  assert.throws(() => parseUsdNano(""));
+  assert.throws(() => parseUsdNano("   "));
+  assert.throws(() => parseUsdNano(false));
+  assert.throws(() => parseUsdNano([]));
+  assert.throws(() => parseUsdNano(null));
+  assert.equal(parseUsdNano(0), 0n);
+  assert.equal(parseUsdNano("0"), 0n);
 });
 
 test("already-pocketed payments are found via account_history", async () => {
