@@ -385,7 +385,20 @@ graph JSON:
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
 ```
 
-`usd` overrides the deposit. `author` routes **the 20% markup of every
+**humanize-comment** quotes each request on its own, instead of one flat deposit.
+The quote is built from the draft, context, and guidance actually sent, and
+from `maxChars` (the model's own output cap, when `maxChars` is omitted). It
+includes every writer, the fallback that can still be billed, up to three
+retries, the decider, and a second decider pass when a protected span can be
+repaired, priced at those models' per-token rates. That worst case plus the
+20% markup is the maximum charge for the request. The deposit is 12% above
+that charge, at least $0.001, rounded up, and it is never below the charge.
+A short comment is not asked for the longest comment's hold. The figure in
+the quote is the deposit taken for that call; the run still settles at the
+metered cost plus 20%, and the difference is returned. The graph's `usd` is
+only the ceiling for that longest request, used when a model has no price.
+
+`usd` overrides the deposit for every other tool. `author` routes **the 20% markup of every
 successful call to that address** — computed on what the run *actually* cost,
 never on the deposit, and capped by whatever the deposit has left once the cost
 is taken out (a deposit too small to cover cost + 20% pays the author only the

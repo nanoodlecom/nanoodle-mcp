@@ -110,6 +110,20 @@ export const REASK_TEXT = "Your last attempt copied the draft. Rewrite it in you
 
 export const codePoints = (s) => [...String(s ?? "")].length;
 
+/**
+ * Writer output tokens a request can be billed for. The graph's maxTokens is
+ * the API cap. When the caller sets maxChars, the request is sent with
+ * max_tokens lowered to one token per allowed character (still not above the
+ * graph cap), so the bill cannot exceed that length. Omitted maxChars keeps
+ * the graph cap.
+ */
+export function writerOutputTokenCap(graphCap, maxChars) {
+  const cap = Math.max(1, Math.floor(Number(graphCap) || 600));
+  const limit = Number(maxChars);
+  if (!Number.isFinite(limit) || limit <= 0) return cap;
+  return Math.max(1, Math.min(cap, Math.ceil(limit)));
+}
+
 /** Guidance length toward the cap: a leading ONE_THREAD_PREFIX is not counted. */
 export function guidanceUnits(s) {
   const t = String(s ?? "");
@@ -872,6 +886,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const note = writerNote(state.spans, state.ending, state.maxChars);
     const seenDraft = writerDraft || draft;
     if (note || (writerDraft && writerDraft !== draft)) body = annotateWriterBody(body, draft, seenDraft, note);
+    // The deposit prices this cap. Sending it keeps a short maxChars from being billed at the graph's 600-token max.
+    if (state.maxChars) body = { ...body, max_tokens: writerOutputTokenCap(body.max_tokens, state.maxChars) };
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
     let usd = 0, usdKnown = true; // this logical call: every attempt's cost

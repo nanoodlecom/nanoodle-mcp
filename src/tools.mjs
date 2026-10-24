@@ -18,6 +18,7 @@ import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
+import { humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -842,6 +843,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         inputSchema: buildInputSchema(wf),
         // humanize-comment: input caps + writer record + exact ranked texts (src/humanize.mjs)
         humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph) : null,
+        // Quoted per request from length and maxChars. The gate reads quoteDeposit.
+        pricedPerRequest: name === HUMANIZE_TOOL,
       });
     }
   }
@@ -902,8 +905,21 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     costs,
     /** Up-front per-run cost forecasts by tool name (attachEstimates fills this) — the gate quotes off it before a tool has ever run. */
     estimates: {},
+    /** Public catalogs, filled by attachCatalogs. Humanize quotes read prices from here. */
+    catalogs: {},
     /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
     onToolsChanged: null,
+
+    /**
+     * Per-request deposit in USD, or null when this tool quotes the usual way.
+     * Humanize uses the request's own length and maxChars. A missing model
+     * price returns null so the gate keeps the pinned ceiling.
+     */
+    quoteDeposit(name, args) {
+      const tool = tools.find((t) => t.name === name);
+      if (!tool || !tool.pricedPerRequest) return null;
+      return humanizeDepositUsd(tool.wf.graph, args, { prices: humanizePriceTable(registry.catalogs) });
+    },
 
     listTools() {
       // run_noodle is always available, alongside one tool per saved graph.

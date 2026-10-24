@@ -103,6 +103,8 @@ export function hashArgs(name, args) {
 }
 
 const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\.\d\d\d*?)0+$/, "$1");
+/** Exact deposit figure (up to 8 decimals, trailing zeros trimmed) so the quote text matches the amount collected. */
+const exactUsd = (n) => "$" + Number(n).toFixed(8).replace(/(\.\d*?)0+$/, "$1");
 
 /**
  * @param {object} opts
@@ -757,7 +759,7 @@ export function createChargeGate({
     // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const text =
-      `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
+      `PAYMENT REQUIRED — this tool takes a ${exactUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
       `This call is done — hang up. On this payment link, do BOTH of these now:\n` +
       `1. Show your user ONLY this payment link (QR to scan; green check when paid). Do not show them any other URL or the wallet address:\n` +
@@ -878,20 +880,35 @@ export function createChargeGate({
        * the operator eats the difference (see settle()).
        *
        * Precedence:
-       *   1. A graph's own x402.usd is pinned and always wins.
-       *   2. Otherwise quote off the largest of two cost signals — an UP-FRONT
+       *   1. A tool with a per-request quote (registry.quoteDeposit) uses that
+       *      for the call in front of it. humanize-comment prices its own
+       *      length and maxChars this way. The graph's x402.usd stays the
+       *      cold ceiling for tools/list and for a quote that cannot be priced.
+       *   2. Otherwise a graph's own x402.usd is pinned and wins.
+       *   3. Otherwise quote off the largest of two cost signals — an UP-FRONT
        *      catalog forecast (registry.estimates, valid before the tool has ever
        *      run) and the worst metered cost actually seen (registry.costs, a live
        *      high-water mark) — times a safety multiplier for run-to-run variance:
        *      1.25× when the cost is deterministic (image only), 2× otherwise.
-       *   3. With no signal at all (never run, uncatalogued), fall back to the flat
+       *   4. With no signal at all (never run, uncatalogued), fall back to the flat
        *      --charge-usd opening deposit.
        *
        * --charge-usd is the cold-start deposit, NOT a ceiling: expensive graphs
        * quote what they actually cost (change still returns the slack), so the
        * operator stops absorbing overages on video / multi-step tools.
+       *
+       * `args` is the call being quoted. Omit it for the cold figure (the pin,
+       * or the opening deposit) used by tools/list and the startup check.
        */
-      const priceFor = (name) => {
+      const priceFor = (name, args) => {
+        if (args && registry.quoteDeposit) {
+          try {
+            const quoted = registry.quoteDeposit(name, args);
+            if (Number.isFinite(quoted) && quoted > 0) return quoted;
+          } catch (e) {
+            log(`warning: ${name} per-request deposit failed (${e.message}); using the pinned deposit`);
+          }
+        }
         const pin = pinned.get(name);
         if (pin) return pin;
         const rec = registry.costs && registry.costs[name];
@@ -1012,10 +1029,17 @@ export function createChargeGate({
         registry.listTools()
           .filter((t) => t.name !== runNoodleName)
           .map((t) => {
+            const full = registry.tools.find((x) => x.name === t.name);
             const price = priceFor(t.name);
+            // Per-request tools have no single figure to advertise. The quote
+            // for the call is the amount collected. No payment rail in this line:
+            // it is the text agents show before a quote exists.
+            const depositLine = full && full.pricedPerRequest
+              ? "a deposit is quoted for each request from its length and maxChars and covers the most that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned"
+              : `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
-              `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
+              depositLine) +
               (authors.get(t.name) ? " The 20% markup goes to the graph's author." : "");
             const inputSchema = {
               ...t.inputSchema,
@@ -1052,7 +1076,6 @@ export function createChargeGate({
         const { _payment_id, ...args } = rawArgs;
         const name = params.name;
         const argsHash = hashArgs(name, args);
-        const price = priceFor(name);
 
         let q;
         if (_payment_id == null) {
@@ -1065,6 +1088,9 @@ export function createChargeGate({
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
           if (validate) await validate({ name, arguments: args });
+          // After validation, so the quote is for a call that will run and matches
+          // the arguments the caller will pay for.
+          const price = priceFor(name, args);
           const pair = await ratePair();
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),

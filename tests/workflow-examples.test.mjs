@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
 import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, REASK_TEXT, MAX_REASKS, ONE_THREAD_PREFIX, placeholderBudget } from "../src/humanize.mjs";
+import { humanizeCeilingDepositUsd, HUMANIZE_DEPOSIT_MARGIN } from "../src/humanize-deposit.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -203,9 +204,10 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // no reviewed, published sample yet, so no example line or card
     assert.doesNotMatch(tool.description, /Example:/);
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
-    // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
-    assert.equal(mounted.x402.usd.toFixed(8), "0.01963166");
-    // The runtime deposit is the bounded worst case, read from this graph's x402.usd.
+    // x402.usd is the cold ceiling (longest request, after the margin). A call quotes
+    // less when its own draft, context, guidance, and maxChars cost less.
+    assert.equal(mounted.x402.usd.toFixed(8), "0.02198746");
+    // The ceiling is the bounded worst case plus the deposit margin.
     // Every writer at its 600-token cap, inputs + system prompts at 3 characters per token.
     // The first decider reads the Guidance and five 600-token rewrites and replies at its
     // 1600-token cap. Writer C is the worse of Cydonia alone or a billed-but-timed-out
@@ -222,7 +224,8 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // At the counted Guidance cap with no keep and no repair: $0.01061120 with no re-ask
     // and $0.01322120 with 3 re-asks, after the 20% markup.
     // The deposit equals the extreme: uncounted one-thread prefix, the capped placeholder
-    // note, 3 guard retries, both deciders. That is $0.01963166.
+    // note, 3 guard retries, both deciders. That charge is $0.01963166.
+    // The deposit adds 12% and rounds up, so the ceiling recorded on the graph is $0.02198746.
     // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
     // pays no change or author payout, and the operator absorbs the provider cost above it.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
@@ -279,8 +282,13 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const longLabel = Math.max(...["k2", "k3", "k4", "k5", "k6"].map((k) => bytes(byId.get(k).fields.sep)));
     const reviewX = ((bytes(judge.fields.system) + Draft + Context + gExtreme + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel) / CPT + W + Draft / CPT) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
     const worst = (baseX + reaskX + judgeX + reviewX) / 1e6 * 1.2;
-    assert.equal(worst.toFixed(8), "0.01963166", "the bounded worst case");
-    assert.equal(mounted.x402.usd.toFixed(8), worst.toFixed(8), "the runtime deposit equals the bounded worst case");
+    assert.equal(worst.toFixed(8), "0.01963166", "the bounded worst case, before the margin");
+    const ceiling = humanizeCeilingDepositUsd(graph);
+    assert.equal(ceiling.toFixed(8), "0.02198746");
+    assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);
+    assert.ok(ceiling >= worst, "the ceiling covers the worst-case charge");
+    assert.ok(ceiling <= worst * 1.15 + 1e-9, "the margin stays inside 15%");
+    assert.equal(mounted.x402.usd.toFixed(8), ceiling.toFixed(8), "the pinned ceiling is that deposit");
     assert.ok(worst <= mounted.x402.usd + 1e-12, `worst case $${worst} exceeds the deposit`);
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
