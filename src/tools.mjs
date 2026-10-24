@@ -970,7 +970,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const { onProgress, notices } = runNotices(tool.wf);
       // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
       // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
-      let runWf = tool.wf, hf = null, posedQuote = null;
+      let runWf = tool.wf, hf = null, posedQuote = null, fetchImpl = null;
       if (tool.humanize) {
         const args = params.arguments || {};
         const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
@@ -984,7 +984,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         const stored = paidDeposit.getStore();
         posedQuote = Number.isFinite(stored) && stored > 0 ? stored : posedQuoteUsd(tool.wf.graph, tool.wf.catalog);
         const budget = openBudget(posedQuote);
-        const fetchImpl = posedFetch({
+        fetchImpl = posedFetch({
           stages: posedStageUsd(tool.wf.graph, tool.wf.catalog),
           budget,
           fetch: globalThis.fetch,
@@ -1001,7 +1001,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         result = await runWf.run(inputs, { onProgress });
       } catch (e) {
         // A mesh the deposit could not cover is still a finished run: charge only what ran.
-        if (tool.name === POSED_TOOL && e && e.result && posedBudgetPartial(e.result)) result = e.result;
+        // So is a run that already reserved an invoice: the ledger names it, and the customer
+        // is charged that amount instead of being refunded for a payment that may have been sent.
+        const uncertain = tool.name === POSED_TOOL && fetchImpl && fetchImpl.ledger && (fetchImpl.ledger.costUnknown || fetchImpl.ledger.unreportedUsd > 0);
+        if (tool.name === POSED_TOOL && e && e.result && (posedBudgetPartial(e.result) || uncertain)) result = e.result;
         else throw describeRunFailure(e);
       }
       if (tool.humanize) {
@@ -1015,6 +1018,12 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       }
       if (tool.name === POSED_TOOL) {
         notices.push(...posedSkipNotes(result));
+        const ledger = fetchImpl && fetchImpl.ledger;
+        if (ledger && ledger.unreportedUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + ledger.unreportedUsd;
+        if (ledger && ledger.costUnknown) result.costExact = false;
+        if (ledger) for (const c of ledger.reconcile) {
+          notices.push(`note: payment ${c.paymentId} needs reconciling (${c.status}${c.ambiguous ? ", may or may not have been sent" : ""}).`);
+        }
         if (posedBudgetPartial(result)) harvestPosedOutputs(runWf, result);
         const metered = Number.isFinite(result.costUsd) ? result.costUsd : 0;
         result.costUsd = meteredWithinQuote(metered, posedQuote);

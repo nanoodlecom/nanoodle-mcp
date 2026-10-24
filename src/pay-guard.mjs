@@ -72,7 +72,97 @@ export function openBudget(quote) {
     add(usd) {
       if (typeof usd === "number" && Number.isFinite(usd) && usd > 0) metered += usd;
     },
+    /** Give back a reservation that was not sent. Never drops the total below zero. */
+    release(usd) {
+      if (typeof usd === "number" && Number.isFinite(usd) && usd > 0) metered = Math.max(0, metered - usd);
+    },
   };
+}
+
+/**
+ * A known invoice price, in USD. Null, a blank, and a non-finite value are
+ * unknown. They are not zero: a missing price must not look free.
+ */
+export function knownInvoiceUsd(amount) {
+  if (typeof amount === "number") return Number.isFinite(amount) && amount >= 0 ? amount : null;
+  if (typeof amount === "string" && amount.trim() !== "") {
+    const n = Number(amount);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  }
+  return null;
+}
+
+/**
+ * One synchronous payment decision. Call it inside the queued payment callback,
+ * with no await before it returns, so the check and the reservation cannot split
+ * across two requests. Refuses an unknown USD price, a paymentId already
+ * reserved, and an amount whose 1.2 markup does not fit the remaining budget.
+ * The first body stored for a paymentId is kept; a later request cannot replace it.
+ * The reservation counts against the budget before payment() runs.
+ */
+export function reserveInvoice({ signal, inv, bodyStr, paidIds, bodies, budget, stageLabel }) {
+  if (signal && signal.aborted) {
+    const e = new Error(signal.reason && signal.reason.message ? signal.reason.message : "cancelled before payment");
+    e.paymentNotSent = true;
+    e.cause = signal.reason;
+    throw e;
+  }
+  const id = inv && inv.paymentId ? String(inv.paymentId) : "";
+  if (!id || !inv.completeUrl) {
+    const e = new Error("payment required, but the 402 response offered no usable Nano option");
+    e.code = "x402";
+    e.paymentNotSent = true;
+    throw e;
+  }
+  if (typeof bodyStr === "string" && bodyStr.length && !bodies.has(id)) bodies.set(id, bodyStr);
+  if (paidIds.has(id)) {
+    const e = new Error(`x402 invoice ${id} was already paid; not paying it again`);
+    e.code = "x402";
+    e.paymentNotSent = true;
+    throw e;
+  }
+  const usd = knownInvoiceUsd(inv.amountUsd);
+  if (usd == null) {
+    const e = new Error("invoice has no USD price; not paying");
+    e.code = "x402";
+    e.paymentNotSent = true;
+    e.unknownPrice = true;
+    throw e;
+  }
+  if (budget && !budget.fits(usd * SETTLE_MARKUP)) {
+    const e = new Error(`remaining deposit cannot cover ${stageLabel || "this stage"}`);
+    e.code = "budget-skip";
+    e.paymentNotSent = true;
+    e.budgetRefused = true;
+    throw e;
+  }
+  paidIds.add(id);
+  if (budget && usd > 0) budget.add(usd);
+  return { id, usd, body: bodies.has(id) ? bodies.get(id) : bodyStr, committed: usd > 0 ? usd : 0 };
+}
+
+/** Undo a reservation that proved nothing was sent. */
+export function releaseInvoice({ id, usd, paidIds, budget }) {
+  if (id && paidIds) paidIds.delete(String(id));
+  if (budget && usd > 0 && typeof budget.release === "function") budget.release(usd);
+}
+
+/**
+ * Record a payment whose outcome is not known, then the caller rethrows.
+ * `inv` is the invoice parsed outside the try, so a throw still names it.
+ */
+export function noteUncertainPayment(ledger, inv, status) {
+  ledger.costUnknown = true;
+  const entry = {
+    paymentId: inv && inv.paymentId,
+    amountUsd: inv && inv.amountUsd,
+    ambiguous: true,
+    status,
+  };
+  ledger.reconcile.push(entry);
+  const usd = knownInvoiceUsd(inv && inv.amountUsd);
+  if (usd > 0) ledger.unreportedUsd += usd;
+  return entry;
 }
 
 /** bytes/3.5, rounded up, then the small token margin. */

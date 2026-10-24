@@ -53,7 +53,7 @@
  */
 import { ParamsError } from "./tools.mjs";
 import { parseNanoInvoice } from "nanoodle";
-import { beginPayment } from "./pay-guard.mjs";
+import { beginPayment, reserveInvoice, releaseInvoice } from "./pay-guard.mjs";
 
 export const HUMANIZE_TOOL = "humanize-comment";
 /** Hard caps in Unicode code points ([...s].length). */
@@ -127,6 +127,8 @@ export function failedBeforeSend(e, signal) {
  */
 export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS }) {
   const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, costUnknown: false };
+  // paymentId → the exact request string that invoice was issued for. The first body wins.
+  const billedBodies = new Map();
   let reasksLeft = maxReasks;
   const byModel = new Map();
   const dupes = new Set();
@@ -165,6 +167,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   const jsonResponse = (j, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
 
   const wrapped = async (url, init = {}) => {
+    const retryId = hdr(init && init.headers, "x-x402-payment-id");
+    if (retryId && billedBodies.has(String(retryId))) {
+      return fetch(url, { ...init, body: billedBodies.get(String(retryId)) });
+    }
     if (!/\/api\/v1\/chat\/completions(\?|$)/.test(String(url)) || !init || typeof init.body !== "string") return fetch(url, init);
     let body;
     try { body = JSON.parse(init.body); } catch { return fetch(url, init); }
@@ -195,19 +201,23 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         const raw = await r.text();
         let inv = null;
         try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
-        if (!inv || !inv.paymentId || !inv.completeUrl || state.paidIds.has(inv.paymentId)) {
+        if (!inv || !inv.paymentId || !inv.completeUrl) {
           rec.status = 402;
-          const e = new Error(inv && state.paidIds.has(inv.paymentId) ? `x402 invoice ${inv.paymentId} was already paid; not paying it again` : "payment required, but the 402 response offered no usable Nano option");
-          e.code = "x402"; throw e;
+          const e = new Error("payment required, but the 402 response offered no usable Nano option");
+          e.code = "x402";
+          e.paymentNotSent = true;
+          throw e;
         }
-        // Checked before the callback is queued, and again inside it. A cancel during
-        // r.text() above is already visible here; a cancel in the microtask gap is
-        // visible inside beginPayment. Neither path calls payment().
+        // Invoice stays in this scope for every catch below. The duplicate-id check,
+        // the unknown-price check, and the reservation happen together inside the callback.
+        let reserved = null;
         try {
           const paying = beginPayment(signal, () => {
+            reserved = reserveInvoice({
+              signal, inv, bodyStr, paidIds: state.paidIds, bodies: billedBodies, budget: null,
+            });
             if (commit) commit();
             rec.paymentId = inv.paymentId;
-            state.paidIds.add(inv.paymentId);
             // marked inside the callback, before the wallet call returns: a wallet can
             // send and still throw, so from here on this attempt counts as possibly paid
             // and is never followed by a fallback, unless the wallet error carries
@@ -229,6 +239,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         } catch (e) {
           // Not started, or the wallet proved nothing was sent: do not reconcile it as paid.
           if ((e && e.paymentNotSent === true) || !rec.paymentStarted) {
+            if (reserved) releaseInvoice({ id: reserved.id, usd: 0, paidIds: state.paidIds, budget: null });
             rec.paymentStarted = false;
             rec.status = "payment not sent";
             if (!(e && e.paymentNotSent === true) && e instanceof Error) e.paymentNotSent = true;
@@ -236,6 +247,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           }
           rec.paymentAmbiguous = true;
           rec.status = signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed";
+          state.costUnknown = true;
           state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: true, status: rec.status });
           throw e;
         }
@@ -255,8 +267,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
             let cj = null;
             try { cj = await cr.json(); } catch { cj = null; }
             if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { r = jsonResponse(cj); break; }
-            // settle-only receipt: replay THIS attempt's exact body, stamped with its own payment id
-            r = await fetch(url, { ...req, headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId } });
+            // settle-only receipt: replay the exact billed body, never a later rewrite of it
+            const replayBody = billedBodies.get(String(inv.paymentId)) || bodyStr;
+            r = await fetch(url, { ...req, body: replayBody, headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId } });
             if (r.status === 402) {
               rec.status = 402;
               const e = new Error(`payment ${inv.paymentId} settled, but the API still answered 402 on replay; not paying again`);

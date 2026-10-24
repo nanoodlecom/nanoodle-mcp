@@ -762,7 +762,7 @@ export function createChargeGate({
     // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const priceLine = toolDepositIsCap(q.tool)
-      ? `This deposit is a cap. The charge is min(the run's metered model cost × 1.2, this deposit). A stage the remaining deposit cannot cover is skipped and not billed. Change comes back to the paying wallet.`
+      ? `This deposit caps what the customer pays. The charge is the lesser of the metered model cost × 1.2 and this deposit, and the difference is returned. The operator absorbs any provider overrun. A stage the remaining deposit cannot cover is skipped and not billed. Direct-wallet spending has no cap.`
       : `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.`;
     const text =
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
@@ -1034,7 +1034,7 @@ export function createChargeGate({
           .map((t) => {
             const price = priceFor(t.name);
             const spend = depositCap(t.name) != null
-              ? `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — this deposit is a cap; the charge is min(metered cost × 1.2, this deposit); a stage the remaining deposit cannot cover is skipped and not billed; change returned; no account needed`
+              ? `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — this deposit caps what the customer pays; the charge is the lesser of the metered cost × 1.2 and this deposit; the operator absorbs any provider overrun; a stage the remaining deposit cannot cover is skipped and not billed; change returned. Direct-wallet spending has no cap`
               : `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,

@@ -162,14 +162,20 @@ test("the deposit is worst-case cost × 1.2 plus the margin, not the variant max
   });
   const wrapped = gate.wrapRegistry(registry);
   const listed = wrapped.listTools().find((x) => x.name === POSED_TOOL);
-  assert.match(listed.description, /this deposit is a cap/);
-  assert.match(listed.description, /min\(metered cost × 1\.2, this deposit\)/);
-  assert.match(listed.description, /skipped and not billed/);
+  assert.match(listed.description, /caps what the customer pays/);
+  assert.match(listed.description, /the operator absorbs any provider overrun/);
+  assert.match(listed.description, /Direct-wallet spending has no cap/);
   assert.match(listed.description, /posed and quad-meshed for rigging/);
   const quoted = await wrapped.callTool({ name: POSED_TOOL, arguments: {} });
   assert.equal(quoted.structuredContent.x402.amountUsd, quote);
-  assert.match(quoted.content[0].text, /This deposit is a cap/);
-  assert.match(quoted.content[0].text, /min\(the run's metered model cost × 1\.2, this deposit\)/);
+  assert.match(quoted.content[0].text, /This deposit caps what the customer pays/);
+  assert.match(quoted.content[0].text, /The operator absorbs any provider overrun/);
+  assert.match(quoted.content[0].text, /Direct-wallet spending has no cap/);
+  // The locked tier is standard. A catalog whose per_run is the variant maximum must not raise the quote.
+  const inflated = posedStageUsd(graph, {
+    model3d: [{ id: RODIN_MODEL, pricing: { per_run: 1.92, per_run_by_variant: { standard: 0.48, "extreme-high+highpack": 1.92 }, currency: "USD" } }],
+  });
+  assert.equal(inflated.mesh, 0.48);
 });
 
 test("a missing catalog still quotes the fallback deposit cap", async (t) => {
@@ -411,3 +417,175 @@ test("posed fetch does not pay when cancelled inside the queued payment callback
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(paid, 0);
 });
+
+const x402Headers = { "content-type": "application/json", "x-x402": "true" };
+
+test("an invoice with no USD price is refused before payment and is not treated as free", async () => {
+  let paid = 0;
+  const budget = openBudget(2);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.48 },
+    budget,
+    payment: () => { paid += 1; },
+    fetch: async () => new Response(JSON.stringify({
+      payment: { paymentId: "payU", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", completeUrl: "http://x/api/x402/complete/payU" }] },
+    }), { status: 402, headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+  }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true && e.code !== "budget-skip");
+  assert.equal(paid, 0);
+  assert.equal(budget.metered, 0);
+  assert.equal(fetchImpl.ledger.unreportedUsd, 0);
+  for (const bad of ["", "  ", "nope"]) {
+    const again = posedFetch({
+      stages: { mesh: 0.48 },
+      budget: openBudget(2),
+      payment: () => { paid += 1; },
+      fetch: async () => new Response(JSON.stringify({
+        payment: { paymentId: "payBlank", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: bad, completeUrl: "http://x/api/x402/complete/payBlank" }] },
+      }), { status: 402, headers: { "content-type": "application/json" } }),
+    });
+    await assert.rejects(again("http://x/api/generate-video", {
+      method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+    }), (e) => e && e.unknownPrice === true && e.paymentNotSent === true);
+    assert.equal(again.ledger.paidIds.size, 0);
+  }
+  assert.equal(paid, 0, "a blank or non-numeric price is not a free invoice");
+});
+
+test("an invoice that does not fit at the 1.2 markup is refused, and an accepted invoice counts immediately", async () => {
+  let paid = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const budget = openBudget(0.10);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.05, image: 0.01 },
+    budget,
+    payment: () => { paid += 1; return gate; },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ runId: "run-1", x_nanogpt_pricing: { costUsd: 0.05 } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const model = JSON.parse(init.body).model;
+      const id = model === RODIN_MODEL ? "payMesh" : "payImg";
+      return new Response(JSON.stringify(invoice(id, 0.05)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  const first = fetchImpl("http://x/api/generate-video", { method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }) });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(paid, 1);
+  assert.ok(Math.abs(budget.metered - 0.05) < 1e-9, `reserved ${budget.metered}`);
+  await assert.rejects(fetchImpl("http://x/v1/images/generations", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: FLUX_MODEL }),
+  }), (e) => e && e.budgetRefused === true && e.paymentNotSent === true);
+  assert.equal(paid, 1);
+  release();
+  await first;
+});
+
+test("a paid replay resends the exact billed body, and a later retry cannot replace it", async () => {
+  const seen = [];
+  const budget = openBudget(2);
+  const billed = JSON.stringify({ model: RODIN_MODEL, tier: "Gen-2.5-Medium", note: "billed bytes" });
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.48 },
+    budget,
+    payment: () => {},
+    fetch: async (url, init) => {
+      seen.push({ url: String(url), body: init.body, paid: headerOf(init.headers, "x-x402-payment-id") });
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ status: "paid" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (headerOf(init.headers, "x-x402-payment-id")) {
+        return new Response(JSON.stringify({ runId: "run-1", x_nanogpt_pricing: { costUsd: 0.48 } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify(invoice("payM", 0.48)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  await fetchImpl("http://x/api/generate-video", { method: "POST", headers: x402Headers, body: billed });
+  const replay = seen.find((s) => s.paid === "payM");
+  assert.ok(replay, "replay was sent");
+  assert.equal(replay.body, billed);
+  seen.length = 0;
+  await fetchImpl("http://x/api/generate-video", {
+    method: "POST",
+    headers: { ...x402Headers, "x-x402-payment-id": "payM" },
+    body: JSON.stringify({ model: RODIN_MODEL, tier: "CHANGED" }),
+  });
+  assert.equal(seen[0].body, billed);
+  assert.equal(fetchImpl.ledger.bodies.get("payM"), billed);
+});
+
+test("the same paymentId is reserved once, and a second request cannot overwrite its body", async () => {
+  let paid = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const budget = openBudget(2);
+  const firstBody = JSON.stringify({ model: RODIN_MODEL, note: "first" });
+  const secondBody = JSON.stringify({ model: RODIN_MODEL, note: "second" });
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.48 },
+    budget,
+    payment: () => { paid += 1; return gate; },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) {
+        return new Response(JSON.stringify({ runId: "run-1" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify(invoice("payOnce", 0.48)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  const first = fetchImpl("http://x/api/generate-video", { method: "POST", headers: x402Headers, body: firstBody });
+  await new Promise((r) => setTimeout(r, 20));
+  await assert.rejects(fetchImpl("http://x/api/generate-video", { method: "POST", headers: x402Headers, body: secondBody }), /already paid/);
+  assert.equal(paid, 1);
+  assert.equal(fetchImpl.ledger.bodies.get("payOnce"), firstBody);
+  release();
+  await first;
+});
+
+test("a payment error records the invoice and costUnknown before it rejects", async () => {
+  const budget = openBudget(2);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.48 },
+    budget,
+    payment: () => { throw new Error("rpc down"); },
+    fetch: async () => new Response(JSON.stringify(invoice("payE", 0.48)), { status: 402, headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }),
+  }), /rpc down/);
+  assert.equal(fetchImpl.ledger.costUnknown, true);
+  assert.equal(fetchImpl.ledger.reconcile[0].paymentId, "payE");
+  assert.equal(fetchImpl.ledger.reconcile[0].amountUsd, 0.48);
+  assert.equal(fetchImpl.ledger.reconcile[0].ambiguous, true);
+  assert.ok(fetchImpl.ledger.unreportedUsd > 0);
+  assert.equal(fetchImpl.ledger.paidIds.has("payE"), true);
+});
+
+test("a cancel after the wallet runs records the invoice and costUnknown before it rejects", async () => {
+  const ac = new AbortController();
+  const budget = openBudget(2);
+  const fetchImpl = posedFetch({
+    stages: { mesh: 0.48 },
+    budget,
+    payment: async () => { ac.abort(new Error("cancelled")); },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) throw (init && init.signal && init.signal.reason) || new Error("aborted after payment");
+      return new Response(JSON.stringify(invoice("payCancel", 0.48)), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  await assert.rejects(fetchImpl("http://x/api/generate-video", {
+    method: "POST", headers: x402Headers, body: JSON.stringify({ model: RODIN_MODEL }), signal: ac.signal,
+  }), /cancelled|aborted after payment/);
+  assert.equal(fetchImpl.ledger.costUnknown, true);
+  assert.equal(fetchImpl.ledger.reconcile[0].paymentId, "payCancel");
+  assert.equal(fetchImpl.ledger.reconcile[0].amountUsd, 0.48);
+  assert.equal(fetchImpl.ledger.reconcile[0].status, "aborted after payment");
+  assert.equal(fetchImpl.ledger.paidIds.has("payCancel"), true);
+  assert.ok(fetchImpl.ledger.unreportedUsd > 0);
+});
+
+function headerOf(headers, name) {
+  if (!headers) return null;
+  const hit = Object.entries(headers).find(([k]) => k.toLowerCase() === name);
+  return hit ? hit[1] : null;
+}

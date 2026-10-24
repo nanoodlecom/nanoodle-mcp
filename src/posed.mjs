@@ -15,6 +15,7 @@ import { MediaRef, parseNanoInvoice } from "nanoodle";
 import { ParamsError } from "./tools.mjs";
 import {
   SETTLE_MARKUP, depositFromCharge, chatCallUsd, beginPayment, openBudget,
+  reserveInvoice, releaseInvoice, noteUncertainPayment,
 } from "./pay-guard.mjs";
 
 export const POSED_TOOL = "posed-game-character";
@@ -63,6 +64,12 @@ function perImage(catalogs, id, size, fallback) {
   return fallback;
 }
 
+/**
+ * Rodin price for the locked graph options: tier Gen-2.5-Medium and no HighPack.
+ * That is the catalog's `standard` variant. `per_run` on this model is that same
+ * standard price; the higher variants are Extreme High and HighPack, which this
+ * graph does not send. A catalog that only publishes `per_run` still bills standard.
+ */
 function rodinUsd(catalogs) {
   const row = catalogModel(catalogs, "model3d", RODIN_MODEL);
   const by = row && row.pricing && row.pricing.per_run_by_variant;
@@ -176,9 +183,20 @@ function jsonResponse(j, status = 200) {
  */
 export function posedFetch({ stages, budget, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com" }) {
   const book = budget || openBudget(0);
-  return async (url, init = {}) => {
+  const ledger = {
+    paidIds: new Set(),
+    bodies: new Map(),
+    reconcile: [],
+    costUnknown: false,
+    unreportedUsd: 0,
+  };
+  const fn = async (url, init = {}) => {
     const method = String((init && init.method) || "GET").toUpperCase();
     if (method !== "POST" || !init || typeof init.body !== "string") return fetch(url, init);
+    const retryId = header(init.headers, "x-x402-payment-id");
+    if (retryId && ledger.bodies.has(String(retryId))) {
+      return fetch(url, { ...init, body: ledger.bodies.get(String(retryId)) });
+    }
     let body;
     try { body = JSON.parse(init.body); } catch { return fetch(url, init); }
     enforceSfwBody(body);
@@ -190,7 +208,7 @@ export function posedFetch({ stages, budget, fetch = globalThis.fetch, payment =
     const r = await fetch(url, next);
     const x402 = !!payment && String(header(init.headers, "x-x402")) === "true" && !header(init.headers, "authorization");
     if (stage && r.status === 402 && x402) {
-      return settle402({ r, signal, payment, fetch, url, init: next, baseUrl, budget: book, stage, forecast });
+      return settle402({ r, signal, payment, fetch, url, init: next, baseUrl, budget: book, ledger, stage });
     }
     if (stage && r.ok) {
       let j = null;
@@ -200,52 +218,81 @@ export function posedFetch({ stages, budget, fetch = globalThis.fetch, payment =
     }
     return r;
   };
+  fn.ledger = ledger;
+  return fn;
 }
 
-async function settle402({ r, signal, payment, fetch, url, init, baseUrl, budget, stage, forecast }) {
+async function settle402({ r, signal, payment, fetch, url, init, baseUrl, budget, ledger, stage }) {
   const raw = await r.text();
-  // After the invoice body is in hand, and again inside beginPayment's callback.
-  if (signal && signal.aborted) throw signal.reason;
+  // Parsed out here so every error and cancel path below can still name the invoice.
   let inv = null;
   try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+  if (signal && signal.aborted) throw signal.reason;
   if (!inv || !inv.paymentId || !inv.completeUrl) {
     const e = new Error("payment required, but the 402 response offered no usable Nano option");
     e.code = "x402";
+    e.paymentNotSent = true;
     throw e;
   }
-  const invoiceUsd = Number(inv.amountUsd);
-  // A 402 is not billed until it is paid. Refuse one the forecast or the remaining deposit cannot cover.
-  if (!(invoiceUsd > 0) || invoiceUsd > forecast + 1e-9 || !budget.fits(invoiceUsd * SETTLE_MARKUP)) {
-    throw budgetSkip(stage);
-  }
-  await beginPayment(signal, () => payment(inv));
-  const cr = await fetch(inv.completeUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-x402": "true" },
-    body: "{}",
-    signal,
-  });
-  let cj = null;
-  if (cr.ok) {
-    try { cj = await cr.clone().json(); } catch { cj = null; }
-  }
-  const replayed = cj && typeof cj === "object" && (cj.choices || cj.data || cj.runId || cj.output);
-  let result = replayed ? cj : null;
-  if (!result) {
-    const again = await fetch(url, {
-      ...init,
-      headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId },
+  const stageLabel = STAGE_LABEL[stage] || stage;
+  let reserved = null;
+  try {
+    // After the invoice read, and again inside the queued callback before reserveInvoice pays.
+    await beginPayment(signal, () => {
+      reserved = reserveInvoice({
+        signal, inv, bodyStr: init.body, paidIds: ledger.paidIds, bodies: ledger.bodies,
+        budget, stageLabel,
+      });
+      return payment(inv);
     });
-    if (!again.ok) return again;
-    try { result = await again.json(); } catch { return again; }
+    const cr = await fetch(inv.completeUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-x402": "true" },
+      body: "{}",
+      signal,
+    });
+    let cj = null;
+    if (cr.ok) {
+      try { cj = await cr.clone().json(); } catch { cj = null; }
+    }
+    const replayed = cj && typeof cj === "object" && (cj.choices || cj.data || cj.runId || cj.output);
+    let result = replayed ? cj : null;
+    if (!result) {
+      const again = await fetch(url, {
+        ...init,
+        body: reserved.body,
+        headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId },
+      });
+      if (!again.ok) {
+        const err = new Error(`payment ${inv.paymentId} settled, but the replay was not accepted`);
+        err.code = "x402";
+        throw err;
+      }
+      try { result = await again.json(); } catch {
+        const err = new Error(`payment ${inv.paymentId} settled, but the replay was not JSON`);
+        err.code = "x402";
+        throw err;
+      }
+    }
+    if (result && typeof result === "object" && usdOf(result) == null && reserved.usd > 0) {
+      result = { ...result, x_nanogpt_pricing: { ...(result.x_nanogpt_pricing || {}), costUsd: reserved.usd } };
+    }
+    const metered = usdOf(result);
+    if (metered != null && reserved.committed > 0) {
+      budget.release(reserved.committed);
+      budget.add(metered);
+    }
+    return jsonResponse(result || {});
+  } catch (e) {
+    // Nothing was reserved, or the wallet proved it did not send: not an uncertain payment.
+    if (!reserved || (e && e.paymentNotSent === true)) {
+      if (reserved) releaseInvoice({ id: reserved.id, usd: reserved.committed, paidIds: ledger.paidIds, budget });
+      throw e;
+    }
+    const status = signal && signal.aborted ? "aborted after payment" : "payment outcome uncertain";
+    noteUncertainPayment(ledger, inv, status);
+    throw e;
   }
-  if (result && typeof result === "object" && usdOf(result) == null && invoiceUsd > 0) {
-    result = { ...result, x_nanogpt_pricing: { ...(result.x_nanogpt_pricing || {}), costUsd: invoiceUsd } };
-  }
-  const metered = usdOf(result);
-  if (metered != null) budget.add(metered);
-  else if (invoiceUsd > 0) budget.add(invoiceUsd);
-  return jsonResponse(result || {});
 }
 
 function isBudgetSkip(e) {
