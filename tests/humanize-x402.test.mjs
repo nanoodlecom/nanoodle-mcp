@@ -833,3 +833,352 @@ test("cancelling during the decider invoice read never pays", async () => {
     }),
   });
 });
+
+/** 1 XNO, with no USD figure. Number(null) must not turn that into a free invoice. */
+const invoiceNoUsd = (id) => new Response(JSON.stringify({
+  payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000000000000000000000000000000", completeUrl: "http://x/api/x402/complete/" + id }] },
+}), { status: 402, headers: { "content-type": "application/json" } });
+
+const x402Headers = { "Content-Type": "application/json", "x-x402": "true" };
+const chatBody = (model, content) => JSON.stringify({ model, messages: [{ role: "user", content }] });
+
+async function refuseUnknownUsd({ budgetUsd, kind }) {
+  const payments = [];
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { payments.push(inv.paymentId); },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return okRes("should not settle");
+      return invoiceNoUsd("pay" + kind);
+    },
+  });
+  const model = kind === "decider" ? "z-ai/glm-5.3" : pricedRecord.A.model;
+  const r = await hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody(model, "hello") });
+  assert.equal(payments.length, 0, `${kind}: an invoice with no USD price is not paid`);
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).x_nanogpt_pricing.costUsd, 0);
+  assert.equal(hf.state.meteredUsd, 0);
+  assert.equal(hf.state.committedUsd, 0);
+  assert.equal(hf.state.costUnknown, false);
+  assert.equal(hf.state.paidIds.has("pay" + kind), false);
+  const rec = hf.state.attempts.find((a) => a.kind === (kind === "decider" ? "decider" : "primary"));
+  assert.ok(rec, `${kind} attempt recorded`);
+  assert.equal(rec.priceUnknown, true);
+  assert.equal(rec.paymentStarted, false);
+  assert.equal(rec.invoiceCommitted ?? null, null);
+}
+
+test("an invoice with no USD price is refused before payment on a $0.001 budget", async () => {
+  await refuseUnknownUsd({ budgetUsd: 0.001, kind: "writer" });
+  await refuseUnknownUsd({ budgetUsd: 0.001, kind: "decider" });
+});
+
+test("an invoice with no USD price is refused on a direct wallet too", async () => {
+  await refuseUnknownUsd({ budgetUsd: null, kind: "writer" });
+  await refuseUnknownUsd({ budgetUsd: null, kind: "decider" });
+});
+
+test("a known USD price of zero is still payable", async () => {
+  const payments = [];
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.001,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { payments.push(inv.amountUsd); },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ choices: [{ message: { content: "free" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+      return invoiceOf("payZero", 0);
+    },
+  });
+  const r = await hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody(pricedRecord.A.model, "hello") });
+  assert.equal(r.status, 200);
+  assert.deepEqual(payments, [0]);
+  assert.equal((await r.json()).choices[0].message.content, "free");
+});
+
+test("a fallback is not paid for an invoice with no USD price, and a priced fallback still can be", async () => {
+  const payments = [];
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "hello",
+    payment: async (inv) => { payments.push(inv.paymentId); },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ choices: [{ message: { content: "from starry" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+      const model = JSON.parse(init.body).model;
+      if (model === CYD) return invoiceNoUsd("payCyd");
+      return invoiceOf("payStar", 0.0001);
+    },
+  });
+  const r = await hf.fetch(CHAT, xreq(CYD));
+  assert.deepEqual(payments, ["payStar"]);
+  assert.equal(hf.state.paidIds.has("payCyd"), false);
+  assert.equal(hf.state.paidIds.has("payStar"), true);
+  assert.equal(hf.state.fallback.C.ok, true);
+  assert.equal((await r.json()).choices[0].message.content, "from starry");
+  assert.equal(hf.state.costUnknown, false);
+});
+
+test("a re-ask invoice with no USD price is not paid and the first answer is kept", async () => {
+  const draft = "one two three four five six";
+  let n = 0;
+  const payments = [];
+  const hf = humanizeFetch({
+    record: REC,
+    draft,
+    payment: async (inv) => { payments.push(inv.paymentId); },
+    fetch: async () => {
+      n += 1;
+      if (n === 1) return okRes(draft);
+      return invoiceNoUsd("payReask");
+    },
+  });
+  const r = await hf.fetch(CHAT, xreq("d"));
+  assert.deepEqual(payments, []);
+  assert.equal((await r.json()).choices[0].message.content, draft);
+  assert.equal(hf.state.paidIds.has("payReask"), false);
+  assert.equal(hf.state.costUnknown, false);
+  const rec = hf.state.attempts.find((a) => a.kind === "reask");
+  assert.equal(rec.priceUnknown, true);
+  assert.equal(rec.paymentStarted, false);
+});
+
+test("a repair invoice with no USD price is not paid", async () => {
+  for (const budgetUsd of [0.001, null]) {
+    const payments = [];
+    const hf = humanizeFetch({
+      record: pricedRecord,
+      draft: "hello",
+      budgetUsd,
+      prices: HUMANIZE_MODEL_PRICES,
+      payment: async (inv) => { payments.push(inv.paymentId); },
+      fetch: async () => invoiceNoUsd("payReview"),
+    });
+    hf.state.judgeReq = {
+      url: CHAT,
+      headers: x402Headers,
+      body: { model: "z-ai/glm-5.3", messages: [{ role: "user", content: "rank" }] },
+      user: "rank",
+    };
+    const verdict = await hf.state.reviewRepair("fixed hello", "A", pricedRecord.A.model);
+    assert.equal(verdict.ok, false);
+    assert.deepEqual(payments, [], `budget ${budgetUsd}: repair does not pay an unpriced invoice`);
+    assert.equal(hf.state.paidIds.has("payReview"), false);
+    assert.equal(hf.state.meteredUsd, 0);
+    assert.equal(hf.state.committedUsd, 0);
+    assert.equal(hf.state.costUnknown, false);
+    const rec = hf.state.attempts.find((a) => a.kind === "review");
+    assert.ok(rec, "the review reached the invoice");
+    assert.equal(rec.priceUnknown, true);
+    assert.equal(rec.paymentStarted, false);
+  }
+});
+
+test("a rejected decider payment records the invoice before rethrowing", async () => {
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "hello",
+    payment: async () => { throw new Error("wallet rejected"); },
+    fetch: async () => inv402("payDec"),
+  });
+  await assert.rejects(hf.fetch(CHAT, {
+    method: "POST",
+    headers: x402Headers,
+    body: chatBody("z-ai/glm-5.3", "rank"),
+  }), (err) => {
+    assert.equal(err instanceof ReferenceError, false);
+    assert.doesNotMatch(String(err && err.message), /inv is not defined/);
+    assert.match(err.message, /wallet rejected/);
+    return true;
+  });
+  assert.equal(hf.state.reconcile.length, 1);
+  assert.equal(hf.state.reconcile[0].paymentId, "payDec");
+  assert.equal(hf.state.reconcile[0].kind, "decider");
+  assert.equal(hf.state.reconcile[0].ambiguous, true);
+  assert.equal(hf.state.reconcile[0].status, "payment call failed");
+  assert.equal(hf.state.costUnknown, true);
+  assert.equal(hf.state.paidIds.has("payDec"), true, "a wallet error keeps the reservation");
+});
+
+test("cancelling a pending decider payment records the invoice before rethrowing", async () => {
+  let mark;
+  const started = new Promise((r) => { mark = r; });
+  const ac = new AbortController();
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "hello",
+    payment: async () => { mark(); await new Promise(() => {}); },
+    fetch: async () => inv402("payPend"),
+  });
+  const pending = hf.fetch(CHAT, {
+    method: "POST",
+    headers: x402Headers,
+    signal: ac.signal,
+    body: chatBody("z-ai/glm-5.3", "rank"),
+  });
+  await started;
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(pending, (err) => {
+    assert.equal(err instanceof ReferenceError, false);
+    assert.doesNotMatch(String(err && err.message), /inv is not defined/);
+    assert.match(err.message, /cancelled/);
+    return true;
+  });
+  assert.equal(hf.state.reconcile.length, 1);
+  assert.equal(hf.state.reconcile[0].paymentId, "payPend");
+  assert.equal(hf.state.reconcile[0].ambiguous, true);
+  assert.equal(hf.state.reconcile[0].status, "payment still pending at the deadline");
+  assert.equal(hf.state.costUnknown, true);
+  assert.equal(hf.state.paidIds.has("payPend"), true, "an in-flight cancel keeps the reservation");
+});
+
+test("two simultaneous payments on one id pay exactly once", async () => {
+  const paid = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "hello",
+    payment: async (inv) => { paid.push(inv.paymentId); await gate; },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ choices: [{ message: { content: "once" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+      return invoiceOf("shared", 0.0001);
+    },
+  });
+  const pending = Promise.allSettled([
+    hf.fetch(CHAT, xreq("a", [{ role: "user", content: "alpha-body" }])),
+    hf.fetch(CHAT, xreq("b", [{ role: "user", content: "beta-body" }])),
+  ]);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(paid, ["shared"]);
+  release();
+  const settled = await pending;
+  assert.deepEqual(paid, ["shared"]);
+  assert.equal(settled.filter((s) => s.status === "fulfilled").length, 1);
+  assert.equal(settled.filter((s) => s.status === "rejected").length, 1);
+  const rejected = settled.find((s) => s.status === "rejected").reason;
+  assert.match(rejected.message, /already reserved/);
+  assert.equal(hf.state.paidIds.size, 1);
+});
+
+test("a second request cannot replace the body of a payment that is still in flight", async () => {
+  const paid = [];
+  let mark;
+  const started = new Promise((r) => { mark = r; });
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const seen = [];
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "unrelated draft",
+    payment: async (inv) => { paid.push(inv.paymentId); mark(); await gate; },
+    fetch: async (url, init) => {
+      const raw = typeof init.body === "string" ? init.body : "";
+      const pid = init.headers && init.headers["x-x402-payment-id"];
+      seen.push({ raw, pid: pid || null });
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ status: "paid" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (pid) return okRes("replayed");
+      return invoiceOf("shared", 0.0001);
+    },
+  });
+  const first = hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody("a", "alpha-body") });
+  await started;
+  await assert.rejects(
+    hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody("b", "beta-body") }),
+    /already reserved/,
+  );
+  assert.deepEqual(paid, ["shared"]);
+  release();
+  const res = await first;
+  assert.equal(res.status, 200);
+  assert.deepEqual(paid, ["shared"]);
+  const replay = seen.find((s) => s.pid === "shared");
+  assert.ok(replay, "the winner replays after settle");
+  assert.match(replay.raw, /alpha-body/);
+  assert.doesNotMatch(replay.raw, /beta-body/);
+});
+
+test("a wallet error keeps the id reserved and the first body stored", async () => {
+  const paid = [];
+  const seen = [];
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "unrelated draft",
+    payment: async (inv) => { paid.push(inv.paymentId); throw new Error("mid-flight"); },
+    fetch: async (_url, init) => {
+      seen.push(init.body);
+      return invoiceOf("shared", 0.0001);
+    },
+  });
+  await assert.rejects(hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody("a", "alpha-body") }), /mid-flight/);
+  assert.equal(hf.state.paidIds.has("shared"), true);
+  assert.equal(hf.state.reconcile.length, 1);
+  assert.equal(hf.state.costUnknown, true);
+  await assert.rejects(hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody("b", "beta-body") }), /already reserved/);
+  assert.deepEqual(paid, ["shared"], "the second request does not pay");
+  const retry = await hf.fetch(CHAT, {
+    method: "POST",
+    headers: { ...x402Headers, "x-x402-payment-id": "shared" },
+    body: chatBody("b", "beta-body"),
+  });
+  assert.equal(retry.status, 402, "the stub still answers the forwarded retry");
+  assert.equal(seen.length, 3);
+  assert.match(seen[2], /alpha-body/);
+  assert.doesNotMatch(seen[2], /beta-body/);
+  assert.deepEqual(paid, ["shared"]);
+});
+
+test("cancelling an in-flight writer payment does not free its id for a second payment", async () => {
+  const paid = [];
+  let mark;
+  const started = new Promise((r) => { mark = r; });
+  const ac = new AbortController();
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "hello",
+    payment: async (inv) => { paid.push(inv.paymentId); mark(); await new Promise(() => {}); },
+    fetch: async () => invoiceOf("shared", 0.0001),
+  });
+  const first = hf.fetch(CHAT, { ...xreq("a"), signal: ac.signal });
+  await started;
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(first, /cancelled/);
+  assert.equal(hf.state.paidIds.has("shared"), true);
+  assert.equal(hf.state.costUnknown, true);
+  await assert.rejects(hf.fetch(CHAT, xreq("b")), /already reserved/);
+  assert.deepEqual(paid, ["shared"]);
+});
+
+test("two invoices that race the remaining budget pay only what still fits", async () => {
+  const paid = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.02,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { paid.push(inv.paymentId); await gate; },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+      const model = JSON.parse(init.body).model;
+      return invoiceOf("pay-" + model, 0.01);
+    },
+  });
+  const pending = Promise.allSettled([
+    hf.fetch(CHAT, xreq(pricedRecord.A.model)),
+    hf.fetch(CHAT, xreq(pricedRecord.B.model)),
+  ]);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(paid.length, 1);
+  release();
+  const settled = await pending;
+  assert.equal(paid.length, 1);
+  assert.equal(settled.filter((s) => s.status === "rejected").length, 0);
+  assert.equal(hf.state.paidIds.size, 1);
+  const metered = hf.state.meteredUsd + hf.state.committedUsd;
+  assert.ok(metered <= 0.02 + 1e-9, `spend stayed inside the budget: ${metered}`);
+});
