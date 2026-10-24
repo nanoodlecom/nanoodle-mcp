@@ -1,5 +1,6 @@
-// humanize-comment quotes a deposit per request: the worst case that request
-// can be charged, plus a small margin, never below that charge.
+// humanize-comment quotes a deposit per request. The quote caps what the
+// customer pays: the priced worst case plus a small margin, never below that
+// charge. A provider can still meter more; the operator absorbs any overrun.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, copyFile, readFile, rm } from "node:fs/promises";
@@ -120,8 +121,9 @@ test("the quote shown to the caller is the deposit that is collected", async () 
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
     const listed = listTools().find((t) => t.name === "humanize-comment");
-    assert.match(listed.description, /a deposit is quoted for each request from its length and maxChars and is the most that request can be charged/);
-    assert.doesNotMatch(listed.description, /paid in Nano|x402|0\.0196/);
+    assert.match(listed.description, /a deposit is quoted for each request from its length and maxChars and caps what the customer pays/);
+    assert.match(listed.description, /the operator absorbs any overrun/);
+    assert.doesNotMatch(listed.description, /paid in Nano|x402|0\.0196|proven/);
 
     const quote = async (args) => {
       const result = await callTool({ name: "humanize-comment", arguments: args });

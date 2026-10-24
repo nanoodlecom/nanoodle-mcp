@@ -1,11 +1,11 @@
 /**
  * Per-request deposit for humanize-comment.
  *
- * The quote is the most this request can be charged. Settlement keeps the
- * lesser of the metered cost plus 20% and this deposit, so a call cannot be
- * billed above its quote; the operator absorbs a rare overrun on a call that
- * was already in flight. The run also stops before the next paid step when
- * that step would pass the deposit.
+ * The quote caps what the customer pays for this request. Settlement charges
+ * the customer the lesser of the metered cost plus 20% and this deposit.
+ * A provider can still meter more. The operator absorbs any overrun, including
+ * on a call that was already in flight. The run also stops before the next
+ * paid step when that step would pass the deposit.
  *
  * The priced worst case is only a little above a typical run: one call per
  * writer (a fallback is the more expensive of the two, not both), one extra

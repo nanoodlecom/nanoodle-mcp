@@ -493,7 +493,7 @@ test("cancelling mid repair-review aborts without further paid calls", async () 
   assert.deepEqual(seen, [CHAT], "no complete poll and no replay after cancel");
 });
 
-test("cancelling during the invoice read never pays", async () => {
+test("cancelling during the repair invoice read never pays", async () => {
   const ac = new AbortController();
   let payments = 0;
   let markStarted;
@@ -560,4 +560,113 @@ test("repair review deadline: a slow payment stops without another paid call", a
   assert.equal(hf.state.reconcile[0].status, "payment still pending at the deadline");
   assert.equal(hf.state.reconcile[0].ambiguous, true);
   assert.equal(hf.state.costUnknown, true);
+});
+
+/** A 402 whose body stays pending until `finish`. Cancelling before that must not pay. */
+function delayedInvoice(id) {
+  let markStarted;
+  let finishRead;
+  const startedP = new Promise((r) => { markStarted = r; });
+  const readP = new Promise((r) => { finishRead = r; });
+  const invoice = JSON.stringify({ payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: 0.004, completeUrl: "http://x/api/x402/complete/" + id }] } });
+  const res = { status: 402, ok: false, text: () => { markStarted(); return readP; } };
+  return { res, startedP, finish: () => finishRead(invoice) };
+}
+
+/**
+ * Drive one paid path, abort once its 402 body has started and before it resolves,
+ * then release the invoice. payment() must not run.
+ */
+async function cancelDuringRead({ kind, draft = "draft", extra = {}, fetch, call }) {
+  const ac = new AbortController();
+  let payments = 0;
+  const late = delayedInvoice("pay" + kind);
+  const hf = humanizeFetch({
+    record: REC,
+    draft,
+    payment: async () => { payments++; },
+    fetch: (url, init) => fetch(url, init, late),
+    ...extra,
+  });
+  const before = hf.state.unreportedUsd;
+  const p = call(hf, ac);
+  await Promise.race([
+    late.startedP,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${kind} invoice read did not start`)), 2000)),
+  ]);
+  ac.abort(new Error("cancelled"));
+  late.finish();
+  await assert.rejects(p, /cancelled/);
+  assert.equal(payments, 0, `${kind}: a cancel during the invoice read does not call payment`);
+  // A writer retry's first answer can already be metered. The cancelled invoice is $0.004 and must not land.
+  assert.ok(hf.state.unreportedUsd - before < 0.004, `${kind}: no late $0.004 charge is recorded (${hf.state.unreportedUsd})`);
+  assert.equal(hf.state.paidIds.has("pay" + kind), false, `${kind}: the invoice is not recorded as paid`);
+  const rec = hf.state.attempts.find((a) => a.kind === kind);
+  assert.ok(rec, `${kind} attempt was recorded`);
+  assert.equal(rec.paymentStarted, false);
+  assert.notEqual(rec.usd, 0.004);
+}
+
+test("cancelling during the primary writer invoice read never pays", async () => {
+  await cancelDuringRead({
+    kind: "primary",
+    fetch: (_url, _init, late) => late.res,
+    call: (hf, ac) => hf.fetch(CHAT, { ...xreq("a"), signal: ac.signal }),
+  });
+});
+
+test("cancelling during the fallback invoice read never pays", async () => {
+  await cancelDuringRead({
+    kind: "fallback",
+    fetch: (_url, init, late) => {
+      const model = JSON.parse(init.body).model;
+      if (model === CYD) return new Response(JSON.stringify({ error: "overloaded" }), { status: 429 });
+      return late.res;
+    },
+    call: (hf, ac) => hf.fetch(CHAT, { ...xreq(CYD), signal: ac.signal }),
+  });
+});
+
+test("cancelling during the reask invoice read never pays", async () => {
+  const draft = "one two three four five six";
+  let n = 0;
+  await cancelDuringRead({
+    kind: "reask",
+    draft,
+    fetch: (_url, _init, late) => {
+      n++;
+      if (n === 1) return okRes(draft);
+      return late.res;
+    },
+    call: (hf, ac) => hf.fetch(CHAT, { ...xreq("d"), signal: ac.signal }),
+  });
+});
+
+test("cancelling during the guard invoice read never pays", async () => {
+  const draft = "Thanks for the detailed writeup about the release.";
+  let n = 0;
+  await cancelDuringRead({
+    kind: "guard",
+    draft,
+    extra: { ending: "question" },
+    fetch: (_url, _init, late) => {
+      n++;
+      if (n === 1) return okRes("A different sentence entirely.");
+      return late.res;
+    },
+    call: (hf, ac) => hf.fetch(CHAT, { ...xreq("d"), signal: ac.signal }),
+  });
+});
+
+test("cancelling during the decider invoice read never pays", async () => {
+  await cancelDuringRead({
+    kind: "decider",
+    fetch: (_url, _init, late) => late.res,
+    call: (hf, ac) => hf.fetch(CHAT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-x402": "true" },
+      signal: ac.signal,
+      body: JSON.stringify(judgeBody()),
+    }),
+  });
 });

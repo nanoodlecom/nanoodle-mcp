@@ -324,6 +324,31 @@ test("keep_last and forceRepair keep protected spacing byte for byte, so deliver
   assert.ok(text.endsWith(last), text);
 });
 
+test("forceRepair appends a missing span without trimming restored protected text", () => {
+  const spans = [{ id: 1, text: "  One  " }, { id: 2, text: "Two" }];
+  const repaired = forceRepair("[[k1]]", spans);
+  assert.equal(repaired, "  One   Two");
+  assert.equal(repaired.includes("  One  "), true);
+  assert.equal(repaired.includes("Two"), true);
+});
+
+test("ensureEnding keep_last keeps protected leading spaces on every exit", () => {
+  const spans = [{ id: 1, text: "  One  " }, { id: 2, text: "Two" }];
+  assert.equal(ensureEnding("  One   Two", "keep_last", spans, ""), "  One   Two");
+  // The ending span is missing: append it, and keep the other span's bytes.
+  assert.equal(ensureEnding("  One  hello", "keep_last", spans, ""), "  One  hello Two");
+  // The ending span has to move, and the other span's edge spaces stay.
+  const moved = ensureEnding("Two and  One  ", "keep_last", spans, "");
+  assert.ok(moved.endsWith("Two"), moved);
+  assert.equal(moved.includes("  One  "), true, moved);
+  // No question to move, and an empty last span: trimming stays outside the phrase.
+  assert.equal(moveQuestionToEnd("  One  stays", [{ id: 1, text: "  One  " }]), "  One  stays");
+  assert.equal(ensureEnding("  One  ", "keep_last", [{ id: 1, text: "  One  " }, { id: 2, text: "" }], ""), "  One  ");
+  // A protected ending that itself has trailing spaces still counts as the ending.
+  const edged = [{ id: 1, text: "  One  " }, { id: 2, text: "Two  " }];
+  assert.equal(ensureEnding("  One   Two  ", "keep_last", edged, ""), "  One   Two  ");
+});
+
 test("keep_last keeps a final sentence that ends with a closing quote", () => {
   assert.deepEqual(sentencesOf('Please read the note here."'), ['Please read the note here."']);
   assert.equal(finalSentence('Please read the note here."'), 'Please read the note here."');

@@ -32,12 +32,15 @@
  *      happen per run, first come first served. A re-ask has its own deadline: it
  *      must finish within REASK_END_MS (55 s) of the writer call starting, or it is
  *      abandoned and the first answer is kept. Both calls' costs are reported.
- *    - x402 (keyless wallet mode): writer 402 invoices are settled here, not by the
- *      nanoodle client, so the dash fix, re-asks and fallback credit apply to paid
- *      calls too. One invoice per attempt, paid at most once, replayed only with the
- *      body it was issued for; no fallback after a primary's payment STARTED (it is
- *      marked before the wallet call, since a wallet can send and still throw), unless
- *      the wallet error carries paymentNotSent === true. An unconfirmed payment goes to
+ *    - x402 (keyless wallet mode): writer 402 invoices, the decider's 402, and the
+ *      repair review are settled here, not by the nanoodle client, so the dash fix,
+ *      re-asks and fallback credit apply to paid calls too. A cancel during the
+ *      invoice read never starts a payment, and the queued callback checks again
+ *      before the wallet runs. One invoice per attempt, paid at most once, replayed
+ *      only with the body it was issued for; no fallback after a primary's payment
+ *      STARTED (it is marked before the wallet call, since a wallet can send and
+ *      still throw), unless the wallet error carries paymentNotSent === true. An
+ *      unconfirmed payment goes to
  *      state.reconcile (invoice id, ambiguous) and the run notes, and its amount is left
  *      out of the cost, which is then flagged as a lower bound. Each writer call keeps
  *      its own attempt records, so concurrent writers never read each other's state.
@@ -77,10 +80,11 @@
  *    title keep the previous result shape, the same six paid calls, and the
  *    previous price.
  * 9. Deposit. max_tokens on every call is sized from maxChars, or from the
- *    draft length when maxChars is omitted, plus a small slack. The quoted
- *    deposit is the maximum charge: settlement keeps the lesser of the metered
- *    cost plus 20% and that deposit. A paid step that would pass the deposit
- *    is skipped, and the run finishes with a partial result or with no charge.
+ *    draft length when maxChars is omitted, plus a small slack. The quote caps
+ *    what the customer pays: settlement charges the lesser of the metered cost
+ *    plus 20% and that deposit. A provider can still meter more, and the
+ *    operator absorbs any overrun. A paid step that would pass the deposit is
+ *    skipped, and the run finishes with a partial result or with no charge.
  */
 import { ParamsError } from "./tools.mjs";
 import { parseNanoInvoice } from "nanoodle";
@@ -116,9 +120,10 @@ export const REASK_TEXT = "Your last attempt copied the draft. Rewrite it in you
 export const codePoints = (s) => [...String(s ?? "")].length;
 
 /**
- * Realistic token estimate: about 3.5 bytes per token. The quote is a deposit
- * the caller cannot be charged above (the gate keeps the lesser of metered
- * cost + 20% and the deposit), so this does not have to be a tokenizer proof.
+ * Realistic token estimate: about 3.5 bytes per token. The quote caps what the
+ * customer pays (the gate keeps the lesser of metered cost + 20% and the
+ * deposit). A provider can still meter more; the operator absorbs that overrun.
+ * The estimate does not have to be a tokenizer proof.
  */
 export const HUMANIZE_BYTES_PER_TOKEN = 3.5;
 /** The gate keeps metered cost times this. A later paid step must fit inside the deposit at this markup. */
@@ -565,11 +570,17 @@ export function forceRepair(raw, spans) {
   for (const s of list) {
     if (used.has(tokenOf(s.id))) continue;
     if (!s.text || t.includes(s.text)) continue;
-    const body = t.trim();
-    t = body ? `${body} ${s.text}` : s.text;
+    // The restored text may already be a protected span. Trimming it here would
+    // eat that span's own spaces before the later collapse can lift it out.
+    t = t ? `${t} ${s.text}` : s.text;
   }
   t = omitExtraSpans(t, list);
   return protectingSpans(t, list, (masked) => masked.replace(/[ \t]{2,}/g, " ").trim());
+}
+
+/** Trim only the whitespace outside protected spans. Span bytes stay as they are. */
+function trimOutsideSpans(text, spans) {
+  return protectingSpans(text, spans, (masked) => String(masked ?? "").trim());
 }
 
 const CLOSING_QUOTE = new Set(['"', "'", "\u201D", "\u2019"]);
@@ -693,10 +704,6 @@ export function moveQuestionToEnd(text, spans) {
 
 function endWith(text, span, spans) {
   const raw = String(text ?? "");
-  if (!span) return raw.trim();
-  const trimmed = raw.trim();
-  // Already the ending. trim() does not touch bytes inside the phrase.
-  if (trimmed.endsWith(span)) return trimmed;
   const pieces = [];
   const seen = new Set();
   for (const s of spans || []) {
@@ -704,7 +711,12 @@ function endWith(text, span, spans) {
     seen.add(s.text);
     pieces.push({ text: s.text });
   }
-  if (!seen.has(span)) pieces.push({ text: span });
+  if (span && !seen.has(span)) pieces.push({ text: span });
+  // No ending phrase, or the phrase is already the ending: drop whitespace
+  // outside the spans only. A full-string trim would eat a protected prefix.
+  if (!span) return trimOutsideSpans(raw, pieces);
+  const kept = trimOutsideSpans(raw, pieces);
+  if (kept.endsWith(span)) return kept;
   const lifted = liftSpans(raw, pieces);
   const idxs = [];
   lifted.holes.forEach((h, i) => { if (h === span) idxs.push(i); });
@@ -730,7 +742,7 @@ export function ensureEnding(text, ending, spans, draft) {
   if (!ending || ending === "any") return text;
   if (ending === "keep_last") {
     const last = spans && spans.length ? spans[spans.length - 1].text : finalSentence(draft);
-    return last ? endWith(text, last, spans) : String(text ?? "").trim();
+    return last ? endWith(text, last, spans) : trimOutsideSpans(String(text ?? ""), spans);
   }
   if (ending === "question") {
     const moved = moveQuestionToEnd(text, spans);
@@ -936,7 +948,8 @@ function acceptableDelivery(text, state) {
   if (state.ending === "question" && !isQuestion(t)) return false;
   if (state.ending === "keep_last") {
     const last = state.spans && state.spans.length ? state.spans[state.spans.length - 1].text : finalSentence(state.draft);
-    if (last && !t.trim().endsWith(last)) return false;
+    const ended = trimOutsideSpans(t, state.spans && state.spans.length ? state.spans : [{ text: last }]);
+    if (last && !ended.endsWith(last)) return false;
   }
   if (state.spans && state.spans.length) {
     const want = new Map();
@@ -1051,11 +1064,13 @@ export function failedBeforeSend(e, signal) {
  *
  * x402 (keyless, `payment` callback): the nanoodle client's _paidFetch settles a 402 through the
  * invoice's complete URL, and that replayed result never passes back through a chat-completions
- * fetch. So for writer calls this wrapper settles the 402 itself, with the same callback, and hands
- * the client a finished 200 (the client then has nothing to pay). Every attempt (primary, fallback,
- * re-ask) is its own logical call with its own invoice, paid at most once, and replayed only with the
- * exact body that invoice was issued for. Once a primary's invoice is paid there is no fallback: a
- * paid call that then fails is reported as failed, never re-sent to another model and paid again.
+ * fetch. So this wrapper settles writer attempts (primary, fallback, re-ask, guard), the decider,
+ * and the repair review itself, with the same callback, and hands the client a finished 200 (the
+ * client then has nothing to pay). Every one of those goes through queueInvoicePayment: a cancel
+ * after the invoice is read, and again inside the queued callback, never calls payment(). Each
+ * attempt is its own logical call with its own invoice, paid at most once, and replayed only with
+ * the exact body that invoice was issued for. Once a primary's invoice is paid there is no fallback:
+ * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
 export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null }) {
   const budget = Number(budgetUsd);
@@ -1082,6 +1097,45 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     signal.addEventListener("abort", on, { once: true });
     p.then((v) => { signal.removeEventListener("abort", on); res(v); }, (e) => { signal.removeEventListener("abort", on); rej(e); });
   });
+  /**
+   * Pay one parsed invoice, or refuse when the run is already cancelled.
+   * The check after the invoice read and the check inside the queued callback
+   * are the same: a cancel in either gap never calls payment(). paidIds and
+   * paymentStarted flip only after the second check, immediately before the
+   * wallet call. `commit` runs in that same gap (it stops a fallback timer).
+   */
+  const queueInvoicePayment = (inv, rec, signal, lateStatus, commit, onBook) => {
+    const notSent = () => {
+      const reason = signal && signal.reason;
+      const err = new Error(reason && reason.message ? reason.message : "cancelled");
+      if (reason && reason.name) err.name = reason.name;
+      err.paymentNotSent = true;
+      return err;
+    };
+    if (signal && signal.aborted) {
+      rec.paymentStarted = false;
+      rec.status = "payment not sent";
+      throw notSent();
+    }
+    if (commit) commit();
+    rec.paymentId = inv.paymentId;
+    const paying = Promise.resolve().then(() => {
+      if (signal && signal.aborted) throw notSent();
+      state.paidIds.add(inv.paymentId);
+      rec.paymentStarted = true;
+      return payment(inv);
+    });
+    paying.then(() => {
+      if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
+      rec.paid = true; rec.paymentAmbiguous = false; rec.usd = inv.amountUsd; rec.counted = true;
+      if (Number.isFinite(inv.amountUsd)) state.unreportedUsd += inv.amountUsd; else state.costUnknown = true;
+      const c = state.reconcile.find((x) => x.paymentId === inv.paymentId);
+      if (c) { c.ambiguous = false; c.status = lateStatus; c.late = true; }
+      if (onBook) onBook(c);
+      if (typeof state.onLate === "function") state.onLate(c || { letter: rec.letter, kind: rec.kind, paymentId: inv.paymentId, amountUsd: inv.amountUsd });
+    }, () => {});
+    return paying;
+  };
   /**
    * Cost of an attempt that ended without a usable answer: a known payment counts; a started but
    * unconfirmed payment is unknown; an x402 request that was never paid is free; a keyed request
@@ -1157,6 +1211,91 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           finishPaid(held, failedBeforeSend(e, init.signal) ? 0 : null);
           throw e;
         }
+        const x402Judge = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
+        if (r.status === 402 && x402Judge) {
+          const rec = { letter: null, kind: "decider", model: body.model, status: null, paymentStarted: false, paid: false, paymentAmbiguous: false, paymentId: null, usd: null };
+          state.attempts.push(rec);
+          try {
+            const raw = await r.text();
+            let inv = null;
+            try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+            if (!inv || !inv.paymentId || !inv.completeUrl || state.paidIds.has(inv.paymentId)) {
+              rec.status = 402;
+              const e = new Error(inv && state.paidIds.has(inv.paymentId) ? `x402 invoice ${inv.paymentId} was already paid; not paying it again` : "payment required, but the 402 response offered no usable Nano option");
+              e.code = "x402";
+              throw e;
+            }
+            const paying = queueInvoicePayment(inv, rec, init.signal, "paid after the decider stopped waiting; its result was not used");
+            await raceAbort(paying, init.signal);
+            rec.paid = true;
+            rec.usd = inv.amountUsd;
+            const deadline = inv.expiresAt || now() + 15 * 60 * 1000;
+            const replayInit = { ...init, body: JSON.stringify(body) };
+            let settled = null;
+            for (;;) {
+              let cr;
+              try {
+                cr = await fetch(inv.completeUrl, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: "{}", signal: init.signal });
+              } catch (e) {
+                rec.status = "aborted after payment";
+                state.reconcile.push({ letter: null, kind: "decider", model: body.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: false, status: rec.status });
+                throw e;
+              }
+              if (cr.ok) {
+                let cj = null;
+                try { cj = await cr.clone().json(); } catch { cj = null; }
+                if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { settled = jsonResponse(cj); break; }
+                settled = await fetch(url, { ...replayInit, headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId } });
+                if (settled.status === 402) {
+                  rec.status = 402;
+                  const e = new Error(`payment ${inv.paymentId} settled, but the API still answered 402 on replay; not paying again`);
+                  e.code = "x402";
+                  throw e;
+                }
+                break;
+              }
+              if (cr.status !== 402) { settled = cr; break; }
+              await cr.text().catch(() => {});
+              if (now() >= deadline) {
+                rec.status = "x402 expired";
+                const e = new Error(`payment window expired for ${inv.paymentId}`);
+                e.code = "x402-expired";
+                throw e;
+              }
+              try { await wait(pollMs, init.signal); }
+              catch (e) {
+                rec.status = "aborted after payment";
+                state.reconcile.push({ letter: null, kind: "decider", model: body.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: false, status: rec.status });
+                throw e;
+              }
+            }
+            rec.status = settled.status;
+            let judged = null;
+            try { judged = await settled.clone().json(); } catch { judged = null; }
+            const reported = usdOf(judged, settled);
+            if (reported != null) rec.usd = reported;
+            else if (rec.paid) state.costUnknown = true;
+            finishPaid(held, reported == null ? (settled.ok ? null : rec.usd) : reported);
+            return settled;
+          } catch (e) {
+            if ((e && e.paymentNotSent === true) || (!rec.paymentStarted && init.signal && init.signal.aborted)) {
+              rec.paymentStarted = false;
+              rec.status = "payment not sent";
+              finishPaid(held, 0);
+              throw e;
+            }
+            if (!rec.paid && rec.paymentStarted) {
+              rec.paymentAmbiguous = true;
+              rec.status = init.signal && init.signal.aborted ? "payment still pending at the deadline" : "payment call failed";
+              state.reconcile.push({ letter: null, kind: "decider", model: body.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: true, status: rec.status });
+            }
+            const c = failCost(rec, true);
+            finishPaid(held, c);
+            if (c == null) state.costUnknown = true;
+            else if (c > 0) state.unreportedUsd += c;
+            throw e;
+          }
+        }
         let judged = null;
         try { judged = await r.clone().json(); } catch { judged = null; }
         const reported = usdOf(judged, r);
@@ -1203,28 +1342,21 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           const e = new Error(inv && state.paidIds.has(inv.paymentId) ? `x402 invoice ${inv.paymentId} was already paid; not paying it again` : "payment required, but the 402 response offered no usable Nano option");
           e.code = "x402"; throw e;
         }
-        if (commit) commit();
-        rec.paymentId = inv.paymentId;
-        state.paidIds.add(inv.paymentId);
-        // marked BEFORE the wallet call: a wallet can send and still throw, so from here on this
-        // attempt counts as possibly paid and is never followed by a fallback, unless the wallet
-        // proves nothing was sent (an error carrying paymentNotSent === true)
-        rec.paymentStarted = true;
+        // Cancel during the invoice read, and again inside the queued callback.
+        // paidIds and paymentStarted flip only after that second check, still
+        // before the wallet call: a wallet can send and still throw, so from
+        // there on this attempt counts as possibly paid and is never followed
+        // by a fallback, unless the wallet error carries paymentNotSent === true.
         try {
-          const paying = Promise.resolve().then(() => payment(inv));
-          // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
-          paying.then(() => {
-            if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
-            rec.paid = true; rec.paymentAmbiguous = false; rec.usd = inv.amountUsd; rec.counted = true;
-            if (Number.isFinite(inv.amountUsd)) state.unreportedUsd += inv.amountUsd; else state.costUnknown = true;
-            const c = state.reconcile.find((x) => x.paymentId === inv.paymentId);
-            if (c) { c.ambiguous = false; c.status = "paid after the writer stopped waiting; its result was not used"; c.late = true; }
+          const paying = queueInvoicePayment(inv, rec, signal, "paid after the writer stopped waiting; its result was not used", commit, () => {
             if (state.paidFailed[letter] && state.paidFailed[letter].paymentId === inv.paymentId) state.paidFailed[letter].ambiguous = false;
-            if (typeof state.onLate === "function") state.onLate(c || { letter, kind, paymentId: inv.paymentId, amountUsd: inv.amountUsd });
-          }, () => {});
+          });
           await raceAbort(paying, signal);
         } catch (e) {
           if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
+          // The abort can win the race before the microtask marks the attempt.
+          // Nothing was sent, so this is not an ambiguous payment.
+          if (!rec.paymentStarted && signal && signal.aborted) { rec.status = "payment not sent"; throw e; }
           rec.paymentAmbiguous = true;
           rec.status = signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed";
           state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: true, status: rec.status });
@@ -1529,40 +1661,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         rec.status = 402;
         throw new Error("decider review could not be paid");
       }
-      // A cancel during the invoice read must not pay. Check again inside the
-      // queued callback: the signal can flip in the gap before that microtask runs.
-      const notSent = () => {
-        const reason = signal && signal.reason;
-        const err = new Error(reason && reason.message ? reason.message : "cancelled");
-        if (reason && reason.name) err.name = reason.name;
-        err.paymentNotSent = true;
-        return err;
-      };
-      if (signal && signal.aborted) {
-        rec.paymentStarted = false;
-        rec.status = "payment not sent";
-        throw notSent();
-      }
-      rec.paymentId = inv.paymentId;
       try {
-        const paying = Promise.resolve().then(() => {
-          if (signal && signal.aborted) throw notSent();
-          state.paidIds.add(inv.paymentId);
-          rec.paymentStarted = true;
-          return payment(inv);
-        });
-        // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
-        paying.then(() => {
-          if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
-          rec.paid = true; rec.paymentAmbiguous = false; rec.usd = inv.amountUsd; rec.counted = true;
-          if (Number.isFinite(inv.amountUsd)) state.unreportedUsd += inv.amountUsd; else state.costUnknown = true;
-          const c = state.reconcile.find((x) => x.paymentId === inv.paymentId);
-          if (c) { c.ambiguous = false; c.status = "paid after the review stopped waiting; its result was not used"; c.late = true; }
-          if (typeof state.onLate === "function") state.onLate(c || { letter: rec.letter, kind: rec.kind, paymentId: inv.paymentId, amountUsd: inv.amountUsd });
-        }, () => {});
+        const paying = queueInvoicePayment(inv, rec, signal, "paid after the review stopped waiting; its result was not used");
         await raceAbort(paying, signal);
       } catch (e) {
         if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
+        if (!rec.paymentStarted && signal && signal.aborted) { rec.status = "payment not sent"; throw e; }
         rec.paymentAmbiguous = true;
         reviewReconcile(rec, inv, signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed");
         throw e;

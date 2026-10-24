@@ -978,7 +978,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           const dk = Object.keys(inputs).find((k) => k.trim().toLowerCase() === "draft");
           if (dk) inputs[dk] = cleanDraft;
         }
-        // The quote is the maximum charge. The wrapper stops before a paid step that would pass it.
+        // The quote caps what the customer pays. The wrapper stops before a paid step that would pass it. The operator absorbs a provider overrun.
         const prices = humanizePriceTable(registry.catalogs);
         const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
         const pin = tool.x402 && Number(tool.x402.usd);
