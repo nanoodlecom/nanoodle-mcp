@@ -1266,13 +1266,21 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       // erase it, or a repair charge can follow a paid check of the draft.
       commitSpend(rec, held, usd);
       rec.paymentStarted = true;
-      return Promise.resolve(payment(inv)).then((v) => v, (e) => {
-        // A wallet that says it did not send releases the budget hold. The id
-        // and the stored body stay: dropping them would let another caller pay
-        // an invoice whose send might already have happened.
+      // A throw inside payment() happens while the argument to Promise.resolve
+      // is evaluated, before a rejection handler exists. Release a confirmed
+      // not-sent failure here and on a returned rejection. An error that does
+      // not say paymentNotSent leaves the commit, the hold, and the id in place.
+      const releaseIfNotSent = (e) => {
         if (e && e.paymentNotSent === true) undoCommit(rec, held);
         throw e;
-      });
+      };
+      let wallet;
+      try {
+        wallet = payment(inv);
+      } catch (e) {
+        releaseIfNotSent(e);
+      }
+      return Promise.resolve(wallet).then((v) => v, releaseIfNotSent);
     });
     paying.then(() => {
       if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;

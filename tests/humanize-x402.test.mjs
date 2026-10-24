@@ -270,6 +270,76 @@ test("ambiguous payment: the wallet call throws after sending → no fallback, r
   assert.equal(hf2.state.costUnknown, false);
 });
 
+test("a synchronous paymentNotSent releases the budget so the fallback can pay", async () => {
+  const paid = [];
+  let hf;
+  hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.02,
+    prices: HUMANIZE_MODEL_PRICES,
+    // Not async: the throw happens before Promise.resolve can attach a handler.
+    payment: (inv) => {
+      paid.push(inv.paymentId);
+      if (inv.paymentId === "payCyd") {
+        const e = new Error("insufficient balance");
+        e.paymentNotSent = true;
+        throw e;
+      }
+    },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) return okRes("from starry", 0);
+      if (init.headers && init.headers["x-x402-payment-id"]) return okRes("from starry", 0);
+      const model = JSON.parse(init.body).model;
+      if (model === STARRY) {
+        assert.equal(hf.state.meteredUsd, 0, "the not-sent primary recorded no usage");
+        assert.equal(hf.state.committedUsd, 0, "the not-sent primary released its budget commit");
+        assert.ok(hf.state.reservedUsd < 0.001, "the primary reservation is gone: " + hf.state.reservedUsd);
+      }
+      return invoiceOf(model === CYD ? "payCyd" : "payStar", 0.01);
+    },
+  });
+  const r = await hf.fetch(CHAT, xreq(CYD));
+  assert.equal((await r.json()).choices[0].message.content, "from starry");
+  assert.deepEqual(paid, ["payCyd", "payStar"]);
+  assert.equal(hf.state.fallback.C.ok, true);
+  assert.ok(near(hf.state.meteredUsd, 0.01), "only the fallback invoice is usage: " + hf.state.meteredUsd);
+  assert.equal(hf.state.committedUsd, 0);
+  assert.equal(hf.state.reservedUsd, 0);
+  assert.equal(hf.state.costUnknown, false);
+  assert.deepEqual(hf.state.reconcile, []);
+  assert.equal(hf.state.paidIds.has("payCyd"), true, "the id stays reserved after a not-sent error");
+  assert.equal(hf.state.paidIds.has("payStar"), true);
+  assert.deepEqual(hf.state.skippedForBudget, []);
+});
+
+test("a synchronous wallet throw without paymentNotSent keeps the commit and blocks the fallback", async () => {
+  const seen = [];
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.02,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: () => { throw new Error("RPC timed out after publish"); },
+    fetch: async (url, init) => {
+      if (String(url).includes("/complete/")) return okRes("from starry", 0);
+      seen.push(JSON.parse(init.body).model);
+      return invoiceOf("payAmbSync", 0.01);
+    },
+  });
+  await assert.rejects(hf.fetch(CHAT, xreq(CYD)), /RPC timed out/);
+  assert.deepEqual(seen, [CYD], "no Starry request");
+  assert.equal(hf.state.fallback.C, undefined);
+  assert.equal(hf.state.paidIds.has("payAmbSync"), true);
+  assert.equal(hf.state.paidFailed.C.ambiguous, true);
+  assert.equal(hf.state.costUnknown, true);
+  assert.equal(hf.state.reconcile[0].ambiguous, true);
+  assert.equal(hf.state.reconcile[0].status, "payment call failed");
+  assert.ok(near(hf.state.meteredUsd, 0.01), "the unconfirmed invoice stays against the budget: " + hf.state.meteredUsd);
+  assert.equal(hf.state.committedUsd, 0);
+  assert.equal(hf.state.reservedUsd, 0);
+});
+
 test("slow payment past the re-ask deadline: the wait is bounded and the first answer is kept", async () => {
   let calls = 0;
   const hf = humanizeFetch({ record: REC, draft: "one two three four five six", reaskEndMs: 80, payment: (inv) => (inv.paymentId === "payR" ? new Promise(() => {}) : Promise.resolve()), fetch: async (u, init) => {
