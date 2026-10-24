@@ -978,6 +978,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           const dk = Object.keys(inputs).find((k) => k.trim().toLowerCase() === "draft");
           if (dk) inputs[dk] = cleanDraft;
         }
+        // The quote is the maximum charge. The wrapper stops before a paid step that would pass it.
+        const prices = humanizePriceTable(registry.catalogs);
+        const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
+        const pin = tool.x402 && Number(tool.x402.usd);
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
           record: tool.humanize,
@@ -990,6 +994,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           title: opts.title === true,
           payment: apiKey ? null : payment,
           baseUrl: baseUrl || "https://nano-gpt.com",
+          budgetUsd: quoted ?? (Number.isFinite(pin) && pin > 0 ? pin : null),
+          prices,
         });
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
         hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);

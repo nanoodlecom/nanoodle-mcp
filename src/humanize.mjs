@@ -76,6 +76,11 @@
  *    caller passes title: true. Callers who omit keep, ending, maxChars, and
  *    title keep the previous result shape, the same six paid calls, and the
  *    previous price.
+ * 9. Deposit. max_tokens on every call is sized from maxChars, or from the
+ *    draft length when maxChars is omitted, plus a small slack. The quoted
+ *    deposit is the maximum charge: settlement keeps the lesser of the metered
+ *    cost plus 20% and that deposit. A paid step that would pass the deposit
+ *    is skipped, and the run finishes with a partial result or with no charge.
  */
 import { ParamsError } from "./tools.mjs";
 import { parseNanoInvoice } from "nanoodle";
@@ -111,36 +116,65 @@ export const REASK_TEXT = "Your last attempt copied the draft. Rewrite it in you
 export const codePoints = (s) => [...String(s ?? "")].length;
 
 /**
- * Writer output tokens a request can be billed for. The graph's maxTokens is
- * the API cap. When the caller sets maxChars, the request is sent with
- * max_tokens lowered to one token per allowed character (still not above the
- * graph cap), so the bill cannot exceed that length. Omitted maxChars keeps
- * the graph cap.
+ * Realistic token estimate: about 3.5 bytes per token. The quote is a deposit
+ * the caller cannot be charged above (the gate keeps the lesser of metered
+ * cost + 20% and the deposit), so this does not have to be a tokenizer proof.
  */
-export function writerOutputTokenCap(graphCap, maxChars) {
-  const cap = Math.max(1, Math.floor(Number(graphCap) || 600));
-  const limit = Number(maxChars);
-  if (!Number.isFinite(limit) || limit <= 0) return cap;
-  return Math.max(1, Math.min(cap, Math.ceil(limit)));
-}
-
+export const HUMANIZE_BYTES_PER_TOKEN = 3.5;
+/** The gate keeps metered cost times this. A later paid step must fit inside the deposit at this markup. */
+export const HUMANIZE_SETTLE_MARKUP = 1.2;
 /**
- * Enforced size of a writer completion before a later paid call sees it.
- * Output tokens are already capped by max_tokens. A token can be several
- * bytes, so the text is also cut to this many bytes. Four is one UTF-8 code
- * point per token: long enough for the short comments this tool asks for,
- * and short enough that the next stage's byte count is a proven token cap.
+ * Output tokens added on top of the request length. Small next to a model cap:
+ * enough for a rewrite to run a little long, not enough to price the model's
+ * own 600- or 1600-token ceiling.
  */
-export const HUMANIZE_MAX_BYTES_PER_TOKEN = 4;
+export const HUMANIZE_OUTPUT_SLACK = 48;
+/**
+ * Extra output tokens for the decider only. Its reply is the winning rewrite
+ * plus a short ranking JSON, so the rewrite-sized cap needs this much more
+ * room. It is not the model's output cap.
+ */
+export const HUMANIZE_JUDGE_JSON_TOKENS = 256;
+/**
+ * Retries the deposit prices, on top of one call per writer. The run may still
+ * attempt up to MAX_REASKS; a further call that would pass the deposit is skipped.
+ */
+export const HUMANIZE_PRICED_REASKS = 1;
 
-/** One token per byte. A byte-level tokenizer cannot split a byte, so this is an upper bound. */
+/** Bytes of a string. Used for the token estimate and for span sizes. */
 export function tokenUpperBound(text) {
   return Buffer.byteLength(String(text ?? ""), "utf8");
 }
 
-/** Bytes a writer completion is cut to before it is echoed, restored, or judged. */
+/** Token estimate for a known byte length. Empty text is zero tokens. */
+export function estimateTokensFromBytes(byteLength) {
+  const n = Math.max(0, Math.floor(Number(byteLength) || 0));
+  if (n === 0) return 0;
+  return Math.ceil(n / HUMANIZE_BYTES_PER_TOKEN);
+}
+
+/**
+ * max_tokens for one call, taken from the request rather than the model's
+ * output cap. maxChars, when set, is that many characters (priced as one byte
+ * each). Otherwise the basis is the draft's byte length. A small slack is
+ * added. The decider also gets room for its ranking JSON.
+ */
+export function requestOutputTokenCap(maxChars, inputText, { judge = false } = {}) {
+  const limit = Number(maxChars);
+  const basis = Number.isFinite(limit) && limit > 0
+    ? Math.max(1, Math.ceil(limit))
+    : Math.max(1, tokenUpperBound(inputText));
+  const slack = HUMANIZE_OUTPUT_SLACK + (judge ? HUMANIZE_JUDGE_JSON_TOKENS : 0);
+  return Math.max(1, estimateTokensFromBytes(basis) + slack);
+}
+
+/**
+ * Bytes of writer text forwarded into a later call. Floor of tokens × 3.5, so
+ * re-estimating those bytes does not come out above the max_tokens that produced them.
+ */
 export function writerForwardByteCap(tokenCap) {
-  return Math.max(1, Math.floor(Number(tokenCap) || 1)) * HUMANIZE_MAX_BYTES_PER_TOKEN;
+  const n = Math.max(1, Math.floor(Number(tokenCap) || 1));
+  return Math.max(1, Math.floor(n * HUMANIZE_BYTES_PER_TOKEN));
 }
 
 /**
@@ -1023,8 +1057,9 @@ export function failedBeforeSend(e, signal) {
  * exact body that invoice was issued for. Once a primary's invoice is paid there is no fallback: a
  * paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false }) {
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null };
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null }) {
+  const budget = Number(budgetUsd);
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: Number.isFinite(budget) && budget > 0 ? budget : null, meteredUsd: 0, reservedUsd: 0, skippedForBudget: [] };
   let reasksLeft = maxReasks;
   const byModel = new Map();
   const dupes = new Set();
@@ -1061,6 +1096,47 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     return rec.beforeSend ? 0 : null;
   };
   const jsonResponse = (j, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
+  const messageBytes = (messages) => {
+    let n = 0;
+    for (const m of messages || []) if (m && typeof m.content === "string") n += tokenUpperBound(m.content);
+    return n;
+  };
+  /**
+   * Reserve the estimate of one paid call, or return null when starting it
+   * would push metered spend (including calls already in flight) past the
+   * deposit at the 20% markup. Null budget means this run is not capping.
+   * The reservation is synchronous, so parallel writers cannot all pass on
+   * the same remaining room.
+   */
+  const hold = (kind, letter, model, messages, outTokens) => {
+    if (state.budgetUsd == null) return 0;
+    const rate = prices && prices[model];
+    let provider = null;
+    if (rate && rate[0] > 0 && rate[1] > 0) {
+      const inT = estimateTokensFromBytes(messageBytes(messages));
+      const outT = Math.max(1, Math.floor(Number(outTokens) || 1));
+      provider = (inT * rate[0] + outT * rate[1]) / 1e6;
+    }
+    const room = provider == null ? Infinity : (state.meteredUsd + state.reservedUsd + provider) * HUMANIZE_SETTLE_MARKUP;
+    if (provider == null || room > state.budgetUsd + 1e-9) {
+      state.skippedForBudget.push({ kind, letter: letter || null, model: model || null });
+      return null;
+    }
+    state.reservedUsd += provider;
+    return provider;
+  };
+  /** Swap a reservation for the metered cost. An unknown meter stays reserved so the next call cannot spend it. */
+  const finishPaid = (held, actualUsd) => {
+    if (state.budgetUsd == null) return;
+    const reserved = Number(held) || 0;
+    state.reservedUsd = Math.max(0, state.reservedUsd - reserved);
+    if (actualUsd == null || !Number.isFinite(Number(actualUsd))) {
+      state.reservedUsd += reserved;
+      return;
+    }
+    state.meteredUsd += Number(actualUsd);
+  };
+  const skippedResponse = () => jsonResponse({ choices: [{ message: { content: "" } }], x_nanogpt_pricing: { costUsd: 0 } });
 
   const wrapped = async (url, init = {}) => {
     if (!/\/api\/v1\/chat\/completions(\?|$)/.test(String(url)) || !init || typeof init.body !== "string") return fetch(url, init);
@@ -1070,18 +1146,32 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (!letter) {
       if (body && body.model === "z-ai/glm-5.3" && !state.judgeReq) {
         const user = (body.messages || []).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).join("\n");
+        const outCap = requestOutputTokenCap(state.maxChars, state.draft, { judge: true });
+        body = { ...body, max_tokens: outCap };
+        const held = hold("decider", null, body.model, body.messages, body.max_tokens);
+        if (held == null) return skippedResponse();
         state.judgeReq = { url: String(url), headers: init.headers, body, user, signal: init.signal || null };
+        let r;
+        try { r = await fetch(url, { ...init, body: JSON.stringify(body) }); }
+        catch (e) {
+          finishPaid(held, failedBeforeSend(e, init.signal) ? 0 : null);
+          throw e;
+        }
+        let judged = null;
+        try { judged = await r.clone().json(); } catch { judged = null; }
+        const reported = usdOf(judged, r);
+        finishPaid(held, reported == null ? (r.ok ? null : 0) : reported);
+        return r;
       }
       return fetch(url, init);
     }
     const note = writerNote(state.spans, state.ending, state.maxChars);
     const seenDraft = writerDraft || draft;
     if (note || (writerDraft && writerDraft !== draft)) body = annotateWriterBody(body, draft, seenDraft, note);
-    // The deposit prices the graph's 600-token writer cap (lower when maxChars is set).
-    // Never send a higher max_tokens than that, or the completion can be billed past the quote.
-    const tokenCap = writerOutputTokenCap(600, state.maxChars);
-    const requested = Number(body.max_tokens);
-    body = { ...body, max_tokens: requested > 0 ? Math.min(requested, tokenCap) : tokenCap };
+    // max_tokens follows the request (maxChars, or the draft length) plus a small
+    // slack. The model's own output cap is not what this call can spend.
+    const tokenCap = requestOutputTokenCap(state.maxChars, state.draft);
+    body = { ...body, max_tokens: tokenCap };
     const forwardCap = writerForwardByteCap(tokenCap);
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
@@ -1190,6 +1280,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
 
     let model = body.model;
     let res;
+    const heldPrimary = hold("primary", letter, body.model, body.messages, body.max_tokens);
+    if (heldPrimary == null) return skippedResponse();
     try {
       const fb = record[letter].fallbackModel;
       if (fb) {
@@ -1200,11 +1292,14 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
         try {
           res = await attempt(body, "primary", ac.signal, () => clearTimeout(timer));
+          finishPaid(heldPrimary, res.rec.usd);
           addCost(res.rec.usd);
           if (res.r.status === 429 || res.r.status >= 500) reason = `HTTP ${res.r.status}`;
         } catch (e) {
           const rec = lastMine();
-          addCost(failCost(rec, x402)); // unknown (lower bound) unless provably free or a known payment
+          const failed = failCost(rec, x402);
+          finishPaid(heldPrimary, failed);
+          addCost(failed); // unknown (lower bound) unless provably free or a known payment
           if (rec && (rec.paid || rec.paymentStarted)) {
             state.paidFailed[letter] = { model: body.model, status: rec.status, paymentId: rec.paymentId, ambiguous: !rec.paid };
             throw e;
@@ -1221,21 +1316,38 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           state.paidFailed[letter] = { model: body.model, status: res.r.status };
           reason = null;
         } else if (reason) {
-          model = fb;
+          const fbBody = { ...body, model: fb };
+          const heldFb = hold("fallback", letter, fb, fbBody.messages, fbBody.max_tokens);
           state.fallback[letter] = { from: body.model, to: fb, reason, ok: false };
-          try {
-            res = await attempt({ ...body, model: fb }, "fallback", init.signal);
-          } catch (e) {
-            addCost(failCost(lastMine(), x402));
-            state.fallback[letter].failed = "request error";
-            throw e;
+          if (heldFb == null) {
+            state.fallback[letter].failed = "skipped so the deposit would not be exceeded";
+            if (!res) { lose(); return skippedResponse(); }
+          } else {
+            model = fb;
+            try {
+              res = await attempt(fbBody, "fallback", init.signal);
+              finishPaid(heldFb, res.rec.usd);
+            } catch (e) {
+              const failed = failCost(lastMine(), x402);
+              finishPaid(heldFb, failed);
+              addCost(failed);
+              state.fallback[letter].failed = "request error";
+              throw e;
+            }
+            addCost(res.rec.usd);
+            if (res.r.ok) state.fallback[letter].ok = true; else state.fallback[letter].failed = `HTTP ${res.r.status}`;
           }
-          addCost(res.rec.usd);
-          if (res.r.ok) state.fallback[letter].ok = true; else state.fallback[letter].failed = `HTTP ${res.r.status}`;
         }
       } else {
-        try { res = await attempt(body, "primary", init.signal); }
-        catch (e) { addCost(failCost(lastMine(), x402)); throw e; }
+        try {
+          res = await attempt(body, "primary", init.signal);
+          finishPaid(heldPrimary, res.rec.usd);
+        } catch (e) {
+          const failed = failCost(lastMine(), x402);
+          finishPaid(heldPrimary, failed);
+          addCost(failed);
+          throw e;
+        }
         addCost(res.rec.usd);
       }
     } catch (e) { lose(); throw e; }
@@ -1254,43 +1366,55 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     }
     const normalized = normalizeDashes(msg.content);
     if (normalized !== msg.content) state.dashes[letter] = true;
-    let text = capUtf8(normalized, forwardCap);
+    // Judge the model's full reply. Capping first would shorten a paragraph or
+    // an over-length rewrite until the guard no longer saw it. The reply that
+    // is kept is cut to the priced size before a later call sees it.
+    let text = normalized;
     // With protected spans, "copied the draft" means the placeholder draft the writer was shown.
     const copySource = state.spans.length && writerDraft ? writerDraft : draft;
     const ratio = copyRatio(text, copySource);
     if (ratio > NEAR_COPY_RATIO && (reasksLeft <= 0 || now() - t0 >= reaskDeadlineMs)) {
       state.skippedReask[letter] = { ratio, why: reasksLeft <= 0 ? `the ${maxReasks}-re-ask limit for this run was reached` : "too late in the writer's time budget" };
     } else if (ratio > NEAR_COPY_RATIO) {
-      reasksLeft--;
       // its own deadline: the re-ask must finish by reaskEndMs after the writer call began, or the
       // first answer is kept (so the writer's 60 s node timeout never eats a usable rewrite)
-      const left = Math.max(0, t0 + reaskEndMs - now());
-      const ac = new AbortController();
-      const timer = setTimeout(() => { const e = new Error("re-ask timed out"); e.name = "TimeoutError"; ac.abort(e); }, left);
-      const onOuter = () => ac.abort(init.signal.reason);
-      if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
-      try {
-        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: text }, { role: "user", content: REASK_TEXT }] }, "reask", ac.signal);
-        addCost(r2.rec.usd);
-        const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
-        if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
-          const t2 = capUtf8(normalizeDashes(m2.content), forwardCap);
-          state.reasked[letter] = { ratio, after: copyRatio(t2, copySource) };
-          text = t2;
-        } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
-      } catch (e) {
-        const rec = lastMine();
-        // cost first, on every exit (outer cancel included): known payments stay in the totals,
-        // unconfirmed ones flag the total as a lower bound and stay in state.reconcile
-        if (rec && rec.kind === "reask") addCost(failCost(rec, x402));
-        if (init.signal && init.signal.aborted) {
-          state.reasked[letter] = { ratio, after: null, failed: "cancelled" };
-          lose(); throw e;
+      const reBody = { ...body, model, messages: [...(body.messages || []), { role: "assistant", content: capUtf8(text, forwardCap) }, { role: "user", content: REASK_TEXT }] };
+      const heldRe = hold("reask", letter, model, reBody.messages, reBody.max_tokens);
+      if (heldRe == null) {
+        state.skippedReask[letter] = { ratio, why: "it would have cost more than this request's deposit" };
+      } else {
+        reasksLeft--;
+        const left = Math.max(0, t0 + reaskEndMs - now());
+        const ac = new AbortController();
+        const timer = setTimeout(() => { const e = new Error("re-ask timed out"); e.name = "TimeoutError"; ac.abort(e); }, left);
+        const onOuter = () => ac.abort(init.signal.reason);
+        if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
+        try {
+          const r2 = await attempt(reBody, "reask", ac.signal);
+          finishPaid(heldRe, r2.rec.usd);
+          addCost(r2.rec.usd);
+          const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
+          if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
+            const t2 = capUtf8(normalizeDashes(m2.content), forwardCap);
+            state.reasked[letter] = { ratio, after: copyRatio(t2, copySource) };
+            text = t2;
+          } else state.reasked[letter] = { ratio, after: null, failed: r2.r.ok ? "no text in the answer" : `HTTP ${r2.r.status}` };
+        } catch (e) {
+          const rec = lastMine();
+          // cost first, on every exit (outer cancel included): known payments stay in the totals,
+          // unconfirmed ones flag the total as a lower bound and stay in state.reconcile
+          const failed = rec && rec.kind === "reask" ? failCost(rec, x402) : 0;
+          finishPaid(heldRe, failed);
+          if (rec && rec.kind === "reask") addCost(failed);
+          if (init.signal && init.signal.aborted) {
+            state.reasked[letter] = { ratio, after: null, failed: "cancelled" };
+            lose(); throw e;
+          }
+          state.reasked[letter] = { ratio, after: null, failed: ac.signal.aborted ? `no answer within ${Math.round(reaskEndMs / 1000)} s of the writer call` : "request error" };
+        } finally {
+          clearTimeout(timer);
+          if (init.signal) init.signal.removeEventListener("abort", onOuter);
         }
-        state.reasked[letter] = { ratio, after: null, failed: ac.signal.aborted ? `no answer within ${Math.round(reaskEndMs / 1000)} s of the writer call` : "request error" };
-      } finally {
-        clearTimeout(timer);
-        if (init.signal) init.signal.removeEventListener("abort", onOuter);
       }
     }
     const system = (body.messages || []).filter((m) => m.role === "system" && typeof m.content === "string").map((m) => m.content).join("\n");
@@ -1302,30 +1426,39 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       state.skippedGuard[letter] = reasksLeft <= 0 ? `the ${maxReasks}-re-ask limit for this run was reached` : "too late in the writer's time budget";
     }
     if (guardAllowed) {
-      reasksLeft--;
-      const left = Math.max(0, t0 + reaskEndMs - now());
-      const ac = new AbortController();
-      const timer = setTimeout(() => { const e = new Error("guard retry timed out"); e.name = "TimeoutError"; ac.abort(e); }, left);
-      const onOuter = () => ac.abort(init.signal.reason);
-      if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
       const prompt = guardRetryPrompt(assessment.reasons, guardOpts);
-      try {
-        const r2 = await attempt({ ...body, model, messages: [...(body.messages || []), { role: "assistant", content: capUtf8(text, forwardCap) }, { role: "user", content: prompt }] }, "guard", ac.signal);
-        addCost(r2.rec.usd);
-        const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
-        if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
-          text = capUtf8(normalizeDashes(m2.content), forwardCap);
-          assessment = assessWriterOutput(text, guardOpts);
-          state.guarded = state.guarded || {};
-          state.guarded[letter] = { reasons: assessment.ok ? [] : assessment.reasons, ok: assessment.ok };
+      const guardBody = { ...body, model, messages: [...(body.messages || []), { role: "assistant", content: capUtf8(text, forwardCap) }, { role: "user", content: prompt }] };
+      const heldGuard = hold("guard", letter, model, guardBody.messages, guardBody.max_tokens);
+      if (heldGuard == null) {
+        state.skippedGuard[letter] = "it would have cost more than this request's deposit";
+      } else {
+        reasksLeft--;
+        const left = Math.max(0, t0 + reaskEndMs - now());
+        const ac = new AbortController();
+        const timer = setTimeout(() => { const e = new Error("guard retry timed out"); e.name = "TimeoutError"; ac.abort(e); }, left);
+        const onOuter = () => ac.abort(init.signal.reason);
+        if (init.signal) { if (init.signal.aborted) onOuter(); else init.signal.addEventListener("abort", onOuter, { once: true }); }
+        try {
+          const r2 = await attempt(guardBody, "guard", ac.signal);
+          finishPaid(heldGuard, r2.rec.usd);
+          addCost(r2.rec.usd);
+          const m2 = r2.j && r2.j.choices && r2.j.choices[0] && r2.j.choices[0].message;
+          if (r2.r.ok && m2 && typeof m2.content === "string" && m2.content.trim()) {
+            text = normalizeDashes(m2.content);
+            assessment = assessWriterOutput(text, guardOpts);
+            state.guarded = state.guarded || {};
+            state.guarded[letter] = { reasons: assessment.ok ? [] : assessment.reasons, ok: assessment.ok };
+          }
+        } catch (e) {
+          const rec = lastMine();
+          const failed = rec && rec.kind === "guard" ? failCost(rec, x402) : 0;
+          finishPaid(heldGuard, failed);
+          if (rec && rec.kind === "guard") addCost(failed);
+          if (init.signal && init.signal.aborted) { lose(); throw e; }
+        } finally {
+          clearTimeout(timer);
+          if (init.signal) init.signal.removeEventListener("abort", onOuter);
         }
-      } catch (e) {
-        const rec = lastMine();
-        if (rec && rec.kind === "guard") addCost(failCost(rec, x402));
-        if (init.signal && init.signal.aborted) { lose(); throw e; }
-      } finally {
-        clearTimeout(timer);
-        if (init.signal) init.signal.removeEventListener("abort", onOuter);
       }
     }
     if (!assessment.ok) {
@@ -1484,7 +1617,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const req = state.judgeReq;
     if (!req) return { ok: false };
     const model = modelName || (record[letter] && record[letter].model) || "";
-    const tokenCap = writerOutputTokenCap(600, state.maxChars);
+    const tokenCap = requestOutputTokenCap(state.maxChars, state.draft);
     const cappedCandidate = capPreservingSpans(candidate, state.spans, candidateByteCap(tokenCap, state.spans, { ending: state.ending, draft: state.draft }));
     const user = reviewUserMessage(req.user, letter, model, cappedCandidate);
     const messages = Array.isArray(req.body.messages) ? req.body.messages.map((m) => ({ ...m })) : [];
@@ -1497,7 +1630,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       }
     }
     if (!replaced) return { ok: false };
-    const body = { ...req.body, messages };
+    const judgeCap = requestOutputTokenCap(state.maxChars, state.draft, { judge: true });
+    const body = { ...req.body, messages, max_tokens: judgeCap };
+    const held = hold("review", letter, body.model, body.messages, body.max_tokens);
+    if (held == null) return { ok: false };
     const rec = { letter, kind: "review", model: body.model, status: null, paid: false, paymentStarted: false, usd: null };
     state.attempts.push(rec);
     const outer = req.signal || null;
@@ -1513,12 +1649,17 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (outer) { if (outer.aborted) onOuter(); else outer.addEventListener("abort", onOuter, { once: true }); }
     try {
       const result = await paidChat(req.url, req.headers, body, rec, ac.signal);
+      const metered = result && result.known && result.usd != null && isFinite(Number(result.usd))
+        ? Number(result.usd)
+        : (result && result.paidUsd != null && isFinite(Number(result.paidUsd)) ? Number(result.paidUsd) : null);
+      finishPaid(held, metered);
       recordReviewPrice(state, rec, result);
       if (!result.status || result.status !== 200 || !result.content) return { ok: false };
       return parseRepairVerdict(result.content, letter);
     } catch (e) {
       const x402 = !!payment && String(hget(req.headers, "x-x402")) === "true" && !hget(req.headers, "authorization");
       const c = failCost(rec, x402);
+      finishPaid(held, c);
       if (c == null) state.costUnknown = true;
       else state.unreportedUsd += c;
       throw e;
@@ -1547,6 +1688,9 @@ export function humanizeRunNotes(state) {
     const again = state.guarded && state.guarded[l] ? " It was asked once more, and that reply was dropped too."
       : state.skippedGuard && state.skippedGuard[l] ? ` It was not asked again (${state.skippedGuard[l]}).` : "";
     notes.push(`note: writer ${l}'s rewrite was dropped before the decider (${d.why}).${again}`);
+  }
+  if (state.skippedForBudget && state.skippedForBudget.length) {
+    notes.push("note: a later step was skipped because it would have cost more than this request's deposit.");
   }
   return notes;
 }

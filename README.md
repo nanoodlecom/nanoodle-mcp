@@ -386,21 +386,20 @@ graph JSON:
 ```
 
 **humanize-comment** quotes each request on its own, instead of one flat deposit.
-The quote is built from the draft, context, and guidance actually sent, and
-from `maxChars` (the model's own output cap, when `maxChars` is omitted). It
-includes every writer, the fallback that can still be billed, up to three
-retries, the decider, and a second decider pass when a protected span can be
-repaired, priced at those models' per-token rates. Each input is capped and
-counted as one token per byte, each output is the max_tokens actually sent,
-and the decider is reserved for the size of a rewrite after protected phrases
-are put back, so the figure is an upper bound on the charge rather than a
-guess. That worst case plus the 20% markup is the maximum charge for the
-request. The deposit is 12% above that charge, at least $0.001, rounded up,
-and it is never below the charge.
-A short comment is not asked for the longest comment's hold. The figure in
-the quote is the deposit taken for that call; the run still settles at the
-metered cost plus 20%, and the difference is returned. The graph's `usd` is
-only the ceiling for that longest request, used when a model has no price.
+The quote is the most that request can be charged. It is built from the draft,
+context, guidance, and `maxChars` actually sent. Each call's `max_tokens` is
+sized from that request: `maxChars`, or the draft's length when `maxChars` is
+omitted, plus a small slack. Tokens are estimated at about 3.5 bytes each. The
+priced worst case is every writer once (a fallback counts as the more expensive
+of the two calls), one extra retry, the decider, and a second decider pass when
+a protected span can be repaired. A step that would push the metered spend past
+the quote is skipped. The run then ends with a partial result, or with nothing
+owed when nothing was sent. The deposit is 12% above that priced charge, at least $0.001,
+rounded up, and never below it. Settlement charges the lesser of the metered
+cost plus 20% and the quoted deposit, and returns the difference. The operator
+absorbs a rare overrun on a call that was already in flight. A short comment
+is not asked for the longest comment's hold. The graph's `usd` is only the
+ceiling for that longest request, used when a model has no price.
 
 `usd` overrides the deposit for every other tool. `author` routes **the 20% markup of every
 successful call to that address** — computed on what the run *actually* cost,

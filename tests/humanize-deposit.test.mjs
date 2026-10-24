@@ -7,10 +7,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChargeGate } from "../src/gate.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { humanizeFetch, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, writerOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
+import { humanizeFetch, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
 import {
   humanizeChargeUsd, humanizeDepositUsd, humanizeCeilingDepositUsd, humanizePriceTable, humanizeStageBudget,
-  depositFromCharge, HUMANIZE_DEPOSIT_FLOOR_USD, HUMANIZE_DEPOSIT_MARGIN,
+  depositFromCharge, settledChargeUsd, HUMANIZE_DEPOSIT_FLOOR_USD, HUMANIZE_DEPOSIT_MARGIN, HUMANIZE_MODEL_PRICES,
 } from "../src/humanize-deposit.mjs";
 
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
@@ -49,10 +49,12 @@ test("short, typical, and maximum-length deposits cover their own worst case and
   const maximum = covers(MAXIMUM);
   assert.ok(short < typical, `${short} should be under the 1,500-character draft`);
   assert.ok(typical < maximum, `${typical} should be under the capped request`);
-  assert.equal(typical.toFixed(8), "0.02735012");
-  assert.equal(maximum.toFixed(8), "0.03565818");
+  assert.ok(typical <= 0.012, `typical deposit ${typical} is above $0.012`);
+  assert.equal(typical.toFixed(8), "0.00754320");
+  assert.equal(maximum.toFixed(8), "0.01905403");
   const ceiling = humanizeCeilingDepositUsd(graph);
   assert.ok(maximum <= ceiling + 1e-12);
+  assert.equal(ceiling.toFixed(8), "0.04719701");
   assert.equal(ceiling.toFixed(8), graph.x402.usd.toFixed(8));
 });
 
@@ -88,7 +90,7 @@ test("maxChars lowers the deposit and is the max_tokens the writer request sends
     method: "POST",
     body: JSON.stringify({ model: record.A.model, max_tokens: 600, messages: [{ role: "user", content: open.Draft }] }),
   });
-  assert.equal(sent.max_tokens, 40);
+  assert.equal(sent.max_tokens, requestOutputTokenCap(40, open.Draft));
 });
 
 test("a higher catalog rate raises the deposit and the deposit still covers that rate", () => {
@@ -118,7 +120,7 @@ test("the quote shown to the caller is the deposit that is collected", async () 
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
     const listed = listTools().find((t) => t.name === "humanize-comment");
-    assert.match(listed.description, /a deposit is quoted for each request from its length and maxChars and covers the most that request can cost/);
+    assert.match(listed.description, /a deposit is quoted for each request from its length and maxChars and is the most that request can be charged/);
     assert.doesNotMatch(listed.description, /paid in Nano|x402|0\.0196/);
 
     const quote = async (args) => {
@@ -128,7 +130,8 @@ test("the quote shown to the caller is the deposit that is collected", async () 
     const typical = await quote(TYPICAL);
     const expected = humanizeDepositUsd(graph, TYPICAL);
     assert.equal(typical.x402.amountUsd, expected);
-    assert.match(typical.text, new RegExp(`\\$${expected.toFixed(8)} deposit`));
+    const shown = expected.toFixed(8).replace(/(\.\d*?)0+$/, "$1");
+    assert.match(typical.text, new RegExp(`\\$${shown.replace(/\./g, "\\.")} deposit`));
     const maximum = await quote(MAXIMUM);
     assert.equal(maximum.x402.amountUsd, humanizeDepositUsd(graph, MAXIMUM));
     assert.ok(typical.x402.amountUsd < maximum.x402.amountUsd);
@@ -167,12 +170,13 @@ test("a writer completion is cut to the byte cap the deposit prices", async () =
     body: JSON.stringify({ model: record.A.model, max_tokens: 9000, messages: [{ role: "user", content: "hello" }] }),
   });
   const body = await res.json();
-  const cap = writerForwardByteCap(writerOutputTokenCap(600, null));
-  assert.equal(sent.max_tokens, 600, "output tokens cannot exceed the priced cap");
+  const capTokens = requestOutputTokenCap(null, "hello");
+  const cap = writerForwardByteCap(capTokens);
+  assert.equal(sent.max_tokens, capTokens, "output tokens are the request length plus a small slack");
   assert.equal(tokenUpperBound(body.choices[0].message.content), cap);
 });
 
-test("the quote is at least the max charge, including a restore that grows 1732 bytes to 7726 and a request over the old ceiling", () => {
+test("the quote is at least the max charge, including a restore that grows 1732 bytes to 7726", () => {
   const emoji = "😀";
   const draft = emoji.repeat(HUMANIZE_INPUT_CAPS.Draft);
   const keep = emoji.repeat(500);
@@ -191,7 +195,6 @@ test("the quote is at least the max charge, including a restore that grows 1732 
   assert.ok(grewDeposit >= grewCharge);
   assert.equal(budget.chargeUsd, grewCharge);
 
-  // This request quoted $0.02597835 under the old bytes/3 estimate, above the old $0.02198746 pin.
   const ember = {
     Draft: draft,
     Context: emoji.repeat(HUMANIZE_INPUT_CAPS.Context),
@@ -200,14 +203,15 @@ test("the quote is at least the max charge, including a restore that grows 1732 
   };
   const emberCharge = humanizeChargeUsd(graph, ember);
   const emberDeposit = humanizeDepositUsd(graph, ember);
-  assert.ok(emberCharge > 0.02597835, `true charge ${emberCharge} is still under the old under-quote`);
-  assert.ok(emberCharge > 0.02198746);
   assert.ok(emberDeposit >= emberCharge);
   const ceiling = humanizeCeilingDepositUsd(graph);
-  assert.equal(ceiling.toFixed(8), "0.12230219");
+  assert.equal(ceiling.toFixed(8), "0.04719701");
   assert.ok(emberDeposit <= ceiling);
   assert.ok(grewDeposit <= ceiling);
   assert.equal(graph.x402.usd, ceiling);
+  // A meter past the quote still settles at the quote. The operator absorbs the rest.
+  assert.ok(Math.abs(settledChargeUsd(emberCharge / 1.2, emberDeposit) - emberCharge) < 1e-9);
+  assert.equal(settledChargeUsd(10, emberDeposit), emberDeposit);
 });
 
 test("fuzz: every legal request's deposit covers its own max charge and stays under the ceiling", () => {
@@ -254,9 +258,90 @@ test("fuzz: every legal request's deposit covers its own max charge and stays un
     assert.ok(Math.abs(units / 1e6 * 1.2 - charge) < 1e-9);
     assert.ok(deposit <= ceiling + 1e-12, `deposit ${deposit} exceeds the ceiling ${ceiling}`);
     const { spans } = collectSpans(Draft, args.keep || []);
-    const tokenCap = writerOutputTokenCap(600, args.maxChars);
-    const worstRaw = "z".repeat(Math.max(0, writerForwardByteCap(tokenCap) - 6)) + (spans.length ? "[[k1]]" : "");
-    const restored = reinsertSpans(worstRaw.slice(0, writerForwardByteCap(tokenCap)), spans);
+    const tokenCap = requestOutputTokenCap(args.maxChars, Draft);
+    const forward = writerForwardByteCap(tokenCap);
+    const worstRaw = "z".repeat(Math.max(0, forward - 6)) + (spans.length ? "[[k1]]" : "");
+    const restored = reinsertSpans(worstRaw.slice(0, forward), spans);
     assert.ok(tokenUpperBound(restored) <= budget.candidateBytes, `restored ${tokenUpperBound(restored)} exceeds reserve ${budget.candidateBytes}`);
+    assert.ok(Math.abs(settledChargeUsd(charge / 1.2, deposit) - charge) < 1e-9);
+    assert.equal(settledChargeUsd(charge, deposit), deposit);
   }
+});
+
+test("the run stops before the next paid step once metered spend would pass the deposit", async () => {
+  const record = {
+    A: { model: "qwen/qwen3.8-27b-novelist" },
+    B: { model: "deepseek/deepseek-v4.1-flash-1017" },
+    C: { model: "TheDrummer/Cydonia-24B-v4.3", fallbackModel: "gemma-4-12b-it-starry-ocean" },
+    D: { model: "qwen/qwen3.8-27b-antislop" },
+    E: { model: "inception/mercury-3" },
+  };
+  const seen = [];
+  const budgetUsd = 0.01;
+  const hf = humanizeFetch({
+    record,
+    draft: "a".repeat(1500),
+    budgetUsd,
+    prices: HUMANIZE_MODEL_PRICES,
+    fetch: (_url, init) => {
+      seen.push(JSON.parse(init.body).model);
+      return Promise.resolve(new Response(JSON.stringify({
+        choices: [{ message: { content: "short reply" } }],
+        x_nanogpt_pricing: { costUsd: 0.05 },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    },
+  });
+  const url = "http://x/api/v1/chat/completions";
+  const call = (model) => hf.fetch(url, {
+    method: "POST",
+    body: JSON.stringify({ model, max_tokens: 600, messages: [{ role: "user", content: "a".repeat(1500) }] }),
+  });
+  await call(record.A.model);
+  await call(record.B.model);
+  await call("z-ai/glm-5.3");
+  const verdict = await hf.state.reviewRepair("repaired", "A", record.A.model);
+  assert.deepEqual(seen, [record.A.model], "only the call already started is paid; the next writer, the decider, and the repair are not");
+  assert.equal(verdict.ok, false);
+  assert.ok(hf.state.meteredUsd * 1.2 > budgetUsd, "the in-flight call can meter past the deposit");
+  assert.equal(settledChargeUsd(hf.state.meteredUsd, budgetUsd), budgetUsd);
+  assert.ok(hf.state.skippedForBudget.some((s) => s.kind === "primary"));
+  assert.ok(hf.state.skippedForBudget.some((s) => s.kind === "decider"));
+
+  // A quote smaller than the first estimate never starts a paid call.
+  const blocked = [];
+  const hf2 = humanizeFetch({
+    record, draft: "a".repeat(1500), budgetUsd: 0.0000001, prices: HUMANIZE_MODEL_PRICES,
+    fetch: () => { blocked.push(1); return Promise.resolve(new Response("{}", { status: 200 })); },
+  });
+  const quiet = await hf2.fetch(url, {
+    method: "POST",
+    body: JSON.stringify({ model: record.A.model, messages: [{ role: "user", content: "a".repeat(1500) }] }),
+  });
+  const body = await quiet.json();
+  assert.deepEqual(blocked, []);
+  assert.equal(hf2.state.meteredUsd, 0);
+  assert.equal(body.x_nanogpt_pricing.costUsd, 0);
+  assert.equal(settledChargeUsd(hf2.state.meteredUsd, 0.0000001), 0);
+
+  // The decider can finish, and the repair after it is the step that does not start.
+  const reviewSeen = [];
+  const hf3 = humanizeFetch({
+    record, draft: "hi", budgetUsd, prices: HUMANIZE_MODEL_PRICES,
+    fetch: (_url, init) => {
+      reviewSeen.push(JSON.parse(init.body).model);
+      return Promise.resolve(new Response(JSON.stringify({
+        choices: [{ message: { content: "{}" } }],
+        x_nanogpt_pricing: { costUsd: 0.05 },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    },
+  });
+  await hf3.fetch(url, {
+    method: "POST",
+    body: JSON.stringify({ model: "z-ai/glm-5.3", messages: [{ role: "user", content: "hi" }] }),
+  });
+  const repair = await hf3.state.reviewRepair("fixed phrase", "A", record.A.model);
+  assert.deepEqual(reviewSeen, ["z-ai/glm-5.3"]);
+  assert.equal(repair.ok, false);
+  assert.ok(hf3.state.skippedForBudget.some((s) => s.kind === "review"));
+  assert.equal(settledChargeUsd(hf3.state.meteredUsd, budgetUsd), budgetUsd);
 });

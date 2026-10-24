@@ -1035,7 +1035,7 @@ export function createChargeGate({
             // for the call is the amount collected. No payment rail in this line:
             // it is the text agents show before a quote exists.
             const depositLine = full && full.pricedPerRequest
-              ? "a deposit is quoted for each request from its length and maxChars and covers the most that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned"
+              ? "a deposit is quoted for each request from its length and maxChars and is the most that request can be charged; it settles at the lesser of the metered cost plus 20% and that deposit, and any difference is returned"
               : `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
