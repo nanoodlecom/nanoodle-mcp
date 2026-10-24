@@ -33,6 +33,7 @@ import { writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
+import { knownUsd } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
 
@@ -77,7 +78,15 @@ const GRAIN = 10n ** 22n;
  * with an explicit floor/ceil.
  */
 export function parseUsdNano(v) {
-  const s = String(v).trim();
+  let s;
+  if (typeof v === "number") {
+    if (!Number.isFinite(v) || v < 0) throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+    s = String(v);
+  } else if (typeof v === "string") {
+    s = v.trim();
+  } else {
+    throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  }
   const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
   if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
   const digits = m[2] + (m[3] || "");
@@ -869,8 +878,8 @@ export function createChargeGate({
      */
     wrapRegistry(registry, { runNoodleName = "run_noodle" } = {}) {
       const pinned = new Map(registry.tools.map((t) => {
-        const v = t.x402 && Number(t.x402.usd);
-        return [t.name, Number.isFinite(v) && v > 0 ? v : null];
+        const v = t.x402 ? knownUsd(t.x402.usd) : null;
+        return [t.name, v != null && v > 0 ? v : null];
       }));
       /**
        * Deposit for a tool as of right now. The deposit is a HOLD, not the price:

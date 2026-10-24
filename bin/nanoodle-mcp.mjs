@@ -31,6 +31,7 @@ import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
 import { loadTools, attachEstimates, attachCatalogs } from "../src/tools.mjs";
+import { knownUsd } from "../src/usd.mjs";
 import { warnIfFfmpegMissing } from "../src/ffmpeg-check.mjs";
 import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
@@ -148,13 +149,13 @@ async function main() {
   if (!graphDirs.length) { console.error("--graphs <dir> is required"); usage(); }
   let maxUsd = null;
   if (maxUsdFlag != null) {
-    maxUsd = Number(maxUsdFlag);
-    if (!Number.isFinite(maxUsd) || maxUsd <= 0) { console.error("--max-usd expects a positive number"); usage(); }
+    maxUsd = knownUsd(maxUsdFlag);
+    if (maxUsd == null || maxUsd <= 0) { console.error("--max-usd expects a positive number"); usage(); }
   }
   const positive = (flag, v) => {
     if (v == null) return null;
-    const n = Number(v);
-    if (!Number.isFinite(n) || n <= 0) { console.error(`${flag} expects a positive number`); usage(); }
+    const n = knownUsd(v);
+    if (n == null || n <= 0) { console.error(`${flag} expects a positive number`); usage(); }
     return n;
   };
   const chargeUsd = positive("--charge-usd", chargeUsdFlag);

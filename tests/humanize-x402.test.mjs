@@ -881,6 +881,67 @@ test("an invoice with no USD price is refused on a direct wallet too", async () 
   await refuseUnknownUsd({ budgetUsd: null, kind: "decider" });
 });
 
+function invoiceRawUsd(id, usd, { present = true } = {}) {
+  const option = {
+    scheme: "nano",
+    payTo: "nano_1stub",
+    maxAmountRequired: "1000000000000000000000000000000",
+    completeUrl: "http://x/api/x402/complete/" + id,
+  };
+  if (present) option.maxAmountRequiredUSD = usd;
+  return new Response(JSON.stringify({
+    payment: { paymentId: id, accepted: [option] },
+  }), { status: 402, headers: { "content-type": "application/json" } });
+}
+
+async function assertMalformedUsdRefused(label, usd, present = true) {
+  let payments = 0;
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.001,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async () => { payments += 1; },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return okRes("should not settle");
+      return invoiceRawUsd("payBad", usd, { present });
+    },
+  });
+  const r = await hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody(pricedRecord.A.model, "hello") });
+  assert.equal(payments, 0, `${label}: payment() is never called`);
+  assert.equal(r.status, 200);
+  assert.equal(hf.state.meteredUsd, 0, `${label}: spend stays at 0 because nothing was paid`);
+  assert.equal(hf.state.committedUsd, 0);
+  assert.equal(hf.state.paidIds.has("payBad"), false);
+  const rec = hf.state.attempts.find((a) => a.kind === "primary");
+  assert.equal(rec.paymentStarted, false);
+  assert.equal(rec.priceUnknown, true);
+}
+
+test("an empty-string USD price does not start payment", async () => {
+  await assertMalformedUsdRefused("empty string", "");
+});
+
+test("a whitespace USD price does not start payment", async () => {
+  await assertMalformedUsdRefused("whitespace", "   ");
+});
+
+test("a boolean USD price does not start payment", async () => {
+  await assertMalformedUsdRefused("false", false);
+});
+
+test("an array USD price does not start payment", async () => {
+  await assertMalformedUsdRefused("array", []);
+});
+
+test("a null USD price does not start payment", async () => {
+  await assertMalformedUsdRefused("null", null);
+});
+
+test("a missing USD field does not start payment", async () => {
+  await assertMalformedUsdRefused("missing", undefined, false);
+});
+
 test("a known USD price of zero is still payable", async () => {
   const payments = [];
   const hf = humanizeFetch({
@@ -898,6 +959,22 @@ test("a known USD price of zero is still payable", async () => {
   assert.equal(r.status, 200);
   assert.deepEqual(payments, [0]);
   assert.equal((await r.json()).choices[0].message.content, "free");
+
+  let textPayments = 0;
+  const textZero = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.001,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { textPayments += 1; assert.equal(inv.amountUsd, 0); },
+    fetch: async (url) => {
+      if (String(url).includes("/complete/")) return new Response(JSON.stringify({ choices: [{ message: { content: "free" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+      return invoiceRawUsd("payZeroText", "0");
+    },
+  });
+  const textPaid = await textZero.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody(pricedRecord.A.model, "hello") });
+  assert.equal(textPaid.status, 200);
+  assert.equal(textPayments, 1, "the string 0 is a real zero and is paid");
 });
 
 test("a fallback is not paid for an invoice with no USD price, and a priced fallback still can be", async () => {

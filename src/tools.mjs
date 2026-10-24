@@ -19,6 +19,7 @@ import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
+import { knownUsd } from "./usd.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -381,7 +382,8 @@ function buildDescription(wf, spendSource, { cost, name } = {}) {
  * is ~$0.000002 and must not read as $0.0000.
  */
 export function formatCostUsd(usd) {
-  const n = Number(usd);
+  const n = knownUsd(usd);
+  if (n == null) return "0.0000";
   if (n > 0 && n < 0.0001) return n.toFixed(8).replace(/0+$/, "");
   return n.toFixed(4);
 }
@@ -982,7 +984,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
         const prices = humanizePriceTable(registry.catalogs);
         const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
-        const pin = tool.x402 && Number(tool.x402.usd);
+        const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
           record: tool.humanize,
@@ -995,7 +997,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           title: opts.title === true,
           payment: apiKey ? null : payment,
           baseUrl: baseUrl || "https://nano-gpt.com",
-          budgetUsd: hosted ? (quoted ?? (Number.isFinite(pin) && pin > 0 ? pin : null)) : null,
+          budgetUsd: hosted ? (quoted ?? (pin != null && pin > 0 ? pin : null)) : null,
           prices,
         });
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
@@ -1012,8 +1014,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         if (fb && fb.note) notices.push(fb.note);
         // attempts whose answer never reached the engine (failed fallbacks, paid-but-failed calls,
         // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
-        if (hf.state.unreportedUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + hf.state.unreportedUsd;
-        if (hf.state.reviewUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + hf.state.reviewUsd;
+        if (hf.state.unreportedUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.unreportedUsd;
+        if (hf.state.reviewUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.reviewUsd;
         if (hf.state.costUnknown) result.costExact = false;
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked

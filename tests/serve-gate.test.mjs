@@ -614,6 +614,13 @@ test("parseUsdNano is string-exact, handles exponents, truncates below 1e-9 USD"
   assert.equal(parseUsdNano("0.0000000001"), 0n); // 1e-10 USD truncates
   assert.throws(() => parseUsdNano("-1"));
   assert.throws(() => parseUsdNano("abc"));
+  assert.throws(() => parseUsdNano(""));
+  assert.throws(() => parseUsdNano("   "));
+  assert.throws(() => parseUsdNano(false));
+  assert.throws(() => parseUsdNano([]));
+  assert.throws(() => parseUsdNano(null));
+  assert.equal(parseUsdNano(0), 0n);
+  assert.equal(parseUsdNano("0"), 0n);
 });
 
 test("already-pocketed payments are found via account_history", async () => {

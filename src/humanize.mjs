@@ -91,6 +91,7 @@
  *    when a hosted step is skipped.
  */
 import { ParamsError } from "./tools.mjs";
+import { knownUsd } from "./usd.mjs";
 import { parseNanoInvoice } from "nanoodle";
 
 export const HUMANIZE_TOOL = "humanize-comment";
@@ -1017,16 +1018,52 @@ export function copyRatio(text, draft) {
   for (const t of r) if (d.has(t)) hit++;
   return hit / r.size;
 }
+/**
+ * The raw USD field on a 402, in the same order the invoice parser reads it.
+ * The value is returned unchanged so a later check can reject it by type.
+ * A missing field is undefined. Null falls through to the next field.
+ */
+function invoiceUsdRaw(body) {
+  const pay = body && body.payment;
+  const pool = [
+    ...(Array.isArray(body && body.accepts) ? body.accepts : []),
+    ...(Array.isArray(pay && pay.accepted) ? pay.accepted : []),
+  ];
+  const nano = pool.find((a) => a && a.scheme === "nano" && /^nano_[a-z0-9]+$/.test(String(a.payTo || "")));
+  if (nano && nano.maxAmountRequiredUSD != null) return nano.maxAmountRequiredUSD;
+  if (nano && nano.amountUsd != null) return nano.amountUsd;
+  if (pay && pay.amountUsd != null) return pay.amountUsd;
+  return undefined;
+}
+
+/**
+ * Parsed invoice whose USD price is the raw field, checked by type before any
+ * Number() conversion. The library parser coerces "", whitespace, false, and
+ * [] to 0; that coerced 0 is discarded here.
+ */
+function parsePricedInvoice(body, baseUrl) {
+  const inv = parseNanoInvoice(body, baseUrl);
+  if (!inv) return null;
+  return { ...inv, amountUsd: knownUsd(invoiceUsdRaw(body)) };
+}
+
 const usdOf = (j, r) => {
   const p = j && j.x_nanogpt_pricing;
   const pUsd = p && (p.costUsd != null ? p.costUsd : p.cost != null ? p.cost : p.amount);
   const mUsd = j && j.metadata && j.metadata.cost;
-  if (j && typeof j.cost === "number" && j.cost > 0) return j.cost;
-  if (pUsd != null && isFinite(Number(pUsd))) return Number(pUsd);
-  if (mUsd != null && isFinite(Number(mUsd))) return Number(mUsd);
-  if (j && typeof j.cost === "number") return j.cost;
-  const h = r && r.headers && r.headers.get ? parseFloat(r.headers.get("x-cost") || r.headers.get("x-nano-cost") || "") : NaN;
-  return isNaN(h) ? null : h;
+  const top = j && j.cost != null ? knownUsd(j.cost) : null;
+  if (top != null && top > 0) return top;
+  if (pUsd != null) {
+    const n = knownUsd(pUsd);
+    if (n != null) return n;
+  }
+  if (mUsd != null) {
+    const n = knownUsd(mUsd);
+    if (n != null) return n;
+  }
+  if (top != null) return top;
+  const header = r && r.headers && r.headers.get ? (r.headers.get("x-cost") || r.headers.get("x-nano-cost")) : null;
+  return header == null ? null : knownUsd(header);
 };
 
 /**
@@ -1036,17 +1073,17 @@ const usdOf = (j, r) => {
  * a stand-in that keeps the total exact.
  */
 export function recordReviewPrice(state, rec, result) {
-  const reported = result && result.known && result.usd != null && isFinite(Number(result.usd));
-  if (!reported) {
+  const reported = result && result.known ? knownUsd(result.usd) : null;
+  if (reported == null) {
     state.costUnknown = true;
     rec.priceKnown = false;
     rec.usd = null;
-    const paid = result && result.paidUsd;
-    if (paid != null && isFinite(Number(paid)) && Number(paid) > 0) state.reviewUsd += Number(paid);
+    const paid = knownUsd(result && result.paidUsd);
+    if (paid != null && paid > 0) state.reviewUsd += paid;
     return;
   }
   rec.priceKnown = true;
-  rec.usd = Number(result.usd);
+  rec.usd = reported;
   state.reviewUsd += rec.usd;
 }
 
@@ -1080,8 +1117,8 @@ export function failedBeforeSend(e, signal) {
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
 export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null }) {
-  const budget = Number(budgetUsd);
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: Number.isFinite(budget) && budget > 0 ? budget : null, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [] };
+  const budget = knownUsd(budgetUsd);
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget != null && budget > 0 ? budget : null, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [] };
   // paymentId → the exact request string that invoice was issued for. A paid retry,
   // including one that re-enters this wrapper with the caller's original body, sends this string.
   const billedBodies = new Map();
@@ -1108,13 +1145,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     p.then((v) => { signal.removeEventListener("abort", on); res(v); }, (e) => { signal.removeEventListener("abort", on); rej(e); });
   });
   /**
-   * A known USD price is a finite number >= 0. Null, and anything Number(null)
-   * would turn into 0, is unknown: that must not pass a budget check.
+   * A known USD price is a finite number >= 0, or strict decimal text.
+   * "", whitespace, false, [], null, and a missing field are unknown.
    */
-  const invoiceUsd = (amount) => {
-    if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) return null;
-    return amount;
-  };
+  const invoiceUsd = knownUsd;
   /** Keep the first body stored for an id. A later request must not replace it. */
   const rememberBody = (id, bodyStr) => {
     if (id == null || typeof bodyStr !== "string") return;
@@ -1124,7 +1158,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   /** Parse a 402. Paying does not store the body here; the claim inside queueInvoicePayment does. */
   const note402 = async (response) => {
     if (!response || response.status !== 402) return null;
-    try { return parseNanoInvoice(await response.clone().json(), baseUrl); } catch { return null; }
+    try { return parsePricedInvoice(await response.clone().json(), baseUrl); } catch { return null; }
   };
   /**
    * A 402 this run is handing back unpaid (the caller pays, or the request was keyed).
@@ -1136,8 +1170,11 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   };
   const undoCommit = (rec, held) => {
     if (!rec || rec.invoiceCommitted == null) return;
-    state.committedUsd = Math.max(0, state.committedUsd - Number(rec.invoiceCommitted));
-    if (rec.holdReleased) state.reservedUsd += Number(held) || 0;
+    const committed = knownUsd(rec.invoiceCommitted);
+    if (committed == null) return;
+    state.committedUsd = Math.max(0, state.committedUsd - committed);
+    const heldUsd = knownUsd(held);
+    if (rec.holdReleased && heldUsd != null) state.reservedUsd += heldUsd;
     rec.invoiceCommitted = null;
     rec.holdReleased = false;
   };
@@ -1149,14 +1186,16 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   const invoiceFits = (amount, held) => {
     if (state.budgetUsd == null) return true;
     if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) return false;
-    const reservedOther = Math.max(0, state.reservedUsd - (Number(held) || 0));
+    const heldUsd = knownUsd(held);
+    const reservedOther = Math.max(0, state.reservedUsd - (heldUsd == null ? 0 : heldUsd));
     const spent = state.meteredUsd + state.committedUsd + reservedOther + amount;
     return spent * HUMANIZE_SETTLE_MARKUP <= state.budgetUsd + 1e-9;
   };
   const commitSpend = (rec, held, amount) => {
     if (state.budgetUsd == null) return;
     if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) return;
-    state.reservedUsd = Math.max(0, state.reservedUsd - (Number(held) || 0));
+    const heldUsd = knownUsd(held);
+    state.reservedUsd = Math.max(0, state.reservedUsd - (heldUsd == null ? 0 : heldUsd));
     state.committedUsd += amount;
     rec.invoiceCommitted = amount;
     rec.holdReleased = true;
@@ -1238,7 +1277,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     paying.then(() => {
       if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
       rec.paid = true; rec.paymentAmbiguous = false; rec.usd = inv.amountUsd; rec.counted = true;
-      if (Number.isFinite(inv.amountUsd)) state.unreportedUsd += inv.amountUsd; else state.costUnknown = true;
+      const lateUsd = knownUsd(inv.amountUsd);
+      if (lateUsd != null) state.unreportedUsd += lateUsd; else state.costUnknown = true;
       const c = state.reconcile.find((x) => x.paymentId === inv.paymentId);
       if (c) { c.ambiguous = false; c.status = lateStatus; c.late = true; }
       if (onBook) onBook(c);
@@ -1297,20 +1337,22 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
    */
   const finishPaid = (held, actualUsd, committedUsd = null) => {
     if (state.budgetUsd == null) return;
-    if (committedUsd != null && Number.isFinite(Number(committedUsd))) {
-      const committed = Number(committedUsd);
+    const committed = knownUsd(committedUsd);
+    if (committed != null) {
       state.committedUsd = Math.max(0, state.committedUsd - committed);
-      const actual = actualUsd == null || !Number.isFinite(Number(actualUsd)) ? null : Number(actualUsd);
+      const actual = knownUsd(actualUsd);
       state.meteredUsd += actual == null ? committed : Math.max(committed, actual);
       return;
     }
-    const reserved = Number(held) || 0;
-    state.reservedUsd = Math.max(0, state.reservedUsd - reserved);
-    if (actualUsd == null || !Number.isFinite(Number(actualUsd))) {
-      state.reservedUsd += reserved;
+    const reserved = knownUsd(held);
+    const holdUsd = reserved == null ? 0 : reserved;
+    state.reservedUsd = Math.max(0, state.reservedUsd - holdUsd);
+    const actual = knownUsd(actualUsd);
+    if (actual == null) {
+      state.reservedUsd += holdUsd;
       return;
     }
-    state.meteredUsd += Number(actualUsd);
+    state.meteredUsd += actual;
   };
   const skippedResponse = () => jsonResponse({ choices: [{ message: { content: "" } }], x_nanogpt_pricing: { costUsd: 0 } });
 
@@ -1352,7 +1394,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           let inv = null;
           try {
             const raw = await r.text();
-            try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+            try { inv = parsePricedInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
             if (!inv || !inv.paymentId || !inv.completeUrl) {
               rec.status = 402;
               const e = new Error("payment required, but the 402 response offered no usable Nano option");
@@ -1456,7 +1498,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
     let usd = 0, usdKnown = true; // this logical call: every attempt's cost
-    const addCost = (v) => { if (v == null || !isFinite(v)) usdKnown = false; else usd += Number(v); };
+    const addCost = (v) => { const n = knownUsd(v); if (n == null) usdKnown = false; else usd += n; };
 
     /**
      * One attempt = one request body, sent once and (under x402) paid at most once.
@@ -1478,7 +1520,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (r.status === 402 && x402) {
         const raw = await r.text();
         let inv = null;
-        try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+        try { inv = parsePricedInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
         if (!inv || !inv.paymentId || !inv.completeUrl) {
           rec.status = 402;
           const e = new Error("payment required, but the 402 response offered no usable Nano option");
@@ -1657,7 +1699,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (state.fallback[letter] && state.fallback[letter].failed) state.fallback[letter].ok = false;
       if (!r.ok) { lose(); return r; } // the engine reads no cost from an error answer
       // ok but unreadable: the engine reports r's own price; earlier attempts are carried here
-      const own = res.rec.usd || 0;
+      const own = knownUsd(res.rec.usd) ?? 0;
       if (usd - own > 0) state.unreportedUsd += usd - own;
       if (!usdKnown) state.costUnknown = true;
       return r;
@@ -1811,8 +1853,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const init = { method: "POST", headers: headerCopy(headers), body: sentBody, signal };
     const chatPrice = (j, r, paidUsd) => {
       const usd = usdOf(j, r);
-      if (usd == null || !isFinite(Number(usd))) return { known: false, usd: null, paidUsd: paidUsd ?? null };
-      return { known: true, usd: Number(usd), paidUsd: paidUsd ?? null };
+      const n = knownUsd(usd);
+      const paid = knownUsd(paidUsd);
+      if (n == null) return { known: false, usd: null, paidUsd: paid };
+      return { known: true, usd: n, paidUsd: paid };
     };
     if (signal && signal.aborted) { rec.status = "request error"; rec.beforeSend = true; throw signal.reason; }
     let r;
@@ -1824,7 +1868,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (r.status === 402 && x402) {
       const raw = await r.text();
       let inv = null;
-      try { inv = parseNanoInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
+      try { inv = parsePricedInvoice(JSON.parse(raw), baseUrl); } catch { inv = null; }
       if (!inv || !inv.paymentId || !inv.completeUrl) {
         rec.status = 402;
         throw new Error("decider review could not be paid");
@@ -1923,9 +1967,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (outer) { if (outer.aborted) onOuter(); else outer.addEventListener("abort", onOuter, { once: true }); }
     try {
       const result = await paidChat(req.url, req.headers, body, rec, ac.signal, held);
-      const metered = result && result.known && result.usd != null && isFinite(Number(result.usd))
-        ? Number(result.usd)
-        : (result && result.paidUsd != null && isFinite(Number(result.paidUsd)) ? Number(result.paidUsd) : null);
+      const metered = result && result.known && knownUsd(result.usd) != null
+        ? knownUsd(result.usd)
+        : knownUsd(result && result.paidUsd);
       finishPaid(held, metered, rec.invoiceCommitted);
       recordReviewPrice(state, rec, result);
       if (!result.status || result.status !== 200 || !result.content) return { ok: false };

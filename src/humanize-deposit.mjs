@@ -24,6 +24,7 @@ import {
   MAX_CHARS_LIMIT, ONE_THREAD_PREFIX, REASK_TEXT, candidateByteCap, collectSpans,
   estimateTokensFromBytes, guardRetryPrompt, requestOutputTokenCap, tokenUpperBound, writerForwardByteCap, writerNote,
 } from "./humanize.mjs";
+import { knownUsd } from "./usd.mjs";
 
 export { HUMANIZE_SETTLE_MARKUP };
 
@@ -70,9 +71,9 @@ export function humanizePriceTable(catalogs) {
     const id = row && row.id;
     const p = row && row.pricing;
     if (!id || !p) continue;
-    const pin = Number(p.prompt);
-    const pout = Number(p.completion);
-    if (!(pin > 0) || !(pout > 0)) continue;
+    const pin = knownUsd(p.prompt);
+    const pout = knownUsd(p.completion);
+    if (pin == null || pout == null || !(pin > 0) || !(pout > 0)) continue;
     table[id] = [pin, pout];
   }
   return table;
@@ -98,8 +99,8 @@ export function ceilUsd(n) {
  * The result is always >= the charge.
  */
 export function depositFromCharge(chargeUsd) {
-  const charge = Number(chargeUsd);
-  if (!Number.isFinite(charge) || charge < 0) throw new Error("charge must be a non-negative number");
+  const charge = knownUsd(chargeUsd);
+  if (charge == null) throw new Error("charge must be a non-negative number");
   const target = Math.max(HUMANIZE_DEPOSIT_FLOOR_USD, charge * (1 + HUMANIZE_DEPOSIT_MARGIN));
   let deposit = ceilUsd(target);
   if (deposit + 1e-12 < charge) deposit = ceilUsd(charge);
@@ -108,11 +109,11 @@ export function depositFromCharge(chargeUsd) {
 
 /** What the caller pays: the lesser of metered cost + 20% and the quoted deposit. */
 export function settledChargeUsd(meteredUsd, depositUsd) {
-  const metered = Number(meteredUsd);
-  if (!Number.isFinite(metered) || metered <= 0) return 0;
+  const metered = knownUsd(meteredUsd);
+  if (metered == null || metered <= 0) return 0;
   const marked = metered * HUMANIZE_SETTLE_MARKUP;
-  const deposit = Number(depositUsd);
-  if (!Number.isFinite(deposit) || deposit < 0) return marked;
+  const deposit = knownUsd(depositUsd);
+  if (deposit == null) return marked;
   return Math.min(marked, deposit);
 }
 
