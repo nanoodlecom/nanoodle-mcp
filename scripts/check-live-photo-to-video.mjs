@@ -22,6 +22,12 @@ export const EXPECTED_RESOLUTION = "480p";
 export const EXPECTED_DURATION = "5";
 /** Covers the request and reading the body. Tests pass a shorter timeoutMs. */
 export const FETCH_TIMEOUT_MS = 20_000;
+/**
+ * How long to wait for res.body.cancel() when the body was not read.
+ * A streaming error must not pin the process, and a cancel that never
+ * settles must not either. Tests pass a shorter bodyCancelMs.
+ */
+const BODY_CANCEL_MS = 1000;
 
 const ATTEMPTS = 5;
 const PAUSE_MS = 3000;
@@ -107,29 +113,61 @@ export function checkPhotoToVideoGraph(graph) {
 }
 
 /**
+ * Drop a response body we are not going to read. cancel() can hang on a
+ * stream that never ends, so the wait is raced against a short ref'd timer
+ * and that timer is cleared as soon as either side finishes.
+ * @param {object} res
+ * @param {number} bodyCancelMs
+ */
+async function cancelUnreadBody(res, bodyCancelMs) {
+  const body = res && res.body;
+  if (!body || typeof body.cancel !== "function") return;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => body.cancel()).then(() => undefined, () => undefined),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, bodyCancelMs);
+        timer.ref();
+      }),
+    ]);
+  } catch {
+    // Cleanup must not replace the caller's error.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Fetch one graph. One AbortSignal stays active through the request and
  * res.text(), so a hung connection and a hung body both fail at timeoutMs.
+ * A non-OK response throws the HTTP status and closes the unread body.
  * @param {string} url
- * @param {{ fetchImpl?: typeof fetch, timeoutMs?: number }} [opts]
+ * @param {{ fetchImpl?: typeof fetch, timeoutMs?: number, bodyCancelMs?: number }} [opts]
  */
-export async function fetchLivePhotoToVideoGraph(url, { fetchImpl = fetch, timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+export async function fetchLivePhotoToVideoGraph(url, {
+  fetchImpl = fetch,
+  timeoutMs = FETCH_TIMEOUT_MS,
+  bodyCancelMs = BODY_CANCEL_MS,
+} = {}) {
   const timeout = startTimeout(timeoutMs);
   const { signal } = timeout;
+  let res;
+  let consumed = false;
   try {
-    const res = await untilAbort(
+    res = await untilAbort(
       Promise.resolve().then(() => fetchImpl(url, {
         headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
         signal,
       })),
       signal,
     );
-    if (!res || res.ok !== true) throw new Error(`fetch failed: HTTP ${res && res.status != null ? res.status : "no response"}`);
-    if (res.body && typeof res.body.cancel === "function") {
-      signal.addEventListener("abort", () => {
-        res.body.cancel(signal.reason).catch(() => {});
-      }, { once: true });
+    if (!res || res.ok !== true) {
+      const status = res && res.status != null ? res.status : "no response";
+      throw new Error(`fetch failed: HTTP ${status}`);
     }
     const text = await untilAbort(Promise.resolve().then(() => res.text()), signal);
+    consumed = true;
     try {
       return JSON.parse(text);
     } catch {
@@ -137,6 +175,7 @@ export async function fetchLivePhotoToVideoGraph(url, { fetchImpl = fetch, timeo
     }
   } finally {
     timeout.done();
+    if (!consumed) await cancelUnreadBody(res, bodyCancelMs);
   }
 }
 

@@ -96,6 +96,59 @@ test("a hanging request fails within the timeout", { timeout: 2000 }, async () =
   );
 });
 
+test("a streaming 503 then a good 200 passes and leaves no open handles", { timeout: 2000 }, async () => {
+  const bodyCancelMs = 40;
+  // Stands in for the socket behind a body that never ends. Only cancel() clears it.
+  const leak = setInterval(() => {}, 60_000);
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          cancel() {
+            clearInterval(leak);
+            return new Promise(() => {});
+          },
+        },
+        text: () => new Promise(() => {}),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(graph(passingFields)),
+    };
+  };
+  const url = "https://mcp.nanoodle.com/graph/photo-to-video.json";
+  const started = Date.now();
+  try {
+    await assert.rejects(
+      () => fetchLivePhotoToVideoGraph(url, { fetchImpl, timeoutMs: 5000, bodyCancelMs }),
+      (err) => {
+        assert.match(err.message, /fetch failed: HTTP 503/);
+        assert.notEqual(err.name, "TimeoutError");
+        return true;
+      },
+    );
+    const got = checkPhotoToVideoGraph(
+      await fetchLivePhotoToVideoGraph(url, { fetchImpl, timeoutMs: 5000, bodyCancelMs }),
+    );
+    assert.deepEqual(got, { model: MODEL, resolution: "480p", duration: "5" });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 500, `took ${elapsed}ms`);
+    assert.equal(calls, 2);
+    assert.ok(
+      !process._getActiveHandles().includes(leak),
+      "the 503 body is still holding a handle",
+    );
+  } finally {
+    clearInterval(leak);
+  }
+});
+
 test("a hanging body fails within the timeout", { timeout: 2000 }, async () => {
   const timeoutMs = 40;
   await assertTimesOut(
