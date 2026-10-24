@@ -17,8 +17,8 @@ import {
   HUMANIZE_V27_CAP_CHARGE, DEPOSIT_MARGIN, SETTLE_MARKUP,
   REFINE_MODEL, REFINE_SYSTEM, REFINE_TEMPERATURE, REFINE_MAX_TOKENS,
   D1_MODEL, SFW_MODEL, SFW_INSTRUCTIONS, GATE_INSTRUCTIONS, FUNNY_INSTRUCTIONS, FUNNY_LEVELS,
-  GUIDANCE_DEFAULT, depositFromCharge, humanizeProviderUsd, subnanoChargeUsd, sfwChargeUsd,
-  exactUsd,
+  GUIDANCE_DEFAULT, depositFromCharge, subnanoChargeUsd, sfwChargeUsd,
+  exactUsd, outputTokenCap, settledCharge,
 } from "../src/subnano.mjs";
 import { HUMANIZE_INPUT_CAPS } from "../src/humanize.mjs";
 
@@ -47,19 +47,17 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
   const { dir, registry, graph } = await loadHumanize();
   try {
     const caps = HUMANIZE_INPUT_CAPS;
-    const provider = humanizeProviderUsd(graph, {
-      draftBytes: caps.Draft * 4, contextBytes: caps.Context * 4, guidanceBytes: caps.Guidance * 4,
-    });
-    assert.equal(HUMANIZE_V27_CAP_CHARGE.toFixed(8), "0.01304480");
-    assert.ok(provider * SETTLE_MARKUP > HUMANIZE_V27_CAP_CHARGE, "the byte bound is above the old bytes/3 estimate");
-
-    const full = subnanoChargeUsd({
+    const ceilingLens = {
       graph,
-      refineDraftBytes: caps.Draft * 4,
+      draftChars: caps.Draft,
+      draftBytes: caps.Draft * 4,
       contextBytes: caps.Context * 4,
       guidanceBytes: caps.Guidance * 4,
-    });
-    assert.ok(full > provider * SETTLE_MARKUP, "refine and the two d1 calls sit on top of humanize");
+    };
+    assert.equal(HUMANIZE_V27_CAP_CHARGE.toFixed(8), "0.01304480");
+
+    const full = subnanoChargeUsd(ceilingLens);
+    assert.ok(full > 0);
     const deposit = depositFromCharge(full);
     assert.equal(deposit, Math.ceil(full * (1 + DEPOSIT_MARGIN) * 1e8 - 1e-6) / 1e8);
     assert.ok(deposit >= full);
@@ -69,14 +67,20 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
 
     const tool = registry.tools.find((t) => t.name === "subnano_comment");
     assert.equal(tool.x402.usd, deposit, "the pinned cold ceiling is the full-cap deposit");
-    assert.match(tool.depositNote, /upper bound/);
+    assert.match(tool.depositNote, /quoted for each request from its context and guidance/);
+    assert.match(tool.depositNote, /is a cap on the charge/);
     const typicalCharge = subnanoChargeUsd({
-      graph, refineDraftBytes: 240, contextBytes: 480, guidanceBytes: GUIDANCE_DEFAULT.length,
+      graph, draftChars: 240, draftBytes: 240, contextBytes: 480, guidanceBytes: GUIDANCE_DEFAULT.length,
     });
-    assert.equal(full.toFixed(8), "0.09440489");
-    assert.equal(deposit.toFixed(8), "0.10573348");
-    assert.equal(typicalCharge.toFixed(8), "0.06437962");
-    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.07210517");
+    // A 240-byte draft. The four-byte ceiling is a real max-size request, above Maxi's ~$0.016 cap.
+    assert.equal(typicalCharge.toFixed(8), "0.00446707");
+    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.00500313");
+    assert.equal(full.toFixed(8), "0.02001439");
+    assert.equal(deposit.toFixed(8), "0.02241612");
+    assert.equal(registry.quoteDeposit("subnano_comment", {
+      Draft: "a".repeat(240), Context: "b".repeat(480),
+    }).toFixed(8), "0.00500313");
+    assert.ok(depositFromCharge(typicalCharge) <= 0.013, "a typical comment deposits about $0.013 or less");
     assert.ok(typicalCharge < full);
     assert.ok(depositFromCharge(typicalCharge) < deposit);
     const quoted = registry.quoteDeposit("subnano_comment", {
@@ -97,22 +101,25 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
       Context: "We shipped the editor today.",
     });
     assert.ok(shorter < deposit, "a shorter context quotes a smaller deposit");
-    assert.ok(shorter > provider * SETTLE_MARKUP * 0.5, "the humanize leg still assumes the draft cap");
+    assert.ok(shorter < asciiCap);
+    assert.ok(settledCharge(typicalCharge / SETTLE_MARKUP, depositFromCharge(typicalCharge)) <= depositFromCharge(typicalCharge));
 
     const one = sfwChargeUsd({ images: 1, frames: 0 });
     const five = sfwChargeUsd({ images: 0, frames: 5 });
     const cold = sfwChargeUsd({ images: 1, frames: 8 });
-    assert.equal(one.toFixed(8), "0.00010279");
-    assert.equal(depositFromCharge(one).toFixed(8), "0.00011513");
-    assert.equal(five.toFixed(8), "0.00051396");
-    assert.equal(depositFromCharge(five).toFixed(8), "0.00057564");
-    assert.equal(cold.toFixed(8), "0.00092513");
-    assert.equal(depositFromCharge(cold).toFixed(8), "0.00103615");
+    assert.equal(one.toFixed(8), "0.00002551");
+    assert.equal(depositFromCharge(one).toFixed(8), "0.00002858");
+    assert.equal(five.toFixed(8), "0.00012756");
+    assert.equal(depositFromCharge(five).toFixed(8), "0.00014287");
+    assert.equal(cold.toFixed(8), "0.00022961");
+    assert.equal(depositFromCharge(cold).toFixed(8), "0.00025717");
     assert.ok(one < five && five < cold);
     const sfw = registry.tools.find((t) => t.name === "sfw_check");
     assert.equal(sfw.x402.usd, depositFromCharge(cold));
-    assert.match(sfw.depositNote, /it is an estimate, not an upper bound/);
-    assert.ok(sfw.x402.usd < 0.05, "the image-token estimate stays a small deposit");
+    assert.match(sfw.depositNote, /is a cap on the charge/);
+    assert.doesNotMatch(sfw.depositNote, /estimate/);
+    assert.ok(settledCharge(cold / SETTLE_MARKUP, sfw.x402.usd) <= sfw.x402.usd);
+    assert.ok(sfw.x402.usd < 0.01, "the picture cap stays a small deposit");
     assert.equal(registry.quoteDeposit("sfw_check", { image: "https://example.com/a.jpg" }), depositFromCharge(one));
     assert.equal(registry.quoteDeposit("sfw_check", { video: "https://example.com/a.mp4" }), depositFromCharge(five));
     assert.equal(registry.quoteDeposit("sfw_check", { video: "https://example.com/a.mp4", frames: 2, image: "https://example.com/a.jpg" }), depositFromCharge(sfwChargeUsd({ images: 1, frames: 2 })));
@@ -124,7 +131,7 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
 test("a higher catalog rate replaces the fallback and a decision row may have a $0 completion price", async () => {
   const { dir, graph } = await loadHumanize();
   try {
-    const lens = { graph, refineDraftBytes: 200, contextBytes: 400, guidanceBytes: GUIDANCE_DEFAULT.length };
+    const lens = { graph, draftChars: 200, draftBytes: 200, contextBytes: 400, guidanceBytes: GUIDANCE_DEFAULT.length };
     const base = subnanoChargeUsd(lens);
     const higher = subnanoChargeUsd({
       ...lens,
@@ -221,7 +228,7 @@ test("subnano_comment runs refine, then humanize, then the gate, then the funny 
       seen.push({ path: req.url, model: body.model, body });
       if (req.url.startsWith("/api/v1/decisions")) {
         const q = body.questions && body.questions.answer;
-        const usage = { cost: q && q.type === "score" ? 0.00004 : 0.00003 };
+        const usage = { cost: q && q.type === "score" ? 0.000005 : 0.000004 };
         const answer = q && q.type === "score"
           ? { type: "score", score: 4, probabilities: { "0": 0.1, "4": 0.7, "9": 0.2 } }
           : { type: "noul", noul: 0.82 };
@@ -229,10 +236,10 @@ test("subnano_comment runs refine, then humanize, then the gate, then the funny 
         return res.end(JSON.stringify({ answers: { answer }, usage }));
       }
       let content = "That launch note is the one I would reply to.";
-      let cost = 0.001;
-      if (body.model === REFINE_MODEL) { content = "The launch post is worth a close look."; cost = 0.0002; }
+      let cost = 0.0002;
+      if (body.model === REFINE_MODEL) { content = "The launch post is worth a close look."; cost = 0.00001; }
       if (body.model === "z-ai/glm-5.3") {
-        cost = 0.002;
+        cost = 0.0005;
         content = JSON.stringify({
           winner: "A",
           text: "decider copy, discarded",
@@ -255,23 +262,31 @@ test("subnano_comment runs refine, then humanize, then the gate, then the funny 
     });
     assert.equal(result.textOutput, true);
     const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.partial, undefined);
     assert.equal(payload.comment, "That launch note is the one I would reply to.");
     assert.deepEqual(payload.gate, { verdict: "yes", yes: 0.82 });
     assert.equal(payload.funny.score, 4);
     assert.equal(payload.funny.max, 9);
     assert.equal(payload.funny.label, FUNNY_LEVELS[4]);
     assert.equal(payload.steps.refine.model, REFINE_MODEL);
-    assert.equal(payload.steps.refine.usd, 0.0002);
-    assert.equal(payload.steps.humanize.usd, 0.007);
-    assert.equal(payload.steps.gate.usd, 0.00003);
-    assert.equal(payload.steps.funny.usd, 0.00004);
-    assert.equal(result.costUsd, 0.0002 + 0.007 + 0.00003 + 0.00004);
+    assert.equal(payload.steps.refine.usd, 0.00001);
+    assert.equal(payload.steps.humanize.usd, 0.0015);
+    assert.equal(payload.steps.gate.usd, 0.000004);
+    assert.equal(payload.steps.funny.usd, 0.000005);
+    assert.equal(result.costUsd, 0.00001 + 0.0015 + 0.000004 + 0.000005);
     assert.equal(result.costExact, true);
-    assert.match(result.content[1].text, /^cost: \$0\.0073/);
+    assert.match(result.content[1].text, /^cost: \$0\.0015/);
 
     assert.equal(seen[0].model, REFINE_MODEL);
     assert.equal(seen[0].body.temperature, REFINE_TEMPERATURE);
-    assert.equal(seen[0].body.max_tokens, REFINE_MAX_TOKENS);
+    const draftCap = outputTokenCap("Please welcome the launch.".length);
+    assert.equal(seen[0].body.max_tokens, draftCap);
+    assert.ok(draftCap < REFINE_MAX_TOKENS);
+    const writer = seen.find((r) => r.model === "qwen/qwen3.8-27b-novelist");
+    assert.equal(writer.body.max_tokens, draftCap);
+    const judge = seen.find((r) => r.model === "z-ai/glm-5.3");
+    assert.ok(judge.body.max_tokens < 1600);
+    assert.ok(judge.body.max_tokens >= 320);
     assert.equal(seen[0].body.messages[0].content, REFINE_SYSTEM);
     assert.match(seen[0].body.messages[1].content, /Please welcome the launch\./);
     const firstDecision = seen.findIndex((r) => r.path.startsWith("/api/v1/decisions"));
@@ -288,7 +303,6 @@ test("subnano_comment runs refine, then humanize, then the gate, then the funny 
     assert.equal(seen[firstDecision + 1].body.questions.answer.instructions, FUNNY_INSTRUCTIONS);
     assert.deepEqual(seen[firstDecision + 1].body.questions.answer.criteria, [...FUNNY_LEVELS]);
     // humanize saw the refine output, not the original draft
-    const writer = seen.find((r) => r.model === "qwen/qwen3.8-27b-novelist");
     assert.match(JSON.stringify(writer.body.messages), /The launch post is worth a close look\./);
     assert.doesNotMatch(JSON.stringify(writer.body.messages), /Please welcome the launch\./);
   } finally {
@@ -484,6 +498,94 @@ test("a failed step throws so the caller is not charged for a partial comment", 
       registry.callTool({ name: "subnano_comment", arguments: { Draft: "Hello there.", Context: "A post." } }),
       /refine failed/,
     );
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stage the remaining budget cannot cover stops the run, and the charge stays inside the quote", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "subnano-budget-"));
+  await copyFile(GRAPH_URL, join(dir, "humanize-comment.noodle-graph.json"));
+  const seen = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      seen.push(body.model);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "Refined, and then the budget is spent." } }], cost: 5 }));
+    });
+  });
+  const port = await listen(server);
+  const registry = await loadTools({
+    dirs: [dir], apiKey: "test-key", baseUrl: `http://127.0.0.1:${port}`, outDir: join(dir, "out"), log: () => {},
+  });
+  const args = { Draft: "Please welcome the launch.", Context: "The editor shipped today." };
+  try {
+    const quote = registry.quoteDeposit("subnano_comment", args);
+    const result = await registry.callTool({ name: "subnano_comment", arguments: args });
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.partial, true);
+    assert.equal(payload.stopped, "humanize");
+    assert.equal(payload.comment, "Refined, and then the budget is spent.");
+    assert.equal(payload.gate, undefined);
+    assert.deepEqual(seen, [REFINE_MODEL]);
+    assert.ok(result.costUsd <= quote / SETTLE_MARKUP + 1e-12);
+    assert.ok(settledCharge(result.costUsd, quote) <= quote + 1e-12);
+    assert.ok(result.costUsd < 1, "a provider bill past the quote is not what the caller is charged");
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sfw_check skips a picture the remaining budget cannot cover and never charges above the quote", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "subnano-sfw-budget-"));
+  await writeFile(join(dir, "hello.json"), TINY);
+  let calls = 0;
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      calls++;
+      const cost = calls === 1 ? 5 : 0.000002;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ answers: { answer: { type: "noul", noul: 0.9 } }, usage: { cost } }));
+    });
+  });
+  const port = await listen(server);
+  const registry = await loadTools({
+    dirs: [dir], apiKey: "test-key", baseUrl: `http://127.0.0.1:${port}`, outDir: join(dir, "out"), log: () => {},
+  });
+  const sfw = registry.tools.find((t) => t.name === "sfw_check");
+  sfw.deps.fit = async (url) => url;
+  sfw.deps.sampleFrames = async (_src, count) => Array.from({ length: count }, () => "data:image/jpeg;base64,OK");
+  try {
+    const oneArgs = { image: "data:image/jpeg;base64,OK" };
+    const oneQuote = registry.quoteDeposit("sfw_check", oneArgs);
+    const image = await registry.callTool({ name: "sfw_check", arguments: oneArgs });
+    const imagePayload = JSON.parse(image.content[0].text);
+    assert.equal(imagePayload.sfw, true);
+    assert.equal(imagePayload.partial, undefined);
+    assert.equal(calls, 1);
+    assert.ok(image.costUsd <= oneQuote / SETTLE_MARKUP + 1e-12);
+    assert.ok(settledCharge(image.costUsd, oneQuote) <= oneQuote + 1e-12);
+
+    calls = 0;
+    const videoArgs = { video: "https://example.com/clip.mp4", frames: 3 };
+    const videoQuote = registry.quoteDeposit("sfw_check", videoArgs);
+    const video = await registry.callTool({ name: "sfw_check", arguments: videoArgs });
+    const videoPayload = JSON.parse(video.content[0].text);
+    assert.equal(videoPayload.partial, true);
+    assert.equal(videoPayload.stopped, "picture");
+    assert.equal(videoPayload.sfw, false);
+    assert.equal(videoPayload.verdict, "unchecked");
+    assert.equal(videoPayload.frames.length, 1);
+    assert.equal(calls, 1, "the next frame is not sent once the budget is spent");
+    assert.ok(video.costUsd <= videoQuote / SETTLE_MARKUP + 1e-12);
+    assert.ok(settledCharge(video.costUsd, videoQuote) <= videoQuote + 1e-12);
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });

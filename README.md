@@ -621,15 +621,17 @@ start):
   only when every picture is yes. There is no argument that turns it off.
   Sampling a video needs ffmpeg; checking a still image does not.
 
-In charge mode `subnano_comment`'s deposit is quoted before payment and is an
-upper bound on that request: each stage's input is capped and counted at one
-token per UTF-8 byte, each stage's output is capped at the max_tokens sent,
-and the post gate and funny judge are priced from the capped comment after
-humanize, plus the 20% settle markup and a 12% margin. `sfw_check`'s deposit
-is an estimate. The question text is bounded the same way and each picture is
-shrunk to 512px, but the model's image-token count is not a published cap, so
-the quote reserves 8 tokens per 32px tile and is not a ceiling. Either way the
-run settles at the metered cost plus 20% and the difference is returned.
+In charge mode each call's deposit is quoted before payment and is a cap on
+the charge. `subnano_comment` sizes every stage's max_tokens from that draft
+(about 1.5× its length, plus a little slack), estimates input at about one
+token per 3.5 bytes plus a small margin, and caps re-asks at the same output
+size. The gate and the funny judge read the comment clipped to that size.
+Settlement is the metered cost plus 20%, and never more than the quote. Before
+each paid stage the run stops when the remaining budget cannot cover it,
+returns what already finished, and charges only the calls that ran.
+`sfw_check` is the same kind of cap: the quote is the pictures that request
+asks to check, a picture that would exceed the remaining budget is not sent,
+and settlement cannot exceed the quote. The difference is returned.
 
 ## Run any share link
 
