@@ -5,16 +5,19 @@
 # mcp.nanoodle.com loads graphs from a host directory that refreshes only when
 # this deploy runs. awesome-noodles never pushes this repo, so a graph fix
 # there misses the push trigger. repository_dispatch type
-# awesome-noodles-updated runs this same job. The caller is a workflow on
-# awesome-noodles main; it authenticates with a token secret added on that
-# repo, not with a secret in this one.
+# awesome-noodles-updated runs this same job. The sender workflow is not on
+# awesome-noodles main, and no token setup is authorized. The dispatch trigger
+# stays inert until Mikkel adds that sender and its token secret himself.
+# See docs/README.md for which revision is live, and for rollback.
 name: deploy
 on:
   push:
     branches: [main, master]
   repository_dispatch:
     types: [awesome-noodles-updated]
-# Pushes and dispatches share one group so two deploys cannot overlap on the box.
+# The in-progress deploy is left running (cancel-in-progress: false). GitHub
+# keeps only one pending run in this group: a newer queued run replaces the
+# older pending one. Pushes and dispatches share the group.
 concurrency:
   group: nanoodle-mcp-deploy
   cancel-in-progress: false
@@ -32,42 +35,11 @@ jobs:
           echo "159.195.17.119 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHcFN8/48EuW9f6MXgGx9a/syadihZ4XpY+EazT2KbQe" > ~/.ssh/known_hosts
           ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp"
 
-      # The curated comment node still says "Spicy" after the model swap.
-      # Only node model fields are checked. Retry so a restart cannot fail a good deploy.
-      - name: Check photo-to-video is off the spicy model
-        run: |
-          python3 - <<'PY'
-          import json, sys, time, urllib.request
-
-          url = "https://mcp.nanoodle.com/graph/photo-to-video.json"
-          last = "photo-to-video check did not run"
-          for attempt in range(1, 6):
-              try:
-                  req = urllib.request.Request(
-                      url + "?deploy-check=" + str(attempt),
-                      headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
-                  )
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-                      data = json.load(resp)
-                  models = []
-                  for node in data.get("nodes") or []:
-                      model = (node.get("fields") or {}).get("model")
-                      if isinstance(model, str) and model:
-                          models.append(model)
-                  shown = ", ".join(models) if models else "(none)"
-                  print("attempt %d models: %s" % (attempt, shown), flush=True)
-                  if not models:
-                      last = "photo-to-video graph has no model fields"
-                  else:
-                      spicy = [m for m in models if "spicy" in m.lower()]
-                      if not spicy:
-                          sys.exit(0)
-                      last = "model contains spicy: " + ", ".join(spicy)
-              except Exception as exc:
-                  last = "fetch failed: %s" % exc
-                  print("attempt %d %s" % (attempt, last), flush=True)
-              if attempt < 5:
-                  time.sleep(3)
-          sys.stderr.write(last + "\n")
-          sys.exit(1)
-          PY
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.1"
+      # Requires the ivideo node to be minimax-h3-singularity/image-to-video
+      # at 480p for 5 seconds. A failure fails this job. It does not roll back.
+      - name: Check live photo-to-video graph
+        run: node scripts/check-live-photo-to-video.mjs
