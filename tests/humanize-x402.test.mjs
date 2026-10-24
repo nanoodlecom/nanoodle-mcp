@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
 import { humanizeFetch } from "../src/humanize.mjs";
+import { beginPayment } from "../src/pay-guard.mjs";
 
 const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
 const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop";
@@ -382,4 +383,263 @@ test("late settlement after the deadline or a cancel: recorded once, never lost 
   rel2(); await new Promise((r3) => setTimeout(r3, 20));
   assert.ok(near(hf2.state.unreportedUsd - b2, PRICE));
   assert.equal(hf2.state.paidFailed.C.ambiguous, false);
+});
+
+test("cancel during the 402 invoice read does not queue payment", async () => {
+  const ac = new AbortController();
+  const reason = new Error("cancelled");
+  let paid = 0;
+  const payload = JSON.stringify({ payment: { paymentId: "payC", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: PRICE, completeUrl: "http://x/api/x402/complete/payC" }] } });
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "",
+    payment: () => { paid += 1; },
+    fetch: async () => new Response(new ReadableStream({
+      pull(controller) {
+        ac.abort(reason);
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    }), { status: 402, headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(hf.fetch(CHAT, { ...xreq(CYD), signal: ac.signal }), (e) => e === reason || /cancelled/.test(String(e && e.message)));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(paid, 0);
+  assert.equal(hf.state.attempts.at(-1).paymentStarted, false);
+  assert.equal(hf.state.paidIds.size, 0);
+});
+
+test("beginPayment checks cancellation again inside the queued payment callback", async () => {
+  const ac = new AbortController();
+  let paid = 0;
+  const pending = beginPayment(ac.signal, () => { paid += 1; });
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(pending, (e) => e && e.paymentNotSent === true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(paid, 0);
+});
+
+/** aborted flips true on the nth read, so the check inside the queued callback is the one that fires. */
+function abortOnNthRead(n) {
+  const ac = new AbortController();
+  const reason = new Error("cancelled");
+  let reads = 0;
+  return new Proxy(ac.signal, {
+    get(target, prop, receiver) {
+      if (prop === "aborted") { reads += 1; return reads >= n; }
+      if (prop === "reason") return reason;
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+test("humanize checks cancellation inside the queued payment callback", async () => {
+  let paid = 0;
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "",
+    payment: () => { paid += 1; },
+    fetch: async () => inv402("payC"),
+  });
+  // Writer A has no fallback, so beginPayment sees this signal. Reads: before the
+  // request, beginPayment's sync check, raceAbort, then the callback.
+  await assert.rejects(hf.fetch(CHAT, { ...xreq("a"), signal: abortOnNthRead(4) }), (e) => e && e.paymentNotSent === true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(paid, 0);
+  assert.equal(hf.state.attempts.at(-1).paymentStarted, false);
+});
+
+test("a malformed USD price never calls payment, and an explicit 0 does", async () => {
+  const bad = [
+    ["''", ""],
+    ["whitespace", "   "],
+    ["false", false],
+    ["[]", []],
+    ["null", null],
+    ["missing", undefined],
+  ];
+  for (const [label, usd] of bad) {
+    let paid = 0;
+    const accepted = { scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1" + "0".repeat(30), completeUrl: "http://x/api/x402/complete/payBad" };
+    if (usd !== undefined) accepted.maxAmountRequiredUSD = usd;
+    const hf = humanizeFetch({
+      record: REC, draft: "", payment: () => { paid += 1; },
+      fetch: async () => new Response(JSON.stringify({ payment: { paymentId: "payBad", accepted: [accepted] } }), { status: 402, headers: { "content-type": "application/json" } }),
+    });
+    await assert.rejects(hf.fetch(CHAT, xreq("a")), (e) => e && e.unknownPrice === true && e.paymentNotSent === true);
+    assert.equal(paid, 0, label);
+    assert.equal(hf.state.paidIds.size, 0, label);
+    assert.equal(hf.state.costUnknown, false, label);
+  }
+  let paid = 0;
+  const hf = humanizeFetch({
+    record: REC, draft: "", payment: async () => { paid += 1; },
+    fetch: async (u) => {
+      if (/complete\//.test(u)) return okRes("from a", 0);
+      return new Response(JSON.stringify({ payment: { paymentId: "pay0", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: 0, completeUrl: "http://x/api/x402/complete/pay0" }] } }), { status: 402, headers: { "content-type": "application/json" } });
+    },
+  });
+  const r = await hf.fetch(CHAT, xreq("a"));
+  assert.equal((await r.json()).choices[0].message.content, "from a");
+  assert.equal(paid, 1);
+});
+
+test("an invoice with no USD price is refused before payment and does not fall back", async () => {
+  const seen = [];
+  let paid = 0;
+  const noPrice = () => new Response(JSON.stringify({
+    payment: { paymentId: "payU", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: "", completeUrl: "http://x/api/x402/complete/payU" }] },
+  }), { status: 402, headers: { "content-type": "application/json" } });
+  const hf = humanizeFetch({
+    record: REC, draft: "", payment: () => { paid += 1; },
+    fetch: async (u, init) => { seen.push(JSON.parse(init.body).model); return noPrice(); },
+  });
+  await assert.rejects(hf.fetch(CHAT, xreq(CYD)), (e) => e && e.unknownPrice === true && e.paymentNotSent === true && e.code === "x402");
+  assert.equal(paid, 0);
+  assert.deepEqual(seen, [CYD], "a missing price is not a free primary, and Starry is not paid instead");
+  assert.equal(hf.state.costUnknown, false);
+  assert.equal(hf.state.paidIds.size, 0);
+  assert.equal(hf.state.unreportedUsd, 0);
+  assert.deepEqual(hf.state.reconcile, []);
+});
+
+test("a paid replay resends the exact billed body, and a later retry cannot replace it", async () => {
+  const seen = [];
+  const hf = humanizeFetch({
+    record: REC, draft: "", payment: async () => {},
+    fetch: async (u, init) => {
+      const pid = init.headers && (init.headers["x-x402-payment-id"] || (typeof init.headers.get === "function" && init.headers.get("x-x402-payment-id")));
+      seen.push({ url: String(u), body: init.body, pid });
+      if (/complete\//.test(u)) return new Response(JSON.stringify({ status: "paid" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (pid) return okRes("from a");
+      return inv402("payM");
+    },
+  });
+  const billed = JSON.stringify({ model: "a", messages: [{ role: "user", content: "hi" }], note: "billed" });
+  const r = await hf.fetch(CHAT, { method: "POST", headers: { "Content-Type": "application/json", "x-x402": "true" }, body: billed });
+  assert.equal((await r.json()).choices[0].message.content, "from a");
+  const first = seen.find((s) => /chat\/completions/.test(s.url) && !s.pid);
+  const replay = seen.find((s) => s.pid === "payM");
+  assert.ok(first && replay);
+  assert.equal(replay.body, first.body);
+  seen.length = 0;
+  await hf.fetch(CHAT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true", "x-x402-payment-id": "payM" },
+    body: JSON.stringify({ model: "a", messages: [{ role: "user", content: "hi" }], note: "CHANGED" }),
+  });
+  assert.equal(seen[0].body, first.body);
+});
+
+test("the same paymentId is reserved once, and a second request cannot overwrite its body", async () => {
+  let paid = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const seen = [];
+  const hf = humanizeFetch({
+    record: REC, draft: "",
+    payment: () => { paid += 1; return gate; },
+    fetch: async (u, init) => {
+      seen.push(init.body);
+      if (/complete\//.test(u)) return okRes("from a");
+      return inv402("payOnce");
+    },
+  });
+  const headers = { "Content-Type": "application/json", "x-x402": "true" };
+  const firstBody = JSON.stringify({ model: "a", messages: [{ role: "user", content: "one" }] });
+  const secondBody = JSON.stringify({ model: "a", messages: [{ role: "user", content: "two" }] });
+  const first = hf.fetch(CHAT, { method: "POST", headers, body: firstBody });
+  const second = hf.fetch(CHAT, { method: "POST", headers, body: secondBody });
+  const settledP = Promise.allSettled([first, second]);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(paid, 1);
+  release();
+  const settled = await settledP;
+  const rejected = settled.filter((s) => s.status === "rejected");
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0].reason.message, /already paid/);
+  assert.equal(paid, 1);
+  seen.length = 0;
+  await hf.fetch(CHAT, {
+    method: "POST",
+    headers: { ...headers, "x-x402-payment-id": "payOnce" },
+    body: JSON.stringify({ model: "a", messages: [{ role: "user", content: "CHANGED" }] }),
+  });
+  assert.notEqual(seen[0], JSON.stringify({ model: "a", messages: [{ role: "user", content: "CHANGED" }] }));
+  assert.ok(seen[0] === firstBody || seen[0] === secondBody);
+});
+
+test("an x-cost of 1e-7 is a known price, and a leading-dot cost is too", async () => {
+  for (const [header, expectUsd] of [["1e-7", 1e-7], [".001", 0.001], ["0.001", 0.001]]) {
+    const hf = humanizeFetch({
+      record: REC, draft: "",
+      fetch: async () => new Response(JSON.stringify({ choices: [{ message: { content: "hi" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json", "x-cost": header },
+      }),
+    });
+    const r = await hf.fetch(CHAT, xreq("a"));
+    assert.equal(r.status, 200, header);
+    assert.equal(hf.state.attempts.at(-1).usd, expectUsd, header);
+    assert.equal(hf.state.costUnknown, false, header);
+  }
+});
+
+test("a synchronous paymentNotSent throw releases the paymentId and a later attempt can pay", async () => {
+  let paid = 0;
+  const hf = humanizeFetch({
+    record: REC, draft: "",
+    payment() {
+      paid += 1;
+      if (paid === 1) {
+        const e = new Error("wallet refused");
+        e.paymentNotSent = true;
+        throw e;
+      }
+    },
+    fetch: async (u) => {
+      if (/complete\//.test(String(u))) return okRes("from a");
+      return inv402("paySync");
+    },
+  });
+  await assert.rejects(hf.fetch(CHAT, xreq("a")), (e) => e && e.paymentNotSent === true && /wallet refused/.test(e.message));
+  assert.equal(paid, 1);
+  assert.equal(hf.state.paidIds.size, 0);
+  assert.equal(hf.state.costUnknown, false);
+  assert.equal(hf.state.unreportedUsd, 0);
+  assert.deepEqual(hf.state.reconcile, []);
+  const r = await hf.fetch(CHAT, xreq("a"));
+  assert.equal((await r.json()).choices[0].message.content, "from a");
+  assert.equal(paid, 2);
+  assert.equal(hf.state.paidIds.has("paySync"), true);
+  assert.equal(hf.state.costUnknown, false);
+});
+
+test("a payment error records the invoice and costUnknown before it rejects", async () => {
+  const hf = humanizeFetch({
+    record: REC, draft: "",
+    payment: () => { throw new Error("rpc down"); },
+    fetch: async () => inv402("payE"),
+  });
+  await assert.rejects(hf.fetch(CHAT, xreq("a")), /rpc down/);
+  assert.equal(hf.state.costUnknown, true);
+  assert.equal(hf.state.reconcile[0].paymentId, "payE");
+  assert.equal(hf.state.reconcile[0].amountUsd, PRICE);
+  assert.equal(hf.state.reconcile[0].ambiguous, true);
+  assert.equal(hf.state.paidIds.has("payE"), true);
+  const ac = new AbortController();
+  const hf2 = humanizeFetch({
+    record: REC, draft: "",
+    payment: () => new Promise(() => {}),
+    fetch: async () => inv402("payHang"),
+  });
+  const pending = hf2.fetch(CHAT, { ...xreq("a"), signal: ac.signal });
+  await new Promise((r) => setTimeout(r, 20));
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(pending, /cancelled/);
+  assert.equal(hf2.state.costUnknown, true);
+  assert.equal(hf2.state.reconcile[0].paymentId, "payHang");
+  assert.equal(hf2.state.reconcile[0].amountUsd, PRICE);
+  assert.equal(hf2.state.reconcile[0].ambiguous, true);
 });

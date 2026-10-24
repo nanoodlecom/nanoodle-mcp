@@ -34,6 +34,7 @@ import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
+import { paidDeposit, knownInvoiceUsd } from "./pay-guard.mjs";
 import { redactUrl } from "./redact.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -77,7 +78,12 @@ const GRAIN = 10n ** 22n;
  * with an explicit floor/ceil.
  */
 export function parseUsdNano(v) {
-  const s = String(v).trim();
+  if (typeof v !== "number" && typeof v !== "string") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  if (typeof v === "number" && !Number.isFinite(v)) throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  let s = String(v).trim();
+  // ".001" is the same amount as "0.001". A bare dot is still unusable.
+  if (s.startsWith(".")) s = "0" + s;
+  else if (s.startsWith("-.")) s = "-0" + s.slice(1);
   const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
   if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
   const digits = m[2] + (m[3] || "");
@@ -721,6 +727,10 @@ export function createChargeGate({
 
   const watchUrl = (q) => `${publicBase}/x402/watch/${q.id}`;
 
+  // wrapRegistry points this at tools whose deposit is a cap (posed-game-character).
+  // Live, not a snapshot: attachEstimates can refresh registry.depositCaps later.
+  let toolDepositIsCap = () => false;
+
   function paymentRequiredResult(q) {
     // Three sequential phases — never parallel:
     //   1) this tools/call HANGS UP with pay instructions (payUrl for the human)
@@ -756,9 +766,12 @@ export function createChargeGate({
     // so the agent has a concrete URL to open without mistaking it for the link
     // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
+    const priceLine = toolDepositIsCap(q.tool)
+      ? `This deposit caps what the customer pays. The charge is the lesser of the metered model cost × 1.2 and this deposit, and the difference is returned. The operator absorbs any provider overrun. A stage the remaining deposit cannot cover is skipped and not billed. Direct-wallet spending has no cap.`
+      : `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.`;
     const text =
       `PAYMENT REQUIRED — this tool takes a ${fmtUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
-      `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
+      `${priceLine}\n\n` +
       `This call is done — hang up. On this payment link, do BOTH of these now:\n` +
       `1. Show your user ONLY this payment link (QR to scan; green check when paid). Do not show them any other URL or the wallet address:\n` +
       `   ${pUrl}\n` +
@@ -867,8 +880,8 @@ export function createChargeGate({
      */
     wrapRegistry(registry, { runNoodleName = "run_noodle" } = {}) {
       const pinned = new Map(registry.tools.map((t) => {
-        const v = t.x402 && Number(t.x402.usd);
-        return [t.name, Number.isFinite(v) && v > 0 ? v : null];
+        const v = t.x402 && knownInvoiceUsd(t.x402.usd);
+        return [t.name, v != null && v > 0 ? v : null];
       }));
       /**
        * Deposit for a tool as of right now. The deposit is a HOLD, not the price:
@@ -879,21 +892,33 @@ export function createChargeGate({
        *
        * Precedence:
        *   1. A graph's own x402.usd is pinned and always wins.
-       *   2. Otherwise quote off the largest of two cost signals — an UP-FRONT
+       *   2. registry.depositCaps[name], when set, is the quote. It is already
+       *      worst-case × 1.2 plus a margin, so the variance multiplier is not applied.
+       *   3. Otherwise quote off the largest of two cost signals — an UP-FRONT
        *      catalog forecast (registry.estimates, valid before the tool has ever
        *      run) and the worst metered cost actually seen (registry.costs, a live
        *      high-water mark) — times a safety multiplier for run-to-run variance:
        *      1.25× when the cost is deterministic (image only), 2× otherwise.
-       *   3. With no signal at all (never run, uncatalogued), fall back to the flat
+       *   4. With no signal at all (never run, uncatalogued), fall back to the flat
        *      --charge-usd opening deposit.
        *
        * --charge-usd is the cold-start deposit, NOT a ceiling: expensive graphs
        * quote what they actually cost (change still returns the slack), so the
        * operator stops absorbing overages on video / multi-step tools.
        */
+      const depositCap = (name) => {
+        const caps = registry.depositCaps;
+        const v = caps && knownInvoiceUsd(caps[name]);
+        return v != null && v > 0 ? v : null;
+      };
+      toolDepositIsCap = (name) => depositCap(name) != null;
       const priceFor = (name) => {
         const pin = pinned.get(name);
         if (pin) return pin;
+        // A deposit cap is the quote. It already includes worst-case × 1.2 and the margin,
+        // so the variance multiplier must not stack on top of it.
+        const cap = depositCap(name);
+        if (cap) return cap;
         const rec = registry.costs && registry.costs[name];
         const obsHi = rec && rec.exact !== false
           ? Math.max(Number.isFinite(rec.usd) ? rec.usd : 0, Number.isFinite(rec.hiUsd) ? rec.hiUsd : 0)
@@ -918,7 +943,7 @@ export function createChargeGate({
         // calls on 2026-07-23 took a $0.05 deposit against real costs up to
         // $0.2455. Say it out loud rather than discovering it in the ledger.
         const est = registry.estimates && registry.estimates[t.name];
-        if (!pinned.get(t.name) && !est && !(rec && Number.isFinite(rec.usd))) {
+        if (!pinned.get(t.name) && !depositCap(t.name) && !est && !(rec && Number.isFinite(rec.usd))) {
           log(`warning: ${t.name} has no cost forecast (its models are not in the public catalog) and has never run — ` +
             `it quotes the flat ${fmtUsd(usd)} opening deposit and you eat any overage; pin a price with x402.usd in its graph file`);
         } else if (est && est.unpriced > 0) {
@@ -1013,9 +1038,12 @@ export function createChargeGate({
           .filter((t) => t.name !== runNoodleName)
           .map((t) => {
             const price = priceFor(t.name);
+            const spend = depositCap(t.name) != null
+              ? `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — this deposit caps what the customer pays; the charge is the lesser of the metered cost × 1.2 and this deposit; the operator absorbs any provider overrun; a stage the remaining deposit cannot cover is skipped and not billed; change returned. Direct-wallet spending has no cap`
+              : `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
-              `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
+              spend) +
               (authors.get(t.name) ? " The 20% markup goes to the graph's author." : "");
             const inputSchema = {
               ...t.inputSchema,
@@ -1136,7 +1164,7 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, costExact, textOutput, ...result } = await registry.callTool({ name, arguments: args });
+              const { costUsd, costExact, textOutput, ...result } = await paidDeposit.run(q.usd, () => registry.callTool({ name, arguments: args }));
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.
