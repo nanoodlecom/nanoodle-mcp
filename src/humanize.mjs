@@ -36,8 +36,10 @@
  *      nanoodle client, so the dash fix, re-asks and fallback credit apply to paid
  *      calls too. One invoice per attempt, paid at most once, replayed only with the
  *      body it was issued for; no fallback after a primary's payment STARTED (it is
- *      marked before the wallet call, since a wallet can send and still throw), unless
- *      the wallet error carries paymentNotSent === true. An unconfirmed payment goes to
+ *      marked inside the queued payment callback, before the wallet call returns, since
+ *      a wallet can send and still throw), unless the wallet error carries
+ *      paymentNotSent === true. A cancel after the invoice is read is checked again
+ *      inside that callback, and neither path calls payment(). An unconfirmed payment goes to
  *      state.reconcile (invoice id, ambiguous) and the run notes, and its amount is left
  *      out of the cost, which is then flagged as a lower bound. Each writer call keeps
  *      its own attempt records, so concurrent writers never read each other's state.
@@ -51,6 +53,7 @@
  */
 import { ParamsError } from "./tools.mjs";
 import { parseNanoInvoice } from "nanoodle";
+import { beginPayment } from "./pay-guard.mjs";
 
 export const HUMANIZE_TOOL = "humanize-comment";
 /** Hard caps in Unicode code points ([...s].length). */
@@ -197,15 +200,21 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           const e = new Error(inv && state.paidIds.has(inv.paymentId) ? `x402 invoice ${inv.paymentId} was already paid; not paying it again` : "payment required, but the 402 response offered no usable Nano option");
           e.code = "x402"; throw e;
         }
-        if (commit) commit();
-        rec.paymentId = inv.paymentId;
-        state.paidIds.add(inv.paymentId);
-        // marked BEFORE the wallet call: a wallet can send and still throw, so from here on this
-        // attempt counts as possibly paid and is never followed by a fallback, unless the wallet
-        // proves nothing was sent (an error carrying paymentNotSent === true)
-        rec.paymentStarted = true;
+        // Checked before the callback is queued, and again inside it. A cancel during
+        // r.text() above is already visible here; a cancel in the microtask gap is
+        // visible inside beginPayment. Neither path calls payment().
         try {
-          const paying = Promise.resolve().then(() => payment(inv));
+          const paying = beginPayment(signal, () => {
+            if (commit) commit();
+            rec.paymentId = inv.paymentId;
+            state.paidIds.add(inv.paymentId);
+            // marked inside the callback, before the wallet call returns: a wallet can
+            // send and still throw, so from here on this attempt counts as possibly paid
+            // and is never followed by a fallback, unless the wallet error carries
+            // paymentNotSent === true
+            rec.paymentStarted = true;
+            return payment(inv);
+          });
           // a settlement that lands after we stopped waiting (deadline or cancel) is recorded once
           paying.then(() => {
             if (rec.paid || !rec.paymentAmbiguous || rec.counted) return;
@@ -218,7 +227,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           }, () => {});
           await raceAbort(paying, signal);
         } catch (e) {
-          if (e && e.paymentNotSent === true) { rec.paymentStarted = false; rec.status = "payment not sent"; throw e; }
+          // Not started, or the wallet proved nothing was sent: do not reconcile it as paid.
+          if ((e && e.paymentNotSent === true) || !rec.paymentStarted) {
+            rec.paymentStarted = false;
+            rec.status = "payment not sent";
+            if (!(e && e.paymentNotSent === true) && e instanceof Error) e.paymentNotSent = true;
+            throw e;
+          }
           rec.paymentAmbiguous = true;
           rec.status = signal && signal.aborted ? "payment still pending at the deadline" : "payment call failed";
           state.reconcile.push({ letter, kind, model: b.model, paymentId: inv.paymentId, amountUsd: inv.amountUsd, ambiguous: true, status: rec.status });

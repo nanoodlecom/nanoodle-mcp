@@ -18,6 +18,8 @@ import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes } from "./humanize.mjs";
+import { POSED_TOOL, POSED_SENTENCE_CAP, checkPosedInputs, posedQuoteUsd, posedStageUsd, posedFetch, posedBudgetPartial, posedSkipNotes, harvestPosedOutputs } from "./posed.mjs";
+import { paidDeposit, meteredWithinQuote, openBudget } from "./pay-guard.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -171,6 +173,14 @@ export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.co
     consequence: ", and quote the flat opening deposit until they've run",
     log: (line) => log("catalog: " + line),
   });
+  // posed-game-character quotes a deposit cap even when a catalog is missing
+  // (the cap then uses the fallback stage prices). Other tools still need a catalog.
+  registry.depositCaps = registry.depositCaps && typeof registry.depositCaps === "object" ? registry.depositCaps : {};
+  for (const t of registry.tools) {
+    if (t.name !== POSED_TOOL) continue;
+    try { registry.depositCaps[t.name] = posedQuoteUsd(t.wf.graph, catalogs); }
+    catch (e) { log(`deposit cap for ${t.name} failed: ${e.message}`); }
+  }
   // Nothing priceable in any graph, or no catalog loaded at all → nothing to forecast.
   if (!Object.keys(catalogs).length) return (registry.estimates = {});
 
@@ -367,9 +377,11 @@ function buildDescription(wf, spendSource, { cost, name } = {}) {
   const intent = graphIntent(wf.graph);
   const chain = typeChain(wf.graph);
   const returns = describeOutputs(wf);
+  const sfw = name === POSED_TOOL ? " The SFW safety checker stays on, and NSFW is off by default." : "";
   return `${intent ? `${intent} ` : ""}${chain ? `${chain}${returns ? `; ${returns}` : ""}. ` : ""}` +
     `Runs on NanoGPT — every call spends real credit from ${spendSource}${cost ? `; ${cost}` : ""}.` +
-    (example ? ` Example: ${example.title} (${example.play}). ${example.description}` + (example.skill ? ` Agent skill: ${example.skill}` : "") : "");
+    (example ? ` Example: ${example.title} (${example.play}). ${example.description}` + (example.skill ? ` Agent skill: ${example.skill}` : "") : "") +
+    sfw;
 }
 
 /**
@@ -665,8 +677,13 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   // uses this flag to keep it off disk (media pointers + receipts are safe to
   // persist, the files themselves die by --out-ttl).
   let textOutput = false;
-  for (const o of wf.outputs) {
-    const value = result.outputs[o.key];
+  const rows = [];
+  for (const o of wf.outputs) rows.push({ key: o.key, nodeId: o.nodeId, value: result.outputs[o.key], sink: true });
+  if (result && Array.isArray(result.extraOutputs)) {
+    for (const extra of result.extraOutputs) rows.push({ key: extra.key, value: extra.value, sink: false });
+  }
+  for (const o of rows) {
+    const value = o.value;
     if (value === undefined) {
       // an output a closed gate skipped: say so (it is not paid content — textOutput untouched)
       const rec = result.nodes && result.nodes[o.nodeId];
@@ -852,6 +869,13 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (p) { p.maxLength = cap; p.description = `${p.description ? p.description + "; " : ""}at most ${cap} characters`; }
     }
   }
+  for (const t of tools) if (t.name === POSED_TOOL) {
+    const p = t.inputSchema.properties.Character;
+    if (p) {
+      p.maxLength = POSED_SENTENCE_CAP;
+      p.description = `${p.description ? p.description + " " : ""}One sentence, at most ${POSED_SENTENCE_CAP} characters.`;
+    }
+  }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
@@ -892,6 +916,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     costs,
     /** Up-front per-run cost forecasts by tool name (attachEstimates fills this) — the gate quotes off it before a tool has ever run. */
     estimates: {},
+    /** Live deposit caps by tool name (attachEstimates). The charge gate quotes these instead of the variance multiplier. */
+    depositCaps: {},
     /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
     onToolsChanged: null,
 
@@ -927,6 +953,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         throw new ParamsError("tools/call arguments must be an object");
       }
       if (tool.humanize) checkHumanizeInputs(args);
+      if (tool.name === POSED_TOOL) checkPosedInputs(args);
       const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
       return { tool, inputs };
     },
@@ -943,7 +970,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const { onProgress, notices } = runNotices(tool.wf);
       // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
       // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
-      let runWf = tool.wf, hf = null;
+      let runWf = tool.wf, hf = null, posedQuote = null;
       if (tool.humanize) {
         const args = params.arguments || {};
         const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
@@ -952,8 +979,31 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
         hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
         runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
+      } else if (tool.name === POSED_TOOL) {
+        // The gate binds the deposit the caller paid. BYOK has no store and uses the worst-case quote.
+        const stored = paidDeposit.getStore();
+        posedQuote = Number.isFinite(stored) && stored > 0 ? stored : posedQuoteUsd(tool.wf.graph, tool.wf.catalog);
+        const budget = openBudget(posedQuote);
+        const fetchImpl = posedFetch({
+          stages: posedStageUsd(tool.wf.graph, tool.wf.catalog),
+          budget,
+          fetch: globalThis.fetch,
+          payment: apiKey ? null : payment,
+          baseUrl: baseUrl || "https://nano-gpt.com",
+        });
+        runWf = Workflow.fromJSON(tool.rawText, {
+          apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: fetchImpl,
+          pollIntervals: { video: 20, model3d: 20, x402: 20 },
+        });
       }
-      const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      let result;
+      try {
+        result = await runWf.run(inputs, { onProgress });
+      } catch (e) {
+        // A mesh the deposit could not cover is still a finished run: charge only what ran.
+        if (tool.name === POSED_TOOL && e && e.result && posedBudgetPartial(e.result)) result = e.result;
+        else throw describeRunFailure(e);
+      }
       if (tool.humanize) {
         notices.push(...humanizeRunNotes(hf.state));
         const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
@@ -962,6 +1012,12 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
         if (hf.state.unreportedUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + hf.state.unreportedUsd;
         if (hf.state.costUnknown) result.costExact = false;
+      }
+      if (tool.name === POSED_TOOL) {
+        notices.push(...posedSkipNotes(result));
+        if (posedBudgetPartial(result)) harvestPosedOutputs(runWf, result);
+        const metered = Number.isFinite(result.costUsd) ? result.costUsd : 0;
+        result.costUsd = meteredWithinQuote(metered, posedQuote);
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
       return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });

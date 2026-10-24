@@ -5,8 +5,8 @@ import { serveHttp } from "../src/http.mjs";
 // nanoodle.com sends Cross-Origin-Resource-Policy: same-origin, so a browser on the
 // mcp host blocks any image hotlinked from it. Every landing-page <img> must come
 // from this server or from nanoodle's media host.
-// The 10 tools the hosted server mounts (mcp.nanoodle.com tools/list).
-const LIVE_TOOLS = ["character-sprites", "image-model-arena", "neon-shrine-duel", "photo-to-video", "sing", "storyboard-relay", "talking-avatar", "tiny-world-film", "idea-to-3d-model", "mix-the-references"];
+// The hosted server's tools/list (mcp.nanoodle.com). posed-game-character has no preview image.
+const LIVE_TOOLS = ["character-sprites", "image-model-arena", "neon-shrine-duel", "photo-to-video", "sing", "storyboard-relay", "talking-avatar", "tiny-world-film", "idea-to-3d-model", "mix-the-references", "posed-game-character"];
 const PUBLIC_BASE = "https://mcp.nanoodle.com";
 const MEDIA_ORIGIN = "https://media.nanoodle.com";
 // The media check makes real (free) HEAD requests. Set NANOODLE_OFFLINE=1 to skip it.

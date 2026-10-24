@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
 import { humanizeFetch } from "../src/humanize.mjs";
+import { beginPayment } from "../src/pay-guard.mjs";
 
 const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
 const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop";
@@ -382,4 +383,69 @@ test("late settlement after the deadline or a cancel: recorded once, never lost 
   rel2(); await new Promise((r3) => setTimeout(r3, 20));
   assert.ok(near(hf2.state.unreportedUsd - b2, PRICE));
   assert.equal(hf2.state.paidFailed.C.ambiguous, false);
+});
+
+test("cancel during the 402 invoice read does not queue payment", async () => {
+  const ac = new AbortController();
+  const reason = new Error("cancelled");
+  let paid = 0;
+  const payload = JSON.stringify({ payment: { paymentId: "payC", accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: PRICE, completeUrl: "http://x/api/x402/complete/payC" }] } });
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "",
+    payment: () => { paid += 1; },
+    fetch: async () => new Response(new ReadableStream({
+      pull(controller) {
+        ac.abort(reason);
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    }), { status: 402, headers: { "content-type": "application/json" } }),
+  });
+  await assert.rejects(hf.fetch(CHAT, { ...xreq(CYD), signal: ac.signal }), (e) => e === reason || /cancelled/.test(String(e && e.message)));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(paid, 0);
+  assert.equal(hf.state.attempts.at(-1).paymentStarted, false);
+  assert.equal(hf.state.paidIds.size, 0);
+});
+
+test("beginPayment checks cancellation again inside the queued payment callback", async () => {
+  const ac = new AbortController();
+  let paid = 0;
+  const pending = beginPayment(ac.signal, () => { paid += 1; });
+  ac.abort(new Error("cancelled"));
+  await assert.rejects(pending, (e) => e && e.paymentNotSent === true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(paid, 0);
+});
+
+/** aborted flips true on the nth read, so the check inside the queued callback is the one that fires. */
+function abortOnNthRead(n) {
+  const ac = new AbortController();
+  const reason = new Error("cancelled");
+  let reads = 0;
+  return new Proxy(ac.signal, {
+    get(target, prop, receiver) {
+      if (prop === "aborted") { reads += 1; return reads >= n; }
+      if (prop === "reason") return reason;
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+test("humanize checks cancellation inside the queued payment callback", async () => {
+  let paid = 0;
+  const hf = humanizeFetch({
+    record: REC,
+    draft: "",
+    payment: () => { paid += 1; },
+    fetch: async () => inv402("payC"),
+  });
+  // Writer A has no fallback, so beginPayment sees this signal. Reads: before the
+  // request, beginPayment's sync check, raceAbort, then the callback.
+  await assert.rejects(hf.fetch(CHAT, { ...xreq("a"), signal: abortOnNthRead(4) }), (e) => e && e.paymentNotSent === true);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(paid, 0);
+  assert.equal(hf.state.attempts.at(-1).paymentStarted, false);
 });

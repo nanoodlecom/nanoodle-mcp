@@ -1,0 +1,172 @@
+{
+  "v": 1,
+  "nodes": [
+    {
+      "id": "c-intent",
+      "type": "comment",
+      "x": -40,
+      "y": -360,
+      "w": 640,
+      "fields": {
+        "text": "One sentence in, a textured game character out: posed and quad-meshed for rigging. GLM writes the prompt, FLUX.3 Klein paints the A-pose, Bria cuts the background, and Rodin 2.5 builds the mesh.",
+        "color": "yellow"
+      }
+    },
+    {
+      "id": "character",
+      "type": "text",
+      "x": -40,
+      "y": 0,
+      "w": 320,
+      "name": "Character",
+      "fields": {
+        "text": "A teal clockwork fox knight with a brass lantern, striped scarf, and round goggles."
+      }
+    },
+    {
+      "id": "writer",
+      "type": "llm",
+      "x": 380,
+      "y": 0,
+      "w": 340,
+      "name": "GLM prompt",
+      "fields": {
+        "model": "z-ai/glm-5.3-flash",
+        "reasoningEffort": "low",
+        "maxTokens": "200",
+        "system": "You write the image prompt for one family-friendly game character. Describe the whole figure from the front in a neutral A-pose: symmetric left to right, standing, feet apart, arms slightly away from the body, palms forward, face visible. Include silhouette, clothing, materials, colors, and small surface details. Do not mention background, camera, lighting, or text. Output only the prompt, one paragraph.",
+        "onError": "skip",
+        "locked": true
+      }
+    },
+    {
+      "id": "rules",
+      "type": "text",
+      "x": 380,
+      "y": 420,
+      "w": 340,
+      "name": "A-pose rules",
+      "fields": {
+        "text": "Full-body front view of one symmetric game character in a neutral A-pose, arms slightly away from the body, palms forward, feet apart, the entire character in frame with margin, plain flat light-gray background, no ground, no props, no text.",
+        "locked": true
+      }
+    },
+    {
+      "id": "j-prompt",
+      "type": "join",
+      "x": 800,
+      "y": 180,
+      "w": 240,
+      "name": "Concept prompt",
+      "fields": {
+        "sep": "\\n\\n",
+        "locked": true
+      }
+    },
+    {
+      "id": "concept",
+      "type": "image",
+      "x": 1120,
+      "y": 40,
+      "w": 300,
+      "name": "A-pose concept",
+      "fields": {
+        "model": "blackforestlabs/flux-3/klein/text-to-image",
+        "size": "1024x1024",
+        "variations": "1",
+        "prompt": "",
+        "onError": "skip",
+        "locked": true
+      }
+    },
+    {
+      "id": "cut-rule",
+      "type": "text",
+      "x": 1120,
+      "y": 420,
+      "w": 300,
+      "name": "Cutout instruction",
+      "fields": {
+        "text": "Remove the background. Keep the entire character, including thin parts, and leave a transparent background.",
+        "locked": true
+      }
+    },
+    {
+      "id": "cutout",
+      "type": "edit",
+      "x": 1500,
+      "y": 160,
+      "w": 320,
+      "name": "Background cutout",
+      "fields": {
+        "model": "bria/remove-background-guided",
+        "size": "auto",
+        "prompt": "",
+        "onError": "skip",
+        "locked": true
+      }
+    },
+    {
+      "id": "mesh",
+      "type": "model3d",
+      "x": 1900,
+      "y": 80,
+      "w": 420,
+      "name": "Rodin 2.5 standard",
+      "fields": {
+        "model": "hyper3d/rodin-v2.5",
+        "prompt": "",
+        "modelOpts": {
+          "tier": "Gen-2.5-Medium",
+          "quality_and_mesh": "18K Quad",
+          "material": "All",
+          "hd_texture": false,
+          "ta_pose": true,
+          "addons": "",
+          "is_symmetric": "symmetric"
+        },
+        "onError": "skip",
+        "locked": true
+      }
+    }
+  ],
+  "links": [
+    {
+      "id": "l1",
+      "from": { "node": "character", "port": "text" },
+      "to": { "node": "writer", "port": "prompt" }
+    },
+    {
+      "id": "l2",
+      "from": { "node": "writer", "port": "text" },
+      "to": { "node": "j-prompt", "port": "a" }
+    },
+    {
+      "id": "l3",
+      "from": { "node": "rules", "port": "text" },
+      "to": { "node": "j-prompt", "port": "b" }
+    },
+    {
+      "id": "l4",
+      "from": { "node": "j-prompt", "port": "text" },
+      "to": { "node": "concept", "port": "prompt" }
+    },
+    {
+      "id": "l5",
+      "from": { "node": "cut-rule", "port": "text" },
+      "to": { "node": "cutout", "port": "prompt" }
+    },
+    {
+      "id": "l6",
+      "from": { "node": "concept", "port": "image" },
+      "to": { "node": "cutout", "port": "image" }
+    },
+    {
+      "id": "l7",
+      "from": { "node": "cutout", "port": "image" },
+      "to": { "node": "mesh", "port": "image" }
+    }
+  ],
+  "nid": 10,
+  "lid": 8
+}
