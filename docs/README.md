@@ -14,28 +14,33 @@ awesome-noodles `main` and adds the token secret there himself.
 ## Which revision is deployed
 
 `GET https://mcp.nanoodle.com/version` returns `{ name, version, commit }`.
-`commit` is the short git SHA of the nanoodle-mcp checkout the running process
-started from (`git rev-parse --short=7 HEAD` in that checkout, at least 7 hex
-digits).
+`commit` is the short git SHA of the nanoodle-mcp app checkout the running
+process started from (`git rev-parse --short=7 HEAD` in that checkout, at least
+7 hex digits).
 
-A push deploy's Actions run records the same commit as `github.sha`. After the
-run, compare that SHA with `commit` on `/version`. A `repository_dispatch` run's
-SHA is this repo's default-branch HEAD at dispatch time. It is not an
-awesome-noodles SHA, and the workflow never sends it to the box.
+A push deploy's Actions run records that push as `github.sha`. A
+`repository_dispatch` run's SHA is this repo's default-branch HEAD at dispatch
+time. The workflow never sends either value to the box. Compare `github.sha`
+with `commit` on `/version` when you want the app checkout that was current for
+that run.
 
-`/version` does not name the graph files. The served graph is whatever the host
-directory held when the process started. `GET https://mcp.nanoodle.com/graph/photo-to-video.json`
-is the photo-to-video graph the server loaded.
+`/version`'s `commit` and the workflow SHA identify only the nanoodle-mcp app
+checkout. They do not say which awesome-noodles graph revision is live. The
+served graphs are the files in the host directory when the process started.
+`GET https://mcp.nanoodle.com/graph/photo-to-video.json` is the photo-to-video
+graph that was loaded.
 
 ## Rollback
 
-The rollback this workflow supports is a revert merge to `main` (or `master`).
-That push runs this deploy again. The host command then deploys current `main`.
+A revert merge of nanoodle-mcp `main` (or `master`) redeploys this app. That
+push runs this workflow again. Re-running an old deploy does not select that
+run's SHA: every run executes the same SSH command, `nanoodle-mcp`, and does
+not pass a commit, so the host deploys whatever it deploys for current `main`.
 
-Re-running the deploy workflow for a prior good SHA does not roll back. Every
-run executes the same SSH command, `nanoodle-mcp`, and does not pass a SHA, so
-a re-run ships whatever the host deploys as current `main`, not the old run's
-commit.
+Reverting nanoodle-mcp `main` does not undo graph changes made in
+awesome-noodles. Those graphs are not in this repo. To restore a graph, restore
+a verified earlier graph snapshot, or get an approved upstream revert in
+awesome-noodles, then redeploy so the host directory refreshes.
 
 ## The photo-to-video check does not roll back
 
@@ -46,8 +51,9 @@ live graph. The video node (`ivideo`) must be model
 `minimax-h3/image-to-video-spicy`, exits non-zero.
 
 That failure fails the job. It does not revert the box, restore the previous
-graph, or start another deploy. The SSH step has already finished. To undo a
-bad deploy, revert `main` and let that new push deploy.
+graph, or start another deploy. The SSH step has already finished. Restoring
+a graph takes a verified earlier snapshot, or an approved awesome-noodles
+revert, and then another deploy.
 
 ## Concurrency
 

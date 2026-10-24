@@ -20,9 +20,56 @@ export const EXPECTED_MODEL = "minimax-h3-singularity/image-to-video";
 export const EXPECTED_RESOLUTION = "480p";
 /** Graph field `duration`. The string "5" is five seconds. */
 export const EXPECTED_DURATION = "5";
+/** Covers the request and reading the body. Tests pass a shorter timeoutMs. */
+export const FETCH_TIMEOUT_MS = 20_000;
 
 const ATTEMPTS = 5;
 const PAUSE_MS = 3000;
+
+function timeoutError(signal) {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error("The operation was aborted due to timeout");
+  err.name = "TimeoutError";
+  return err;
+}
+
+/**
+ * AbortSignal.timeout() uses an unref'd timer, so a fetch that never settles
+ * lets the process exit before the deadline. A ref'd timer on an AbortController
+ * keeps the deadline alive through the request and the body read.
+ */
+function startTimeout(timeoutMs) {
+  const controller = new AbortController();
+  const err = new Error("The operation was aborted due to timeout");
+  err.name = "TimeoutError";
+  const timer = setTimeout(() => controller.abort(err), timeoutMs);
+  timer.ref();
+  return {
+    signal: controller.signal,
+    done() { clearTimeout(timer); },
+  };
+}
+
+/** Reject when `signal` aborts, including when `promise` never settles. */
+function untilAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(timeoutError(signal));
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(timeoutError(signal));
+    signal.addEventListener("abort", fail, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", fail);
+        if (signal.aborted) fail();
+        else resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener("abort", fail);
+        reject(err);
+      },
+    );
+  });
+}
 
 /**
  * Judge one graph object. Returns the video node's model, resolution, and
@@ -59,6 +106,40 @@ export function checkPhotoToVideoGraph(graph) {
   return { model, resolution: fields.resolution, duration: fields.duration };
 }
 
+/**
+ * Fetch one graph. One AbortSignal stays active through the request and
+ * res.text(), so a hung connection and a hung body both fail at timeoutMs.
+ * @param {string} url
+ * @param {{ fetchImpl?: typeof fetch, timeoutMs?: number }} [opts]
+ */
+export async function fetchLivePhotoToVideoGraph(url, { fetchImpl = fetch, timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+  const timeout = startTimeout(timeoutMs);
+  const { signal } = timeout;
+  try {
+    const res = await untilAbort(
+      Promise.resolve().then(() => fetchImpl(url, {
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+        signal,
+      })),
+      signal,
+    );
+    if (!res || res.ok !== true) throw new Error(`fetch failed: HTTP ${res && res.status != null ? res.status : "no response"}`);
+    if (res.body && typeof res.body.cancel === "function") {
+      signal.addEventListener("abort", () => {
+        res.body.cancel(signal.reason).catch(() => {});
+      }, { once: true });
+    }
+    const text = await untilAbort(Promise.resolve().then(() => res.text()), signal);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error("photo-to-video response is not JSON");
+    }
+  } finally {
+    timeout.done();
+  }
+}
+
 async function pause(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -68,11 +149,7 @@ async function main() {
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     const url = `${LIVE_GRAPH_URL}?deploy-check=${attempt}`;
     try {
-      const res = await fetch(url, {
-        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
-      });
-      if (!res.ok) throw new Error(`fetch failed: HTTP ${res.status}`);
-      const graph = await res.json();
+      const graph = await fetchLivePhotoToVideoGraph(url);
       const got = checkPhotoToVideoGraph(graph);
       console.log(`photo-to-video video node: ${got.model} ${got.resolution} duration ${got.duration} (5 seconds)`);
       return;

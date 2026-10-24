@@ -40,6 +40,7 @@ jobs:
         with:
           node-version: "24.22.1"
       # Requires the ivideo node to be minimax-h3-singularity/image-to-video
-      # at 480p for 5 seconds. A failure fails this job. It does not roll back.
+      # at 480p for 5 seconds. The script aborts the fetch and the body read
+      # after 20s. A failure fails this job. It does not roll back.
       - name: Check live photo-to-video graph
         run: node scripts/check-live-photo-to-video.mjs

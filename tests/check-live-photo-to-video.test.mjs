@@ -9,7 +9,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkPhotoToVideoGraph } from "../scripts/check-live-photo-to-video.mjs";
+import {
+  FETCH_TIMEOUT_MS,
+  checkPhotoToVideoGraph,
+  fetchLivePhotoToVideoGraph,
+} from "../scripts/check-live-photo-to-video.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -64,6 +68,46 @@ test("a wrong resolution or duration fails", () => {
   assert.throws(
     () => checkPhotoToVideoGraph(graph({ ...passingFields, duration: "10" })),
     /duration "10" \(expected "5", 5 seconds\)/,
+  );
+});
+
+test("the live fetch times out after 20s", () => {
+  assert.equal(FETCH_TIMEOUT_MS, 20_000);
+});
+
+async function assertTimesOut(run, timeoutMs) {
+  const started = Date.now();
+  await assert.rejects(run(), (err) => {
+    assert.equal(err.name, "TimeoutError");
+    return true;
+  });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < timeoutMs + 1000, `took ${elapsed}ms; timeout was ${timeoutMs}ms`);
+}
+
+test("a hanging request fails within the timeout", { timeout: 2000 }, async () => {
+  const timeoutMs = 40;
+  await assertTimesOut(
+    () => fetchLivePhotoToVideoGraph("https://mcp.nanoodle.com/graph/photo-to-video.json", {
+      timeoutMs,
+      fetchImpl: () => new Promise(() => {}),
+    }),
+    timeoutMs,
+  );
+});
+
+test("a hanging body fails within the timeout", { timeout: 2000 }, async () => {
+  const timeoutMs = 40;
+  await assertTimesOut(
+    () => fetchLivePhotoToVideoGraph("https://mcp.nanoodle.com/graph/photo-to-video.json", {
+      timeoutMs,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        text: () => new Promise(() => {}),
+      }),
+    }),
+    timeoutMs,
   );
 });
 
