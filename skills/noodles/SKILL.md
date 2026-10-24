@@ -46,8 +46,10 @@ mid-session. To add or edit a tool:
 `subnano_comment` needs the `humanize-comment` graph: it refines a draft, runs
 that graph, then returns a post gate and a funny score with the cost of each
 step. `sfw_check` judges an image and sampled video frames; it has no switch
-to skip the check, and video sampling needs ffmpeg. In charge mode each call's
-deposit is quoted from that request's worst case plus a small margin.
+to skip the check, and video sampling needs ffmpeg. In charge mode
+`subnano_comment`'s deposit is an upper bound on that request (capped input
+and output, one token per byte). `sfw_check`'s deposit is an estimate: image
+tokens have no published cap.
 
 Local-media graphs (resize, combine, trim, extract-audio, video-frames,
 soundtrack) load and run headlessly — this package depends on nanoodle ≥ 0.9,

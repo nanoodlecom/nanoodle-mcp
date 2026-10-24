@@ -9,11 +9,14 @@
  * sfw_check — one yes/no safe-for-work decision per still image and per sampled
  * video frame. There is no argument that turns the check off.
  *
- * In charge mode each call's deposit is the worst case that request can still
- * run, plus the 20% settle markup, plus a 12% margin, rounded up to 1e-8 USD.
- * The deposit is quoted before payment. Settlement stays metered cost + 20%;
- * the difference is returned. No $0.001 floor: on a vision decision that floor
- * would be larger than the margin.
+ * In charge mode subnano_comment's deposit is an upper bound on that request:
+ * each stage's input is capped and counted at one token per UTF-8 byte plus a
+ * fixed wrapper allowance, each stage's output is the max_tokens cap, and the
+ * gate and funny judge are priced from the capped comment after humanize (the
+ * text the judge actually reads), plus the 20% settle markup and a 12% margin.
+ * sfw_check cannot be bounded that way: the decision model's image-token count
+ * is not a published cap, so its deposit is an estimate. Settlement stays
+ * metered cost + 20%; the difference is returned. No $0.001 floor.
  */
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
@@ -24,7 +27,7 @@ import { NanoClient } from "nanoodle";
 import { ParamsError, formatCostUsd } from "./tools.mjs";
 import {
   HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, REASK_TEXT, MAX_REASKS,
-  checkHumanizeInputs, humanizeWriterRecord,
+  checkHumanizeInputs, humanizeWriterRecord, clipUtf8, writerOutBytes,
 } from "./humanize.mjs";
 
 export const SUBNANO_TOOL = "subnano_comment";
@@ -34,7 +37,26 @@ export const SFW_TOOL = "sfw_check";
 export const DEPOSIT_MARGIN = 0.12;
 /** What the charge gate keeps on top of metered cost (cost / 5). */
 export const SETTLE_MARKUP = 1.2;
-const CPT = 3;
+/**
+ * Tokens reserved per chat message for role markers and special tokens that
+ * are not in the message bytes. ChatML-style wrappers are a few dozen tokens;
+ * 256 is the ceiling this quote stands behind.
+ */
+export const CHAT_WRAPPER_TOKENS = 256;
+/**
+ * Tokens reserved for a decision model's hidden wrapper, on top of the state
+ * and question bytes. The text itself is counted at one token per byte.
+ */
+export const DECISION_WRAPPER_TOKENS = 2048;
+/**
+ * Image-token reserve for one still fitted to 512px (16×16 tiles of 32px).
+ * Perplexity's docs measure about one token per tile and do not publish a cap,
+ * so 8 per tile is an estimate. sfw_check's quote is an estimate because of this.
+ */
+export const SFW_TILES_PER_SIDE = 16;
+export const SFW_TOKENS_PER_TILE_ESTIMATE = 8;
+export const SFW_IMAGE_TOKEN_CAP = SFW_TILES_PER_SIDE * SFW_TILES_PER_SIDE * SFW_TOKENS_PER_TILE_ESTIMATE;
+export const SFW_QUOTE_IS_ESTIMATE = true;
 
 export const REFINE_MODEL = "liquid/lfm-2.5-2.6b";
 export const REFINE_MAX_TOKENS = 400;
@@ -44,7 +66,7 @@ export const SFW_MODEL = "perplexity/pplx-decider-v1.2";
 export const SFW_FRAMES_DEFAULT = 5;
 export const SFW_FRAMES_MAX = 8;
 export const GUIDANCE_DEFAULT = "a friendly, specific reply";
-/** Published v2.7 humanize charge at the input caps (provider × 1.2). Used only when the graph is not mounted. */
+/** Published v2.7 humanize charge at the input caps (provider × 1.2). The old bytes/3 estimate, not this quote. */
 export const HUMANIZE_V27_CAP_CHARGE = 0.01304480;
 const MAX_MEDIA_BYTES = 4 * 1024 * 1024;
 
@@ -100,8 +122,6 @@ export function exactUsd(n) {
   return "$" + s;
 }
 
-const codePoints = (s) => [...String(s ?? "")].length;
-const bytes = (s) => Buffer.byteLength(String(s ?? ""), "utf8");
 
 export function refineUser(context, guidance, draft) {
   return `Context:\n${context}\n\nGuidance:\n${guidance}\n\nDraft:\n${draft}`;
@@ -109,8 +129,6 @@ export function refineUser(context, guidance, draft) {
 export function commentState(context, comment) {
   return `Context:\n${context}\n\nComment:\n${comment}`;
 }
-const REFINE_OVERHEAD = codePoints(refineUser("", "", ""));
-const STATE_OVERHEAD = codePoints(commentState("", ""));
 
 function pick(args, name) {
   if (!args || typeof args !== "object") return undefined;
@@ -151,35 +169,126 @@ export function chatRates(catalogs, model, fallback) {
   return fallback;
 }
 
+/** One token per UTF-8 byte of text we send. A BPE token is at least one byte. */
+export function textTokens(s) {
+  return Buffer.byteLength(String(s ?? ""), "utf8");
+}
+
+/** Worst UTF-8 size of a string capped at `codePoints` Unicode scalars. */
+export function maxUtf8Bytes(codePoints) {
+  const n = Number(codePoints) || 0;
+  return n > 0 ? n * 4 : 0;
+}
+
+/** Provider USD for one chat call. Output is the max_tokens cap, not a guess. */
+export function chatCallUsd(rates, inputBytes, messages, outTokens) {
+  const inTok = inputBytes + messages * CHAT_WRAPPER_TOKENS;
+  return (inTok * rates[0] + outTokens * rates[1]) / 1e6;
+}
+
 /**
- * Provider USD (no settle markup) for one humanize-comment run at the given
- * input lengths. Draft length is a character count, not the draft text: the
- * hosted quote always passes the Draft cap, because refine may expand.
- * Same arithmetic as the v2.7 estimate locked in tests/workflow-examples.test.mjs.
+ * Byte length of the text wired into `nodeId`'s `port`, walking joins.
+ * `leaves` maps a text or llm node id to the bytes that node contributes.
+ * Join separators are the exact strings the runner sends.
  */
-export function humanizeProviderUsd(graph, { draftChars, contextChars, guidanceChars }, catalogs) {
+export function wiredTextBytes(graph, nodeId, port, leaves) {
+  const byId = new Map((graph.nodes || []).map((n) => [n.id, n]));
+  const walk = (id, p) => {
+    const link = (graph.links || []).find((l) => l.to && l.to.node === id && l.to.port === p);
+    if (!link) return 0;
+    const src = byId.get(link.from.node);
+    if (!src) return 0;
+    if (src.type === "join") {
+      const a = walk(src.id, "a");
+      const b = walk(src.id, "b");
+      const sep = textTokens(String(src.fields && src.fields.sep != null ? src.fields.sep : " ").replace(/\\n/g, "\n"));
+      if (!(a > 0)) return b;
+      if (!(b > 0)) return a;
+      return a + sep + b;
+    }
+    return leaves.get(src.id) || 0;
+  };
+  return walk(nodeId, port);
+}
+
+const LETTERS = ["A", "B", "C", "D", "E"];
+
+function textLeafBytes(graph, { draftBytes, contextBytes, guidanceBytes }) {
+  const leaves = new Map();
+  for (const n of graph.nodes || []) {
+    if (n.type !== "text") continue;
+    const name = String(n.name || "").toLowerCase();
+    if (name === "draft") leaves.set(n.id, draftBytes);
+    else if (name === "context") leaves.set(n.id, contextBytes);
+    else if (name === "guidance") leaves.set(n.id, guidanceBytes);
+  }
+  return leaves;
+}
+
+/** Largest writer text the judge, gate, and funny step can be shown. */
+export function maxWriterOutBytes(graph) {
+  const record = graph && humanizeWriterRecord(graph);
+  if (!record) return writerOutBytes(600);
+  let n = 0;
+  for (const letter of LETTERS) n = Math.max(n, writerOutBytes(record[letter].maxTokens));
+  return n || writerOutBytes(600);
+}
+
+/**
+ * Byte sizes the humanize graph actually feeds each model.
+ * The judge user message is the joined writer outputs after they are clipped
+ * (the post-restore size: this graph has no placeholders, so that is the
+ * writer text itself), not the draft divided by three.
+ */
+export function humanizeTextBytes(graph, { draftBytes, contextBytes, guidanceBytes }) {
+  const record = humanizeWriterRecord(graph);
+  if (!record) throw new Error("humanize-comment graph cannot be priced");
+  const leaves = textLeafBytes(graph, { draftBytes, contextBytes, guidanceBytes });
+  let writerOut = 0;
+  const writers = {};
+  for (const letter of LETTERS) {
+    const rec = record[letter];
+    const cap = writerOutBytes(rec.maxTokens);
+    writerOut += cap;
+    leaves.set(rec.nodeId, cap);
+    writers[letter] = { nodeId: rec.nodeId, userBytes: wiredTextBytes(graph, rec.nodeId, "prompt", leaves) };
+  }
+  return {
+    writers,
+    writerOutBytes: writerOut,
+    judgeUserBytes: wiredTextBytes(graph, "judge", "prompt", leaves),
+  };
+}
+
+/**
+ * Provider USD (no settle markup) for one humanize-comment run.
+ * Input tokens are one per byte of the capped strings plus the chat wrapper.
+ * Output tokens are each node's max_tokens. The judge is priced on the joined
+ * writer texts at their byte caps.
+ */
+export function humanizeProviderUsd(graph, { draftBytes, contextBytes, guidanceBytes }, catalogs) {
   const record = humanizeWriterRecord(graph);
   if (!record) throw new Error("humanize-comment graph cannot be priced");
   const nodes = new Map((graph.nodes || []).map((n) => [n.id, n]));
-  const jin = nodes.get("j-in");
   const judge = nodes.get("judge");
-  if (!jin || !judge) throw new Error("humanize-comment graph cannot be priced");
+  if (!judge) throw new Error("humanize-comment graph cannot be priced");
+  const sized = humanizeTextBytes(graph, { draftBytes, contextBytes, guidanceBytes });
   const rates = (model) => chatRates(catalogs, model, TEXT_RATES[model]);
   let base = 0;
   const reasks = [];
-  let writerOut = 0;
-  for (const letter of ["A", "B", "C", "D", "E"]) {
+  for (const letter of LETTERS) {
     const rec = record[letter];
     const n = nodes.get(rec.nodeId);
     const W = Number(n && n.fields && n.fields.maxTokens) || 600;
-    writerOut += W;
+    const system = String(n && n.fields && n.fields.system || "").trim();
+    const messages = system ? 2 : 1;
+    const inputBytes = textTokens(system) + sized.writers[letter].userBytes;
     const P = rates(rec.model);
-    const inTok = (bytes(n.fields.system) + draftChars + contextChars + guidanceChars + 2 * bytes(jin.fields && jin.fields.sep)) / CPT;
-    const call = (pc, extra = 0) => (inTok + extra) * pc[0] + W * pc[1];
-    const re = (pc) => call(pc, W + bytes(REASK_TEXT) / CPT);
+    const call = (pc, extraBytes = 0, extraMessages = 0) => chatCallUsd(pc, inputBytes + extraBytes, messages + extraMessages, W);
+    const re = (pc) => call(pc, writerOutBytes(W) + textTokens(REASK_TEXT), 2);
     if (rec.fallbackModel) {
       const FP = rates(rec.fallbackModel);
-      base += Math.max(call(P), call(P) + call(FP));
+      base += call(P) + call(FP);
       reasks.push(Math.max(re(P), re(FP)));
     } else {
       base += call(P);
@@ -187,44 +296,45 @@ export function humanizeProviderUsd(graph, { draftChars, contextChars, guidanceC
     }
   }
   const reask = reasks.sort((a, b) => b - a).slice(0, MAX_REASKS).reduce((a, b) => a + b, 0);
-  let seps = 0;
-  for (const n of graph.nodes || []) {
-    if (n.type === "join" && n.id !== "j-in" && n.fields && n.fields.sep != null) seps += bytes(n.fields.sep);
-  }
+  const system = String(judge.fields && judge.fields.system || "").trim();
   const JP = rates(judge.fields.model);
-  const judgeUsd = ((bytes(judge.fields.system) + draftChars + contextChars + guidanceChars + seps) / CPT + writerOut) * JP[0]
-    + Number(judge.fields.maxTokens) * JP[1];
-  return (base + reask + judgeUsd) / 1e6;
+  const judgeUsd = chatCallUsd(
+    JP,
+    textTokens(system) + sized.judgeUserBytes,
+    system ? 2 : 1,
+    Number(judge.fields.maxTokens) || 1600,
+  );
+  return base + reask + judgeUsd;
 }
 
-export function refineProviderUsd({ draftChars, contextChars, guidanceChars }, catalogs) {
+export function refineProviderUsd({ draftBytes, contextBytes, guidanceBytes }, catalogs) {
   const [pin, pout] = chatRates(catalogs, REFINE_MODEL, TEXT_RATES[REFINE_MODEL]);
-  const inTok = Math.ceil((bytes(REFINE_SYSTEM) + REFINE_OVERHEAD + draftChars + contextChars + guidanceChars) / CPT);
-  return (inTok * pin + REFINE_MAX_TOKENS * pout) / 1e6;
+  const userBytes = textTokens(refineUser("", "", "")) + draftBytes + contextBytes + guidanceBytes;
+  return chatCallUsd([pin, pout], textTokens(REFINE_SYSTEM) + userBytes, 2, REFINE_MAX_TOKENS);
 }
 
-/** Input-token estimate for one decision. Image tokens are 800, twice the library's 400, so the ceiling sits above its forecast. */
-export function decideProviderUsd({ model, question, levels = "", options = "", stateChars = 0, images = 0 }, catalogs) {
-  const [pin] = chatRates(catalogs, model, DECISION_RATES[model]);
-  const inTok = 120 + Math.round((String(question).length + String(options).length + String(levels).length) / 4) + 250
-    + images * 800 + Math.ceil(stateChars / CPT);
-  return inTok * pin / 1e6;
+function noulQuestionBytes(instructions) {
+  return textTokens(JSON.stringify({ type: "noul", instructions: String(instructions).trim() }));
+}
+function scoreQuestionBytes(instructions, levels) {
+  return textTokens(JSON.stringify({
+    type: "score",
+    instructions: String(instructions).trim(),
+    criteria: [...levels],
+  }));
 }
 
-function worstCommentChars(graph) {
-  let maxW = 600;
-  try {
-    const record = graph && humanizeWriterRecord(graph);
-    if (record) {
-      const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
-      maxW = 0;
-      for (const letter of ["A", "B", "C", "D", "E"]) {
-        const n = nodes.get(record[letter].nodeId);
-        maxW = Math.max(maxW, Number(n && n.fields && n.fields.maxTokens) || 600);
-      }
-    }
-  } catch { /* a graph that cannot be read keeps the published 600-token writer cap */ }
-  return Math.max(HUMANIZE_INPUT_CAPS.Draft, maxW * 4);
+/**
+ * Provider USD for one decision. Text is one token per byte plus the wrapper.
+ * Image tokens use SFW_IMAGE_TOKEN_CAP, which is an estimate.
+ * A $0 completion price bills no output; a positive one reserves 32 tokens.
+ */
+export function decideProviderUsd({ model, questionBytes = 0, stateBytes = 0, images = 0 }, catalogs) {
+  const fallback = DECISION_RATES[model] || TEXT_RATES[model];
+  const [pin, pout] = chatRates(catalogs, model, fallback);
+  const inTok = questionBytes + stateBytes + DECISION_WRAPPER_TOKENS + (images > 0 ? images * SFW_IMAGE_TOKEN_CAP : 0);
+  const outTok = pout > 0 ? 32 : 0;
+  return (inTok * pin + outTok * pout) / 1e6;
 }
 
 function guidanceOf(args, humanize) {
@@ -241,25 +351,29 @@ function subnanoLengths(args, humanize) {
   const context = pick(args, "context");
   const guidance = guidanceOf(args, humanize);
   return {
-    draftChars: codePoints(draft),
-    contextChars: codePoints(context),
-    guidanceChars: codePoints(guidance),
+    refineDraftBytes: textTokens(draft),
+    contextBytes: textTokens(context),
+    guidanceBytes: textTokens(guidance),
   };
 }
 
 /**
- * Metered cost × 1.2 for one subnano_comment request. Humanize is priced at the
- * Draft cap (refine may grow the draft). Refine input uses the real draft length.
+ * Metered cost × 1.2 for one subnano_comment request. Humanize's draft is the
+ * refine output, so it is priced at the Draft cap's worst UTF-8 size. Refine
+ * input uses the bytes of this request. Gate and funny read the capped comment.
  */
-export function subnanoChargeUsd({ graph, draftChars, contextChars, guidanceChars, catalogs }) {
-  const humanize = graph
-    ? humanizeProviderUsd(graph, { draftChars: HUMANIZE_INPUT_CAPS.Draft, contextChars, guidanceChars }, catalogs)
-    : HUMANIZE_V27_CAP_CHARGE / SETTLE_MARKUP;
-  const refine = refineProviderUsd({ draftChars, contextChars, guidanceChars }, catalogs);
-  const stateChars = STATE_OVERHEAD + contextChars + worstCommentChars(graph);
-  const gate = decideProviderUsd({ model: D1_MODEL, question: GATE_INSTRUCTIONS, stateChars }, catalogs);
+export function subnanoChargeUsd({ graph, refineDraftBytes, contextBytes, guidanceBytes, catalogs }) {
+  if (!graph) throw new Error("humanize-comment graph cannot be priced");
+  const humanize = humanizeProviderUsd(graph, {
+    draftBytes: maxUtf8Bytes(HUMANIZE_INPUT_CAPS.Draft),
+    contextBytes,
+    guidanceBytes,
+  }, catalogs);
+  const refine = refineProviderUsd({ draftBytes: refineDraftBytes, contextBytes, guidanceBytes }, catalogs);
+  const stateBytes = textTokens(commentState("", "")) + contextBytes + maxWriterOutBytes(graph);
+  const gate = decideProviderUsd({ model: D1_MODEL, questionBytes: noulQuestionBytes(GATE_INSTRUCTIONS), stateBytes }, catalogs);
   const funny = decideProviderUsd({
-    model: D1_MODEL, question: FUNNY_INSTRUCTIONS, levels: FUNNY_LEVELS.join("\n"), stateChars,
+    model: D1_MODEL, questionBytes: scoreQuestionBytes(FUNNY_INSTRUCTIONS, FUNNY_LEVELS), stateBytes,
   }, catalogs);
   return (humanize + refine + gate + funny) * SETTLE_MARKUP;
 }
@@ -267,7 +381,9 @@ export function subnanoChargeUsd({ graph, draftChars, contextChars, guidanceChar
 export function sfwChargeUsd({ images = 0, frames = 0 }, catalogs) {
   const n = images + frames;
   if (!(n > 0)) throw new Error("nothing to check");
-  const one = decideProviderUsd({ model: SFW_MODEL, question: SFW_INSTRUCTIONS, images: 1 }, catalogs);
+  const one = decideProviderUsd({
+    model: SFW_MODEL, questionBytes: noulQuestionBytes(SFW_INSTRUCTIONS), images: 1,
+  }, catalogs);
   return one * n * SETTLE_MARKUP;
 }
 
@@ -440,6 +556,9 @@ async function runSubnano(args, ctx) {
   }
   refined = clipCodePoints(String(refined).trim(), HUMANIZE_INPUT_CAPS.Draft);
   if (!refined) throw new Error("refine returned an empty comment");
+  if (textTokens(refined) > maxUtf8Bytes(HUMANIZE_INPUT_CAPS.Draft)) {
+    refined = clipUtf8(refined, maxUtf8Bytes(HUMANIZE_INPUT_CAPS.Draft));
+  }
 
   let human;
   try {
@@ -451,7 +570,8 @@ async function runSubnano(args, ctx) {
     throw stepFail("humanize", e);
   }
 
-  const state = commentState(context, human.text);
+  const comment = clipUtf8(human.text, maxWriterOutBytes(humanizeGraph(humanize)));
+  const state = commentState(context, comment);
   let gate;
   let funny;
   try {
@@ -501,7 +621,7 @@ async function runSubnano(args, ctx) {
   }
 
   return finishResult({
-    comment: human.text,
+    comment,
     gate,
     funny,
     steps,
@@ -655,8 +775,8 @@ export async function sampleVideoFrames(source, count, { fetch: fetchFn = global
   }
 }
 
-const SUBNANO_NOTE = "a deposit is quoted for each request from its context and guidance and covers the most that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned";
-const SFW_NOTE = "a deposit is quoted for each request from how many pictures it checks and covers the most that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned";
+const SUBNANO_NOTE = "a deposit is quoted for each request from its context and guidance and is an upper bound on what that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned";
+const SFW_NOTE = "a deposit is quoted for each request from how many pictures it checks; it is an estimate, not an upper bound, because an image's token count has no published cap; it settles at the metered cost plus 20%, and the difference is returned";
 
 function spendLine(spendSource) {
   return `Runs on NanoGPT — every call spends real credit from ${spendSource}.`;
@@ -713,9 +833,9 @@ export function builtinTools({ spendSource, humanize }) {
       const graph = humanizeGraph(h);
       return depositFromCharge(subnanoChargeUsd({
         graph,
-        draftChars: caps.Draft,
-        contextChars: caps.Context,
-        guidanceChars: caps.Guidance,
+        refineDraftBytes: maxUtf8Bytes(caps.Draft),
+        contextBytes: maxUtf8Bytes(caps.Context),
+        guidanceBytes: maxUtf8Bytes(caps.Guidance),
         catalogs: ctx && ctx.catalogs,
       }));
     },
@@ -726,7 +846,10 @@ export function builtinTools({ spendSource, humanize }) {
       return runSubnano(args, { ...ctx, humanize: ctx.humanize || humanize });
     },
   };
-  subnano.x402 = { usd: subnano.coldDeposit({ humanize }) };
+  // A directory with graphs but no humanize-comment still registers the tool.
+  // Its quote and prepare refuse until that graph is mounted, so there is no
+  // cold ceiling to pin yet.
+  subnano.x402 = { usd: humanizeGraph(humanize) ? subnano.coldDeposit({ humanize }) : 0 };
 
   const sfw = {
     name: SFW_TOOL,

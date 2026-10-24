@@ -48,13 +48,16 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
   try {
     const caps = HUMANIZE_INPUT_CAPS;
     const provider = humanizeProviderUsd(graph, {
-      draftChars: caps.Draft, contextChars: caps.Context, guidanceChars: caps.Guidance,
+      draftBytes: caps.Draft * 4, contextBytes: caps.Context * 4, guidanceBytes: caps.Guidance * 4,
     });
-    assert.equal((provider * SETTLE_MARKUP).toFixed(8), "0.01304480");
     assert.equal(HUMANIZE_V27_CAP_CHARGE.toFixed(8), "0.01304480");
+    assert.ok(provider * SETTLE_MARKUP > HUMANIZE_V27_CAP_CHARGE, "the byte bound is above the old bytes/3 estimate");
 
     const full = subnanoChargeUsd({
-      graph, draftChars: caps.Draft, contextChars: caps.Context, guidanceChars: caps.Guidance,
+      graph,
+      refineDraftBytes: caps.Draft * 4,
+      contextBytes: caps.Context * 4,
+      guidanceBytes: caps.Guidance * 4,
     });
     assert.ok(full > provider * SETTLE_MARKUP, "refine and the two d1 calls sit on top of humanize");
     const deposit = depositFromCharge(full);
@@ -65,20 +68,29 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
     assert.ok(deposit - full < full * DEPOSIT_MARGIN + 1e-8);
 
     const tool = registry.tools.find((t) => t.name === "subnano_comment");
-    assert.equal(full.toFixed(8), "0.01359361");
-    assert.equal(deposit.toFixed(8), "0.01522485");
     assert.equal(tool.x402.usd, deposit, "the pinned cold ceiling is the full-cap deposit");
+    assert.match(tool.depositNote, /upper bound/);
     const typicalCharge = subnanoChargeUsd({
-      graph, draftChars: 240, contextChars: 480, guidanceChars: GUIDANCE_DEFAULT.length,
+      graph, refineDraftBytes: 240, contextBytes: 480, guidanceBytes: GUIDANCE_DEFAULT.length,
     });
-    assert.equal(typicalCharge.toFixed(8), "0.01137790");
-    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.01274326");
+    assert.equal(full.toFixed(8), "0.09440489");
+    assert.equal(deposit.toFixed(8), "0.10573348");
+    assert.equal(typicalCharge.toFixed(8), "0.06437962");
+    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.07210517");
+    assert.ok(typicalCharge < full);
+    assert.ok(depositFromCharge(typicalCharge) < deposit);
     const quoted = registry.quoteDeposit("subnano_comment", {
+      Draft: "😀".repeat(caps.Draft),
+      Context: "😀".repeat(caps.Context),
+      Guidance: "😀".repeat(caps.Guidance),
+    });
+    assert.equal(quoted, deposit);
+    const asciiCap = registry.quoteDeposit("subnano_comment", {
       Draft: "d".repeat(caps.Draft),
       Context: "c".repeat(caps.Context),
       Guidance: "g".repeat(caps.Guidance),
     });
-    assert.equal(quoted, deposit);
+    assert.ok(asciiCap < deposit, "one byte per character is inside the four-byte ceiling");
 
     const shorter = registry.quoteDeposit("subnano_comment", {
       Draft: "Nice work on the launch.",
@@ -90,16 +102,17 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
     const one = sfwChargeUsd({ images: 1, frames: 0 });
     const five = sfwChargeUsd({ images: 0, frames: 5 });
     const cold = sfwChargeUsd({ images: 1, frames: 8 });
+    assert.equal(one.toFixed(8), "0.00010279");
+    assert.equal(depositFromCharge(one).toFixed(8), "0.00011513");
+    assert.equal(five.toFixed(8), "0.00051396");
+    assert.equal(depositFromCharge(five).toFixed(8), "0.00057564");
+    assert.equal(cold.toFixed(8), "0.00092513");
+    assert.equal(depositFromCharge(cold).toFixed(8), "0.00103615");
     assert.ok(one < five && five < cold);
     const sfw = registry.tools.find((t) => t.name === "sfw_check");
-    assert.equal(one.toFixed(8), "0.00002902");
-    assert.equal(depositFromCharge(one).toFixed(8), "0.00003250");
-    assert.equal(five.toFixed(8), "0.00014508");
-    assert.equal(depositFromCharge(five).toFixed(8), "0.00016249");
-    assert.equal(cold.toFixed(8), "0.00026114");
     assert.equal(sfw.x402.usd, depositFromCharge(cold));
-    assert.equal(sfw.x402.usd.toFixed(8), "0.00029249");
-    assert.ok(sfw.x402.usd < 0.001, "the vision deposit stays under a tenth of a cent — no $0.001 floor");
+    assert.match(sfw.depositNote, /it is an estimate, not an upper bound/);
+    assert.ok(sfw.x402.usd < 0.05, "the image-token estimate stays a small deposit");
     assert.equal(registry.quoteDeposit("sfw_check", { image: "https://example.com/a.jpg" }), depositFromCharge(one));
     assert.equal(registry.quoteDeposit("sfw_check", { video: "https://example.com/a.mp4" }), depositFromCharge(five));
     assert.equal(registry.quoteDeposit("sfw_check", { video: "https://example.com/a.mp4", frames: 2, image: "https://example.com/a.jpg" }), depositFromCharge(sfwChargeUsd({ images: 1, frames: 2 })));
@@ -111,16 +124,15 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
 test("a higher catalog rate replaces the fallback and a decision row may have a $0 completion price", async () => {
   const { dir, graph } = await loadHumanize();
   try {
-    const base = subnanoChargeUsd({
-      graph, draftChars: 200, contextChars: 400, guidanceChars: GUIDANCE_DEFAULT.length,
-    });
+    const lens = { graph, refineDraftBytes: 200, contextBytes: 400, guidanceBytes: GUIDANCE_DEFAULT.length };
+    const base = subnanoChargeUsd(lens);
     const higher = subnanoChargeUsd({
-      graph, draftChars: 200, contextChars: 400, guidanceChars: GUIDANCE_DEFAULT.length,
+      ...lens,
       catalogs: { chat: [{ id: REFINE_MODEL, pricing: { prompt: 1, completion: 1 } }] },
     });
     assert.ok(higher > base);
     const d1 = subnanoChargeUsd({
-      graph, draftChars: 200, contextChars: 400, guidanceChars: GUIDANCE_DEFAULT.length,
+      ...lens,
       catalogs: { chat: [{ id: D1_MODEL, pricing: { prompt: 1, completion: 0 } }] },
     });
     assert.ok(d1 > base, "liquid/d1's catalog prompt price is used even though completion is 0");
