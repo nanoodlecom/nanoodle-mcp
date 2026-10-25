@@ -797,8 +797,8 @@ function guidanceCoverage(text, guidance) {
 
 /**
  * The reply is the guidance, or a near-copy of it. Surrounding quotes and
- * extra space still count. A short copy counts too. A fact taken from a
- * longer guidance does not: it does not reproduce that guidance.
+ * extra space still count. Copying a long fact out of a longer guidance is
+ * not enough: the reply also has to reproduce the guidance.
  */
 function instructionEcho(text, guidance) {
   const t = normalizedEcho(text);
@@ -806,7 +806,6 @@ function instructionEcho(text, guidance) {
   if (!t || !g) return false;
   if (t === g) return true;
   if (copyRatio(t, g) < 0.95) return false;
-  if (codePoints(t) >= 80) return true;
   return guidanceCoverage(t, g) >= 0.95;
 }
 

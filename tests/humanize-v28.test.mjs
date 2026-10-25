@@ -216,7 +216,8 @@ test("a title may repeat guidance facts, and a full instruction echo is rejected
   const echo = "Rewrite this title with the same facts, no preface, no commentary, and no extra explanation.";
   assert.equal(echoesInstruction(title, facts, "", { title: true }), false);
   assert.equal(echoesInstruction(echo, echo, "", { title: true }), true);
-  assert.equal(echoesInstruction(echo, `${facts} ${echo}`, "", { title: true }), true);
+  // The instruction is only part of this guidance. A long excerpt is not a near-total echo.
+  assert.equal(echoesInstruction(echo, `${facts} ${echo}`, "", { title: true }), false);
   assert.equal(echoesInstruction(`  ${echo}  `, echo, "", { title: true }), true);
 
   const opts = { title: true, maxChars: 300, guidance: echo };
@@ -232,6 +233,15 @@ test("a title may repeat guidance facts, and a full instruction echo is rejected
   const kept = assessWriterOutput(JSON.stringify({ title }), { title: true, maxChars: 300, guidance: facts });
   assert.equal(kept.ok, true);
   assert.equal(kept.text, title);
+});
+
+test("a factual title longer than 80 characters is not an instruction echo", () => {
+  const title = "One continuous paper-craft village shot travels from noon to midnight in exactly one take and costs only 42 cents.";
+  const guidance = "Rewrite the article title so it is shorter and clearer. Keep these facts: " + title + " One line only.";
+  assert.ok(codePoints(title) > 80);
+  const fit = assessWriterOutput(title, { title: true, maxChars: 300, guidance, ending: "any", spans: [] });
+  assert.equal(fit.ok, true);
+  assert.equal(fit.text, title);
 });
 
 test("a short guidance echo is rejected when it is quoted or recovered from fenced JSON", () => {
