@@ -78,11 +78,16 @@
  * 8. Writer echo (v2.8). A rewrite that contains the one-thread prefix, a
  *    <comment> wrapper, or a long overlap with the guidance or the instructions
  *    is dropped before the decider sees it (one retry first, inside the same
- *    MAX_REASKS budget). A title may repeat facts the guidance listed; that
- *    overlap is not an instruction echo. Paragraph-length rewrites are dropped
- *    only when the caller passes title: true. Callers who omit keep, ending,
- *    maxChars, and title keep the previous result shape, the same six paid
- *    calls, and the previous price.
+ *    MAX_REASKS budget). A title may repeat facts the guidance listed. A full
+ *    or near-total copy of the guidance is still an instruction echo, whether
+ *    it arrives as a plain line, a JSON title, or one line of a longer reply.
+ *    Paragraph-length rewrites are dropped only when the caller passes
+ *    title: true. When the decider's reply is unusable, a rewrite that fits
+ *    the cap is delivered only after the decider confirms it is faithful and
+ *    safe. Fitting the cap does not make it faithful. A missing, rejecting,
+ *    or failed check errors the run, and the charge gate refunds the deposit.
+ *    Callers who omit keep, ending, maxChars, and title keep the previous
+ *    result shape, the same six paid calls, and the previous price.
  * 9. Deposit. max_tokens on every call is sized from maxChars, or from the
  *    draft length when maxChars is omitted, plus a small slack. On a hosted
  *    payment the quote caps what the customer pays: settlement charges the
@@ -770,9 +775,27 @@ function windowsOverlap(text, ref, n) {
   return false;
 }
 
+function normalizedEcho(s) {
+  return String(s ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The reply is the guidance, or a long near-copy of it. A short title that
+ * keeps a few listed facts stays under this bar.
+ */
+function instructionEcho(text, guidance) {
+  const t = normalizedEcho(text);
+  const g = normalizedEcho(guidance);
+  if (!t || !g) return false;
+  if (t === g) return true;
+  return codePoints(t) >= 80 && copyRatio(t, g) >= 0.95;
+}
+
 /**
  * True when a writer reply echoes the guidance wrapper, the one-thread prefix,
  * a <comment> tag, or a long stretch of the guidance or the instruction text.
+ * Title mode still allows a short factual overlap. It does not allow the
+ * reply to be the instruction itself.
  */
 export function echoesInstruction(text, guidance, system, { title = false } = {}) {
   const t = String(text ?? "");
@@ -780,8 +803,7 @@ export function echoesInstruction(text, guidance, system, { title = false } = {}
   if (COMMENT_TAG.test(t)) return true;
   const prefix = ONE_THREAD_PREFIX.trim();
   if (t.includes(prefix) || t.includes(prefix.slice(0, 32))) return true;
-  // A title is supposed to keep the facts the guidance listed. Overlap with
-  // that text is not the writer pasting the instructions.
+  if (instructionEcho(t, guidance)) return true;
   if (!title && windowsOverlap(t, guidance, 40)) return true;
   if (windowsOverlap(t, system, 80)) return true;
   const g = String(guidance || "").trim();
@@ -850,27 +872,36 @@ function assessWriterOutputOnce(raw, { spans = [], ending = "any", draft = "", g
  * field), not to a trailing comment or the guidance wrapped around it.
  */
 export function assessWriterOutput(raw, opts = {}) {
+  const guidance = String(opts.guidance || "").trim();
+  const echoed = (s) => instructionEcho(s, guidance);
   if (opts.title) {
     const fromJson = jsonTitle(raw);
-    if (fromJson) {
+    // The same full-echo rejection as a plain line. A JSON title does not
+    // skip it by returning before the line scan.
+    if (fromJson && !echoed(fromJson)) {
       const parsed = assessWriterOutputOnce(fromJson, opts);
-      if (parsed.ok) return parsed;
+      if (parsed.ok && !echoed(parsed.text)) return parsed;
     }
   }
-  const once = assessWriterOutputOnce(raw, opts);
-  if (!opts.title || once.ok) return once;
+  let once = assessWriterOutputOnce(raw, opts);
+  if (!opts.title) return once;
+  // A JSON document whose title or text field is the instruction is an echo
+  // even when the braces pull the whole reply just under the near-copy bar.
+  const embedded = jsonTitle(raw);
+  if (once.ok && (echoed(once.text) || (embedded && echoed(embedded)))) {
+    once = { ok: false, reasons: ["echo"], text: null, problems: once.problems };
+  }
+  if (once.ok) return once;
   const recoverable = once.reasons.every((r) => r === "title" || r === "max" || r === "echo");
   if (!recoverable) return once;
   const fromJson = jsonTitle(raw);
   const whole = String(raw ?? "").trim();
-  const guidance = String(opts.guidance || "").trim();
   let best = null;
   for (const candidate of titleCandidates(raw)) {
     if (candidate === whole || candidate === fromJson) continue;
-    // A line that is the guidance itself is the instruction, not the title.
-    if (guidance && (candidate === guidance || (codePoints(candidate) >= 80 && copyRatio(candidate, guidance) >= 0.95))) continue;
+    if (echoed(candidate)) continue;
     const again = assessWriterOutputOnce(candidate, opts);
-    if (!again.ok) continue;
+    if (!again.ok || echoed(again.text)) continue;
     if (!best || codePoints(again.text) > codePoints(best.text)) best = again;
   }
   return best || once;
@@ -2367,32 +2398,63 @@ export async function applyHumanizeFallback(wf, result, record, state) {
   const constrained = !!(state.maxChars || state.title || state.ending === "question" || state.ending === "keep_last" || (state.spans && state.spans.length));
   if (constrained && !acceptableDelivery(text, state)) {
     // The decider's pick (often the original draft, after an unusable reply)
-    // missed the cap. A writer rewrite that already fits is the text to measure,
-    // not the draft and not the decider JSON.
+    // missed the cap. Measure a writer rewrite, not the draft and not the JSON.
+    // A row the decider already called faithful can be delivered. An unjudged
+    // row that merely fits is not faithful until the decider says so.
     const row = fittingRanked(parsed, state);
     if (row) {
-      const unjudged = /not judged/.test(String(row.reason || ""));
-      row.faithful = true;
-      row.disqualified = false;
-      if (unjudged) row.reason = "fits the length cap; the decider reply was not usable";
       parsed.winner = row.writer;
       parsed.text = row.text;
-      if (unjudged) parsed.why = "The decider's reply was not usable, so the first rewrite that fits the length cap is used.";
       result.outputs[out.key] = JSON.stringify(parsed);
-      return unjudged
-        ? { note: "note: the decider's reply was not usable, so the first rewrite that fits the length cap is used." }
-        : null;
+      return null;
+    }
+    const pending = unjudgedFitting(parsed, state);
+    if (pending) {
+      const verdict = await confirmFittingRow(pending, state);
+      if (verdict.error) return verdict;
+      pending.faithful = true;
+      pending.disqualified = false;
+      pending.reason = "decider confirmed faithful and safe";
+      parsed.winner = pending.writer;
+      parsed.text = pending.text;
+      parsed.why = "The decider's reply was not usable. The first rewrite that fits the cap was checked again and confirmed faithful and safe.";
+      result.outputs[out.key] = JSON.stringify(parsed);
+      return { note: "note: the decider's reply was not usable, so the first rewrite that fits the cap was checked again and the decider confirmed it is faithful and safe." };
     }
     return { error: failureMessage(state) };
   }
   return null;
 }
 
-/** A ranked rewrite that already satisfies the hard caps. Unfaithful rows stay out. */
+/** A ranked rewrite the decider already marked faithful, and that fits the caps. */
 function fittingRanked(parsed, state) {
   const rows = parsed && Array.isArray(parsed.ranked) ? parsed.ranked : [];
-  const ok = (row) => row && typeof row.text === "string" && acceptableDelivery(row.text, state);
-  const trusted = rows.find((row) => ok(row) && row.faithful === true && row.disqualified !== true);
-  if (trusted) return trusted;
-  return rows.find((row) => ok(row) && /not judged/.test(String(row.reason || ""))) || null;
+  return rows.find((row) => row && row.faithful === true && row.disqualified !== true && typeof row.text === "string" && acceptableDelivery(row.text, state)) || null;
+}
+
+/** A fitting rewrite the decider never judged. Fitting alone is not a verdict. */
+function unjudgedFitting(parsed, state) {
+  const rows = parsed && Array.isArray(parsed.ranked) ? parsed.ranked : [];
+  return rows.find((row) => row && /not judged/.test(String(row.reason || "")) && typeof row.text === "string" && acceptableDelivery(row.text, state)) || null;
+}
+
+/**
+ * Faithfulness and safety for one unjudged rewrite. No review function, a
+ * review that does not return ok, or a review that throws is not a verdict:
+ * the caller fails the run and the deposit is refunded. The row is unchanged.
+ */
+async function confirmFittingRow(row, state) {
+  if (typeof state.reviewRepair !== "function") {
+    return { error: failureMessage(state, "the rewrite was not confirmed faithful and safe.") };
+  }
+  let verdict = { ok: false };
+  try {
+    verdict = await state.reviewRepair(row.text, row.writer, row.model);
+  } catch {
+    return { error: failureMessage(state, "the decider could not check the rewrite.") };
+  }
+  if (!verdict || verdict.ok !== true || !acceptableDelivery(row.text, state)) {
+    return { error: failureMessage(state, "the rewrite was not confirmed faithful and safe.") };
+  }
+  return {};
 }
