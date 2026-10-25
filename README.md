@@ -385,7 +385,23 @@ graph JSON:
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
 ```
 
-`usd` overrides the deposit. `author` routes **the 20% markup of every
+**humanize-comment** quotes each request on its own. The quote is built from the draft,
+context, guidance, and `maxChars` actually sent. Each call's `max_tokens` is
+sized from that request: `maxChars`, or the draft's length when `maxChars` is
+omitted, plus a small slack. Tokens are estimated at about 3.5 bytes each. The
+priced worst case is every writer once, one extra retry, the decider, and a second decider pass when
+a protected span can be repaired. When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
+On a hosted payment the quote caps what the customer pays. A step whose estimate or invoice would push the spend past
+the quote is skipped. The run then ends with a partial result, or with nothing
+owed when nothing was sent. The deposit is 12% above that priced charge, at least $0.001,
+rounded up, and never below it. Settlement of a hosted payment charges the customer the lesser of the metered
+cost plus 20% and the quoted deposit, and returns the difference. When a provider
+meters more than the quote, the operator absorbs that overrun. This refund and cap apply to hosted payments.
+Direct-wallet spending has no cap and is not refunded. A short comment
+is not asked for the longest comment's hold. The graph's `usd` is only the
+ceiling for that longest request, used when a model has no price.
+
+`usd` overrides the deposit for every other tool. `author` routes **the 20% markup of every
 successful call to that address** — computed on what the run *actually* cost,
 never on the deposit, and capped by whatever the deposit has left once the cost
 is taken out (a deposit too small to cover cost + 20% pays the author only the
