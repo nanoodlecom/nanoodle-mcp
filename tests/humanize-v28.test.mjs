@@ -234,6 +234,29 @@ test("a title may repeat guidance facts, and a full instruction echo is rejected
   assert.equal(kept.text, title);
 });
 
+test("a short guidance echo is rejected when it is quoted or recovered from fenced JSON", () => {
+  const guidance = "Rewrite this title clearly.";
+  const opts = { title: true, maxChars: 300, guidance, ending: "any", spans: [] };
+  const fenced = "```json\n{\"title\":\"Rewrite this title clearly.\"}\n```";
+  const quoted = "\"Rewrite this title clearly.\"";
+  for (const raw of [fenced, quoted]) {
+    const fit = assessWriterOutput(raw, opts);
+    assert.equal(fit.ok, false, raw);
+    assert.equal(fit.text, null);
+    assert.ok(fit.reasons.includes("echo"), fit.reasons.join(","));
+  }
+  const facts = "Rewrite the article title so it is shorter and clearer. Keep the facts: a paper-craft village sunset, noon to midnight, one take, 42 cents. One line only.";
+  const title = "Noon to midnight, one take, 42 cents";
+  const overlap = assessWriterOutput(title, { title: true, maxChars: 300, guidance: facts, ending: "any", spans: [] });
+  assert.equal(overlap.ok, true);
+  assert.equal(overlap.text, title);
+  assert.equal(echoesInstruction(title, facts, "", { title: true }), false);
+  const fencedFact = "```json\n{\"title\":\"Noon to midnight, one take, 42 cents\"}\n```";
+  const kept = assessWriterOutput(fencedFact, { title: true, maxChars: 300, guidance: facts, ending: "any", spans: [] });
+  assert.equal(kept.ok, true);
+  assert.equal(kept.text, title);
+});
+
 test("a single-line title under maxChars is not refused at 220, and a wrapped title is the line", async (t) => {
   const line = "A".repeat(250);
   const draft = "B".repeat(400);

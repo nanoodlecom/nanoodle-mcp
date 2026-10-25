@@ -776,19 +776,38 @@ function windowsOverlap(text, ref, n) {
 }
 
 function normalizedEcho(s) {
-  return String(s ?? "").replace(/\s+/g, " ").trim();
+  let t = String(s ?? "").replace(/\s+/g, " ").trim();
+  let prev;
+  do {
+    prev = t;
+    t = t.replace(/^["'`]+|["'`]+$/g, "").trim();
+  } while (t !== prev);
+  return t;
+}
+
+/** Share of the guidance's trigrams that also occur in the reply. */
+function guidanceCoverage(text, guidance) {
+  const ref = trigrams(guidance);
+  if (!ref.size) return 0;
+  const have = trigrams(text);
+  let hit = 0;
+  for (const gram of ref) if (have.has(gram)) hit++;
+  return hit / ref.size;
 }
 
 /**
- * The reply is the guidance, or a long near-copy of it. A short title that
- * keeps a few listed facts stays under this bar.
+ * The reply is the guidance, or a near-copy of it. Surrounding quotes and
+ * extra space still count. A short copy counts too. A fact taken from a
+ * longer guidance does not: it does not reproduce that guidance.
  */
 function instructionEcho(text, guidance) {
   const t = normalizedEcho(text);
   const g = normalizedEcho(guidance);
   if (!t || !g) return false;
   if (t === g) return true;
-  return codePoints(t) >= 80 && copyRatio(t, g) >= 0.95;
+  if (copyRatio(t, g) < 0.95) return false;
+  if (codePoints(t) >= 80) return true;
+  return guidanceCoverage(t, g) >= 0.95;
 }
 
 /**
@@ -846,13 +865,22 @@ function titleCandidates(raw) {
     if (t && !out.includes(t)) out.push(t);
   };
   push(jsonTitle(raw));
-  for (const line of String(raw ?? "").split(/\n/)) push(line);
+  for (const line of String(raw ?? "").split(/\n/)) {
+    if (/^```/.test(line.trim())) continue;
+    push(line);
+  }
   return out;
 }
 
 function assessWriterOutputOnce(raw, { spans = [], ending = "any", draft = "", guidance = "", system = "", maxChars = null, title = false } = {}) {
   const reasons = [];
   if (echoesInstruction(raw, guidance, system, { title })) reasons.push("echo");
+  // A recovered line may be the JSON object itself. The field has to face the
+  // same echo check as a plain title. The braces are not a different sentence.
+  if (title && !reasons.includes("echo")) {
+    const embedded = jsonTitle(raw);
+    if (embedded && echoesInstruction(embedded, guidance, system, { title: true })) reasons.push("echo");
+  }
   const problems = spanProblems(raw, spans);
   if (problems.length) reasons.push("keep");
   let text = problems.length ? null : reinsertSpans(raw, spans);
