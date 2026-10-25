@@ -72,11 +72,12 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
     const typicalCharge = subnanoChargeUsd({
       graph, draftChars: 240, draftBytes: 240, contextBytes: 480, guidanceBytes: GUIDANCE_DEFAULT.length,
     });
-    // A 240-byte draft. The four-byte ceiling is a real max-size request, above Maxi's ~$0.016 cap.
+    // A 240-byte draft. The four-byte ceiling uses humanize v2.8's Guidance cap
+    // (600 characters). It is a real max-size request, above Maxi's ~$0.016 cap.
     assert.equal(typicalCharge.toFixed(8), "0.00446707");
     assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.00500313");
-    assert.equal(full.toFixed(8), "0.02001439");
-    assert.equal(deposit.toFixed(8), "0.02241612");
+    assert.equal(full.toFixed(8), "0.02072490");
+    assert.equal(deposit.toFixed(8), "0.02321189");
     assert.equal(registry.quoteDeposit("subnano_comment", {
       Draft: "a".repeat(240), Context: "b".repeat(480),
     }).toFixed(8), "0.00500313");

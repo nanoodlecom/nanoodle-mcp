@@ -27,7 +27,7 @@ import { NanoClient } from "nanoodle";
 import { ParamsError, formatCostUsd } from "./tools.mjs";
 import {
   HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, REASK_TEXT, MAX_REASKS,
-  checkHumanizeInputs, humanizeWriterRecord, clipUtf8,
+  checkHumanizeInputs, humanizeWriterRecord, capUtf8,
 } from "./humanize.mjs";
 
 export const SUBNANO_TOOL = "subnano_comment";
@@ -647,7 +647,7 @@ async function runSubnano(args, ctx) {
   }
   refined = clipCodePoints(String(refined).trim(), HUMANIZE_INPUT_CAPS.Draft);
   if (!refined) throw new Error("refine returned an empty comment");
-  refined = clipUtf8(refined, stages.commentBytes);
+  refined = capUtf8(refined, stages.commentBytes);
 
   if (!budget.fits(stages.settled.humanize)) {
     return stoppedResult("humanize", { comment: refined, steps }, budget);
@@ -669,7 +669,7 @@ async function runSubnano(args, ctx) {
     throw stepFail("humanize", e);
   }
 
-  const comment = clipUtf8(human.text, stages.commentBytes);
+  const comment = capUtf8(human.text, stages.commentBytes);
   if (!budget.fits(stages.settled.gate)) {
     return stoppedResult("gate", {
       comment, steps, ...(human.notes.length ? { notes: human.notes } : {}),

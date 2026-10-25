@@ -33,6 +33,7 @@ import { writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
+import { knownUsd } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
 
@@ -77,7 +78,20 @@ const GRAIN = 10n ** 22n;
  * with an explicit floor/ceil.
  */
 export function parseUsdNano(v) {
-  const s = String(v).trim();
+  let s;
+  if (typeof v === "number") {
+    if (!Number.isFinite(v) || v < 0) throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+    s = String(v);
+  } else if (typeof v === "string") {
+    s = v.trim();
+  } else {
+    throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
+  }
+  // Same numeric text knownUsd accepts: optional sign, a leading dot, a
+  // trailing dot. The digits stay in the string so the nano conversion is exact.
+  s = s.replace(/^([+-])?\./, (_, sign) => (sign === "-" ? "-0." : "0."));
+  if (/^\d+\.$/.test(s)) s = s.slice(0, -1);
+  if (s.startsWith("+")) s = s.slice(1);
   const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
   if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
   const digits = m[2] + (m[3] || "");
@@ -103,8 +117,8 @@ export function hashArgs(name, args) {
 }
 
 const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\.\d\d\d*?)0+$/, "$1");
-/** Per-request quotes are collected at this exact figure, so the sentence must not round to cents. */
-const exactUsd = (n) => "$" + Number(n).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+/** Exact deposit figure (up to 8 decimals, trailing zeros trimmed) so the quote text matches the amount collected. */
+const exactUsd = (n) => "$" + Number(n).toFixed(8).replace(/(\.\d*?)0+$/, "$1");
 
 /**
  * @param {object} opts
@@ -759,7 +773,7 @@ export function createChargeGate({
     // to hand over.
     const expMin = Math.max(1, Math.round((q.expiresAt - now()) / 60_000));
     const text =
-      `PAYMENT REQUIRED — this tool takes a ${(q.perRequest ? exactUsd(q.usd) : fmtUsd(q.usd))} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
+      `PAYMENT REQUIRED — this tool takes a ${exactUsd(q.usd)} deposit (exactly ${rawToXno(q.amountRaw)} XNO), paid in Nano. No account needed. ` +
       `The actual price is the run's metered model cost + 20%; everything above that comes back to the paying wallet as change after the run.\n\n` +
       `This call is done — hang up. On this payment link, do BOTH of these now:\n` +
       `1. Show your user ONLY this payment link (QR to scan; green check when paid). Do not show them any other URL or the wallet address:\n` +
@@ -869,8 +883,8 @@ export function createChargeGate({
      */
     wrapRegistry(registry, { runNoodleName = "run_noodle" } = {}) {
       const pinned = new Map(registry.tools.map((t) => {
-        const v = t.x402 && Number(t.x402.usd);
-        return [t.name, Number.isFinite(v) && v > 0 ? v : null];
+        const v = t.x402 ? knownUsd(t.x402.usd) : null;
+        return [t.name, v != null && v > 0 ? v : null];
       }));
       /**
        * Deposit for a tool as of right now. The deposit is a HOLD, not the price:
@@ -880,12 +894,12 @@ export function createChargeGate({
        * the operator eats the difference (see settle()).
        *
        * Precedence:
-       *   1. A per-request quote (registry.quoteDeposit) when the caller passed
-       *      arguments. That quote is the most this request can cost, plus a
-       *      small margin. A throw or a non-positive result falls through to
-       *      the pin below. tools/list calls priceFor with no arguments, so a
-       *      priced-per-request tool advertises the pin's sentence, not one dollar.
-       *   2. A graph's own x402.usd is pinned and always wins over a forecast.
+       *   1. A tool with a per-request quote (registry.quoteDeposit) uses that
+       *      for the call in front of it. humanize-comment prices its own
+       *      length and maxChars this way. Built-ins with a quote function use
+       *      the same hook. The graph's x402.usd stays the cold ceiling for
+       *      tools/list and for a quote that cannot be priced.
+       *   2. Otherwise a graph's own x402.usd is pinned and wins.
        *   3. Otherwise quote off the largest of two cost signals — an UP-FRONT
        *      catalog forecast (registry.estimates, valid before the tool has ever
        *      run) and the worst metered cost actually seen (registry.costs, a live
@@ -897,8 +911,19 @@ export function createChargeGate({
        * --charge-usd is the cold-start deposit, NOT a ceiling: expensive graphs
        * quote what they actually cost (change still returns the slack), so the
        * operator stops absorbing overages on video / multi-step tools.
+       *
+       * `args` is the call being quoted. Omit it for the cold figure (the pin,
+       * or the opening deposit) used by tools/list and the startup check.
        */
-      const priceFor = (name) => {
+      const priceFor = (name, args) => {
+        if (args && registry.quoteDeposit) {
+          try {
+            const quoted = registry.quoteDeposit(name, args);
+            if (Number.isFinite(quoted) && quoted > 0) return quoted;
+          } catch (e) {
+            log(`warning: ${name} per-request deposit failed (${e.message}); using the pinned deposit`);
+          }
+        }
         const pin = pinned.get(name);
         if (pin) return pin;
         const rec = registry.costs && registry.costs[name];
@@ -977,8 +1002,10 @@ export function createChargeGate({
       function settle(q, name, costUsd, alreadySettled = false) {
         const author = authors.get(name);
         const deposit = BigInt(q.amountRaw);
-        const known = Number.isFinite(costUsd);
-        const costRaw0 = known ? usdToRaw(costUsd, q.pair, "ceil") : 0n;
+        // "1e-7" and ".001" are that cost. Text knownUsd rejects stays unknown.
+        const parsed = knownUsd(costUsd);
+        const known = parsed != null;
+        const costRaw0 = known ? usdToRaw(parsed, q.pair, "ceil") : 0n;
         const costRaw = costRaw0 > deposit ? deposit : costRaw0;
         const remaining = deposit - costRaw;
         const markup = costRaw0 / 5n;
@@ -986,14 +1013,14 @@ export function createChargeGate({
         const change = remaining - take;
 
         // Recompute-only replay after a restart: the money already moved.
-        if (alreadySettled) return { known, costRaw, take, change, author: !!author };
+        if (alreadySettled) return { known, costRaw, take, change, author: !!author, costUsd: known ? parsed : null };
 
         if (costRaw0 > deposit) {
-          log(`call ${q.id} (${name}) cost $${costUsd} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
+          log(`call ${q.id} (${name}) cost $${parsed} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
         if (author && take > 0n) {
           ops.transfer(author, take.toString(), "author payout:")
-            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? costUsd : null, hash }))
+            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? parsed : null, hash }))
             .catch((e) => {
               log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
               owe(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id, tool: name });
@@ -1012,41 +1039,25 @@ export function createChargeGate({
             usage("change", { paymentId: q.id, tool: name, ok: false, amountRaw: change.toString(), error: "payer account unknown" });
           }
         }
-        return { known, costRaw, take, change, author: !!author };
+        return { known, costRaw, take, change, author: !!author, costUsd: known ? parsed : null };
       }
-
-      /**
-       * Deposit for this call. Per-request tools quote from the arguments after
-       * they have been validated. Everyone else uses priceFor (pin, forecast, or
-       * the flat opening deposit).
-       */
-      const quotedPrice = (name, args) => {
-        if (args && typeof registry.quoteDeposit === "function") {
-          try {
-            const q = registry.quoteDeposit(name, args);
-            if (q == null) { /* not priced per request */ }
-            else if (Number.isFinite(q) && q > 0) return { usd: q, perRequest: true };
-            else log(`warning: ${name} per-request quote was not a positive amount — using the pinned deposit`);
-          } catch (e) {
-            log(`warning: ${name} per-request quote failed (${e && e.message ? e.message : "failed"}) — using the pinned deposit`);
-          }
-        }
-        return { usd: priceFor(name), perRequest: false };
-      };
 
       const listTools = () =>
         registry.listTools()
           .filter((t) => t.name !== runNoodleName)
           .map((t) => {
+            const full = registry.tools.find((x) => x.name === t.name);
             const price = priceFor(t.name);
-            // The humanize v2.8 sentence, kept for any tool that sets pricedPerRequest
-            // and does not bring its own note. Per-request tools do not advertise one dollar.
-            const perRequest = t.pricedPerRequest
-              ? (t.depositNote || "a deposit is quoted for each request from its length and maxChars and covers the most that request can cost, plus a small margin; it settles at the metered cost plus 20%, and the difference is returned")
-              : null;
+            // Per-request tools have no single figure to advertise. The quote
+            // for the call is the amount collected. No payment rail in this line:
+            // it is the text agents show before a quote exists. A tool may bring
+            // its own depositNote; humanize-comment uses the sentence below.
+            const depositLine = full && full.pricedPerRequest
+              ? (full.depositNote || "a deposit is quoted for each request from its length and maxChars and caps what the customer pays; it settles at the lesser of the metered cost plus 20% and that deposit, and any difference is returned; the operator absorbs any overrun. When Cydonia fails and the Starry Ocean fallback runs, both calls are charged. This refund and cap apply to hosted payments. Direct-wallet spending has no cap")
+              : `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`;
             const description = t.description.replace(
               /every call spends real credit from [^;.]+/,
-              perRequest || `${fmtUsd(price)} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%, change returned; no account needed`) +
+              depositLine) +
               (authors.get(t.name) ? " The 20% markup goes to the graph's author." : "");
             const inputSchema = {
               ...t.inputSchema,
@@ -1095,13 +1106,15 @@ export function createChargeGate({
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
           if (validate) await validate({ name, arguments: args });
-          const price = quotedPrice(name, args);
+          // After validation, so the quote is for a call that will run and matches
+          // the arguments the caller will pay for.
+          const price = priceFor(name, args);
           const pair = await ratePair();
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
-            tool: name, argsHash, usd: price.usd, perRequest: price.perRequest,
+            tool: name, argsHash, usd: price,
             pair, // settle math must use the exact pair the deposit was priced at
-            amountRaw: tagAmount(price.usd, pair),
+            amountRaw: tagAmount(price, pair),
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
             etaMs: etaOf(name),
@@ -1187,7 +1200,7 @@ export function createChargeGate({
               // settled on restore but carrying no stored figures — falls back to
               // this recompute-only run's numbers rather than reading undefined.
               if (!q.settleReceipt) {
-                q.settleReceipt = { known: s.known, costUsd: s.known ? costUsd : null, exact: costExact !== false,
+                q.settleReceipt = { known: s.known, costUsd: s.known ? s.costUsd : null, exact: costExact !== false,
                   take: s.take.toString(), change: s.change.toString(), author: s.author };
               }
               q.settled = true;

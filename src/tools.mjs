@@ -17,7 +17,9 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
-import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes } from "./humanize.mjs";
+import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
+import { humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
+import { knownUsd } from "./usd.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
@@ -390,7 +392,8 @@ function buildDescription(wf, spendSource, { cost, name } = {}) {
  * is ~$0.000002 and must not read as $0.0000.
  */
 export function formatCostUsd(usd) {
-  const n = Number(usd);
+  const n = knownUsd(usd);
+  if (n == null) return "0.0000";
   if (n > 0 && n < 0.0001) return n.toFixed(8).replace(/0+$/, "");
   return n.toFixed(4);
 }
@@ -794,7 +797,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
  * mode owns stdout. `catalogTimeoutMs` overrides the catalog fetch timeout.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -865,6 +868,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         inputSchema: buildInputSchema(wf),
         // humanize-comment: input caps + writer record + exact ranked texts (src/humanize.mjs)
         humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph) : null,
+        // Quoted per request from length and maxChars. The gate reads quoteDeposit.
+        pricedPerRequest: name === HUMANIZE_TOOL,
       });
     }
   }
@@ -872,8 +877,18 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   for (const t of tools) if (t.humanize) {
     for (const [k, cap] of Object.entries(HUMANIZE_INPUT_CAPS)) {
       const p = t.inputSchema.properties[k];
-      if (p) { p.maxLength = cap; p.description = `${p.description ? p.description + "; " : ""}at most ${cap} characters`; }
+      if (!p) continue;
+      if (k === "Guidance") {
+        // The one-thread prefix may lead the string and is not counted, so the
+        // schema maxLength has room for it. checkHumanizeInputs enforces the counted cap.
+        p.maxLength = cap + [...ONE_THREAD_PREFIX].length;
+        p.description = `${p.description ? p.description + "; " : ""}at most ${cap} characters; a leading one-thread prefix ("${ONE_THREAD_PREFIX.trim()}") is not counted`;
+      } else {
+        p.maxLength = cap;
+        p.description = `${p.description ? p.description + "; " : ""}at most ${cap} characters`;
+      }
     }
+    Object.assign(t.inputSchema.properties, humanizeExtraProperties());
   }
   // Built-ins ship in the package so a deploy does not need a new graph file.
   // They stay off an empty directory: with no graph loaded there is nothing to serve.
@@ -923,6 +938,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     costs,
     /** Up-front per-run cost forecasts by tool name (attachEstimates fills this) — the gate quotes off it before a tool has ever run. */
     estimates: {},
+    /** Public catalogs, filled by attachCatalogs. Humanize quotes read prices from here. */
+    catalogs: {},
     /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
     onToolsChanged: null,
 
@@ -942,14 +959,19 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     },
 
     /**
-     * Per-request deposit in USD, or null when this tool is not priced per call.
-     * Throws when the request cannot be priced; the charge gate then keeps the
-     * tool's pinned x402.usd (the cold ceiling) and logs the warning.
+     * Per-request deposit in USD, or null when this tool quotes the usual way.
+     * Built-ins expose quote(). humanize-comment prices its own length and
+     * maxChars. A missing model price returns null so the gate keeps the
+     * pinned ceiling. A throw falls through the same way.
      */
     quoteDeposit(name, args) {
       const tool = byName.get(name);
-      if (!tool || typeof tool.quote !== "function") return null;
-      return tool.quote(args, { catalogs: registry.catalogs, humanize: byName.get(HUMANIZE_TOOL) });
+      if (!tool) return null;
+      if (typeof tool.quote === "function") {
+        return tool.quote(args, { catalogs: registry.catalogs, humanize: byName.get(HUMANIZE_TOOL) });
+      }
+      if (!tool.pricedPerRequest || !tool.wf) return null;
+      return humanizeDepositUsd(tool.wf.graph, args, { prices: humanizePriceTable(registry.catalogs) });
     },
 
     /**
@@ -980,7 +1002,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         return { tool, inputs: null };
       }
       if (tool.humanize) checkHumanizeInputs(args);
-      const inputs = await resolveInputs(tool.wf, args, `tool "${tool.name}"`);
+      const inputs = await resolveInputs(tool.wf, tool.humanize ? humanizeGraphArgs(args) : args, `tool "${tool.name}"`);
       return { tool, inputs };
     },
 
@@ -1009,16 +1031,35 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       let runWf = tool.wf, hf = null;
       if (tool.humanize) {
         const args = params.arguments || {};
-        const dk = Object.keys(args).find((k) => k.trim().toLowerCase() === "draft");
+        const opts = humanizeCallOpts(args);
+        const { cleanDraft, writerDraft, spans } = collectSpans(opts.draft, opts.keep);
+        if (cleanDraft !== opts.draft) {
+          const dk = Object.keys(inputs).find((k) => k.trim().toLowerCase() === "draft");
+          if (dk) inputs[dk] = cleanDraft;
+        }
+        // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
+        // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
+        const prices = humanizePriceTable(registry.catalogs);
+        const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
+        const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
           record: tool.humanize,
-          draft: dk ? String(args[dk]) : "",
+          draft: cleanDraft,
+          writerDraft: spans.length ? writerDraft : null,
+          spans,
+          ending: opts.ending,
+          maxChars: opts.maxChars,
+          guidance: opts.guidance,
+          title: opts.title === true,
           payment: apiKey ? null : payment,
           baseUrl: baseUrl || "https://nano-gpt.com",
-          maxTokens: params.maxTokens,
-          judgeMaxTokens: params.judgeMaxTokens,
-          clipBytes: params.clipBytes,
+          budgetUsd: hosted ? (quoted ?? (pin != null && pin > 0 ? pin : null)) : null,
+          prices,
+          // subnano_comment sizes this humanize run from the request. A normal
+          // humanize-comment call leaves these unset, and the v2.8 caps apply.
+          ...(Number(params.maxTokens) > 0 ? { writerTokenCap: Math.floor(Number(params.maxTokens)) } : {}),
+          ...(Number(params.judgeMaxTokens) > 0 ? { judgeTokenCap: Math.floor(Number(params.judgeMaxTokens)) } : {}),
         });
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
         hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
@@ -1029,9 +1070,13 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         notices.push(...humanizeRunNotes(hf.state));
         const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
         if (note) notices.push(note);
+        const fb = await applyHumanizeFallback(runWf, result, tool.humanize, hf.state);
+        if (fb && fb.error) throw new Error(fb.error);
+        if (fb && fb.note) notices.push(fb.note);
         // attempts whose answer never reached the engine (failed fallbacks, paid-but-failed calls,
         // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
-        if (hf.state.unreportedUsd > 0) result.costUsd = (Number.isFinite(result.costUsd) ? result.costUsd : 0) + hf.state.unreportedUsd;
+        if (hf.state.unreportedUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.unreportedUsd;
+        if (hf.state.reviewUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.reviewUsd;
         if (hf.state.costUnknown) result.costExact = false;
       }
       await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
