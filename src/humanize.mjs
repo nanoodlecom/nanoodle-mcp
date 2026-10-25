@@ -71,15 +71,18 @@
  *    alone. Omitted, it changes nothing.
  * 7. Guidance cap is 600 characters. A leading one-thread prefix
  *    (ONE_THREAD_PREFIX) is the server's own line and is not counted. `maxChars`,
- *    when set, is a hard output cap: over-length rewrites are dropped and that
- *    writer is asked once more.
+ *    when set, is a hard output cap on the rewrite itself: a title line, not the
+ *    surrounding comment or a JSON wrapper. Over-length rewrites are dropped and
+ *    that writer is asked once more. For a title, a single line the caller
+ *    allowed is not also refused at 220 characters.
  * 8. Writer echo (v2.8). A rewrite that contains the one-thread prefix, a
  *    <comment> wrapper, or a long overlap with the guidance or the instructions
  *    is dropped before the decider sees it (one retry first, inside the same
- *    MAX_REASKS budget). Paragraph-length rewrites are dropped only when the
- *    caller passes title: true. Callers who omit keep, ending, maxChars, and
- *    title keep the previous result shape, the same six paid calls, and the
- *    previous price.
+ *    MAX_REASKS budget). A title may repeat facts the guidance listed; that
+ *    overlap is not an instruction echo. Paragraph-length rewrites are dropped
+ *    only when the caller passes title: true. Callers who omit keep, ending,
+ *    maxChars, and title keep the previous result shape, the same six paid
+ *    calls, and the previous price.
  * 9. Deposit. max_tokens on every call is sized from maxChars, or from the
  *    draft length when maxChars is omitted, plus a small slack. On a hosted
  *    payment the quote caps what the customer pays: settlement charges the
@@ -771,30 +774,63 @@ function windowsOverlap(text, ref, n) {
  * True when a writer reply echoes the guidance wrapper, the one-thread prefix,
  * a <comment> tag, or a long stretch of the guidance or the instruction text.
  */
-export function echoesInstruction(text, guidance, system) {
+export function echoesInstruction(text, guidance, system, { title = false } = {}) {
   const t = String(text ?? "");
   if (!t.trim()) return false;
   if (COMMENT_TAG.test(t)) return true;
   const prefix = ONE_THREAD_PREFIX.trim();
   if (t.includes(prefix) || t.includes(prefix.slice(0, 32))) return true;
-  if (windowsOverlap(t, guidance, 40)) return true;
+  // A title is supposed to keep the facts the guidance listed. Overlap with
+  // that text is not the writer pasting the instructions.
+  if (!title && windowsOverlap(t, guidance, 40)) return true;
   if (windowsOverlap(t, system, 80)) return true;
   const g = String(guidance || "").trim();
-  if (codePoints(g) >= 80 && copyRatio(t, g) >= 0.6) return true;
+  if (!title && codePoints(g) >= 80 && copyRatio(t, g) >= 0.6) return true;
   return false;
 }
 
-export function isParagraphOutput(text, spans) {
-  const body = String(text ?? "").replace(/\n+$/, "");
+export function isParagraphOutput(text, spans, maxChars = null) {
+  const body = String(text ?? "").replace(/^\n+/, "").replace(/\n+$/, "");
   if (body.includes("\n")) return true;
   const allowance = (spans || []).reduce((n, s) => n + codePoints(s.text), 0);
-  return codePoints(body) > TITLE_OUTPUT_MAX + allowance;
+  const cap = Number(maxChars);
+  // maxChars is the caller's cap. It replaces the 220 title ceiling when it
+  // is higher, and the separate maxChars check still enforces a lower one.
+  const limit = Number.isFinite(cap) && cap > 0 ? Math.max(TITLE_OUTPUT_MAX, cap) : TITLE_OUTPUT_MAX;
+  return codePoints(body) > limit + allowance;
 }
 
-/** Decide whether a dashed writer reply may be shown to the decider. */
-export function assessWriterOutput(raw, { spans = [], ending = "any", draft = "", guidance = "", system = "", maxChars = null, title = false } = {}) {
+/** A JSON object's title or text, when the whole reply is that object. */
+function jsonTitle(raw) {
+  let t = String(raw ?? "").trim();
+  const fence = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) t = fence[1].trim();
+  if (!t.startsWith("{") || !t.endsWith("}")) return "";
+  try {
+    const j = JSON.parse(t);
+    if (!j || typeof j !== "object" || Array.isArray(j)) return "";
+    const pick = ["title", "text"].map((k) => j[k]).find((v) => typeof v === "string" && v.trim());
+    return pick ? String(pick).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Lines and a JSON title/text field pulled out of a longer writer reply. */
+function titleCandidates(raw) {
+  const out = [];
+  const push = (s) => {
+    const t = String(s ?? "").trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+    if (t && !out.includes(t)) out.push(t);
+  };
+  push(jsonTitle(raw));
+  for (const line of String(raw ?? "").split(/\n/)) push(line);
+  return out;
+}
+
+function assessWriterOutputOnce(raw, { spans = [], ending = "any", draft = "", guidance = "", system = "", maxChars = null, title = false } = {}) {
   const reasons = [];
-  if (echoesInstruction(raw, guidance, system)) reasons.push("echo");
+  if (echoesInstruction(raw, guidance, system, { title })) reasons.push("echo");
   const problems = spanProblems(raw, spans);
   if (problems.length) reasons.push("keep");
   let text = problems.length ? null : reinsertSpans(raw, spans);
@@ -803,9 +839,41 @@ export function assessWriterOutput(raw, { spans = [], ending = "any", draft = ""
     if (ending === "question" && !isQuestion(text)) reasons.push("question");
   }
   const shown = text != null ? text : String(raw ?? "");
-  if (title && isParagraphOutput(shown, spans)) reasons.push("title");
+  if (title && isParagraphOutput(shown, spans, maxChars)) reasons.push("title");
   if (maxChars && text != null && codePoints(shown) > maxChars) reasons.push("max");
   return { ok: reasons.length === 0, reasons, text: reasons.length === 0 ? text : null, problems };
+}
+
+/**
+ * Decide whether a writer reply may be shown to the decider.
+ * For a title, the cap is applied to the title line (or a JSON title/text
+ * field), not to a trailing comment or the guidance wrapped around it.
+ */
+export function assessWriterOutput(raw, opts = {}) {
+  if (opts.title) {
+    const fromJson = jsonTitle(raw);
+    if (fromJson) {
+      const parsed = assessWriterOutputOnce(fromJson, opts);
+      if (parsed.ok) return parsed;
+    }
+  }
+  const once = assessWriterOutputOnce(raw, opts);
+  if (!opts.title || once.ok) return once;
+  const recoverable = once.reasons.every((r) => r === "title" || r === "max" || r === "echo");
+  if (!recoverable) return once;
+  const fromJson = jsonTitle(raw);
+  const whole = String(raw ?? "").trim();
+  const guidance = String(opts.guidance || "").trim();
+  let best = null;
+  for (const candidate of titleCandidates(raw)) {
+    if (candidate === whole || candidate === fromJson) continue;
+    // A line that is the guidance itself is the instruction, not the title.
+    if (guidance && (candidate === guidance || (codePoints(candidate) >= 80 && copyRatio(candidate, guidance) >= 0.95))) continue;
+    const again = assessWriterOutputOnce(candidate, opts);
+    if (!again.ok) continue;
+    if (!best || codePoints(again.text) > codePoints(best.text)) best = again;
+  }
+  return best || once;
 }
 
 export function guardRetryPrompt(reasons, { spans = [], maxChars = null } = {}) {
@@ -949,7 +1017,7 @@ function acceptableDelivery(text, state) {
   const t = String(text ?? "");
   if (!t.trim()) return false;
   if (state.maxChars && codePoints(t) > state.maxChars) return false;
-  if (state.title && isParagraphOutput(t, state.spans)) return false;
+  if (state.title && isParagraphOutput(t, state.spans, state.maxChars)) return false;
   if (state.ending === "question" && !isQuestion(t)) return false;
   if (state.ending === "keep_last") {
     const last = state.spans && state.spans.length ? state.spans[state.spans.length - 1].text : finalSentence(state.draft);
@@ -961,7 +1029,7 @@ function acceptableDelivery(text, state) {
     for (const s of state.spans) want.set(s.text, (want.get(s.text) || 0) + 1);
     for (const [span, n] of want) if (span && t.split(span).length - 1 < n) return false;
   }
-  if (echoesInstruction(t, state.guidance, "")) return false;
+  if (echoesInstruction(t, state.guidance, "", { title: !!state.title })) return false;
   return true;
 }
 
@@ -2184,7 +2252,7 @@ export function rebuildHumanizeResult(wf, result, record, answered = {}) {
       return { writer: letter, model: modelOf(letter), text: text ?? "", faithful: false, disqualified: true, reason: text == null ? "missing" : "not judged: decider reply unusable" };
     });
     result.outputs[out.key] = JSON.stringify({ winner: "ORIGINAL", text: draft, why: "The decider's reply was not usable, so the original draft is returned unchanged.", ranked });
-    return "note: the decider's reply was not valid JSON with a ranked list, so humanize-comment returned the original draft as the winner; the five rewrites are listed with their real texts, unjudged.";
+    return "note: the decider's reply was not valid JSON with a ranked list, so the five rewrites are listed with their real texts, unjudged.";
   }
   const seen = new Set();
   const ranked = [];
@@ -2297,6 +2365,34 @@ export async function applyHumanizeFallback(wf, result, record, state) {
     }
   }
   const constrained = !!(state.maxChars || state.title || state.ending === "question" || state.ending === "keep_last" || (state.spans && state.spans.length));
-  if (constrained && !acceptableDelivery(text, state)) return { error: failureMessage(state) };
+  if (constrained && !acceptableDelivery(text, state)) {
+    // The decider's pick (often the original draft, after an unusable reply)
+    // missed the cap. A writer rewrite that already fits is the text to measure,
+    // not the draft and not the decider JSON.
+    const row = fittingRanked(parsed, state);
+    if (row) {
+      const unjudged = /not judged/.test(String(row.reason || ""));
+      row.faithful = true;
+      row.disqualified = false;
+      if (unjudged) row.reason = "fits the length cap; the decider reply was not usable";
+      parsed.winner = row.writer;
+      parsed.text = row.text;
+      if (unjudged) parsed.why = "The decider's reply was not usable, so the first rewrite that fits the length cap is used.";
+      result.outputs[out.key] = JSON.stringify(parsed);
+      return unjudged
+        ? { note: "note: the decider's reply was not usable, so the first rewrite that fits the length cap is used." }
+        : null;
+    }
+    return { error: failureMessage(state) };
+  }
   return null;
+}
+
+/** A ranked rewrite that already satisfies the hard caps. Unfaithful rows stay out. */
+function fittingRanked(parsed, state) {
+  const rows = parsed && Array.isArray(parsed.ranked) ? parsed.ranked : [];
+  const ok = (row) => row && typeof row.text === "string" && acceptableDelivery(row.text, state);
+  const trusted = rows.find((row) => ok(row) && row.faithful === true && row.disqualified !== true);
+  if (trusted) return trusted;
+  return rows.find((row) => ok(row) && /not judged/.test(String(row.reason || ""))) || null;
 }

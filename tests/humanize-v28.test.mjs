@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback, echoesInstruction, isParagraphOutput, assessWriterOutput } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -179,6 +179,63 @@ test("the guidance-wrapper echo is never picked, and a title paragraph is droppe
   assert.equal(blob.includes("</comment>"), false);
   assert.equal(blob.includes("One thread: ONE main point"), false);
   assert.equal(blob.includes(paragraph.slice(0, 80)), false);
+});
+
+test("a short article title that repeats the guidance facts fits maxChars", async (t) => {
+  // The guidance lists the facts a title has to keep. Overlap with that list
+  // used to be read as an instruction echo, the line was dropped, and the
+  // original (under maxChars, over the old 220 title ceiling) failed as
+  // "no rewrite fit within 300 characters".
+  const guidance = "Rewrite the article title so it is shorter and clearer. Keep the facts: a paper-craft village sunset, noon to midnight, one take, 42 cents. One line only.";
+  const title = "Noon to midnight, one take, 42 cents";
+  const draft = ("How a paper village goes from noon to midnight in one continuous take. ").repeat(4).trim();
+  assert.ok(codePoints(title) < 300);
+  assert.ok(codePoints(draft) > TITLE_OUTPUT_MAX && codePoints(draft) <= 300, codePoints(draft));
+  assert.equal(echoesInstruction(title, guidance, ""), true);
+  assert.equal(echoesInstruction(title, guidance, "", { title: true }), false);
+  assert.equal(isParagraphOutput(draft, [], 300), false);
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return title;
+  }, { Draft: draft, Context: "The article is about that render.", Guidance: guidance, title: true, maxChars: 300 });
+  assert.equal(json.text, title);
+  assert.ok(codePoints(json.text) <= 300);
+  const asJson = JSON.stringify({ title, comment: guidance });
+  const wrapped = `${guidance}\n\n${title}`;
+  for (const raw of [asJson, wrapped]) {
+    const fit = assessWriterOutput(raw, { title: true, maxChars: 300, guidance });
+    assert.equal(fit.ok, true, raw.slice(0, 48));
+    assert.equal(fit.text, title);
+    assert.ok(codePoints(fit.text) <= 300);
+  }
+});
+
+test("a single-line title under maxChars is not refused at 220, and a wrapped title is the line", async (t) => {
+  const line = "A".repeat(250);
+  const draft = "B".repeat(400);
+  assert.ok(line.length > TITLE_OUTPUT_MAX && line.length <= 300);
+  assert.equal(isParagraphOutput(line, [], 300), false);
+  const wrapped = `Here is the title:\n${line}\n\n${"Keep every fact from the guidance. ".repeat(12)}`;
+  assert.ok(codePoints(wrapped) > 300);
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    if (body.model === MODELS[0]) return line;
+    return wrapped;
+  }, { Draft: draft, Context: "an article", Guidance: "Shorter title, one line.", title: true, maxChars: 300 });
+  assert.equal(json.text, line);
+  assert.equal(json.winner, "A");
+});
+
+test("a truncated decider still delivers the short title that fits", async (t) => {
+  const title = "A clearer headline for the piece";
+  const draft = "C".repeat(400);
+  const { json, texts } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return '{"winner":"A","text":"A clearer headline';
+    return title;
+  }, { Draft: draft, Context: "an article", Guidance: "Make the headline sharper and shorter.", title: true, maxChars: 300 });
+  assert.equal(json.text, title);
+  assert.ok(codePoints(json.text) <= 300);
+  assert.equal(texts.some((x) => /no rewrite fit within/.test(x)), false);
 });
 
 test("an old-style call is unchanged: same shape, same text, no new prompt, same price", async (t) => {
