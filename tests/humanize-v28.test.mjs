@@ -6,7 +6,7 @@ import { mkdtemp, copyFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
-import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback } from "../src/humanize.mjs";
+import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback, echoesInstruction, isParagraphOutput, assessWriterOutput } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
 const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
@@ -179,6 +179,287 @@ test("the guidance-wrapper echo is never picked, and a title paragraph is droppe
   assert.equal(blob.includes("</comment>"), false);
   assert.equal(blob.includes("One thread: ONE main point"), false);
   assert.equal(blob.includes(paragraph.slice(0, 80)), false);
+});
+
+test("a short article title that repeats the guidance facts fits maxChars", async (t) => {
+  // The guidance lists the facts a title has to keep. Overlap with that list
+  // used to be read as an instruction echo, the line was dropped, and the
+  // original (under maxChars, over the old 220 title ceiling) failed as
+  // "no rewrite fit within 300 characters".
+  const guidance = "Rewrite the article title so it is shorter and clearer. Keep the facts: a paper-craft village sunset, noon to midnight, one take, 42 cents. One line only.";
+  const title = "Noon to midnight, one take, 42 cents";
+  const draft = ("How a paper village goes from noon to midnight in one continuous take. ").repeat(4).trim();
+  assert.ok(codePoints(title) < 300);
+  assert.ok(codePoints(draft) > TITLE_OUTPUT_MAX && codePoints(draft) <= 300, codePoints(draft));
+  assert.equal(echoesInstruction(title, guidance, ""), true);
+  assert.equal(echoesInstruction(title, guidance, "", { title: true }), false);
+  assert.equal(isParagraphOutput(draft, [], 300), false);
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return title;
+  }, { Draft: draft, Context: "The article is about that render.", Guidance: guidance, title: true, maxChars: 300 });
+  assert.equal(json.text, title);
+  assert.ok(codePoints(json.text) <= 300);
+  const asJson = JSON.stringify({ title, comment: guidance });
+  const wrapped = `${guidance}\n\n${title}`;
+  for (const raw of [asJson, wrapped]) {
+    const fit = assessWriterOutput(raw, { title: true, maxChars: 300, guidance });
+    assert.equal(fit.ok, true, raw.slice(0, 48));
+    assert.equal(fit.text, title);
+    assert.ok(codePoints(fit.text) <= 300);
+  }
+});
+
+test("a title may repeat guidance facts, and a full instruction echo is rejected in every shape", () => {
+  const facts = "Rewrite the article title so it is shorter and clearer. Keep the facts: a paper-craft village sunset, noon to midnight, one take, 42 cents. One line only.";
+  const title = "Noon to midnight, one take, 42 cents";
+  const echo = "Rewrite this title with the same facts, no preface, no commentary, and no extra explanation.";
+  assert.equal(echoesInstruction(title, facts, "", { title: true }), false);
+  assert.equal(echoesInstruction(echo, echo, "", { title: true }), true);
+  // The instruction is only part of this guidance. A long excerpt is not a near-total echo.
+  assert.equal(echoesInstruction(echo, `${facts} ${echo}`, "", { title: true }), false);
+  assert.equal(echoesInstruction(`  ${echo}  `, echo, "", { title: true }), true);
+
+  const opts = { title: true, maxChars: 300, guidance: echo };
+  for (const raw of [echo, JSON.stringify({ title: echo }), JSON.stringify({ text: echo }), `\n${echo}\n`]) {
+    const fit = assessWriterOutput(raw, opts);
+    assert.equal(fit.ok, false, raw.slice(0, 48));
+    assert.equal(fit.text, null);
+    assert.ok(fit.reasons.includes("echo"), fit.reasons.join(","));
+  }
+  const mixed = assessWriterOutput(`${echo}\n${title}`, { title: true, maxChars: 300, guidance: echo });
+  assert.equal(mixed.ok, true);
+  assert.equal(mixed.text, title);
+  const kept = assessWriterOutput(JSON.stringify({ title }), { title: true, maxChars: 300, guidance: facts });
+  assert.equal(kept.ok, true);
+  assert.equal(kept.text, title);
+});
+
+test("a factual title longer than 80 characters is not an instruction echo", () => {
+  const title = "One continuous paper-craft village shot travels from noon to midnight in exactly one take and costs only 42 cents.";
+  const guidance = "Rewrite the article title so it is shorter and clearer. Keep these facts: " + title + " One line only.";
+  assert.ok(codePoints(title) > 80);
+  const fit = assessWriterOutput(title, { title: true, maxChars: 300, guidance, ending: "any", spans: [] });
+  assert.equal(fit.ok, true);
+  assert.equal(fit.text, title);
+});
+
+test("a short guidance echo is rejected when it is quoted or recovered from fenced JSON", () => {
+  const guidance = "Rewrite this title clearly.";
+  const opts = { title: true, maxChars: 300, guidance, ending: "any", spans: [] };
+  const fenced = "```json\n{\"title\":\"Rewrite this title clearly.\"}\n```";
+  const quoted = "\"Rewrite this title clearly.\"";
+  for (const raw of [fenced, quoted]) {
+    const fit = assessWriterOutput(raw, opts);
+    assert.equal(fit.ok, false, raw);
+    assert.equal(fit.text, null);
+    assert.ok(fit.reasons.includes("echo"), fit.reasons.join(","));
+  }
+  const facts = "Rewrite the article title so it is shorter and clearer. Keep the facts: a paper-craft village sunset, noon to midnight, one take, 42 cents. One line only.";
+  const title = "Noon to midnight, one take, 42 cents";
+  const overlap = assessWriterOutput(title, { title: true, maxChars: 300, guidance: facts, ending: "any", spans: [] });
+  assert.equal(overlap.ok, true);
+  assert.equal(overlap.text, title);
+  assert.equal(echoesInstruction(title, facts, "", { title: true }), false);
+  const fencedFact = "```json\n{\"title\":\"Noon to midnight, one take, 42 cents\"}\n```";
+  const kept = assessWriterOutput(fencedFact, { title: true, maxChars: 300, guidance: facts, ending: "any", spans: [] });
+  assert.equal(kept.ok, true);
+  assert.equal(kept.text, title);
+});
+
+test("a single-line title under maxChars is not refused at 220, and a wrapped title is the line", async (t) => {
+  const line = "A".repeat(250);
+  const draft = "B".repeat(400);
+  assert.ok(line.length > TITLE_OUTPUT_MAX && line.length <= 300);
+  assert.equal(isParagraphOutput(line, [], 300), false);
+  const wrapped = `Here is the title:\n${line}\n\n${"Keep every fact from the guidance. ".repeat(12)}`;
+  assert.ok(codePoints(wrapped) > 300);
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    if (body.model === MODELS[0]) return line;
+    return wrapped;
+  }, { Draft: draft, Context: "an article", Guidance: "Shorter title, one line.", title: true, maxChars: 300 });
+  assert.equal(json.text, line);
+  assert.equal(json.winner, "A");
+});
+
+function reviewVerdict(letter, { faithful = true, safe = true, disqualified = false, reason = "faithful" } = {}) {
+  return JSON.stringify({
+    winner: letter, text: "reviewed", why: reason, safe,
+    ranked: [{ writer: letter, faithful, disqualified, safe, reason }],
+  });
+}
+
+function judgeLetter(user) {
+  const blocks = user.match(/\n\[([A-E])\] /g) || [];
+  if (blocks.length !== 1) return null;
+  return blocks[0].match(/\[([A-E])\]/)[1];
+}
+
+test("an unusable decider delivers a fitting rewrite only after a faithful and safe review", async (t) => {
+  const title = "A clearer headline for the piece";
+  const draft = "C".repeat(400);
+  const { json, texts, seen } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) {
+      const letter = judgeLetter(ctx.user);
+      if (letter) return reviewVerdict(letter, { faithful: true, safe: true });
+      return '{"winner":"A","text":"A clearer headline';
+    }
+    return title;
+  }, { Draft: draft, Context: "an article", Guidance: "Make the headline sharper and shorter.", title: true, maxChars: 300 });
+  assert.equal(json.text, title);
+  assert.equal(json.winner, "A");
+  assert.ok(codePoints(json.text) <= 300);
+  const row = json.ranked.find((r) => r.writer === "A");
+  assert.equal(row.faithful, true);
+  assert.equal(row.disqualified, false);
+  assert.equal(row.reason, "decider confirmed faithful and safe");
+  assert.equal(json.ranked.filter((r) => r.writer !== "A").every((r) => r.faithful === false && /not judged/.test(r.reason)), true);
+  assert.match(json.why, /confirmed faithful and safe/);
+  assert.equal(/fits the length cap/.test(json.why + row.reason), false);
+  const judges = seen.filter((s) => s.model === "z-ai/glm-5.3");
+  assert.equal(judges.length, 2, "the fitting rewrite is sent back to the decider");
+  assert.ok(judges[1].user.includes(title));
+  assert.ok(texts.includes("cost: $0.0007"), texts.find((x) => /^cost/.test(x)));
+  assert.equal(texts.some((x) => /no rewrite fit within/.test(x)), false);
+});
+
+test("an unusable decider does not deliver an unjudged rewrite when the review rejects, is empty, or marks it unsafe", async (t) => {
+  const title = "A clearer headline for the piece";
+  const draft = "C".repeat(400);
+  const args = { Draft: draft, Context: "an article", Guidance: "Make the headline sharper and shorter.", title: true, maxChars: 300 };
+  const run = (review) => {
+    const judgeUsers = [];
+    return assert.rejects(
+      runHumanize(t, (body, ctx) => {
+        if (ctx.judge) {
+          judgeUsers.push(ctx.user);
+          const letter = judgeLetter(ctx.user);
+          if (letter) return review(letter, ctx.user);
+          return '{"winner":"A","text":"truncated';
+        }
+        return title;
+      }, args),
+      (e) => {
+        assert.match(e.message, /not confirmed faithful and safe/);
+        assert.match(e.message, /API key/);
+        assert.doesNotMatch(e.message, /Nothing was charged/);
+        assert.equal(e.message.includes(title), false);
+        return true;
+      },
+    ).then(() => judgeUsers);
+  };
+  const rejected = await run((letter) => reviewVerdict(letter, { faithful: false, safe: true, disqualified: true, reason: "adds a claim" }));
+  assert.equal(rejected.filter((u) => judgeLetter(u)).length, 1);
+  const unsafe = await run((letter) => reviewVerdict(letter, { faithful: true, safe: false, reason: "unsafe" }));
+  assert.equal(unsafe.filter((u) => judgeLetter(u)).length, 1);
+  const unavailable = await run(() => "");
+  assert.equal(unavailable.filter((u) => judgeLetter(u)).length, 1);
+});
+
+test("a constrained call does not deliver an invented or altered fact that only fits the cap", async (t) => {
+  const draft = "The paper village render cost 42 cents. ".repeat(8).trim();
+  assert.ok(codePoints(draft) > 80);
+  const cases = [
+    ["You stole $100000 from your employer.", "adds an accusation"],
+    ["The paper village render cost 42 dollars.", "changes 42 cents"],
+  ];
+  for (const [line, reason] of cases) {
+    assert.ok(codePoints(line) <= 80, line);
+    const seen = [];
+    await assert.rejects(
+      runHumanize(t, (body, ctx) => {
+        if (ctx.judge) {
+          seen.push(ctx.user);
+          const letter = judgeLetter(ctx.user);
+          if (letter) return reviewVerdict(letter, { faithful: false, safe: false, disqualified: true, reason });
+          return "not json";
+        }
+        return line;
+      }, { Draft: draft, Context: "a render note", Guidance: "Keep the 42 cents.", maxChars: 80 }),
+      (e) => {
+        assert.match(e.message, /not confirmed faithful and safe/);
+        assert.equal(e.message.includes(line), false);
+        assert.doesNotMatch(e.message, /Nothing was charged/);
+        return true;
+      },
+    );
+    assert.ok(seen.some((u) => u.includes(line)), "the decider was shown the unjudged line");
+  }
+});
+
+test("an unjudged fitting row is not marked faithful when the review throws or is missing", async () => {
+  const title = "A clearer headline";
+  const invented = "You stole $100000 from your employer.";
+  const altered = "The paper village render cost 42 dollars.";
+  const draft = "D".repeat(400);
+  const record = Object.fromEntries(["A", "B", "C", "D", "E"].map((l) => [l, { model: l.toLowerCase() }]));
+  const wf = { outputs: [{ nodeId: "judge", key: "out" }] };
+  const ranked = (text) => ["A", "B", "C", "D", "E"].map((writer) => ({
+    writer, model: writer.toLowerCase(), text: writer === "A" ? text : "",
+    faithful: false, disqualified: true, reason: writer === "A" ? "not judged: decider reply unusable" : "missing",
+  }));
+  const deliver = (text, state) => ({
+    outputs: { out: JSON.stringify({ winner: "ORIGINAL", text: draft, why: "unusable", ranked: ranked(text) }) },
+    state,
+  });
+  const base = { maxChars: 300, title: true, draft, guidance: "Make the headline sharper.", spans: [], ending: "any", answered: { A: "a" }, dropped: {}, billing: "key", attempts: [{ paid: true, usd: 0.0001, status: 200 }], reviewUsd: 0 };
+
+  const missing = deliver(invented, { ...base, attempts: [...base.attempts] });
+  const missed = await applyHumanizeFallback(wf, missing, record, missing.state);
+  assert.match(missed.error, /not confirmed faithful and safe/);
+  assert.match(missed.error, /API key/);
+  const missedJson = JSON.parse(missing.outputs.out);
+  assert.equal(missedJson.winner, "ORIGINAL");
+  assert.equal(missedJson.ranked[0].faithful, false);
+  assert.equal(missedJson.ranked[0].reason, "not judged: decider reply unusable");
+  assert.equal(missedJson.text.includes(invented), false);
+
+  let threw = 0;
+  const thrownState = { ...base, attempts: [...base.attempts], reviewUsd: 0.0002, reviewRepair: async () => { threw++; throw new Error("decider down"); } };
+  const thrown = deliver(altered, thrownState);
+  const threwFb = await applyHumanizeFallback(wf, thrown, record, thrownState);
+  assert.equal(threw, 1);
+  assert.match(threwFb.error, /could not check the rewrite/);
+  assert.equal(thrownState.reviewUsd, 0.0002);
+  const thrownJson = JSON.parse(thrown.outputs.out);
+  assert.equal(thrownJson.ranked[0].faithful, false);
+  assert.equal(thrownJson.ranked[0].text, altered);
+  assert.equal(thrownJson.winner, "ORIGINAL");
+  assert.equal(thrownJson.text.includes(altered), false);
+
+  const rejectedState = {
+    ...base,
+    attempts: [...base.attempts],
+    reviewRepair: async (candidate) => {
+      rejectedState.reviewUsd += 0.0003;
+      rejectedState.attempts.push({ kind: "review", paid: true, usd: 0.0003, status: 200 });
+      assert.equal(candidate, invented);
+      return { ok: false };
+    },
+  };
+  const rejected = deliver(invented, rejectedState);
+  const rejectedFb = await applyHumanizeFallback(wf, rejected, record, rejectedState);
+  assert.match(rejectedFb.error, /not confirmed faithful and safe/);
+  assert.equal(rejectedState.reviewUsd, 0.0003);
+  assert.equal(rejectedState.attempts.filter((a) => a.kind === "review").length, 1);
+  assert.equal(JSON.parse(rejected.outputs.out).ranked[0].faithful, false);
+
+  let reviewed = 0;
+  const trustedText = "Short and already judged.";
+  const trustedRanked = ranked(trustedText);
+  trustedRanked[0] = { ...trustedRanked[0], text: trustedText, faithful: true, disqualified: false, reason: "ok" };
+  const trusted = { outputs: { out: JSON.stringify({ winner: "ORIGINAL", text: draft, why: "too long", ranked: trustedRanked }) } };
+  const trustedFb = await applyHumanizeFallback(wf, trusted, record, {
+    ...base,
+    reviewRepair: async () => { reviewed++; return { ok: true }; },
+  });
+  assert.equal(trustedFb, null);
+  assert.equal(reviewed, 0);
+  const trustedJson = JSON.parse(trusted.outputs.out);
+  assert.equal(trustedJson.winner, "A");
+  assert.equal(trustedJson.text, trustedText);
+  assert.equal(trustedJson.ranked[0].reason, "ok");
 });
 
 test("an old-style call is unchanged: same shape, same text, no new prompt, same price", async (t) => {
