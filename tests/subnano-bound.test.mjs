@@ -17,7 +17,7 @@ import {
   outputTokenCap, outputByteCap, judgeTokenCap, openBudget, settledCharge, meteredWithinQuote,
   humanizeTextBytes, refineProviderUsd, subnanoChargeUsd, sfwChargeUsd,
 } from "../src/subnano.mjs";
-import { HUMANIZE_INPUT_CAPS } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_JUDGE_JSON_TOKENS, HUMANIZE_JUDGE_REASONING_TOKENS } from "../src/humanize.mjs";
 
 const GRAPH_URL = new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url);
 
@@ -51,9 +51,11 @@ test("input tokens are bytes/3.5 plus a margin, under one token per byte", () =>
   assert.equal(textBytes("🙂"), 4);
   assert.equal(outputTokenCap(240), Math.ceil(240 * OUTPUT_FACTOR / BYTES_PER_TOKEN) + OUTPUT_SLACK);
   assert.equal(outputByteCap(outputTokenCap(240)), Math.ceil(outputTokenCap(240) * BYTES_PER_TOKEN));
-  assert.equal(judgeTokenCap(50), 320);
-  assert.equal(judgeTokenCap(400), 400);
-  assert.equal(judgeTokenCap(2000), 1600);
+  const judgeFor = (writer) => writer + HUMANIZE_JUDGE_JSON_TOKENS + HUMANIZE_JUDGE_REASONING_TOKENS;
+  assert.equal(judgeTokenCap(50), judgeFor(50));
+  assert.equal(judgeTokenCap(400), judgeFor(400));
+  assert.equal(judgeTokenCap(2000), judgeFor(2000));
+  assert.ok(judgeTokenCap(2000) > 1600, "the graph's 1600 is not the request cap");
 
   const outTokens = outputTokenCap(240);
   const none = refineProviderUsd({ draftBytes: 0, contextBytes: 0, guidanceBytes: 0, outTokens });

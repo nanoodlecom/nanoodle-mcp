@@ -206,15 +206,15 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // x402.usd is the cold ceiling (longest request, after the margin). A call quotes
     // less when its own draft, context, guidance, and maxChars cost less.
-    assert.equal(mounted.x402.usd.toFixed(8), "0.04719701");
+    assert.equal(mounted.x402.usd.toFixed(8), "0.04871089");
     // Tokens are bytes / 3.5. Writer output is the draft length plus a small slack,
     // and the decider adds room for its ranking JSON. When Cydonia fails and the
     // Starry fallback runs, both calls are charged. This figure reserves the larger
     // of those two rates. The quote prices HUMANIZE_PRICED_REASKS
     // extra writer calls; the run may still attempt MAX_REASKS and stops when the
     // next one would pass the deposit. At the counted Guidance cap, with no keep
-    // and no repair, that charge is $0.00842604 after the 20% markup.
-    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.04719701.
+    // and no repair, that charge is $0.00910188 after the 20% markup.
+    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.04871089.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
     // Starry Ocean $0.05/$0.25, others $0.10 in and $0.35-$0.60 out.
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
@@ -254,16 +254,16 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const judgeUsd = estimateTokensFromBytes(judgeBytes) * 0.6 + judgeOut * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
     assert.equal(HUMANIZE_BYTES_PER_TOKEN, 3.5);
-    assert.equal(est(base + reask + judgeUsd), "0.00842604", "guidance at its cap, one priced retry, after the markup");
+    assert.equal(est(base + reask + judgeUsd), "0.00910188", "guidance at its cap, one priced retry, after the markup");
     const shaped = { Draft: draft, Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) };
-    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.00842604");
+    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.00910188");
     const budget = placeholderBudget();
     assert.ok(budget.count > 8, "repeats, not the 8-entry keep list, set the placeholder cap");
     assert.equal(budget.writerDraftChars <= Draft, true);
     const ceilingCharge = humanizeChargeUsd(graph, null, { ceiling: true });
     const ceiling = humanizeCeilingDepositUsd(graph);
-    assert.equal(ceilingCharge.toFixed(8), "0.04214018", "the capped worst case, before the margin");
-    assert.equal(ceiling.toFixed(8), "0.04719701");
+    assert.equal(ceilingCharge.toFixed(8), "0.04349186", "the capped worst case, before the margin");
+    assert.equal(ceiling.toFixed(8), "0.04871089");
     assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);
     assert.ok(ceiling >= ceilingCharge, "the ceiling covers the worst-case charge");
     assert.ok(ceiling <= ceilingCharge * 1.15 + 1e-9, "the margin stays inside 15%");
@@ -358,7 +358,7 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
   }
 });
 
-async function runHumanizeWith(t, judgeContent) {
+async function callHumanizeWith(t, judgeContent) {
   const { createServer } = await import("node:http");
   const srv = createServer((req, res) => {
     let raw = "";
@@ -376,25 +376,45 @@ async function runHumanizeWith(t, judgeContent) {
   t.after(() => rm(dir, { recursive: true, force: true }));
   await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
   const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
-  const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+  return registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+}
+async function runHumanizeWith(t, judgeContent) {
+  const result = await callHumanizeWith(t, judgeContent);
   assert.notEqual(result.isError, true);
   const block = result.content.find((c) => /^\{"winner"/.test(c.text || ""));
   return { json: JSON.parse(block.text), texts: result.content.map((c) => c.text || "") };
 }
 const HC_MODELS = { A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "TheDrummer/Cydonia-24B-v4.3", D: "qwen/qwen3.8-27b-antislop", E: "inception/mercury-3" };
 
-test("humanize-comment: an unusable decider reply is never passed through; ORIGINAL wins with real writer texts", async (t) => {
+test("humanize-comment: an unusable decider reply is an error, not the draft returned as success", async (t) => {
   for (const bad of ['{"winner":"A","text":"oops", "ranked":[{"writer":"A"', '{"winner":"A","text":"made up","why":"x"}', "[]", "Sure! Here is my ranking: A"]) {
-    const { json, texts } = await runHumanizeWith(t, bad);
-    assert.deepEqual(Object.keys(json), ["winner", "text", "why", "ranked"]);
-    assert.equal(json.winner, "ORIGINAL");
-    assert.equal(json.text, "Thanks for sharing this.");
-    assert.deepEqual(json.ranked.map((r) => [r.writer, r.model, r.text, r.faithful, r.disqualified]),
-      Object.entries(HC_MODELS).map(([w, m]) => [w, m, "rewrite by " + m, false, true]));
-    assert.ok(json.ranked.every((r) => r.reason === "not judged: decider reply unusable"));
-    assert.ok(texts.some((x) => /^note: the decider's reply was not valid JSON with a ranked list/.test(x)), "a clear note leads the result");
-    assert.ok(!texts.some((x) => x.includes("made up") || x.includes("Sure!")), "nothing of the bad reply is passed through");
+    await assert.rejects(
+      () => callHumanizeWith(t, bad),
+      (e) => {
+        assert.match(e.message, /could not return a rewrite/);
+        assert.match(e.message, /not valid JSON with a ranked list/);
+        assert.doesNotMatch(e.message, /Nothing was charged/);
+        assert.equal(e.message.includes("made up"), false);
+        assert.equal(e.message.includes("Sure!"), false);
+        assert.equal(e.message.includes("Thanks for sharing this."), false);
+        return true;
+      },
+    );
   }
+});
+
+test("humanize-comment: a fenced decider reply with trailing text still ranks the real rewrites", async (t) => {
+  const ranked = ["A", "B", "C", "D", "E"].map((writer) => ({
+    writer, faithful: writer === "A", disqualified: writer !== "A", reason: writer === "A" ? "ok" : "no",
+  }));
+  const body = "Here is the ranking:\n```json\n" + JSON.stringify({
+    winner: "A", text: "made up", why: "specific", ranked,
+  }) + "\n```\nThanks for asking.";
+  const { json, texts } = await runHumanizeWith(t, body);
+  assert.equal(json.winner, "A");
+  assert.equal(json.text, "rewrite by " + HC_MODELS.A);
+  assert.equal(json.why, "specific");
+  assert.equal(texts.some((x) => x.includes("made up") || x.includes("Thanks for asking")), false);
 });
 
 test("humanize-comment: an entry with faithful:false never wins, even if the decider picks it", async (t) => {

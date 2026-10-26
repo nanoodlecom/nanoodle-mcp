@@ -18,9 +18,10 @@ import {
   REFINE_MODEL, REFINE_SYSTEM, REFINE_TEMPERATURE, REFINE_MAX_TOKENS,
   D1_MODEL, SFW_MODEL, SFW_INSTRUCTIONS, GATE_INSTRUCTIONS, FUNNY_INSTRUCTIONS, FUNNY_LEVELS,
   GUIDANCE_DEFAULT, depositFromCharge, subnanoChargeUsd, sfwChargeUsd,
-  exactUsd, outputTokenCap, settledCharge,
+  exactUsd, judgeTokenCap, outputTokenCap, settledCharge,
 } from "../src/subnano.mjs";
-import { HUMANIZE_INPUT_CAPS } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_JUDGE_JSON_TOKENS, HUMANIZE_JUDGE_REASONING_TOKENS, estimateTokensFromBytes, tokenUpperBound } from "../src/humanize.mjs";
+import { HUMANIZE_MODEL_PRICES } from "../src/humanize-deposit.mjs";
 
 const GRAPH_URL = new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url);
 const TINY = JSON.stringify({
@@ -74,13 +75,13 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
     });
     // A 240-byte draft. The four-byte ceiling uses humanize v2.8's Guidance cap
     // (600 characters). It is a real max-size request, above Maxi's ~$0.016 cap.
-    assert.equal(typicalCharge.toFixed(8), "0.00446707");
-    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.00500313");
-    assert.equal(full.toFixed(8), "0.02072490");
-    assert.equal(deposit.toFixed(8), "0.02321189");
+    assert.equal(typicalCharge.toFixed(8), "0.00522607");
+    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.00585321");
+    assert.equal(full.toFixed(8), "0.02173866");
+    assert.equal(deposit.toFixed(8), "0.02434730");
     assert.equal(registry.quoteDeposit("subnano_comment", {
       Draft: "a".repeat(240), Context: "b".repeat(480),
-    }).toFixed(8), "0.00500313");
+    }).toFixed(8), "0.00585321");
     assert.ok(depositFromCharge(typicalCharge) <= 0.013, "a typical comment deposits about $0.013 or less");
     assert.ok(typicalCharge < full);
     assert.ok(depositFromCharge(typicalCharge) < deposit);
@@ -286,8 +287,9 @@ test("subnano_comment runs refine, then humanize, then the gate, then the funny 
     const writer = seen.find((r) => r.model === "qwen/qwen3.8-27b-novelist");
     assert.equal(writer.body.max_tokens, draftCap);
     const judge = seen.find((r) => r.model === "z-ai/glm-5.3");
-    assert.ok(judge.body.max_tokens < 1600);
-    assert.ok(judge.body.max_tokens >= 320);
+    assert.equal(judge.body.max_tokens, judgeTokenCap(draftCap));
+    assert.equal(judge.body.max_tokens, draftCap + HUMANIZE_JUDGE_JSON_TOKENS + HUMANIZE_JUDGE_REASONING_TOKENS);
+    assert.ok(judge.body.max_tokens > 320);
     assert.equal(seen[0].body.messages[0].content, REFINE_SYSTEM);
     assert.match(seen[0].body.messages[1].content, /Please welcome the launch\./);
     const firstDecision = seen.findIndex((r) => r.path.startsWith("/api/v1/decisions"));
@@ -306,6 +308,150 @@ test("subnano_comment runs refine, then humanize, then the gate, then the funny 
     // humanize saw the refine output, not the original draft
     assert.match(JSON.stringify(writer.body.messages), /The launch post is worth a close look\./);
     assert.doesNotMatch(JSON.stringify(writer.body.messages), /Please welcome the launch\./);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function chatEstimateUsd(body) {
+  const rate = HUMANIZE_MODEL_PRICES[body.model];
+  if (!rate) return 0.00001;
+  let n = 0;
+  for (const m of body.messages || []) if (m && typeof m.content === "string") n += tokenUpperBound(m.content);
+  const outT = Math.max(1, Math.floor(Number(body.max_tokens) || 1));
+  return (estimateTokensFromBytes(n) * rate[0] + outT * rate[1]) / 1e6;
+}
+
+test("hosted subnano_comment bills an exact quote and still runs the decider, gate, and funny score", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "subnano-exact-"));
+  await copyFile(GRAPH_URL, join(dir, "humanize-comment.noodle-graph.json"));
+  const draft = "x".repeat(800);
+  const context = "We shipped the editor today.";
+  const refined = "Nice launch.";
+  const rewrite = "Glad the editor shipped.";
+  const seen = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      seen.push({ path: req.url, model: body.model, body });
+      if (req.url.startsWith("/api/v1/decisions")) {
+        const q = body.questions && body.questions.answer;
+        const usage = { cost: 0.000004 };
+        const answer = q && q.type === "score"
+          ? { type: "score", score: 2, probabilities: { "2": 1 } }
+          : { type: "noul", noul: 0.9 };
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ answers: { answer }, usage }));
+      }
+      let content = rewrite;
+      let finish = "stop";
+      if (body.model === REFINE_MODEL) content = refined;
+      if (body.model === "z-ai/glm-5.3") {
+        const ranked = ["A", "B", "C", "D", "E"].map((writer) => ({
+          writer, faithful: true, disqualified: false, reason: "ok",
+        }));
+        content = "Ranking:\n```json\n" + JSON.stringify({
+          winner: "A", text: "decider copy, discarded", why: "specific", ranked,
+        }) + "\n```\ntrailing prose";
+      }
+      const cost = chatEstimateUsd(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content }, finish_reason: finish }],
+        cost,
+        x_nanogpt_pricing: { costUsd: cost },
+      }));
+    });
+  });
+  const port = await listen(server);
+  const registry = await loadTools({
+    dirs: [dir], apiKey: "test-key", hosted: true, baseUrl: `http://127.0.0.1:${port}`, outDir: join(dir, "out"), log: () => {},
+  });
+  try {
+    const args = { Draft: draft, Context: context };
+    const quote = registry.quoteDeposit("subnano_comment", args);
+    const graph = registry.tools.find((t) => t.name === "humanize-comment").wf.graph;
+    const lens = { graph, draftChars: draft.length, draftBytes: draft.length, contextBytes: context.length, guidanceBytes: GUIDANCE_DEFAULT.length };
+    assert.equal(quote, depositFromCharge(subnanoChargeUsd(lens)));
+    const result = await registry.callTool({ name: "subnano_comment", arguments: args });
+    assert.notEqual(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.partial, undefined);
+    assert.equal(payload.comment, rewrite);
+    assert.notEqual(payload.comment, refined);
+    assert.deepEqual(payload.gate, { verdict: "yes", yes: 0.9 });
+    assert.equal(payload.funny.score, 2);
+    assert.equal(payload.notes, undefined);
+    const texts = result.content.map((c) => c.text || "").join("\n");
+    assert.doesNotMatch(texts, /skipped because it would have cost more/);
+    assert.doesNotMatch(texts, /not valid JSON with a ranked list/);
+    const writers = seen.filter((r) => r.path.startsWith("/api/v1/chat") && r.model !== REFINE_MODEL && r.model !== "z-ai/glm-5.3");
+    assert.equal(writers.length, 5);
+    const cap = outputTokenCap(draft.length);
+    assert.ok(writers.every((r) => r.body.max_tokens === cap));
+    const judge = seen.find((r) => r.model === "z-ai/glm-5.3");
+    assert.ok(judge, "the decider was called");
+    assert.equal(judge.body.max_tokens, judgeTokenCap(cap));
+    const decisions = seen.filter((r) => r.path.startsWith("/api/v1/decisions"));
+    assert.equal(decisions.length, 2);
+    const humanizeUsd = seen.filter((r) => r.model !== REFINE_MODEL && !String(r.path).startsWith("/api/v1/decisions"))
+      .reduce((a, r) => a + chatEstimateUsd(r.body), 0);
+    assert.ok(humanizeUsd * SETTLE_MARKUP <= quote, `humanize spend ${humanizeUsd} does not fit the quote ${quote}`);
+    assert.ok(result.costUsd * SETTLE_MARKUP <= quote + 1e-9);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a truncated decider is an error, not the refined draft returned as the comment", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "subnano-trunc-"));
+  await copyFile(GRAPH_URL, join(dir, "humanize-comment.noodle-graph.json"));
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      if (req.url.startsWith("/api/v1/decisions")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ answers: { answer: { type: "noul", noul: 0.9 } }, usage: { cost: 0.000001 } }));
+      }
+      let content = "A finished rewrite.";
+      let finish = "stop";
+      if (body.model === REFINE_MODEL) content = "Nice launch.";
+      if (body.model === "z-ai/glm-5.3") {
+        content = "{\"winner\":\"A\",\"text\":\"Nice launch.\",\"ranked\":[";
+        finish = "length";
+      }
+      const cost = chatEstimateUsd(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content }, finish_reason: finish }],
+        cost,
+        x_nanogpt_pricing: { costUsd: cost },
+      }));
+    });
+  });
+  const port = await listen(server);
+  const registry = await loadTools({
+    dirs: [dir], apiKey: "test-key", hosted: true, baseUrl: `http://127.0.0.1:${port}`, outDir: join(dir, "out"), log: () => {},
+  });
+  try {
+    await assert.rejects(
+      registry.callTool({
+        name: "subnano_comment",
+        arguments: { Draft: "x".repeat(800), Context: "We shipped the editor today." },
+      }),
+      (e) => {
+        assert.match(e.message, /humanize failed/);
+        assert.match(e.message, /cut off before it finished a ranked list/);
+        assert.doesNotMatch(e.message, /Nice launch\./);
+        return true;
+      },
+    );
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });

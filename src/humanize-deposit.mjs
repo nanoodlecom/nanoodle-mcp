@@ -14,7 +14,12 @@
  * span can be repaired. When Cydonia fails and the Starry Ocean fallback runs,
  * both calls are charged. Output tokens are sized from the request (maxChars,
  * or the draft length) plus a small slack, not from the model's output cap.
- * Token counts are a realistic estimate, bytes / 3.5. The deposit is that
+ * The decider's cap adds the ranking JSON and GLM reasoning tokens, which
+ * share max_tokens. A caller that already chose writer and judge caps
+ * (subnano_comment sizes them from the original draft) is priced at those
+ * caps, so a shorter refined draft cannot shrink the hold below the request
+ * that will actually be sent. Token counts are a realistic estimate, bytes /
+ * 3.5. The deposit is that
  * charge times HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up, and
  * never below the charge. Prices are USD per million tokens: the public
  * catalog when it has a rate, otherwise the table below (NanoGPT, 20 Oct 2026).
@@ -22,7 +27,7 @@
 import {
   HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, HUMANIZE_PRICED_REASKS, HUMANIZE_SETTLE_MARKUP,
   MAX_CHARS_LIMIT, ONE_THREAD_PREFIX, REASK_TEXT, candidateByteCap, collectSpans,
-  estimateTokensFromBytes, guardRetryPrompt, requestOutputTokenCap, tokenUpperBound, writerForwardByteCap, writerNote,
+  estimateTokensFromBytes, guardRetryPrompt, judgeOutputTokenCap, requestOutputTokenCap, tokenUpperBound, writerForwardByteCap, writerNote,
 } from "./humanize.mjs";
 import { knownUsd } from "./usd.mjs";
 
@@ -146,8 +151,7 @@ function stageCalls(graph, spec, prices) {
   const judgeRate = rate(prices, judge.fields.model);
   if (!judgeRate) return null;
   const sep = bytes(jin.fields.sep);
-  const writerOut = requestOutputTokenCap(spec.maxChars, spec.draftText || "");
-  const judgeOut = requestOutputTokenCap(spec.maxChars, spec.draftText || "", { judge: true });
+  const { writerOut, judgeOut } = outputCaps(spec);
   const calls = [];
   const retries = [];
   for (const id of ["w-a", "w-b", "w-c", "w-d", "w-e"]) {
@@ -201,6 +205,33 @@ function stageCalls(graph, spec, prices) {
 
 function callUsd(call) {
   return call.inTokens * call.rate[0] + call.outTokens * call.rate[1];
+}
+
+/**
+ * Writer and decider max_tokens for this quote. Explicit caps win: they are
+ * the request that will be sent. A writer cap with no judge cap still reserves
+ * the ranking JSON and the reasoning headroom on top of that writer cap.
+ */
+function outputCaps(spec) {
+  const writerGiven = Math.floor(Number(spec.writerOutTokens) || 0);
+  const judgeGiven = Math.floor(Number(spec.judgeOutTokens) || 0);
+  const writerOut = writerGiven > 0
+    ? writerGiven
+    : requestOutputTokenCap(spec.maxChars, spec.draftText || "");
+  const judgeOut = judgeGiven > 0
+    ? judgeGiven
+    : writerGiven > 0
+      ? judgeOutputTokenCap(writerOut)
+      : requestOutputTokenCap(spec.maxChars, spec.draftText || "", { judge: true });
+  return { writerOut, judgeOut };
+}
+
+function withOutputCaps(spec, opts) {
+  const writer = Math.floor(Number(opts && opts.writerOutTokens) || 0);
+  const judge = Math.floor(Number(opts && opts.judgeOutTokens) || 0);
+  if (writer > 0) spec.writerOutTokens = writer;
+  if (judge > 0) spec.judgeOutTokens = judge;
+  return spec;
 }
 
 /**
@@ -305,9 +336,9 @@ function specFromArgs(graph, args) {
  * Maximum USD the gate can retain for this request (metered worst case + 20%).
  * Null when a model has no price — the caller then keeps the pinned ceiling.
  */
-export function humanizeChargeUsd(graph, args, { prices = HUMANIZE_MODEL_PRICES, ceiling = false } = {}) {
+export function humanizeChargeUsd(graph, args, { prices = HUMANIZE_MODEL_PRICES, ceiling = false, writerOutTokens = 0, judgeOutTokens = 0 } = {}) {
   if (!ceiling) {
-    const provider = providerUsd(graph, specFromArgs(graph, args), prices);
+    const provider = providerUsd(graph, withOutputCaps(specFromArgs(graph, args), { writerOutTokens, judgeOutTokens }), prices);
     if (provider == null) return null;
     return provider * HUMANIZE_SETTLE_MARKUP;
   }
@@ -324,7 +355,7 @@ export function humanizeChargeUsd(graph, args, { prices = HUMANIZE_MODEL_PRICES,
 /** Per-call token caps for a request. Tests recompute the charge from these. */
 export function humanizeStageBudget(graph, args, opts = {}) {
   const prices = opts.prices || HUMANIZE_MODEL_PRICES;
-  const spec = opts.ceiling ? humanizeCeilingSpec(graph, prices) : specFromArgs(graph, args);
+  const spec = opts.ceiling ? humanizeCeilingSpec(graph, prices) : withOutputCaps(specFromArgs(graph, args), opts);
   const built = stageCalls(graph, spec, prices);
   if (!built) return null;
   return {

@@ -12,7 +12,9 @@
  * The deposit is a cap, not a padded worst case. Each stage's max_tokens is
  * about 1.5× the draft's length plus a little slack, input tokens are about
  * bytes/3.5 plus a small margin, and re-asks use that same output cap. The
- * text the gate and the funny judge read is the comment clipped to that cap.
+ * decider adds the ranking JSON and GLM reasoning on top of that writer cap,
+ * and the humanize deposit inside the call is quoted at those same caps.
+ * The text the gate and the funny judge read is the comment clipped to that cap.
  * Settlement is min(metered cost × 1.2, the quoted deposit). Before each paid
  * stage the run stops when the remaining budget cannot cover that stage, and
  * returns what already finished, charged only for the calls that ran. The same
@@ -29,6 +31,7 @@ import { bytesToDataUrl, sniffMime, NanoClient } from "nanoodle";
 import { ParamsError, formatCostUsd } from "./tools.mjs";
 import {
   HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, REASK_TEXT, MAX_REASKS,
+  HUMANIZE_JUDGE_JSON_TOKENS, HUMANIZE_JUDGE_REASONING_TOKENS,
   checkHumanizeInputs, humanizeWriterRecord, capUtf8,
 } from "./humanize.mjs";
 
@@ -49,7 +52,10 @@ export const MESSAGE_TOKENS = 4;
 export const OUTPUT_FACTOR = 1.5;
 /** Extra completion tokens so a short draft can still become a sentence. */
 export const OUTPUT_SLACK = 24;
-/** The decider's JSON needs a floor even when the comment itself is short. */
+/**
+ * Lowest decider cap. The request cap is the writer cap plus the ranking JSON
+ * and GLM reasoning, which is above this floor for every real draft.
+ */
 export const JUDGE_OUTPUT_FLOOR = 320;
 /**
  * Tokens reserved for one fitted still. Settlement is capped at the quote, so
@@ -214,9 +220,12 @@ export function outputByteCap(tokens) {
   return Math.max(1, Math.ceil(n * BYTES_PER_TOKEN));
 }
 
-export function judgeTokenCap(outTokens, graphMax = 1600) {
-  const g = Number(graphMax) > 0 ? Math.floor(Number(graphMax)) : 1600;
-  return Math.min(g, Math.max(JUDGE_OUTPUT_FLOOR, Math.floor(Number(outTokens) || 0)));
+export function judgeTokenCap(outTokens) {
+  // The graph's 1600 is the model's own ceiling, not this request. GLM-5.3
+  // thinking shares max_tokens with the ranking JSON, so the decider is
+  // priced and sent at the writer cap plus JSON slack plus reasoning headroom.
+  const writer = Math.max(1, Math.floor(Number(outTokens) || 0));
+  return Math.max(JUDGE_OUTPUT_FLOOR, writer + HUMANIZE_JUDGE_JSON_TOKENS + HUMANIZE_JUDGE_REASONING_TOKENS);
 }
 
 /** Provider USD for one chat call. Output is the max_tokens this request sends. */
