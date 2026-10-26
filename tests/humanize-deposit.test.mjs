@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, copyFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 import { createChargeGate } from "../src/gate.mjs";
 import { loadTools } from "../src/tools.mjs";
 import { humanizeFetch, failureMessage, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
@@ -16,6 +17,7 @@ import {
 import { budgetCap, knownUsd } from "../src/usd.mjs";
 
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
+const PAYER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
 const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
 
 const TYPICAL = { Draft: "a".repeat(1500), Context: "We cut CI from 14 to 6 minutes." };
@@ -407,6 +409,76 @@ test("copy says both fallback calls are charged, and the refund and cap are host
   const wallet = failureMessage({ billing: "wallet", attempts: [{ paid: true, usd: 0.01 }] });
   assert.match(wallet, /not refunded/);
   assert.match(wallet, /Direct-wallet spending has no cap/);
+});
+
+test("a hosted unusable decider with one guard-dropped writer errors and refunds the deposit", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-refund-"));
+  const guidance = "Keep it to one friendly sentence and do not add facts.";
+  const draft = "Thanks for the note.";
+  const transfers = [];
+  const events = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      const content = body.model === "z-ai/glm-5.3" ? "not a ranking" : body.model && body.model.includes("novelist") ? guidance : "Glad you wrote this up.";
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const receivable = {};
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const registry = await loadTools({
+      dirs: [dir], apiKey: "test-key", hosted: true,
+      baseUrl: "http://127.0.0.1:" + server.address().port,
+      outDir: join(dir, "out"), log: () => {},
+    });
+    const gate = createChargeGate({
+      address: GATE_ADDR,
+      ops: {
+        rpc: async (body) => {
+          if (body.action === "receivable") return { blocks: { ...receivable } };
+          if (body.action === "account_history") return { history: [] };
+          throw new Error("unexpected rpc " + body.action);
+        },
+        transfer: async (to, amountRaw, describe) => {
+          transfers.push({ to, amountRaw, describe });
+          return "F".repeat(64);
+        },
+        pocket: async () => {},
+      },
+      usd: 0.05,
+      xnoUsd: 1,
+      publicBase: "http://pay.test",
+      pollMs: 10,
+      waitMs: 300,
+      validate: (p) => registry.prepareCall(p),
+      usage: (e, f) => events.push([e, f]),
+      log: () => {},
+    });
+    const { callTool } = gate.wrapRegistry(registry);
+    const args = { Draft: draft, Context: "A short post.", Guidance: guidance };
+    const quote = await callTool({ name: "humanize-comment", arguments: args });
+    const x = quote.structuredContent.x402;
+    receivable["B".repeat(64)] = { amount: x.amountRaw, source: PAYER };
+    const res = await callTool({ name: "humanize-comment", arguments: { ...args, _payment_id: x.paymentId } });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /not valid JSON with a ranked list/);
+    assert.match(res.content[0].text, /refunded to/);
+    assert.doesNotMatch(res.content[0].text, /winner/);
+    assert.equal(res.content[0].text.includes(draft), false);
+    const deadline = Date.now() + 5000;
+    while (transfers.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+    const refund = events.find(([e]) => e === "refund");
+    assert.equal(refund[1].reason, "run_failed");
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("a hosted run refuses an invoice the quote cannot cover, and a direct wallet pays it", async () => {

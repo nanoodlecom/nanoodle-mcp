@@ -2390,6 +2390,8 @@ function reviewUserMessage(user, letter, model, text) {
  *  - if the decider's reply is not valid JSON or has no ranked array, nothing of it is passed
  *    through: winner ORIGINAL with the draft as text, every writer listed with its real text as
  *    disqualified ("not judged: decider reply unusable", or "missing"), and a notice says so.
+ *    result.deciderUnusable is set at the same time. Display reasons can be replaced later
+ *    with why a writer was dropped; that flag is what makes the run an error.
  */
 export function rebuildHumanizeResult(wf, result, record, answered = {}) {
   const modelOf = (letter) => answered[letter] || record[letter].model;
@@ -2408,9 +2410,11 @@ export function rebuildHumanizeResult(wf, result, record, answered = {}) {
       const text = textOf(letter);
       return { writer: letter, model: modelOf(letter), text: text ?? "", faithful: false, disqualified: true, reason: text == null ? "missing" : "not judged: decider reply unusable" };
     });
+    result.deciderUnusable = true;
     result.outputs[out.key] = JSON.stringify({ winner: "ORIGINAL", text: draft, why: "The decider's reply was not usable, so the original draft is returned unchanged.", ranked });
     return "note: the decider's reply was not valid JSON with a ranked list, so the five rewrites are listed with their real texts, unjudged.";
   }
+  result.deciderUnusable = false;
   const seen = new Set();
   const ranked = [];
   for (const r of j.ranked) {
@@ -2549,18 +2553,8 @@ export async function applyHumanizeFallback(wf, result, record, state) {
     }
     return { error: failureMessage(state) };
   }
-  if (deciderUnusable(parsed)) return { error: deciderFailureMessage(state) };
+  if (result.deciderUnusable) return { error: deciderFailureMessage(state) };
   return null;
-}
-
-/** The rebuilt draft-unchanged result of a decider that never produced a ranked list. */
-function deciderUnusable(parsed) {
-  if (!parsed || parsed.winner !== "ORIGINAL" || !Array.isArray(parsed.ranked)) return false;
-  if (!String(parsed.why || "").includes("not usable")) return false;
-  return parsed.ranked.every((r) => {
-    const reason = String(r && r.reason || "");
-    return reason === "missing" || reason.startsWith("not judged");
-  });
 }
 
 function deciderFailureMessage(state) {
