@@ -14,7 +14,8 @@
  * span can be repaired. When Cydonia fails and the Starry Ocean fallback runs,
  * both calls are charged. Output tokens are sized from the request (maxChars,
  * or the draft length) plus a small slack, not from the model's output cap.
- * Token counts are a realistic estimate, bytes / 3.5. The deposit is that
+ * The decider's cap adds the ranking JSON and GLM reasoning tokens, which
+ * share max_tokens. Token counts are a realistic estimate, bytes / 3.5. The deposit is that
  * charge times HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up, and
  * never below the charge. Prices are USD per million tokens: the public
  * catalog when it has a rate, otherwise the table below (NanoGPT, 20 Oct 2026).

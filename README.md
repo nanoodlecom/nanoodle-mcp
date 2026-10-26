@@ -388,12 +388,12 @@ graph JSON:
 **humanize-comment** quotes each request on its own. The quote is built from the draft,
 context, guidance, and `maxChars` actually sent. Each call's `max_tokens` is
 sized from that request: `maxChars`, or the draft's length when `maxChars` is
-omitted, plus a small slack. Tokens are estimated at about 3.5 bytes each. The
+omitted, plus a small slack. The decider also reserves tokens for its ranking JSON and for GLM reasoning, which shares that max_tokens budget. Tokens are estimated at about 3.5 bytes each. The
 priced worst case is every writer once, one extra retry, the decider, and a second decider pass when
 a protected span can be repaired. When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
 On a hosted payment the quote caps what the customer pays. A step whose estimate or invoice would push the spend past
-the quote is skipped. The run then ends with a partial result, or with nothing
-owed when nothing was sent. The deposit is 12% above that priced charge, at least $0.001,
+the quote is skipped. A skipped writer step ends as a partial result, or with nothing
+owed when nothing was sent. A skipped or unusable decider is an error, not the original draft returned as a successful comment. The deposit is 12% above that priced charge, at least $0.001,
 rounded up, and never below it. Settlement of a hosted payment charges the customer the lesser of the metered
 cost plus 20% and the quoted deposit, and returns the difference. When a provider
 meters more than the quote, the operator absorbs that overrun. This refund and cap apply to hosted payments.
