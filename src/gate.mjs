@@ -1180,7 +1180,7 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, costExact, textOutput, ...result } = await registry.callTool({ name, arguments: args });
+              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args });
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.
@@ -1199,8 +1199,13 @@ export function createChargeGate({
               // Keyed on settleReceipt (not settled) so a legacy quote — marked
               // settled on restore but carrying no stored figures — falls back to
               // this recompute-only run's numbers rather than reading undefined.
+              const clamped = typeof providerUsd === "number" && typeof costUsd === "number" && providerUsd - costUsd > 1e-9;
               if (!q.settleReceipt) {
                 q.settleReceipt = { known: s.known, costUsd: s.known ? s.costUsd : null, exact: costExact !== false,
+                  providerUsd: typeof providerUsd === "number" ? providerUsd : null,
+                  providerExact: providerExact === true,
+                  billedUsd: typeof billedUsd === "number" ? billedUsd : null,
+                  clamped,
                   take: s.take.toString(), change: s.change.toString(), author: s.author };
               }
               q.settled = true;
@@ -1210,16 +1215,22 @@ export function createChargeGate({
               // deposit's cent rounding — $0.0656 must not print as $0.07. Change is
               // the exact raw remainder (30 decimals); the 8-decimal grain is only
               // how wallets display a quote, and it clips a sub-grain refund.
+              // A clamped provider cost is not the billed amount. The gate still
+              // settles min(metered × 1.2, deposit) from costUsd.
+              const settledLine = !r.known
+                ? " — the model reported no cost, so the whole deposit is being returned to your wallet"
+                : r.clamped && r.providerUsd != null && r.billedUsd != null
+                  ? ` — provider cost $${formatCostUsd(r.providerUsd)} (${r.providerExact ? "exact" : "a lower bound — some calls did not report a price"}); billed $${formatCostUsd(r.billedUsd)} (capped at the deposit)`
+                  : r.exact === false
+                    ? ` — settled at estimated cost $${formatCostUsd(r.costUsd)} (a lower bound: some calls did not report a price) + 20%`
+                    : ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%`;
               const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
                 (q.payHash ? ` (block ${q.payHash})` : "") +
+                settledLine +
                 (r.known
-                  ? (r.exact === false
-                    // some calls reported no price: the total is a lower bound, not the actual cost
-                    ? ` — settled at estimated cost $${formatCostUsd(r.costUsd)} (a lower bound: some calls did not report a price) + 20%`
-                    : ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%`) +
-                    (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
+                  ? (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
                     (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change returned to your wallet` : "")
-                  : " — the model reported no cost, so the whole deposit is being returned to your wallet");
+                  : "");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
               // (quote, paid, refund, change, author_payout), never run telemetry.

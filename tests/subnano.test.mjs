@@ -533,9 +533,16 @@ test("a stage the remaining budget cannot cover stops the run, and the charge st
     assert.equal(payload.comment, "Refined, and then the budget is spent.");
     assert.equal(payload.gate, undefined);
     assert.deepEqual(seen, [REFINE_MODEL]);
+    assert.equal(result.providerUsd, 5);
+    assert.equal(result.providerExact, true, "the provider did report this cost");
+    assert.equal(result.costExact, false, "the clamped base is not the exact provider cost");
     assert.ok(result.costUsd <= quote / SETTLE_MARKUP + 1e-12);
-    assert.ok(settledCharge(result.costUsd, quote) <= quote + 1e-12);
-    assert.ok(result.costUsd < 1, "a provider bill past the quote is not what the caller is charged");
+    assert.equal(result.billedUsd, settledCharge(result.providerUsd, quote));
+    assert.ok(result.billedUsd <= quote + 1e-12);
+    assert.equal(settledCharge(result.costUsd, quote), result.billedUsd);
+    assert.match(result.content[1].text, /cost: \$5\.0000/);
+    assert.match(result.content[1].text, /capped at the deposit/);
+    assert.doesNotMatch(result.content[1].text, /lower bound/);
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });

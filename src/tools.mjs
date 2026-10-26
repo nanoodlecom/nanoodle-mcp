@@ -894,23 +894,25 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   // They stay off an empty directory: with no graph loaded there is nothing to serve.
   if (tools.length) {
     const humanize = tools.find((t) => t.name === HUMANIZE_TOOL);
-    for (const b of builtinTools({ spendSource, humanize })) tools.push(b);
+    for (const b of builtinTools({ spendSource, humanize, hosted })) tools.push(b);
   }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
   async function recordCost(tool, result, ms) {
-    if (typeof result.costUsd !== "number" || !Number.isFinite(result.costUsd)) return;
-    const rec = { usd: result.costUsd, at: new Date().toISOString() };
+    const observedUsd = typeof result.providerUsd === "number" && Number.isFinite(result.providerUsd) ? result.providerUsd : result.costUsd;
+    const observedExact = typeof result.providerUsd === "number" ? result.providerExact !== false : result.costExact !== false;
+    if (typeof observedUsd !== "number" || !Number.isFinite(observedUsd)) return;
+    const rec = { usd: observedUsd, at: new Date().toISOString() };
     if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
-    if (result.costExact === false) rec.exact = false; // renders "$X+"
+    if (!observedExact) rec.exact = false; // renders "$X+"
     // High-water mark across runs — the charge gate prices deposits off the
     // worst run on record, so one cheap run can't shrink the deposit below it.
     const prev = costs[tool.name];
     const hi = Math.max(
       prev && Number.isFinite(prev.hiUsd) ? prev.hiUsd : 0,
       prev && Number.isFinite(prev.usd) ? prev.usd : 0);
-    if (hi > result.costUsd) rec.hiUsd = hi;
+    if (hi > observedUsd) rec.hiUsd = hi;
     costs[tool.name] = rec;
     try {
       await mkdir(outDir, { recursive: true });
@@ -1015,7 +1017,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (tool.builtin) {
         const t0 = Date.now();
         const result = await tool.run(params.arguments || {}, {
-          apiKey, payment, baseUrl, registry,
+          apiKey, payment, baseUrl, registry, hosted,
           humanize: byName.get(HUMANIZE_TOOL),
           catalogs: registry.catalogs,
         });
