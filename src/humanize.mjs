@@ -86,17 +86,19 @@
  *    the cap is delivered only after the decider confirms it is faithful and
  *    safe. Fitting the cap does not make it faithful. A missing, rejecting,
  *    or failed check errors the run, and the charge gate refunds the deposit.
- *    Callers who omit keep, ending, maxChars, and title keep the previous
- *    result shape, the same six paid calls, and the previous price.
+ *    An unusable, truncated, or skipped decider is an error on every call,
+ *    including one with no keep, ending, maxChars, or title. The draft is not
+ *    returned as a successful comment.
  * 9. Deposit. max_tokens on every call is sized from maxChars, or from the
- *    draft length when maxChars is omitted, plus a small slack. On a hosted
- *    payment the quote caps what the customer pays: settlement charges the
- *    lesser of the metered cost plus 20% and that deposit, and the difference
- *    is returned. A provider can still meter more, and the operator absorbs
- *    any overrun. A hosted run skips a paid step, and refuses an invoice,
- *    that would pass the deposit. Direct-wallet spending has no cap and is
- *    not refunded. The run finishes with a partial result or with no charge
- *    when a hosted step is skipped.
+ *    draft length when maxChars is omitted, plus a small slack. The decider
+ *    also gets room for its ranking JSON and for GLM reasoning, which shares
+ *    that max_tokens budget. On a hosted payment the quote caps what the
+ *    customer pays: settlement charges the lesser of the metered cost plus
+ *    20% and that deposit, and the difference is returned. A provider can
+ *    still meter more, and the operator absorbs any overrun. A hosted run
+ *    skips a paid step, and refuses an invoice, that would pass the deposit.
+ *    Direct-wallet spending has no cap and is not refunded. A skipped writer
+ *    step ends as a partial result. A skipped or failed decider is an error.
  */
 import { ParamsError } from "./tools.mjs";
 import { budgetCap, knownUsd } from "./usd.mjs";
@@ -154,6 +156,12 @@ export const HUMANIZE_OUTPUT_SLACK = 48;
  */
 export const HUMANIZE_JUDGE_JSON_TOKENS = 256;
 /**
+ * GLM-5.3 thinking is forced and shares the completion budget with the
+ * ranking JSON. The quote reserves this many tokens so a low-effort trace
+ * cannot cut the JSON off. It is priced in the deposit, not added after it.
+ */
+export const HUMANIZE_JUDGE_REASONING_TOKENS = 512;
+/**
  * Retries the deposit prices, on top of one call per writer. The run may still
  * attempt up to MAX_REASKS; a further call that would pass the deposit is skipped.
  */
@@ -175,15 +183,21 @@ export function estimateTokensFromBytes(byteLength) {
  * max_tokens for one call, taken from the request rather than the model's
  * output cap. maxChars, when set, is that many characters (priced as one byte
  * each). Otherwise the basis is the draft's byte length. A small slack is
- * added. The decider also gets room for its ranking JSON.
+ * added. The decider also gets room for its ranking JSON and for reasoning.
  */
 export function requestOutputTokenCap(maxChars, inputText, { judge = false } = {}) {
   const limit = Number(maxChars);
   const basis = Number.isFinite(limit) && limit > 0
     ? Math.max(1, Math.ceil(limit))
     : Math.max(1, tokenUpperBound(inputText));
-  const slack = HUMANIZE_OUTPUT_SLACK + (judge ? HUMANIZE_JUDGE_JSON_TOKENS : 0);
+  const slack = HUMANIZE_OUTPUT_SLACK + (judge ? HUMANIZE_JUDGE_JSON_TOKENS + HUMANIZE_JUDGE_REASONING_TOKENS : 0);
   return Math.max(1, estimateTokensFromBytes(basis) + slack);
+}
+
+/** Judge max_tokens when the writer cap is already fixed and the draft length is not the cap. */
+export function judgeOutputTokenCap(writerOutTokens) {
+  const writer = Math.max(1, Math.floor(Number(writerOutTokens) || 1));
+  return writer + HUMANIZE_JUDGE_JSON_TOKENS + HUMANIZE_JUDGE_REASONING_TOKENS;
 }
 
 /**
@@ -1246,7 +1260,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   // null is "no cap". An explicit amount, including 0, stays that amount.
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [] };
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], judgeFinish: null, judgeTruncated: false };
   // paymentId → the exact request string that invoice was issued for. A paid retry,
   // including one that re-enters this wrapper with the caller's original body, sends this string.
   const billedBodies = new Map();
@@ -1491,6 +1505,14 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     state.meteredUsd += actual;
   };
   const skippedResponse = () => jsonResponse({ choices: [{ message: { content: "" } }], x_nanogpt_pricing: { costUsd: 0 } });
+  const noteJudgeFinish = (j) => {
+    const choice = j && Array.isArray(j.choices) ? j.choices[0] : null;
+    const reason = choice && typeof choice.finish_reason === "string" ? choice.finish_reason
+      : choice && typeof choice.finishReason === "string" ? choice.finishReason
+      : "";
+    if (reason) state.judgeFinish = reason;
+    if (reason === "length") state.judgeTruncated = true;
+  };
 
   const wrapped = async (url, init = {}) => {
     if (!/\/api\/v1\/chat\/completions(\?|$)/.test(String(url))) return fetch(url, init);
@@ -1584,6 +1606,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
             rec.status = settled.status;
             let judged = null;
             try { judged = await settled.clone().json(); } catch { judged = null; }
+            noteJudgeFinish(judged);
             const reported = usdOf(judged, settled);
             if (reported != null) rec.usd = reported;
             else if (rec.paid) state.costUnknown = true;
@@ -1617,6 +1640,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         }
         let judged = null;
         try { judged = await r.clone().json(); } catch { judged = null; }
+        noteJudgeFinish(judged);
         const reported = usdOf(judged, r);
         finishPaid(held, reported == null ? (r.ok ? null : 0) : reported);
         return r;
@@ -2087,7 +2111,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const judgeCap = requestOutputTokenCap(state.maxChars, state.draft, { judge: true });
     const body = { ...req.body, messages, max_tokens: judgeCap };
     const held = hold("review", letter, body.model, body.messages, body.max_tokens);
-    if (held == null) return { ok: false };
+    if (held == null) return { ok: false, skipped: true };
     const rec = { letter, kind: "review", model: body.model, status: null, paid: false, paymentStarted: false, usd: null };
     state.attempts.push(rec);
     const outer = req.signal || null;
@@ -2242,16 +2266,92 @@ function assertKeepPossible(draft, keep, maxChars) {
   }
 }
 
+/**
+ * Next balanced `{...}` at or after `from`, ignoring braces inside strings.
+ * An unclosed object (the reply was cut off) returns null.
+ */
+function nextJsonObject(text, from = 0) {
+  const s = String(text ?? "");
+  for (let start = from; start < s.length; start++) {
+    if (s[start] !== "{") continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === "\"") inStr = false;
+        continue;
+      }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) return { text: s.slice(start, i + 1), end: i + 1 };
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+/** First balanced `{...}` in `text`. An unclosed object returns null. */
+export function extractJsonObject(text) {
+  const found = nextJsonObject(text, 0);
+  return found ? found.text : null;
+}
+
+function rankedObject(text) {
+  if (!text) return null;
+  try {
+    const j = JSON.parse(text);
+    if (j && typeof j === "object" && !Array.isArray(j) && Array.isArray(j.ranked)) return j;
+  } catch { /* not a ranked object */ }
+  return null;
+}
+
+/**
+ * The decider's ranking object. Accepts a raw JSON object, a ```json fence,
+ * and prose before or after the object. A truncated object is not guessed.
+ */
+function rankedFromChunk(chunk) {
+  const direct = rankedObject(chunk);
+  if (direct) return direct;
+  let from = 0;
+  while (from < chunk.length) {
+    const found = nextJsonObject(chunk, from);
+    if (!found) return null;
+    const parsed = rankedObject(found.text);
+    if (parsed) return parsed;
+    from = found.end;
+  }
+  return null;
+}
+
+export function parseDeciderJson(content) {
+  const raw = String(content ?? "").trim();
+  if (!raw) return null;
+  const chunks = [raw];
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) chunks.unshift(fence[1].trim());
+  for (const chunk of chunks) {
+    const parsed = rankedFromChunk(chunk);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
 /** The decider's verdict on one repaired rewrite. Faithful and not disqualified, and the winner is that rewrite. */
 export function parseRepairVerdict(content, letter) {
   const raw = String(content ?? "").trim();
-  let j = null;
-  try { j = JSON.parse(raw); } catch { j = null; }
-  if (!j || typeof j !== "object" || Array.isArray(j)) {
-    const m = raw.match(/\{[\s\S]*\}/);
-    if (m) { try { j = JSON.parse(m[0]); } catch { j = null; } }
+  let j = rankedObject(raw);
+  if (!j) {
+    const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    j = rankedObject(fence && fence[1]) || rankedObject(extractJsonObject(fence ? fence[1] : raw));
   }
-  if (!j || typeof j !== "object" || Array.isArray(j)) return { ok: false };
+  if (!j) return { ok: false };
   const want = String(letter || "").toUpperCase();
   const winner = typeof j.winner === "string" ? j.winner.trim().toUpperCase() : "";
   const row = Array.isArray(j.ranked) ? j.ranked.find((r) => r && typeof r.writer === "string" && r.writer.trim().toUpperCase() === want) : null;
@@ -2290,6 +2390,8 @@ function reviewUserMessage(user, letter, model, text) {
  *  - if the decider's reply is not valid JSON or has no ranked array, nothing of it is passed
  *    through: winner ORIGINAL with the draft as text, every writer listed with its real text as
  *    disqualified ("not judged: decider reply unusable", or "missing"), and a notice says so.
+ *    result.deciderUnusable is set at the same time. Display reasons can be replaced later
+ *    with why a writer was dropped; that flag is what makes the run an error.
  */
 export function rebuildHumanizeResult(wf, result, record, answered = {}) {
   const modelOf = (letter) => answered[letter] || record[letter].model;
@@ -2302,16 +2404,17 @@ export function rebuildHumanizeResult(wf, result, record, answered = {}) {
   };
   const draftRec = result.nodes && result.nodes.draft && result.nodes.draft.out;
   const draft = draftRec && typeof draftRec.text === "string" ? draftRec.text : "";
-  let j = null;
-  try { j = JSON.parse(result.outputs[out.key]); } catch { j = null; }
-  if (!j || typeof j !== "object" || Array.isArray(j) || !Array.isArray(j.ranked)) {
+  const j = parseDeciderJson(result.outputs[out.key]);
+  if (!j) {
     const ranked = LETTERS.map((letter) => {
       const text = textOf(letter);
       return { writer: letter, model: modelOf(letter), text: text ?? "", faithful: false, disqualified: true, reason: text == null ? "missing" : "not judged: decider reply unusable" };
     });
+    result.deciderUnusable = true;
     result.outputs[out.key] = JSON.stringify({ winner: "ORIGINAL", text: draft, why: "The decider's reply was not usable, so the original draft is returned unchanged.", ranked });
     return "note: the decider's reply was not valid JSON with a ranked list, so the five rewrites are listed with their real texts, unjudged.";
   }
+  result.deciderUnusable = false;
   const seen = new Set();
   const ranked = [];
   for (const r of j.ranked) {
@@ -2450,7 +2553,16 @@ export async function applyHumanizeFallback(wf, result, record, state) {
     }
     return { error: failureMessage(state) };
   }
+  if (result.deciderUnusable) return { error: deciderFailureMessage(state) };
   return null;
+}
+
+function deciderFailureMessage(state) {
+  const skipped = Array.isArray(state && state.skippedForBudget)
+    && state.skippedForBudget.some((s) => s && s.kind === "decider");
+  if (skipped) return failureMessage(state, "the decider was skipped because it would have cost more than this request's deposit.");
+  if (state && state.judgeTruncated) return failureMessage(state, "the decider's reply was cut off before it finished a ranked list.");
+  return failureMessage(state, "the decider's reply was not valid JSON with a ranked list.");
 }
 
 /** A ranked rewrite the decider already marked faithful, and that fits the caps. */
@@ -2479,6 +2591,9 @@ async function confirmFittingRow(row, state) {
     verdict = await state.reviewRepair(row.text, row.writer, row.model);
   } catch {
     return { error: failureMessage(state, "the decider could not check the rewrite.") };
+  }
+  if (verdict && verdict.skipped) {
+    return { error: failureMessage(state, "the decider's check of the fitting rewrite was skipped because it would have cost more than this request's deposit.") };
   }
   if (!verdict || verdict.ok !== true || !acceptableDelivery(row.text, state)) {
     return { error: failureMessage(state, "the rewrite was not confirmed faithful and safe.") };
