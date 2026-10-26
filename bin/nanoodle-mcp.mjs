@@ -256,7 +256,11 @@ async function main() {
     baseUrl: process.env.NANOGPT_BASE_URL || undefined,
     outDir: resolvedOut,
     publicBase: serveSpec !== null ? publicBase : null,
+    // hosted is billing (--charge-usd). remote is the HTTP transport: every
+    // --serve listener refuses local paths, whether or not it charges.
+    // Only stdio reads files on this machine.
     hosted: chargeUsd != null,
+    remote: serveSpec !== null,
   });
 
   // With several dirs in play, a bare filename is ambiguous — qualify it with its dir.

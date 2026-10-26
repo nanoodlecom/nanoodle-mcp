@@ -21,12 +21,10 @@
 import { spawn } from "node:child_process";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import { isIP } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { bytesToDataUrl, sniffMime, NanoClient } from "nanoodle";
 import { ParamsError, formatCostUsd } from "./tools.mjs";
 import {
@@ -515,11 +513,14 @@ function prepareSubnano(args, humanize) {
   }
 }
 
-export function parseSfw(args, { hosted = false } = {}) {
+export function parseSfw(args, { hosted = false, remote = false } = {}) {
   requireArgs(args, SFW_TOOL);
   unknownKeys(args, SFW_KEYS, SFW_TOOL);
-  const image = checkMedia(pick(args, "image"), "image", { hosted });
-  const video = checkMedia(pick(args, "video"), "video", { hosted });
+  // `remote` is the HTTP transport. `hosted` is billing. Either one is a
+  // process that must not read the server's own disk; only stdio does.
+  const noLocal = remote || hosted;
+  const image = checkMedia(pick(args, "image"), "image", { remote: noLocal });
+  const video = checkMedia(pick(args, "video"), "video", { remote: noLocal });
   if (!image && !video) throw new ParamsError(`${SFW_TOOL} needs an image, a video, or both. Nothing was charged.`);
   let frames = 0;
   if (video) {
@@ -540,7 +541,7 @@ function parseFrameCount(raw) {
   return n;
 }
 
-function checkMedia(value, label, { hosted = false } = {}) {
+function checkMedia(value, label, { remote = false } = {}) {
   if (value == null || value === "") return null;
   if (typeof value !== "string") throw new ParamsError(`${label} must be a file path, an https URL, or a data URL. Nothing was charged.`);
   const v = value.trim();
@@ -567,8 +568,10 @@ function checkMedia(value, label, { hosted = false } = {}) {
   if (/^[a-z][a-z0-9+.-]*:/i.test(v)) {
     throw new ParamsError(`${label} must be a file path, an https URL, or a data URL. Nothing was charged.`);
   }
-  // Hosted callers are remote. A filesystem path would read the server's own disk.
-  if (hosted) {
+  // An HTTP listener is a remote caller even when it does not charge. A
+  // filesystem path would read the server's own disk. Checked before stat
+  // so a missing path and a real one return the same error.
+  if (remote) {
     throw new ParamsError(`${label} must be an https URL or a data URL. A hosted server does not read local files. Nothing was charged.`);
   }
   if (!existsSync(v)) throw new ParamsError(`${label} file was not found. Nothing was charged.`);
@@ -777,14 +780,14 @@ async function runSubnano(args, ctx) {
 }
 
 async function runSfw(args, ctx) {
-  const hosted = !!ctx.hosted;
-  const parsed = parseSfw(args, { hosted });
+  const remote = !!(ctx.remote || ctx.hosted);
+  const parsed = parseSfw(args, { remote });
   const { decideRun, DECIDE_IMG_FALLBACK } = await loadDecide();
   const client = clientFor(ctx);
   const fit = ctx.fit || fitStillImage;
   const sample = ctx.sampleFrames || sampleVideoFrames;
   const media = {
-    hosted,
+    remote,
     lookup: ctx.lookup,
     request: ctx.request,
     timeoutMs: ctx.mediaTimeoutMs,
@@ -900,13 +903,18 @@ function ipv4Blocked(ip) {
   if (n == null) return true;
   const a = n >>> 24;
   const b = (n >>> 16) & 255;
+  const c = (n >>> 8) & 255;
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 169 && b === 254) return true; // link-local, including 169.254.169.254
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
-  if (n >= 0xE0000000 && n <= 0xEFFFFFFF) return true; // multicast
-  if (n === 0xFFFFFFFF) return true;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24, 192.0.2.0/24
+  if (a === 192 && b === 88 && c === 99) return true; // 192.88.99.0/24 6to4 anycast
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24
+  if (n >= 0xE0000000) return true; // multicast 224/4, reserved 240/4, broadcast
   return false;
 }
 
@@ -936,9 +944,30 @@ function expandIPv6(ip) {
   return words;
 }
 
+/** First `bits` of `words` equal the prefix words. Missing prefix words are 0. */
+function prefixMatch(words, bits, ...prefix) {
+  let left = bits;
+  for (let i = 0; left > 0 && i < 8; i++) {
+    const take = Math.min(16, left);
+    const mask = take === 16 ? 0xffff : (0xffff << (16 - take)) & 0xffff;
+    const expect = prefix[i] || 0;
+    if ((words[i] & mask) !== (expect & mask)) return false;
+    left -= take;
+  }
+  return true;
+}
+
+function v4FromWords(words, i) {
+  return `${words[i] >> 8}.${words[i] & 255}.${words[i + 1] >> 8}.${words[i + 1] & 255}`;
+}
+
 /**
- * True for addresses a hosted fetch must not connect to. IPv4-mapped IPv6
- * (::ffff:10.0.0.1 and ::ffff:7f00:1) is judged as the embedded IPv4 address.
+ * True unless the address is global unicast. IPv4-mapped (::ffff:0:0/96),
+ * NAT64 (64:ff9b::/96), and 6to4 (2002::/16) are judged by the embedded IPv4,
+ * so a private or special v4 stays blocked. Everything else outside 2000::/3
+ * is blocked, including ::/128, ::1, 100::/64, ULA, link-local, site-local
+ * fec0::/10, and multicast. Inside 2000::/3, documentation and the IETF
+ * special block 2001::/23 are blocked too.
  */
 export function isBlockedIp(ip) {
   const s = String(ip ?? "").trim().replace(/%.*/, "");
@@ -948,16 +977,13 @@ export function isBlockedIp(ip) {
   if (fam !== 6) return true;
   const words = expandIPv6(s);
   if (!words) return true;
-  const mapped = words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0xffff;
-  if (mapped) {
-    const v4 = `${words[6] >> 8}.${words[6] & 255}.${words[7] >> 8}.${words[7] & 255}`;
-    return ipv4Blocked(v4);
-  }
-  if (words.every((w, i) => w === (i === 7 ? 1 : 0))) return true; // ::1
-  if (words.every((w) => w === 0)) return true; // ::
-  if ((words[0] & 0xff00) === 0xff00) return true; // multicast
-  if ((words[0] & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
-  if ((words[0] & 0xfe00) === 0xfc00) return true; // ULA fc00::/7
+  if (prefixMatch(words, 96, 0, 0, 0, 0, 0, 0xffff)) return ipv4Blocked(v4FromWords(words, 6));
+  if (prefixMatch(words, 96, 0x64, 0xff9b)) return ipv4Blocked(v4FromWords(words, 6));
+  if (prefixMatch(words, 16, 0x2002)) return ipv4Blocked(v4FromWords(words, 1));
+  if (!prefixMatch(words, 3, 0x2000)) return true;
+  if (prefixMatch(words, 23, 0x2001, 0)) return true; // 2001::/23 special
+  if (prefixMatch(words, 32, 0x2001, 0xdb8)) return true; // 2001:db8::/32 documentation
+  if (prefixMatch(words, 20, 0x3fff, 0)) return true; // 3fff::/20 documentation
   return false;
 }
 
@@ -990,7 +1016,14 @@ function destroyStream(res) {
   try { if (res && res.req && typeof res.req.destroy === "function") res.req.destroy(); } catch { /* already closed */ }
 }
 
-function requestOnce(url, ip, { timeoutMs }) {
+/** Drop the socket as well as the request. req.destroy() does not always run the socket's own destroy. */
+function destroyReq(req) {
+  if (!req) return;
+  try { if (typeof req.destroy === "function") req.destroy(); } catch { /* already closed */ }
+  try { if (req.socket && typeof req.socket.destroy === "function") req.socket.destroy(); } catch { /* already closed */ }
+}
+
+function requestOnce(url, ip, { timeoutMs, register }) {
   return new Promise((resolve, reject) => {
     const lib = url.protocol === "https:" ? https : http;
     const family = isIP(ip) === 6 ? 6 : 4;
@@ -1004,20 +1037,16 @@ function requestOnce(url, ip, { timeoutMs }) {
       family,
       timeout: timeoutMs,
     }, (res) => resolve({ status: res.statusCode, headers: res.headers, stream: res, req }));
-    const fail = (e) => { req.destroy(); reject(e instanceof Error ? e : new Error("media download timed out")); };
+    if (register) register(req);
+    if (req.destroyed) {
+      destroyReq(req);
+      reject(new Error("media download timed out"));
+      return;
+    }
+    const fail = (e) => { destroyReq(req); reject(e instanceof Error ? e : new Error("media download timed out")); };
     req.on("error", fail);
     req.on("timeout", () => fail(new Error("media download timed out")));
     req.end();
-  });
-}
-
-function raceTimeout(promise, ms, onTimeout) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      try { if (onTimeout) onTimeout(); } catch { /* ignore */ }
-      reject(new Error("media download timed out"));
-    }, ms);
-    promise.then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); reject(e); });
   });
 }
 
@@ -1067,12 +1096,13 @@ async function readCapped(res, byteCap, deadline, overMsg) {
 }
 
 /**
- * GET an http(s) URL. Each hop is resolved and rejected unless every address
- * is public, then the socket is opened to that address (not the name) so a
- * later DNS answer cannot retarget the connection. Redirects are manual.
- * The body is counted as it arrives and destroyed once it passes `byteCap`.
+ * GET an http(s) URL. One deadline covers DNS, every redirect, the request,
+ * and the body. A lookup that resolves after the deadline does not send.
+ * Each hop is rejected unless every address is public, then the socket is
+ * opened to that address (not the name). Redirects are manual. The body is
+ * counted as it arrives and destroyed once it passes `byteCap`.
  */
-export async function fetchPublicBytes(rawUrl, {
+export function fetchPublicBytes(rawUrl, {
   lookup = defaultLookup,
   request = requestOnce,
   byteCap = MAX_MEDIA_BYTES,
@@ -1081,36 +1111,75 @@ export async function fetchPublicBytes(rawUrl, {
   overMsg = "video is over 4 MB",
 } = {}) {
   const deadline = Date.now() + timeoutMs;
-  let current;
-  try { current = new URL(rawUrl); } catch { throw new Error("media URL is not valid"); }
-  for (let hop = 0; hop <= maxRedirects; hop++) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error("media download timed out");
-    if (current.protocol !== "http:" && current.protocol !== "https:") throw new Error("media URL must be http or https");
-    if (current.username || current.password) throw new Error("media URL must not include credentials");
-    const ip = await resolvePublic(current.hostname, lookup);
-    const res = await raceTimeout(Promise.resolve().then(() => request(current, ip, { timeoutMs: remaining })), remaining, () => {});
-    const status = res.status;
-    if (status >= 300 && status < 400) {
-      const loc = res.headers && (res.headers.location || res.headers.Location);
-      destroyStream(res);
-      if (!loc) throw new Error(`redirect missing location (HTTP ${status})`);
-      if (hop === maxRedirects) throw new Error("too many redirects");
-      try { current = new URL(loc, current); } catch { throw new Error("redirect location is not a valid URL"); }
-      continue;
-    }
-    if (status < 200 || status >= 300) {
-      destroyStream(res);
-      throw new Error(`could not fetch video (HTTP ${status})`);
-    }
-    const len = Number(res.headers && (res.headers["content-length"] ?? res.headers["Content-Length"]));
-    if (Number.isFinite(len) && len > byteCap) {
-      destroyStream(res);
-      throw new Error(overMsg);
-    }
-    return await readCapped(res, byteCap, deadline, overMsg);
-  }
-  throw new Error("too many redirects");
+  let timedOut = false;
+  let inflight = null;
+  let settled = false;
+  const drop = () => {
+    const cur = inflight;
+    inflight = null;
+    if (!cur) return;
+    try { cur.destroy(); } catch { /* already closed */ }
+  };
+  const past = () => timedOut || Date.now() >= deadline;
+  return new Promise((resolve, reject) => {
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      drop();
+      fn(val);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      finish(reject, new Error("media download timed out"));
+    }, timeoutMs);
+    const track = (req) => {
+      inflight = { destroy: () => destroyReq(req) };
+      if (past()) drop();
+    };
+    (async () => {
+      let current;
+      try { current = new URL(rawUrl); } catch { throw new Error("media URL is not valid"); }
+      for (let hop = 0; hop <= maxRedirects; hop++) {
+        if (past()) throw new Error("media download timed out");
+        if (current.protocol !== "http:" && current.protocol !== "https:") throw new Error("media URL must be http or https");
+        if (current.username || current.password) throw new Error("media URL must not include credentials");
+        const ip = await resolvePublic(current.hostname, lookup);
+        if (past()) throw new Error("media download timed out");
+        const res = await request(current, ip, {
+          timeoutMs: Math.max(1, deadline - Date.now()),
+          register: track,
+        });
+        inflight = { destroy: () => destroyStream(res) };
+        if (past()) throw new Error("media download timed out");
+        const status = res.status;
+        if (status >= 300 && status < 400) {
+          const loc = res.headers && (res.headers.location || res.headers.Location);
+          destroyStream(res);
+          inflight = null;
+          if (!loc) throw new Error(`redirect missing location (HTTP ${status})`);
+          if (hop === maxRedirects) throw new Error("too many redirects");
+          try { current = new URL(loc, current); } catch { throw new Error("redirect location is not a valid URL"); }
+          continue;
+        }
+        if (status < 200 || status >= 300) {
+          destroyStream(res);
+          inflight = null;
+          throw new Error(`could not fetch video (HTTP ${status})`);
+        }
+        const len = Number(res.headers && (res.headers["content-length"] ?? res.headers["Content-Length"]));
+        if (Number.isFinite(len) && len > byteCap) {
+          destroyStream(res);
+          inflight = null;
+          throw new Error(overMsg);
+        }
+        const body = await readCapped(res, byteCap, deadline, overMsg);
+        inflight = null;
+        return body;
+      }
+      throw new Error("too many redirects");
+    })().then((v) => finish(resolve, v), (e) => finish(reject, e));
+  });
 }
 
 function dataBytes(source, label, byteCap) {
@@ -1123,7 +1192,7 @@ function dataBytes(source, label, byteCap) {
   return buf;
 }
 
-async function loadMediaBytes(source, { hosted = false, label = "media", byteCap = MAX_MEDIA_BYTES, lookup, request, timeoutMs } = {}) {
+async function loadMediaBytes(source, { hosted = false, remote = false, label = "media", byteCap = MAX_MEDIA_BYTES, lookup, request, timeoutMs } = {}) {
   if (/^data:/i.test(source)) return dataBytes(source, label, byteCap);
   if (/^https?:\/\//i.test(source)) {
     return fetchPublicBytes(source, {
@@ -1131,7 +1200,7 @@ async function loadMediaBytes(source, { hosted = false, label = "media", byteCap
       overMsg: `${label} is over 4 MB`,
     });
   }
-  if (hosted) throw new Error("a hosted server does not read local files");
+  if (remote || hosted) throw new Error("a hosted server does not read local files");
   const buf = await readFile(source);
   if (buf.length > byteCap) throw new Error(`${label} is over 4 MB`);
   return buf;
@@ -1183,7 +1252,7 @@ export async function fitStillImage(url, maxDim, budget, opts = {}) {
   return dataUrl;
 }
 
-export function runProc(cmd, args, { timeoutMs = PROC_TIMEOUT_MS } = {}) {
+export function runProc(cmd, args, { timeoutMs = PROC_TIMEOUT_MS, input = null } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (fn, val) => {
@@ -1192,7 +1261,10 @@ export function runProc(cmd, args, { timeoutMs = PROC_TIMEOUT_MS } = {}) {
       clearTimeout(timer);
       fn(val);
     };
-    const child = mediaProcs.spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const child = mediaProcs.spawn(cmd, args, {
+      stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"],
+      detached: true,
+    });
     const kill = () => {
       if (child.pid) {
         try { process.kill(-child.pid, "SIGKILL"); return; } catch { /* not a group leader */ }
@@ -1203,6 +1275,10 @@ export function runProc(cmd, args, { timeoutMs = PROC_TIMEOUT_MS } = {}) {
       kill();
       finish(reject, new Error(`${cmd} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    if (input != null && child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(Buffer.isBuffer(input) ? input : Buffer.from(input));
+    }
     const chunks = [];
     let err = "";
     child.stdout.on("data", (d) => chunks.push(d));
@@ -1221,34 +1297,54 @@ export function runProc(cmd, args, { timeoutMs = PROC_TIMEOUT_MS } = {}) {
   });
 }
 
+/**
+ * mp4, mov, webm, or matroska. Anything else (a DASH/HLS manifest, for one)
+ * is refused so ffmpeg is never asked to open a playlist.
+ */
+export function videoContainer(bytes) {
+  const b = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
+    return b.toString("ascii", 8, 12) === "qt  " ? "mov" : "mp4";
+  }
+  if (b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) {
+    const head = b.subarray(0, Math.min(b.length, 4096)).toString("latin1");
+    if (head.includes("webm")) return "webm";
+    if (head.includes("matroska")) return "matroska";
+  }
+  return null;
+}
+
 /** Evenly spaced JPEG data URLs. The library's extractVideoFrames clusters at one end, which is the wrong sample for an SFW check. */
 export async function sampleVideoFrames(source, count, opts = {}) {
   const bytesIn = await loadMediaBytes(source, { ...opts, label: "video" });
-  const dir = await mkdtemp(join(tmpdir(), "sfw-"));
+  const format = videoContainer(bytesIn);
+  if (!format) throw new Error("video must be mp4, mov, webm, or matroska");
   const timeoutMs = opts.timeoutMs;
-  try {
-    const inPath = join(dir, "in.bin");
-    await writeFile(inPath, bytesIn);
-    const probe = await runProc("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", inPath], { timeoutMs });
-    const dur = Number(String(probe).trim());
-    if (!(dur > 0)) throw new Error("could not read the video duration");
-    const frames = [];
-    for (let i = 0; i < count; i++) {
-      const t = Math.min(Math.max(0, dur - 0.05), Math.max(0, dur * (i + 0.5) / count));
-      const outPath = join(dir, `f${i}.jpg`);
-      await runProc("ffmpeg", [
-        "-y", "-ss", t.toFixed(3), "-i", inPath,
-        "-frames:v", "1",
-        "-vf", `scale=${FRAME_MAX_EDGE}:${FRAME_MAX_EDGE}:force_original_aspect_ratio=decrease`,
-        "-q:v", "5", outPath,
-      ], { timeoutMs });
-      const jpg = await readFile(outPath);
-      frames.push(`data:image/jpeg;base64,${jpg.toString("base64")}`);
-    }
-    return frames;
-  } finally {
-    await rm(dir, { recursive: true, force: true });
+  // pipe + a forced demuxer: a playlist cannot open a file: or network URL,
+  // and the only protocol ffmpeg is allowed is the stdin we just handed it.
+  const locked = ["-protocol_whitelist", "pipe", "-f", format];
+  const probe = await runProc("ffprobe", [
+    "-v", "error", ...locked,
+    "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", "pipe:0",
+  ], { timeoutMs, input: bytesIn });
+  const dur = Number(String(probe).trim());
+  if (!(dur > 0)) throw new Error("could not read the video duration");
+  const frames = [];
+  for (let i = 0; i < count; i++) {
+    const t = Math.min(Math.max(0, dur - 0.05), Math.max(0, dur * (i + 0.5) / count));
+    const jpg = await runProc("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", ...locked,
+      "-i", "pipe:0",
+      "-ss", t.toFixed(3),
+      "-frames:v", "1",
+      "-vf", `scale=${FRAME_MAX_EDGE}:${FRAME_MAX_EDGE}:force_original_aspect_ratio=decrease`,
+      "-q:v", "5",
+      "-f", "mjpeg",
+      "pipe:1",
+    ], { timeoutMs, input: bytesIn });
+    frames.push(`data:image/jpeg;base64,${jpg.toString("base64")}`);
   }
+  return frames;
 }
 
 const SUBNANO_NOTE = "a deposit is quoted for each request from its context and guidance and is a cap on the charge; it settles at the metered cost plus 20% or the quote, whichever is less, and the run stops before a stage the remaining budget cannot cover; the difference is returned";
@@ -1263,7 +1359,8 @@ function spendLine(spendSource) {
  * --graphs directory still exits with "no runnable graphs".
  * `deps` is how tests replace the video sampler and the image fitter.
  */
-export function builtinTools({ spendSource, humanize, hosted = false }) {
+export function builtinTools({ spendSource, humanize, hosted = false, remote = false }) {
+  const noLocal = remote || hosted;
   const caps = HUMANIZE_INPUT_CAPS;
   const subnano = {
     name: SUBNANO_TOOL,
@@ -1354,13 +1451,13 @@ export function builtinTools({ spendSource, humanize, hosted = false }) {
       properties: {
         image: {
           type: "string",
-          description: hosted
+          description: noLocal
             ? "optional; still image — https URL or data URL. At most 4 MB. A hosted server does not read local files. Does not use ffmpeg."
             : "optional; still image — file path, https URL, or data URL. At most 4 MB. Does not use ffmpeg.",
         },
         video: {
           type: "string",
-          description: hosted
+          description: noLocal
             ? "optional; video — https URL or data URL. Frames are sampled evenly. At most 4 MB. Needs ffmpeg. A hosted server does not read local files."
             : "optional; video — file path, https URL, or data URL. Frames are sampled evenly. At most 4 MB. Needs ffmpeg.",
         },
@@ -1368,19 +1465,19 @@ export function builtinTools({ spendSource, humanize, hosted = false }) {
       },
     },
     quote(args, ctx) {
-      const parsed = parseSfw(args, { hosted });
+      const parsed = parseSfw(args, { remote: noLocal });
       return depositFromCharge(sfwChargeUsd({ images: parsed.images, frames: parsed.frames }, ctx && ctx.catalogs));
     },
     coldDeposit(ctx) {
       return depositFromCharge(sfwChargeUsd({ images: 1, frames: SFW_FRAMES_MAX }, ctx && ctx.catalogs));
     },
     prepare(args) {
-      parseSfw(args, { hosted });
+      parseSfw(args, { remote: noLocal });
     },
     run(args, ctx) {
       return runSfw(args, {
         ...ctx,
-        hosted,
+        remote: noLocal,
         fit: ctx.fit || this.deps.fit,
         sampleFrames: ctx.sampleFrames || this.deps.sampleFrames,
       });

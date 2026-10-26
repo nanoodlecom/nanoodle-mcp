@@ -5,10 +5,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile, chmod } from "node:fs/promises";
+import { statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { NanoClient } from "nanoodle";
 import { looksLikeResult } from "../node_modules/nanoodle/src/x402.mjs";
@@ -16,8 +18,10 @@ import { createChargeGate } from "../src/gate.mjs";
 import { loadTools } from "../src/tools.mjs";
 import {
   MEDIA_MAX_REDIRECTS, finishResult, settledCharge, meteredWithinQuote, isBlockedIp, fetchPublicBytes,
-  fitStillImage, imageDimensions, runProc, sampleVideoFrames, mediaProcs,
+  fitStillImage, imageDimensions, runProc, sampleVideoFrames, mediaProcs, videoContainer,
 } from "../src/subnano.mjs";
+
+const BIN = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "nanoodle-mcp.mjs");
 
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
 const PAYER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
@@ -54,14 +58,18 @@ test("isBlockedIp rejects private, loopback, link-local, CGNAT, multicast, ULA, 
     "100.64.0.0", "100.127.255.255",
     "172.16.0.1", "172.31.255.255", "192.168.1.1",
     "224.0.0.1", "239.255.255.255", "255.255.255.255",
-    "::1", "::", "fe80::1", "febf::1", "fc00::1", "fd00::1", "fd12:3456::abcd", "ff02::1",
+    "::1", "::", "fe80::1", "febf::1", "fec0::1", "feff::1", "fc00::1", "fd00::1", "fd12:3456::abcd", "ff02::1",
     "::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:192.168.0.8",
     "::ffff:7f00:1", "::ffff:a00:1", "::ffff:169.254.169.254",
+    "100::1", "2001::1", "2001:db8::1", "3fff::1",
+    "64:ff9b::10.0.0.1", "64:ff9b::7f00:1", "2002:a00:1::", "2002:7f00:1::",
+    "192.0.2.1", "198.51.100.1", "203.0.113.1", "240.0.0.1",
   ];
   const allowed = [
     "1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.1",
     "172.15.5.5", "172.32.0.1", "192.169.1.1", "11.0.0.1",
     "2001:4860:4860::8888", "::ffff:1.1.1.1", "::ffff:8.8.8.8",
+    "64:ff9b::1.1.1.1", "64:ff9b::808:808", "2002:101:101::", "2002:808:808::1",
   ];
   for (const ip of blocked) assert.equal(isBlockedIp(ip), true, ip);
   for (const ip of allowed) assert.equal(isBlockedIp(ip), false, ip);
@@ -353,6 +361,203 @@ test("a clamped provider cost is billed at the deposit and the receipt does not 
   const depositRaw = BigInt(quote.structuredContent.x402.amountRaw);
   const sent = state.transfers.reduce((sum, t) => sum + BigInt(t.amountRaw), 0n);
   assert.ok(sent * 20n < depositRaw, "settlement stays inside the deposit; got " + state.transfers.map((t) => t.describe + " " + t.amountRaw).join(", "));
+});
+
+test("isBlockedIp allows only global unicast and rejects fec0::/10 and the other non-global IPv6 ranges", () => {
+  const blocked = {
+    "::/128": ["::", "0:0:0:0:0:0:0:0"],
+    "::1/128": ["::1"],
+    "100::/64": ["100::", "100::1"],
+    "2001::/23": ["2001::", "2001::1", "2001:1::1"],
+    "2001:db8::/32": ["2001:db8::", "2001:db8::1"],
+    "fc00::/7": ["fc00::1", "fd00::1"],
+    "fe80::/10": ["fe80::1", "febf::1"],
+    "fec0::/10": ["fec0::1", "feff::ffff"],
+    "ff00::/8": ["ff00::1", "ff02::1"],
+    "mapped private": ["::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:192.0.2.1", "::ffff:169.254.169.254"],
+    "nat64 private": ["64:ff9b::10.0.0.1", "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b:1::1"],
+    "6to4 private": ["2002:a00:1::", "2002:7f00:1::", "2002:c0a8:1::"],
+  };
+  for (const [range, ips] of Object.entries(blocked)) {
+    for (const ip of ips) assert.equal(isBlockedIp(ip), true, `${range} ${ip}`);
+  }
+  const allowed = ["2001:4860:4860::8888", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::8.8.8.8", "2002:808:808::"];
+  for (const ip of allowed) assert.equal(isBlockedIp(ip), false, ip);
+});
+
+test("one deadline covers DNS and every redirect hop, and no request is sent after it", async () => {
+  let releaseDns;
+  let requested = 0;
+  const lookup = () => new Promise((resolve) => {
+    releaseDns = () => resolve([{ address: "1.2.3.4" }]);
+  });
+  const request = () => {
+    requested++;
+    return { status: 200, headers: {}, stream: Readable.from([Buffer.from("x")]) };
+  };
+  const pending = fetchPublicBytes("http://slow.example/v.mp4", { lookup, request, timeoutMs: 5 });
+  const outcome = await Promise.race([
+    pending.then(() => ({ ok: true }), (e) => ({ e })),
+    new Promise((resolve) => setTimeout(() => resolve({ pending: true }), 250)),
+  ]);
+  assert.equal(outcome.pending, undefined, "a 5ms budget was still pending while DNS had not resolved");
+  assert.match(outcome.e.message, /timed out/);
+  assert.equal(requested, 0);
+  releaseDns();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(requested, 0, "DNS resolving after the deadline must not send a request");
+
+  let releaseSecond;
+  const calls = [];
+  const redirectLookup = (host) => {
+    if (host === "one.example") return Promise.resolve([{ address: "1.2.3.4" }]);
+    return new Promise((resolve) => {
+      releaseSecond = () => resolve([{ address: "8.8.8.8" }]);
+    });
+  };
+  const redirectPending = fetchPublicBytes("http://one.example/a", {
+    lookup: redirectLookup,
+    timeoutMs: 30,
+    request: (url) => {
+      calls.push(url.hostname);
+      return { status: 302, headers: { location: "http://two.example/next" }, stream: Readable.from([]) };
+    },
+  });
+  const second = await Promise.race([
+    redirectPending.then(() => ({ ok: true }), (e) => ({ e })),
+    new Promise((resolve) => setTimeout(() => resolve({ pending: true }), 250)),
+  ]);
+  assert.equal(second.pending, undefined, "the redirect hop's DNS was outside the deadline");
+  assert.match(second.e.message, /timed out/);
+  assert.deepEqual(calls, ["one.example"]);
+  releaseSecond();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.deepEqual(calls, ["one.example"], "the hop whose DNS resolved late was not requested");
+});
+
+test("a pre-header timeout destroys the request and its socket", async () => {
+  const socket = { destroyed: false, destroy() { this.destroyed = true; } };
+  const req = { destroyed: false, socket, destroy() { this.destroyed = true; } };
+  let registered = false;
+  await assert.rejects(fetchPublicBytes("http://ok.example/hang", {
+    timeoutMs: 30,
+    lookup: async () => [{ address: "1.2.3.4" }],
+    request: (url, ip, opts) => {
+      assert.equal(ip, "1.2.3.4");
+      assert.equal(url.hostname, "ok.example");
+      registered = true;
+      opts.register(req);
+      return new Promise(() => {});
+    },
+  }), /timed out/);
+  assert.equal(registered, true);
+  assert.equal(req.destroyed, true, "request.destroy did not run");
+  assert.equal(socket.destroyed, true, "the socket was not destroyed");
+});
+
+test("unpaid --serve refuses local file inputs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sfw-serve-"));
+  const secret = join(dir, "secret.jpg");
+  const missing = join(dir, "missing.jpg");
+  await writeFile(join(dir, "hello.json"), TINY);
+  await writeFile(secret, PNG_1);
+  utimesSync(secret, 1, Date.now() / 1000);
+  const probe = createServer();
+  const port = await listen(probe);
+  await new Promise((resolve) => probe.close(resolve));
+  const child = spawn(process.execPath, [BIN, "--graphs", dir, "--serve", `127.0.0.1:${port}`, "--out", join(dir, "out")], {
+    env: { ...process.env, NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: "http://127.0.0.1:9" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (c) => { stderr += c; });
+  const rpc = async (method, params) => {
+    const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, ...(params ? { params } : {}) }),
+    });
+    return res.json();
+  };
+  try {
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("server did not listen\n" + stderr)), 8000);
+      const wait = () => {
+        if (stderr.includes("MCP over HTTP") && stderr.includes("free")) { clearTimeout(t); resolve(); }
+      };
+      child.stderr.on("data", wait);
+      child.once("exit", (code) => { clearTimeout(t); reject(new Error("exited " + code + "\n" + stderr)); });
+    });
+    assert.match(stderr, /free/);
+    assert.doesNotMatch(stderr, /charging/);
+    const list = await rpc("tools/list");
+    const sfw = list.result.tools.find((t) => t.name === "sfw_check");
+    assert.match(sfw.inputSchema.properties.image.description, /does not read local files/);
+    assert.doesNotMatch(sfw.inputSchema.properties.image.description, /file path/);
+    assert.doesNotMatch(sfw.inputSchema.properties.video.description, /file path/);
+    const existing = await rpc("tools/call", { name: "sfw_check", arguments: { image: secret } });
+    const absent = await rpc("tools/call", { name: "sfw_check", arguments: { image: missing } });
+    assert.equal(existing.error.code, -32602);
+    assert.equal(absent.error.code, -32602);
+    assert.match(existing.error.message, /does not read local files/);
+    assert.equal(existing.error.message, absent.error.message);
+    assert.doesNotMatch(existing.error.message, /not found/);
+    assert.equal(statSync(secret).atimeMs, 1000, "unpaid --serve stat'd a local file");
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => {
+      const t = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 1000);
+      child.once("exit", () => { clearTimeout(t); resolve(); });
+    });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a DASH or HLS manifest cannot make ffprobe or ffmpeg open another local file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sfw-manifest-"));
+  const clip = join(dir, "clip.mp4");
+  const secret = join(dir, "secret.mp4");
+  const orig = mediaProcs.spawn;
+  const argvs = [];
+  mediaProcs.spawn = (cmd, args, opts) => {
+    argvs.push([cmd, ...args]);
+    return orig(cmd, args, opts);
+  };
+  try {
+    execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=black:s=16x16:d=0.4", "-c:v", "mpeg4", clip], { stdio: "ignore" });
+    execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=black:s=16x16:d=0.2", "-c:v", "mpeg4", secret], { stdio: "ignore" });
+    utimesSync(secret, 1, Date.now() / 1000);
+    const frames = await sampleVideoFrames(clip, 1, { timeoutMs: 15000 });
+    assert.equal(frames.length, 1);
+    assert.match(frames[0], /^data:image\/jpeg;base64,/);
+    assert.ok(argvs.length >= 2, "ffprobe and ffmpeg should both run for a real mp4");
+    for (const argv of argvs) {
+      const at = argv.indexOf("-protocol_whitelist");
+      assert.notEqual(at, -1, argv.join(" "));
+      assert.equal(argv[at + 1], "pipe");
+      const fmt = argv.indexOf("-f");
+      assert.notEqual(fmt, -1);
+      assert.ok(["mp4", "mov", "webm", "matroska"].includes(argv[fmt + 1]), argv.join(" "));
+      assert.ok(argv.includes("pipe:0"));
+      assert.equal(argv.some((a) => String(a).includes(secret)), false);
+    }
+    assert.ok(["mp4", "mov"].includes(videoContainer(await readFile(clip))), "the generated clip was not detected as mp4 or mov");
+    const before = statSync(secret).atimeMs;
+    assert.equal(before, 1000);
+    const m3u8 = `#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:0.2,\n${secret}\n#EXT-X-ENDLIST\n`;
+    const mpd = `<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT0.2S" minBufferTime="PT1S"><Period><AdaptationSet mimeType="video/mp4"><Representation id="1" bandwidth="500000"><BaseURL>${secret}</BaseURL></Representation></AdaptationSet></Period></MPD>`;
+    const spawned = argvs.length;
+    for (const body of [m3u8, mpd]) {
+      const url = "data:application/octet-stream;base64," + Buffer.from(body).toString("base64");
+      await assert.rejects(sampleVideoFrames(url, 1, { timeoutMs: 5000 }), /mp4, mov, webm, or matroska/);
+    }
+    assert.equal(argvs.length, spawned, "ffmpeg was started for a manifest");
+    assert.equal(statSync(secret).atimeMs, before, "the manifest's local target was opened");
+  } finally {
+    mediaProcs.spawn = orig;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("still images skip ffprobe and ffmpeg, including a stdio local file", async () => {

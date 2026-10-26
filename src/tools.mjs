@@ -797,7 +797,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
  * mode owns stdout. `catalogTimeoutMs` overrides the catalog fetch timeout.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -894,7 +894,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   // They stay off an empty directory: with no graph loaded there is nothing to serve.
   if (tools.length) {
     const humanize = tools.find((t) => t.name === HUMANIZE_TOOL);
-    for (const b of builtinTools({ spendSource, humanize, hosted })) tools.push(b);
+    for (const b of builtinTools({ spendSource, humanize, hosted, remote })) tools.push(b);
   }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
@@ -1017,7 +1017,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (tool.builtin) {
         const t0 = Date.now();
         const result = await tool.run(params.arguments || {}, {
-          apiKey, payment, baseUrl, registry, hosted,
+          apiKey, payment, baseUrl, registry, hosted, remote,
           humanize: byName.get(HUMANIZE_TOOL),
           catalogs: registry.catalogs,
         });
