@@ -390,7 +390,8 @@ context, guidance, and `maxChars` actually sent. Each call's `max_tokens` is
 sized from that request: `maxChars`, or the draft's length when `maxChars` is
 omitted, plus a small slack. The decider also reserves tokens for its ranking JSON and for GLM reasoning, which shares that max_tokens budget. Tokens are estimated at about 3.5 bytes each. The
 priced worst case is every writer once, one extra retry, the decider, and a second decider pass when
-a protected span can be repaired. When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
+a protected span can be repaired or the call can ask the decider to confirm one fitting rewrite (a title, a length cap, or a required ending).
+When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
 On a hosted payment the quote caps what the customer pays. A step whose estimate or invoice would push the spend past
 the quote is skipped. A skipped writer step ends as a partial result, or with nothing
 owed when nothing was sent. A skipped or unusable decider is an error, not the original draft returned as a successful comment. The deposit is 12% above that priced charge, at least $0.001,

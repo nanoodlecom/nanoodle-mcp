@@ -10,9 +10,11 @@
  * to hosted payments. Direct-wallet spending has no cap and is not refunded.
  *
  * The priced worst case is only a little above a typical run: one call per
- * writer, one extra retry, the decider, and a repair review when a protected
- * span can be repaired. When Cydonia fails and the Starry Ocean fallback runs,
- * both calls are charged. Output tokens are sized from the request (maxChars,
+ * writer, one extra retry, the decider, and a second decider pass when a
+ * protected span can be repaired or the call can ask the decider to confirm
+ * one fitting rewrite (a title, a maxChars cap, or a required ending).
+ * When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
+ * Output tokens are sized from the request (maxChars,
  * or the draft length) plus a small slack, not from the model's output cap.
  * The decider's cap adds the ranking JSON and GLM reasoning tokens, which
  * share max_tokens. Token counts are a realistic estimate, bytes / 3.5. The deposit is that
@@ -189,7 +191,7 @@ function stageCalls(graph, spec, prices) {
     : writerForwardByteCap(writerOut) + (spec.spanBytes || 0) + (spec.endingExtra || 0);
   const judgeBytes = bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes + seps + 5 * candidateBytes;
   calls.push({ model: judge.fields.model, inTokens: estimateTokensFromBytes(judgeBytes), outTokens: judgeOut, rate: judgeRate });
-  if (spec.repair) {
+  if (needsSecondDecider(spec)) {
     const longLabel = Math.max(...["k2", "k3", "k4", "k5", "k6"].map((id) => bytes(byId.get(id).fields.sep)));
     const reviewBytes = bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes
       + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel
@@ -202,6 +204,16 @@ function stageCalls(graph, spec, prices) {
 
 function callUsd(call) {
   return call.inTokens * call.rate[0] + call.outTokens * call.rate[1];
+}
+
+/**
+ * A second decider call. Span repair uses it when every rewrite drops a
+ * protected phrase. A title, a maxChars cap, or a required ending uses it
+ * when the first ranking is unusable and one rewrite still fits: that check
+ * is a paid call, so the quote reserves it up front.
+ */
+function needsSecondDecider(spec) {
+  return !!(spec.repair || spec.title || spec.maxChars != null || spec.ending === "question" || spec.ending === "keep_last");
 }
 
 /**
@@ -231,7 +243,7 @@ export function humanizeCeilingSpecs() {
       writerBytes: draftBytes,
       noteExtraBytes: plainNote ? 2 + bytes(plainNote) : 0,
       retryText: longestRetry([], null, "keep_last", true),
-      repair: false,
+      repair: true,
       spans: [],
       ending: "keep_last",
     },
@@ -251,7 +263,7 @@ export function humanizeCeilingSpecs() {
       writerBytes: draftBytes,
       noteExtraBytes: capNote ? 2 + bytes(capNote) : 0,
       retryText: longestRetry([], MAX_CHARS_LIMIT, "question", true),
-      repair: false,
+      repair: true,
       spans: [],
       ending: "question",
     },
@@ -297,6 +309,7 @@ function specFromArgs(graph, args) {
     maxChars,
     retryText: longestRetry(spans, maxChars, ending, title),
     repair: spans.length > 0,
+    title,
     spans,
     ending,
   };

@@ -2111,7 +2111,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const judgeCap = requestOutputTokenCap(state.maxChars, state.draft, { judge: true });
     const body = { ...req.body, messages, max_tokens: judgeCap };
     const held = hold("review", letter, body.model, body.messages, body.max_tokens);
-    if (held == null) return { ok: false };
+    if (held == null) return { ok: false, skipped: true };
     const rec = { letter, kind: "review", model: body.model, status: null, paid: false, paymentStarted: false, usd: null };
     state.attempts.push(rec);
     const outer = req.signal || null;
@@ -2597,6 +2597,9 @@ async function confirmFittingRow(row, state) {
     verdict = await state.reviewRepair(row.text, row.writer, row.model);
   } catch {
     return { error: failureMessage(state, "the decider could not check the rewrite.") };
+  }
+  if (verdict && verdict.skipped) {
+    return { error: failureMessage(state, "the decider's check of the fitting rewrite was skipped because it would have cost more than this request's deposit.") };
   }
   if (!verdict || verdict.ok !== true || !acceptableDelivery(row.text, state)) {
     return { error: failureMessage(state, "the rewrite was not confirmed faithful and safe.") };

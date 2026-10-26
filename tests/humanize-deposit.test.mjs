@@ -91,26 +91,29 @@ test("short, typical, and maximum-length deposits cover their own worst case and
   assert.ok(typical < maximum, `${typical} should be under the capped request`);
   assert.ok(typical <= 0.012, `typical deposit ${typical} is above $0.012`);
   assert.equal(typical.toFixed(8), "0.00830015");
-  assert.equal(maximum.toFixed(8), "0.01981097");
+  assert.equal(maximum.toFixed(8), "0.02669910");
   const ceiling = humanizeCeilingDepositUsd(graph);
   assert.ok(maximum <= ceiling + 1e-12);
-  assert.equal(ceiling.toFixed(8), "0.04871089");
+  assert.equal(ceiling.toFixed(8), "0.05012747");
   assert.equal(ceiling.toFixed(8), graph.x402.usd.toFixed(8));
 });
 
-test("the repair path is priced only when a protected span can be repaired, and the deposit covers it", () => {
+test("a second decider pass is priced for a repair, a title, a length cap, or a required ending", () => {
   const plain = { Draft: REPAIR.Draft, Context: REPAIR.Context };
-  const kept = covers(REPAIR);
-  const without = covers(plain);
-  assert.ok(kept > without, "the second decider pass raises the deposit");
+  const glm = (args) => humanizeStageBudget(graph, args).calls.filter((c) => c.model === "z-ai/glm-5.3").length;
+  assert.equal(glm(plain), 1);
+  for (const args of [REPAIR, { ...plain, title: true }, { ...plain, maxChars: 80 }, { ...plain, ending: "question" }, { ...plain, ending: "keep_last" }]) {
+    assert.equal(glm(args), 2);
+    assert.ok(covers(args) > covers(plain), JSON.stringify(args));
+  }
   assert.ok(humanizeChargeUsd(graph, REPAIR) > humanizeChargeUsd(graph, plain));
-  assert.ok(kept <= humanizeCeilingDepositUsd(graph) + 1e-12);
 });
 
-test("maxChars lowers the deposit and is the max_tokens the writer request sends", async () => {
+test("maxChars is the writer max_tokens, and the deposit reserves the confirm pass", async () => {
   const open = { Draft: "a".repeat(200), Context: "c".repeat(200) };
   const capped = { ...open, maxChars: 40 };
-  assert.ok(covers(capped) < covers(open));
+  assert.ok(requestOutputTokenCap(40, open.Draft) < requestOutputTokenCap(null, open.Draft));
+  assert.ok(covers(capped) > covers(open), "a length cap adds the decider's confirm pass");
   const record = {
     A: { model: "qwen/qwen3.8-27b-novelist" },
     B: { model: "deepseek/deepseek-v4.1-flash-1017" },
@@ -249,7 +252,7 @@ test("the quote is at least the max charge, including a restore that grows 1732 
   const emberDeposit = humanizeDepositUsd(graph, ember);
   assert.ok(emberDeposit >= emberCharge);
   const ceiling = humanizeCeilingDepositUsd(graph);
-  assert.equal(ceiling.toFixed(8), "0.04871089");
+  assert.equal(ceiling.toFixed(8), "0.05012747");
   assert.ok(emberDeposit <= ceiling);
   assert.ok(grewDeposit <= ceiling);
   assert.equal(graph.x402.usd, ceiling);
