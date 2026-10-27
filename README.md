@@ -642,7 +642,9 @@ In charge mode each call's deposit is quoted before payment and is a cap on
 the charge. `subnano_comment` sizes every stage's max_tokens from that draft
 (about 1.5× its length, plus a little slack), estimates input at about one
 token per 3.5 bytes plus a small margin, and caps re-asks at the same output
-size. The gate and the funny judge read the comment clipped to that size.
+size. The decider keeps 256 ranking-JSON tokens and 512 GLM reasoning tokens
+on top of that writer cap, and the humanize hold inside the call is quoted at
+those caps. The gate and the funny judge read the comment clipped to that size.
 Settlement is the metered cost plus 20%, and never more than the quote. Before
 each paid stage the run stops when the remaining budget cannot cover it,
 returns what already finished, and charges only the calls that ran.

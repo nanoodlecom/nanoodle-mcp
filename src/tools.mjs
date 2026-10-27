@@ -424,12 +424,20 @@ export function renderCost(rec) {
 }
 
 /**
+ * One rendered cost segment. The dollar figure contains a period (`$0.0011`),
+ * and a duration or "+" may follow it. The sentence period is the look-ahead,
+ * so a later run replaces the segment instead of gluing the next price onto
+ * the leftover fraction (`last run $0.0011.0026`).
+ */
+const OBSERVED_COST = /; last run (?:<\$0\.0001|\$\d+\.\d+\+?)(?:, ~(?:\d+m(?: \d+s)?|\d+s))?(?=\.)/;
+
+/**
  * Drop a previous "last run …" segment and insert the new one before the period,
  * matching buildDescription. Built-ins have no graph to rebuild the sentence from.
  */
 function withObservedCost(description, rec) {
   const cost = renderCost(rec);
-  const stripped = String(description).replace(/; last run [^.]*/, "");
+  const stripped = String(description).replace(OBSERVED_COST, "");
   if (!cost) return stripped;
   return stripped.replace(/(every call spends real credit from [^.;]+)/, `$1; ${cost}`);
 }
@@ -1042,7 +1050,16 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
         // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
         const prices = humanizePriceTable(registry.catalogs);
-        const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
+        // subnano_comment passes the caps it will send. The deposit has to
+        // reserve those caps even when the refined draft is shorter than the
+        // original, or the decider hold is skipped inside an exact quote.
+        const writerOutTokens = Number(params.maxTokens) > 0 ? Math.floor(Number(params.maxTokens)) : 0;
+        const judgeOutTokens = Number(params.judgeMaxTokens) > 0 ? Math.floor(Number(params.judgeMaxTokens)) : 0;
+        const quoted = humanizeDepositUsd(tool.wf.graph, args, {
+          prices,
+          ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
+          ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
+        });
         const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
