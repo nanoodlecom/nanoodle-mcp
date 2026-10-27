@@ -462,6 +462,62 @@ test("an unjudged fitting row is not marked faithful when the review throws or i
   assert.equal(trustedJson.ranked[0].reason, "ok");
 });
 
+test("a guard-dropped writer does not turn an unusable decider into a successful original", async () => {
+  const letters = ["A", "B", "C", "D", "E"];
+  const record = Object.fromEntries(letters.map((l) => [l, { model: "m-" + l, nodeId: "n-" + l }]));
+  const wf = { outputs: [{ nodeId: "judge", key: "out" }] };
+  const draft = "Thanks for the note.";
+  const echoWhy = "it echoed the guidance or the instructions";
+  const build = () => {
+    const nodes = { draft: { out: { text: draft } } };
+    for (const l of letters) {
+      const text = l === "A" ? "" : "rewrite " + l;
+      nodes["n-" + l] = { status: "done", out: { text } };
+    }
+    return { outputs: { out: "not json" }, nodes };
+  };
+  const run = async (extra) => {
+    const result = build();
+    const note = rebuildHumanizeResult(wf, result, record, {});
+    assert.match(note, /not valid JSON/);
+    assert.equal(result.deciderUnusable, true);
+    const fb = await applyHumanizeFallback(wf, result, record, {
+      billing: "key",
+      attempts: [{ status: 200, usd: 0.01 }],
+      dropped: { A: { why: echoWhy, reasons: ["echo"] } },
+      ...extra,
+    });
+    return { fb, parsed: JSON.parse(result.outputs.out) };
+  };
+  const malformed = await run();
+  assert.match(malformed.fb.error, /not valid JSON with a ranked list/);
+  assert.equal(malformed.parsed.winner, "ORIGINAL");
+  assert.equal(malformed.parsed.ranked.find((r) => r.writer === "A").reason, echoWhy);
+  assert.ok(malformed.parsed.ranked.filter((r) => r.writer !== "A").every((r) => r.reason.startsWith("not judged")));
+  const truncated = await run({ judgeTruncated: true });
+  assert.match(truncated.fb.error, /cut off before it finished a ranked list/);
+  const skipped = await run({ skippedForBudget: [{ kind: "decider" }] });
+  assert.match(skipped.fb.error, /decider was skipped/);
+
+  const judged = build();
+  judged.outputs.out = JSON.stringify({
+    winner: "B", text: "x", why: "specific",
+    ranked: letters.map((writer) => ({ writer, faithful: writer !== "A", disqualified: writer === "A", reason: "ok" })),
+  });
+  rebuildHumanizeResult(wf, judged, record, {});
+  assert.equal(judged.deciderUnusable, false);
+  const kept = await applyHumanizeFallback(wf, judged, record, {
+    billing: "key",
+    attempts: [{ status: 200, usd: 0.01 }],
+    dropped: { A: { why: echoWhy, reasons: ["echo"] } },
+  });
+  assert.equal(kept, null);
+  const keptJson = JSON.parse(judged.outputs.out);
+  assert.equal(keptJson.winner, "B");
+  assert.equal(keptJson.text, "rewrite B");
+  assert.equal(keptJson.ranked.find((r) => r.writer === "A").reason, echoWhy);
+});
+
 test("an old-style call is unchanged: same shape, same text, no new prompt, same price", async (t) => {
   const draft = "Thanks for sharing this.";
   const { json, texts, seen, judgePrompt, result } = await runHumanize(t, (body, ctx) => {

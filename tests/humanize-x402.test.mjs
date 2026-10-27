@@ -740,9 +740,10 @@ const invoiceOf = (id, usd) => new Response(JSON.stringify({
   payment: { paymentId: id, accepted: [{ scheme: "nano", payTo: "nano_1stub", maxAmountRequired: "1000", maxAmountRequiredUSD: usd, completeUrl: "http://x/api/x402/complete/" + id }] },
 }), { status: 402, headers: { "content-type": "application/json" } });
 
-test("paid retry resends the billed 306-token request, not the original 1600-token request", async () => {
+test("paid retry resends the billed judge request, not the original 1600-token request", async () => {
   const draft = "hello";
-  assert.equal(requestOutputTokenCap(null, draft, { judge: true }), 306);
+  const judgeCap = requestOutputTokenCap(null, draft, { judge: true });
+  assert.equal(judgeCap, 818);
   const original = JSON.stringify({
     model: "z-ai/glm-5.3",
     messages: [{ role: "user", content: draft }],
@@ -777,8 +778,8 @@ test("paid retry resends the billed 306-token request, not the original 1600-tok
   const chats = seen.filter((s) => s.includes("glm-5.3"));
   assert.equal(chats.length, 2, "the billed request and the settle-only replay");
   assert.equal(chats[0], chats[1], "the replay body is the billed body, byte for byte");
-  assert.equal(JSON.parse(chats[0]).max_tokens, 306);
-  assert.equal(JSON.parse(chats[1]).max_tokens, 306);
+  assert.equal(JSON.parse(chats[0]).max_tokens, judgeCap);
+  assert.equal(JSON.parse(chats[1]).max_tokens, judgeCap);
   assert.equal(JSON.parse(original).max_tokens, 1600);
   assert.notEqual(chats[0], original);
 
@@ -808,8 +809,8 @@ test("paid retry resends the billed 306-token request, not the original 1600-tok
   assert.equal(second.status, 200);
   assert.equal(seen2.length, 2);
   assert.equal(seen2[0], seen2[1]);
-  assert.equal(JSON.parse(seen2[0]).max_tokens, 306);
-  assert.equal(JSON.parse(seen2[1]).max_tokens, 306);
+  assert.equal(JSON.parse(seen2[0]).max_tokens, judgeCap);
+  assert.equal(JSON.parse(seen2[1]).max_tokens, judgeCap);
 });
 
 test("an invoice of $0.01 is not paid against a $0.001 budget", async () => {
@@ -943,7 +944,26 @@ async function refuseUnknownUsd({ budgetUsd, kind }) {
 
 test("an invoice with no USD price is refused before payment on a $0.001 budget", async () => {
   await refuseUnknownUsd({ budgetUsd: 0.001, kind: "writer" });
-  await refuseUnknownUsd({ budgetUsd: 0.001, kind: "decider" });
+  // The decider's output cap does not fit a $0.001 hold, so that request is
+  // not sent. A budget that covers the hold still refuses the unpriced invoice.
+  await refuseUnknownUsd({ budgetUsd: 0.01, kind: "decider" });
+});
+
+test("a $0.001 budget does not send the decider when its output cap does not fit", async () => {
+  const payments = [];
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.001,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { payments.push(inv.paymentId); },
+    fetch: async () => invoiceNoUsd("payDecider"),
+  });
+  const r = await hf.fetch(CHAT, { method: "POST", headers: x402Headers, body: chatBody("z-ai/glm-5.3", "hello") });
+  assert.equal(payments.length, 0);
+  assert.equal((await r.json()).choices[0].message.content, "");
+  assert.equal(hf.state.attempts.length, 0);
+  assert.ok(hf.state.skippedForBudget.some((s) => s.kind === "decider"));
 });
 
 test("an invoice with no USD price is refused on a direct wallet too", async () => {
@@ -1189,34 +1209,52 @@ test("a re-ask invoice with no USD price is not paid and the first answer is kep
 });
 
 test("a repair invoice with no USD price is not paid", async () => {
-  for (const budgetUsd of [0.001, null]) {
-    const payments = [];
-    const hf = humanizeFetch({
-      record: pricedRecord,
-      draft: "hello",
-      budgetUsd,
-      prices: HUMANIZE_MODEL_PRICES,
-      payment: async (inv) => { payments.push(inv.paymentId); },
-      fetch: async () => invoiceNoUsd("payReview"),
-    });
-    hf.state.judgeReq = {
-      url: CHAT,
-      headers: x402Headers,
-      body: { model: "z-ai/glm-5.3", messages: [{ role: "user", content: "rank" }] },
-      user: "rank",
-    };
-    const verdict = await hf.state.reviewRepair("fixed hello", "A", pricedRecord.A.model);
-    assert.equal(verdict.ok, false);
-    assert.deepEqual(payments, [], `budget ${budgetUsd}: repair does not pay an unpriced invoice`);
-    assert.equal(hf.state.paidIds.has("payReview"), false);
-    assert.equal(hf.state.meteredUsd, 0);
-    assert.equal(hf.state.committedUsd, 0);
-    assert.equal(hf.state.costUnknown, false);
-    const rec = hf.state.attempts.find((a) => a.kind === "review");
-    assert.ok(rec, "the review reached the invoice");
-    assert.equal(rec.priceUnknown, true);
-    assert.equal(rec.paymentStarted, false);
-  }
+  const payments = [];
+  const skipped = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: 0.001,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { payments.push(inv.paymentId); },
+    fetch: async () => invoiceNoUsd("payReview"),
+  });
+  skipped.state.judgeReq = {
+    url: CHAT,
+    headers: x402Headers,
+    body: { model: "z-ai/glm-5.3", messages: [{ role: "user", content: "rank" }] },
+    user: "rank",
+  };
+  const skippedVerdict = await skipped.state.reviewRepair("fixed hello", "A", pricedRecord.A.model);
+  assert.equal(skippedVerdict.ok, false);
+  assert.deepEqual(payments, []);
+  assert.equal(skipped.state.attempts.find((a) => a.kind === "review"), undefined);
+  assert.ok(skipped.state.skippedForBudget.some((s) => s.kind === "review"));
+
+  const hf = humanizeFetch({
+    record: pricedRecord,
+    draft: "hello",
+    budgetUsd: null,
+    prices: HUMANIZE_MODEL_PRICES,
+    payment: async (inv) => { payments.push(inv.paymentId); },
+    fetch: async () => invoiceNoUsd("payReview"),
+  });
+  hf.state.judgeReq = {
+    url: CHAT,
+    headers: x402Headers,
+    body: { model: "z-ai/glm-5.3", messages: [{ role: "user", content: "rank" }] },
+    user: "rank",
+  };
+  const verdict = await hf.state.reviewRepair("fixed hello", "A", pricedRecord.A.model);
+  assert.equal(verdict.ok, false);
+  assert.deepEqual(payments, [], "repair does not pay an unpriced invoice");
+  assert.equal(hf.state.paidIds.has("payReview"), false);
+  assert.equal(hf.state.meteredUsd, 0);
+  assert.equal(hf.state.committedUsd, 0);
+  assert.equal(hf.state.costUnknown, false);
+  const rec = hf.state.attempts.find((a) => a.kind === "review");
+  assert.ok(rec, "the review reached the invoice");
+  assert.equal(rec.priceUnknown, true);
+  assert.equal(rec.paymentStarted, false);
 });
 
 test("a rejected decider payment records the invoice before rethrowing", async () => {
