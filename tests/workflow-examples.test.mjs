@@ -270,6 +270,11 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.ok(ceiling <= ceilingCharge * 1.15 + 1e-9, "the margin stays inside 15%");
     assert.equal(mounted.x402.usd.toFixed(8), ceiling.toFixed(8), "the pinned ceiling is that deposit");
     assert.ok(ceilingCharge <= mounted.x402.usd + 1e-12, `worst case $${ceilingCharge} exceeds the deposit`);
+    // The file this server loaded is already the #102 pin. It is served unchanged.
+    const servedPin = JSON.parse(mounted.rawText).x402.usd;
+    assert.equal(servedPin.toFixed(8), "0.05428204");
+    assert.ok(servedPin + 1e-12 >= ceiling, "the served graph pin is at least the computed ceiling");
+    assert.equal(mounted.rawText, await readFile(join(dir, "humanize-comment.noodle-graph.json"), "utf8"));
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);

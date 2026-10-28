@@ -37,6 +37,13 @@ test("a stale pin below the computed ceiling is raised to the ceiling at load", 
     assert.equal(ceiling.toFixed(8), "0.05428204");
     const tool = registry.tools.find((t) => t.name === "humanize-comment");
     assert.equal(tool.x402.usd, ceiling);
+    const served = JSON.parse(tool.rawText);
+    assert.equal(served.x402.usd.toFixed(8), "0.05428204");
+    assert.ok(served.x402.usd + 1e-12 >= ceiling);
+    const onDisk = JSON.parse(await readFile(join(dir, "humanize-comment.noodle-graph.json"), "utf8"));
+    assert.equal(onDisk.x402.usd, STALE, "the file on disk stays the stale pin");
+    onDisk.x402.usd = served.x402.usd;
+    assert.deepEqual(served, onDisk, "only the served pin changes");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -62,6 +69,37 @@ test("with no computable ceiling the quote is refused, and the gate never uses t
     assert.throws(() => registry.quoteDeposit("humanize-comment", ARGS), /refusing/);
     const { callTool } = gate.wrapRegistry(registry);
     await assert.rejects(callTool({ name: "humanize-comment", arguments: ARGS }), /refusing/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a pretty-printed stale pin is served as 0.05428204 and the rest of the file is unchanged", async () => {
+  const original = await readFile(FIXTURE, "utf8");
+  assert.match(original, /"usd": 0\.05428204/);
+  const stale = original.replace('"usd": 0.05428204', '"usd": 0.01963166');
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-pin-pretty-"));
+  await writeFile(join(dir, "humanize-comment.noodle-graph.json"), stale);
+  try {
+    const registry = await loadTools({ dirs: [dir], apiKey: "test-key", hosted: true, outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.tools.find((t) => t.name === "humanize-comment");
+    assert.equal(tool.rawText, original);
+    assert.equal(JSON.parse(tool.rawText).x402.usd.toFixed(8), "0.05428204");
+    assert.equal(tool.x402.usd.toFixed(8), "0.05428204");
+    const ceiling = humanizeCeilingDepositUsd(JSON.parse(original));
+    assert.ok(tool.x402.usd + 1e-12 >= ceiling);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a pin at or above the ceiling is served byte for byte", async () => {
+  const graph = JSON.parse(await readFile(FIXTURE, "utf8"));
+  graph.x402.usd = 0.06;
+  const body = JSON.stringify(graph);
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-pin-high-"));
+  await writeFile(join(dir, "humanize-comment.noodle-graph.json"), body);
+  try {
+    const registry = await loadTools({ dirs: [dir], apiKey: "test-key", hosted: true, outDir: join(dir, "out"), log: () => {} });
+    const tool = registry.tools.find((t) => t.name === "humanize-comment");
+    assert.equal(tool.rawText, body);
+    assert.equal(tool.x402.usd, 0.06);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
