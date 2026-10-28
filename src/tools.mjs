@@ -18,7 +18,7 @@ import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
-import { humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
+import { humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
@@ -1061,6 +1061,13 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
         });
         const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
+        // Keep the decider's priced worst case aside until it starts, so a
+        // writer that meters high on a long context cannot crowd it out.
+        const deciderReserveUsd = quoted != null ? (humanizeDeciderReserveUsd(tool.wf.graph, args, {
+          prices,
+          ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
+          ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
+        }) ?? 0) : 0;
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
           record: tool.humanize,
@@ -1074,6 +1081,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           payment: apiKey ? null : payment,
           baseUrl: baseUrl || "https://nano-gpt.com",
           budgetUsd: hosted ? (quoted ?? (pin != null && pin > 0 ? pin : null)) : null,
+          deciderReserveUsd: hosted ? deciderReserveUsd : 0,
           prices,
           // subnano_comment sizes this humanize run from the request. A normal
           // humanize-comment call leaves these unset, and the v2.8 caps apply.
