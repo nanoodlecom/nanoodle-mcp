@@ -1,5 +1,6 @@
-// Long-context humanize-comment calls: the quote covers the decider's worst
-// case, and writer re-asks cannot spend the room the decider needs.
+// Long-context humanize-comment calls: the quote prices the decider's
+// estimated worst case, and admission counts that estimate as headroom before
+// a writer re-ask is allowed. The headroom is an estimate, not money set aside.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, copyFile, readFile, rm } from "node:fs/promises";
@@ -34,19 +35,19 @@ test("a long-context quote prices the decider from the caller's context and cand
   assert.ok(decider[0].inTokens >= Math.ceil(5 * budget.candidateBytes / 3.5), "and the five candidate rewrites are in it");
   const reserve = humanizeDeciderReserveUsd(graph, LONG);
   const deposit = humanizeDepositUsd(graph, LONG);
-  assert.ok(reserve * HUMANIZE_SETTLE_MARKUP < deposit, "the decider fits inside the deposit");
+  assert.ok(reserve * HUMANIZE_SETTLE_MARKUP < deposit, "the decider estimate fits inside the deposit");
   assert.ok(deposit >= humanizeChargeUsd(graph, LONG));
-  // The reserve grows with the context, so a long call is not priced like a short one.
+  // The decider estimate grows with the context, so a long call is not priced like a short one.
   assert.ok(humanizeDeciderReserveUsd(graph, SHORT) < reserve);
 });
 
-test("a short call's quote is not inflated by the decider reserve", () => {
+test("a short call's quote is not inflated by the decider estimate", () => {
   const deposit = humanizeDepositUsd(graph, SHORT);
   // main before this change quoted 0.00358265 for this call.
   assert.ok(deposit <= 0.00358265 * 1.01, `short deposit ${deposit} grew more than 1%`);
 });
 
-test("writer re-asks cannot spend the decider's reserve", async () => {
+test("a writer is not admitted when it would not fit beside the decider headroom estimate", async () => {
   const record = {
     A: { model: "qwen/qwen3.8-27b-novelist" },
     B: { model: "deepseek/deepseek-v4.1-flash-1017" },
@@ -59,16 +60,16 @@ test("writer re-asks cannot spend the decider's reserve", async () => {
   const url = "http://x/api/v1/chat/completions";
   const body = (model) => ({ method: "POST", body: JSON.stringify({ model, max_tokens: 600, messages: [{ role: "user", content: "a".repeat(10000) }] }) });
   // Each writer holds ~$0.00065 and meters $0.001. The first fits next to the
-  // $0.0072 reserve; the second would only fit if it could spend the reserve.
+  // $0.0072 headroom estimate; the second only fits if the estimate is ignored.
   await hf.fetch(url, body(record.A.model));
   await hf.fetch(url, body(record.B.model));
-  assert.ok(hf.state.skippedForBudget.some((s) => s.kind === "primary"), "the writer that would eat the reserve is skipped");
+  assert.ok(hf.state.skippedForBudget.some((s) => s.kind === "primary"), "the writer that does not fit beside the headroom estimate is skipped");
   await hf.fetch(url, body("z-ai/glm-5.3"));
-  assert.equal(hf.state.skippedForBudget.some((s) => s.kind === "decider"), false, "the decider still runs");
-  assert.equal(hf.state.deciderReserveUsd, 0, "the decider's own hold replaced the reserve");
+  assert.equal(hf.state.skippedForBudget.some((s) => s.kind === "decider"), false, "in this run the decider is admitted");
+  assert.equal(hf.state.deciderReserveUsd, 0, "the decider's own hold replaced the headroom estimate");
 });
 
-test("hosted long-context call: near-copy re-asks run, and the decider is not skipped", async () => {
+test("hosted long-context call under dense billing: re-asks run and the decider is admitted", async () => {
   const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-long-"));
   const seen = [];
   // Bill each call at 3 bytes per token on its input and the full max_tokens on

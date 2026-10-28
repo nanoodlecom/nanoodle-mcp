@@ -388,7 +388,7 @@ graph JSON:
 **humanize-comment** quotes each request on its own. The quote is built from the draft,
 context, guidance, and `maxChars` actually sent. Each call's `max_tokens` is
 sized from that request: `maxChars`, or the draft's length when `maxChars` is
-omitted, plus a small slack. The decider also reserves tokens for its ranking JSON and for GLM reasoning, which shares that max_tokens budget. Tokens are estimated at about 3.5 bytes each; the draft, context, and guidance the decider reads are priced at 2.5 bytes per token, so its reserve grows with context length. A hosted run keeps the decider's priced cost aside until the decider starts, so writer re-asks cannot spend it. The
+omitted, plus a small slack. The decider also reserves tokens for its ranking JSON and for GLM reasoning, which shares that max_tokens budget. Tokens are estimated at about 3.5 bytes each; the draft, context, and guidance the decider reads are priced at 2.5 bytes per token, so its estimate grows with context length. Until the decider starts, a hosted run admits a writer, fallback, or re-ask only if it fits the deposit with the decider's estimated cost still counted. That estimate is admission headroom, not money set aside, so it makes a skipped decider less likely but does not rule it out. The
 priced worst case is every writer once, one extra retry, the decider, and a second decider pass when
 a protected span can be repaired or the call can ask the decider to confirm one fitting rewrite (a title, a length cap, or a required ending).
 When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.

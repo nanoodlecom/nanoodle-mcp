@@ -1329,10 +1329,13 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     rec.holdReleased = false;
   };
   /**
-   * Provider USD kept aside for the decider. A writer step (primary, fallback,
-   * re-ask, guard) has to fit with this reserve still held, so the decider is
-   * never the step that no longer fits. The decider and its review do not
-   * count it against themselves.
+   * Estimated decider headroom (provider USD) for admission. A writer step
+   * (primary, fallback, re-ask, guard) is admitted only if it fits with this
+   * estimate counted, which makes it less likely that the decider is the step
+   * that no longer fits. It is an estimate, not money set aside: no funds are
+   * held for it, and a writer that meters above its own hold can still leave
+   * the decider short. The decider and its review do not count it against
+   * themselves.
    */
   const deciderRoom = (kind) => (kind === "decider" || kind === "review" ? 0 : state.deciderReserveUsd);
   /**
@@ -1479,7 +1482,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
    */
   const hold = (kind, letter, model, messages, outTokens) => {
     const r = holdInner(kind, letter, model, messages, outTokens);
-    // The decider has started: its own hold replaces the up-front reserve.
+    // The decider has started: its own hold replaces the headroom estimate.
     if (r != null && kind === "decider") state.deciderReserveUsd = 0;
     return r;
   };

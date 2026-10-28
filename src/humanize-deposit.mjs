@@ -397,9 +397,11 @@ export function humanizeStageBudget(graph, args, opts = {}) {
 }
 
 /**
- * Provider USD the run keeps aside for the decider (and its second pass) until
- * the decider starts, so writers, fallbacks, and re-asks cannot spend it.
- * Null when a model has no price.
+ * Estimated provider USD for the decider (and its second pass), used as
+ * headroom in the run's admission checks: until the decider starts, a writer,
+ * fallback, or re-ask is admitted only if it fits with this estimate counted.
+ * It is not money set aside and does not guarantee the decider runs; actual
+ * metered costs can still exceed it. Null when a model has no price.
  */
 export function humanizeDeciderReserveUsd(graph, args, opts = {}) {
   const prices = opts.prices || HUMANIZE_MODEL_PRICES;

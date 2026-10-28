@@ -1061,8 +1061,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
         });
         const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
-        // Keep the decider's priced worst case aside until it starts, so a
-        // writer that meters high on a long context cannot crowd it out.
+        // Estimated decider headroom for admission checks: until the decider
+        // starts, a writer step is admitted only if it fits with this estimate
+        // still counted. It is an estimate, not money set aside.
         const deciderReserveUsd = quoted != null ? (humanizeDeciderReserveUsd(tool.wf.graph, args, {
           prices,
           ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
