@@ -48,6 +48,17 @@ mid-session. To add or edit a tool:
 2. Restart the MCP server (in Claude Code: `/mcp` → reconnect, or restart the
    session) to pick it up.
 
+`subnano_comment` and `sfw_check` are built in whenever any graph is loaded.
+`subnano_comment` needs the `humanize-comment` graph: it refines a draft, runs
+that graph, then returns a post gate and a funny score with the cost of each
+step. `sfw_check` judges an image and sampled video frames; it has no switch
+to skip the check, and video sampling needs ffmpeg. In charge mode
+`subnano_comment`'s deposit is a cap on that request: max_tokens is about
+1.5× the draft, tokens are about bytes/3.5 plus a margin, and settlement is
+min(metered cost × 1.2, the quote). The run stops before a stage the remaining
+budget cannot cover. `sfw_check`'s deposit is the same kind of cap, one
+picture at a time.
+
 Local-media graphs (resize, combine, trim, extract-audio, video-frames,
 soundtrack) load and run headlessly — this package depends on nanoodle ≥ 0.9,
 which can execute them. They need ffmpeg on PATH for formats the pure-JS

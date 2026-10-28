@@ -242,8 +242,12 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
   const cmd = cmds.claude;
   const cards = tools.map((t) => {
     const info = infoByName.get(t.name);
-    const links = info ? `<span class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
-      ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>` : "";
+    // Built-ins have no graph file. Linking them would point at href="undefined"
+    // and a 404 /graph/<tool>.json.
+    const links = info && info.editorUrl && info.rawText
+      ? `<span class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
+        ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>`
+      : "";
     const author = info && info.x402 && info.x402.author
       ? `<p class="muted">author payout: <code>${esc(info.x402.author)}</code></p>` : "";
     const card = info && info.card;
@@ -440,7 +444,8 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
   lines.push(`## Tools`, ``);
   for (const t of tools) {
     lines.push(`- ${t.name}: ${t.description}`);
-    if (infoByName.has(t.name)) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
+    const info = infoByName.get(t.name);
+    if (info && info.rawText) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
     const sample = infoByName.get(t.name)?.card?.sample;
     if (sample) lines.push(
       `  included sample (${sample.label}): ${sample.text.replace(/\s+/g, " ")}`,

@@ -20,6 +20,7 @@ import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
+import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
 
 /**
@@ -142,13 +143,21 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
  */
 export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const needed = new Set();
-  for (const t of registry.tools) for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
-  if (!needed.size) return (registry.catalogs = {});
+  for (const t of registry.tools) {
+    if (!t.wf) continue; // built-ins (subnano_comment, sfw_check) have no graph
+    for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
+  }
+  if (!needed.size) {
+    registry.catalogs = {};
+    refreshBuiltinDeposits(registry);
+    return registry.catalogs;
+  }
   const catalogs = await fetchCatalogs(needed, { baseUrl, fetch, log, maxAgeMs, timeoutMs, consequence });
   registry.catalogs = catalogs;
   // Only overwrite a tool's catalog when something loaded — a failed refresh
   // must not strip the limits an earlier successful one installed.
-  if (Object.keys(catalogs).length) for (const t of registry.tools) t.wf.catalog = catalogs;
+  if (Object.keys(catalogs).length) for (const t of registry.tools) if (t.wf) t.wf.catalog = catalogs;
+  refreshBuiltinDeposits(registry);
   return catalogs;
 }
 
@@ -178,6 +187,7 @@ export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.co
 
   const estimates = {};
   for (const t of registry.tools) {
+    if (!t.wf) continue;
     try {
       const e = estimateGraphCost(t.wf.graph, catalogs);
       if (e.priced > 0) estimates[t.name] = e;
@@ -411,6 +421,25 @@ export function renderCost(rec) {
   if (rec.usd < 0.0001 && rec.exact !== false) return `last run <$0.0001${dur}`;
   const usd = rec.usd.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, "$1");
   return `last run $${usd}${rec.exact === false ? "+" : ""}${dur}`;
+}
+
+/**
+ * One rendered cost segment. The dollar figure contains a period (`$0.0011`),
+ * and a duration or "+" may follow it. The sentence period is the look-ahead,
+ * so a later run replaces the segment instead of gluing the next price onto
+ * the leftover fraction (`last run $0.0011.0026`).
+ */
+const OBSERVED_COST = /; last run (?:<\$0\.0001|\$\d+\.\d+\+?)(?:, ~(?:\d+m(?: \d+s)?|\d+s))?(?=\.)/;
+
+/**
+ * Drop a previous "last run …" segment and insert the new one before the period,
+ * matching buildDescription. Built-ins have no graph to rebuild the sentence from.
+ */
+function withObservedCost(description, rec) {
+  const cost = renderCost(rec);
+  const stripped = String(description).replace(OBSERVED_COST, "");
+  if (!cost) return stripped;
+  return stripped.replace(/(every call spends real credit from [^.;]+)/, `$1; ${cost}`);
 }
 
 /** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
@@ -776,7 +805,7 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
  * mode owns stdout. `catalogTimeoutMs` overrides the catalog fetch timeout.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -790,7 +819,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   const failures = [];
   // Seed the reserved run_noodle name so a file that sanitizes to it gets suffixed, not shadowed.
   // Shared across every dir, so the first-scanned occurrence of a name wins it.
-  const usedNames = new Map([[RUN_NOODLE_NAME, 1]]);
+  // Built-in tool names are reserved the same way as run_noodle: a graph file
+  // that sanitizes to one of them is suffixed (-2), it does not replace the tool.
+  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [SUBNANO_TOOL, 1], [SFW_TOOL, 1]]);
 
   for (const dir of dirs) {
     let entries;
@@ -867,21 +898,29 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     }
     Object.assign(t.inputSchema.properties, humanizeExtraProperties());
   }
+  // Built-ins ship in the package so a deploy does not need a new graph file.
+  // They stay off an empty directory: with no graph loaded there is nothing to serve.
+  if (tools.length) {
+    const humanize = tools.find((t) => t.name === HUMANIZE_TOOL);
+    for (const b of builtinTools({ spendSource, humanize, hosted, remote })) tools.push(b);
+  }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
   async function recordCost(tool, result, ms) {
-    if (typeof result.costUsd !== "number" || !Number.isFinite(result.costUsd)) return;
-    const rec = { usd: result.costUsd, at: new Date().toISOString() };
+    const observedUsd = typeof result.providerUsd === "number" && Number.isFinite(result.providerUsd) ? result.providerUsd : result.costUsd;
+    const observedExact = typeof result.providerUsd === "number" ? result.providerExact !== false : result.costExact !== false;
+    if (typeof observedUsd !== "number" || !Number.isFinite(observedUsd)) return;
+    const rec = { usd: observedUsd, at: new Date().toISOString() };
     if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
-    if (result.costExact === false) rec.exact = false; // renders "$X+"
+    if (!observedExact) rec.exact = false; // renders "$X+"
     // High-water mark across runs — the charge gate prices deposits off the
     // worst run on record, so one cheap run can't shrink the deposit below it.
     const prev = costs[tool.name];
     const hi = Math.max(
       prev && Number.isFinite(prev.hiUsd) ? prev.hiUsd : 0,
       prev && Number.isFinite(prev.usd) ? prev.usd : 0);
-    if (hi > result.costUsd) rec.hiUsd = hi;
+    if (hi > observedUsd) rec.hiUsd = hi;
     costs[tool.name] = rec;
     try {
       await mkdir(outDir, { recursive: true });
@@ -893,7 +932,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     } catch (e) {
       console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
     }
-    const description = buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name });
+    const description = tool.wf
+      ? buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name })
+      : withObservedCost(tool.description, rec);
     if (description !== tool.description) {
       tool.description = description;
       if (registry.onToolsChanged) registry.onToolsChanged();
@@ -912,23 +953,35 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     /** Set by the host to hear about description changes (→ notifications/tools/list_changed). */
     onToolsChanged: null,
 
-    /**
-     * Per-request deposit in USD, or null when this tool quotes the usual way.
-     * Humanize uses the request's own length and maxChars. A missing model
-     * price returns null so the gate keeps the pinned ceiling.
-     */
-    quoteDeposit(name, args) {
-      const tool = tools.find((t) => t.name === name);
-      if (!tool || !tool.pricedPerRequest) return null;
-      return humanizeDepositUsd(tool.wf.graph, args, { prices: humanizePriceTable(registry.catalogs) });
-    },
-
     listTools() {
       // run_noodle is always available, alongside one tool per saved graph.
+      // pricedPerRequest / depositNote let the charge gate describe a deposit
+      // that is quoted per call instead of a single pinned dollar figure.
       return [
-        ...tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+        ...tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema,
+          ...(t.pricedPerRequest ? { pricedPerRequest: true, depositNote: t.depositNote } : {}),
+        })),
         runNoodleTool(spendSource),
       ];
+    },
+
+    /**
+     * Per-request deposit in USD, or null when this tool quotes the usual way.
+     * Built-ins expose quote(). humanize-comment prices its own length and
+     * maxChars. A missing model price returns null so the gate keeps the
+     * pinned ceiling. A throw falls through the same way.
+     */
+    quoteDeposit(name, args) {
+      const tool = byName.get(name);
+      if (!tool) return null;
+      if (typeof tool.quote === "function") {
+        return tool.quote(args, { catalogs: registry.catalogs, humanize: byName.get(HUMANIZE_TOOL) });
+      }
+      if (!tool.pricedPerRequest || !tool.wf) return null;
+      return humanizeDepositUsd(tool.wf.graph, args, { prices: humanizePriceTable(registry.catalogs) });
     },
 
     /**
@@ -954,6 +1007,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       if (typeof args !== "object" || Array.isArray(args)) {
         throw new ParamsError("tools/call arguments must be an object");
       }
+      if (tool.builtin) {
+        await tool.prepare(args, { humanize: byName.get(HUMANIZE_TOOL), catalogs: registry.catalogs });
+        return { tool, inputs: null };
+      }
       if (tool.humanize) checkHumanizeInputs(args);
       const inputs = await resolveInputs(tool.wf, tool.humanize ? humanizeGraphArgs(args) : args, `tool "${tool.name}"`);
       return { tool, inputs };
@@ -965,6 +1022,16 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
       }
       const { tool, inputs } = await registry.prepareCall(params);
+      if (tool.builtin) {
+        const t0 = Date.now();
+        const result = await tool.run(params.arguments || {}, {
+          apiKey, payment, baseUrl, registry, hosted, remote,
+          humanize: byName.get(HUMANIZE_TOOL),
+          catalogs: registry.catalogs,
+        });
+        await recordCost(tool, result, Date.now() - t0);
+        return result;
+      }
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();
@@ -983,7 +1050,16 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
         // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
         const prices = humanizePriceTable(registry.catalogs);
-        const quoted = humanizeDepositUsd(tool.wf.graph, args, { prices });
+        // subnano_comment passes the caps it will send. The deposit has to
+        // reserve those caps even when the refined draft is shorter than the
+        // original, or the decider hold is skipped inside an exact quote.
+        const writerOutTokens = Number(params.maxTokens) > 0 ? Math.floor(Number(params.maxTokens)) : 0;
+        const judgeOutTokens = Number(params.judgeMaxTokens) > 0 ? Math.floor(Number(params.judgeMaxTokens)) : 0;
+        const quoted = humanizeDepositUsd(tool.wf.graph, args, {
+          prices,
+          ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
+          ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
+        });
         const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
@@ -999,6 +1075,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           baseUrl: baseUrl || "https://nano-gpt.com",
           budgetUsd: hosted ? (quoted ?? (pin != null && pin > 0 ? pin : null)) : null,
           prices,
+          // subnano_comment sizes this humanize run from the request. A normal
+          // humanize-comment call leaves these unset, and the v2.8 caps apply.
+          ...(Number(params.maxTokens) > 0 ? { writerTokenCap: Math.floor(Number(params.maxTokens)) } : {}),
+          ...(Number(params.judgeMaxTokens) > 0 ? { judgeTokenCap: Math.floor(Number(params.judgeMaxTokens)) } : {}),
         });
         // a writer payment that settles after its writer stopped waiting: the operator log keeps it
         hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);

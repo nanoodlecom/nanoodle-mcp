@@ -1256,11 +1256,19 @@ export function failedBeforeSend(e, signal) {
  * that invoice was issued for. Once a primary's invoice is paid there is no fallback:
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null }) {
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null, writerTokenCap = 0, judgeTokenCap = 0 }) {
   // null is "no cap". An explicit amount, including 0, stays that amount.
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
   const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], judgeFinish: null, judgeTruncated: false };
+  // Optional caps from a caller that already sized this run (subnano_comment).
+  // Unset, both stay 0 and every call uses requestOutputTokenCap, which includes
+  // the decider's ranking JSON and GLM reasoning reserve.
+  const sizedCap = (judge = false) => {
+    const n = Number(judge ? judgeTokenCap : writerTokenCap);
+    if (n > 0) return Math.floor(n);
+    return requestOutputTokenCap(state.maxChars, state.draft, { judge });
+  };
   // paymentId → the exact request string that invoice was issued for. A paid retry,
   // including one that re-enters this wrapper with the caller's original body, sends this string.
   const billedBodies = new Map();
@@ -1529,7 +1537,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (!letter) {
       if (body && body.model === "z-ai/glm-5.3" && !state.judgeReq) {
         const user = (body.messages || []).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).join("\n");
-        const outCap = requestOutputTokenCap(state.maxChars, state.draft, { judge: true });
+        const outCap = sizedCap(true);
         body = { ...body, max_tokens: outCap };
         const held = hold("decider", null, body.model, body.messages, body.max_tokens);
         if (held == null) return skippedResponse();
@@ -1652,7 +1660,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (note || (writerDraft && writerDraft !== draft)) body = annotateWriterBody(body, draft, seenDraft, note);
     // max_tokens follows the request (maxChars, or the draft length) plus a small
     // slack. The model's own output cap is not what this call can spend.
-    const tokenCap = requestOutputTokenCap(state.maxChars, state.draft);
+    const tokenCap = sizedCap();
     body = { ...body, max_tokens: tokenCap };
     const forwardCap = writerForwardByteCap(tokenCap);
     const t0 = now();
@@ -2095,7 +2103,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const req = state.judgeReq;
     if (!req) return { ok: false };
     const model = modelName || (record[letter] && record[letter].model) || "";
-    const tokenCap = requestOutputTokenCap(state.maxChars, state.draft);
+    const tokenCap = sizedCap();
     const cappedCandidate = capPreservingSpans(candidate, state.spans, candidateByteCap(tokenCap, state.spans, { ending: state.ending, draft: state.draft }));
     const user = reviewUserMessage(req.user, letter, model, cappedCandidate);
     const messages = Array.isArray(req.body.messages) ? req.body.messages.map((m) => ({ ...m })) : [];
@@ -2108,7 +2116,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       }
     }
     if (!replaced) return { ok: false };
-    const judgeCap = requestOutputTokenCap(state.maxChars, state.draft, { judge: true });
+    const judgeCap = sizedCap(true);
     const body = { ...req.body, messages, max_tokens: judgeCap };
     const held = hold("review", letter, body.model, body.messages, body.max_tokens);
     if (held == null) return { ok: false, skipped: true };
@@ -2189,7 +2197,7 @@ export function humanizeWriterRecord(graph) {
     const w = link && nodes.get(link.from.node);
     if (!w || w.type !== "llm") return null;
     if (w.fields.model !== m[2]) throw new Error(`humanize-comment: join ${n.id} labels [${m[1]}] ${m[2]} but its writer ${w.id} runs ${w.fields.model}`);
-    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, fallbackModel: HUMANIZE_FALLBACKS[w.fields.model] || null });
+    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, maxTokens: Number(w.fields.maxTokens) || 600, fallbackModel: HUMANIZE_FALLBACKS[w.fields.model] || null });
   }
   return LETTERS.every((l) => record[l]) && nodes.has("judge") && nodes.has("draft") ? Object.freeze(record) : null;
 }

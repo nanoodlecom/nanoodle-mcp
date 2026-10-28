@@ -17,5 +17,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24.22.1"
+      # The apt ffmpeg package is about 94MB across 99 dependencies, fetched
+      # from the Azure Ubuntu mirror. That download has no bound of its own,
+      # and this job's 10-minute limit has cancelled the run while libavcodec
+      # was still transferring. Tests only need ffmpeg and ffprobe, including
+      # the lavfi color source, so install one pinned static build instead.
+      - name: Install ffmpeg
+        run: |
+          set -euo pipefail
+          url=https://johnvansickle.com/ffmpeg/releases/ffmpeg-7.0.2-amd64-static.tar.xz
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 "$url" -o /tmp/ffmpeg.tar.xz
+          echo "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67  /tmp/ffmpeg.tar.xz" | sha256sum -c
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo install -m 755 /tmp/ffmpeg-7.0.2-amd64-static/ffmpeg /tmp/ffmpeg-7.0.2-amd64-static/ffprobe /usr/local/bin/
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
       - run: npm ci
       - run: npm test

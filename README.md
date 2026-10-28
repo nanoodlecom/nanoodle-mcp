@@ -621,6 +621,37 @@ just `./noodles`, since `~` is not expanded in MCP args). Cursor
 (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`) take the same `args` in
 the config shapes shown under [Install](#install).
 
+## Hosted subnano tools
+
+When at least one graph is loaded, the server also exposes two built-in tools
+(they are not graph files, and an empty `--graphs` directory still refuses to
+start):
+
+- **`subnano_comment`** — one call that rewrites a draft with `liquid/lfm-2.5-2.6b`
+  (Liquid d1 is a decision model and cannot write the comment), runs the mounted
+  `humanize-comment` graph on that rewrite, then asks `liquid/d1` whether the
+  result is safe to post and how funny it is. Needs `humanize-comment` in
+  `--graphs`. A "no" from the gate is returned with the comment; it does not
+  discard it.
+- **`sfw_check`** — one yes/no safe-for-work decision per still image and per
+  evenly sampled video frame (`perplexity/pplx-decider-v1.2`). The check passes
+  only when every picture is yes. There is no argument that turns it off.
+  Sampling a video needs ffmpeg; checking a still image does not.
+
+In charge mode each call's deposit is quoted before payment and is a cap on
+the charge. `subnano_comment` sizes every stage's max_tokens from that draft
+(about 1.5× its length, plus a little slack), estimates input at about one
+token per 3.5 bytes plus a small margin, and caps re-asks at the same output
+size. The decider keeps 256 ranking-JSON tokens and 512 GLM reasoning tokens
+on top of that writer cap, and the humanize hold inside the call is quoted at
+those caps. The gate and the funny judge read the comment clipped to that size.
+Settlement is the metered cost plus 20%, and never more than the quote. Before
+each paid stage the run stops when the remaining budget cannot cover it,
+returns what already finished, and charges only the calls that ran.
+`sfw_check` is the same kind of cap: the quote is the pictures that request
+asks to check, a picture that would exceed the remaining budget is not sent,
+and settlement cannot exceed the quote. The difference is returned.
+
 ## Run any share link
 
 Every nanoodle share link is an executable tool. Alongside your saved graphs the
