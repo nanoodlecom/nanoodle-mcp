@@ -1,10 +1,26 @@
 # Template: copy to <repo>/.github/workflows/deploy.yml, set APP_NAME.
 # Repo secret DEPLOY_SSH_KEY = contents of /root/.ssh/deploy_key on the box
 # (key is locked to the deploy-app forced command — it cannot run anything else).
+#
+# mcp.nanoodle.com loads graphs from a host directory that refreshes only when
+# this deploy runs. awesome-noodles never pushes this repo, so a graph fix
+# there misses the push trigger. repository_dispatch type
+# awesome-noodles-updated runs this same job. The sender workflow is not on
+# awesome-noodles main, and no token setup is authorized. The dispatch trigger
+# stays inert until Mikkel adds that sender and its token secret himself.
+# See docs/README.md for which revision is live, and for rollback.
 name: deploy
 on:
   push:
     branches: [main, master]
+  repository_dispatch:
+    types: [awesome-noodles-updated]
+# The in-progress deploy is left running (cancel-in-progress: false). GitHub
+# keeps only one pending run in this group: a newer queued run replaces the
+# older pending one. Pushes and dispatches share the group.
+concurrency:
+  group: nanoodle-mcp-deploy
+  cancel-in-progress: false
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -18,3 +34,13 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           echo "159.195.17.119 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHcFN8/48EuW9f6MXgGx9a/syadihZ4XpY+EazT2KbQe" > ~/.ssh/known_hosts
           ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp"
+
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.1"
+      # Requires the ivideo node to be minimax-h3-singularity/image-to-video
+      # at 480p for 5 seconds. The script aborts the fetch and the body read
+      # after 20s. A failure fails this job. It does not roll back.
+      - name: Check live photo-to-video graph
+        run: node scripts/check-live-photo-to-video.mjs
