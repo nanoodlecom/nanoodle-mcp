@@ -18,7 +18,7 @@ import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
-import { humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
+import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
@@ -805,6 +805,50 @@ async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase,
  * mode owns stdout. `catalogTimeoutMs` overrides the catalog fetch timeout.
  * @returns {{ tools: Array, failures: Array<{file, dir, reason}>, listTools(), callTool(params) }}
  */
+/**
+ * The cold deposit for humanize-comment: never below the computed worst-case
+ * ceiling. A graph file's x402.usd can be stale (a pin written before a
+ * pricing change), and an unpriceable quote falls back to this figure, so a
+ * pin under the ceiling is raised to it. When the ceiling cannot be computed,
+ * the pin is dropped and the tool is marked unpriceable: its quotes refuse.
+ */
+export function humanizeColdPin(graph, x402, log = () => {}) {
+  const pin = x402 ? knownUsd(x402.usd) : null;
+  let ceiling = null;
+  try { ceiling = humanizeCeilingDepositUsd(graph); } catch { ceiling = null; }
+  if (ceiling == null || !(ceiling > 0)) {
+    log(`warning: ${HUMANIZE_TOOL} worst-case ceiling cannot be computed; an unpriceable quote will be refused instead of using x402.usd`);
+    return { ...(x402 || {}), usd: null, unpriceable: true };
+  }
+  if (pin == null || pin < ceiling) {
+    if (pin != null) log(`warning: ${HUMANIZE_TOOL} x402.usd ${pin} is below the computed worst-case ceiling ${ceiling}; using the ceiling`);
+    return { ...(x402 || {}), usd: ceiling };
+  }
+  return x402;
+}
+
+/**
+ * A humanize-comment quote. When this request cannot be priced (a model
+ * missing from the price table, or a throw), it falls back to the worst-case
+ * ceiling, never to a possibly stale graph pin. With no computable ceiling it
+ * throws, and the gate refuses the call.
+ */
+export function humanizeQuoteOrCeiling(tool, args, prices) {
+  let quoted = null;
+  try { quoted = humanizeDepositUsd(tool.wf.graph, args, { prices }); } catch { quoted = null; }
+  if (Number.isFinite(quoted) && quoted > 0) return quoted;
+  const ceilings = [];
+  try { ceilings.push(humanizeCeilingDepositUsd(tool.wf.graph, { prices })); } catch { /* unpriceable at live prices */ }
+  if (tool.x402 && !tool.x402.unpriceable) ceilings.push(knownUsd(tool.x402.usd));
+  const ceiling = Math.max(...ceilings.filter((v) => Number.isFinite(v) && v > 0), 0);
+  if (ceiling > 0) return ceiling;
+  throw new HumanizeUnpriceableError(`${HUMANIZE_TOOL} cannot be priced for this request and has no computable worst-case ceiling; refusing instead of guessing a deposit`);
+}
+
+export class HumanizeUnpriceableError extends Error {
+  constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
+}
+
 export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false }) {
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
@@ -861,6 +905,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         costs[name] = costs[`${name}-noodle-graph`];
         delete costs[`${name}-noodle-graph`];
       }
+      if (name === HUMANIZE_TOOL) x402 = humanizeColdPin(wf.graph, x402, log);
       tools.push({
         name,
         file,
@@ -981,7 +1026,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         return tool.quote(args, { catalogs: registry.catalogs, humanize: byName.get(HUMANIZE_TOOL) });
       }
       if (!tool.pricedPerRequest || !tool.wf) return null;
-      return humanizeDepositUsd(tool.wf.graph, args, { prices: humanizePriceTable(registry.catalogs) });
+      return humanizeQuoteOrCeiling(tool, args, humanizePriceTable(registry.catalogs));
     },
 
     /**
@@ -1060,7 +1105,6 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
           ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
         });
-        const pin = tool.x402 ? knownUsd(tool.x402.usd) : null;
         // Estimated decider headroom for admission checks: until the decider
         // starts, a writer step is admitted only if it fits with this estimate
         // still counted. It is an estimate, not money set aside.
@@ -1081,7 +1125,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           title: opts.title === true,
           payment: apiKey ? null : payment,
           baseUrl: baseUrl || "https://nano-gpt.com",
-          budgetUsd: hosted ? (quoted ?? (pin != null && pin > 0 ? pin : null)) : null,
+          // An unpriceable request falls back to the worst-case ceiling, never a stale pin.
+          budgetUsd: hosted ? (quoted ?? humanizeQuoteOrCeiling(tool, null, prices)) : null,
           deciderReserveUsd: hosted ? deciderReserveUsd : 0,
           prices,
           // subnano_comment sizes this humanize run from the request. A normal

@@ -921,6 +921,9 @@ export function createChargeGate({
             const quoted = registry.quoteDeposit(name, args);
             if (Number.isFinite(quoted) && quoted > 0) return quoted;
           } catch (e) {
+            // A refusal (humanize-comment with no computable ceiling) is final:
+            // never fall back to a pin that may be stale.
+            if (e && e.refuse) throw e;
             log(`warning: ${name} per-request deposit failed (${e.message}); using the pinned deposit`);
           }
         }
