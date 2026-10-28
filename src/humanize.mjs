@@ -1256,11 +1256,11 @@ export function failedBeforeSend(e, signal) {
  * that invoice was issued for. Once a primary's invoice is paid there is no fallback:
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, prices = null, writerTokenCap = 0, judgeTokenCap = 0 }) {
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0 }) {
   // null is "no cap". An explicit amount, including 0, stays that amount.
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], judgeFinish: null, judgeTruncated: false };
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], deciderReserveUsd: Math.max(0, knownUsd(deciderReserveUsd) ?? 0), judgeFinish: null, judgeTruncated: false };
   // Optional caps from a caller that already sized this run (subnano_comment).
   // Unset, both stay 0 and every call uses requestOutputTokenCap, which includes
   // the decider's ranking JSON and GLM reasoning reserve.
@@ -1329,16 +1329,23 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     rec.holdReleased = false;
   };
   /**
+   * Provider USD kept aside for the decider. A writer step (primary, fallback,
+   * re-ask, guard) has to fit with this reserve still held, so the decider is
+   * never the step that no longer fits. The decider and its review do not
+   * count it against themselves.
+   */
+  const deciderRoom = (kind) => (kind === "decider" || kind === "review" ? 0 : state.deciderReserveUsd);
+  /**
    * True when this invoice still fits the deposit at the 20% markup.
    * This call's own reservation is left out, so it is not counted twice.
    * An unknown amount does not fit a capped run. A null budget is uncapped.
    */
-  const invoiceFits = (amount, held) => {
+  const invoiceFits = (amount, held, kind) => {
     if (state.budgetUsd == null) return true;
     if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) return false;
     const heldUsd = knownUsd(held);
     const reservedOther = Math.max(0, state.reservedUsd - (heldUsd == null ? 0 : heldUsd));
-    const spent = state.meteredUsd + state.committedUsd + reservedOther + amount;
+    const spent = state.meteredUsd + state.committedUsd + reservedOther + amount + deciderRoom(kind);
     return spent * HUMANIZE_SETTLE_MARKUP <= state.budgetUsd + 1e-9;
   };
   const commitSpend = (rec, held, amount) => {
@@ -1386,7 +1393,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       rec.priceUnknown = true;
       throw notSent("price");
     }
-    if (!invoiceFits(usd, held)) {
+    if (!invoiceFits(usd, held, rec.kind)) {
       rec.paymentStarted = false;
       rec.status = "payment not sent";
       rec.budgetRefused = true;
@@ -1399,7 +1406,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (signal && signal.aborted) throw notSent("cancel");
       // The synchronous budget check can race another invoice that commits
       // before this step. Check again here, still before the id is reserved.
-      if (!invoiceFits(usd, held)) {
+      if (!invoiceFits(usd, held, rec.kind)) {
         rec.paymentStarted = false;
         rec.status = "payment not sent";
         rec.budgetRefused = true;
@@ -1471,6 +1478,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
    * the same remaining room.
    */
   const hold = (kind, letter, model, messages, outTokens) => {
+    const r = holdInner(kind, letter, model, messages, outTokens);
+    // The decider has started: its own hold replaces the up-front reserve.
+    if (r != null && kind === "decider") state.deciderReserveUsd = 0;
+    return r;
+  };
+  const holdInner = (kind, letter, model, messages, outTokens) => {
     if (state.budgetUsd == null) return 0;
     const rate = prices && prices[model];
     let provider = null;
@@ -1479,7 +1492,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       const outT = Math.max(1, Math.floor(Number(outTokens) || 1));
       provider = (inT * rate[0] + outT * rate[1]) / 1e6;
     }
-    const room = provider == null ? Infinity : (state.meteredUsd + state.committedUsd + state.reservedUsd + provider) * HUMANIZE_SETTLE_MARKUP;
+    const room = provider == null ? Infinity : (state.meteredUsd + state.committedUsd + state.reservedUsd + provider + deciderRoom(kind)) * HUMANIZE_SETTLE_MARKUP;
     if (provider == null || room > state.budgetUsd + 1e-9) {
       state.skippedForBudget.push({ kind, letter: letter || null, model: model || null });
       return null;

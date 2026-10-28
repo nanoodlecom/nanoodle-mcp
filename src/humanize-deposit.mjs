@@ -53,6 +53,22 @@ export const HUMANIZE_DEPOSIT_FLOOR_USD = 0.001;
 
 const bytes = (s) => tokenUpperBound(s);
 
+/**
+ * Bytes per token for caller text (draft, context, guidance) on the decider.
+ * The decider (GLM) is the most expensive model per token, and it reads every
+ * caller byte plus five rewrites. Real tokenizers can come in well under 3.5
+ * bytes per token on long technical context (code, numbers, URLs), so a long
+ * call that the writers already metered a little high left no room for the
+ * decider. Caller bytes on the decider are priced at this denser rate, so the
+ * reserve grows with context length and stays small for a short call.
+ */
+export const HUMANIZE_DECIDER_CALLER_BYTES_PER_TOKEN = 2.5;
+
+/** Decider input tokens: fixed prompt text at the usual rate, caller text at the dense rate. */
+function deciderInTokens(fixedBytes, callerBytes) {
+  return estimateTokensFromBytes(fixedBytes) + Math.ceil(Math.max(0, callerBytes) / HUMANIZE_DECIDER_CALLER_BYTES_PER_TOKEN);
+}
+
 function findArg(args, name) {
   if (!args || typeof args !== "object") return undefined;
   const k = Object.keys(args).find((x) => String(x).trim().toLowerCase() === name);
@@ -192,14 +208,15 @@ function stageCalls(graph, spec, prices) {
   const candidateBytes = Array.isArray(spec.spans)
     ? candidateByteCap(writerOut, spec.spans, { ending: spec.ending, draft: spec.draftText })
     : writerForwardByteCap(writerOut) + (spec.spanBytes || 0) + (spec.endingExtra || 0);
-  const judgeBytes = bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes + seps + 5 * candidateBytes;
-  calls.push({ model: judge.fields.model, inTokens: estimateTokensFromBytes(judgeBytes), outTokens: judgeOut, rate: judgeRate });
+  const callerBytes = spec.draftBytes + spec.contextBytes + spec.guidanceBytes;
+  const judgeFixed = bytes(judge.fields.system) + seps + 5 * candidateBytes;
+  calls.push({ model: judge.fields.model, kind: "decider", inTokens: deciderInTokens(judgeFixed, callerBytes), outTokens: judgeOut, rate: judgeRate });
   if (needsSecondDecider(spec)) {
     const longLabel = Math.max(...["k2", "k3", "k4", "k5", "k6"].map((id) => bytes(byId.get(id).fields.sep)));
-    const reviewBytes = bytes(judge.fields.system) + spec.draftBytes + spec.contextBytes + spec.guidanceBytes
+    const reviewFixed = bytes(judge.fields.system)
       + bytes(byId.get("j-cg").fields.sep) + bytes(byId.get("k1").fields.sep) + longLabel
       + candidateBytes;
-    calls.push({ model: judge.fields.model, inTokens: estimateTokensFromBytes(reviewBytes), outTokens: judgeOut, rate: judgeRate });
+    calls.push({ model: judge.fields.model, kind: "review", inTokens: deciderInTokens(reviewFixed, callerBytes), outTokens: judgeOut, rate: judgeRate });
   }
   const units = calls.reduce((a, c) => a + c.inTokens * c.rate[0] + c.outTokens * c.rate[1], 0);
   return { calls, units, candidateBytes };
@@ -372,11 +389,23 @@ export function humanizeStageBudget(graph, args, opts = {}) {
   const built = stageCalls(graph, spec, prices);
   if (!built) return null;
   return {
-    calls: built.calls.map((c) => ({ model: c.model, inTokens: c.inTokens, outTokens: c.outTokens, rate: c.rate })),
+    calls: built.calls.map((c) => ({ model: c.model, kind: c.kind || "writer", inTokens: c.inTokens, outTokens: c.outTokens, rate: c.rate })),
     candidateBytes: built.candidateBytes,
     providerUsd: built.units / 1e6,
     chargeUsd: built.units / 1e6 * HUMANIZE_SETTLE_MARKUP,
   };
+}
+
+/**
+ * Provider USD the run keeps aside for the decider (and its second pass) until
+ * the decider starts, so writers, fallbacks, and re-asks cannot spend it.
+ * Null when a model has no price.
+ */
+export function humanizeDeciderReserveUsd(graph, args, opts = {}) {
+  const prices = opts.prices || HUMANIZE_MODEL_PRICES;
+  const built = stageCalls(graph, withOutputCaps(specFromArgs(graph, args), opts), prices);
+  if (!built) return null;
+  return built.calls.filter((c) => c.kind === "decider" || c.kind === "review").reduce((a, c) => a + callUsd(c), 0) / 1e6;
 }
 
 /** Deposit for one call. Never below humanizeChargeUsd for the same arguments. */
