@@ -206,15 +206,15 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // x402.usd is the cold ceiling (longest request, after the margin). A call quotes
     // less when its own draft, context, guidance, and maxChars cost less.
-    assert.equal(mounted.x402.usd.toFixed(8), "0.05012747");
-    // Tokens are bytes / 3.5. Writer output is the draft length plus a small slack,
+    assert.equal(mounted.x402.usd.toFixed(8), "0.05428204");
+    // Tokens are bytes / 3.5 (caller text on the decider: bytes / 2.5). Writer output is the draft length plus a small slack,
     // and the decider adds room for its ranking JSON and for GLM reasoning. When
     // Cydonia fails and the Starry fallback runs, both calls are charged. This
     // figure reserves the larger of those two rates. The quote prices HUMANIZE_PRICED_REASKS
     // extra writer calls; the run may still attempt MAX_REASKS and stops when the
     // next one would pass the deposit. At the counted Guidance cap, with no keep
-    // and no repair, that charge is $0.00910188 after the 20% markup.
-    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.05012747.
+    // and no repair, that charge is $0.00956268 after the 20% markup.
+    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.05428204.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
     // Starry Ocean $0.05/$0.25, others $0.10 in and $0.35-$0.60 out.
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
@@ -250,20 +250,21 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     }
     const reask = reasks.sort((a, b) => b - a).slice(0, HUMANIZE_PRICED_REASKS).reduce((a, b) => a + b, 0);
     const seps = ["k1", "k2", "k3", "k4", "k5", "k6", "j-cg"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
-    const judgeBytes = bytes(judge.fields.system) + Draft + Context + Guidance + seps + 5 * echoed;
-    const judgeUsd = estimateTokensFromBytes(judgeBytes) * 0.6 + judgeOut * 1.1;
+    // Caller text on the decider is priced at 2.5 bytes per token, the rest at 3.5.
+    const judgeTokens = estimateTokensFromBytes(bytes(judge.fields.system) + seps + 5 * echoed) + Math.ceil((Draft + Context + Guidance) / 2.5);
+    const judgeUsd = judgeTokens * 0.6 + judgeOut * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
     assert.equal(HUMANIZE_BYTES_PER_TOKEN, 3.5);
-    assert.equal(est(base + reask + judgeUsd), "0.00910188", "guidance at its cap, one priced retry, after the markup");
+    assert.equal(est(base + reask + judgeUsd), "0.00956268", "guidance at its cap, one priced retry, after the markup");
     const shaped = { Draft: draft, Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) };
-    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.00910188");
+    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.00956268");
     const budget = placeholderBudget();
     assert.ok(budget.count > 8, "repeats, not the 8-entry keep list, set the placeholder cap");
     assert.equal(budget.writerDraftChars <= Draft, true);
     const ceilingCharge = humanizeChargeUsd(graph, null, { ceiling: true });
     const ceiling = humanizeCeilingDepositUsd(graph);
-    assert.equal(ceilingCharge.toFixed(8), "0.04475666", "the capped worst case, before the margin");
-    assert.equal(ceiling.toFixed(8), "0.05012747");
+    assert.equal(ceilingCharge.toFixed(8), "0.04846610", "the capped worst case, before the margin");
+    assert.equal(ceiling.toFixed(8), "0.05428204");
     assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);
     assert.ok(ceiling >= ceilingCharge, "the ceiling covers the worst-case charge");
     assert.ok(ceiling <= ceilingCharge * 1.15 + 1e-9, "the margin stays inside 15%");
