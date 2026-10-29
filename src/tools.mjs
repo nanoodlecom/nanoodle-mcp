@@ -324,13 +324,84 @@ function shortModel(model) {
 }
 
 /**
+ * A model id is spicy when it carries spicy / nsfw / uncensored as its own
+ * token. "minimax-h3/image-to-video-spicy" matches; "minimax-h3-singularity/image-to-video"
+ * and "minimax/h3-max" do not. Catalog capability flags are not consulted —
+ * NanoGPT marks some non-spicy video models nsfw-capable, and the hosted
+ * default is the non-spicy id.
+ */
+const SPICY_MODEL_RE = /(?:^|[^a-z0-9])(?:spicy|nsfw|uncensored)(?:[^a-z0-9]|$)/i;
+
+/** Lead sentence every spicy tool description must start with. */
+export const SPICY_WARNING_LEAD =
+  "Content warning: uses an NSFW-permissive ('spicy') model and can produce adult content even from a harmless prompt.";
+
+export function modelIsSpicy(model) {
+  return SPICY_MODEL_RE.test(String(model ?? ""));
+}
+
+export function graphUsesSpicyModel(graph) {
+  return ((graph && graph.nodes) || []).some((n) => modelIsSpicy(n && n.fields && n.fields.model));
+}
+
+/** Safe sibling of a `-spicy` tool name, or "" when the name has no suffix. */
+export function safeSiblingName(name) {
+  return String(name || "").endsWith("-spicy") ? String(name).slice(0, -"-spicy".length) : "";
+}
+
+/**
+ * Filename order puts `photo-to-video-spicy.noodle-graph.json` before
+ * `photo-to-video.noodle-graph.json` (`-` < `.`). Tool order is by name, with
+ * each `-spicy` variant directly after its unsuffixed sibling so a caller
+ * meets the safe tool first.
+ */
+export function compareToolNames(a, b) {
+  const base = (n) => (n.endsWith("-spicy") ? n.slice(0, -"-spicy".length) : n);
+  const ba = base(a), bb = base(b);
+  if (ba !== bb) return ba < bb ? -1 : 1;
+  const sa = a.endsWith("-spicy") ? 1 : 0;
+  const sb = b.endsWith("-spicy") ? 1 : 0;
+  if (sa !== sb) return sa - sb;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Failures for a hosted tool list. Empty means:
+ * every `-spicy` description starts with the warning, no unsuffixed tool uses
+ * a spicy model, and each spicy tool sits directly after a safe sibling.
+ */
+export function hostedSpicyViolations(tools) {
+  const names = new Set(tools.map((t) => t.name));
+  const violations = [];
+  tools.forEach((t, i) => {
+    const spicyName = t.name.endsWith("-spicy");
+    const spicyModel = graphUsesSpicyModel(t.wf && t.wf.graph);
+    if ((spicyName || spicyModel) && !String(t.description || "").startsWith(SPICY_WARNING_LEAD)) {
+      violations.push(`${t.name}: description does not start with the spicy-model content warning`);
+    }
+    if (!spicyName && spicyModel) {
+      violations.push(`${t.name}: spicy/nsfw/uncensored model on a tool that is not named -spicy`);
+    }
+    if (spicyName && !spicyModel) {
+      violations.push(`${t.name}: named -spicy but no node uses a spicy/nsfw/uncensored model`);
+    }
+    if (spicyName) {
+      const safe = safeSiblingName(t.name);
+      if (!names.has(safe)) violations.push(`${t.name}: missing safe sibling ${safe}`);
+      const prev = tools[i - 1];
+      if (!prev || prev.name !== safe) violations.push(`${t.name}: must be listed directly after ${safe}`);
+    }
+  });
+  return violations;
+}
+
+/**
  * The first comment node's text doubles as the tool's stated intent — the
  * author's own words lead the description. One line, capped, sentence-final.
+ * A leading spicy-model content warning is kept whole; only the text after it
+ * is capped, so the warning cannot be cut off to make room for the rest.
  */
-function graphIntent(graph) {
-  const c = graph.nodes.find((n) => n.type === "comment" && String((n.fields || {}).text || "").trim());
-  if (!c) return "";
-  let text = String(c.fields.text).replace(/\s+/g, " ").trim();
+function finishIntent(text) {
   if (text.length > 200) {
     let cut = text.slice(0, 197);
     // A cut landing mid-surrogate-pair leaves a lone surrogate — strict-UTF-8 JSON
@@ -339,6 +410,27 @@ function graphIntent(graph) {
     text = cut + "…";
   }
   return /[.!?…]$/.test(text) ? text : text + ".";
+}
+
+function splitLeadingSpicyWarning(text) {
+  if (!text.startsWith(SPICY_WARNING_LEAD)) return null;
+  const rest = text.slice(SPICY_WARNING_LEAD.length).trimStart();
+  const follow = rest.match(/^Agents wanting safe output should use \S+\.\s*/);
+  if (!follow) return { warning: SPICY_WARNING_LEAD, rest };
+  return {
+    warning: `${SPICY_WARNING_LEAD} ${follow[0].trim()}`,
+    rest: rest.slice(follow[0].length).trim(),
+  };
+}
+
+function graphIntent(graph) {
+  const c = graph.nodes.find((n) => n.type === "comment" && String((n.fields || {}).text || "").trim());
+  if (!c) return "";
+  const text = String(c.fields.text).replace(/\s+/g, " ").trim();
+  const split = splitLeadingSpicyWarning(text);
+  if (!split) return finishIntent(text);
+  if (!split.rest) return split.warning;
+  return `${split.warning} ${finishIntent(split.rest)}`;
 }
 
 /**
@@ -926,6 +1018,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       });
     }
   }
+  // Safe tool, then its -spicy sibling. Filename sort does the opposite.
+  tools.sort((a, b) => compareToolNames(a.name, b.name));
 
   for (const t of tools) if (t.humanize) {
     for (const [k, cap] of Object.entries(HUMANIZE_INPUT_CAPS)) {
