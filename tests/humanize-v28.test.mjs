@@ -36,7 +36,7 @@ async function runHumanize(t, reply, args, opts = {}) {
         content = reply(body, { user, reask, judge: true });
       } else content = reply(body, { user, reask, judge: false });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ choices: [{ message: { content: content == null ? "" : content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+      res.end(JSON.stringify({ choices: [{ message: { content: content == null ? "" : content } }], x_nanogpt_pricing: { costUsd: opts.costUsd ?? 0.0001 } }));
     });
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -48,6 +48,7 @@ async function runHumanize(t, reply, args, opts = {}) {
     dirs: [dir],
     apiKey: opts.wallet ? undefined : "test-key",
     payment: opts.wallet || undefined,
+    hosted: opts.hosted === true,
     baseUrl: "http://127.0.0.1:" + srv.address().port,
     outDir: join(dir, "out"),
     log: () => {},
@@ -1013,4 +1014,56 @@ test("a wallet caller who already paid is not told they were not charged", async
       return true;
     },
   );
+});
+
+
+test("title mode tells every writer to rewrite a title before the first call", async (t) => {
+  const expected = "One picture becomes a splat and mesh";
+  const { json, seen } = await runHumanize(t, (_body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return ctx.user.includes("This request is a title rewrite") ? expected : "You made a splat and mesh, thanks for sharing.";
+  }, { Draft: "One image made a Gaussian splat and 3D mesh", Context: "an article headline", title: true });
+  assert.equal(json.text, expected);
+  const writers = seen.filter((s) => s.model !== "z-ai/glm-5.3" && !s.reask);
+  assert.equal(writers.length, 5);
+  for (const writer of writers) assert.match(writer.user, /one title line only/);
+});
+
+test("title guard retries preserve the requested output format", () => {
+  for (const reasons of [["echo"], ["keep"], ["max"], ["question"], []]) {
+    const prompt = guardRetryPrompt(reasons, { title: true, maxChars: 100, spans: [] });
+    assert.match(prompt, /title/);
+    assert.doesNotMatch(prompt, /rewritten comment/);
+  }
+});
+
+test("a 329-character intro is accepted under a 700-character cap", async (t) => {
+  const draft = "An intro with details about a project. ".repeat(10).slice(0, 329);
+  assert.equal([...draft].length, 329);
+  const { json } = await runHumanize(t, (_body, ctx) => ctx.judge
+    ? judge("A", ["A", "B", "C", "D", "E"])
+    : "Here is the project intro in a fresh voice, with the same details.",
+  { Draft: draft, Context: "project introduction", maxChars: 700 });
+  assert.ok(json.text.length < 700);
+});
+
+test("an unusable decider is reported before a coincidental cap failure", async () => {
+  const wf = { outputs: [{ key: "result", nodeId: "judge" }] };
+  const result = { deciderUnusable: true, outputs: { result: JSON.stringify({ winner: "ORIGINAL", text: "x".repeat(800), ranked: [] }) } };
+  const state = { draft: "x".repeat(800), maxChars: 700, title: false, spans: [], ending: "any", judgeTruncated: true };
+  const failed = await applyHumanizeFallback(wf, result, {}, state);
+  assert.match(failed.error, /decider.*cut off/);
+  assert.doesNotMatch(failed.error, /no rewrite fit/);
+});
+
+
+test("humanize cost output and observed-cost record stay numeric with decimal-string meters", async (t) => {
+  const { texts, registry } = await runHumanize(t, (_body, ctx) => ctx.judge
+    ? judge("A", ["A", "B", "C", "D", "E"])
+    : "A fresh rewrite for this note.",
+  { Draft: "Details about the shipped fix.", Context: "project note" }, { costUsd: "1e-4" });
+  assert.deepEqual(texts.filter((text) => text.startsWith("cost:")), ["cost: $0.0006"]);
+  const cost = registry.costs["humanize-comment"].usd;
+  assert.equal(typeof cost, "number");
+  assert.ok(Math.abs(cost - 0.0006) < 1e-12);
 });

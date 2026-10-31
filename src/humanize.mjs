@@ -948,16 +948,17 @@ export function assessWriterOutput(raw, opts = {}) {
   return best || once;
 }
 
-export function guardRetryPrompt(reasons, { spans = [], maxChars = null } = {}) {
-  if (reasons.includes("echo")) return "Your last attempt echoed the guidance or the instructions. Output only the rewritten comment, with no guidance text, no one-thread prefix, and no comment tags.";
+export function guardRetryPrompt(reasons, { spans = [], maxChars = null, title = false } = {}) {
+  const output = title ? "rewritten title" : "rewritten comment";
+  if (reasons.includes("echo")) return `Your last attempt echoed the guidance or the instructions. Output only the ${output}, with no guidance text, no one-thread prefix, and no comment tags.`;
   if (reasons.includes("keep")) {
     const toks = spans.map((s) => tokenOf(s.id)).join(", ");
-    return `Your last attempt dropped, duplicated, or changed a placeholder. Copy each of these exactly once, unchanged: ${toks}. Output only the rewritten comment.`;
+    return `Your last attempt dropped, duplicated, or changed a placeholder. Copy each of these exactly once, unchanged: ${toks}. Output only the ${output}.`;
   }
   if (reasons.includes("title")) return "Your last attempt was a paragraph. Reply with one short line only, and nothing else.";
-  if (reasons.includes("max")) return `Your last attempt was too long. Rewrite it in under ${maxChars} characters. Output only the rewritten comment.`;
-  if (reasons.includes("question")) return "Your last attempt did not end with a question. End with one question. Output only the rewritten comment.";
-  return "Output only the rewritten comment.";
+  if (reasons.includes("max")) return `Your last attempt was too long. Rewrite it in under ${maxChars} characters. Output only the ${output}.`;
+  if (reasons.includes("question")) return `Your last attempt did not end with a question. End with one question. Output only the ${output}.`;
+  return `Output only the ${output}.`;
 }
 
 const DROP_WHY = {
@@ -992,7 +993,7 @@ export function humanizeExtraProperties() {
     title: {
       type: "boolean",
       default: false,
-      description: "optional; when true, a paragraph-length rewrite is rejected and that writer is asked once more. Default false: a short draft is not treated as a title on its own.",
+      description: "optional; when true, writers are asked for one title line rather than a comment; paragraph-length replies are rejected and that writer is asked once more. Default false: a short draft is not treated as a title on its own.",
     },
   };
 }
@@ -1034,8 +1035,9 @@ export function humanizeCallOpts(args) {
   };
 }
 
-export function writerNote(spans, ending, maxChars) {
+export function writerNote(spans, ending, maxChars, title = false) {
   const bits = [];
+  if (title) bits.push("This request is a title rewrite, replacing the comment format described above. Output one title line only, with the same facts and meaning as the draft. Do not address a commenter or add a greeting, reaction, explanation, or comment body.");
   if (spans && spans.length) {
     const toks = spans.map((s) => tokenOf(s.id)).join(", ");
     bits.push(`Protected placeholders: ${toks}. Copy each one exactly once, unchanged. Do not drop, duplicate, or edit them.`);
@@ -1131,7 +1133,9 @@ export function failureMessage(state, why) {
     : state && state.ending === "question" ? "no rewrite ended with a question."
     : "no rewrite could be delivered."
   );
-  const money = !incurredSpend(state)
+  const money = state && state.billing === "hosted"
+    ? "See the payment receipt for the hosted deposit and refund status."
+    : !incurredSpend(state)
     ? "Nothing was charged."
     : state && state.billing === "wallet"
       ? "The model calls already paid from your wallet stand and are not refunded by this error. Direct-wallet spending has no cap."
@@ -1256,11 +1260,11 @@ export function failedBeforeSend(e, signal) {
  * that invoice was issued for. Once a primary's invoice is paid there is no fallback:
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0 }) {
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0, hosted = false }) {
   // null is "no cap". An explicit amount, including 0, stays that amount.
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
-  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], deciderReserveUsd: Math.max(0, knownUsd(deciderReserveUsd) ?? 0), judgeFinish: null, judgeTruncated: false };
+  const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: hosted ? "hosted" : payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], deciderReserveUsd: Math.max(0, knownUsd(deciderReserveUsd) ?? 0), judgeFinish: null, judgeTruncated: false };
   // Optional caps from a caller that already sized this run (subnano_comment).
   // Unset, both stay 0 and every call uses requestOutputTokenCap, which includes
   // the decider's ranking JSON and GLM reasoning reserve.
@@ -1671,7 +1675,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       }
       return fetch(url, init);
     }
-    const note = writerNote(state.spans, state.ending, state.maxChars);
+    const note = writerNote(state.spans, state.ending, state.maxChars, state.title);
     const seenDraft = writerDraft || draft;
     if (note || (writerDraft && writerDraft !== draft)) body = annotateWriterBody(body, draft, seenDraft, note);
     // max_tokens follows the request (maxChars, or the draft length) plus a small
@@ -1902,7 +1906,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     } else if (ratio > NEAR_COPY_RATIO) {
       // its own deadline: the re-ask must finish by reaskEndMs after the writer call began, or the
       // first answer is kept (so the writer's 60 s node timeout never eats a usable rewrite)
-      const reBody = { ...body, model, messages: [...(body.messages || []), { role: "assistant", content: capUtf8(text, forwardCap) }, { role: "user", content: REASK_TEXT }] };
+      const reBody = { ...body, model, messages: [...(body.messages || []), { role: "assistant", content: capUtf8(text, forwardCap) }, { role: "user", content: state.title ? REASK_TEXT.replace("rewritten comment text", "rewritten title text") : REASK_TEXT }] };
       const heldRe = hold("reask", letter, model, reBody.messages, reBody.max_tokens);
       if (heldRe == null) {
         state.skippedReask[letter] = { ratio, why: "it would have cost more than this request's deposit" };
@@ -2575,7 +2579,7 @@ export async function applyHumanizeFallback(wf, result, record, state) {
       result.outputs[out.key] = JSON.stringify(parsed);
       return { note: "note: the decider's reply was not usable, so the first rewrite that fits the cap was checked again and the decider confirmed it is faithful and safe." };
     }
-    return { error: failureMessage(state) };
+    return { error: result.deciderUnusable ? deciderFailureMessage(state) : failureMessage(state) };
   }
   if (result.deciderUnusable) return { error: deciderFailureMessage(state) };
   return null;

@@ -142,8 +142,8 @@ export function settledChargeUsd(meteredUsd, depositUsd) {
 }
 
 function longestRetry(spans, maxChars, ending, title) {
-  const opts = { spans, maxChars };
-  const options = [REASK_TEXT, guardRetryPrompt(["echo"], opts)];
+  const opts = { spans, maxChars, title };
+  const options = [title ? REASK_TEXT.replace("rewritten comment text", "rewritten title text") : REASK_TEXT, guardRetryPrompt(["echo"], opts)];
   if (spans && spans.length) options.push(guardRetryPrompt(["keep"], opts));
   if (title) options.push(guardRetryPrompt(["title"], opts));
   if (maxChars) options.push(guardRetryPrompt(["max"], opts));
@@ -279,10 +279,10 @@ export function humanizeCeilingSpecs() {
   const guidanceBytes = bytes(guidance);
   const draftBytes = bytes(draft);
   const { writerDraft, spans } = collectSpans(draft, [draft]);
-  const shared = { contextBytes, guidanceBytes, draftBytes, draftText: draft };
-  const plainNote = writerNote([], "keep_last", null);
-  const keepNote = writerNote(spans, "any", null);
-  const capNote = writerNote([], "question", MAX_CHARS_LIMIT);
+  const shared = { contextBytes, guidanceBytes, draftBytes, draftText: draft, title: true };
+  const plainNote = writerNote([], "keep_last", null, true);
+  const keepNote = writerNote(spans, "any", null, true);
+  const capNote = writerNote([], "question", MAX_CHARS_LIMIT, true);
   return [
     {
       ...shared,
@@ -345,7 +345,7 @@ function specFromArgs(graph, args) {
   const keep = Array.isArray(keepRaw) ? keepRaw.filter((s) => typeof s === "string") : [];
   const title = findArg(args, "title") === true;
   const { cleanDraft, writerDraft, spans } = collectSpans(draftText, keep);
-  const note = writerNote(spans, ending, maxChars);
+  const note = writerNote(spans, ending, maxChars, title);
   return {
     contextBytes: bytes(contextText),
     guidanceBytes: bytes(guidanceText),

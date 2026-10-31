@@ -1116,6 +1116,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
           record: tool.humanize,
+          hosted,
           draft: cleanDraft,
           writerDraft: spans.length ? writerDraft : null,
           spans,
