@@ -2109,7 +2109,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     let j = null;
     try { j = await r.json(); } catch { j = null; }
     const content = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    return { status: r.status, content: typeof content === "string" ? content : "", ...chatPrice(j, r, paidUsd) };
+    const choice = j && j.choices && j.choices[0];
+    const truncated = choice && (choice.finish_reason === "length" || choice.finishReason === "length");
+    return { status: r.status, content: typeof content === "string" ? content : "", truncated: !!truncated, ...chatPrice(j, r, paidUsd) };
   };
 
   /**
@@ -2160,7 +2162,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         : knownUsd(result && result.paidUsd);
       finishPaid(held, metered, rec.invoiceCommitted);
       recordReviewPrice(state, rec, result);
-      if (!result.status || result.status !== 200 || !result.content) return { ok: false };
+      if (!result.status || result.status !== 200 || !result.content || result.truncated) return { ok: false };
       return parseRepairVerdict(result.content, letter);
     } catch (e) {
       if (e && (e.budgetRefused || e.priceUnknown)) {
@@ -2382,7 +2384,9 @@ export function parseRepairVerdict(content, letter) {
   if (!j) return { ok: false };
   const want = String(letter || "").toUpperCase();
   const winner = typeof j.winner === "string" ? j.winner.trim().toUpperCase() : "";
-  const row = Array.isArray(j.ranked) ? j.ranked.find((r) => r && typeof r.writer === "string" && r.writer.trim().toUpperCase() === want) : null;
+  const rows = j.ranked.filter((r) => r && typeof r.writer === "string" && r.writer.trim().toUpperCase() === want);
+  if (rows.length !== 1) return { ok: false };
+  const row = rows[0];
   if (j.safe === false || (row && row.safe === false)) return { ok: false };
   const ok = !!(row && row.faithful === true && row.disqualified === false && winner === want);
   return { ok };
@@ -2421,7 +2425,7 @@ function reviewUserMessage(user, letter, model, text) {
  *    result.deciderUnusable is set at the same time. Display reasons can be replaced later
  *    with why a writer was dropped; that flag is what makes the run an error.
  */
-export function rebuildHumanizeResult(wf, result, record, answered = {}) {
+export function rebuildHumanizeResult(wf, result, record, answered = {}, { judgeTruncated = false } = {}) {
   const modelOf = (letter) => answered[letter] || record[letter].model;
   const out = wf.outputs.find((o) => o.nodeId === "judge");
   if (!out || typeof result.outputs[out.key] !== "string") return null;
@@ -2432,7 +2436,9 @@ export function rebuildHumanizeResult(wf, result, record, answered = {}) {
   };
   const draftRec = result.nodes && result.nodes.draft && result.nodes.draft.out;
   const draft = draftRec && typeof draftRec.text === "string" ? draftRec.text : "";
-  const j = parseDeciderJson(result.outputs[out.key]);
+  // A syntactically complete object is still not a completed verdict when the
+  // provider says it ran out of completion tokens. Never trust a partial ranking.
+  const j = judgeTruncated ? null : parseDeciderJson(result.outputs[out.key]);
   if (!j) {
     const ranked = LETTERS.map((letter) => {
       const text = textOf(letter);
@@ -2554,9 +2560,9 @@ export async function applyHumanizeFallback(wf, result, record, state) {
     }
   }
   const constrained = !!(state.maxChars || state.title || state.ending === "question" || state.ending === "keep_last" || (state.spans && state.spans.length));
-  if (constrained && !acceptableDelivery(text, state)) {
-    // The decider's pick (often the original draft, after an unusable reply)
-    // missed the cap. Measure a writer rewrite, not the draft and not the JSON.
+  if (constrained && (result.deciderUnusable || !acceptableDelivery(text, state))) {
+    // A failed ranking needs a verdict even if the original draft fits. Otherwise
+    // the decider's pick missed a constraint. Measure the writer rewrite itself.
     // A row the decider already called faithful can be delivered. An unjudged
     // row that merely fits is not faithful until the decider says so.
     const row = fittingRanked(parsed, state);

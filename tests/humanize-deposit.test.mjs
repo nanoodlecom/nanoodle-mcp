@@ -417,11 +417,13 @@ test("a hosted unusable decider with one guard-dropped writer errors and refunds
   const draft = "Thanks for the note.";
   const transfers = [];
   const events = [];
+  let modelCalls = 0;
   const server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => { raw += c; });
     req.on("end", () => {
       const body = raw ? JSON.parse(raw) : {};
+      modelCalls++;
       const content = body.model === "z-ai/glm-5.3" ? "not a ranking" : body.model && body.model.includes("novelist") ? guidance : "Glad you wrote this up.";
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -468,6 +470,8 @@ test("a hosted unusable decider with one guard-dropped writer errors and refunds
     assert.equal(res.isError, true);
     assert.match(res.content[0].text, /not valid JSON with a ranked list/);
     assert.match(res.content[0].text, /refunded to/);
+    assert.match(res.content[0].text, /hosted payment[\s\S]*Provider costs already incurred by the service remain separate/);
+    assert.doesNotMatch(res.content[0].text, /you were not charged|you won't be charged/);
     assert.doesNotMatch(res.content[0].text, /not refunded|billed to the API key/);
     assert.doesNotMatch(res.content[0].text, /winner/);
     assert.equal(res.content[0].text.includes(draft), false);
@@ -476,6 +480,12 @@ test("a hosted unusable decider with one guard-dropped writer errors and refunds
     assert.deepEqual(transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
     const refund = events.find(([e]) => e === "refund");
     assert.equal(refund[1].reason, "run_failed");
+    const completedCalls = modelCalls;
+    const replay = await callTool({ name: "humanize-comment", arguments: { ...args, _payment_id: x.paymentId } });
+    assert.equal(replay.isError, true);
+    assert.match(replay.content[0].text, /was refunded/);
+    assert.equal(modelCalls, completedCalls, "retrying a refunded payment does not call models again");
+    assert.equal(transfers.length, 1, "retrying a refunded payment does not refund twice");
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });

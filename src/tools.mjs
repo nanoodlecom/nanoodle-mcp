@@ -1142,7 +1142,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
       if (tool.humanize) {
         notices.push(...humanizeRunNotes(hf.state));
-        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
+        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered, hf.state);
         if (note) notices.push(note);
         const fb = await applyHumanizeFallback(runWf, result, tool.humanize, hf.state);
         if (fb && fb.error) throw new Error(fb.error);

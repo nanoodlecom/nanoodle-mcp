@@ -488,6 +488,9 @@ test("a bounced refund is retried until it lands — the customer's money is nev
   const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(res.isError);
   assert.match(res.content[0].text, /refunded to .* automatically/, "caller must be told the refund retries, not to chase the operator");
+  assert.match(res.content[0].text, /refund is pending/);
+  assert.match(res.content[0].text, /Provider costs already incurred by the service remain separate/);
+  assert.doesNotMatch(res.content[0].text, /you were not charged|you won't be charged/);
   assert.deepEqual(chain.state.transfers, []);
 
   chain.state.failTransfer = false;

@@ -1256,14 +1256,14 @@ export function createChargeGate({
               // replayed failure shows "(error details not retained…)" plus the
               // real refund status — enough for the caller to know the money is
               // handled, without keeping their content at rest.
-              // Lead with the outcome that matters to the payer — not charged,
-              // money coming back, safe to retry — then the technical detail.
+              // Report the hosted payment's actual refund status separately from
+              // provider costs: returning the deposit does not reverse model spend.
               // A throttled-RPC failure (all nodes 429) lands here too, so the
               // caller should read "try again," never "payment failed."
               const payer = refunded
-                ? `The run didn't complete, so your payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source} — you were not charged. You can try again in a moment.`
+                ? `The run didn't complete, so your hosted payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}. Provider costs already incurred by the service remain separate from this refund. You can try again in a moment.`
                 : q.source
-                  ? `The run didn't complete, so your ${rawToXno(q.amountRaw)} XNO deposit is being refunded to ${q.source} automatically (the first send bounced; the server retries until it lands) — you won't be charged for a run that didn't finish. You can try again shortly.`
+                  ? `The run didn't complete. Your ${rawToXno(q.amountRaw)} XNO hosted deposit is being refunded to ${q.source} automatically; the refund is pending because the first send failed and is queued for retry. Provider costs already incurred by the service remain separate from this refund. Contact the operator if the refund does not arrive.`
                   : `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`;
               q.error = `${payer}\n\nDetails: ${msg}`;
               q.errorPersist = `${payer}\n\nDetails: (error details not retained across restarts)`;
