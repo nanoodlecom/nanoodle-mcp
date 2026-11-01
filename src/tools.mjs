@@ -1116,6 +1116,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
         hf = humanizeFetch({
           record: tool.humanize,
+          hosted,
           draft: cleanDraft,
           writerDraft: spans.length ? writerDraft : null,
           spans,
@@ -1141,7 +1142,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
       if (tool.humanize) {
         notices.push(...humanizeRunNotes(hf.state));
-        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered);
+        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered, hf.state);
         if (note) notices.push(note);
         const fb = await applyHumanizeFallback(runWf, result, tool.humanize, hf.state);
         if (fb && fb.error) throw new Error(fb.error);

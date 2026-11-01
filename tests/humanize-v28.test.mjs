@@ -29,14 +29,14 @@ async function runHumanize(t, reply, args, opts = {}) {
       const body = JSON.parse(raw || "{}");
       const user = (body.messages || []).filter((m) => m.role === "user").map((m) => m.content).join("\n");
       const reask = (body.messages || []).length > 2;
-      seen.push({ model: body.model, user, reask, messages: body.messages || [] });
+      seen.push({ model: body.model, user, reask, messages: body.messages || [], max_tokens: body.max_tokens });
       let content;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompt = user;
         content = reply(body, { user, reask, judge: true });
       } else content = reply(body, { user, reask, judge: false });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ choices: [{ message: { content: content == null ? "" : content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+      res.end(JSON.stringify({ choices: [{ message: { content: content == null ? "" : content }, finish_reason: opts.finishReason?.(body, user) ?? "stop" }], x_nanogpt_pricing: { costUsd: opts.costUsd ?? 0.0001 } }));
     });
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -48,6 +48,7 @@ async function runHumanize(t, reply, args, opts = {}) {
     dirs: [dir],
     apiKey: opts.wallet ? undefined : "test-key",
     payment: opts.wallet || undefined,
+    hosted: opts.hosted === true,
     baseUrl: "http://127.0.0.1:" + srv.address().port,
     outDir: join(dir, "out"),
     log: () => {},
@@ -295,6 +296,50 @@ function judgeLetter(user) {
   if (blocks.length !== 1) return null;
   return blocks[0].match(/\[([A-E])\]/)[1];
 }
+
+test("an unusable title ranking checks a fitting rewrite even when the original fits too", async (t) => {
+  const title = "A shorter headline";
+  const { json, seen } = await runHumanize(t, (body, ctx) => {
+    if (!ctx.judge) return title;
+    const letter = judgeLetter(ctx.user);
+    return letter ? reviewVerdict(letter) : '{"winner":"A","ranked":[';
+  }, { Draft: "A headline for the article", Context: "An article.", title: true, maxChars: 100 });
+  assert.equal(json.text, title);
+  assert.equal(seen.filter((s) => s.model === "z-ai/glm-5.3").length, 2);
+  const judges = seen.filter((s) => s.model === "z-ai/glm-5.3");
+  assert.equal(judges[1].max_tokens, judges[0].max_tokens, "confirmation uses the already quoted output cap");
+});
+
+test("a length-limited ranking requires a new verdict even when its JSON parses", async (t) => {
+  const title = "A shorter headline";
+  const { json, seen } = await runHumanize(t, (body, ctx) => {
+    if (!ctx.judge) return title;
+    const letter = judgeLetter(ctx.user);
+    return letter ? reviewVerdict(letter) : judge("A", ["A", "B", "C", "D", "E"]);
+  }, { Draft: "A headline for the article", Context: "An article.", title: true, maxChars: 100 }, {
+    finishReason: (body, user) => body.model === "z-ai/glm-5.3" && !judgeLetter(user) ? "length" : "stop",
+  });
+  assert.equal(json.ranked.find((r) => r.writer === "A").reason, "decider confirmed faithful and safe");
+  assert.equal(seen.filter((s) => s.model === "z-ai/glm-5.3").length, 2);
+});
+
+test("a length-limited or conflicting confirmation cannot approve an unjudged rewrite", async (t) => {
+  for (const conflicting of [false, true]) {
+    const judges = [];
+    await assert.rejects(runHumanize(t, (body, ctx) => {
+      if (!ctx.judge) return "A shorter headline";
+      judges.push(ctx.user);
+      const letter = judgeLetter(ctx.user);
+      if (!letter) return '{"winner":"A","ranked":[';
+      const verdict = JSON.parse(reviewVerdict(letter));
+      if (conflicting) verdict.ranked.push({ writer: letter, faithful: false, disqualified: true, safe: false });
+      return JSON.stringify(verdict);
+    }, { Draft: "C".repeat(400), Context: "An article.", title: true, maxChars: 100 }, {
+      finishReason: (body, user) => !conflicting && body.model === "z-ai/glm-5.3" && judgeLetter(user) ? "length" : "stop",
+    }), /not confirmed faithful and safe/);
+    assert.equal(judges.length, 2, "one confirmation only, with no repeated paid retry");
+  }
+});
 
 test("an unusable decider delivers a fitting rewrite only after a faithful and safe review", async (t) => {
   const title = "A clearer headline for the piece";
@@ -1013,4 +1058,56 @@ test("a wallet caller who already paid is not told they were not charged", async
       return true;
     },
   );
+});
+
+
+test("title mode tells every writer to rewrite a title before the first call", async (t) => {
+  const expected = "One picture becomes a splat and mesh";
+  const { json, seen } = await runHumanize(t, (_body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return ctx.user.includes("This request is a title rewrite") ? expected : "You made a splat and mesh, thanks for sharing.";
+  }, { Draft: "One image made a Gaussian splat and 3D mesh", Context: "an article headline", title: true });
+  assert.equal(json.text, expected);
+  const writers = seen.filter((s) => s.model !== "z-ai/glm-5.3" && !s.reask);
+  assert.equal(writers.length, 5);
+  for (const writer of writers) assert.match(writer.user, /one title line only/);
+});
+
+test("title guard retries preserve the requested output format", () => {
+  for (const reasons of [["echo"], ["keep"], ["max"], ["question"], []]) {
+    const prompt = guardRetryPrompt(reasons, { title: true, maxChars: 100, spans: [] });
+    assert.match(prompt, /title/);
+    assert.doesNotMatch(prompt, /rewritten comment/);
+  }
+});
+
+test("a 329-character intro is accepted under a 700-character cap", async (t) => {
+  const draft = "An intro with details about a project. ".repeat(10).slice(0, 329);
+  assert.equal([...draft].length, 329);
+  const { json } = await runHumanize(t, (_body, ctx) => ctx.judge
+    ? judge("A", ["A", "B", "C", "D", "E"])
+    : "Here is the project intro in a fresh voice, with the same details.",
+  { Draft: draft, Context: "project introduction", maxChars: 700 });
+  assert.ok(json.text.length < 700);
+});
+
+test("an unusable decider is reported before a coincidental cap failure", async () => {
+  const wf = { outputs: [{ key: "result", nodeId: "judge" }] };
+  const result = { deciderUnusable: true, outputs: { result: JSON.stringify({ winner: "ORIGINAL", text: "x".repeat(800), ranked: [] }) } };
+  const state = { draft: "x".repeat(800), maxChars: 700, title: false, spans: [], ending: "any", judgeTruncated: true };
+  const failed = await applyHumanizeFallback(wf, result, {}, state);
+  assert.match(failed.error, /decider.*cut off/);
+  assert.doesNotMatch(failed.error, /no rewrite fit/);
+});
+
+
+test("humanize cost output and observed-cost record stay numeric with decimal-string meters", async (t) => {
+  const { texts, registry } = await runHumanize(t, (_body, ctx) => ctx.judge
+    ? judge("A", ["A", "B", "C", "D", "E"])
+    : "A fresh rewrite for this note.",
+  { Draft: "Details about the shipped fix.", Context: "project note" }, { costUsd: "1e-4" });
+  assert.deepEqual(texts.filter((text) => text.startsWith("cost:")), ["cost: $0.0006"]);
+  const cost = registry.costs["humanize-comment"].usd;
+  assert.equal(typeof cost, "number");
+  assert.ok(Math.abs(cost - 0.0006) < 1e-12);
 });

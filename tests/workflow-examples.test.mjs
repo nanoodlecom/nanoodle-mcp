@@ -206,7 +206,7 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // x402.usd is the cold ceiling (longest request, after the margin). A call quotes
     // less when its own draft, context, guidance, and maxChars cost less.
-    assert.equal(mounted.x402.usd.toFixed(8), "0.05428204");
+    assert.equal(mounted.x402.usd.toFixed(8), "0.05433870");
     // Tokens are bytes / 3.5 (caller text on the decider: bytes / 2.5). Writer output is the draft length plus a small slack,
     // and the decider adds room for its ranking JSON and for GLM reasoning. When
     // Cydonia fails and the Starry fallback runs, both calls are charged. This
@@ -214,7 +214,7 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // extra writer calls; the run may still attempt MAX_REASKS and stops when the
     // next one would pass the deposit. At the counted Guidance cap, with no keep
     // and no repair, that charge is $0.00956268 after the 20% markup.
-    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.05428204.
+    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.0543387.
     // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
     // Starry Ocean $0.05/$0.25, others $0.10 in and $0.35-$0.60 out.
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
@@ -263,8 +263,8 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.equal(budget.writerDraftChars <= Draft, true);
     const ceilingCharge = humanizeChargeUsd(graph, null, { ceiling: true });
     const ceiling = humanizeCeilingDepositUsd(graph);
-    assert.equal(ceilingCharge.toFixed(8), "0.04846610", "the capped worst case, before the margin");
-    assert.equal(ceiling.toFixed(8), "0.05428204");
+    assert.equal(ceilingCharge.toFixed(8), "0.04851670", "the capped worst case, before the margin");
+    assert.equal(ceiling.toFixed(8), "0.05433870");
     assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);
     assert.ok(ceiling >= ceilingCharge, "the ceiling covers the worst-case charge");
     assert.ok(ceiling <= ceilingCharge * 1.15 + 1e-9, "the margin stays inside 15%");

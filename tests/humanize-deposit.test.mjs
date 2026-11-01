@@ -96,7 +96,7 @@ test("short, typical, and maximum-length deposits cover their own worst case and
   assert.equal(maximum.toFixed(8), "0.02775871");
   const ceiling = humanizeCeilingDepositUsd(graph);
   assert.ok(maximum <= ceiling + 1e-12);
-  assert.equal(ceiling.toFixed(8), "0.05428204");
+  assert.equal(ceiling.toFixed(8), "0.05433870");
   assert.equal(ceiling.toFixed(8), graph.x402.usd.toFixed(8));
 });
 
@@ -254,7 +254,7 @@ test("the quote is at least the max charge, including a restore that grows 1732 
   const emberDeposit = humanizeDepositUsd(graph, ember);
   assert.ok(emberDeposit >= emberCharge);
   const ceiling = humanizeCeilingDepositUsd(graph);
-  assert.equal(ceiling.toFixed(8), "0.05428204");
+  assert.equal(ceiling.toFixed(8), "0.05433870");
   assert.ok(emberDeposit <= ceiling);
   assert.ok(grewDeposit <= ceiling);
   assert.equal(graph.x402.usd, ceiling);
@@ -417,11 +417,13 @@ test("a hosted unusable decider with one guard-dropped writer errors and refunds
   const draft = "Thanks for the note.";
   const transfers = [];
   const events = [];
+  let modelCalls = 0;
   const server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => { raw += c; });
     req.on("end", () => {
       const body = raw ? JSON.parse(raw) : {};
+      modelCalls++;
       const content = body.model === "z-ai/glm-5.3" ? "not a ranking" : body.model && body.model.includes("novelist") ? guidance : "Glad you wrote this up.";
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -468,6 +470,9 @@ test("a hosted unusable decider with one guard-dropped writer errors and refunds
     assert.equal(res.isError, true);
     assert.match(res.content[0].text, /not valid JSON with a ranked list/);
     assert.match(res.content[0].text, /refunded to/);
+    assert.match(res.content[0].text, /hosted payment[\s\S]*Provider costs already incurred by the service remain separate/);
+    assert.doesNotMatch(res.content[0].text, /you were not charged|you won't be charged/);
+    assert.doesNotMatch(res.content[0].text, /not refunded|billed to the API key/);
     assert.doesNotMatch(res.content[0].text, /winner/);
     assert.equal(res.content[0].text.includes(draft), false);
     const deadline = Date.now() + 5000;
@@ -475,6 +480,12 @@ test("a hosted unusable decider with one guard-dropped writer errors and refunds
     assert.deepEqual(transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
     const refund = events.find(([e]) => e === "refund");
     assert.equal(refund[1].reason, "run_failed");
+    const completedCalls = modelCalls;
+    const replay = await callTool({ name: "humanize-comment", arguments: { ...args, _payment_id: x.paymentId } });
+    assert.equal(replay.isError, true);
+    assert.match(replay.content[0].text, /was refunded/);
+    assert.equal(modelCalls, completedCalls, "retrying a refunded payment does not call models again");
+    assert.equal(transfers.length, 1, "retrying a refunded payment does not refund twice");
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });
@@ -529,4 +540,15 @@ test("a hosted run refuses an invoice the quote cannot cover, and a direct walle
     else process.env.NANOGPT_API_KEY = prevKey;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+
+test("hosted failures defer refund claims to the charge gate receipt", () => {
+  for (const attempts of [[], [{ status: 200, usd: 0.001 }], [{ paymentStarted: true, paid: true, usd: 0.001 }]]) {
+    const message = failureMessage({ billing: "hosted", attempts, maxChars: 700 });
+    assert.match(message, /payment receipt/);
+    assert.doesNotMatch(message, /Nothing was charged|not refunded|billed to the API key/);
+  }
+  assert.match(failureMessage({ billing: "key", attempts: [{ status: 200, usd: 0.001 }] }), /billed to the API key/);
+  assert.match(failureMessage({ billing: "wallet", attempts: [{ paid: true, usd: 0.001 }] }), /not refunded/);
 });
