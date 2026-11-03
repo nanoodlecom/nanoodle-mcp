@@ -1,0 +1,15 @@
+{
+  "name": "nanoodle-mcp-compatibility",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node checks.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/sdk": "1.32.2"
+  }
+}
