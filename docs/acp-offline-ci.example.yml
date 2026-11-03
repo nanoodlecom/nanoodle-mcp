@@ -1,0 +1,33 @@
+name: ACP v2 offline qualification
+on:
+  pull_request:
+    paths:
+      - 'src/ecosystems/acp/**'
+      - 'src/gate.mjs'
+      - 'src/server.mjs'
+      - 'qualification/acp-v2/**'
+      - '.github/workflows/acp-offline.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/ecosystems/acp/**'
+      - 'qualification/acp-v2/**'
+      - '.github/workflows/acp-offline.yml'
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NANOODLE_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - run: npm ci --ignore-scripts
+      - run: npm --prefix qualification/acp-v2 ci --ignore-scripts
+      - run: npm --prefix qualification/acp-v2 test
