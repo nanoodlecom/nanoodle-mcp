@@ -26,10 +26,16 @@
     "LICENSE"
   ],
   "dependencies": {
+    "@solana/kit": "8.6.0",
+    "@x402/core": "2.29.0",
+    "@x402/evm": "2.29.0",
+    "@x402/svm": "2.29.0",
     "nanocurrency": "^2.5.0",
     "nanoodle": "file:vendor/nanoodle-0.13.1.tgz"
   },
-  "bundleDependencies": ["nanoodle"],
+  "bundleDependencies": [
+    "nanoodle"
+  ],
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -65,6 +71,7 @@
   },
   "devDependencies": {
     "@hot-labs/near-connect": "0.12.0",
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "viem": "2.57.14"
   }
 }
