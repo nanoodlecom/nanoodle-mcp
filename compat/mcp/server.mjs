@@ -80,9 +80,14 @@ export function createCompatibilityServer({ paidRegistry, version, revision, tim
     });
     // Canonical gate currently ignores cancellation during a paid run. Keep its
     // promise alive: abandoning the wait must not release/reissue a reservation.
-    const execution = Promise.resolve().then(() => paidRegistry.callTool({
-      name: params.name, arguments: params.arguments ?? {},
-    }, { signal: controller.signal, streaming: false })).then(result => {
+    const execution = Promise.resolve().then(async () => {
+      // invoke() returns before this microtask runs. Cancellation can arrive in
+      // that gap, so check again at the actual dispatch boundary, with no await
+      // between the check and the canonical gate call.
+      if (controller.signal.aborted) return uncertain(paymentId, 'Request cancelled before dispatch.');
+      const result = await paidRegistry.callTool({
+        name: params.name, arguments: params.arguments ?? {},
+      }, { signal: controller.signal, streaming: false });
       if (!object(result) || !Array.isArray(result.content) || result.isError) {
         return uncertain(paymentId, 'The workflow did not return a successful result.');
       }

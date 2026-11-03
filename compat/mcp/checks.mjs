@@ -180,6 +180,68 @@ test('pre-aborted request never reaches the injected boundary; free registry fai
   assert.throws(() => createCompatibilityServer({ paidRegistry: { ...p, listTools: () => [definition] }, version: '0.6.0', revision }), /charge-gated/);
 });
 
+test('abort between invoke and scheduled dispatch neither allocates nor consumes a canonical quote', async () => {
+  const f = fixture();
+  const a = createCompatibilityServer({ paidRegistry: f.paidRegistry, version: '0.6.0', revision });
+  const quoteAbort = new AbortController();
+  const quotePending = a.invoke(call(), { signal: quoteAbort.signal });
+  quoteAbort.abort(); // invoke returned, but its dispatch microtask has not run
+  const quoteResult = await quotePending;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(quoteResult.structuredContent.status, 'outcome_unknown');
+  assert.equal(quoteResult.structuredContent.automaticRetry, false);
+  assert.equal(f.events.length, 0, 'aborted quote request must not allocate a quote');
+  assert.equal(f.runs(), 0);
+
+  const x = (await a.invoke(call())).structuredContent.x402;
+  f.pay(x);
+  assert.equal(await f.gate.waitForPayment(x.paymentId, 1000), 'paid');
+  const params = call({ _payment_id: x.paymentId });
+  const paidAbort = new AbortController();
+  const paidPending = a.invoke(params, { signal: paidAbort.signal });
+  paidAbort.abort(); // same race, now with a real paid canonical reservation
+  const paidResult = await paidPending;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(paidResult.structuredContent.status, 'outcome_unknown');
+  assert.equal(paidResult.structuredContent.automaticRetry, false);
+  assert.equal(paidResult.structuredContent.paymentId, x.paymentId);
+  assert.equal(f.runs(), 0, 'pre-dispatch abort cannot execute the paid workflow');
+  assert.equal(f.gate.quote(x.paymentId).status, 'paid', 'reservation must remain unconsumed');
+  assert.equal(f.transfers.length, 0);
+  assert.equal(f.events.filter(e => e.event === 'quote').length, 1);
+
+  // Explicit reconciliation with the original payment ID can still retrieve it.
+  const recovered = await a.invoke(params);
+  assert.match(recovered.content[0].text, /offline output/);
+  assert.equal(f.runs(), 1);
+});
+
+test('abort after actual canonical dispatch returns uncertainty and preserves same-ID recovery', async () => {
+  let finish, started;
+  const running = new Promise(resolve => { started = resolve; });
+  const f = fixture({ onCall: () => { started(); return new Promise(resolve => { finish = resolve; }); } });
+  const a = createCompatibilityServer({ paidRegistry: f.paidRegistry, version: '0.6.0', revision });
+  const x = (await a.invoke(call())).structuredContent.x402;
+  f.pay(x);
+  assert.equal(await f.gate.waitForPayment(x.paymentId, 1000), 'paid');
+  const params = call({ _payment_id: x.paymentId });
+  const c = new AbortController();
+  const pending = a.invoke(params, { signal: c.signal });
+  await running; // the provider boundary has actually been entered
+  c.abort();
+  const result = await pending;
+  assert.equal(result.structuredContent.status, 'outcome_unknown');
+  assert.equal(result.structuredContent.automaticRetry, false);
+  assert.equal(result.structuredContent.paymentId, x.paymentId);
+  assert.equal(f.runs(), 1);
+  assert.equal(f.gate.quote(x.paymentId).status, 'consumed');
+  assert.equal(f.events.filter(e => e.event === 'quote').length, 1);
+  finish({ content: [{ type: 'text', text: 'completed after abort' }], costUsd: 0.01 });
+  const recovered = await a.invoke(params);
+  assert.match(recovered.content[0].text, /completed after abort/);
+  assert.equal(f.runs(), 1);
+});
+
 test('modern auto client conservatively falls back to unchanged canonical dispatcher', async t => {
   const dispatch = createDispatcher({ name: 'canonical-offline', version: '0.6.0', commit: null,
     listTools: () => [], callTool: async () => { throw new Error('No live calls'); } });

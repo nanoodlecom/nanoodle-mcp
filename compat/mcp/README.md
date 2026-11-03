@@ -101,7 +101,9 @@ This is source provenance, **not proof of chain settlement**. The canonical
 payment receipt is separate; the adapter never invents a transaction hash.
 
 A timeout, abort, disconnect or tool failure is conservative `outcome_unknown`
-with `automaticRetry:false`. Before-dispatch cancellation dispatches nothing;
+with `automaticRetry:false`. Before-dispatch cancellation, including an abort
+after `invoke()` returns but before its scheduled dispatch microtask executes,
+dispatches nothing;
 after dispatch the canonical gate may continue running. The gate currently does
 not consume the façade's cancellation signal during paid execution. Neither an
 abort signal nor tool completion establishes a confirmed refund/change transfer.
@@ -116,17 +118,21 @@ execution. The canonical gate deliberately omits private text output from disk;
 after restart it may rerun that workflow to regenerate output while avoiding
 repeated settlement. In-process shared-gate replay is covered; durable dispatch
 journaling and restart-safe provider execution are outside this compatibility PR.
-Its canonical receipt can also precede confirmation of queued outgoing transfers.
+The cancellation guard does not resolve that restart protection gap; no durable
+exactly-once execution or competing dispatch ledger is introduced. Its canonical
+receipt can also precede confirmation of queued outgoing transfers.
 The façade does not strengthen these guarantees or claim settlement is final.
 
 ## Coverage and limits
 
-Nine offline checks cover actual SDK discovery/envelopes and legacy initialize;
+Eleven offline checks cover actual SDK discovery/envelopes and legacy initialize;
 tools/schema/error/resource semantics; real canonical quote/pay/run/receipt flow;
 two concurrent connections with one canonical dispatch; mismatched-argument
 rejection; paid timeout then same-ID recovery; SDK cancellation then recovery;
-secret-safe failure; uncertain outgoing refund; pre-dispatch abort; rejection of an ungated registry; and a
-v2 auto-negotiating client falling back to the unchanged canonical dispatcher.
+secret-safe failure; uncertain outgoing refund; immediate pre-dispatch abort
+against the real gate (no quote allocation, reservation consumption or workflow
+execution); post-dispatch uncertainty and same-ID recovery; pre-aborted requests;
+rejection of an ungated registry; and a v2 auto-negotiating client falling back to the unchanged canonical dispatcher.
 A simulated payment is a fixture, not a network compatibility receipt.
 
 There is no live Claude, Codex, Cursor, Gemini, ChatGPT, registry, OAuth, HTTP
