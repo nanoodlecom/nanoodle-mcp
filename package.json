@@ -51,5 +51,8 @@
   },
   "bugs": {
     "url": "https://github.com/nanoodlecom/nanoodle-mcp/issues"
+  },
+  "devDependencies": {
+    "@a2a-js/sdk": "1.3.0"
   }
 }
