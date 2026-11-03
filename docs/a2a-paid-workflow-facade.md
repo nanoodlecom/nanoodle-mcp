@@ -28,6 +28,29 @@ certification are **not qualified** by this branch. The offline roundtrip uses
 real SDK client serialization and JSON-RPC server dispatch over an injected
 in-process fetch byte boundary. It does not prove a live HTTP/auth deployment.
 
+## Protocol error categories
+
+The disabled-capability and terminal-task errors follow the official
+[Send Message rules](https://a2a-protocol.org/latest/specification/#311-send-message),
+[capability validation rules](https://a2a-protocol.org/latest/specification/#334-capability-validation)
+and [JSON-RPC mappings](https://a2a-protocol.org/latest/specification/#54-error-code-mappings):
+
+| Request | SDK error | JSON-RPC code / ErrorInfo reason |
+| --- | --- | --- |
+| Disabled push config Create/Get/List/Delete, or a push config in SendMessage | `PushNotificationNotSupportedError` | `-32003` / `PUSH_NOTIFICATION_NOT_SUPPORTED` |
+| Extended card when capability is false | `UnsupportedOperationError` | `-32004` / `UNSUPPORTED_OPERATION` |
+| New run message to a completed, failed or canceled task | `UnsupportedOperationError` | `-32004` / `UNSUPPORTED_OPERATION` |
+| CancelTask after dispatch or completion | `TaskNotCancelableError` | `-32002` / `TASK_NOT_CANCELABLE` |
+
+`ExtendedAgentCardNotConfiguredError` applies only when extended-card support is
+advertised but its card is not configured; this facade advertises no such support.
+An exact duplicate message still replays the recorded operation. A different
+message ID attempting another dispatch does not become a cancellation request.
+SDK server-transport tests assert the serialized numeric code and complete
+`google.rpc.ErrorInfo` category for these cases; a generic rejection is insufficient.
+They route JSON bytes through `JsonRpcTransportHandler`, because an SDK client
+can reject disabled features locally before exercising the server's error mapping.
+
 ## Existing canonical integration seam
 
 `createOfflineChargeBoundary({ gate, registry })` uses the actual
@@ -122,7 +145,9 @@ or cross-process exactly-once delivery.
   displayed error. A failed task does not itself attest a completed refund.
 - Outputs remain in memory only. After restart, a completed task retains its
   receipt and reports `outputUnavailable: true`; it does not rerun to regenerate
-  user content. A production result-retention/download policy remains future work.
+  user content. This remains an unresolved result-availability integration gap: durable task
+  status does not provide durable result delivery. A production retention/download
+  policy remains future work.
 
 ## Onboarding friction and economics
 
@@ -165,8 +190,8 @@ Live enablement remains explicitly out of scope: authenticated HTTP hosting,
 provider cancellation, canonical quote cancellation/refund coordination, durable
 result delivery and operator reconciliation must be reviewed before deployment.
 
-Validation on this branch (2026-11-03): **15/15 A2A tests** pass; complete
-`NANOODLE_OFFLINE=1 npm test`: **419 tests, 418 passed, 1 skipped, 0 failed**.
+Validation on this branch (2026-11-03): **18/18 A2A tests** pass; complete
+`NANOODLE_OFFLINE=1 npm test`: **422 tests, 421 passed, 1 skipped, 0 failed**.
 Node: 24.22.1. ffmpeg: CI's pinned 7.0.2 static archive, verified SHA256
 `abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67`.
 The first broad attempt lacked ffmpeg and had three environment failures;

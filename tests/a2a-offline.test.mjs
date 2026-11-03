@@ -62,6 +62,10 @@ async function fixture(t, { onCall, override, timeoutMs = 1000 } = {}) {
   let facade = createOfflineA2AFacade({ mode, bindings: store, boundary, workflows, timeoutMs });
   t.after(async () => { store.close(); await rm(dir, { recursive: true, force: true }); });
   return { get facade() { return facade; }, get store() { return store; }, state, gate, canonical, path,
+    async rpc(method, params, context = auth()) {
+      const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+      return JSON.parse(JSON.stringify(await new JsonRpcTransportHandler(facade).handle(request, context)));
+    },
     restart() { store.close(); store = openA2ABindings({ mode, path });
       facade = createOfflineA2AFacade({ mode, bindings: store, boundary, workflows, timeoutMs }); },
     async pay(task) {
@@ -303,4 +307,62 @@ test('restart after quote issuance intent fails closed instead of issuing an orp
   f.restart();
   const replay = await f.facade.sendMessage(msg('quote-intent'), auth());
   assert.equal(replay.metadata.phase, 'uncertain'); assert.equal(f.state.quotes, 1);
+});
+
+function wireError(response, code, reason) {
+  assert.equal(response.jsonrpc, '2.0');
+  assert.equal(response.id, 1);
+  assert.equal(Object.hasOwn(response, 'result'), false);
+  assert.equal(response.error.code, code);
+  assert.deepEqual(response.error.data, [{
+    '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason, domain: 'a2a-protocol.org',
+  }]);
+}
+
+test('SDK JSON-RPC wire: all disabled push features return PushNotificationNotSupported', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.facade.getAgentCard()).capabilities.pushNotifications, false);
+  // Use actual JSON bytes and SDK server transport: the SDK client can reject
+  // disabled features locally, which would otherwise hide a wrong server error.
+  for (const [method, params] of [
+    ['CreateTaskPushNotificationConfig', { id: 'config', taskId: 'task', url: 'https://offline.invalid/notify' }],
+    ['GetTaskPushNotificationConfig', { id: 'config', taskId: 'task' }],
+    ['ListTaskPushNotificationConfigs', { taskId: 'task' }],
+    ['DeleteTaskPushNotificationConfig', { id: 'config', taskId: 'task' }],
+  ]) wireError(await f.rpc(method, params), -32003, 'PUSH_NOTIFICATION_NOT_SUPPORTED');
+  const configuredSend = SendMessageRequest.toJSON(msg('disabled-inline-push'));
+  configuredSend.configuration.taskPushNotificationConfig = { id: 'config', url: 'https://offline.invalid/notify' };
+  wireError(await f.rpc('SendMessage', configuredSend), -32003, 'PUSH_NOTIFICATION_NOT_SUPPORTED');
+  assert.equal(f.state.quotes, 0); assert.equal(f.state.calls, 0);
+});
+
+test('SDK JSON-RPC wire: disabled extended card returns UnsupportedOperation', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.facade.getAgentCard()).capabilities.extendedAgentCard, false);
+  wireError(await f.rpc('GetExtendedAgentCard', {}), -32004, 'UNSUPPORTED_OPERATION');
+  assert.equal(f.state.quotes, 0); assert.equal(f.state.calls, 0);
+});
+
+test('SDK JSON-RPC wire: new messages to terminal tasks are unsupported; cancel errors remain distinct', async t => {
+  for (const phase of ['canceled', 'completed', 'failed']) {
+    const f = await fixture(t, phase === 'failed' ? { onCall: async () => { throw new Error('private failure'); } } : {});
+    const q = await f.facade.sendMessage(msg(`terminal-${phase}-quote`), auth());
+    let run;
+    if (phase === 'canceled') await f.facade.cancelTask({ id: q.id }, auth());
+    else {
+      await f.pay(q);
+      run = msg(`terminal-${phase}-run`, { action: 'run', task: q, quoteId: q.metadata.quoteId });
+      await f.facade.sendMessage(run, auth());
+    }
+    const newMessage = msg(`new-${phase}-run`, { action: 'run', task: q, quoteId: q.metadata.quoteId });
+    wireError(await f.rpc('SendMessage', SendMessageRequest.toJSON(newMessage)), -32004, 'UNSUPPORTED_OPERATION');
+    if (run) {
+      // An exact retry remains a replay of the recorded operation, not a new message.
+      const replay = await f.rpc('SendMessage', SendMessageRequest.toJSON(run));
+      assert.equal(replay.result.task.metadata.phase, phase);
+      wireError(await f.rpc('CancelTask', { id: q.id }), -32002, 'TASK_NOT_CANCELABLE');
+    }
+    assert.equal((await f.facade.getTask({ id: q.id }, auth())).metadata.phase, phase);
+    assert.equal(f.state.quotes, 1); assert.equal(f.state.calls, phase === 'canceled' ? 0 : 1);
+  }
 });

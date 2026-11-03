@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { AgentCard, Task, TaskState, Role } from '@a2a-js/sdk';
 import { RequestMalformedError, TaskNotFoundError, TaskNotCancelableError,
-  UnsupportedOperationError, ExtendedAgentCardNotConfiguredError, VersionNotSupportedError } from '@a2a-js/sdk/errors';
+  UnsupportedOperationError, PushNotificationNotSupportedError, VersionNotSupportedError } from '@a2a-js/sdk/errors';
 import { offline, check, hash, copy, identifier } from './bindings.mjs';
 
 const dataPart = value => ({ data: value, mediaType: 'application/json', filename: '' });
 const bad = () => new RequestMalformedError({ message: 'Invalid Noodle A2A request or binding.' });
 const unsupported = async () => { throw new UnsupportedOperationError(); };
+const pushUnsupported = async () => { throw new PushNotificationNotSupportedError(); };
 const phases = { quoting: TaskState.TASK_STATE_WORKING, awaiting: TaskState.TASK_STATE_INPUT_REQUIRED,
   dispatching: TaskState.TASK_STATE_WORKING, uncertain: TaskState.TASK_STATE_INPUT_REQUIRED,
   completed: TaskState.TASK_STATE_COMPLETED, failed: TaskState.TASK_STATE_FAILED,
@@ -97,7 +98,7 @@ export function createOfflineA2AFacade({ mode, bindings, boundary, workflows, ur
       const m = params.message;
       if (m?.role !== Role.ROLE_USER || !identifier(m.messageId) || m.parts?.length !== 1
         || m.parts[0].content?.$case !== 'data' || m.referenceTaskIds?.length || m.extensions?.length
-        || (params.configuration?.taskPushNotificationConfig) || params.tenant) throw bad();
+        || params.tenant) throw bad();
       const data = copy(m.parts[0].content.value);
       if (!data || !['quote', 'run'].includes(data.action) || !offered.has(data.name)
         || !data.arguments || Array.isArray(data.arguments) || typeof data.arguments !== 'object'
@@ -110,9 +111,11 @@ export function createOfflineA2AFacade({ mode, bindings, boundary, workflows, ur
   }
   const handler = {
     async getAgentCard() { offline(mode); return copy(card); },
-    async getAuthenticatedExtendedAgentCard() { throw new ExtendedAgentCardNotConfiguredError(); },
+    getAuthenticatedExtendedAgentCard: unsupported,
     async sendMessage(params, context) {
-      const owner = scope(context), { m, data, messageBinding } = parse(params);
+      const owner = scope(context);
+      if (params.configuration?.taskPushNotificationConfig) throw new PushNotificationNotSupportedError();
+      const { m, data, messageBinding } = parse(params);
       const previous = bindings.message(owner, m.messageId);
       if (previous) {
         if (previous.binding !== messageBinding) throw bad();
@@ -128,7 +131,7 @@ export function createOfflineA2AFacade({ mode, bindings, boundary, workflows, ur
         r = owned(m.taskId, context);
         if ((m.contextId && r.contextId !== m.contextId) || r.callBinding !== callBinding) throw bad();
         if (data.action !== 'run' || data.quoteId !== r.quoteId) throw bad();
-        if (r.phase !== 'awaiting') throw new TaskNotCancelableError({ message: 'Task does not accept another dispatch.' });
+        if (r.phase !== 'awaiting') throw new UnsupportedOperationError({ message: 'Task does not accept another dispatch.' });
         // Validation is side-effect-free; after awaiting it a cancellation may
         // have won. CAS below decides which operation is allowed to proceed.
         try { await bounded(() => boundary.validate(call)); } catch { throw bad(); }
@@ -194,8 +197,8 @@ export function createOfflineA2AFacade({ mode, bindings, boundary, workflows, ur
       // never release money, never abort an already-dispatched paid workflow.
       return view(bindings.get(r.id));
     },
-    listTasks: unsupported, createTaskPushNotificationConfig: unsupported, getTaskPushNotificationConfig: unsupported,
-    listTaskPushNotificationConfigs: unsupported, deleteTaskPushNotificationConfig: unsupported,
+    listTasks: unsupported, createTaskPushNotificationConfig: pushUnsupported, getTaskPushNotificationConfig: pushUnsupported,
+    listTaskPushNotificationConfigs: pushUnsupported, deleteTaskPushNotificationConfig: pushUnsupported,
     async *sendMessageStream() { throw new UnsupportedOperationError(); },
     async *resubscribe() { throw new UnsupportedOperationError(); },
   };
