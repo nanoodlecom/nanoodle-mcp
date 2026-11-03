@@ -823,6 +823,27 @@ function instructionEcho(text, guidance) {
   return guidanceCoverage(t, g) >= 0.95;
 }
 
+/** Share of the guidance's trigrams a reply must cover before a shared stretch counts as an echo. */
+export const GUIDANCE_ECHO_COVERAGE = 0.5;
+
+/**
+ * A comment reply restates the guidance itself, not just the facts it lists.
+ * Guidance for a short, plain reply usually spells out the exact line to say,
+ * so a faithful reply shares a 40-character stretch (or most of its trigrams)
+ * with it. That alone is not an echo. It is one when the reply also opens with
+ * the guidance's own opening, or covers at least half of the guidance.
+ */
+function guidanceRestated(text, guidance) {
+  const g = String(guidance || "").replace(/\s+/g, " ").trim();
+  if (!g) return false;
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  const shared = windowsOverlap(t, g, 40) || (codePoints(g) >= 80 && copyRatio(t, g) >= 0.6);
+  if (!shared) return false;
+  const lead = normalizedEcho(g).slice(0, 40);
+  if (lead.length >= 40 && t.includes(lead)) return true;
+  return guidanceCoverage(t, g) >= GUIDANCE_ECHO_COVERAGE;
+}
+
 /**
  * True when a writer reply echoes the guidance wrapper, the one-thread prefix,
  * a <comment> tag, or a long stretch of the guidance or the instruction text.
@@ -836,10 +857,8 @@ export function echoesInstruction(text, guidance, system, { title = false } = {}
   const prefix = ONE_THREAD_PREFIX.trim();
   if (t.includes(prefix) || t.includes(prefix.slice(0, 32))) return true;
   if (instructionEcho(t, guidance)) return true;
-  if (!title && windowsOverlap(t, guidance, 40)) return true;
   if (windowsOverlap(t, system, 80)) return true;
-  const g = String(guidance || "").trim();
-  if (!title && codePoints(g) >= 80 && copyRatio(t, g) >= 0.6) return true;
+  if (!title && guidanceRestated(t, guidance)) return true;
   return false;
 }
 
