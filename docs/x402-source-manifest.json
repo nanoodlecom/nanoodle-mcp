@@ -1,0 +1,84 @@
+{
+  "checkedOn": "2026-11-03",
+  "repositoryBase": "98e426254a038c90fcaa14a42881ace6bb8c7278",
+  "officialSources": [
+    {
+      "url": "https://github.com/x402-foundation/x402",
+      "purpose": "official protocol and SDK upstream"
+    },
+    {
+      "url": "https://docs.cdp.coinbase.com/x402/seller/facilitator",
+      "purpose": "network capabilities, fees, screening, authentication and Bazaar indexing"
+    },
+    {
+      "url": "https://github.com/x402-foundation/x402/tree/main/typescript/packages/core",
+      "purpose": "resource server and v2 schemas/header codecs"
+    },
+    {
+      "url": "https://github.com/x402-foundation/x402/tree/main/typescript/packages/mechanisms/evm",
+      "purpose": "Base exact/EIP-3009 SDK"
+    },
+    {
+      "url": "https://github.com/x402-foundation/x402/tree/main/typescript/packages/mechanisms/svm",
+      "purpose": "Solana exact SDK"
+    }
+  ],
+  "publishedPackages": [
+    {
+      "name": "@x402/core",
+      "version": "2.29.0",
+      "tarball": "https://registry.npmjs.org/@x402/core/-/core-2.29.0.tgz",
+      "integrity": "sha512-fkS0JqVwHgczteDlwItLRipOlIzm28U9HWLvYnYpnNbfmepoBT/4ux7LjrR0xGD51JHoC8/r+Qo7uCfoAQYeuw=="
+    },
+    {
+      "name": "@x402/evm",
+      "version": "2.29.0",
+      "tarball": "https://registry.npmjs.org/@x402/evm/-/evm-2.29.0.tgz",
+      "integrity": "sha512-Gk4bJ6WoRR3jeT2+vERSPMSkSr1nRL5kjtVh14uoynRm8y+fGFH8xmvlGzuwKT0liA6OLjdr9xjZtN8i0WYk9g=="
+    },
+    {
+      "name": "@x402/svm",
+      "version": "2.29.0",
+      "tarball": "https://registry.npmjs.org/@x402/svm/-/svm-2.29.0.tgz",
+      "integrity": "sha512-7dToC3TmvgaykCbPbCLbRZURx6YWkUS8YFdoD7eotHoxyr2E5NjBiW1gmDXRVvnqirTU/soWERaj21M+/7+oiQ=="
+    },
+    {
+      "name": "@solana/kit",
+      "version": "8.6.0",
+      "tarball": "https://registry.npmjs.org/@solana/kit/-/kit-8.6.0.tgz",
+      "integrity": "sha512-UaigU+LiTzkU237FxfiJhxufvEfb1J02djJOnGpSz1GAjZtbZ8oc4EkQ1bS4sHewSRyR9RUk6yhBb5bLHG0w4w=="
+    },
+    {
+      "name": "viem",
+      "version": "2.57.14",
+      "tarball": "https://registry.npmjs.org/viem/-/viem-2.57.14.tgz",
+      "integrity": "sha512-ctaSyx3I24va98H2PYz8C30FKXXo8Th/H6Wrn7za7N+RuPQHiL09zFedX6GZDCtz73YFLrf7YeVOgU5CUVByng=="
+    }
+  ],
+  "fixtureConstruction": {
+    "source": "tests/fixtures/x402/sdk-fixtures.mjs",
+    "mode": "offline-only",
+    "paymentCreation": "actual official SDK client schemes",
+    "signatureChecks": [
+      "viem verifyTypedData",
+      "Solana Kit verifySignature"
+    ],
+    "solanaRpc": "in-memory mint and blockhash JSON-RPC fixture; unknown operations rejected",
+    "facilitatorSettlement": "scripted response, not an actual chain settlement",
+    "reservationStorage": "test-only in-memory canonical boundary, not durable"
+  },
+  "cdpPricingObserved": {
+    "freeMonthlyOnchainTransactions": 1000,
+    "usdPerAdditionalOnchainTransaction": "0.001",
+    "verification": "free",
+    "exactSettlementOnchainTransactions": 1,
+    "otherBillableOnchainOperations": [
+      "deposit",
+      "refund",
+      "withdrawal"
+    ]
+  },
+  "productionCompatibilityClaimed": false,
+  "bazaarListingClaimed": false,
+  "livePaymentCallsMade": false
+}
