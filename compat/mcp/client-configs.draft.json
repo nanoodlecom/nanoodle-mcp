@@ -1,0 +1,26 @@
+{
+  "status": "draft-local-configuration-examples-not-submitted",
+  "localCanonicalStdio": {
+    "mcpServers": {
+      "nanoodle": {
+        "command": "/ABSOLUTE/PATH/TO/supported/node",
+        "args": ["/ABSOLUTE/PATH/TO/nanoodle-mcp/bin/nanoodle-mcp.mjs", "--graphs", "/ABSOLUTE/PATH/TO/noodles", "--out", "/ABSOLUTE/PATH/TO/outputs", "--max-usd", "0.10", "--no-local-work"]
+      }
+    }
+  },
+  "remoteCanonicalStreamableHttp": {
+    "mcpServers": {
+      "nanoodle": { "url": "https://mcp.nanoodle.com/mcp" }
+    }
+  },
+  "sdkFacade": {
+    "name": "nanoodle-mcp-compat",
+    "module": "./compat/mcp/server.mjs",
+    "export": "serveCompatibility",
+    "transport": "stdio-or-injected-byte-transport",
+    "protocolVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"],
+    "requires": ["operator-injected-canonical-paid-registry", "package-version", "full-source-revision"],
+    "directorySubmission": false,
+    "publishedPackage": false
+  }
+}
