@@ -1,0 +1,28 @@
+{
+  "observed": "2026-11-03",
+  "targetBase": "98e426254a038c90fcaa14a42881ace6bb8c7278",
+  "officialRepository": "https://github.com/Virtual-Protocol/acp-node-v2",
+  "officialOverview": "https://os.virtuals.io/acp/overview",
+  "officialSourceHead": "392dcc6eb17a6884c214c21aff31afa1b99f45ae",
+  "sourceSha256": {
+    "src/events/types.ts": "5e635a0d11063cc18131e8987564982b669b9b5596021a027b42b3cf167599df",
+    "src/jobSession.ts": "bfc29f65077d7e5a03591196eee346d09dc604db9279514cf450577fe0553075",
+    "src/acpAgent.ts": "f09815b7e8ca3624f40281618e45e9845fbd4bc084f12cb79c4073859393c83b",
+    "src/core/acpAbi.ts": "aacc937a53cc72c7dfce82416954a2a1c8b6dcaa705b64cdc13db1496998abfc",
+    "src/clients/evmAcpClient.ts": "73e33284afdddabecf271c4632de6971af906eabd6dfbd641c3d8a9f5dbae697"
+  },
+  "packages": {
+    "@virtuals-protocol/acp-node-v2": {
+      "version": "0.1.15",
+      "resolved": "https://registry.npmjs.org/@virtuals-protocol/acp-node-v2/-/acp-node-v2-0.1.15.tgz",
+      "integrity": "sha512-8hf92cjFiEx532PpwCTejbogqwJfCNlTn4rdYzcM96vIOvALy6hE3OJ0qU2F5H8bMPiPzdTJ8vnBIgtktPFigg=="
+    },
+    "viem": {
+      "version": "2.57.14",
+      "resolved": "https://registry.npmjs.org/viem/-/viem-2.57.14.tgz",
+      "integrity": "sha512-ctaSyx3I24va98H2PYz8C30FKXXo8Th/H6Wrn7za7N+RuPQHiL09zFedX6GZDCtz73YFLrf7YeVOgU5CUVByng=="
+    }
+  },
+  "liveValidation": false,
+  "platformFees": "unknown; explicit operator configuration required"
+}
