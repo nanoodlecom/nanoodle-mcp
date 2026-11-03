@@ -1,0 +1,7 @@
+{
+  "name": "nanoodle-acp-v2-offline-qualification",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test --test-isolation=none *.qual.mjs" },
+  "devDependencies": { "@virtuals-protocol/acp-node-v2": "0.1.15", "viem": "2.57.14" }
+}

@@ -744,6 +744,10 @@ workflow, not in `npm test`: `scripts/assert-npm-version.mjs` fails the registry
 publish unless `server.json`'s version is really on npm. See
 [PUBLISHING.md](PUBLISHING.md).
 
+The optional [ACP v2 seller qualification](docs/acp-v2-seller.md) has its own
+pinned SDK dependencies and offline test command. Its adapter is disabled by
+default and has no live wallet, registry or payment integration.
+
 ## Registry
 
 `server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)

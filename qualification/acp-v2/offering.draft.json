@@ -1,0 +1,17 @@
+{
+  "name": "Noodle fixed response",
+  "description": "OFFLINE QUALIFICATION FIXTURE ONLY. Execute the repository's hello-noodle test graph once with one text input. The graph uses test-model and is not a live service.",
+  "priceType": "fixed",
+  "priceValue": 1,
+  "slaMinutes": 10,
+  "requirements": {
+    "type": "object",
+    "properties": { "Idea": { "type": "string", "minLength": 1, "maxLength": 4000 } },
+    "required": ["Idea"],
+    "additionalProperties": false
+  },
+  "deliverable": "JSON nanoodle.acp.service.v1 receipt with approved HTTPS result reference and workflow, input, result and funding provenance hashes",
+  "requiredFunds": false,
+  "isHidden": true,
+  "isPrivate": true
+}
