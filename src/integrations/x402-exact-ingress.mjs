@@ -8,6 +8,7 @@ import { address, getTransactionDecoder } from "@solana/kit";
 
 export const BASE = "eip155:8453";
 export const SOLANA = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+export const BOUNDARY_CONTRACT = "nanoodle-x402-boundary/v2";
 const schemes = { [BASE]: new ExactEvmScheme(), [SOLANA]: new ExactSvmScheme() };
 class IngressError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -69,14 +70,16 @@ async function bounded(fn, timeoutMs, signal) {
  * Opt-in, transport-free ingress; NOT installed by the CLI or HTTP server.
  * boundary is the authoritative quote/reservation/Nano-dispatch service. It
  * must persist intent before granting settlement and atomically deduplicate
- * authorizationKey across ALL quotes/processes. See docs/x402-exact-ingress.md.
+ * authorizationKey AND the authenticated request's fundingKey across ALL
+ * networks/processes. See docs/x402-exact-ingress.md.
  * No ledger, wallet, FX operation, default facilitator or refund is created.
  */
 export function createX402ExactIngress({ registry, resolveContext, boundary, facilitator,
   facilitatorId, routes, clock = Date.now, timeoutMs = 10_000, capabilityTtlMs = 30_000 }) {
   check(typeof registry?.prepareCall === "function" && typeof registry?.listTools === "function"
     && typeof resolveContext === "function", "MISSING_REGISTRY_CONTEXT");
-  for (const name of ["issueQuote", "lookupQuote", "lookupReservation", "reserve", "beginSettlement", "recordSettlement", "dispatchSettled"])
+  check(boundary?.contractVersion === BOUNDARY_CONTRACT, "MISSING_CANONICAL_BOUNDARY_CONTRACT");
+  for (const name of ["issueQuote", "lookupQuote", "lookupReservation", "lookupFundingClaim", "reserve", "beginSettlement", "recordSettlement", "dispatchSettled"])
     check(typeof boundary?.[name] === "function", "MISSING_CANONICAL_BOUNDARY");
   for (const name of ["getSupported", "verify", "settle"])
     check(typeof facilitator?.[name] === "function", "MISSING_FACILITATOR");
@@ -171,7 +174,7 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
   function reservationCheck(record, expected) {
     check(record && nonempty(record.reservationId) && ["reserved", "settling", "uncertain", "settled", "dispatched"].includes(record.state),
       "INVALID_RESERVATION");
-    for (const key of ["quoteId", "binding", "authorizationKey", "paymentDigest"])
+    for (const key of ["fundingKey", "quoteId", "binding", "authorizationKey", "paymentDigest"])
       check(record[key] === expected[key], "RESERVATION_BINDING_MISMATCH");
     return record;
   }
@@ -179,10 +182,53 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
     check(receipt && receipt.success === true && receipt.network === r.network && receipt.asset === r.asset
       && receipt.amountAtomic === r.amount && receipt.payTo === r.payTo && receipt.facilitatorId === facilitatorId
       && receipt.authorizationKey === expected.authorizationKey && receipt.paymentDigest === expected.paymentDigest
-      && receipt.quoteId === expected.quoteId && receipt.binding === expected.binding
+      && receipt.fundingKey === expected.fundingKey && receipt.quoteId === expected.quoteId && receipt.binding === expected.binding
       && typeof receipt.transaction === "string" && (r.network === BASE ? /^0x[0-9a-fA-F]{64}$/ : /^[1-9A-HJ-NP-Za-km-z]{64,88}$/).test(receipt.transaction)
       && typeof receipt.payer === "string" && (!payer || normalizePayer(receipt.payer, r.network) === normalizePayer(payer, r.network)),
     "INVALID_SETTLEMENT_RECEIPT");
+  }
+  function fundingCheck(claim, fundingKey) {
+    check(claim && claim.fundingKey === fundingKey && nonempty(claim.claimId) && nonempty(claim.quoteId)
+      && nonempty(claim.reservationId) && ["settling", "uncertain", "settled", "dispatched"].includes(claim.state)
+      && [claim.binding, claim.authorizationKey, claim.paymentDigest].every(v => typeof v === "string" && /^[a-f0-9]{64}$/.test(v)),
+    "INVALID_FUNDING_CLAIM");
+    return claim;
+  }
+  const ownsFunding = (claim, expected) => ["fundingKey", "quoteId", "binding", "authorizationKey", "paymentDigest"]
+    .every(k => claim[k] === expected[k]);
+  const fundingBlocked = claim => ({ status: 202, body: { code: "FUNDING_CLAIMED", quoteId: claim.quoteId,
+    reservationId: claim.reservationId, fundingClaimId: claim.claimId, fundingKey: claim.fundingKey,
+    fundingState: claim.state, reconciliationRequired: true, refund: { state: "unknown" } } });
+  function dispatchFailure(code, reservation, claim, receipt, refund = { state: "unknown" }, status = 202) {
+    return { status, body: { code, failureCategory: code === "EXECUTION_FAILED" ? "workflow_failed" : "execution_unavailable",
+      quoteId: reservation.quoteId, reservationId: reservation.reservationId, fundingKey: claim.fundingKey,
+      fundingClaimId: claim.claimId, reconciliationRequired: true, refund }, receipt: copy(receipt) };
+  }
+  function dispatchOutcome(value) {
+    const outcome = copy(value);
+    // Legacy MCP failures are errors too. Their text and metadata must never
+    // be treated as protected success output or echoed to the client.
+    if (outcome?.isError === true) return { failed: true, refund: { state: "unknown" } };
+    check(outcome && !Array.isArray(outcome) && ["completed", "failed"].includes(outcome.status), "INVALID_DISPATCH_OUTCOME");
+    const refund = outcome.refund;
+    check(refund && ["not_required", "not_requested", "pending", "refunded", "uncertain"].includes(refund.state), "INVALID_REFUND_STATE");
+    const safeRefund = { state: refund.state };
+    if (refund.state === "refunded") {
+      check(typeof refund.refundId === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(refund.refundId), "INVALID_REFUND_STATE");
+      safeRefund.refundId = refund.refundId;
+    }
+    if (outcome.status === "failed" || outcome.result?.isError === true) {
+      check(refund.state !== "not_required", "INVALID_REFUND_STATE");
+      return { failed: true, refund: safeRefund };
+    }
+    const result = outcome.result;
+    check(Object.keys(outcome).every(k => ["status", "refund", "result"].includes(k))
+      && refund.state === "not_required" && result && result.isError === false
+      && Object.keys(result).every(k => ["content", "isError"].includes(k))
+      && Array.isArray(result.content) && result.content.length > 0
+      && result.content.every(c => c && c.type === "text" && typeof c.text === "string"
+        && Object.keys(c).every(k => ["type", "text"].includes(k))), "INVALID_DISPATCH_OUTCOME");
+    return { failed: false, result };
   }
   async function handle({ params, paymentSignature, context, signal }) {
     try {
@@ -200,6 +246,9 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         && nonempty(ctx.resource?.url), "MISSING_AUTHORITATIVE_CONTEXT");
       const request = { ...ctx, call: clean };
       const binding = hash(["nanoodle-x402-ingress/v1", request, policy, facilitatorId]);
+      // Request identity deliberately excludes network, nonce, quote ID and
+      // mutable workflow/price data. Requoting a request cannot fund it twice.
+      const fundingKey = hash(["nanoodle-funding/v1", ctx.customerScope, ctx.requestId]);
       const q = copy(await bounded(() => paymentSignature === undefined
         ? boundary.issueQuote({ request, binding, buildRequirements: fields => buildRequirements(fields, signal), signal })
         : boundary.lookupQuote({ request, binding, signal }), timeoutMs, signal));
@@ -217,10 +266,17 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
       const r = q.requirements.find(r => canonical(r) === canonical(payload.accepted));
       check(r, "PAYMENT_REQUIREMENTS_MISMATCH");
       const auth = evidence(payload, r);
-      const expected = { quoteId: q.quoteId, binding, authorizationKey: auth.authorizationKey,
+      const expected = { fundingKey, quoteId: q.quoteId, binding, authorizationKey: auth.authorizationKey,
         paymentDigest: hash(payload) };
+      let funding = await bounded(() => boundary.lookupFundingClaim({ fundingKey, quoteId: q.quoteId, binding, signal }), timeoutMs, signal);
+      if (funding !== null) {
+        funding = fundingCheck(funding, fundingKey);
+        if (!ownsFunding(funding, expected)) return fundingBlocked(funding);
+      }
       let reservation = await bounded(() => boundary.lookupReservation({ ...expected, signal }), timeoutMs, signal);
-      if (reservation) reservation = reservationCheck(reservation, expected);
+      if (reservation !== null) reservation = reservationCheck(reservation, expected);
+      check(!reservation || reservation.state === "reserved" || (funding && funding.reservationId === reservation.reservationId),
+        "MISSING_FUNDING_CLAIM");
       if (reservation && ["settling", "uncertain"].includes(reservation.state))
         return { status: 202, body: { code: "SETTLEMENT_UNCERTAIN", reservationId: reservation.reservationId } };
       const payer = ctx.payer ?? auth.payer;
@@ -248,9 +304,15 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
           // lost. A retry must inspect canonical state, never recreate intent.
           return { status: 202, body: { code: "SETTLEMENT_UNCERTAIN", reservationId: reservation.reservationId } };
         }
+        funding = fundingCheck(begun.fundingClaim, fundingKey);
+        if (!ownsFunding(funding, expected)) {
+          check(begun.granted === false, "INVALID_FUNDING_GRANT");
+          return fundingBlocked(funding);
+        }
         reservation = reservationCheck(begun.reservation, expected);
+        check(funding.reservationId === reservation.reservationId, "FUNDING_RESERVATION_MISMATCH");
         if (begun.granted !== true) return { status: 202, body: { code: "SETTLEMENT_PENDING", reservationId: reservation.reservationId } };
-        check(reservation.state === "settling", "INVALID_SETTLEMENT_INTENT");
+        check(reservation.state === "settling" && funding.state === "settling", "INVALID_SETTLEMENT_INTENT");
         try {
           const settlement = await bounded(() => server.settlePayment(payload, r), timeoutMs, signal);
           const receipt = { ...expected, success: settlement.success, network: settlement.network,
@@ -261,6 +323,9 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
           reservation = reservationCheck(await bounded(() => boundary.recordSettlement({ ...expected,
             reservationId: reservation.reservationId, state: "settled", receipt: copy(receipt) }), timeoutMs), expected);
           check(["settled", "dispatched"].includes(reservation.state), "SETTLEMENT_NOT_DURABLE");
+          funding = fundingCheck(await bounded(() => boundary.lookupFundingClaim({ fundingKey, quoteId: q.quoteId, binding }), timeoutMs), fundingKey);
+          check(ownsFunding(funding, expected) && funding.reservationId === reservation.reservationId
+            && ["settled", "dispatched"].includes(funding.state), "FUNDING_NOT_DURABLE");
         } catch {
           // Also covers cancellation, late responses, malformed receipts and
           // storage ambiguity. NEVER clear durable intent or retry settlement.
@@ -270,6 +335,8 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         }
       }
       receiptCheck(reservation.receipt, expected, r, payer);
+      check(funding && ownsFunding(funding, expected) && funding.reservationId === reservation.reservationId
+        && ["settled", "dispatched"].includes(funding.state), "FUNDING_NOT_DURABLE");
       cancelled(signal);
       let result;
       try {
@@ -278,12 +345,15 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
       } catch {
         // Dispatch may have consumed downstream Nano before losing its reply.
         // Only the canonical dispatcher may reconcile or replay that result.
-        return { status: 202, body: { code: "DISPATCH_UNCERTAIN", reservationId: reservation.reservationId },
-          receipt: copy(reservation.receipt) };
+        return dispatchFailure("DISPATCH_UNCERTAIN", reservation, funding, reservation.receipt);
       }
+      let outcome;
+      try { outcome = dispatchOutcome(result); }
+      catch { return dispatchFailure("DISPATCH_INVALID_OUTCOME", reservation, funding, reservation.receipt, undefined, 502); }
+      if (outcome.failed) return dispatchFailure("EXECUTION_FAILED", reservation, funding, reservation.receipt, outcome.refund, 502);
       return { status: 200, headers: { "PAYMENT-RESPONSE": encodePaymentResponseHeader({ success: true,
         network: r.network, transaction: reservation.receipt.transaction, payer: reservation.receipt.payer }) },
-      body: result, receipt: copy(reservation.receipt) };
+      body: outcome.result, receipt: copy(reservation.receipt) };
     } catch (error) {
       // No raw SDK, registry, storage or upstream error strings reach clients.
       return { status: error?.code === "CANCELLED" ? 499 : 402,

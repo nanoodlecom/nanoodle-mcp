@@ -65,7 +65,7 @@
     ],
     "solanaRpc": "in-memory mint and blockhash JSON-RPC fixture; unknown operations rejected",
     "facilitatorSettlement": "scripted response, not an actual chain settlement",
-    "reservationStorage": "test-only in-memory canonical boundary, not durable"
+    "reservationStorage": "test-only in-memory canonical boundary with atomic request funding/authorization claims, not durable"
   },
   "cdpPricingObserved": {
     "freeMonthlyOnchainTransactions": 1000,
@@ -80,5 +80,6 @@
   },
   "productionCompatibilityClaimed": false,
   "bazaarListingClaimed": false,
-  "livePaymentCallsMade": false
+  "livePaymentCallsMade": false,
+  "boundaryContract": "nanoodle-x402-boundary/v2"
 }
