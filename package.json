@@ -21,6 +21,10 @@
     "LICENSE"
   ],
   "dependencies": {
+    "@solana/kit": "8.6.0",
+    "@x402/core": "2.29.0",
+    "@x402/evm": "2.29.0",
+    "@x402/svm": "2.29.0",
     "nanocurrency": "^2.5.0",
     "nanoodle": "file:vendor/nanoodle-0.9.0-content-url.tgz"
   },
@@ -51,5 +55,8 @@
   },
   "bugs": {
     "url": "https://github.com/nanoodlecom/nanoodle-mcp/issues"
+  },
+  "devDependencies": {
+    "viem": "2.57.14"
   }
 }

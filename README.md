@@ -240,6 +240,10 @@ once and draw down a balance, that's exactly what a NanoGPT account is:
 (Nano included) into an account, take its API key, and run the server in
 normal BYOK mode — same tools, one payment instead of many.
 
+An experimental [Base/Solana x402 exact ingress adapter](docs/x402-exact-ingress.md)
+is available for offline qualification through an injected quote/reservation
+boundary. It is not enabled by the CLI or hosted server.
+
 ## Serve mode — host your noodles as a service (`--serve`)
 
 Everything above speaks MCP over stdio to *your own* agent. `--serve` speaks
