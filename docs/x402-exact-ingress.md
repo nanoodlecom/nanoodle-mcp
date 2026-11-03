@@ -27,8 +27,10 @@ are unchanged. The adapter adds no payment ledger, exchange,
 automatic USDC→Nano swap, wallet management, refund or relayer. It has no
 dependency on the unmerged NEAR branch or `src/payments/offline-usdc-mcp.mjs`.
 
-Before runtime wiring, the common boundary owner must supply the seven operations
-below, backed by the canonical payment/dispatch service. The test implementation
+Before runtime wiring, the common boundary owner must implement
+`contractVersion: "nanoodle-x402-boundary/v2"` and supply the eight operations
+below, backed by the canonical payment/dispatch service. Missing/legacy contracts
+fail closed before any payment operation. The test implementation
 uses memory and illustrates transaction semantics; it is **not durable storage**.
 
 | Operation | Required semantics |
@@ -36,15 +38,60 @@ uses memory and illustrates transaction semantics; it is **not durable storage**
 | `issueQuote({request,binding,buildRequirements,signal})` | Validate authoritative pricing and XNO budget, persist one immutable quote per authenticated request, return it on retry. Use `buildRequirements({network,amountAtomic,maxTimeoutSeconds})` for each enabled network. Prices are atomic decimal strings; this callback does no FX or margin calculation. |
 | `lookupQuote({request,binding,signal})` | Return the same persisted quote only for the authenticated scope, request, workflow and call binding; do not reprice a signed retry. |
 | `lookupReservation({...identity,signal})` | Read the global authorization reservation, or return null. This read grants no attempt and creates no state. The adapter validates identity on returned records. |
-| `reserve({quoteId,binding,authorizationKey,paymentDigest,expiresAt,now,signal})` | Atomically reserve globally unique authorization identity. A different quote, customer, call or payload cannot consume it. New reservations must be unexpired. Return existing state on retry; never reset an attempted authorization. |
-| `beginSettlement({...identity,reservationId,now,expiresAt,signal})` | Atomically compare-and-set `reserved`→`settling` and **durably commit before** returning `{granted:true,reservation}`. Only one caller/process may receive a grant. Expired/cancelled attempts get no grant. A lost reply must leave the intent blocking another attempt. |
-| `recordSettlement({...identity,reservationId,state,receipt?})` | Persist success or uncertainty monotonically. A late uncertain write must not erase an authoritative settlement. Atomically enforce unique `(network,transaction)` across quotes. Return the full persisted reservation. |
-| `dispatchSettled({...identity,reservationId,receipt,request,signal})` | Validate authoritative settled state and receipt against the stored quote, reserve downstream Nano budget, then invoke the established paid executor once. Persist execution intent before any downstream spend. Cache/replay results; a lost dispatch response must never rerun the workflow. Retain a recoverable receipt/output reference without logging prompts or raw signed payloads. |
+| `lookupFundingClaim({fundingKey,quoteId,binding,signal})` | Read the authenticated request's funding claim across **all** authorizations, quotes and networks, or return null. A read grants no attempt. A different authorization cannot replace an existing settling/uncertain/settled/dispatched claim. |
+| `reserve({...identity,expiresAt,now,signal})` | Atomically reserve globally unique authorization identity. A different quote, customer, call or payload cannot consume it. New reservations must be unexpired. Return existing state on retry; never reset an attempted authorization. This alone does **not** grant a funding/settlement attempt. |
+| `beginSettlement({...identity,reservationId,now,expiresAt,signal})` | In **one durable transaction**, claim exclusive request-level funding AND compare-and-set its authorization `reserved`→`settling`. Commit both before returning `{granted:true,reservation,fundingClaim}`. Only one authorization/network/process may receive a grant for the request. If funding is already claimed, return `{granted:false,reservation,fundingClaim}` with the actual winning claim. Expired/cancelled attempts get no grant. A lost reply retains the exclusive funding claim and settlement intent. |
+| `recordSettlement({...identity,reservationId,state,receipt?})` | Persist success or uncertainty monotonically on **both** the reservation and its request funding claim. A late uncertain write must not erase authoritative settlement. Atomically enforce unique `(network,transaction)` across quotes. Return the full persisted reservation; the adapter rereads the durable funding claim before dispatch. |
+| `dispatchSettled({...identity,reservationId,receipt,request,signal})` | Validate authoritative settled reservation, exclusive funding claim and receipt against the stored quote, reserve downstream Nano budget, then invoke the established paid executor once **per fundingKey/request**, regardless of nonce/network. Persist execution intent before any downstream spend. Persist and cache/replay typed success **and failure** outcomes with refund state; a lost dispatch response must never rerun the workflow. Retain a recoverable receipt/output reference without logging prompts or raw signed payloads. |
 
-`identity` consists of `quoteId`, `binding`, `authorizationKey`, `paymentDigest`.
+`identity` consists of `fundingKey`, `quoteId`, `binding`, `authorizationKey`, `paymentDigest`.
 Every reservation response includes these exact fields, `reservationId`, `state`
 (`reserved`, `settling`, `uncertain`, `settled`, `dispatched`) and, for the latter
 two states, `receipt`. The adapter checks these fields before proceeding.
+
+`fundingKey = sha256(canonical(["nanoodle-funding/v1", customerScope, requestId]))`.
+It deliberately excludes quote ID, authorization nonce, network, workflow and
+price. The canonical authority must enforce this same request funding identity
+across its replicas and adapters. Requoting or changing workflow metadata for
+the same authenticated request does not create another funding opportunity.
+A funding claim contains `fundingKey`, `claimId`, `quoteId`, `binding`,
+`reservationId`, `authorizationKey`, `paymentDigest` and `state` (`settling`,
+`uncertain`, `settled`, `dispatched`). A fresh authorization or alternate network
+returns `202 FUNDING_CLAIMED` with safe reconciliation identifiers while any of
+these states exists. The original settled authorization can replay its result.
+The adapter never releases a claim. Only canonical authoritative reconciliation
+may clear one after proving the prior attempt cannot have charged; a timeout,
+expiry, dispatch failure or refund request is insufficient. Settlement or a
+completed/refunded execution does not automatically authorize repurchasing the
+same request. A separate intentional purchase needs a new server request ID.
+
+## Typed dispatch outcomes and refund state
+
+The v2 boundary returns one of these envelopes, durably cached by fundingKey:
+
+```js
+{ status: "completed", refund: { state: "not_required" },
+  result: { isError: false, content: [{ type: "text", text: "protected output" }] } }
+{ status: "failed", refund: { state: "not_requested" } }
+```
+
+This bounded success schema accepts text blocks only and no extra result or
+content fields. Media/structured output needs a separately reviewed schema;
+it must not be passed through unchecked. A returned legacy `{isError:true,...}`
+or typed failed/nested error result becomes `502 EXECUTION_FAILED` with the fixed
+`workflow_failed` category. No raw provider error content or metadata is returned.
+Malformed outcomes become `502 DISPATCH_INVALID_OUTCOME`; thrown/timeout outcomes
+remain `202 DISPATCH_UNCERTAIN`. These responses retain the validated payment
+receipt, quote ID, reservation ID, funding key/claim ID, `reconciliationRequired`
+and an explicit refund state. They never masquerade as HTTP 200 success.
+
+On a typed failure, canonical refund states are `not_requested`, `pending`,
+`refunded` or `uncertain`. `refunded` additionally requires a bounded canonical
+`refundId` and must refer to an already authoritatively reconciled, durable
+refund receipt. Extra refund fields are not exposed. For legacy/malformed/
+thrown outcomes, state is `unknown`, requiring reconciliation. `not_required`
+is valid only on completed success. These are reports from the trusted authority;
+this adapter never initiates a refund transfer or infers one from an exception.
 
 Quote shape:
 
@@ -76,12 +123,15 @@ ambiguous/duplicate payment headers before invoking this seam.
 3. The adapter reads any existing reservation. A new authorization is verified
    through the SDK resource server and explicitly injected facilitator **before**
    reserving its global replay identity; an invalid signature cannot poison the
-   legitimate payer's nonce/message. It then atomically obtains a durable
-   settlement grant. Verification alone never permits dispatch.
+   legitimate payer's nonce/message. It then atomically obtains a durable,
+   exclusive request funding claim and settlement grant in the same transaction.
+   Per-authorization deduplication is insufficient: a second genuine signature
+   with a fresh nonce, or a Solana payment instead of Base, cannot fund it again.
+   Verification alone never permits dispatch.
 4. It asks the facilitator to settle once, validates `success`, network,
    transaction format, optional settled amount and payer, and persists a bound
    receipt before dispatch. The receipt contains quote/call/payload binding,
-   network, asset, atomic amount, recipient, payer, transaction and facilitator
+   request funding key, network, asset, atomic amount, recipient, payer, transaction and facilitator
    identity. Asset/amount/recipient are bound from the verified exact request;
    the facilitator settlement response is not falsely described as independently
    supplying all those fields or as a local chain-finality proof.

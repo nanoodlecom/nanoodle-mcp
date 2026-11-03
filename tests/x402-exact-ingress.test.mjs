@@ -8,7 +8,7 @@ import { encodePaymentSignatureHeader, decodePaymentRequiredHeader, decodePaymen
 import { PaymentRequiredV2Schema } from "@x402/core/schemas";
 import { loadTools } from "../src/tools.mjs";
 import { createDispatcher } from "../src/server.mjs";
-import { createX402ExactIngress, BASE, SOLANA, canonical } from "../src/integrations/x402-exact-ingress.mjs";
+import { createX402ExactIngress, BASE, SOLANA, BOUNDARY_CONTRACT, canonical } from "../src/integrations/x402-exact-ingress.mjs";
 import { sdkPayload, verifyOffline, evmSigner, svmSigner, svmSeller, svmFeePayer } from "./fixtures/x402/sdk-fixtures.mjs";
 
 const clone = x => JSON.parse(JSON.stringify(x));
@@ -17,7 +17,7 @@ const params = { name: "hello-noodle", arguments: { Name: "Ada" } };
 const secret = "SECRET upstream request contents";
 function harness(options = {}) {
   let time = Date.now(), serial = 0;
-  const quotes = new Map(), reservations = new Map(), deliveries = new Map();
+  const quotes = new Map(), reservations = new Map(), deliveries = new Map(), fundingClaims = new Map();
   const counts = { verify: 0, settle: 0, dispatch: 0, prepare: 0, quote: 0, supported: 0 };
   const ctx = { requestId: "server-request-1", customerScope: "authenticated-customer", workflowDigest: "a".repeat(64),
     resource: { url: "https://offline.invalid/tools/hello-noodle", mimeType: "application/json" } };
@@ -26,6 +26,7 @@ function harness(options = {}) {
   const supported = { kinds: routes.map(r => ({ x402Version: 2, scheme: "exact", network: r.network,
     ...(r.network === SOLANA ? { extra: { feePayer: svmFeePayer.address } } : {}) })), extensions: [], signers: {} };
   const boundary = {
+    contractVersion: BOUNDARY_CONTRACT,
     async issueQuote({ request, binding, buildRequirements }) {
       counts.quote++;
       const previous = quotes.get(request.requestId);
@@ -39,6 +40,9 @@ function harness(options = {}) {
     async lookupReservation(input) {
       const r = reservations.get(input.authorizationKey); return r ? clone(r) : null;
     },
+    async lookupFundingClaim(input) {
+      const claim = fundingClaims.get(input.fundingKey); return claim ? clone(claim) : null;
+    },
     // Test-only memory implementation. Production MUST implement these as
     // durable transactions, including global authorization/receipt uniqueness.
     async reserve(input) {
@@ -48,15 +52,21 @@ function harness(options = {}) {
         return clone(existing);
       }
       assert.ok(input.now < input.expiresAt);
-      const { quoteId, binding, authorizationKey, paymentDigest } = input;
-      const r = { quoteId, binding, authorizationKey, paymentDigest, reservationId: `r-${++serial}`, state: "reserved" };
+      const { fundingKey, quoteId, binding, authorizationKey, paymentDigest } = input;
+      const r = { fundingKey, quoteId, binding, authorizationKey, paymentDigest, reservationId: `r-${++serial}`, state: "reserved" };
       reservations.set(authorizationKey, r); return clone(r);
     },
     async beginSettlement(input) {
       const r = reservations.get(input.authorizationKey);
-      const granted = r.state === "reserved" && input.now < input.expiresAt;
-      if (granted) r.state = "settling";
-      return { granted, reservation: clone(r) };
+      const existingClaim = fundingClaims.get(input.fundingKey);
+      const granted = !existingClaim && r.state === "reserved" && input.now < input.expiresAt;
+      if (granted) {
+        r.state = "settling";
+        // This synchronous test transaction atomically claims request funding
+        // AND authorization intent. Production needs one durable transaction.
+        fundingClaims.set(input.fundingKey, { ...r, claimId: `claim-${++serial}` });
+      }
+      return { granted, reservation: clone(r), fundingClaim: clone(fundingClaims.get(input.fundingKey)) };
     },
     async recordSettlement(input) {
       const r = reservations.get(input.authorizationKey);
@@ -65,18 +75,24 @@ function harness(options = {}) {
         r.state = input.state;
         if (input.receipt) r.receipt = clone(input.receipt);
       }
+      const claim = fundingClaims.get(input.fundingKey);
+      assert.equal(claim.reservationId, r.reservationId);
+      claim.state = r.state;
       return clone(r);
     },
     async dispatchSettled(input) {
       const r = reservations.get(input.authorizationKey);
+      const claim = fundingClaims.get(input.fundingKey);
+      assert.equal(claim.reservationId, r.reservationId);
       assert.ok(["settled", "dispatched"].includes(r.state));
       assert.equal(digest(input.receipt), digest(r.receipt));
-      if (!deliveries.has(r.reservationId)) {
+      if (!deliveries.has(r.fundingKey)) {
         counts.dispatch++;
-        deliveries.set(r.reservationId, { content: [{ type: "text", text: "offline protected output" }] });
+        deliveries.set(r.fundingKey, { status: "completed", refund: { state: "not_required" },
+          result: { isError: false, content: [{ type: "text", text: "offline protected output" }] } });
       }
-      r.state = "dispatched";
-      return clone(deliveries.get(r.reservationId));
+      r.state = "dispatched"; claim.state = "dispatched";
+      return clone(deliveries.get(r.fundingKey));
     },
   };
   const facilitator = {
@@ -97,7 +113,7 @@ function harness(options = {}) {
     routes, clock: () => time, timeoutMs: options.timeoutMs ?? 1000, capabilityTtlMs: 1000 };
   function fresh() { return createX402ExactIngress(settings); }
   const app = fresh();
-  return { app, fresh, settings, boundary, facilitator, registry, ctx, supported, counts, quotes, reservations,
+  return { app, fresh, settings, boundary, facilitator, registry, ctx, supported, counts, quotes, reservations, fundingClaims,
     advance: ms => { time += ms; },
     quote: () => app.handle({ params }),
     async payment(network = BASE) {
@@ -134,6 +150,89 @@ test("concurrent retries grant exactly one settlement and one dispatch", async (
   assert.ok(results.every(r => [200, 202].includes(r.status)), JSON.stringify(results));
   assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1);
 });
+test("P1: distinct genuine EIP-3009 nonces cannot settle or dispatch one quote twice", async () => {
+  const h = harness(), first = await h.payment(), second = await h.payment();
+  assert.notEqual(first.payload.payload.authorization.nonce, second.payload.payload.authorization.nonce);
+  assert.equal((await verifyOffline(second.payload, second.payload.accepted)).isValid, true);
+  assert.equal((await h.app.handle({ params, paymentSignature: first.paymentSignature })).status, 200);
+  const blocked = await h.fresh().handle({ params, paymentSignature: second.paymentSignature });
+  assert.equal(blocked.status, 202); assert.equal(blocked.body.code, "FUNDING_CLAIMED");
+  assert.equal(blocked.body.fundingState, "dispatched");
+  assert.equal(blocked.body.quoteId, [...h.reservations.values()][0].quoteId);
+  assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1); assert.equal(h.fundingClaims.size, 1);
+});
+test("P1: concurrent fresh authorizations share one atomic funding claim across Base and Solana", async t => {
+  for (const networks of [[BASE, BASE], [BASE, SOLANA], [SOLANA, BASE], [SOLANA, SOLANA]]) {
+    await t.test(networks.join(" vs "), async () => {
+      const h = harness(), payments = [];
+      for (const network of networks) payments.push(await h.payment(network));
+      const results = await Promise.all(payments.map(p => h.fresh().handle({ params, paymentSignature: p.paymentSignature })));
+      assert.equal(results.filter(r => r.status === 200).length, 1, JSON.stringify(results));
+      assert.equal(results.filter(r => r.body.code === "FUNDING_CLAIMED").length, 1, JSON.stringify(results));
+      assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1); assert.equal(h.fundingClaims.size, 1);
+      assert.equal((await h.fresh().handle({ params, paymentSignature: payments[results[0].status === 200 ? 1 : 0].paymentSignature })).body.code,
+        "FUNDING_CLAIMED");
+    });
+  }
+});
+test("P1: settling and uncertain request funding block fresh nonces and alternate networks, even after expiry", async () => {
+  const h = harness(), first = await h.payment(), nextBase = await h.payment(), nextSolana = await h.payment(SOLANA);
+  let fail, started;
+  const start = new Promise(resolve => { started = resolve; });
+  h.facilitator.settle = async () => { h.counts.settle++; started(); return new Promise((_, reject) => { fail = reject; }); };
+  const pending = h.app.handle({ params, paymentSignature: first.paymentSignature });
+  await start;
+  for (const payment of [nextBase, nextSolana]) {
+    const blocked = await h.fresh().handle({ params, paymentSignature: payment.paymentSignature });
+    assert.equal(blocked.body.code, "FUNDING_CLAIMED"); assert.equal(blocked.body.fundingState, "settling");
+  }
+  fail(new Error("lost settlement reply")); assert.equal((await pending).body.code, "SETTLEMENT_UNCERTAIN");
+  h.advance(70_000);
+  for (const payment of [nextBase, nextSolana]) {
+    const blocked = await h.fresh().handle({ params, paymentSignature: payment.paymentSignature });
+    assert.equal(blocked.body.code, "FUNDING_CLAIMED"); assert.equal(blocked.body.fundingState, "uncertain");
+  }
+  assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 0); assert.equal(h.counts.verify, 1);
+});
+test("request funding survives a replacement quote and changed workflow binding", async () => {
+  const h = harness(), first = await h.payment();
+  assert.equal((await h.app.handle({ params, paymentSignature: first.paymentSignature })).status, 200);
+  h.quotes.delete(h.ctx.requestId); h.ctx.workflowDigest = "c".repeat(64);
+  const next = await h.payment(SOLANA);
+  const blocked = await h.fresh().handle({ params, paymentSignature: next.paymentSignature });
+  assert.equal(blocked.body.code, "FUNDING_CLAIMED"); assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1);
+});
+test("legacy or incomplete authority contracts fail closed, including grants without funding proof", async () => {
+  for (const remove of [b => delete b.contractVersion, b => delete b.lookupFundingClaim]) {
+    const h = harness(); remove(h.boundary); assert.throws(h.fresh, /MISSING_CANONICAL_BOUNDARY/);
+  }
+  const h = harness(), payment = await h.payment(), begin = h.boundary.beginSettlement;
+  h.boundary.beginSettlement = async input => { const value = await begin(input); delete value.fundingClaim; return value; };
+  assert.equal((await h.app.handle({ params, paymentSignature: payment.paymentSignature })).body.code, "INVALID_FUNDING_CLAIM");
+  assert.equal(h.counts.settle, 0); assert.equal(h.counts.dispatch, 0);
+  const next = await h.payment(SOLANA);
+  assert.equal((await h.fresh().handle({ params, paymentSignature: next.paymentSignature })).body.code, "FUNDING_CLAIMED");
+});
+test("missing durable request funding cannot release an otherwise settled receipt", async () => {
+  const h = harness(), payment = await h.payment();
+  assert.equal((await h.app.handle({ params, paymentSignature: payment.paymentSignature })).status, 200);
+  h.fundingClaims.clear();
+  assert.equal((await h.fresh().handle({ params, paymentSignature: payment.paymentSignature })).body.code, "MISSING_FUNDING_CLAIM");
+  assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1);
+});
+test("malformed funding reads and mismatched atomic funding grants fail before settlement", async () => {
+  for (const claim of [undefined, false, 0, {}, { state: "reserved" }]) {
+    const h = harness(), payment = await h.payment(); h.boundary.lookupFundingClaim = async () => claim;
+    assert.equal((await h.app.handle({ params, paymentSignature: payment.paymentSignature })).body.code, "INVALID_FUNDING_CLAIM");
+    assert.equal(h.counts.verify, 0); assert.equal(h.counts.settle, 0);
+  }
+  const h = harness(), payment = await h.payment(), begin = h.boundary.beginSettlement;
+  h.boundary.beginSettlement = async input => {
+    const result = await begin(input); result.fundingClaim.paymentDigest = "a".repeat(64); return result;
+  };
+  assert.equal((await h.app.handle({ params, paymentSignature: payment.paymentSignature })).body.code, "INVALID_FUNDING_GRANT");
+  assert.equal(h.counts.settle, 0); assert.equal(h.counts.dispatch, 0);
+});
 test("Solana signature changes cannot disguise a previously reserved message", async () => {
   const h = harness(), { payload, paymentSignature } = await h.payment(SOLANA);
   assert.equal((await h.app.handle({ params, paymentSignature })).status, 200);
@@ -142,7 +241,7 @@ test("Solana signature changes cannot disguise a previously reserved message", a
   // payload digest changes, but global replay identity must stay the same.
   const bytes = Buffer.from(payload.payload.transaction, "base64"); bytes[1] ^= 1;
   payload.payload.transaction = bytes.toString("base64");
-  assert.equal((await h.app.handle({ params, paymentSignature: encodePaymentSignatureHeader(payload) })).status, 402);
+  assert.equal((await h.app.handle({ params, paymentSignature: encodePaymentSignatureHeader(payload) })).body.code, "FUNDING_CLAIMED");
   assert.deepEqual([...h.reservations.keys()], [original]);
   assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1);
 });
@@ -271,6 +370,67 @@ test("a lost downstream response is uncertain and replay cannot spend or charge 
   assert.equal((await h.fresh().handle({ params, paymentSignature })).status, 200);
   assert.equal(h.counts.settle, 1); assert.equal(h.counts.dispatch, 1);
 });
+test("P1: returned provider failures are sanitized and retain payment, reconciliation and refund state", async t => {
+  for (const value of [
+    { isError: true, content: [{ type: "text", text: secret }] },
+    { status: "failed", refund: { state: "not_requested" }, content: [{ type: "text", text: secret }], error: secret },
+    { status: "completed", refund: { state: "pending" }, result: { isError: true, content: [{ type: "text", text: secret }] } },
+    { status: "failed", refund: { state: "uncertain" }, error: { message: secret } },
+    // This fixture reports authoritative refund state; the adapter initiates no transfer.
+    { status: "failed", refund: { state: "refunded", refundId: "canonical-refund-1" }, error: secret },
+  ]) {
+    await t.test(value.status ?? "legacy MCP error", async () => {
+      const h = harness(), payment = await h.payment();
+      h.boundary.dispatchSettled = async () => clone(value);
+      const result = await h.app.handle({ params, paymentSignature: payment.paymentSignature });
+      assert.equal(result.status, 502); assert.equal(result.body.code, "EXECUTION_FAILED");
+      assert.equal(result.body.failureCategory, "workflow_failed"); assert.equal(result.body.reconciliationRequired, true);
+      assert.equal(result.body.refund.state, value.refund?.state ?? "unknown");
+      assert.ok(result.body.quoteId); assert.ok(result.body.reservationId); assert.ok(result.body.fundingClaimId);
+      assert.equal(result.body.fundingKey, result.receipt.fundingKey); assert.ok(result.receipt.transaction);
+      assert.ok(!JSON.stringify(result).includes(secret)); assert.equal(result.body.content, undefined);
+      const next = await h.payment(SOLANA);
+      assert.equal((await h.fresh().handle({ params, paymentSignature: next.paymentSignature })).body.code, "FUNDING_CLAIMED");
+      assert.equal(h.counts.settle, 1);
+    });
+  }
+});
+test("malformed returned outcomes never become HTTP 200 protected output", async t => {
+  for (const value of [null, undefined, [], true,
+    { content: [{ type: "text", text: secret }] },
+    { status: "completed", refund: { state: "not_required" }, result: { content: [{ type: "text", text: secret }] } },
+    { status: "completed", error: secret, refund: { state: "not_required" }, result: { isError: false, content: [{ type: "text", text: secret }] } },
+    { status: "completed", refund: { state: "not_required" }, result: { isError: false, content: [{ type: "text", text: secret }], error: secret } },
+    { status: "completed", refund: { state: "not_required" }, result: { isError: false, content: [{ type: "error", text: secret }] } },
+    { status: "completed", refund: { state: "not_required" }, result: { isError: false, content: [] } },
+    { status: "completed", refund: { state: "not_required" }, result: { isError: "false", content: [{ type: "text", text: secret }] } },
+    { status: "failed", refund: { state: secret }, error: secret },
+    { status: "failed", refund: { state: "refunded" }, error: secret },
+    { status: "failed", refund: { state: "not_required" }, error: secret },
+  ]) {
+    await t.test(String(value?.status ?? value), async () => {
+      const h = harness(), payment = await h.payment(); h.boundary.dispatchSettled = async () => value;
+      const result = await h.app.handle({ params, paymentSignature: payment.paymentSignature });
+      assert.equal(result.status, 502); assert.equal(result.body.code, "DISPATCH_INVALID_OUTCOME");
+      assert.equal(result.body.refund.state, "unknown"); assert.ok(result.body.fundingClaimId);
+      assert.ok(result.receipt.transaction); assert.ok(!JSON.stringify(result).includes(secret));
+      assert.equal(h.counts.settle, 1);
+    });
+  }
+});
+test("returned outcome getters are not invoked, and thrown failures expose fixed refund uncertainty", async () => {
+  const h = harness(), payment = await h.payment(); let getterCalls = 0;
+  const value = Object.defineProperty({}, "status", { enumerable: true, get() { getterCalls++; return secret; } });
+  h.boundary.dispatchSettled = async () => value;
+  const malformed = await h.app.handle({ params, paymentSignature: payment.paymentSignature });
+  assert.equal(malformed.body.code, "DISPATCH_INVALID_OUTCOME"); assert.equal(getterCalls, 0);
+  h.boundary.dispatchSettled = async () => { throw new Error(secret); };
+  const thrown = await h.fresh().handle({ params, paymentSignature: payment.paymentSignature });
+  assert.equal(thrown.status, 202); assert.equal(thrown.body.code, "DISPATCH_UNCERTAIN");
+  assert.equal(thrown.body.refund.state, "unknown"); assert.equal(thrown.body.quoteId, thrown.receipt.quoteId);
+  assert.ok(thrown.body.reservationId); assert.ok(thrown.body.fundingClaimId); assert.ok(!JSON.stringify(thrown).includes(secret));
+  assert.equal(h.counts.settle, 1);
+});
 test("reconciled settled state requires a bound receipt before protected dispatch", async () => {
   const h = harness(), { paymentSignature } = await h.payment();
   h.facilitator.settle = async () => { h.counts.settle++; throw new Error(secret); };
@@ -286,7 +446,7 @@ test("authoritatively reconciled settlement can resume dispatch without another 
   assert.equal((await h.app.handle({ params, paymentSignature })).status, 202);
   const r = [...h.reservations.values()][0], q = h.quotes.get(h.ctx.requestId), req = q.requirements[0];
   await h.boundary.recordSettlement({ ...r, state: "settled", receipt: {
-    quoteId: r.quoteId, binding: r.binding, authorizationKey: r.authorizationKey, paymentDigest: r.paymentDigest,
+    fundingKey: r.fundingKey, quoteId: r.quoteId, binding: r.binding, authorizationKey: r.authorizationKey, paymentDigest: r.paymentDigest,
     success: true, network: BASE, transaction: `0x${"ab".repeat(32)}`, payer: payload.payload.authorization.from,
     asset: req.asset, amountAtomic: req.amount, payTo: req.payTo, facilitatorId: "offline-fixture-only",
   } });
