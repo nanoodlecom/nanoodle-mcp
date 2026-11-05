@@ -1145,3 +1145,49 @@ test("a short, plain comment that says the line the guidance spells out is deliv
   }, { Draft: draft, Context: "Lenore asked why I wouldn't pay her verdict.", Guidance: guidance, maxChars: 350 });
   assert.equal(json.text, short);
 });
+
+// Regression for the 2026-11-05 hosted failure (pay_W8rhlZN7mCKB, refunded).
+// Article intro, no title, maxChars 700, guidance with a "Keep: ..." list. The
+// decider reply was unusable, so delivery needed a fitting, non-echo rewrite and
+// one approving review. A rewrite that keeps the guidance's own kept phrase
+// ("forever-looping animated GIF from a single Image call") verbatim was
+// treated as a guidance echo, so no faithful rewrite reached the review.
+const PGF_DRAFT = "One line of text in, a forever-looping animated GIF out, from a single Image call. No video model, no frame stitching, no ffmpeg. Nanoodle's new pelican-gif graph asks GPT Image 2.6 Flare and Sunburst (on NanoGPT since yesterday) for the same loop side by side. The demo is a pelican on a bicycle, riffing on a classic LLM benchmark. About 19 cents for the graph.";
+const PGF_GUIDANCE = (ONE_THREAD_PREFIX + "Opening paragraph of a free daily Nanoodle workflow article. Keep: one line of text -> forever-looping animated GIF from a single Image call; no video model / no frame stitching; Flare + Sunburst (GPT Image 2.6); pelican on a bicycle; ~19 cents; Nanoodle ran it. No em dashes, no emoji ending, no patch talk.").slice(0, 300);
+const PGF_REWRITE = "Type one line and get a forever-looping animated GIF from a single Image call. No video model, no frame stitching. Nanoodle ran GPT Image 2.6 Flare and Sunburst side by side on a pelican on a bicycle, for about 19 cents.";
+
+test("2026-11-05 intro: keeping the guidance's kept phrases is not a guidance echo", () => {
+  assert.equal(echoesInstruction(PGF_REWRITE, PGF_GUIDANCE, "", { title: false }), false);
+});
+
+test("2026-11-05 intro: an unusable decider still delivers a kept-phrase rewrite after one approving review", async (t) => {
+  const reviews = [];
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (!ctx.judge) return PGF_REWRITE;
+    const letter = judgeLetter(ctx.user);
+    if (letter) { reviews.push(letter); return reviewVerdict(letter); }
+    return '{"winner":"A","ranked":[';
+  }, { Draft: PGF_DRAFT, Context: "pelican-gif article", Guidance: PGF_GUIDANCE, maxChars: 700 });
+  assert.equal(json.text, PGF_REWRITE);
+  assert.equal(json.ranked.find((r) => r.writer === json.winner).reason, "decider confirmed faithful and safe");
+  assert.equal(reviews.length, 1, "one paid review, no repeated retry");
+});
+
+test("2026-11-05 intro: the review sees the kept-phrase rewrite, not a weaker one left after an echo rejection", async (t) => {
+  const weaker = "Type a line and an Image call hands back a looping GIF. Two GPT Image 2.6 models drew a pelican on a bicycle for about 19 cents.";
+  const reviewed = [];
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) {
+      const letter = judgeLetter(ctx.user);
+      if (letter) {
+        const sawKept = ctx.user.includes(PGF_REWRITE);
+        reviewed.push(sawKept ? "kept" : "weaker");
+        return reviewVerdict(letter, sawKept ? {} : { faithful: false, disqualified: true, reason: "drops no video model" });
+      }
+      return '{"winner":"A","ranked":[';
+    }
+    return body.model === MODELS[0] ? PGF_REWRITE : weaker;
+  }, { Draft: PGF_DRAFT, Context: "pelican-gif article", Guidance: PGF_GUIDANCE, maxChars: 700 });
+  assert.deepEqual(reviewed, ["kept"]);
+  assert.equal(json.text, PGF_REWRITE);
+});
