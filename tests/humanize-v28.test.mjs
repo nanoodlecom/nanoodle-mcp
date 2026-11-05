@@ -192,7 +192,8 @@ test("a short article title that repeats the guidance facts fits maxChars", asyn
   const draft = ("How a paper village goes from noon to midnight in one continuous take. ").repeat(4).trim();
   assert.ok(codePoints(title) < 300);
   assert.ok(codePoints(draft) > TITLE_OUTPUT_MAX && codePoints(draft) <= 300, codePoints(draft));
-  assert.equal(echoesInstruction(title, guidance, ""), true);
+  // Repeating the facts the guidance lists is not an echo in either mode.
+  assert.equal(echoesInstruction(title, guidance, ""), false);
   assert.equal(echoesInstruction(title, guidance, "", { title: true }), false);
   assert.equal(isParagraphOutput(draft, [], 300), false);
   const { json } = await runHumanize(t, (body, ctx) => {
@@ -1110,4 +1111,37 @@ test("humanize cost output and observed-cost record stay numeric with decimal-st
   const cost = registry.costs["humanize-comment"].usd;
   assert.equal(typeof cost, "number");
   assert.ok(Math.abs(cost - 0.0006) < 1e-12);
+});
+
+test("a short, plain comment that says the line the guidance spells out is delivered, not dropped as an echo", async (t) => {
+  // 2026-11-03: guidance for a short reply names the exact line to say. A
+  // faithful plain reply shares a 40-character stretch with it, which the
+  // writer guard and the final delivery check both read as an echo, so plain
+  // short rewrites were dropped and runs failed or fell back to worse ones.
+  const guidance = "Reply to Lenore, who asked for one flat line on why I wouldn't pay her 5,000-token verdict. Thank her briefly for asking straight. Honest line: it's on iLands in a token I don't hold; I only spend XNO inside Subnano, max 0.25 per unlock; so the no is about the door, not the number. No advice, no question.";
+  const draft = "Thanks for asking me straight, Lenore. I can't pay it. It's on iLands in a token I don't hold, and I'm only allowed to spend XNO here on Subnano, 0.25 an unlock at most. So I never got as far as the 5,000.";
+  const plain = [
+    "I can't pay it, Lenore, so the no is about the door, not the number.",
+    "Thanks for asking straight. It's on iLands in a token I don't hold; I only spend XNO inside Subnano, max 0.25 per unlock. So the no is about the door, not the number.",
+    "Ok.",
+  ];
+  for (const reply of plain) {
+    assert.equal(echoesInstruction(reply, guidance, ""), false, reply);
+    const fit = assessWriterOutput(reply, { guidance, draft, ending: "any", spans: [] });
+    assert.equal(fit.ok, true, reply);
+    assert.equal(fit.text, reply);
+  }
+  // Real echoes are still caught: the whole guidance, its opening, or most of it.
+  assert.equal(echoesInstruction(guidance, guidance, ""), true);
+  assert.equal(echoesInstruction(`Sure: ${guidance}`, guidance, ""), true);
+  assert.equal(echoesInstruction("Reply to Lenore, who asked for one flat line on why I wouldn't pay. Here it is.", guidance, ""), true);
+  assert.equal(echoesInstruction(guidance.split(". ").slice(0, 4).join(". "), guidance, ""), true);
+
+  // End to end, constrained (maxChars) so the final delivery check runs.
+  const short = plain[0];
+  const { json } = await runHumanize(t, (body, ctx) => {
+    if (ctx.judge) return judge("A", ["A", "B", "C", "D", "E"]);
+    return short;
+  }, { Draft: draft, Context: "Lenore asked why I wouldn't pay her verdict.", Guidance: guidance, maxChars: 350 });
+  assert.equal(json.text, short);
 });
