@@ -414,6 +414,7 @@ export function createChargeGate({
             amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
             status: q.status === "consumed" && !result && !error ? "paid" : q.status,
             source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
+            completedAt: q.completedAt ?? null,
             settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
             settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
             result,
@@ -432,13 +433,23 @@ export function createChargeGate({
   if (stateFile) {
     try {
       const data = JSON.parse(readFileSync(stateFile, "utf8"));
+      if (!data || typeof data !== "object" || !Array.isArray(data.quotes) || !Array.isArray(data.owed)) {
+        throw new Error("invalid gate state structure");
+      }
       // A pre-v2 file predates content stripping: its results may be full tool
       // output (text included) and its errors may be free-text upstream messages
       // — both can quote user content. We can't prove any legacy field is clean,
       // so we scrub at the door and never let it re-persist.
       const legacy = data.v !== 2;
       for (const s of Array.isArray(data.quotes) ? data.quotes : []) {
+        if (!s || typeof s.id !== "string" || !s.id || quotes.has(s.id) ||
+            !["pending", "paid", "consumed", "expired", "refunded"].includes(s.status) ||
+            !/^\d+$/.test(s.amountRaw) || BigInt(s.amountRaw) <= 0n ||
+            !Number.isFinite(s.createdAt) || !Number.isFinite(s.expiresAt)) {
+          throw new Error("invalid quote in gate state");
+        }
         const q = { ...s, pair: { usdNano: BigInt(s.pair.usdNano), raw: BigInt(s.pair.raw) }, waiters: [] };
+        if (q.pair.usdNano <= 0n || q.pair.raw <= 0n) throw new Error("invalid quote rate in gate state");
         if (legacy) {
           // Legacy result: drop it. Old code only cached a result AFTER settling,
           // so a consumed quote that carried one was already settled — mark it so
@@ -468,6 +479,10 @@ export function createChargeGate({
         quotes.set(q.id, q);
       }
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
+        if (!s || !checkAddress(s.to) || !/^\d+$/.test(s.amountRaw) || BigInt(s.amountRaw) <= 0n ||
+            !["refund", "change", "author_payout"].includes(s.event)) {
+          throw new Error("invalid owed send in gate state");
+        }
         // Legacy state files predate the payments-ledger policy: their queued
         // refunds carry free-text reasons like "run failed: <upstream error>",
         // which can quote user content. When such an owed send later lands (or
@@ -495,7 +510,10 @@ export function createChargeGate({
       }
       if (quotes.size || owed.length) log(`restored ${quotes.size} quote(s) and ${owed.length} queued send(s) from ${stateFile}`);
     } catch (e) {
-      if (e.code !== "ENOENT") log(`cannot read gate state ${stateFile}: ${e.message} — starting fresh`);
+      // Starting fresh could forget a paid run or an outstanding refund, then
+      // overwrite the only recovery record. A missing first-run file is fine;
+      // unreadable or corrupt money state requires operator recovery.
+      if (e.code !== "ENOENT") throw new Error(`cannot restore gate state ${stateFile} — refusing to accept payments; recover the state file before restarting`, { cause: e });
     }
   }
 
@@ -508,7 +526,10 @@ export function createChargeGate({
         resolveWaiters(q);
         changed = true;
       }
-      if (t - q.createdAt > RETAIN_MS) { quotes.delete(q.id); changed = true; }
+      // Retention may remove completed outcomes, never an unclaimed payment
+      // or a run still in flight. Those records are outstanding obligations.
+      const unfinished = q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
+      if (!unfinished && t - (q.completedAt ?? q.createdAt) > RETAIN_MS) { quotes.delete(q.id); changed = true; }
     }
     if (changed) persist();
   }
@@ -823,9 +844,9 @@ export function createChargeGate({
 
     /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
+      prune();
       const q = quotes.get(String(id));
       if (!q) return null;
-      prune();
       const out = {
         id: q.id, tool: q.tool, status: q.status, usd: q.usd,
         amountRaw: q.amountRaw, amountXno: rawToXno(q.amountRaw),
@@ -865,14 +886,22 @@ export function createChargeGate({
      * default 20s), the wait only exists while a call is genuinely in flight, and
      * a payment arriving early clears the timer through the waiter below.
      */
-    waitForPayment(id, ms) {
+    waitForPayment(id, ms, { signal } = {}) {
       const q = quotes.get(String(id));
       if (!q) return Promise.resolve("unknown");
-      if (q.status !== "pending") return Promise.resolve(q.status);
+      if (q.status !== "pending" || signal?.aborted) return Promise.resolve(q.status);
       ensureWatching();
       return new Promise((res) => {
-        const t = setTimeout(() => res(q.status), ms);
-        q.waiters.push(() => { clearTimeout(t); res(q.status); });
+        const finish = () => {
+          clearTimeout(t);
+          signal?.removeEventListener("abort", finish);
+          const index = q.waiters.indexOf(finish);
+          if (index !== -1) q.waiters.splice(index, 1);
+          res(q.status);
+        };
+        const t = setTimeout(finish, ms);
+        q.waiters.push(finish);
+        signal?.addEventListener("abort", finish, { once: true });
       });
     },
 
@@ -1235,6 +1264,7 @@ export function createChargeGate({
                     (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change returned to your wallet` : "")
                   : "");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
+              q.completedAt = now();
               // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
               // (quote, paid, refund, change, author_payout), never run telemetry.
               // A run event would record the tool, timing, cost, and (on failure)
@@ -1247,7 +1277,10 @@ export function createChargeGate({
               // Only the CALLER (q.error) and the operator's stderr (via log,
               // inside refund) see the upstream error text; the ledger records
               // the failure as the fixed category "run_failed".
-              const refunded = await refund(q, "run_failed");
+              // A text result is regenerated after restart without settling
+              // again. If that recovery fails, the original change/author
+              // payout still stands; refunding the whole deposit would pay twice.
+              const refunded = q.settled === true ? false : await refund(q, "run_failed");
               // The refund-status sentence is gate-authored (no user content), so
               // it's safe on disk; the upstream `msg` can quote prompt content, so
               // it is not. q.error carries the full text for in-process replay;
@@ -1260,13 +1293,16 @@ export function createChargeGate({
               // provider costs: returning the deposit does not reverse model spend.
               // A throttled-RPC failure (all nodes 429) lands here too, so the
               // caller should read "try again," never "payment failed."
-              const payer = refunded
+              const payer = q.settled === true
+                ? "The result could not be regenerated after restart. Your original payment was already settled; no additional refund was sent. Contact the operator for result recovery."
+                : refunded
                 ? `The run didn't complete, so your hosted payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}. Provider costs already incurred by the service remain separate from this refund. You can try again in a moment.`
                 : q.source
                   ? `The run didn't complete. Your ${rawToXno(q.amountRaw)} XNO hosted deposit is being refunded to ${q.source} automatically; the refund is pending because the first send failed and is queued for retry. Provider costs already incurred by the service remain separate from this refund. Contact the operator if the refund does not arrive.`
                   : `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`;
               q.error = `${payer}\n\nDetails: ${msg}`;
               q.errorPersist = `${payer}\n\nDetails: (error details not retained across restarts)`;
+              q.completedAt = now();
               persist();
             }
           })();
