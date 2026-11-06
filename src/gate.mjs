@@ -31,7 +31,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { checkAddress, hashBlock } from "nanocurrency";
+import { checkAddress } from "nanocurrency";
 import { rawToXno } from "./wallet.mjs";
 import { knownUsd } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
@@ -160,7 +160,6 @@ export function createChargeGate({
   pollMs = 1000,
   waitMs = 20_000,
   stateFile = null,
-  recoveryStore = null,
   fetch = globalThis.fetch,
   log = () => {},
   usage = () => {},
@@ -171,27 +170,6 @@ export function createChargeGate({
 
   /** @type {Map<string, object>} paymentId → quote */
   const quotes = new Map();
-  let stopped=false;
-  if (recoveryStore && (typeof ops.transferId !== "function" || typeof ops.reconcileTransfer !== "function")) {
-    throw new Error("durable gate requires stable transfer and read-only reconciliation operations");
-  }
-  const recoveryScope = `gate:${address}`;
-  const recovered = recoveryStore?.load(recoveryScope);
-  let recoveryRevision = recovered?.revision || 0;
-  let recoveryError = null;
-  let historyCursor = recovered?.data?.historyCursor || { marker: null, head: null, newest: null };
-  if(recovered?.data) {
-    const validHash=value=>typeof value==="string"&&/^[A-F0-9]{64}$/i.test(value);
-    if(recovered.data.v!==3 || !recovered.data.historyCursor || typeof historyCursor!=="object" ||
-      ![null,undefined,false,true].includes(historyCursor.initialized) ||
-      (historyCursor.initialized && historyCursor.marker!=="" && !validHash(historyCursor.marker)) ||
-      (historyCursor.head!==null && !validHash(historyCursor.head)) ||
-      (historyCursor.newest!==null && !validHash(historyCursor.newest)) ||
-      (!!historyCursor.head!==!!historyCursor.newest) ||
-      (!historyCursor.initialized && (historyCursor.marker!==null || historyCursor.head!==null || historyCursor.newest!==null)) ||
-      (!historyCursor.initialized && recovered.data.quotes?.some(q=>q.status==="pending"))) throw new Error("invalid durable payment history state");
-  }
-
 
   /* ---------------- pricing ---------------- */
 
@@ -260,7 +238,7 @@ export function createChargeGate({
    * precisely the quoted amount. (An early version hid the tag below display
    * resolution; a hand-typed payment then never matched and sat orphaned.)
    */
-  function tagAmount(usdPrice, pair, quoteId) {
+  function tagAmount(usdPrice, pair) {
     // exact conversion, ceiled so the deposit always covers its USD figure,
     // then ceiled again to a whole 1e-8 XNO…
     let base = usdToRaw(usdPrice, pair, "ceil");
@@ -279,7 +257,7 @@ export function createChargeGate({
       // compares at GRAIN resolution against every quote it still remembers.
       let clash = false;
       for (const q of quotes.values()) if (BigInt(q.amountRaw) / GRAIN === (base + tag) / GRAIN) { clash = true; break; }
-      if (!clash && (!recoveryStore || recoveryStore.reserveAmount(((base+tag)/GRAIN).toString(),quoteId))) return amountRaw;
+      if (!clash) return amountRaw;
     }
   }
 
@@ -289,8 +267,7 @@ export function createChargeGate({
     for (const w of q.waiters.splice(0)) w();
   }
 
-  function markPaid(q, { source, hash, via }) {
-    if(recoveryStore && (!checkAddress(source) || !/^[A-F0-9]{64}$/i.test(hash) || recoveryStore.paymentOwner(hash))) return;
+  async function markPaid(q, { source, hash, via }) {
     q.status = "paid";
     q.paidAt = now();
     q.source = source || null;
@@ -298,7 +275,7 @@ export function createChargeGate({
     log(`payment ${q.id}: ${rawToXno(q.amountRaw)} XNO received via ${via}` +
       (source ? ` from ${source}` : "") + ` (${q.tool})`);
     usage("paid", { paymentId: q.id, tool: q.tool, amountRaw: q.amountRaw, usd: q.usd, source: q.source, via, settleMs: q.paidAt - q.createdAt });
-    persist(recoveryStore ? {payment:{hash,quoteId:q.id}} : {});
+    persist();
     resolveWaiters(q);
   }
 
@@ -311,68 +288,6 @@ export function createChargeGate({
   const owed = []; // { to, amountRaw, describe, event, fields, onOk, tries, at }
   const OWED_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
   const OWED_MAX_TRIES = 100; // ≈16h at the 10-min cap — after that it needs a human
-  function queueDurable(q, to, amountRaw, describe, event, fields) {
-    const id = `gate:${address}:${q.id}:${event}`;
-    if (owed.some((o) => o.id === id)) return owed.find((o) => o.id === id);
-    const o = {
-      id,
-      to,
-      amountRaw: String(amountRaw),
-      describe,
-      event,
-      fields,
-      tries: 0,
-      at: now(),
-      state: "intent",
-    };
-    owed.push(o);
-    return o;
-  }
-  async function retryDurable(o) {
-    if (o.sending || o.legacy || o.state === "review_required" || recoveryError)
-      return false;
-    o.sending = true;
-    o.tries++;
-    const signed = recoveryStore.getSend(o.id);
-    // An intent with no stored block is authoritative evidence that publish
-    // was never admitted. A persisted signed block always reconciles first.
-    const reconcile =
-      (o.state === "uncertain" || o.state === "sending") &&
-      signed?.state !== "intent";
-    o.state = "sending";
-    persist();
-    try {
-      const hash = reconcile
-        ? await ops.reconcileTransfer(o.id)
-        : await ops.transferId(o.id, o.to, o.amountRaw, o.describe);
-      owed.splice(owed.indexOf(o), 1);
-      if (o.event === "refund") {
-        const q = quotes.get(o.fields.paymentId);
-        if (q) q.status = "refunded";
-      }
-      persist();
-      usage(o.event, {
-        ...o.fields,
-        ok: true,
-        to: o.to,
-        amountRaw: o.amountRaw,
-        hash,
-        retries: o.tries,
-      });
-      return true;
-    } catch (e) {
-      if (recoveryError) throw recoveryError;
-      o.state = e.paymentNotSent === true ? "intent" : "uncertain";
-      if (o.tries >= OWED_MAX_TRIES) o.state = "review_required"; // retain the obligation
-      o.at =
-        now() + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
-      persist();
-      return false;
-    } finally {
-      o.sending = false;
-    }
-  }
-
   function owe(to, amountRaw, describe, event, fields, onOk) {
     owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, tries: 0, at: now() + OWED_BACKOFF_MS[0] });
     log(`${describe} ${rawToXno(amountRaw)} XNO to ${to} failed — queued for retry`);
@@ -383,7 +298,6 @@ export function createChargeGate({
     const t = now();
     for (const o of [...owed]) {
       if (t < o.at) continue;
-      if(recoveryStore) { await retryDurable(o);continue; }
       // An entry is only removed from `owed` AFTER its send resolves, so any
       // second retryOwed() running during that await sees it as still owed and
       // sends it again. That is money out the door, once per concurrent pass.
@@ -435,11 +349,6 @@ export function createChargeGate({
       return false;
     }
     q.refunding = (async () => {
-      if(recoveryStore) {
-        const o=queueDurable(q,q.source,q.amountRaw,"refunded","refund",{paymentId:q.id,tool:q.tool,reason});
-        persist();
-        const ok=await retryDurable(o);ensureWatching();return ok;
-      }
       try {
         const hash = await ops.transfer(q.source, q.amountRaw, "refunded");
         q.status = "refunded";
@@ -464,137 +373,66 @@ export function createChargeGate({
    * (CI deploys restart the process on every merge). Serialization drops the
    * live-only bits: waiters/refunding always, inline image blocks from cached
    * results (the media files themselves persist on disk and keep their /out/
-   * URLs). Legacy JSON mode demotes unfinished runs to paid for regeneration.
-   * Journal mode retains execution intent and requires recovery after a crash;
-   * it never regenerates paid text or refunds an ambiguous interrupted run.
+   * URLs), and a consumed-but-unfinished run demotes back to "paid" so the
+   * retry after restart runs it — charged once, delivered once.
    */
-  function snapshot() {
-    return {
-      // v:2 is the content-stripping era — its results are provably media-only
-      // (text output is written as null) and its errors are pre-redacted. A
-      // v:1 (or unversioned) file predates this and may hold user content, so
-      // restore treats it as legacy: drop its results, redact its errors.
-      v: recoveryStore ? 3 : 2,
-      ...(recoveryStore ? { historyCursor } : {}),
-      quotes: [...quotes.values()].map((q) => {
-        // What we're willing to write to disk for this quote's outcome:
-        //   - Media-only results persist as today (minus inline image blocks;
-        //     the files live on disk and keep their /out/ URLs). Their text is
-        //     pointers + a cost line + a gate-authored receipt — no user content.
-        //   - Text-output results (LLM/text nodes) hold the customer's paid
-        //     content, so they NEVER hit disk: persist null. With the status
-        //     rule below that demotes the quote back to "paid", so a retry after
-        //     a restart RE-RUNS instead of replaying content from disk. Charged
-        //     once / delivered once still holds; the only cost is one duplicate
-        //     model call in the rare restart-between-run-and-retry window — the
-        //     operator eats it, and privacy wins the trade.
-        //   - Errors persist in their redacted q.errorPersist form (upstream
-        //     text swapped for a placeholder, refund status kept). Its presence
-        //     keeps status "consumed" so the redacted error replays after restart.
-        const result =
-          q.result && !q.textOutput
-            ? {
-                ...q.result,
-                content: (q.result.content || []).filter(
-                  (c) => c.type !== "image",
-                ),
-              }
-            : null;
-        const error = q.error
-          ? (q.errorPersist ??
-            "run failed: (error details not retained across restarts)")
-          : null;
-        return {
-          id: q.id,
-          tool: q.tool,
-          argsHash: q.argsHash,
-          usd: q.usd,
-          pair: {
-            usdNano: q.pair.usdNano.toString(),
-            raw: q.pair.raw.toString(),
-          },
-          amountRaw: q.amountRaw,
-          createdAt: q.createdAt,
-          expiresAt: q.expiresAt,
-          status:
-            !recoveryStore && q.status === "consumed" && !result && !error
-              ? "paid"
-              : q.status,
-          ...(recoveryStore
-            ? {
-                execution: q.execution ?? null,
-                recoveryRequired: !!q.recoveryRequired,
-                legacyRecovery: !!q.legacyRecovery,
-              }
-            : {}),
-          source: q.source ?? null,
-          payHash: q.payHash ?? null,
-          paidAt: q.paidAt ?? null,
-          completedAt: q.completedAt ?? null,
-          settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
-          settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
-          result,
-          error,
-        };
-      }),
-      owed: owed.map((o) => ({
-        to: o.to,
-        amountRaw: o.amountRaw,
-        describe: o.describe,
-        event: o.event,
-        fields: o.fields,
-        tries: o.tries,
-        ...(recoveryStore
-          ? { id: o.id, state: o.state, at: o.at, legacy: o.legacy === true }
-          : {}),
-      })),
-    };
-  }
   let saveChain = Promise.resolve();
   let saveQueued = false;
-  function persist(extra = {}) {
-    if (recoveryStore) {
-      if (recoveryError) throw recoveryError;
-      try {
-        const intents = owed
-          .filter((o) => o.id && !o.legacy)
-          .map((o) => ({
-            id: o.id,
-            account: address,
-            to: o.to,
-            amountRaw: o.amountRaw,
-          }));
-        recoveryRevision = recoveryStore.save(
-          recoveryScope,
-          recoveryRevision,
-          snapshot(),
-          { intents, ...extra },
-        );
-      } catch (e) {
-        recoveryError = e;
-        throw e;
-      }
-      return;
-    }
+  function persist() {
     if (!stateFile || saveQueued) return;
     saveQueued = true;
-    saveChain = saveChain
-      .then(async () => {
-        saveQueued = false;
-        const data = JSON.stringify(snapshot());
-        await mkdir(dirname(stateFile), { recursive: true });
-        const tmp = stateFile + ".tmp";
-        await writeFile(tmp, data);
-        await rename(tmp, stateFile);
-      })
-      .catch((e) =>
-        log(`cannot persist gate state to ${stateFile}: ${e.message}`),
-      );
+    saveChain = saveChain.then(async () => {
+      saveQueued = false; // snapshot at write time — later mutations queue another write
+      const data = JSON.stringify({
+        // v:2 is the content-stripping era — its results are provably media-only
+        // (text output is written as null) and its errors are pre-redacted. A
+        // v:1 (or unversioned) file predates this and may hold user content, so
+        // restore treats it as legacy: drop its results, redact its errors.
+        v: 2,
+        quotes: [...quotes.values()].map((q) => {
+          // What we're willing to write to disk for this quote's outcome:
+          //   - Media-only results persist as today (minus inline image blocks;
+          //     the files live on disk and keep their /out/ URLs). Their text is
+          //     pointers + a cost line + a gate-authored receipt — no user content.
+          //   - Text-output results (LLM/text nodes) hold the customer's paid
+          //     content, so they NEVER hit disk: persist null. With the status
+          //     rule below that demotes the quote back to "paid", so a retry after
+          //     a restart RE-RUNS instead of replaying content from disk. Charged
+          //     once / delivered once still holds; the only cost is one duplicate
+          //     model call in the rare restart-between-run-and-retry window — the
+          //     operator eats it, and privacy wins the trade.
+          //   - Errors persist in their redacted q.errorPersist form (upstream
+          //     text swapped for a placeholder, refund status kept). Its presence
+          //     keeps status "consumed" so the redacted error replays after restart.
+          const result = q.result && !q.textOutput
+            ? { ...q.result, content: (q.result.content || []).filter((c) => c.type !== "image") }
+            : null;
+          const error = q.error ? (q.errorPersist ?? "run failed: (error details not retained across restarts)") : null;
+          return {
+            id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
+            pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
+            amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
+            status: q.status === "consumed" && !result && !error ? "paid" : q.status,
+            source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
+            completedAt: q.completedAt ?? null,
+            settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
+            settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
+            result,
+            error,
+          };
+        }),
+        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
+      });
+      await mkdir(dirname(stateFile), { recursive: true });
+      const tmp = stateFile + ".tmp";
+      await writeFile(tmp, data);
+      await rename(tmp, stateFile);
+    }).catch((e) => log(`cannot persist gate state to ${stateFile}: ${e.message}`));
   }
 
-  if (stateFile || recovered?.data) {
+  if (stateFile) {
     try {
-      const data = recovered?.data || JSON.parse(readFileSync(stateFile, "utf8"));
+      const data = JSON.parse(readFileSync(stateFile, "utf8"));
       if (!data || typeof data !== "object" || !Array.isArray(data.quotes) || !Array.isArray(data.owed)) {
         throw new Error("invalid gate state structure");
       }
@@ -602,7 +440,7 @@ export function createChargeGate({
       // output (text included) and its errors may be free-text upstream messages
       // — both can quote user content. We can't prove any legacy field is clean,
       // so we scrub at the door and never let it re-persist.
-      const legacy = data.v !== 2 && data.v !== 3;
+      const legacy = data.v !== 2;
       for (const s of Array.isArray(data.quotes) ? data.quotes : []) {
         if (!s || typeof s.id !== "string" || !s.id || quotes.has(s.id) ||
             !["pending", "paid", "consumed", "expired", "refunded"].includes(s.status) ||
@@ -611,7 +449,6 @@ export function createChargeGate({
           throw new Error("invalid quote in gate state");
         }
         const q = { ...s, pair: { usdNano: BigInt(s.pair.usdNano), raw: BigInt(s.pair.raw) }, waiters: [] };
-        if(data.v===3 && ![null,undefined,"intent","completed","failed"].includes(q.execution)) throw new Error("invalid execution recovery state");
         if (q.pair.usdNano <= 0n || q.pair.raw <= 0n) throw new Error("invalid quote rate in gate state");
         if (legacy) {
           // Legacy result: drop it. Old code only cached a result AFTER settling,
@@ -639,30 +476,13 @@ export function createChargeGate({
         // whose result we just dropped has neither result nor error, so it is
         // NOT marked a replay here — it re-runs on retry (guarded by q.settled).
         if (q.status === "consumed" && (q.result || q.error)) q.running = Promise.resolve();
-        if (recoveryStore) {
-          // A pre-journal paid record cannot prove whether a workflow was
-          // already dispatched. Preserve its money metadata and hold recovery.
-          const ambiguous = data.v !== 3 && (q.status === "paid" || (q.status === "consumed" && !q.result && !q.error));
-          const interrupted = q.execution === "intent";
-          const unavailable = q.execution === "completed" && !q.result && !q.error;
-          if (ambiguous || interrupted || unavailable) {
-            q.status="consumed";q.recoveryRequired=true;
-            q.error=q.errorPersist="Payment recovery requires operator reconciliation; no workflow or refund was retried after restart.";
-            q.running=Promise.resolve();
-          }
-          if (data.v !== 3 && (q.status === "expired" || q.status === "pending")) { q.legacyRecovery=true;q.status="expired"; }
-        }
         quotes.set(q.id, q);
-        if(recoveryStore && !recoveryStore.reserveAmount((BigInt(q.amountRaw)/GRAIN).toString(),q.id)) throw new Error("reused quote amount in recovery state");
       }
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
         if (!s || !checkAddress(s.to) || !/^\d+$/.test(s.amountRaw) || BigInt(s.amountRaw) <= 0n ||
             !["refund", "change", "author_payout"].includes(s.event)) {
           throw new Error("invalid owed send in gate state");
         }
-        if(recoveryStore && data.v===3 && (!s.id || typeof s.id!=="string" ||
-          !["intent","sending","uncertain","review_required","legacy_uncertain"].includes(s.state) ||
-          (!s.legacy && !recoveryStore.getSend(s.id)))) throw new Error("incomplete durable send recovery record");
         // Legacy state files predate the payments-ledger policy: their queued
         // refunds carry free-text reasons like "run failed: <upstream error>",
         // which can quote user content. When such an owed send later lands (or
@@ -673,8 +493,6 @@ export function createChargeGate({
         if (fields && "reason" in fields && !REFUND_REASONS.has(fields.reason)) fields.reason = "run_failed";
         owed.push({
           ...s, fields, at: now() + OWED_BACKOFF_MS[0],
-          ...(recoveryStore ? { id:s.id||`legacy:${s.fields?.paymentId||"unknown"}:${s.event}`, legacy:data.v!==3||s.legacy===true,
-            state:data.v!==3||s.legacy===true?"legacy_uncertain":s.state==="sending"?"uncertain":s.state||"intent" } : {}),
           onOk: s.event === "refund" && s.fields && s.fields.paymentId
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
             : null,
@@ -710,8 +528,7 @@ export function createChargeGate({
       }
       // Retention may remove completed outcomes, never an unclaimed payment
       // or a run still in flight. Those records are outstanding obligations.
-      const unfinished = q.status === "paid" || (q.status === "consumed" && !q.result && !q.error) ||
-        (recoveryStore && (q.recoveryRequired || q.legacyRecovery || owed.some(o=>o.fields?.paymentId===q.id)));
+      const unfinished = q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
       if (!unfinished && t - (q.completedAt ?? q.createdAt) > RETAIN_MS) { quotes.delete(q.id); changed = true; }
     }
     if (changed) persist();
@@ -730,7 +547,6 @@ export function createChargeGate({
     const bucket = BigInt(amt) / GRAIN;
     for (const q of quotes.values()) {
       if (BigInt(q.amountRaw) / GRAIN !== bucket) continue;
-      if (recoveryStore && (q.legacyRecovery || q.recoveryRequired)) return;
       if (q.status === "pending") return void markPaid(q, meta);
       if (q.status === "expired" && !q.refunding) {
         log(`late payment for expired quote ${q.id} — refunding`);
@@ -753,8 +569,8 @@ export function createChargeGate({
   // Someone is waiting on money to ARRIVE — poll fast, a caller is blocked on it.
   const anyPaymentWatchable = () => {
     const t = now();
-    return [...quotes.values()].some((q) => !q.legacyRecovery && !q.recoveryRequired &&
-      (q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS)));
+    return [...quotes.values()].some((q) =>
+      q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS));
   };
   // Keep ticking for the owed queue too, but that is money going OUT on its own
   // backoff (OWED_BACKOFF_MS) — it must never pull the receivable poll up to
@@ -763,7 +579,7 @@ export function createChargeGate({
   // refund kept failing — and since a refund typically fails because the RPC is
   // throttling, that poll fed the very rate limit that was blocking it. One
   // failed refund held the loop for 34h and 5,158 calls on 2026-07-23/25.
-  const anyWatchable = () => !stopped && !recoveryError && (owed.some(o=>!recoveryStore||(!o.legacy&&o.state!=="review_required")) || anyPaymentWatchable());
+  const anyWatchable = () => owed.length > 0 || anyPaymentWatchable();
 
   /**
    * Race cover for pocketed payments: the wallet (same process, other duties)
@@ -776,150 +592,7 @@ export function createChargeGate({
    * older and unpocketed is still in `receivable`, which scan() reads first.
    */
   let lastHistoryHash = null;
-  let seeding = null;
-  async function doSeedRecoveryHistory() {
-    if (historyCursor.initialized) return;
-    const h = await ops.rpc({
-      action: "account_history",
-      account: address,
-      count: "1",
-    });
-    if (!Array.isArray(h?.history))
-      throw new Error("invalid payment history baseline");
-    const r = await ops.rpc({
-      action: "receivable",
-      account: address,
-      count: String(RECEIVABLE_COUNT),
-      threshold: "1",
-      source: "true",
-      include_only_confirmed: "true",
-    });
-    if (
-      r?.blocks !== "" &&
-      (!r?.blocks || typeof r.blocks !== "object" || Array.isArray(r.blocks))
-    )
-      throw new Error("invalid receivable baseline");
-    const hashes = Object.keys(r.blocks);
-    if (hashes.length >= RECEIVABLE_COUNT)
-      throw new Error(
-        "payment recovery baseline is incomplete; operator review required before quoting",
-      );
-    const marker = h.history.length ? h.history[0]?.hash : "";
-    if (typeof marker !== "string" || (marker && !/^[A-F0-9]{64}$/i.test(marker)))
-      throw new Error("invalid payment history baseline");
-    historyCursor = { initialized: true, marker, head: null, newest: null };
-    persist({ payments: hashes.map((hash) => ({ hash, quoteId: "baseline" })) });
-  }
-  function seedRecoveryHistory() {
-    if (!seeding)
-      seeding = doSeedRecoveryHistory().catch((e) => {
-        seeding = null;
-        throw e;
-      });
-    return seeding;
-  }
-  async function matchRecoveryHistory(entry) {
-    if (entry.type !== "receive" || !/^\d+$/.test(entry.amount)) return;
-    const bucket = BigInt(entry.amount) / GRAIN;
-    if (
-      ![...quotes.values()].some(
-        (q) =>
-          !q.legacyRecovery &&
-          !q.recoveryRequired &&
-          (q.status === "pending" || q.status === "expired") &&
-          BigInt(q.amountRaw) / GRAIN === bucket,
-      )
-    )
-      return;
-    const receive = await ops.rpc({
-      action: "block_info",
-      hash: entry.hash,
-      json_block: "true",
-    });
-    if (
-      receive?.confirmed !== "true" ||
-      !receive.contents ||
-      hashBlock(receive.contents).toUpperCase() !== entry.hash.toUpperCase() ||
-      hashBlock({ ...receive.contents, account: address }).toUpperCase() !==
-        entry.hash.toUpperCase()
-    )
-      throw new Error("received payment proof requires reconciliation");
-    const sendHash = receive.contents.link;
-    if (!/^[A-F0-9]{64}$/i.test(sendHash))
-      throw new Error("received payment has no source block");
-    if (recoveryStore.paymentOwner(sendHash)) return;
-    const send = await ops.rpc({
-      action: "block_info",
-      hash: sendHash,
-      json_block: "true",
-    });
-    if (
-      send?.confirmed !== "true" ||
-      !send.contents ||
-      String(send.amount) !== String(entry.amount) ||
-      hashBlock(send.contents).toUpperCase() !== sendHash.toUpperCase() ||
-      hashBlock({ ...send.contents, link: address }).toUpperCase() !==
-        sendHash.toUpperCase()
-    )
-      throw new Error("source payment proof requires reconciliation");
-    matchAmount(entry.amount, {
-      source: send.contents.account,
-      hash: sendHash,
-      via: "durable history reconciliation",
-    });
-  }
-  async function scanRecoveryHistory() {
-    if (!historyCursor.initialized) return;
-    for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
-      const h = await ops.rpc({
-        action: "account_history",
-        account: address,
-        count: String(HISTORY_PAGE),
-        ...(historyCursor.head ? { head: historyCursor.head } : {}),
-      });
-      if (!Array.isArray(h?.history))
-        throw new Error("invalid payment history page");
-      const entries = h.history;
-      const newest =
-        historyCursor.newest || entries[0]?.hash || historyCursor.marker;
-      let reached = false;
-      for (const e of entries) {
-        if (!e || !/^[A-F0-9]{64}$/i.test(e.hash))
-          throw new Error("invalid payment history entry");
-        if (e.hash === historyCursor.marker) {
-          reached = true;
-          break;
-        }
-        await matchRecoveryHistory(e);
-      }
-      const previous =
-        typeof h.previous === "string" && !/^0+$/.test(h.previous)
-          ? h.previous
-          : null;
-      if (previous && !/^[A-F0-9]{64}$/i.test(previous))
-        throw new Error("invalid payment history continuation");
-      if (!reached && historyCursor.marker && (!entries.length || !previous))
-        throw new Error("payment history ended before its durable marker; operator reconciliation required");
-      if (reached || !entries.length || !previous) {
-        historyCursor = {
-          initialized: true,
-          marker: newest || "",
-          head: null,
-          newest: null,
-        };
-        persist();
-        return;
-      }
-      if (previous === historyCursor.head)
-        throw new Error("payment history cursor did not advance");
-      historyCursor = { ...historyCursor, head: previous, newest };
-      persist();
-    }
-    // Retain the old marker and continuation at the cap, resuming next scan.
-  }
-
   async function scanHistory() {
-    if(recoveryStore)return scanRecoveryHistory();
     let head = null;
     let newest = null;
     for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
@@ -956,13 +629,12 @@ export function createChargeGate({
   async function scan() {
     prune();
     await retryOwed();
-    if(recoveryStore && !historyCursor.initialized)return;
     // Only the owed queue left → retryOwed above is the whole job. Skip the
     // receivable/history reads: nobody is waiting for an incoming payment, so
     // asking the node about one is pure load on an endpoint that is usually
     // already throttling us (that is why the refund is queued at all).
     if (!anyPaymentWatchable()) return;
-    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true", ...(recoveryStore?{include_only_confirmed:"true"}:{}) });
+    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true" });
     const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     for (const [hash, v] of blocks) {
       const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
@@ -997,7 +669,7 @@ export function createChargeGate({
     // of it. That is what let concurrent retryOwed() passes double-send (see the
     // o.sending guard). Belt and braces: never run two scans at once — the one
     // in flight schedules the next tick when it finishes.
-    if (scanning || stopped) return;
+    if (scanning) return;
     scanning = true;
     timer = null;
     scan().then(
@@ -1026,7 +698,6 @@ export function createChargeGate({
   }
 
   function ensureWatching() {
-    if(stopped)return;
     connectWs();
     if (!timer) tick();
   }
@@ -1049,7 +720,7 @@ export function createChargeGate({
   let ws = null;
   let wsEverFailed = false;
   function connectWs() {
-    if (stopped || !wsUrl || ws) return;
+    if (!wsUrl || ws) return;
     if (typeof WebSocket === "undefined") {
       if (!wsEverFailed) { wsEverFailed = true; log("--nano-ws ignored: no global WebSocket (needs Node ≥ 21)"); }
       return;
@@ -1153,7 +824,6 @@ export function createChargeGate({
    */
   function nextFor(q) {
     if (!q || q.status === "pending") return undefined;
-    if(q.recoveryRequired || q.legacyRecovery) return "Payment recovery requires the operator. No workflow or replacement transfer was retried after restart.";
     if (q.status === "paid" || q.status === "consumed") {
       return `Payment received — this watch stream is done; hang it up. ` +
         `NOW open the RESULTS stream: call the SAME tool with identical arguments plus "_payment_id": "${q.id}". ` +
@@ -1171,16 +841,9 @@ export function createChargeGate({
 
   const gate = {
     address,
-    stopWatching() {
-      stopped=true;
-      if(timer){clearTimeout(timer);timer=null;}
-      ws?.close();
-      for(const q of quotes.values())resolveWaiters(q);
-    },
 
     /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
-      if(stopped)return null;
       prune();
       const q = quotes.get(String(id));
       if (!q) return null;
@@ -1188,7 +851,6 @@ export function createChargeGate({
         id: q.id, tool: q.tool, status: q.status, usd: q.usd,
         amountRaw: q.amountRaw, amountXno: rawToXno(q.amountRaw),
         address, uri: nanoUri(q), expiresAt: new Date(q.expiresAt).toISOString(),
-        ...(recoveryStore ? {reconciliationRequired:!!(q.recoveryRequired||q.legacyRecovery)} : {}),
       };
       // Terminal states close the watch SSE — package the next-step so an agent
       // (or any event-loop subscriber) does not sit on a bare "paid" with no path
@@ -1225,7 +887,6 @@ export function createChargeGate({
      * a payment arriving early clears the timer through the waiter below.
      */
     waitForPayment(id, ms, { signal } = {}) {
-      if(stopped)return Promise.resolve("unknown");
       const q = quotes.get(String(id));
       if (!q) return Promise.resolve("unknown");
       if (q.status !== "pending" || signal?.aborted) return Promise.resolve(q.status);
@@ -1386,8 +1047,6 @@ export function createChargeGate({
         // Recompute-only replay after a restart: the money already moved.
         if (alreadySettled) return { known, costRaw, take, change, author: !!author, costUsd: known ? parsed : null };
 
-        if(recoveryStore) return { known,costRaw,take,change,author:!!author,costUsd:known?parsed:null };
-
         if (costRaw0 > deposit) {
           log(`call ${q.id} (${name}) cost $${parsed} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
@@ -1456,8 +1115,6 @@ export function createChargeGate({
       };
 
       async function callTool(params, ctx = null) {
-        if(stopped)throw new Error("charge gate is closed");
-        if (recoveryError) throw recoveryError;
         // Malformed shells fall through to the registry for its usual ParamsError texts.
         if (params == null || typeof params !== "object" || Array.isArray(params)) return registry.callTool(params);
         if (params.name === runNoodleName) {
@@ -1472,10 +1129,6 @@ export function createChargeGate({
 
         let q;
         if (_payment_id == null) {
-          if(recoveryStore && (recoveryStore.activeSend(address) || owed.some(o=>o.legacy || o.state==="review_required") ||
-            [...quotes.values()].some(q=>q.recoveryRequired&&!q.settled))) {
-            throw new Error("wallet recovery is pending; no new paid call can be admitted");
-          }
           // Never charge for a call that couldn't run: unknown tool / bad args throw here, pre-quote.
           // validate is registry.prepareCall, whose unknown-tool text always appends
           // run_noodle. That tool is hidden from tools/list and refused above, so
@@ -1489,13 +1142,11 @@ export function createChargeGate({
           // the arguments the caller will pay for.
           const price = priceFor(name, args);
           const pair = await ratePair();
-          if(recoveryStore)await seedRecoveryHistory();
-          const quoteId="pay_" + randomBytes(9).toString("base64url");
           q = {
-            id: quoteId,
+            id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,
             pair, // settle math must use the exact pair the deposit was priced at
-            amountRaw: tagAmount(price, pair, quoteId),
+            amountRaw: tagAmount(price, pair),
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
             etaMs: etaOf(name),
@@ -1520,7 +1171,6 @@ export function createChargeGate({
             return errResult(`payment ${q.id} was issued for a different call (tool/arguments changed) — ` +
               `call again without _payment_id to get a quote for these arguments.`);
           }
-          if(recoveryStore && (q.recoveryRequired || q.legacyRecovery)) return errResult(q.error || "Payment recovery requires the operator; no workflow or replacement transfer was retried.");
           if (q.status === "refunded") {
             return errResult(`payment ${q.id} was refunded${q.source ? ` to ${q.source}` : ""} — call again without _payment_id to retry.`);
           }
@@ -1556,15 +1206,11 @@ export function createChargeGate({
           }
         }
         note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
-        if(recoveryStore && !q.running && recoveryStore.activeSend(address)) {
-          throw new Error("wallet recovery is pending; the paid call remains unconsumed");
-        }
         // paid (or consumed): run exactly once, replay the cached outcome afterwards
         if (!q.running) {
           q.status = "consumed";
           const t0 = now();
           q.running = (async () => {
-            if(recoveryStore) { q.execution="intent";persist(); }
             try {
               const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args });
               // Whether this result carries the customer's paid text output. Kept
@@ -1575,8 +1221,7 @@ export function createChargeGate({
               // quote that was demoted to "paid" across a restart — its money
               // already moved, so settle() recomputes the numbers without paying
               // change/author twice.
-              const alreadySettledForRun=q.settled===true;
-              const s = settle(q, name, costUsd, alreadySettledForRun);
+              const s = settle(q, name, costUsd, q.settled === true);
               // The receipt must describe the money that ACTUALLY moved, which is
               // the FIRST run's settlement — a post-restart re-run may report a
               // different cost (or none), and the change/payout already went out at
@@ -1620,13 +1265,6 @@ export function createChargeGate({
                   : "");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               q.completedAt = now();
-              if(recoveryStore) {
-                q.execution="completed";
-                if(!alreadySettledForRun) {
-                  if(s.author && s.take>0n) queueDurable(q,authors.get(name),s.take.toString(),"author payout:","author_payout",{paymentId:q.id,tool:name});
-                  if(q.source && s.change>0n) queueDurable(q,q.source,s.change.toString(),"change:","change",{paymentId:q.id,tool:name});
-                }
-              }
               // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
               // (quote, paid, refund, change, author_payout), never run telemetry.
               // A run event would record the tool, timing, cost, and (on failure)
@@ -1634,14 +1272,8 @@ export function createChargeGate({
               // that belongs in a privacy-respecting ledger. The settle() below
               // still emits the money events (change / author_payout).
               persist();
-              if(recoveryStore && owed.length) ensureWatching();
             } catch (e) {
-              if(recoveryError) throw recoveryError;
               const msg = String((e && e.message) || e);
-              if(recoveryStore) {
-                q.execution="failed";
-                q.error=q.errorPersist="The workflow failed; refund recovery is pending.";
-              }
               // Only the CALLER (q.error) and the operator's stderr (via log,
               // inside refund) see the upstream error text; the ledger records
               // the failure as the fixed category "run_failed".
@@ -1665,8 +1297,6 @@ export function createChargeGate({
                 ? "The result could not be regenerated after restart. Your original payment was already settled; no additional refund was sent. Contact the operator for result recovery."
                 : refunded
                 ? `The run didn't complete, so your hosted payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}. Provider costs already incurred by the service remain separate from this refund. You can try again in a moment.`
-                : recoveryStore && q.source
-                  ? "The run didn't complete. Your hosted refund is pending confirmation or recovery. Provider costs already incurred remain separate. Contact the operator if the refund does not arrive."
                 : q.source
                   ? `The run didn't complete. Your ${rawToXno(q.amountRaw)} XNO hosted deposit is being refunded to ${q.source} automatically; the refund is pending because the first send failed and is queued for retry. Provider costs already incurred by the service remain separate from this refund. Contact the operator if the refund does not arrive.`
                   : `The run didn't complete. The payment was received but the refund account is unknown — contact the operator to be made whole.`;
@@ -1686,7 +1316,6 @@ export function createChargeGate({
   };
   // Restored pending quotes / owed sends need the watcher running from boot,
   // not from the next quote — a payment may land while nobody is calling.
-  if(recoveryStore) persist();
   if (anyWatchable()) ensureWatching();
   return gate;
 }

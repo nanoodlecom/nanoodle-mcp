@@ -77,10 +77,6 @@ function usage(code = 1) {
                  remote work source fails, the send fails cleanly instead. Local
                  CPU work blocks the whole process for minutes; recommended off
                  in --serve mode when --work-rpc points somewhere dependable
-  --recovery-db p opt in to the durable Nano recovery journal at p. Share this
-                  exact database with the charge gate and wallet. Existing JSON
-                  state is retained; ambiguous legacy payments require review.
-                  Older versions cannot safely resume this journal after activation.
 
 Serve mode (host your noodles over HTTP instead of stdio):
   --serve [h:]p    speak MCP over streamable HTTP on [host:]port (default 127.0.0.1:8402);
@@ -118,7 +114,6 @@ async function main() {
   const graphDirs = []; // --graphs is repeatable; order = precedence on name clashes
   let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null, outTtlFlag = null;
   let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null, noLocalWork = false;
-  let recoveryDbFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -135,7 +130,6 @@ async function main() {
     else if (a === "--nano-rpc") nanoRpcFlag = val("--nano-rpc");
     else if (a === "--work-rpc") workRpcFlag = val("--work-rpc");
     else if (a === "--max-usd") maxUsdFlag = val("--max-usd");
-    else if (a === "--recovery-db") recoveryDbFlag = val("--recovery-db");
     else if (a === "--serve") {
       // the value is optional: `--serve` alone binds 127.0.0.1:8402
       serveSpec = argv[i + 1] !== undefined && !argv[i + 1].startsWith("--") ? argv[++i] : "";
@@ -224,14 +218,6 @@ async function main() {
   // there's no API key (a key always wins for runs, matching the library), and — in
   // --charge-usd mode — receiving callers' payments and sending refunds/payouts,
   // which is needed even when an API key funds the runs themselves.
-  const resolvedOut = resolve(outDir || "./nanoodle-out");
-  let recoveryStore = null;
-  if(recoveryDbFlag) {
-    if(!(nanoKey || nanoSeed) || (apiKey && chargeUsd == null)) throw new Error("--recovery-db requires an active Nano wallet");
-    const { openRecoveryStore } = await import("../src/payments/recovery-store.mjs");
-    recoveryStore = openRecoveryStore(resolve(recoveryDbFlag));
-    process.once("exit",()=>recoveryStore.close());
-  }
   let wallet = null;
   if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null)) {
     try {
@@ -243,7 +229,6 @@ async function main() {
         workKey,
         localWork: !noLocalWork,
         maxUsd,
-        recoveryStore,
         log: (line) => console.error("nanoodle-mcp: " + line),
       });
     } catch (e) { console.error("nanoodle-mcp: " + e.message); process.exit(1); }
@@ -257,6 +242,7 @@ async function main() {
     process.exit(1);
   }
 
+  const resolvedOut = resolve(outDir || "./nanoodle-out");
   const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");
   if (chargeUsd != null && serveHost === "0.0.0.0" && !publicUrlFlag) {
     console.error("nanoodle-mcp: warning — charging on 0.0.0.0 without --public-url: pay links will point at 127.0.0.1");
@@ -417,7 +403,6 @@ async function main() {
       publicBase,
       // In-flight money (pending quotes, queued refunds) survives restarts here.
       stateFile: join(resolvedOut, "gate-state.json"),
-      recoveryStore,
       log: (line) => console.error("nanoodle-mcp: " + line),
       usage: usageLog,
     });
