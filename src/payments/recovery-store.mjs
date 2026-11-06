@@ -49,7 +49,7 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
   }
   if (tables.length) {
     const versions = db.prepare("SELECT version FROM recovery_schema").all();
-    if (versions.length !== 1 || versions[0].version !== 1) {
+    if (versions.length !== 1 || versions[0].version !== 2) {
       db.close();
       throw new RecoveryError("RECOVERY_SCHEMA_UNSUPPORTED");
     }
@@ -58,17 +58,37 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
     db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS recovery_schema (version INTEGER NOT NULL);
-      INSERT INTO recovery_schema SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM recovery_schema);
+      INSERT INTO recovery_schema SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM recovery_schema);
       CREATE TABLE IF NOT EXISTS metadata (scope TEXT PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sends (id TEXT PRIMARY KEY, account TEXT NOT NULL, binding TEXT NOT NULL,
         state TEXT NOT NULL, hash TEXT, block TEXT, previous_balance TEXT);
-      CREATE TABLE IF NOT EXISTS active_send (account TEXT PRIMARY KEY, id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS active_send (account TEXT PRIMARY KEY, id TEXT, epoch INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS consumed_payment (hash TEXT PRIMARY KEY, quote_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS quote_amount (bucket TEXT PRIMARY KEY, quote_id TEXT UNIQUE NOT NULL);
       COMMIT;`);
   } catch (e) {
     db.close();
     throw e;
+  }
+  const orphaned = db
+    .prepare(
+      `SELECT s.id FROM sends s LEFT JOIN active_send a
+    ON a.account=s.account AND a.id=s.id
+    WHERE s.state IN ('submitted','uncertain') AND a.id IS NULL LIMIT 1`,
+    )
+    .get();
+  const invalidSlot = db
+    .prepare(
+      `SELECT a.account FROM active_send a LEFT JOIN sends s
+    ON a.id=s.id AND a.account=s.account
+    WHERE a.epoch<1 OR a.epoch>9007199254740991 OR typeof(a.epoch)!='integer'
+      OR (a.id IS NOT NULL AND (s.id IS NULL OR s.state NOT IN ('intent','submitted','uncertain')))
+    LIMIT 1`,
+    )
+    .get();
+  if (orphaned || invalidSlot) {
+    db.close();
+    throw new RecoveryError("RECOVERY_ACCOUNT_STATE_INVALID");
   }
   const directory = openSync(dirname(path), "r");
   try {
@@ -223,35 +243,46 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
     activeSend(account) {
       available();
       const r = db
-        .prepare("SELECT id FROM active_send WHERE account=?")
+        .prepare("SELECT id,epoch FROM active_send WHERE account=?")
         .get(account);
-      return r ? readSend(r.id) : null;
+      if (!r?.id) return null;
+      const operation = readSend(r.id);
+      check(operation, "ACTIVE_OPERATION_MISSING");
+      return { ...operation, epoch: r.epoch };
     },
     beginSend(id, binding) {
       return tx(() => {
         const r = intent(id, binding);
         if (r.state === "completed") return r;
         const active = db
-          .prepare("SELECT id FROM active_send WHERE account=?")
+          .prepare("SELECT id,epoch FROM active_send WHERE account=?")
           .get(r.account);
-        check(!active || active.id === id, "WALLET_RECONCILIATION_REQUIRED");
-        db.prepare("INSERT OR IGNORE INTO active_send VALUES(?,?)").run(
-          r.account,
-          id,
+        check(
+          !active?.id || active.id === id,
+          "WALLET_RECONCILIATION_REQUIRED",
         );
-        return r;
+        if (active?.id === id) return { ...r, epoch: active.epoch };
+        const epoch = (active?.epoch || 0) + 1;
+        check(Number.isSafeInteger(epoch), "ACCOUNT_WRITER_EPOCH_INVALID");
+        db.prepare(
+          "INSERT INTO active_send VALUES(?,?,?) ON CONFLICT(account) DO UPDATE SET id=excluded.id,epoch=excluded.epoch",
+        ).run(r.account, id, epoch);
+        return { ...r, epoch };
       });
     },
-    submitted(id, { hash: h, block, previousBalance }) {
+    submitted(id, { hash: h, block, previousBalance, epoch }) {
       return tx(() => {
         const r = readSend(id);
         check(r, "SEND_NOT_FOUND");
         if (r.state !== "intent") return { ...r, granted: false }; // another worker won
+        const owner = db
+          .prepare("SELECT id,epoch FROM active_send WHERE account=?")
+          .get(r.account);
         check(
-          db
-            .prepare("SELECT id FROM active_send WHERE account=?")
-            .get(r.account)?.id === id,
-          "WALLET_RECONCILIATION_REQUIRED",
+          owner?.id === id &&
+            owner.epoch === epoch &&
+            Number.isSafeInteger(epoch),
+          "ACCOUNT_WRITER_FENCED",
         );
         check(hash(h) && block && uint(previousBalance), "SIGNED_SEND_INVALID");
         db.prepare(
@@ -282,21 +313,19 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
           "SEND_RECEIPT_CONFLICT",
         );
         db.prepare("UPDATE sends SET state='completed' WHERE id=?").run(id);
-        db.prepare("DELETE FROM active_send WHERE account=? AND id=?").run(
-          r.account,
-          id,
-        );
+        db.prepare(
+          "UPDATE active_send SET id=NULL WHERE account=? AND id=?",
+        ).run(r.account, id);
         return readSend(id);
       });
     },
-    releaseUnsigned(id) {
+    releaseUnsigned(id, epoch) {
       return tx(() => {
         const r = readSend(id);
         if (r?.state === "intent")
-          db.prepare("DELETE FROM active_send WHERE account=? AND id=?").run(
-            r.account,
-            id,
-          );
+          db.prepare(
+            "UPDATE active_send SET id=NULL WHERE account=? AND id=? AND epoch=?",
+          ).run(r.account, id, epoch);
       });
     },
     close() {

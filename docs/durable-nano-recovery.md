@@ -8,18 +8,19 @@ This is a Nano recovery authority. It does not advertise or implement the multi-
 
 ## Durable transitions
 
-SQLite uses WAL and `synchronous=FULL`; all metadata changes use `BEGIN IMMEDIATE` transactions. Database creation is private by default, schema initialization is atomic, and unknown/incomplete schemas fail closed rather than silently recreating financial tables. Existing file permissions are not changed. The containing directory is synchronized at initialization. A failed or uncertain commit poisons that writer instance; it cannot authorize later effects until reopened and reconciled.
+SQLite schema **2** uses WAL and `synchronous=FULL`; all metadata changes use `BEGIN IMMEDIATE` transactions. Database creation is private by default, schema initialization is atomic, and unknown/incomplete schemas fail closed rather than silently recreating financial tables. Existing file permissions are not changed. The containing directory is synchronized at initialization. A failed or uncertain commit poisons that writer instance; it cannot authorize later effects until reopened and reconciled.
 
 | Record | Transition / invariant |
 |---|---|
 | Gate snapshot | Revision compare-and-set prevents another stale in-memory gate from overwriting newer payment/execution state. |
 | Settlement/refund plan | Quote settlement state and every payout intent commit in one transaction before any outgoing effect. One immutable operation ID per quote and money-event category. |
-| Wallet operation | `intent → submitted → completed`, or `submitted → uncertain → completed`. Account, recipient and raw amount remain bound to the same ID. |
-| Signed send | Exact signed block, hash and prior balance commit before publishing. Competing workers use the stored winner. No keys are persisted. |
+| Wallet account operation | `intent → submitted → completed`, or `submitted → uncertain → completed`. Account, recipient and raw amount remain bound to the same ID. |
+| Signed send/receive | Exact signed block, hash and prior balance commit before publishing. Competing workers use the stored winner. No keys are persisted. |
 | Completion | Requires the configured RPC's confirmed block proof, matching hash, amount and signed-block binding. A `process` response alone cannot complete the operation. |
 | Retry | An unsigned intent may be prepared again because publish was never admitted. A submitted/uncertain operation performs **read-only reconciliation**; it never creates a replacement send. A completed operation replays its durable hash. |
 | Paid admission | An unresolved account send, legacy owed send or unresolved execution prevents issuing another paid quote. Existing paid calls stay unconsumed while the wallet is blocked. |
-| Account writer slot | An unresolved operation blocks a different outgoing operation, and wallet housekeeping cannot receive over another active operation. This preserves the account-chain boundary while its outcome is unknown. |
+| Account writer slot | Every send and receive claims the same durable account slot before preparation and retains it through confirmation. A persisted generation token fences callbacks from an earlier ownership cycle. Competing actors for the same logical operation share one signed-block submission grant. |
+| Workflow receipt | Change is reported as queued for return; workflow success does not claim the outgoing transfer is confirmed. This wording also applies in legacy mode. |
 | Owed completion | The wallet completion tombstone survives before the gate removes its owed record. A crash in that gap replays completion without another publish. |
 | Give-up | The obligation remains `review_required`; reaching the retry limit never deletes it. Legacy unknown sends remain `legacy_uncertain` and are not automatically retried. |
 | Workflow execution | Execution intent commits before provider invocation. Interrupted execution requires recovery. Completed text output is not persisted and is **not regenerated after restart**. Media pointers and redacted errors retain their existing privacy boundary. |
@@ -86,8 +87,18 @@ NANOODLE_OFFLINE=1 npm test
 
 The full suite requires CI's pinned ffmpeg/ffprobe. Its only intended offline skip is the existing external landing-image check. The normal GPL import-boundary tests remain enforced: only wallet and gate import `nanocurrency`; the recovery coordinator receives those crypto functions from the wallet. No dependency, workflow permission or package-version change is required.
 
-Local qualification of this candidate: **26/26 recovery tests** on Node 22.23.4; full Node 24.22.1 offline suite **445 total, 444 passed, one existing external-image skip, zero failures**. CI receipts and the exact review head are recorded in the draft PR. No independent release clearance or production activation is implied by these tests.
+Local qualification of this candidate: **34/34 recovery tests** on Node 22.23.4; full Node 24.22.1 offline suite **453 total, 452 passed, one existing external-image skip, zero failures**. CI receipts and the exact review head are recorded in the draft PR. No independent release clearance or production activation is implied by these tests.
 
 Release incident: the first short-refspec push resolved to main under the account’s existing `push.default=tracking` configuration and upstream-main tracking. Commit `1086cd6` was automatically deployed with the recovery flag absent. It was reverted by `ef5da94a7eb165f9c773f2df0ecce8b007292bdc`, restoring the exact approved #95 source tree. Read-only checks found no recovery database, unchanged v2 payment aggregates (10 paid, four refunded, three expired, zero owed), and no activation/configuration change. This candidate was then reapplied on a separate branch using an explicit full destination refspec. The incident does not constitute independent release review or activation clearance.
 
 Rollback receipts: [deployment ef5da94](https://github.com/nanoodlecom/nanoodle-mcp/actions/runs/42276722247) and [restored-source CI](https://github.com/nanoodlecom/nanoodle-mcp/actions/runs/42276722307) succeeded. The recovery candidate remains [draft PR #96](https://github.com/nanoodlecom/nanoodle-mcp/pull/96) for independent review.
+
+## Independent-review correction: receive exclusion and receipts
+
+The reviewer reproduced a race at the prior `fb2946a` head: one wallet paused in `receivable`, another committed a signed send and paused publishing, and the first published a competing receive. The send then forked and remained uncertain. The author independently reproduced that sequence with two SQLite handles and real wallet instances. A second deferred-publish fixture reproduced a success receipt falsely claiming returned change. Both tests failed before this correction.
+
+Receives now use the same durable block coordinator as sends, including signed intent, one submission grant and confirmed read-only recovery. Outgoing preparation cannot receive funds while holding a send slot: short-balance funding completes separately journaled receives before claiming the outgoing slot. The early outgoing guard remains, and the coordinator enforces exclusion again at the durable boundary across every await. Lost receive replies retain the account slot and must reconcile before any outgoing operation proceeds.
+
+Account slots retain a monotone generation even when vacant. Submission and unsigned release require the generation granted by `beginSend`; a callback from an earlier cycle cannot publish or unlock a later owner, including when the logical operation ID is reused after an unsigned failure. Missing slots for unresolved signed operations fail startup closed.
+
+The earlier unfenced schema-1 candidate is refused without changing its records. There is no automatic downgrade, table recreation or schema-1 migration. Production has never enabled either journal schema, and migration/rollback clearance remains required. New regressions cover the exact receive/send race, stale-generation ABA, two receive workers, unknown receive recovery across restart, short-balance funding order, schema-1 preservation, missing account-slot preservation, and truthful queued-change receipts.

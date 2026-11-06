@@ -1,4 +1,4 @@
-/** Stable-operation send coordinator. Retry means read-only reconciliation, never a new transfer. */
+/** Fenced account-block coordinator. Retry only reconciles an existing signed block. */
 const sameAddress = (a, b) =>
   typeof a === "string" &&
   typeof b === "string" &&
@@ -13,16 +13,15 @@ function error(code) {
 const check = (ok, code) => {
   if (!ok) throw error(code);
 };
-export function createDurableSender({
-  store,
-  account,
-  publicKey,
-  prepare,
-  publish,
-  lookup,
-  crypto,
-}) {
+function createDurableWriter(
+  { store, account, publicKey, prepare, publish, lookup, crypto },
+  direction,
+) {
   const { checkAddress, hashBlock, verifyBlock, deriveAddress } = crypto;
+  const validTarget = (target) =>
+    direction === "send"
+      ? checkAddress(target)
+      : typeof target === "string" && /^[A-F0-9]{64}$/i.test(target);
   check(
     checkAddress(account) &&
       sameAddress(deriveAddress(publicKey, { useNanoPrefix: true }), account),
@@ -35,6 +34,7 @@ export function createDurableSender({
       b &&
         b.type === "state" &&
         sameAddress(b.account, r.account) &&
+        validTarget(r.to) &&
         /^\d+$/.test(r.previousBalance),
       "SIGNED_SEND_INVALID",
     );
@@ -45,7 +45,9 @@ export function createDurableSender({
       "SIGNED_SEND_BINDING_INVALID",
     );
     check(
-      BigInt(b.balance) + BigInt(r.amountRaw) === BigInt(r.previousBalance),
+      direction === "send"
+        ? BigInt(b.balance) + BigInt(r.amountRaw) === BigInt(r.previousBalance)
+        : BigInt(r.previousBalance) + BigInt(r.amountRaw) === BigInt(b.balance),
       "SIGNED_SEND_AMOUNT_INVALID",
     );
     check(
@@ -80,7 +82,7 @@ export function createDurableSender({
   async function perform(id, to, amountRaw) {
     const binding = { account, to, amountRaw: String(amountRaw) };
     check(
-      checkAddress(to) && /^[1-9]\d*$/.test(binding.amountRaw),
+      validTarget(to) && /^[1-9]\d*$/.test(binding.amountRaw),
       "SEND_BINDING_INVALID",
     );
     let r = store.beginSend(id, binding);
@@ -89,6 +91,7 @@ export function createDurableSender({
       return r.hash;
     }
     if (r.state !== "intent") return reconcile(r);
+    const epoch = r.epoch;
     try {
       const candidate = await prepare(to, binding.amountRaw, id);
       signed({
@@ -100,9 +103,9 @@ export function createDurableSender({
       });
       // The winning signed block is durable before publish. Competing callers
       // must use the winner returned here, never their own stale preparation.
-      r = store.submitted(id, candidate);
+      r = store.submitted(id, { ...candidate, epoch });
     } catch (e) {
-      store.releaseUnsigned(id);
+      store.releaseUnsigned(id, epoch);
       if (store.getSend(id)?.state === "intent") e.paymentNotSent = true;
       throw e;
     }
@@ -143,5 +146,20 @@ export function createDurableSender({
       signed(r);
       return r.state === "completed" ? r.hash : reconcile(r);
     },
+  });
+}
+
+export const createDurableSender = (options) =>
+  createDurableWriter(options, "send");
+export function createDurableReceiver(options) {
+  const writer = createDurableWriter(options, "receive");
+  return Object.freeze({
+    receive: (id, sourceHash, amountRaw) =>
+      writer.transfer(
+        id,
+        typeof sourceHash === "string" ? sourceHash.toUpperCase() : sourceHash,
+        amountRaw,
+      ),
+    reconcile: writer.reconcile,
   });
 }

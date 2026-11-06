@@ -1616,7 +1616,7 @@ export function createChargeGate({
                 settledLine +
                 (r.known
                   ? (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
-                    (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change returned to your wallet` : "")
+                    (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change queued for return to your wallet` : "")
                   : "");
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               q.completedAt = now();

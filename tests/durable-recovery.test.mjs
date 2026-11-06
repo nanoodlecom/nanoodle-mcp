@@ -148,8 +148,8 @@ test("accepted send with lost reply stays uncertain; restart reconciles without 
 test("crash after submitted commit and before publish cannot authorize a fresh send", async (t) => {
   const f = await fixture(t);
   let store = f.open();
-  store.beginSend("op", binding);
-  store.submitted("op", candidate());
+  const lease = store.beginSend("op", binding);
+  store.submitted("op", { ...candidate(), epoch: lease.epoch });
   store.close();
   store = f.open();
   let publishes = 0;
@@ -361,7 +361,9 @@ function fakeRpc() {
     if (body.action === "process") {
       const h = hashBlock(body.block);
       state.publishes++;
-      const amount = (state.balance - BigInt(body.block.balance)).toString();
+      const delta = state.balance - BigInt(body.block.balance);
+      const amount = (delta < 0n ? -delta : delta).toString();
+      if (body.subtype === "receive") delete state.receivable[body.block.link];
       state.ledger.set(h, { confirmed: "true", amount, contents: body.block });
       state.balance = BigInt(body.block.balance);
       state.frontier = h;
@@ -678,7 +680,7 @@ test("SIGKILL after journal submission preserves the signed operation without a 
   ).href;
   const code = `import {openRecoveryStore} from ${JSON.stringify(moduleUrl)};
  const store=openRecoveryStore(process.argv[1]);
- store.beginSend('op',${JSON.stringify(binding)});store.submitted('op',${JSON.stringify(candidate())});
+ const lease=store.beginSend('op',${JSON.stringify(binding)});store.submitted('op',{...${JSON.stringify(candidate())},epoch:lease.epoch});
  process.kill(process.pid,'SIGKILL');`;
   const child = spawnSync(
     process.execPath,
@@ -938,8 +940,8 @@ test("an unresolved wallet send blocks new paid admission without issuing anothe
   const f = await fixture(t),
     store = f.open(),
     rpc = fakeRpc();
-  store.beginSend("unknown", binding);
-  store.submitted("unknown", candidate());
+  const lease = store.beginSend("unknown", binding);
+  store.submitted("unknown", { ...candidate(), epoch: lease.epoch });
   store.uncertain("unknown");
   const first = gateFixture(store, rpc);
   t.after(() => first.gate.stopWatching());
@@ -991,4 +993,351 @@ test("missing canonical history or signed-operation records cannot silently rest
     );
     assert.equal(rpc.state.publishes, 0);
   }
+});
+
+test("a receive cannot publish over another process’s durable signed send", async (t) => {
+  const f = await fixture(t),
+    a = f.open(),
+    b = f.open(),
+    rpc = fakeRpc();
+  const incoming = "8".repeat(64);
+  rpc.state.receivable[incoming] = { amount: "1000", source: payer };
+  let readStarted, releaseRead, sendStarted, releaseSend;
+  const reading = new Promise((r) => {
+      readStarted = r;
+    }),
+    readGate = new Promise((r) => {
+      releaseRead = r;
+    });
+  const publishing = new Promise((r) => {
+      sendStarted = r;
+    }),
+    sendGate = new Promise((r) => {
+      releaseSend = r;
+    });
+  const original = rpc.fetch;
+  let receivePublishes = 0,
+    competingReceives = 0,
+    firstRead = true;
+  async function strictFetch(url, init) {
+    const body = JSON.parse(init.body);
+    if (body.action === "process") {
+      if (body.subtype === "receive") {
+        receivePublishes++;
+        if (b.activeSend(account)?.id === "other-process-send")
+          competingReceives++;
+      }
+      if (body.block.previous !== rpc.state.frontier)
+        return new Response(JSON.stringify({ error: "Fork" }));
+    }
+    return original(url, init);
+  }
+  const receiver = createNanoWallet({
+    secretKey: secret,
+    recoveryStore: a,
+    rpcUrl: "http://fixture.invalid",
+    localWork: false,
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (body.action === "receivable" && firstRead) {
+        firstRead = false;
+        readStarted();
+        await readGate;
+      }
+      return strictFetch(url, init);
+    },
+  });
+  const senderWallet = createNanoWallet({
+    secretKey: secret,
+    recoveryStore: b,
+    rpcUrl: "http://fixture.invalid",
+    localWork: false,
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (body.action === "process" && body.subtype === "send") {
+        sendStarted();
+        await sendGate;
+      }
+      return strictFetch(url, init);
+    },
+  });
+  const pocket = receiver.ops.pocket();
+  await reading;
+  const sending = senderWallet.ops.transferId(
+    "other-process-send",
+    payer,
+    "100",
+  );
+  sending.catch(() => {});
+  await publishing;
+  assert.equal(b.getSend("other-process-send").state, "submitted");
+  try {
+    releaseRead();
+    await pocket;
+    assert.equal(
+      competingReceives,
+      0,
+      "housekeeping must not publish while another process owns the account",
+    );
+    assert.equal(receivePublishes, 0);
+    releaseSend();
+    await sending;
+    assert.equal(b.getSend("other-process-send").state, "completed");
+    await receiver.ops.pocket();
+    assert.equal(
+      receivePublishes,
+      1,
+      "the deferred receive can run after the send completes",
+    );
+  } finally {
+    releaseRead();
+    releaseSend();
+    await Promise.allSettled([pocket, sending]);
+  }
+});
+
+test("a workflow receipt cannot claim change was returned before the queued send is confirmed", async (t) => {
+  const f = await fixture(t),
+    store = f.open(),
+    rpc = fakeRpc(),
+    original = rpc.fetch;
+  let release;
+  const processGate = new Promise((r) => {
+    release = r;
+  });
+  rpc.fetch = async (url, init) => {
+    if (JSON.parse(init.body).action === "process") await processGate;
+    return original(url, init);
+  };
+  const first = gateFixture(store, rpc);
+  const x = (await first.wrapped.callTool({ name: "poster", arguments: {} }))
+    .structuredContent.x402;
+  rpc.state.receivable["7".repeat(64)] = { amount: x.amountRaw, source: payer };
+  try {
+    const result = await first.wrapped.callTool({
+      name: "poster",
+      arguments: { _payment_id: x.paymentId },
+    });
+    const receipt = result.content.at(-1).text;
+    assert.doesNotMatch(receipt, /change returned to your wallet/);
+    assert.match(receipt, /change queued for return/);
+  } finally {
+    release();
+    await until(() => store.load(`gate:${account}`).data.owed.length === 0);
+    first.gate.stopWatching();
+  }
+});
+
+test("account-slot generations fence a stale preparation after release and reacquisition", async (t) => {
+  const f = await fixture(t),
+    store = f.open();
+  const old = store.beginSend("same-operation", binding);
+  store.releaseUnsigned("same-operation", old.epoch);
+  const receiveCycle = store.beginSend("receive-cycle", {
+    account,
+    to: "F".repeat(64),
+    amountRaw: "1000",
+  });
+  store.releaseUnsigned("receive-cycle", receiveCycle.epoch);
+  const fresh = store.beginSend("same-operation", binding);
+  assert.ok(fresh.epoch > old.epoch);
+  store.releaseUnsigned("same-operation", old.epoch);
+  assert.equal(
+    store.activeSend(account).epoch,
+    fresh.epoch,
+    "a stale callback cannot unlock the new generation",
+  );
+  assert.throws(
+    () =>
+      store.submitted("same-operation", { ...candidate(), epoch: old.epoch }),
+    /ACCOUNT_WRITER_FENCED/,
+  );
+  assert.equal(store.getSend("same-operation").state, "intent");
+  let publishes = 0;
+  const c = candidate(payer, "100", "B".repeat(64));
+  const run = sender(store, {
+    prepare: async () => c,
+    publish: async () => {
+      publishes++;
+    },
+    lookup: async () => confirmed(c),
+  });
+  assert.equal(await run.transfer("same-operation", payer, "100"), c.hash);
+  assert.equal(publishes, 1);
+});
+
+test("two receive workers publish one committed winner under the shared account slot", async (t) => {
+  const { createDurableReceiver } = await import(
+    "../src/payments/durable-send.mjs"
+  );
+  const f = await fixture(t),
+    a = f.open(),
+    b = f.open(),
+    sourceHash = "F".repeat(64);
+  const c = createBlock(secret, {
+    previous: frontier,
+    representative: account,
+    balance: (balance + 1000n).toString(),
+    link: sourceHash,
+    work: "0".repeat(16),
+  });
+  c.block.account = account;
+  delete c.block.link_as_account;
+  let ready = 0,
+    release,
+    publishes = 0;
+  const both = new Promise((r) => {
+    release = r;
+  });
+  const options = {
+    account,
+    publicKey,
+    crypto: { checkAddress, hashBlock, verifyBlock, deriveAddress },
+    prepare: async () => {
+      if (++ready === 2) release();
+      await both;
+      return { ...c, previousBalance: balance.toString() };
+    },
+    publish: async () => {
+      publishes++;
+      assert.equal(a.activeSend(account).id, "shared-receive");
+    },
+    lookup: async () => ({
+      confirmed: "true",
+      amount: "1000",
+      contents: c.block,
+    }),
+  };
+  const first = createDurableReceiver({ ...options, store: a }),
+    second = createDurableReceiver({ ...options, store: b });
+  const results = await Promise.all([
+    first.receive("shared-receive", sourceHash.toLowerCase(), "1000"),
+    second.receive("shared-receive", sourceHash, "1000"),
+  ]);
+  assert.deepEqual(results, [c.hash, c.hash]);
+  assert.equal(publishes, 1);
+  assert.equal(a.activeSend(account), null);
+});
+
+test("an uncertain receive survives restart and blocks sends until read-only confirmation succeeds", async (t) => {
+  const f = await fixture(t),
+    a = f.open(),
+    b = f.open(),
+    rpc = fakeRpc(),
+    original = rpc.fetch;
+  rpc.state.receivable["6".repeat(64)] = { amount: "1000", source: payer };
+  let blockProof = true;
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (body.action === "process" && body.subtype === "receive") {
+      await original(url, init);
+      throw Error("lost receive reply");
+    }
+    if (body.action === "block_info" && blockProof)
+      throw Error("receive proof unavailable");
+    return original(url, init);
+  };
+  const first = createNanoWallet({
+    secretKey: secret,
+    recoveryStore: a,
+    fetch,
+    rpcUrl: "http://fixture.invalid",
+    localWork: false,
+  });
+  await first.ops.pocket();
+  const pending = a.activeSend(account);
+  assert.match(pending.id, /^receive:/);
+  assert.equal(pending.state, "uncertain");
+  assert.equal(rpc.state.publishes, 1);
+  a.close();
+  const second = createNanoWallet({
+    secretKey: secret,
+    recoveryStore: b,
+    fetch,
+    rpcUrl: "http://fixture.invalid",
+    localWork: false,
+  });
+  await assert.rejects(
+    () => second.ops.transferId("after-receive", payer, "100"),
+    /RECONCILIATION/,
+  );
+  assert.equal(rpc.state.publishes, 1);
+  assert.equal(b.getSend("after-receive"), null);
+  blockProof = false;
+  await second.ops.transferId("after-receive", payer, "100");
+  assert.equal(rpc.state.publishes, 2);
+  assert.equal(b.getSend(pending.id).state, "completed");
+  assert.equal(b.getSend("after-receive").state, "completed");
+});
+
+test("short-balance funding commits a receive before claiming and publishing its send", async (t) => {
+  const f = await fixture(t),
+    store = f.open(),
+    rpc = fakeRpc(),
+    original = rpc.fetch;
+  rpc.state.balance = 10n;
+  rpc.state.receivable["5".repeat(64)] = { amount: "1000", source: payer };
+  const order = [];
+  const wallet = createNanoWallet({
+    secretKey: secret,
+    recoveryStore: store,
+    rpcUrl: "http://fixture.invalid",
+    localWork: false,
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (body.action === "process") {
+        assert.equal(body.block.previous, rpc.state.frontier);
+        order.push(body.subtype);
+        assert.equal(
+          store.activeSend(account).id,
+          body.subtype === "receive"
+            ? `receive:${account}:${"5".repeat(64)}`
+            : "funded-send",
+        );
+      }
+      return original(url, init);
+    },
+  });
+  await wallet.ops.transferId("funded-send", payer, "500");
+  assert.deepEqual(order, ["receive", "send"]);
+  assert.equal(rpc.state.balance, 510n);
+  assert.equal(store.activeSend(account), null);
+});
+
+test("the unfenced schema-1 candidate is refused without modifying its financial records", async (t) => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const f = await fixture(t),
+    store = f.open();
+  store.beginSend("preserved", binding);
+  store.close();
+  const db = new DatabaseSync(f.path);
+  db.exec("UPDATE recovery_schema SET version=1");
+  db.close();
+  const before = await readFile(f.path);
+  assert.throws(() => f.open(), /RECOVERY_SCHEMA_UNSUPPORTED/);
+  assert.deepEqual(await readFile(f.path), before);
+  const read = new DatabaseSync(f.path, { readOnly: true });
+  assert.equal(read.prepare("SELECT id FROM sends").get().id, "preserved");
+  read.close();
+});
+
+test("a missing durable account slot cannot silently admit a new writer over an unresolved block", async (t) => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const f = await fixture(t),
+    store = f.open();
+  const lease = store.beginSend("preserved", binding);
+  store.submitted("preserved", { ...candidate(), epoch: lease.epoch });
+  store.close();
+  const db = new DatabaseSync(f.path);
+  db.exec("DELETE FROM active_send");
+  db.close();
+  const before = await readFile(f.path);
+  assert.throws(() => f.open(), /RECOVERY_ACCOUNT_STATE_INVALID/);
+  assert.deepEqual(await readFile(f.path), before);
+  const read = new DatabaseSync(f.path, { readOnly: true });
+  assert.equal(
+    read.prepare("SELECT state FROM sends").get().state,
+    "submitted",
+  );
+  read.close();
 });

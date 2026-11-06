@@ -643,8 +643,8 @@ test("receipt change is the exact on-chain raw, not an 8-decimal truncation", as
   const truncated = rawToXno(change.amountRaw);
   assert.notEqual(exact, truncated, "fixture must carry digits past 8 decimals");
   const text = res.content.at(-1).text;
-  assert.match(text, new RegExp(`; ${exact.replace(/\./g, "\\.")} XNO change returned`));
-  assert.doesNotMatch(text, new RegExp(`; ${truncated.replace(/\./g, "\\.")} XNO change returned`));
+  assert.match(text, new RegExp(`; ${exact.replace(/\./g, "\\.")} XNO change queued for return`));
+  assert.doesNotMatch(text, new RegExp(`; ${truncated.replace(/\./g, "\\.")} XNO change queued for return`));
 });
 
 test("parseUsdNano is string-exact, handles exponents, truncates below 1e-9 USD", () => {
@@ -1134,7 +1134,7 @@ test("a re-run after restart reports the FIRST run's settled cost and change, no
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.match(first.content.at(-1).text, /actual cost \$0\.02/);
-  assert.match(first.content.at(-1).text, /change returned to your wallet/);
+  assert.match(first.content.at(-1).text, /change queued for return to your wallet/);
   await untilState(stateFile, "the first run's settlement to persist",
     (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt; });
 
@@ -1148,7 +1148,7 @@ test("a re-run after restart reports the FIRST run's settled cost and change, no
   assert.equal(registry2.callCount(), 1, "the text quote re-runs after restart");
   const receipt = replay.content.at(-1).text;
   assert.match(receipt, /actual cost \$0\.02/, "receipt reports the FIRST run's cost");
-  assert.match(receipt, /change returned to your wallet/, "receipt reports the FIRST run's change");
+  assert.match(receipt, /change queued for return to your wallet/, "receipt reports the FIRST run's change");
   assert.doesNotMatch(receipt, /whole deposit is being returned/, "must NOT claim a full refund off the second run's missing cost");
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(chain2.state.transfers.filter((t) => t.describe === "change:").length, 0, "no money moves on the re-run");
