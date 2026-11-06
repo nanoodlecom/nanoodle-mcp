@@ -44,7 +44,7 @@ This patch repairs concrete request, privacy, retention and recovery transitions
 
 ## Reproduced repairs
 
-`tests/state-audit.test.mjs` adds eleven focused cases. The first five were executed against the original implementation and all failed; a separate original-origin probe also failed. Repaired cases cover:
+`tests/state-audit.test.mjs` adds eleven focused cases. All eleven were reproduced against the original implementation: ten failed in a combined baseline run, and the EOF case failed after its assertion was tightened to wait for the actual end event. Repaired cases cover:
 
 1. Payment state/ledger/staging exposure through the public artifact endpoint, including symlink escape.
 2. Idless or invalid-ID `tools/call` executing side effects.
@@ -90,4 +90,4 @@ Inspected open work without merging, publishing or changing its branches:
 
 Other existing workflow/content PRs were inventoried and left unchanged. Direct peer coordination could not be established: task-list/history bridge reads did not return, and this task's Babel native-session helper reported that its startup mailbox was not prepared. No enrollment/authentication flow was restarted. This is a coordination blocker for the larger shared-authority redesign, not a reason to overwrite other owners' drafts.
 
-Before release, read-only checks verified `https://mcp.nanoodle.com/version` at `dbbb1bd`, active service `/srv/nanoodle-mcp/app`, output state outside the checkout at `/srv/nanoodle-mcp/out`, and valid v2 restore records. Aggregate state: 10 already-settled paid text records, 4 refunded, 3 expired, 0 owed, 0 unfinished consumed, 0 paid-unsettled. No customer arguments, output bodies, account identifiers or payment amounts were retrieved for release checks. The deploy command fast-forwards the app and restarts its service. Rollback should revert the patch on main and redeploy while preserving `/srv/nanoodle-mcp/out`; never delete or reset the state file, and never bypass the new fail-closed reader by starting an empty gate.
+Before release, read-only checks verified `https://mcp.nanoodle.com/version` at `dbbb1bd`, active service `/srv/nanoodle-mcp/app`, output state outside the checkout at `/srv/nanoodle-mcp/out`, and valid v2 restore records. Aggregate state: 10 already-settled paid text records, 4 refunded, 3 expired, 0 owed, 0 unfinished consumed, 0 paid-unsettled. No customer arguments, output bodies, account identifiers or payment amounts were returned in release-check output. The deploy command fast-forwards the app and restarts its service. Rollback should revert the patch on main and redeploy while preserving `/srv/nanoodle-mcp/out`; never delete or reset the state file, and never bypass the new fail-closed reader by starting an empty gate.

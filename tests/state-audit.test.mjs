@@ -295,8 +295,10 @@ test('stdio EOF drains an accepted workflow and writes its result before closing
       callTool: async () => { started = true; await running; return { content: [{ type: 'text', text: 'delivered' }] }; },
       onClose: () => { closed = true; resolve(); } });
   });
+  const ended = new Promise((resolve) => input.once('end', resolve));
   input.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params }) + '\n');
-  await eventually(() => started);
+  await ended;
+  assert.equal(started, true);
   assert.equal(closed, false, 'EOF must not exit while an accepted tool is still running');
   finish();
   await done;
