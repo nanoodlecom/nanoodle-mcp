@@ -29,8 +29,11 @@ import {
   deriveAddress,
   derivePublicKey,
   deriveSecretKey,
+  hashBlock,
+  verifyBlock,
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
+import { createDurableSender, createDurableReceiver } from "./payments/durable-send.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -107,7 +110,7 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, recoveryStore = null, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
@@ -144,7 +147,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify(body),
-        signal,
+        signal: signal || (recoveryStore ? AbortSignal.timeout(30_000) : undefined),
       });
     } catch (e) {
       throw new Error(`Nano RPC ${redactUrl(base)} unreachable (action ${body.action}): ${e.message}`);
@@ -202,7 +205,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   }
 
   async function accountState() {
-    const info = await rpc({ action: "account_info", account: address, representative: "true" }).catch((e) => {
+    const info = await rpc({ action: "account_info", account: address, representative: "true", ...(recoveryStore ? {include_confirmed:"true"} : {}) }).catch((e) => {
       if (/Account not found/i.test(e.message)) {
         throw new Error(
           `wallet ${address} is empty or unopened — fund it with a little XNO first ` +
@@ -210,6 +213,12 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       }
       throw e;
     });
+    if(recoveryStore) {
+      if(!/^[A-F0-9]{64}$/i.test(info.confirmed_frontier)||!/^\d+$/.test(info.confirmed_balance)||!checkAddress(info.confirmed_representative)) {
+        throw new Error("confirmed wallet state unavailable; refusing to prepare a send");
+      }
+      return {frontier:info.confirmed_frontier,balance:BigInt(info.confirmed_balance),representative:info.confirmed_representative};
+    }
     return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative };
   }
 
@@ -325,6 +334,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
    * receivable for the next pass.
    */
   async function pocketReceivables(fresh = false, stopEarly = null) {
+    const active=recoveryStore?.activeSend(address);
+    if(active && !isReceiveOperation(active)) throw new Error("wallet send requires reconciliation before receiving more blocks");
+    if(active)await reconcileActiveReceive();
     let state = await currentState(fresh);
     let blocks;
     try {
@@ -340,6 +352,14 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       if (!/^[0-9A-F]{64}$/i.test(sendHash) || !/^\d+$/.test(String(amountRaw || ""))) continue;
       if (pocketed > 0 && stopEarly && stopEarly(state)) break;
       try {
+        if(durableReceiver) {
+          const sourceHash=sendHash.toUpperCase();
+          const id=`receive:${address}:${sourceHash}`;
+          await durableReceiver.receive(id,sourceHash,String(amountRaw));
+          chain=state=confirmedOperationState(id);
+          pocketed++;
+          continue;
+        }
         const work = await workFor(state.frontier, RECEIVE_WORK_THRESHOLD);
         const { hash, block } = createBlock(secretKey, {
           work,
@@ -447,6 +467,119 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     }
   }
 
+  const durableSender = recoveryStore
+    ? createDurableSender({
+        store: recoveryStore,
+        account: address,
+        publicKey,
+        crypto: { checkAddress, hashBlock, verifyBlock, deriveAddress },
+        async prepare(to, amountRaw) {
+          const amount = BigInt(amountRaw);
+          const state = await currentState(true);
+          if (amount > state.balance)
+            throw new Error("insufficient confirmed wallet balance");
+          const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
+          const { hash, block } = createBlock(secretKey, {
+            work,
+            previous: state.frontier,
+            representative: state.representative,
+            balance: (state.balance - amount).toString(),
+            link: to,
+          });
+          block.account = address;
+          block.link_as_account = to;
+          return { hash, block, previousBalance: state.balance.toString() };
+        },
+        async publish(block) {
+          chain = null;
+          return rpc({
+            action: "process",
+            json_block: "true",
+            subtype: "send",
+            block,
+          });
+        },
+        lookup: (hash) => rpc({ action: "block_info", hash, json_block: "true" }),
+      })
+    : null;
+
+  const durableReceiver = recoveryStore
+    ? createDurableReceiver({
+        store: recoveryStore,
+        account: address,
+        publicKey,
+        crypto: { checkAddress, hashBlock, verifyBlock, deriveAddress },
+        async prepare(sourceHash, amountRaw) {
+          const state = await currentState(true);
+          const work = await workFor(state.frontier, RECEIVE_WORK_THRESHOLD);
+          const { hash, block } = createBlock(secretKey, {
+            work,
+            previous: state.frontier,
+            representative: state.representative,
+            balance: (state.balance + BigInt(amountRaw)).toString(),
+            link: sourceHash,
+          });
+          block.account = address;
+          delete block.link_as_account;
+          return { hash, block, previousBalance: state.balance.toString() };
+        },
+        async publish(block) {
+          chain = null;
+          return rpc({
+            action: "process",
+            json_block: "true",
+            subtype: "receive",
+            block,
+          });
+        },
+        lookup: (hash) => rpc({ action: "block_info", hash, json_block: "true" }),
+      })
+    : null;
+
+  function isReceiveOperation(operation) {
+    return (
+      operation?.id?.startsWith(`receive:${address}:`) &&
+      /^[A-F0-9]{64}$/i.test(operation.to)
+    );
+  }
+  function confirmedOperationState(id) {
+    const operation = recoveryStore.getSend(id);
+    if (operation?.state !== "completed")
+      throw new Error("account operation still requires confirmation");
+    return {
+      frontier: operation.hash,
+      balance: BigInt(operation.block.balance),
+      representative: operation.block.representative,
+    };
+  }
+  async function reconcileActiveReceive() {
+    const operation = recoveryStore?.activeSend(address);
+    if (!isReceiveOperation(operation)) return;
+    if (operation.state === "intent")
+      await durableReceiver.receive(
+        operation.id,
+        operation.to,
+        operation.amountRaw,
+      );
+    else await durableReceiver.reconcile(operation.id);
+    chain = confirmedOperationState(operation.id);
+  }
+  async function sendDurable(id, to, amountRaw) {
+    const operation = recoveryStore.getSend(id);
+    if (operation && operation.state !== "intent")
+      return durableSender.transfer(id, to, amountRaw);
+    await reconcileActiveReceive();
+    // Fund the send through independently journaled receives before claiming
+    // its account slot. Once claimed, preparation may only build this send.
+    if (!recoveryStore.activeSend(address)) {
+      const state = await currentState(true);
+      const amount = BigInt(amountRaw);
+      if (amount > state.balance)
+        await pocketReceivables(true, (s) => amount <= s.balance);
+    }
+    return durableSender.transfer(id, to, amountRaw);
+  }
+
   async function paySend(invoice) {
     if (!/^\d+$/.test(String(invoice.amountRaw || ""))) {
       throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
@@ -462,6 +595,11 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     }
 
     const amount = BigInt(invoice.amountRaw);
+    if(durableSender) {
+      if(!invoice.paymentId || typeof invoice.completeUrl!=="string")throw new Error("durable payment needs an invoice id and provider URL");
+      const origin=new URL(invoice.completeUrl).origin;
+      return sendDurable(`invoice:${origin}:${invoice.paymentId}`,invoice.payTo,amount.toString());
+    }
     // Hot path: send straight off the locally-tracked state. Receivables are
     // only pulled in when the bare balance can't cover the invoice (refunds
     // and deposits waiting to be pocketed usually can) — and only until it can:
@@ -536,7 +674,12 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
      */
     ops: {
       rpc,
+      ...(durableSender ? {
+        transferId:(id,to,amountRaw)=>enqueue(()=>sendDurable(id,to,amountRaw)),
+        reconcileTransfer:id=>enqueue(()=>durableSender.reconcile(id)),
+      } : {}),
       transfer: (to, amountRaw, describe = "sent") => enqueue(async () => {
+        if(recoveryStore)throw new Error("durable wallet transfers require a stable operation id");
         if (!checkAddress(String(to || ""))) throw new Error(`not a valid Nano address: ${to}`);
         // sweep first (a refund's source funds usually ARE a pending receivable),
         // but yield to a waiting payment once this send itself is covered
