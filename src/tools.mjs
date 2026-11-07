@@ -828,6 +828,33 @@ export function humanizeColdPin(graph, x402, log = () => {}) {
 }
 
 /**
+ * Served copy of a humanize-comment graph. /graph/<tool>.json is this text.
+ * When the file's x402.usd is below the cold ceiling, the served copy carries
+ * the ceiling and the rest of the file is unchanged. A pin at or above the
+ * ceiling is left byte for byte.
+ */
+export function humanizeGraphTextWithPin(text, usd) {
+  const pin = Number(usd).toFixed(8);
+  if (!Number.isFinite(Number(pin)) || !(Number(pin) > 0)) return text;
+  let replaced = false;
+  const next = text.replace(
+    /("x402"\s*:\s*\{[^{}]*"usd"\s*:\s*)(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/,
+    (_all, prefix) => {
+      replaced = true;
+      return prefix + pin;
+    },
+  );
+  if (!replaced) return text;
+  try {
+    const parsed = JSON.parse(next);
+    if (!parsed || !parsed.x402 || Number(parsed.x402.usd).toFixed(8) !== pin) return text;
+  } catch {
+    return text;
+  }
+  return next;
+}
+
+/**
  * A humanize-comment quote. When this request cannot be priced (a model
  * missing from the price table, or a throw), it falls back to the worst-case
  * ceiling, never to a possibly stale graph pin. With no computable ceiling it
@@ -905,14 +932,25 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         costs[name] = costs[`${name}-noodle-graph`];
         delete costs[`${name}-noodle-graph`];
       }
-      if (name === HUMANIZE_TOOL) x402 = humanizeColdPin(wf.graph, x402, log);
+      if (name === HUMANIZE_TOOL) {
+        const filePin = x402 ? knownUsd(x402.usd) : null;
+        x402 = humanizeColdPin(wf.graph, x402, log);
+        // Quotes already use the ceiling. The download must too, or a stale
+        // file pin (awesome-noodles before 4a3e48a was 0.01963166) is what
+        // /graph/humanize-comment.json keeps serving.
+        if (x402 && Number.isFinite(x402.usd) && x402.usd > 0) {
+          const cold = x402.usd.toFixed(8);
+          const file = filePin == null ? null : filePin.toFixed(8);
+          if (file == null || Number(file) < Number(cold)) text = humanizeGraphTextWithPin(text, x402.usd);
+        }
+      }
       tools.push({
         name,
         file,
         dir,
         wf,
         x402,
-        rawText: text,               // exact served bytes — /graph/<name>.json and the editor link both come from these
+        rawText: text,               // served bytes — /graph/<name>.json and the editor link both come from these
         editorUrl: editorShareUrl(text),
         // Description pieces as data — the landing page lays them out as a card
         // instead of re-parsing the one-line description.
