@@ -2,7 +2,7 @@
   "name": "nanoodle-mcp",
   "version": "0.6.0",
   "mcpName": "io.github.nanoodlecom/nanoodle-mcp",
-  "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK or accountless x402 (pay per call in Nano), runs on the NanoGPT API",
+  "description": "MCP server (stdio and HTTP) that runs nanoodle workflow graphs, saved or composed by the agent, as tools on the NanoGPT API: BYOK, pay per call in Nano (x402), or pay in native NEAR with automatic refunds",
   "type": "module",
   "bin": {
     "nanoodle-mcp": "bin/nanoodle-mcp.mjs"
@@ -11,7 +11,8 @@
     "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "simulate:near": "node scripts/near-simulate.mjs"
   },
   "files": [
     "src",
@@ -40,7 +41,12 @@
     "x402",
     "nano",
     "accountless",
-    "micropayments"
+    "micropayments",
+    "near",
+    "near-protocol",
+    "agent-payments",
+    "pay-per-call",
+    "custom-workflows"
   ],
   "license": "MIT",
   "author": "255BITS",

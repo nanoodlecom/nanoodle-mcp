@@ -4,11 +4,17 @@
  *
  *   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--out-ttl h] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
  *   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
+ *   nanoodle-mcp --graphs <dir> --serve [host:]port --near-merchant <account> [--near-network testnet|mainnet]
+ *                [--near-rpc url] [--near-key-file path] [--near-usd n] [--near-max-deposit-usd n]
  *
  * Default transport is MCP over stdio. --serve speaks MCP over streamable HTTP
  * instead — host a directory of noodles as a service — and --charge-usd puts an
  * x402 payment gate in front of every call: callers pay in Nano (XNO), no
  * accounts anywhere, refunds on failed runs, optional per-graph author payouts.
+ * --near-merchant instead sells runs for native NEAR, custom workflows included:
+ * a quote, one transfer of the exact deposit, one run, an automatic refund of
+ * whatever the run did not use (docs/near-payments.md). The refund key comes from
+ * --near-key-file or NEAR_PRIVATE_KEY (env or --env-file) — never from argv.
  *
  * Every *.json noodle-graph save in a --graphs dir becomes one MCP tool. --graphs
  * may be repeated to serve several dirs (e.g. a per-project ./noodles plus a shared
@@ -47,11 +53,15 @@ import { startSweeper } from "../src/sweep.mjs";
  */
 const loadWalletMod = () => import("../src/wallet.mjs");
 const loadGateMod = () => import("../src/gate.mjs");
+// The NEAR rail shares pure helpers with the Nano gate module, so it loads on demand too.
+const loadNearMods = () => Promise.all([import("../src/near/index.mjs"), import("../src/near-gate.mjs")]);
 
 function usage(code = 1) {
   console.error(`usage:
   nanoodle-mcp --graphs <dir> [--graphs <dir> …] [--out dir] [--out-ttl h] [--key K] [--env-file path] [--nano-rpc url] [--max-usd n]
   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
+  nanoodle-mcp --graphs <dir> --serve [host:]port --near-merchant acct [--near-network n] [--near-rpc u]
+               [--near-key-file p] [--near-usd n] [--near-max-deposit-usd n] [--public-url u]
   nanoodle-mcp --version
 
   --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required;
@@ -62,7 +72,7 @@ function usage(code = 1) {
                  customers' generations), off in stdio mode (local files are yours to keep).
                  Only media artifacts are ever deleted — never costs.json/gate-state.json/usage.jsonl
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY from a .env-style file
+  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY / NEAR_PRIVATE_KEY from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
   --nano-rpc u   Nano RPC node(s) for wallet reads/publishes, comma-separated,
                  tried in order with failover so one throttling node can't end a
@@ -100,6 +110,24 @@ Serve mode (host your noodles over HTTP instead of stdio):
   --xno-usd n      static XNO/USD rate override (default: NanoGPT's own x402 invoices
                    are the rate oracle — the rate we pay is the rate we charge; cached 60s)
 
+Paid in NEAR (custom workflows too; see docs/near-payments.md):
+  --near-merchant a  sell tool calls for native NEAR, paid to account a (NEAR_MERCHANT).
+                     Callers get a quote, send ONE transfer of the exact deposit, and call
+                     again with _payment_id/_payment_tx/_payment_sender; the run settles at
+                     actual model cost + 20% service fee and the rest is refunded in NEAR.
+                     run_noodle runs callers' own graphs (allowlisted node types only);
+                     price_noodle and noodle_guide stay free. Requires --serve; not with
+                     --charge-usd. NanoGPT is still paid by your API key or Nano wallet.
+  --near-network n   testnet (default) or mainnet (NEAR_NETWORK)
+  --near-rpc u       NEAR JSON-RPC endpoint you trust for finality (NEAR_RPC_URL;
+                     default fastnear's public RPC for the network)
+  --near-key-file p  near-cli credentials JSON for the merchant's full-access key, used
+                     to sign refunds; or NEAR_PRIVATE_KEY=ed25519:… in the env / --env-file.
+                     Never accepted on the command line, never logged
+  --near-usd n       static NEAR/USD rate (NEAR_USD) for tests and demos; default is
+                     CoinGecko's public price, cached 60s, quoting stops when it is stale
+  --near-max-deposit-usd n  refuse any call whose deposit would exceed $n (default 2)
+
 No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
 each call's HTTP 402 invoice is paid in Nano (XNO) from that wallet via x402.
 Use a dedicated wallet with a small balance — it doubles as your spend cap.
@@ -114,6 +142,7 @@ async function main() {
   const graphDirs = []; // --graphs is repeatable; order = precedence on name clashes
   let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null, outTtlFlag = null;
   let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null, noLocalWork = false;
+  let nearMerchantFlag = null, nearNetworkFlag = null, nearRpcFlag = null, nearKeyFile = null, nearUsdFlag = null, nearMaxDepositFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -139,6 +168,17 @@ async function main() {
     else if (a === "--nano-ws") nanoWsFlag = val("--nano-ws");
     else if (a === "--xno-usd") xnoUsdFlag = val("--xno-usd");
     else if (a === "--no-local-work") noLocalWork = true;
+    else if (a === "--near-merchant") nearMerchantFlag = val("--near-merchant");
+    else if (a === "--near-network") nearNetworkFlag = val("--near-network");
+    else if (a === "--near-rpc") nearRpcFlag = val("--near-rpc");
+    else if (a === "--near-key-file") nearKeyFile = val("--near-key-file");
+    else if (a === "--near-usd") nearUsdFlag = val("--near-usd");
+    else if (a === "--near-max-deposit-usd") nearMaxDepositFlag = val("--near-max-deposit-usd");
+    else if (a === "--near-key" || a === "--near-private-key") {
+      console.error(`${a} is not accepted: a key on the command line leaks via ps and shell history. ` +
+        "Use --near-key-file <near-cli credentials JSON> or NEAR_PRIVATE_KEY in the environment or --env-file.");
+      usage();
+    }
     else if (a === "--help" || a === "-h") usage(0);
     else if (a === "--version") {
       const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -169,6 +209,22 @@ async function main() {
   }
   if (chargeUsd != null && serveSpec === null) { console.error("--charge-usd only makes sense with --serve"); usage(); }
 
+  // NEAR mode: explicit operator config only (flags, or the NEAR_* environment).
+  const nearMerchant = nearMerchantFlag || process.env.NEAR_MERCHANT || null;
+  const nearMode = !!nearMerchant;
+  const nearNetwork = nearNetworkFlag || process.env.NEAR_NETWORK || "testnet";
+  const nearUsdText = nearUsdFlag ?? process.env.NEAR_USD ?? null;
+  const nearMaxDeposit = positive("--near-max-deposit-usd", nearMaxDepositFlag);
+  if (!nearMode && (nearNetworkFlag || nearRpcFlag || nearKeyFile || nearUsdFlag || nearMaxDepositFlag)) {
+    console.error("the --near-* options need --near-merchant <account> (or NEAR_MERCHANT)"); usage();
+  }
+  if (nearMode) {
+    if (serveSpec === null) { console.error("--near-merchant only makes sense with --serve (NEAR payments are for a hosted server)"); usage(); }
+    if (chargeUsd != null) { console.error("--near-merchant and --charge-usd are two payment rails; pick one"); usage(); }
+    if (nearNetwork !== "testnet" && nearNetwork !== "mainnet") { console.error(`--near-network must be testnet or mainnet, got "${nearNetwork}"`); usage(); }
+    if (nearUsdText != null) positive("--near-usd", nearUsdText);
+  }
+
   // --out-ttl: auto-delete generated media older than N hours (fractions allowed; 0 disables).
   // Default differs by mode: a hosted --serve server must not hoard customers' generations, so
   // it defaults to 24h; a local stdio user saved those files to their own disk on purpose, so
@@ -193,8 +249,8 @@ async function main() {
   let workUrl = workRpcFlag || process.env.NANO_WORK_URL || null;
   let workKey = process.env.NANO_WORK_KEY || null;
   let nanoWs = nanoWsFlag || process.env.NANO_WS_URL || null;
+  let envText = null;
   if (envFile) {
-    let envText;
     try { envText = await readFile(envFile, "utf8"); }
     catch (e) { console.error(`--env-file: cannot read ${envFile}: ${e.message}`); process.exit(1); }
     const entry = (name) => {
@@ -208,7 +264,7 @@ async function main() {
     if (!workRpcFlag) workUrl = entry("NANO_WORK_URL") ?? workUrl;
     workKey = entry("NANO_WORK_KEY") ?? workKey;
     if (!nanoWsFlag) nanoWs = entry("NANO_WS_URL") ?? nanoWs;
-    if (!fileKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined) {
+    if (!fileKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined && !(nearMode && /^\s*(?:export\s+)?NEAR_PRIVATE_KEY\s*=/m.test(envText))) {
       console.error(`--env-file: no NANOGPT_API_KEY, NANO_SEED, or NANO_PRIVATE_KEY entry in ${envFile}`);
       process.exit(1);
     }
@@ -242,6 +298,12 @@ async function main() {
     process.exit(1);
   }
 
+  if (nearMode && !apiKey && !wallet) {
+    console.error("nanoodle-mcp: --near-merchant needs a NanoGPT funding source to run the workflows it sells — " +
+      "NANOGPT_API_KEY (env, --key or --env-file) or a Nano wallet (NANO_SEED / NANO_PRIVATE_KEY)");
+    process.exit(1);
+  }
+
   const resolvedOut = resolve(outDir || "./nanoodle-out");
   const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");
   if (chargeUsd != null && serveHost === "0.0.0.0" && !publicUrlFlag) {
@@ -270,7 +332,8 @@ async function main() {
   for (const f of registry.failures) {
     console.error(`nanoodle-mcp: skipping ${label(f)}: ${f.reason}`);
   }
-  if (!registry.tools.length) {
+  // A NEAR-paid server sells run_noodle (custom workflows), so it may start with no saved graphs.
+  if (!registry.tools.length && !nearMode) {
     console.error(`nanoodle-mcp: no runnable graphs in ${dirList} — ` +
       (registry.failures.length
         ? "every .json file was skipped (reasons above)."
@@ -291,7 +354,7 @@ async function main() {
   // whatever the graph asked for. Charge mode gets this from its own hourly
   // estimate refresh below (same fetch, also priced), so only do it here.
   // Best-effort: no catalog just means no clamp, exactly as before.
-  if (chargeUsd == null) {
+  if (chargeUsd == null && !nearMode) {
     const catalogOpts = {
       baseUrl: process.env.NANOGPT_BASE_URL || undefined,
       log: (line) => console.error("nanoodle-mcp: " + line),
@@ -317,7 +380,9 @@ async function main() {
 
   console.error(`nanoodle-mcp ${pkg.version}: serving ${registry.tools.length} tool(s) from ${dirList}`);
   for (const t of registry.tools) console.error(`  - ${t.name} (${label(t)}): ${t.description}`);
-  if (serveSpec === null || chargeUsd == null) {
+  if (nearMode) {
+    console.error("  - run_noodle: custom workflows enabled (NEAR-paid, allowlisted nodes); price_noodle and noodle_guide are free");
+  } else if (serveSpec === null || chargeUsd == null) {
     console.error("  - run_noodle: runs any nanoodle share link on the fly (always available)");
   } else {
     console.error("  - run_noodle: disabled in charge mode (arbitrary share links can't be priced up front)");
@@ -364,7 +429,14 @@ async function main() {
   let callTool;
   let gate = null;
   let instructions;
-  if (chargeUsd != null) {
+  let paymentNote = null;
+  let nearInfo = null;
+  if (nearMode) {
+    ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = await startNearMode({
+      registry, merchant: nearMerchant, network: nearNetwork, rpcFlag: nearRpcFlag, keyFile: nearKeyFile,
+      envText, usdText: nearUsdText, maxDepositUsd: nearMaxDeposit, outDir: resolvedOut,
+    }));
+  } else if (chargeUsd != null) {
     usagePath = join(resolvedOut, "usage.jsonl");
     let usageChain = Promise.resolve();
     usageLog = (event, fields) => {
@@ -437,6 +509,7 @@ async function main() {
     callTool,
     instructions,
     gate,
+    paymentNote,
     toolInfo: registry.tools,
     costs: registry.costs,
     outDir: resolvedOut,
@@ -444,7 +517,9 @@ async function main() {
     log: (...a) => console.error(...a),
   });
   console.error(`nanoodle-mcp: MCP over HTTP on http://${serveHost}:${servePort}/mcp` +
-    (chargeUsd != null
+    (nearInfo
+      ? ` — paid in NEAR on ${nearInfo.network} to ${nearInfo.merchant}`
+      : chargeUsd != null
       ? ` — charging $${chargeUsd}/call in XNO to ${wallet.address}`
       : " — free (runs spend from this server's balance)"));
   console.error(`nanoodle-mcp: connect with: claude mcp add --transport http noodles ${publicBase}/mcp`);
@@ -453,4 +528,83 @@ async function main() {
   if (usagePath) console.error(`nanoodle-mcp: payments ledger: ${usagePath}`);
 }
 
+/**
+ * NEAR mode: check the RPC is on the configured network and holds the
+ * merchant's full-access key, load the refund signer (never logged), open the
+ * durable state, finish anything a previous run left in flight, and wrap the
+ * registry in the NEAR gate. Exits with a clear error on any misconfiguration.
+ */
+async function startNearMode({ registry, merchant, network, rpcFlag, keyFile, envText, usdText, maxDepositUsd, outDir }) {
+  const fail = (msg) => { console.error("nanoodle-mcp: " + msg); process.exit(1); };
+  const [near, { createNearGate }] = await loadNearMods();
+  if (!near.isNearAccountId(merchant)) fail(`--near-merchant: "${merchant}" is not a NEAR account id`);
+  const rpcUrl = rpcFlag || process.env.NEAR_RPC_URL || near.NEAR_NETWORKS[network].rpcUrl;
+  let signer;
+  try {
+    signer = await near.loadNearSigner({ accountId: merchant, keyFile, envFileText: envText, env: process.env });
+  } catch (e) { fail(`NEAR refund key: ${e.message}`); }
+  const rpc = near.createNearRpc({ url: rpcUrl });
+  let st;
+  try { st = await rpc.status(); } catch (e) { fail(`cannot reach the NEAR RPC at ${redactUrl(rpcUrl)}: ${e.message}`); }
+  if (st.chain_id !== network) fail(`--near-rpc ${redactUrl(rpcUrl)} is on "${st.chain_id}", not ${network}; point it at a ${network} RPC`);
+  let key;
+  try { key = await rpc.viewAccessKey({ accountId: merchant, publicKey: signer.publicKey }); } catch (e) {
+    fail(`the refund key ${signer.publicKey} is not an access key of ${merchant} on ${network} (${e.message})`);
+  }
+  if (key.permission !== "FullAccess") fail(`the refund key ${signer.publicKey} on ${merchant} is not a full-access key; refunds need one`);
+
+  const usagePath = join(outDir, "usage.jsonl");
+  let usageChain = Promise.resolve();
+  const usage = (event, fields) => {
+    const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
+    usageChain = usageChain
+      .then(() => mkdir(outDir, { recursive: true }))
+      .then(() => appendFile(usagePath, line))
+      .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
+  };
+  const log = (line) => console.error("nanoodle-mcp: " + line);
+
+  // Catalogs clamp payloads and price every quote; refreshed hourly as in charge mode.
+  const catalogBase = process.env.NANOGPT_BASE_URL || "https://nano-gpt.com";
+  const refresh = () => attachEstimates(registry, { baseUrl: catalogBase, log }).catch(() => {});
+  await refresh();
+  const timer = setInterval(refresh, 60 * 60 * 1000);
+  if (timer.unref) timer.unref();
+
+  let ledger;
+  try {
+    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant });
+  } catch (e) { fail(e.message); }
+  const rate = near.createNearUsdRate(usdText != null ? { staticUsd: String(usdText).trim() } : {});
+  const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log });
+  const gate = createNearGate({
+    merchantId: merchant, network, rpc, ledger, rate, refunder,
+    limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
+    baseUrl: catalogBase, log, usage,
+  });
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  await gate.resume(); // before serving: a run a previous process left in flight is refunded, never re-run
+
+  log(`NEAR mode on ${network}: merchant ${merchant} (${near.explorerAccountUrl(network, merchant)})`);
+  log(`NEAR RPC ${redactUrl(rpcUrl)}; NEAR/USD rate ${usdText != null ? `static ${usdText}` : "CoinGecko (60s cache, fails closed)"}; refund key ${signer.publicKey}`);
+
+  const instructions =
+    `Tools on this server are paid per call in native NEAR on ${network}; no account or API key is needed. ` +
+    "price_noodle (free) returns the itemized estimated cost, the 20% service fee, the deposit and the likely refund of any workflow; " +
+    "noodle_guide (free) explains how to compose a custom workflow graph for run_noodle. " +
+    "Calling a paid tool without payment returns a quote: send ONE native NEAR transfer of exactly payment.amountYocto to payment.payTo " +
+    "(one Transfer action, nothing else), then call the same tool again with identical arguments plus _payment_id, _payment_tx " +
+    "(the transaction hash) and _payment_sender (the account you paid from). " +
+    "The amount you send is a deposit, the most you can be charged; you will most likely pay the estimated cost plus the 20% service fee, " +
+    "and the rest is refunded to the paying account automatically after the run. If the run fails, the whole deposit is refunded. " +
+    "Repeating the paying call returns the stored result and never charges again. Quotes expire after 15 minutes.";
+  const paymentNote =
+    `Every call is paid in native NEAR on ${network}. A call without payment returns a quote with an exact deposit; ` +
+    `send one transfer of that amount to ${merchant} and call again with the transaction hash. You are charged the ` +
+    "actual model cost plus a 20% service fee, and the rest of the deposit is refunded automatically. price_noodle " +
+    "(free) shows the itemized estimate first; run_noodle also runs workflow graphs you compose yourself.";
+  return { listTools, callTool, instructions, paymentNote, nearInfo: { network, merchant }, usagePath };
+}
+
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
+

@@ -21,7 +21,8 @@ import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRe
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
-import { Workflow, MediaRef, mediaFromFile, decodeShareUrl, estimateGraphCost, graphModelKinds } from "nanoodle";
+import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
+import { readGraphArgs, checkGraphSafety, priceGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
 
 /**
  * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
@@ -518,40 +519,84 @@ function savedSample(wf) {
 
 let saveSeq = 0;
 
-/** Reserved name of the always-present share-link tool. */
+/** Reserved name of the always-present share-link / custom-graph tool. */
 const RUN_NOODLE_NAME = "run_noodle";
+/** Reserved names of the free design helpers listed next to run_noodle. */
+export const PRICE_NOODLE_NAME = "price_noodle";
+export const NOODLE_GUIDE_NAME = "noodle_guide";
+/** Model catalog kinds noodle_guide can list. */
+const GUIDE_KINDS = ["chat", "image", "video", "audio", "model3d"];
+
+/** `url` / `graph` / `inputs`: the arguments run_noodle and price_noodle share. */
+const graphArgProperties = () => ({
+  url: {
+    type: "string",
+    description:
+      "A nanoodle share link — a full URL (nanoodle.com/#g=…, /play.html#a=…, or a " +
+      "da.gd/TinyURL short link) or a bare #g=/#j=/#a= fragment. Pass url OR graph.",
+  },
+  graph: {
+    type: ["object", "string"],
+    description:
+      'A custom workflow graph you composed: { "nodes": [{ "id", "type", "name"?, "fields": {...} }], ' +
+      '"links": [{ "from": { "node", "port" }, "to": { "node", "port" } }] } (an object, or the same as a JSON string). ' +
+      "Call noodle_guide for the node types, ports and priced models. Pass url OR graph.",
+  },
+  inputs: {
+    type: "object",
+    description:
+      'Workflow inputs keyed by their friendly names — the same keys the graph would take, ' +
+      'e.g. { "Idea": "a lighthouse at dawn" }. Media inputs take a file path or https URL. ' +
+      "Omit to run the graph with its saved defaults.",
+    additionalProperties: { type: "string" },
+  },
+});
 
 /**
  * The one tool that isn't tied to a saved file: it takes any nanoodle share
- * link and runs it, so every share link on the internet is a callable tool.
+ * link, or a graph the caller composed, and runs it.
  */
 const runNoodleTool = (spendSource) => ({
   name: RUN_NOODLE_NAME,
   description:
-    "Run any nanoodle share link as a workflow: a nanoodle.com/#g=… workflow link, a " +
-    "nanoodle.com/play.html#a=… app link, or a da.gd/TinyURL short link to one. Pass the link " +
-    "as `url` and any workflow inputs as `inputs`. Runs on NanoGPT — every call spends real " +
+    "Run any nanoodle workflow: pass a share link as `url` (a nanoodle.com/#g=… workflow link, a " +
+    "nanoodle.com/play.html#a=… app link, or a da.gd/TinyURL short link to one) OR a custom " +
+    "workflow graph you composed as `graph`, plus any workflow inputs as `inputs`. Design with " +
+    "noodle_guide, check the estimated cost with price_noodle (free), then run it here. Runs on NanoGPT — every call spends real " +
     `credit from ${spendSource}. Direct share links decode locally; only fragment-less ` +
     "short links trigger a network read, and it carries no credentials.",
+  inputSchema: { type: "object", properties: graphArgProperties() },
+});
+
+/** Free: the itemized price of a graph, without running it or creating a quote. */
+const priceNoodleTool = () => ({
+  name: PRICE_NOODLE_NAME,
+  description:
+    "Free, never charged: price a workflow before you run it. Takes the same `url` OR `graph` " +
+    "and `inputs` as run_noodle and returns the estimated cost (itemized per paid node: node, " +
+    "model, basis, USD), the 20% service fee on the actual cost, the deposit a paid server would " +
+    "hold (the most a run can be charged), the likely refund, and every problem that would stop the " +
+    "graph from running; iterate until pricing.safety.ok is true. It never " +
+    "runs anything and creates no payment. Workflow: design with noodle_guide → price_noodle → run_noodle.",
+  inputSchema: { type: "object", properties: graphArgProperties() },
+});
+
+/** Free: how to author a graph, plus the priced models. */
+const noodleGuideTool = () => ({
+  name: NOODLE_GUIDE_NAME,
+  description:
+    "Free, never charged: how to write a custom nanoodle workflow graph for run_noodle — the node " +
+    "types this server runs (inputs, outputs, key fields), the wiring rules, a complete example " +
+    "graph, and the priced NanoGPT models with their unit prices (cheapest first). Filter with " +
+    "`kind` (chat, image, video, audio, model3d), `search` (model id substring) and `limit`. " +
+    "Then check the estimated cost with price_noodle before calling run_noodle.",
   inputSchema: {
     type: "object",
     properties: {
-      url: {
-        type: "string",
-        description:
-          "A nanoodle share link — a full URL (nanoodle.com/#g=…, /play.html#a=…, or a " +
-          "da.gd/TinyURL short link) or a bare #g=/#j=/#a= fragment.",
-      },
-      inputs: {
-        type: "object",
-        description:
-          'Workflow inputs keyed by their friendly names — the same keys the graph would take, ' +
-          'e.g. { "Text": "a lighthouse at dawn" }. Media inputs take a file path or https URL. ' +
-          "Omit to run the graph with its saved defaults.",
-        additionalProperties: { type: "string" },
-      },
+      kind: { type: "string", enum: GUIDE_KINDS, description: "Only list models of this kind." },
+      search: { type: "string", description: "Only list models whose id contains this text." },
+      limit: { type: "integer", minimum: 1, maximum: 50, description: "How many models to list (default 20)." },
     },
-    required: ["url"],
   },
 });
 
@@ -750,45 +795,175 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * or a run failure — throws a plain error the server surfaces as
  * an isError tool result, so the agent gets a readable message, never a crash.
  */
-async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }) {
-  const args = params.arguments == null ? {} : params.arguments;
+/**
+ * Everything run_noodle does before it runs: read `url` or `graph` and
+ * `inputs`, decode, load the catalogs, build the Workflow and resolve the
+ * inputs (a missing or unknown input throws ParamsError, → -32602). Nothing
+ * runs and nothing is billed. The NEAR gate calls this at quote time, so a
+ * call that could never run is refused before anyone pays.
+ *
+ * `read` is an already-read readGraphArgs() result, so a caller that has
+ * checked the graph first does not decode it twice.
+ * @returns {Promise<{ graph: object, workflowGraph: object, inputs: object, wf: Workflow, catalogs: object, source: string, url: string|null }>}
+ */
+export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs, allowShortLinks = true, read = null } = {}) {
+  if (args == null) args = {};
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
   }
-  if (typeof args.url !== "string" || !args.url.trim()) {
-    throw new ParamsError('run_noodle needs a "url" — a nanoodle share link (nanoodle.com/#g=…, /play.html#a=…, or a da.gd/TinyURL short link)');
-  }
-  const inputArgs = args.inputs == null ? {} : args.inputs;
-  if (typeof inputArgs !== "object" || Array.isArray(inputArgs)) {
-    throw new ParamsError('run_noodle "inputs" must be an object of workflow inputs, e.g. { "Text": "a lighthouse" }');
-  }
-
-  // Decode: direct #g=/#j=/#a= links are offline; only fragment-less short links
-  // fetch, and those are redirect-header reads with no credentials attached.
-  const decoded = await decodeShareUrl(args.url.trim(), { fetch: globalThis.fetch });
-  // The link is a stranger's graph, so the catalog matters MOST here: it's what
+  // Decode: direct #g=/#j=/#a= links and inline graphs are offline; only
+  // fragment-less short links fetch, and those are redirect-header reads with
+  // no credentials attached.
+  const r = read || await readGraphArgs(args, { allowShortLinks, fetch });
+  // The graph is a stranger's, so the catalog matters MOST here: it's what
   // clamps variations to the model's real max_output_images and refs to
   // max_input_images before anything is billed. Cached, timeout-bounded and
   // best-effort: a warm cache costs nothing, a cold one at most one round trip,
   // and a hanging or down endpoint delays the run by the fetch timeout once a
   // minute at worst (the failure marker covers the calls in between) before the
   // run proceeds unclamped.
-  const catalog = await fetchCatalogs(graphModelKinds(decoded.graph), {
+  const catalogs = await fetchCatalogs(graphModelKinds(r.graph), {
     baseUrl: baseUrl || undefined,
-    fetch: globalThis.fetch,
+    fetch,
     log,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so this link runs with whatever payload it asked for",
   });
-  const wf = new Workflow(decoded.graph, { apiKey, payment, baseUrl, quiet: true, catalog });
+  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs });
   if (wf.warnings.length) {
     // unknown node types: the graph decodes but run() would always refuse
-    throw new Error(`this share link can't run headlessly — ${wf.warnings.join("; ")}`);
+    throw new Error(`this ${r.source === "graph" ? "graph" : "share link"} can't run headlessly — ${wf.warnings.join("; ")}`);
   }
-  const inputs = await resolveInputs(wf, inputArgs, `run_noodle (${decoded.url})`);
+  const inputs = await resolveInputs(wf, r.inputs, `run_noodle (${r.source === "graph" ? "inline graph" : r.url})`);
+  return { graph: r.graph, workflowGraph: wf.graph, inputs, wf, catalogs, source: r.source, url: r.url };
+}
+
+async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }) {
+  const { wf, inputs } = await prepareRunNoodle(params.arguments, { apiKey, payment, baseUrl, log, catalogTimeoutMs, allowShortLinks: true });
   const { onProgress, notices } = runNotices(wf);
   const result = await wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
   return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices });
+}
+
+/**
+ * Inputs a graph would refuse at run time (unknown key, missing required
+ * input), as refusals — price_noodle reports them instead of throwing, so an
+ * agent sees every problem in one answer.
+ */
+function inputRefusals(workflowGraph, given) {
+  let wf;
+  try { wf = new Workflow(workflowGraph, { quiet: true }); } catch { return []; }
+  const keyed = keyedInputs(wf);
+  const known = new Set();
+  for (const { inp, safe } of keyed) { known.add(safe.toLowerCase()); known.add(inp.key.toLowerCase()); }
+  const out = [];
+  const seen = new Set();
+  for (const k of Object.keys(given || {})) {
+    const lk = String(k).trim().toLowerCase();
+    if (!known.has(lk)) {
+      out.push({ code: "BAD_INPUTS", message: `unknown input "${k}" — this graph's inputs: ${keyed.map(({ safe }) => `"${safe}"`).join(", ") || "(none)"}` });
+    }
+    seen.add(lk);
+  }
+  const missing = keyed.filter(({ inp, safe, optional, hasDef }) => !optional && !hasDef && !seen.has(inp.key.toLowerCase()) && !seen.has(safe.toLowerCase()));
+  if (missing.length) {
+    out.push({ code: "BAD_INPUTS", message: `missing required input${missing.length > 1 ? "s" : ""}: ${missing.map(({ safe }) => `"${safe}"`).join(", ")}` });
+  }
+  return out;
+}
+
+/**
+ * The work behind price_noodle, shared with the NEAR gate: read the graph,
+ * check it against the paid-server rules (report only), load the catalogs it
+ * needs and price it node by node. Never runs anything. Argument-shape errors
+ * throw GraphArgsError (-32602); everything else is reported, not thrown.
+ * @returns {Promise<{ read: object|null, safety: {ok, refusals}, pricing: object|null, catalogs: object }>}
+ */
+export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs, allowShortLinks = true, limits = DEFAULT_LIMITS } = {}) {
+  let read;
+  try {
+    read = await readGraphArgs(args == null ? {} : args, { allowShortLinks, fetch, limits });
+  } catch (e) {
+    if (e instanceof GraphRefusedError) return { read: null, safety: { ok: false, refusals: e.refusals }, pricing: null, catalogs: {} };
+    throw e;
+  }
+  const check = checkGraphSafety(read.graph, { inputs: read.inputs, limits });
+  const refusals = [...check.refusals];
+  if (!check.workflowGraph) return { read, safety: { ok: false, refusals }, pricing: null, catalogs: {} };
+  refusals.push(...inputRefusals(check.workflowGraph, read.inputs));
+  const catalogs = await fetchCatalogs(graphModelKinds(check.workflowGraph), {
+    baseUrl: baseUrl || undefined,
+    fetch,
+    log,
+    ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
+    consequence: ", so price_noodle cannot price those nodes",
+  });
+  const pricing = priceGraph(check.workflowGraph, catalogs, { inputs: read.inputs });
+  // What would stop a quote: live-priced models, unpriced nodes, a deposit over the cap.
+  refusals.push(...refusalsForQuote(pricing, { maxDepositUsd: { ...DEFAULT_LIMITS, ...(limits || {}) }.maxDepositUsd }));
+  return { read, safety: { ok: refusals.length === 0, refusals }, pricing, catalogs, workflowGraph: check.workflowGraph };
+}
+
+/**
+ * The price_noodle answer for a computePrice() result. `near` adds the NEAR
+ * figures (see pricingVocabulary); `note` is a leading line about this server.
+ */
+export function priceNoodleResult(computed, { near = null, note = null } = {}) {
+  const { safety, pricing } = computed;
+  if (!pricing) {
+    const lines = [
+      "This workflow cannot be read, so it cannot be priced or run as written:",
+      ...safety.refusals.map((r) => `- ${r.message}`),
+      "",
+      "Call noodle_guide for the graph format, the allowed node types and a complete example.",
+    ];
+    if (note) lines.unshift(note, "");
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      structuredContent: { pricing: null, safety: { ok: false, refusals: safety.refusals.map((r) => ({ ...r })) }, ...(note ? { note } : {}) },
+    };
+  }
+  const voc = pricingVocabulary(pricing, { near, safety });
+  return {
+    content: [{ type: "text", text: note ? `${note}\n\n${voc.text}` : voc.text }],
+    structuredContent: { ...voc.structured, ...(note ? { note } : {}) },
+  };
+}
+
+/** price_noodle on a free server: the operator pays, so the figures are what the run costs. */
+const FREE_PRICE_NOTE =
+  "This server is free to call: runs spend the operator's NanoGPT balance, so the estimated cost is what a run costs " +
+  "the operator and you are charged nothing. The deposit, refund and safety figures describe what a NEAR-paid " +
+  "nanoodle-mcp server would hold and refuse for this graph.";
+
+async function priceNoodle(params, { baseUrl, log, catalogTimeoutMs }) {
+  const computed = await computePrice(params.arguments, { baseUrl, log, catalogTimeoutMs, allowShortLinks: true });
+  return priceNoodleResult(computed, { note: FREE_PRICE_NOTE });
+}
+
+/**
+ * The work behind noodle_guide: validate the filters, load the catalogs for
+ * the kinds asked about, and build the authoring guide.
+ */
+export async function noodleGuide(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs } = {}) {
+  const a = args == null ? {} : args;
+  if (typeof a !== "object" || Array.isArray(a)) throw new ParamsError("tools/call arguments must be an object");
+  if (a.kind != null && !GUIDE_KINDS.includes(a.kind)) {
+    throw new ParamsError(`noodle_guide "kind" must be one of ${GUIDE_KINDS.join(", ")}`);
+  }
+  if (a.search != null && typeof a.search !== "string") throw new ParamsError('noodle_guide "search" must be a string');
+  if (a.limit != null && !(Number.isInteger(a.limit) && a.limit >= 1 && a.limit <= 50)) {
+    throw new ParamsError('noodle_guide "limit" must be an integer from 1 to 50');
+  }
+  const catalogs = await fetchCatalogs(a.kind ? [a.kind] : GUIDE_KINDS, {
+    baseUrl: baseUrl || undefined,
+    fetch,
+    log,
+    ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
+    consequence: ", so noodle_guide lists no models of that kind",
+  });
+  const g = authoringGuide({ catalogs, kind: a.kind || null, search: a.search || null, limit: a.limit || 20 });
+  return { content: [{ type: "text", text: g.text }], structuredContent: g.structured };
 }
 
 /**
@@ -865,7 +1040,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   // Shared across every dir, so the first-scanned occurrence of a name wins it.
   // Built-in tool names are reserved the same way as run_noodle: a graph file
   // that sanitizes to one of them is suffixed (-2), it does not replace the tool.
-  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [SUBNANO_TOOL, 1], [SFW_TOOL, 1]]);
+  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [PRICE_NOODLE_NAME, 1], [NOODLE_GUIDE_NAME, 1], [SUBNANO_TOOL, 1], [SFW_TOOL, 1]]);
 
   for (const dir of dirs) {
     let entries;
@@ -999,7 +1174,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     onToolsChanged: null,
 
     listTools() {
-      // run_noodle is always available, alongside one tool per saved graph.
+      // run_noodle (and its free design helpers price_noodle and noodle_guide)
+      // are always available, alongside one tool per saved graph.
       // pricedPerRequest / depositNote let the charge gate describe a deposit
       // that is quoted per call instead of a single pinned dollar figure.
       return [
@@ -1010,6 +1186,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           ...(t.pricedPerRequest ? { pricedPerRequest: true, depositNote: t.depositNote } : {}),
         })),
         runNoodleTool(spendSource),
+        priceNoodleTool(),
+        noodleGuideTool(),
       ];
     },
 
@@ -1045,7 +1223,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // run_noodle is callable on a free server, so it belongs in this list.
         // The paid gate never reaches here for an unknown name: it answers from
         // its own tools/list, which has already withdrawn run_noodle.
-        const available = [...tools.map((t) => t.name), RUN_NOODLE_NAME].join(", ");
+        const available = [...tools.map((t) => t.name), RUN_NOODLE_NAME, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME].join(", ");
         throw new ParamsError(`unknown tool "${params.name}" — available: ${available}`);
       }
       const args = params.arguments == null ? {} : params.arguments;
@@ -1061,10 +1239,20 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       return { tool, inputs };
     },
 
+    /**
+     * run_noodle's checks with this server's NanoGPT settings, without running
+     * (see prepareRunNoodle). The NEAR gate calls it at quote time.
+     */
+    prepareRunNoodle(args, opts = {}) {
+      return prepareRunNoodle(args, { apiKey, payment, baseUrl, log, catalogTimeoutMs, ...opts });
+    },
+
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
     async callTool(params) {
-      if (params != null && typeof params === "object" && !Array.isArray(params) && params.name === RUN_NOODLE_NAME) {
-        return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
+      if (params != null && typeof params === "object" && !Array.isArray(params)) {
+        if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
+        if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
+        if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
       }
       const { tool, inputs } = await registry.prepareCall(params);
       if (tool.builtin) {

@@ -14,7 +14,8 @@ anything else that speaks the [Model Context Protocol](https://modelcontextproto
 It speaks stdio to your own agent by default, or HTTP to everyone with
 [serve mode](#serve-mode--host-your-noodles-as-a-service---serve) — including
 [charging per call in Nano](#charging-per-call---charge-usd), so strangers'
-agents can pay to run your noodles with no account anywhere.
+agents can pay to run your noodles with no account anywhere — or
+[selling runs for native NEAR, custom workflows included](#pay-with-near--run-custom-workflows).
 
 No middleman server, no telemetry — and with [wallet mode](#wallet-mode--no-account-no-api-key-x402),
 no account either. The MCP implementation here is hand-rolled (stdio +
@@ -360,8 +361,9 @@ Nano has no payment memo, so each quote's amount carries a few raw of random
 dust — **the amount is the memo**. Quotes expire after 15 minutes; a payment
 that arrives late is bounced straight back, and **a run that fails after
 payment is refunded automatically**. Arguments are validated *before* a quote
-is issued (nobody pays for a typo), and `run_noodle` is withdrawn in charge
-mode — an arbitrary share link's cost can't be priced up front.
+is issued (nobody pays for a typo), and `run_noodle` is withdrawn in Nano charge
+mode; NEAR mode prices and sells it, custom graphs included — see
+[Pay with NEAR](#pay-with-near--run-custom-workflows).
 
 Pricing: `--charge-usd` sets the **ceiling** deposit, and the opening quote
 for a tool that has never run. Once a tool has run, its deposit tracks its
@@ -668,6 +670,262 @@ URL). It accepts `#g=`/`#j=` workflow links, `#a=` app links, and short links
 to one. Direct links decode locally; only fragment-less short links trigger a
 network read, and it carries no credentials. Like every other tool, a run
 **spends real money** and ends with a `cost: $X.XXXX` line.
+
+`run_noodle` also takes a workflow you composed yourself: pass the graph JSON as
+`graph` instead of `url`. Two free helpers sit next to it: `noodle_guide` explains
+the graph format, node types and priced models, and `price_noodle` returns the
+itemized estimated cost of a `graph` or `url` without running it.
+
+## Pay with NEAR / run custom workflows
+
+A server started with `--near-merchant` sells workflow runs for **native NEAR**,
+and it runs **workflows the caller composes itself**, not only the saved ones.
+An agent with a NEAR wallet can design a graph, see what it will cost before it
+commits, pay one transfer, get the result, and get the unused part of its deposit
+back in NEAR. Nobody needs an account or an API key. Testnet is the default;
+mainnet is a flag. The full design (verification rules, durable state, threat
+model) is in [docs/near-payments.md](docs/near-payments.md).
+
+> NEAR mode is in this repository and not yet in a published npm release. Run it
+> from a clone (`node bin/nanoodle-mcp.mjs …`, as below); `npx nanoodle-mcp`
+> installs the registry release, which has no NEAR mode yet.
+
+### Try it in one command (offline)
+
+```bash
+git clone https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp && npm install
+node scripts/near-simulate.mjs      # or: npm run simulate:near
+```
+
+| You do | You see |
+|---|---|
+| run the simulation | the real server binary starts in NEAR mode against a local NEAR chain stand-in and a local NanoGPT stand-in, with a throwaway merchant key |
+| step 2–4 | the tool list, `noodle_guide`, then `price_noodle` on a custom `text → llm → image` graph: the itemized estimate, in the words below |
+| step 5–7 | the quote, one transfer of exactly that amount, then the result with a receipt: charged `0.003102197802197802197803` NEAR, the rest refunded on chain |
+| step 8–15 | replay (no re-run, no re-refund), a reused transaction, an unsafe node, an unpriceable model, underpayment, a late payment, a failed run, and the server killed mid-run and mid-refund — each refused or refunded correctly |
+| step 16 | both balances, reconciled: deposits − refunds = what was charged, gas aside |
+
+It needs no network, keys or funds, and exits non-zero if any of its 35 checks fail.
+
+### How pricing works
+
+Every price uses these terms, in `price_noodle`, quotes, receipts and tool
+descriptions:
+
+| Term | Meaning |
+|---|---|
+| **estimated cost** | The model cost the run is expected to have, itemized per paid node (node, model, basis, USD), from NanoGPT's public catalog. Text steps are priced at their `maxTokens` and at the longest text that can reach them. |
+| **service fee** | 20% of the **actual** model cost. |
+| **likely charge** | Estimated cost + 20% service fee: what you will most likely pay. |
+| **deposit** | The most you can be charged. It is held up front and is the amount you send: the likely charge × 2 (× 1.25 when every model has a fixed price), rounded up to the next cent, minimum $0.01. |
+| **charged** | Actual model cost + 20% service fee, capped at the deposit. If the provider does not report the full cost of a run, the estimated cost is charged instead. |
+| **refund** | The deposit minus what was charged, sent back to the paying account automatically. Exact in yoctoNEAR. |
+| **rate** | The NEAR/USD rate used, with its source and time. A quote locks it; settlement uses the locked rate. |
+
+In `structuredContent.pricing`, a figure named after its term is `usd`
+(`estimatedCost.usd`, `likelyCharge.usd`, `deposit.usd`); a figure that is only
+known after the run is `likelyUsd` (`serviceFee.likelyUsd`, `refund.likelyUsd`).
+
+Each quote says, in one sentence, what you will most likely pay and that the
+rest comes back, and in another why the deposit is larger:
+
+> You will most likely pay about $0.0115 (0.003172 NEAR): the estimated cost plus a 20%
+> service fee. You send 0.008379 NEAR as a deposit; that is the most you can be charged,
+> even if the run costs more, and the rest is refunded to your account as soon as the run
+> finishes.
+>
+> Text, video and audio steps bill by what they actually produce, so the deposit holds
+> twice the likely charge as headroom, rounded up to the next cent ($0.03); image prices
+> are fixed.
+
+The worked example (`text → llm → image`, 1 NEAR = $3.64, illustrative catalog prices):
+
+| Step | USD | NEAR |
+|---|---|---|
+| Estimated cost, `LLM` (z-ai/glm-5.3-flash): up to 223 input and 2,000 output tokens | $0.000622 | |
+| Estimated cost, `Image` (flux-3 klein): one 1024×1024 image, fixed price | $0.009 | |
+| **Estimated cost** | **$0.00962** | |
+| Likely charge (estimated cost + 20% service fee) | $0.0115 | 0.003172 |
+| **Deposit** (likely charge × 2, rounded up to the cent) | **$0.03** | 0.008242 + dust 0.000137 = **0.008379** (≈ $0.0305) |
+| Actual model cost reported by NanoGPT after the run | $0.00941 | 0.002585164835164835164836 |
+| Service fee (20% of actual) | $0.001882 | 0.000517032967032967032967 |
+| **Charged** | **$0.011292** | **0.003102197802197802197803** |
+| **Refund** (deposit − charged) | **$0.0305 − $0.011292 ≈ $0.019208** | **0.005276802197802197802197** |
+
+The *dust* (here 0.000137 NEAR, at most 0.000999) makes each open quote's amount
+unique, so the amount identifies the quote; it comes back with the refund, which
+is why the refund is a little more than $0.03 − $0.011292. All on-chain math is
+exact integer yoctoNEAR. A run that fails refunds the whole deposit.
+
+### The agent's side
+
+1. **Design (free).** `noodle_guide` lists the node types this server runs, the
+   ports each one takes wires on, their fields, the wiring rules, a complete
+   example graph and the priced models. `price_noodle { graph, inputs }` returns
+   the itemized price and every problem, without a quote. Iterate until
+   `pricing.safety.ok` is true (it is false whenever a node cannot be priced or
+   the deposit is over the server's cap).
+2. **Quote.** Call `run_noodle { graph, inputs }` (or a saved-graph tool) with no
+   payment arguments. The answer is `structuredContent.payment`: `paymentId`,
+   `payTo`, `network`, `amountYocto`, `amountNear`, `expiresAt` (15 minutes) and
+   the `pricing`. Nothing is charged.
+3. **Pay.** Send **one** native transfer of exactly `amountNear` to `payTo`, for example with
+   [near-cli-rs](https://github.com/near/near-cli-rs):
+
+   ```bash
+   near tokens payer-name.testnet send-near merchant-name.testnet '0.008379 NEAR' network-config testnet sign-with-keychain send
+   ```
+
+4. **Run.** Repeat the same call with the same arguments plus `_payment_id`,
+   `_payment_tx` (the transaction hash the wallet printed) and `_payment_sender`
+   (the account you paid from). The server reads the transaction at FINAL finality,
+   checks receiver, amount, single `Transfer` action and timing, records the hash as
+   consumed, runs the workflow once, and returns the result with a `receipt`:
+   charged, refunded, both transaction hashes and explorer links.
+5. **Replay.** Repeating the paying call returns the stored outcome. It never runs,
+   charges or refunds again.
+
+If the transaction is not final yet, the call says so and nothing is consumed:
+call again 3 seconds later (finality takes 2–3 s). A wrong amount or a payment
+after expiry is refunded in full and nothing runs.
+
+### Running a NEAR-paid server (testnet)
+
+From the cloned repository:
+
+```bash
+# 1. A merchant account (receives payments, signs refunds); near-cli-rs, testnet faucet
+near account create-account sponsor-by-faucet-service merchant-name.testnet autogenerate-new-keypair save-to-keychain network-config testnet create
+near account export-account merchant-name.testnet using-private-key network-config testnet   # prints ed25519:…
+
+# 2. Secrets in a file, never on the command line
+cat > .env <<'EOF'
+NANOGPT_API_KEY=your-nanogpt-key
+NEAR_PRIVATE_KEY=ed25519:the-key-printed-above
+EOF
+chmod 600 .env
+
+# 3. Serve (a graphs folder must exist; it may be empty — run_noodle needs no saved graphs)
+mkdir -p noodles
+node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 0.0.0.0:8402 --public-url https://your-host \
+  --near-merchant merchant-name.testnet --env-file .env
+```
+
+At startup the server checks that the RPC is on the configured network and that
+the key is a full-access key of the merchant account, finishes anything a
+previous run left in flight (a run interrupted by a restart is refunded, never
+re-run), and logs the network, merchant, RPC host and rate source. It refuses to
+start on any mismatch. Use a **dedicated** merchant account: no other software
+should send from its key.
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--near-merchant <account>` | `NEAR_MERCHANT` | off | Turns NEAR mode on. Needs `--serve`; not combinable with `--charge-usd`. |
+| `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify payments and send refunds on. |
+| `--near-rpc <url>` | `NEAR_RPC_URL` | fastnear's public RPC | An RPC you trust to report finality. |
+| `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key (near-cli credentials JSON, or `ed25519:…`). Never accepted on argv, never logged. |
+| `--near-usd <n>` | `NEAR_USD` | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
+| `--near-max-deposit-usd <n>` | | `2` | Refuse any call whose deposit would exceed this. |
+
+NanoGPT is still paid by your API key or Nano wallet, exactly as in the other
+modes; NEAR only changes how callers pay you. Money events go to
+`<out>/usage.jsonl` with `"rail": "near"`; durable payment state is
+`<out>/near-state.json` (one server per `--out` directory).
+
+### Try it live on testnet
+
+With the server above running at `https://your-host`, any shell can act as the
+agent. `jq` is only used to pick fields out of the answers.
+
+```bash
+# 1. A payer account (a second account; the faucet funds it with testnet NEAR)
+near account create-account sponsor-by-faucet-service payer-name.testnet autogenerate-new-keypair save-to-keychain network-config testnet create
+
+# 2. The workflow and a helper that calls run_noodle over MCP's HTTP transport
+GRAPH='{"nodes":[{"id":"n1","type":"text","name":"Idea","fields":{"text":""}},{"id":"n2","type":"llm","fields":{"model":"z-ai/glm-5.3-flash","system":"Write one vivid image prompt for the idea. Reply with the prompt only.","maxTokens":300}},{"id":"n3","type":"image","fields":{"model":"blackforestlabs/flux-3/klein/text-to-image","size":"1024x1024"}}],"links":[{"from":{"node":"n1","port":"text"},"to":{"node":"n2","port":"prompt"}},{"from":{"node":"n2","port":"text"},"to":{"node":"n3","port":"prompt"}}]}'
+call() { curl -s https://your-host/mcp -H 'content-type: application/json' -H 'accept: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run_noodle\",\"arguments\":{\"graph\":$GRAPH,\"inputs\":{\"Idea\":\"a lighthouse at dawn\"}$1}}}"; }
+
+# 3. Free price check, then the quote
+curl -s https://your-host/mcp -H 'content-type: application/json' -H 'accept: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"price_noodle\",\"arguments\":{\"graph\":$GRAPH,\"inputs\":{\"Idea\":\"a lighthouse at dawn\"}}}}" | jq -r '.result.content[0].text'
+call "" | jq '.result.structuredContent.payment | {paymentId, payTo, amountNear, expiresAt}'
+
+# 4. Send exactly amountNear to payTo; near-cli prints the "Transaction ID"
+near tokens payer-name.testnet send-near merchant-name.testnet '<amountNear> NEAR' network-config testnet sign-with-keychain send
+
+# 5. Present the payment: same arguments plus the three _payment_ fields
+call ',"_payment_id":"nq_…","_payment_tx":"<Transaction ID>","_payment_sender":"payer-name.testnet"' \
+  | jq '{text: [.result.content[] | select(.type == "text") | .text], receipt: .result.structuredContent.receipt}'
+```
+
+The receipt has `deposit.explorerUrl` and `refund.explorerUrl`: open both on
+testnet.nearblocks.io. Then check both transfers the way the server does,
+read-only (no keys):
+
+```bash
+# the payment
+node scripts/near-check-tx.mjs --network testnet --merchant merchant-name.testnet --tx <payment hash> --sender payer-name.testnet \
+  --state ./nanoodle-out/near-state.json --payment-id nq_…
+# the refund (payer and merchant swap places)
+node scripts/near-check-tx.mjs --network testnet --merchant payer-name.testnet --tx <refund hash> --sender merchant-name.testnet \
+  --amount-yocto <receipt refund.yocto>
+```
+
+It prints PASS/FAIL for each rule (final, succeeded, receiver, single transfer,
+exact amount, inside the quote's time window). An MCP client that can sign NEAR
+transfers (or an agent with a wallet tool) does steps 3–5 itself; clients that
+cannot sign need a bridge like the shell above.
+
+**Mainnet** is `--near-network mainnet` with a mainnet merchant account and key
+(and preferably your own RPC). Read the
+[limitations](docs/near-payments.md#limitations) first.
+
+### What a paid server will run
+
+Strangers' graphs run on your server, so NEAR mode accepts only node types whose
+inputs come from the caller as text or from upstream NanoGPT nodes, and whose cost
+can be bounded before the run: text logic (`text`, `choice`, `join`, `comment`) and
+the NanoGPT model nodes `llm`, `decide`, `image`, `edit`, `tvideo`, `ivideo`,
+`music`, `tts` and `model3d`. Refused: `upload`/media-input nodes, local media
+processing (resize, trim, combine…), `lipsync`, `inpaint`, custom `endpoint` nodes,
+`vision` (it sends no output limit; use `llm` with an image on `img1`), and nodes
+billed by the length of an input clip (`vedit`, `remix`, `transcribe`,
+`cleanvoice`). Also refused: fields that hold URLs or inline data, `modelOpts` and
+`extraJson` (they are sent to the provider unpriced), a non-numeric `maxTokens` or
+`duration`, wires into pricing fields, media wired into text fields, and
+fragment-less short links. No caller-chosen file, URL or local-media node runs;
+`ffmpeg` may still run on images NanoGPT generated (to shrink one that is too
+large to send to the next model, or to fit an image into a `decide` request).
+
+The graph that runs is the graph that was priced: an `llm` without `maxTokens` is
+sent `max_tokens` = 2,000 (or the model's lower maximum), and a video without a
+duration is sent the catalog default it was priced at. Every paid node must be
+priced by the catalog, and models whose catalog price is set by a live quote at
+run time are refused (the refusal names the node and model). Caps: 40 nodes,
+200 kB of graph JSON (checked before a share link is inflated), 32 inputs of at
+most 20,000 characters (50,000 in total), the deposit cap, and 1,000 open quotes.
+Everything is checked before a quote exists, so nobody pays for a call that could
+not run. Saved graphs that fail these checks are not offered in NEAR mode, and
+neither are the built-in tools.
+
+### Limitations
+
+- No caller-supplied media (image/audio/video inputs); media must be generated by
+  an upstream NanoGPT node.
+- Native NEAR only: no NEP-141 tokens such as USDC, no meta-transactions.
+- The configured RPC is trusted for finality; there is no light-client proof.
+- Deposits are bounds, not guarantees. Text steps are bounded by `maxTokens`, but
+  a provider can still bill more than the catalog suggests (for example a reasoning
+  model's hidden tokens); the charge is capped at the deposit and the operator
+  absorbs the rest.
+- Text results stay in memory only; a replay after a restart returns the receipt
+  and says the text was not kept.
+- No pay page or payment-watch stream: the caller presents the transaction hash.
+- A transfer for a quote that expired more than an hour earlier is not refunded
+  automatically (the quote is gone); the operator sees it in the merchant account.
+
+The full list is in [docs/near-payments.md](docs/near-payments.md#limitations).
 
 ## Making graphs
 

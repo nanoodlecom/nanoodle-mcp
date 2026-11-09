@@ -145,8 +145,8 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     const list = await srv.request("tools/list");
     assert.equal(srv.messages.length, framesBefore + 1, "notifications/initialized must not be answered");
     const tools = list.result.tools;
-    // one tool per fixture graph, plus the always-present run_noodle share-link tool
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "poster", "restyle", "run_noodle", "sfw_check", "subnano_comment"]);
+    // one tool per fixture graph, plus the always-present run_noodle tool and its free helpers
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "noodle_guide", "poster", "price_noodle", "restyle", "run_noodle", "sfw_check", "subnano_comment"]);
 
     // media-typed input advertises "file path or https URL"
     const restyle = tools.find((t) => t.name === "restyle");
@@ -348,15 +348,17 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
 
 /* ============================= run_noodle ============================= */
 
-test("run_noodle is always listed, with a url-required schema and the spend warning", async () => {
+test("run_noodle is always listed, with a url-or-graph schema and the spend warning", async () => {
   const srv = startServer();
   try {
     await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
     const list = await srv.request("tools/list");
     const rn = list.result.tools.find((t) => t.name === "run_noodle");
     assert.ok(rn, "run_noodle must always be in tools/list");
-    assert.deepEqual(rn.inputSchema.required, ["url"]);
+    // url OR graph: neither is schema-required; the handler rejects none/both with -32602
+    assert.equal(rn.inputSchema.required, undefined);
     assert.equal(rn.inputSchema.properties.url.type, "string");
+    assert.deepEqual(rn.inputSchema.properties.graph.type, ["object", "string"]);
     assert.equal(rn.inputSchema.properties.inputs.type, "object");
     assert.match(rn.description, /spends real credit from your API key's balance/);
     assert.match(rn.description, /decode locally/); // documents the no-credentials network note

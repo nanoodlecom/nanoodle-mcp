@@ -1,0 +1,670 @@
+/**
+ * NEAR payment gate: quote → verify → run once → settle → refund → replay.
+ *
+ * Wraps a tool registry (src/tools.mjs) so every paid call is bought with one
+ * native NEAR transfer:
+ *
+ *   1. A call without payment arguments is checked completely (argument
+ *      shapes, graph safety, caps, inputs, that every paid node is priced)
+ *      and answered with a quote: an exact yoctoNEAR deposit with unique dust,
+ *      the itemized price and a locked NEAR/USD rate. Nothing is charged.
+ *   2. The caller sends that exact amount in one transfer and repeats the call
+ *      with _payment_id, _payment_tx and _payment_sender.
+ *   3. The gate reads the transaction at FINAL finality, records its hash as
+ *      consumed (durably, before anything runs), runs the priced graph once
+ *      (maxTokens and durations written in, see bindPaidGraph), and settles:
+ *      charged = min(actual model cost + 20% service fee, deposit) at the
+ *      locked rate; the rest is refunded to the transaction's signer. When the
+ *      provider reports only part of the cost, the estimated cost is charged.
+ *   4. Repeating the paying call returns the stored outcome. It never runs,
+ *      charges or refunds again, also across restarts.
+ *
+ * Money state lives in src/near/ledger.mjs (sync, fsync'd). Text output, the
+ * caller's paid content, is kept in memory only. See docs/near-payments.md.
+ */
+import { randomBytes } from "node:crypto";
+import { graphModelKinds } from "nanoodle";
+import { hashArgs } from "./gate.mjs";
+import {
+  fetchCatalogs, computePrice, priceNoodleResult, ParamsError,
+  PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME,
+} from "./tools.mjs";
+import {
+  DEFAULT_LIMITS, GraphArgsError, GraphRefusedError, readGraphArgs, assertGraphSafe, checkGraphSafety,
+  priceGraph, refusalsForQuote, formatQuote, formatReceipt, exactUsd, estUsd, shortNear,
+} from "./custom-workflow.mjs";
+import {
+  NearError, isNearAccountId, base58Decode, formatYoctoAsNear, usdToYocto, depositYocto, settleYocto,
+  DUST_STEP_YOCTO, readPaymentTransfer, explorerTxUrl,
+} from "./near/index.mjs";
+import { knownUsd } from "./usd.mjs";
+
+const RUN_NOODLE = "run_noodle";
+const FINAL = new Set(["settled", "failed", "rejected"]);
+const SIDE_CARS = ["costUsd", "costExact", "providerUsd", "providerExact", "billedUsd", "textOutput"];
+const TEXT_NOT_RETAINED = "The result text was not retained across a server restart; the run is not repeated.";
+const ERROR_NOT_RETAINED = "Details: (error details not retained across restarts)";
+
+const errResult = (text, structuredContent) => ({
+  content: [{ type: "text", text }],
+  ...(structuredContent ? { structuredContent } : {}),
+  isError: true,
+});
+
+/** A refusal list as an agent-readable tool error (never a JSON-RPC error: the call was well-formed). */
+function refusedResult(refusals) {
+  const lines = [
+    `This workflow cannot run on this server as written: ${refusals.length} problem${refusals.length === 1 ? "" : "s"}. Nothing was quoted or charged.`,
+    ...refusals.map((r) => `- ${r.message}`),
+    "",
+    "Fix the graph and check it for free with price_noodle; noodle_guide lists the allowed node types and priced models.",
+  ];
+  return errResult(lines.join("\n"), { refusals: refusals.map((r) => ({ ...r })) });
+}
+
+/** Exact USD (9 decimals) for a yocto amount at a locked rate, floor. */
+function yoctoToUsd(yocto, usdNano, rateYocto) {
+  const nano = (yocto * usdNano) / rateYocto;
+  const whole = nano / 1_000_000_000n;
+  const frac = (nano % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
+function strip(res) {
+  const out = { ...res };
+  for (const k of SIDE_CARS) delete out[k];
+  return out;
+}
+
+/**
+ * @param {object} opts
+ * @param {string} opts.merchantId   account that receives payments and signs refunds
+ * @param {"testnet"|"mainnet"} opts.network
+ * @param {object} opts.rpc          createNearRpc()
+ * @param {object} opts.ledger       openNearLedger()
+ * @param {object} opts.rate         createNearUsdRate()
+ * @param {object} opts.refunder     createRefunder()
+ * @param {object} [opts.limits]     custom-workflow caps, incl. maxDepositUsd
+ * @param {string} [opts.baseUrl]    NanoGPT base for the public model catalogs
+ * @param {number} [opts.quoteTtlMs] quote lifetime (15 min)
+ * @param {number} [opts.skewMs]     tolerated clock skew between the chain and this server
+ * @param {(line: string) => void} [opts.log]
+ * @param {(event: string, fields: object) => void} [opts.usage]  payments ledger (money events only)
+ * @param {number} [opts.txTimeoutMs]  bound on the FINAL `tx` lookup (default in readPaymentTransfer)
+ * @param {(min: number, max: number) => number} [opts.randomInt]  dust source; tests pin it
+ * @param {number} [opts.maxOpenQuotes]   unexpired unpaid quotes held at once (default 1000); more are refused as busy
+ * @param {number} [opts.expiredRetainMs] how long an expired, unpaid quote is kept so a late transfer is still refunded (1 h)
+ */
+export function createNearGate({
+  merchantId,
+  network,
+  rpc,
+  ledger,
+  rate,
+  refunder,
+  limits = DEFAULT_LIMITS,
+  baseUrl,
+  quoteTtlMs = 15 * 60_000,
+  skewMs = 120_000,
+  log = () => {},
+  usage = () => {},
+  now = Date.now,
+  fetch = globalThis.fetch,
+  txTimeoutMs,
+  randomInt,
+  maxOpenQuotes = 1000,
+  expiredRetainMs = 3_600_000,
+}) {
+  if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
+  if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
+  const L = { ...DEFAULT_LIMITS, ...(limits || {}) };
+  const ev = (event, fields) => {
+    try { usage(event, { rail: "near", ...fields }); } catch { /* the ledger sink never breaks a call */ }
+  };
+
+  /** Full results (incl. text) of finished calls in this process, by payment id. */
+  const results = new Map();
+  /** Per-payment-id serialization: one paying call at a time per id. */
+  const locks = new Map();
+  async function withLock(key, fn) {
+    const prev = locks.get(key) || Promise.resolve();
+    let release;
+    const mine = new Promise((r) => { release = r; });
+    const chained = prev.then(() => mine);
+    locks.set(key, chained);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (locks.get(key) === chained) locks.delete(key);
+    }
+  }
+
+  /* ---------------- receipts ---------------- */
+
+  function refundView(q) {
+    if (!q.refundId) return { status: "none", txHash: null };
+    const r = ledger.getRefund(q.refundId);
+    if (!r) return { status: "none", txHash: null };
+    const status = r.status === "sent" ? "sent" : r.status === "failed_permanent" ? "failed_permanent" : "pending";
+    return { status, txHash: r.txHash || null, amountYocto: r.amountYocto, to: r.to };
+  }
+
+  /** The receipt for a quote as the ledger has it now (refund status included). */
+  function receiptFor(q) {
+    const paid = BigInt(q.paidYocto || "0");
+    const usdNano = BigInt(q.rate.usdNano), rateYocto = BigInt(q.rate.yocto);
+    const s = q.settlement;
+    let chargedYocto = 0n, refundYocto = paid;
+    if (s) { chargedYocto = BigInt(s.chargedYocto); refundYocto = BigInt(s.refundYocto); }
+    const rv = refundView(q);
+    // A refund below the minimum is not sent; it counts toward the charge.
+    if (!q.refundId && refundYocto > 0n && !s) { chargedYocto += refundYocto; refundYocto = 0n; }
+    const costKnown = !!(s && s.costUsd != null);
+    const capped = !!(s && costKnown && BigInt(s.chargedYocto) < BigInt(s.costYocto) + BigInt(s.feeYocto));
+    const receipt = {
+      rail: "near",
+      network,
+      paymentId: q.id,
+      deposit: {
+        yocto: paid.toString(),
+        near: formatYoctoAsNear(paid),
+        // What was actually sent, at the locked rate (the quote's USD deposit plus the dust).
+        usd: yoctoToUsd(paid, usdNano, rateYocto),
+        quotedUsd: q.depositUsd,
+        txHash: q.payTx,
+        explorerUrl: q.payTx ? explorerTxUrl(network, q.payTx) : null,
+      },
+      actualCost: {
+        usd: costKnown ? exactUsd(s.costUsd) : null,
+        exact: costKnown ? s.exact !== false : false,
+        billedAs: costKnown ? s.billedAs || "reported" : null,
+        reportedUsd: s && s.reportedUsd != null ? exactUsd(s.reportedUsd) : null,
+      },
+      serviceFee: { usd: costKnown ? exactUsd(s.costUsd * 0.2) : "0" },
+      charged: {
+        yocto: chargedYocto.toString(),
+        near: formatYoctoAsNear(chargedYocto),
+        usd: costKnown && !capped ? exactUsd(s.costUsd * 1.2) : yoctoToUsd(chargedYocto, usdNano, rateYocto),
+        capped,
+      },
+      refund: {
+        yocto: refundYocto.toString(),
+        near: formatYoctoAsNear(refundYocto),
+        usd: yoctoToUsd(refundYocto, usdNano, rateYocto),
+        to: q.payer,
+        status: refundYocto === 0n ? "none" : rv.status,
+        txHash: rv.txHash,
+        explorerUrl: rv.txHash ? explorerTxUrl(network, rv.txHash) : null,
+      },
+      rate: { nearUsd: q.rate.nearUsd, source: q.rate.source, at: q.rate.at },
+      outcome: q.outcome,
+    };
+    return formatReceipt(receipt);
+  }
+
+  /**
+   * Result + receipt for a settled quote. `body` is the stripped tool result.
+   * The engine's "cost: $X" line (model cost only) is replaced by what was
+   * charged, so the result never shows two different "cost" figures.
+   */
+  function withReceipt(q, body, extraNote = null) {
+    const rc = receiptFor(q);
+    const r = rc.structured.receipt;
+    const charged = `charged: $${r.charged.usd} (${shortNear(r.charged.near)} NEAR): model cost $${r.actualCost.usd ?? "0"} + 20% service fee; ` +
+      `refund ${shortNear(r.refund.near)} NEAR ${r.refund.status}`;
+    const content = (body.content || []).map((c) => (c && c.type === "text" && /^cost: \$/.test(c.text) ? { type: "text", text: charged } : c));
+    if (extraNote) content.push({ type: "text", text: extraNote });
+    content.push({ type: "text", text: rc.text });
+    return { ...body, content, structuredContent: { ...(body.structuredContent || {}), ...rc.structured } };
+  }
+
+  /** The stored outcome of a finished quote. Never runs, charges or refunds. */
+  function replay(q) {
+    if (q.status === "settled") {
+      const mem = results.get(q.id);
+      if (mem) return withReceipt(q, mem);
+      if (q.result) return withReceipt(q, q.result);
+      return withReceipt(q, { content: [] }, TEXT_NOT_RETAINED);
+    }
+    // failed or rejected: a gate-authored sentence + the receipt
+    const rc = receiptFor(q);
+    const details = results.get(q.id)?.details;
+    const head = q.error || "Nothing ran and nothing was charged.";
+    const tail = q.outcome === "run_failed" ? `\n\n${details || ERROR_NOT_RETAINED}` : "";
+    return errResult(`${head}\n\n${rc.text}${tail}`, rc.structured);
+  }
+
+  /* ---------------- refunds ---------------- */
+
+  async function refundFor(q, to, amountYocto, reason) {
+    const r = await refunder.refund({ paymentId: q.id, to, amountYocto, reason });
+    ev("refund", { paymentId: q.id, tool: q.tool, reason, to, amountYocto: amountYocto.toString(), status: r.status, hash: r.txHash || null });
+    return r;
+  }
+
+  /* ---------------- quote ---------------- */
+
+  /** Deposit amounts of unpaid quotes still held (open, or expired within expiredRetainMs). */
+  function openAmounts() {
+    const t = now();
+    const taken = new Set();
+    for (const q of ledger.quotes()) {
+      if ((q.status === "pending" || q.status === "expired") && t <= q.expiresAt + expiredRetainMs) taken.add(q.amountYocto);
+    }
+    return taken;
+  }
+
+  function openQuoteCount() {
+    const t = now();
+    let n = 0;
+    for (const q of ledger.quotes()) if (q.status === "pending" && t <= q.expiresAt) n++;
+    return n;
+  }
+
+  /** Drop unpaid quotes past retention and finished ones past a day, at most once a minute. */
+  let lastPrune = 0;
+  function maybePrune() {
+    const t = now();
+    if (t - lastPrune < 60_000) return;
+    lastPrune = t;
+    try { ledger.prune({ unpaidRetainMs: expiredRetainMs }); } catch (e) { log(`NEAR state prune failed: ${(e && e.message) || e}`); }
+  }
+
+  async function catalogsFor(graph) {
+    return fetchCatalogs(graphModelKinds(graph), { baseUrl: baseUrl || undefined, fetch, log, consequence: ", so graphs using it cannot be quoted" });
+  }
+
+  /**
+   * Everything a paid call is checked for before a quote (and again before a
+   * paid run): argument shapes, graph safety, inputs, prices, caps. Returns
+   * the pricing and the exact call to run: the bound graph and its inputs.
+   * Throws GraphArgsError / ParamsError / GraphRefusedError.
+   */
+  async function prepare(registry, name, args, tool) {
+    let graph, inputs, catalogs;
+    if (name === RUN_NOODLE) {
+      const read = await readGraphArgs(args, { allowShortLinks: false, fetch, limits: L });
+      assertGraphSafe(read.graph, { inputs: read.inputs, limits: L });
+      const prep = await registry.prepareRunNoodle(args, { read, allowShortLinks: false });
+      graph = prep.workflowGraph;
+      inputs = read.inputs;
+      catalogs = prep.catalogs;
+    } else {
+      assertGraphSafe(tool.wf.graph, { inputs: args, limits: L });
+      await registry.prepareCall({ name, arguments: args });
+      graph = tool.wf.graph;
+      inputs = args;
+      catalogs = await catalogsFor(graph);
+    }
+    const pricing = priceGraph(graph, catalogs, { inputs });
+    const refusals = refusalsForQuote(pricing, { maxDepositUsd: L.maxDepositUsd });
+    if (refusals.length) throw new GraphRefusedError(refusals);
+    // The run executes exactly the priced graph, through run_noodle, for saved tools too.
+    return { pricing, run: { name: RUN_NOODLE, arguments: { graph: pricing.boundGraph, inputs } } };
+  }
+
+  async function quote(registry, name, args, tool) {
+    const { pricing } = await prepare(registry, name, args, tool);
+    maybePrune();
+    if (openQuoteCount() >= maxOpenQuotes) {
+      return errResult("This server is holding too many open quotes right now; try again in a few minutes. Nothing was charged.");
+    }
+
+    let r;
+    try {
+      r = await rate.current();
+    } catch (e) {
+      if (e instanceof NearError && e.code === "RATE_UNAVAILABLE") {
+        return errResult("Cannot quote in NEAR right now: no current NEAR/USD rate; try again shortly. Nothing was charged.");
+      }
+      throw e;
+    }
+    const taken = openAmounts();
+    let amountYocto;
+    try {
+      amountYocto = depositYocto(pricing.depositUsd, r, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []));
+    } catch (e) {
+      if (e instanceof NearError && e.code === "NO_UNIQUE_AMOUNT") {
+        return errResult("This server is holding too many open quotes at this price right now; try again in a few minutes. Nothing was charged.");
+      }
+      throw e;
+    }
+    const id = "nq_" + randomBytes(9).toString("base64url");
+    const createdAt = now();
+    const expiresAt = createdAt + quoteTtlMs;
+    // Only what payment and settlement need is stored; the itemized pricing is in the answer.
+    const record = {
+      id, tool: name, argsHash: hashArgs(name, args), status: "pending",
+      amountYocto: amountYocto.toString(),
+      depositUsd: exactUsd(pricing.depositUsd),
+      estimatedCostUsd: exactUsd(pricing.estimatedCostUsd),
+      rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(), nearUsd: r.nearUsd, source: r.source, at: r.at },
+      createdAt, expiresAt,
+      payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
+      settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
+    };
+    ledger.putQuote(record);
+    ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source });
+    const likelyChargeNear = formatYoctoAsNear(usdToYocto(pricing.likelyChargeUsd, r, "ceil"), { maxDecimals: 6 });
+    const baseYocto = stepUp(usdToYocto(pricing.depositUsd, r, "ceil"));
+    const q = formatQuote({
+      pricing,
+      now: createdAt,
+      payment: {
+        network, paymentId: id, payTo: merchantId,
+        amountYocto: record.amountYocto, amountNear: formatYoctoAsNear(amountYocto),
+        depositUsd: record.depositUsd,
+        depositUsdSent: estUsd(Number(yoctoToUsd(amountYocto, r.usdNano, r.yocto))),
+        dustNear: formatYoctoAsNear(amountYocto - baseYocto),
+        likelyChargeNear,
+        rate: { nearUsd: r.nearUsd, source: r.source, at: r.at },
+        expiresAt: new Date(expiresAt).toISOString(),
+      },
+    });
+    return { content: [{ type: "text", text: q.text }], structuredContent: q.structured };
+  }
+
+  /* ---------------- price_noodle with NEAR figures ---------------- */
+
+  async function priceNear(args) {
+    // computePrice also reports what stops a quote: live-priced or unpriced models, a deposit over the cap.
+    const computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits: L });
+    let note = null, near = null;
+    if (computed.pricing) {
+      try {
+        const r = await rate.current();
+        near = {
+          network,
+          nearUsd: r.nearUsd, rateSource: r.source, rateAt: r.at,
+          likelyChargeNear: formatYoctoAsNear(usdToYocto(computed.pricing.likelyChargeUsd, r, "ceil"), { maxDecimals: 6 }),
+          depositNear: formatYoctoAsNear(stepUp(usdToYocto(computed.pricing.depositUsd, r, "ceil")), { maxDecimals: 6 }),
+          depositApprox: true,
+        };
+        note = `This server is paid in NEAR on ${network}. Call run_noodle with the same arguments for a quote; nothing is charged until you send the transfer.`;
+      } catch (e) {
+        if (!(e instanceof NearError && e.code === "RATE_UNAVAILABLE")) throw e;
+        note = "No current NEAR/USD rate is available, so the figures are in USD only; a quote needs a rate and will fail until one is available.";
+      }
+    }
+    return priceNoodleResult(computed, { near, note });
+  }
+
+  const stepUp = (y) => ((y + DUST_STEP_YOCTO - 1n) / DUST_STEP_YOCTO) * DUST_STEP_YOCTO;
+
+  /* ---------------- pay → run → settle ---------------- */
+
+  async function pay(registry, { name, args, argsHash, paymentId, tx, sender, ctx, tool }) {
+    const q0 = ledger.getQuote(paymentId);
+    if (!q0) return errResult(`Unknown or expired payment id "${paymentId}" — call again without _payment_id for a fresh quote.`);
+    if (q0.tool !== name || q0.argsHash !== argsHash) {
+      return errResult(`payment ${q0.id} was issued for a different call (tool/arguments changed) — ` +
+        "call again without _payment_id to get a quote for these arguments.");
+    }
+    if (FINAL.has(q0.status)) return replay(q0);
+    if (q0.status === "running") {
+      return errResult(`payment ${q0.id} is still being processed — call again in a moment with the same arguments.`);
+    }
+
+    // pending or expired: verify the transfer
+    if (typeof tx !== "string" || !tx.trim() || typeof sender !== "string" || !sender.trim()) {
+      throw new GraphArgsError("the paying call needs _payment_tx (your transfer's transaction hash) and _payment_sender (the account you paid from) together with _payment_id");
+    }
+    const txHash = tx.trim(), senderId = sender.trim();
+    try { base58Decode(txHash, 32); } catch { throw new GraphArgsError("_payment_tx must be a NEAR transaction hash (base58, 32 bytes)"); }
+    if (!isNearAccountId(senderId)) throw new GraphArgsError("_payment_sender must be a NEAR account id, e.g. alice.testnet");
+
+    const consumed = ledger.consumedBy(txHash);
+    if (consumed && consumed !== q0.id) {
+      return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
+    }
+
+    const note = (s) => {
+      if (ctx && typeof ctx.announce === "function") ctx.announce(s);
+      else if (ctx && typeof ctx.report === "function") ctx.report(s);
+    };
+    note(`checking payment ${q0.id} on NEAR ${network}`);
+    let t;
+    try {
+      t = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
+    } catch (e) {
+      if (!(e instanceof NearError)) throw e;
+      const why = {
+        TX_NOT_FOUND: `Transaction ${txHash} was not found as final on ${network}. If you just sent it, wait 3 seconds and call again (finality takes about 2-3 s; retry for up to 30 s). If it still fails, check that _payment_tx is the hash your wallet printed, that _payment_sender is the account that signed it, and that you paid on ${network}. Nothing was consumed.`,
+        TX_NOT_FINAL: `Transaction ${txHash} is not final on ${network} yet — wait a few seconds and call again. Nothing was consumed.`,
+        TX_FAILED: `Transaction ${txHash} failed on chain, so no NEAR arrived. Send a new transfer of exactly the quoted amount.`,
+        NOT_A_SINGLE_TRANSFER: `Transaction ${txHash} is not exactly one native NEAR transfer (one Transfer action, nothing else). Send a plain transfer of exactly the quoted amount.`,
+        WRONG_RECEIVER: `Transaction ${txHash} does not pay ${merchantId}. Send exactly the quoted amount to ${merchantId}.`,
+        TX_MISMATCH: "The NEAR RPC returned a different transaction than the one asked for; try again.",
+        RPC_UNAVAILABLE: "The NEAR RPC could not be reached to check the payment; try again shortly. Nothing was consumed.",
+      }[e.code] || `The payment could not be checked (${e.code}); try again. Nothing was consumed.`;
+      return errResult(why);
+    }
+    if (t.blockTimeMs < q0.createdAt - skewMs) {
+      return errResult(`Transaction ${txHash} is older than this quote, so it cannot pay for it. Send a new transfer of exactly the quoted amount.`);
+    }
+
+    const wrongAmount = t.amountYocto !== BigInt(q0.amountYocto);
+    if (wrongAmount && openAmounts().has(t.amountYocto.toString())) {
+      // The transfer carries the exact amount of ANOTHER open quote: it belongs to
+      // that quote's payer. Consuming it here would let anyone who sees a payment
+      // on chain burn it against a free quote of their own, so it is left untouched.
+      return errResult(`Transaction ${txHash} sent ${formatYoctoAsNear(t.amountYocto)} NEAR, the exact amount of a different quote, ` +
+        `so it was not used for this one (which asks for ${formatYoctoAsNear(BigInt(q0.amountYocto))} NEAR). Nothing was consumed.`);
+    }
+
+    // Re-check the call and rebuild the graph to run before taking the payment.
+    // The quote already passed these checks; this only fails if the catalog changed.
+    let prepared = null, prepError = null;
+    if (!wrongAmount && t.blockTimeMs <= q0.expiresAt) {
+      try { prepared = await prepare(registry, name, args, tool); } catch (e) { prepError = e; }
+    }
+    const fresh = ledger.getQuote(q0.id);
+    if (!fresh || fresh.status !== q0.status) return replay(fresh || q0);
+
+    // From here to updateQuote there is no await: the consume and the status
+    // change cannot interleave with another call.
+    if (consumed !== q0.id && !ledger.consumeTx(txHash, q0.id)) {
+      return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
+    }
+    const paidFields = { payTx: txHash, payer: t.payer, paidYocto: t.amountYocto.toString(), paidAtBlockMs: t.blockTimeMs };
+    const reject = wrongAmount ? "wrong_amount" : t.blockTimeMs > q0.expiresAt ? "late_payment" : null;
+    if (reject) {
+      const error = reject === "wrong_amount"
+        ? `The quote asked for exactly ${formatYoctoAsNear(BigInt(q0.amountYocto))} NEAR.`
+        : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`;
+      let q = ledger.updateQuote(q0.id, { ...paidFields, status: "rejected", outcome: reject, error, finishedAt: now() });
+      ev("paid", { paymentId: q.id, tool: name, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
+      const rf = await refundFor(q, t.payer, t.amountYocto, reject);
+      q = ledger.updateQuote(q.id, { refundId: rf.refundId });
+      return replay(q);
+    }
+    let q = ledger.updateQuote(q0.id, { ...paidFields, status: "running" });
+    ev("paid", { paymentId: q.id, tool: name, ok: true, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
+    note(`payment verified — running ${name}`);
+
+    let res;
+    try {
+      if (prepError) throw prepError;
+      res = await registry.callTool(prepared.run);
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
+      // Persist the failure before the refund goes out, so a restart never re-runs it.
+      q = ledger.updateQuote(q.id, { status: "failed", outcome: "run_failed", error, finishedAt: now() });
+      results.set(q.id, { details: `Details: ${msg}` });
+      const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), "run_failed");
+      q = ledger.updateQuote(q.id, { refundId: rf.refundId });
+      return replay(q);
+    }
+
+    const body = strip(res);
+    // The provider's reported cost settles the run. When it reported only part
+    // of it (costExact false) or nothing, the caller is charged the estimated
+    // cost instead of a lower bound: strangers choose the models here.
+    const reportedUsd = knownUsd(res.costUsd);
+    const estimatedUsd = knownUsd(q.estimatedCostUsd);
+    let settleUsd = res.costUsd, billedAs = "reported";
+    if ((res.costExact === false || reportedUsd == null) && estimatedUsd != null && estimatedUsd > (reportedUsd ?? 0)) {
+      settleUsd = q.estimatedCostUsd;
+      billedAs = "estimate";
+    }
+    const s = settleYocto({
+      depositYocto: BigInt(q.paidYocto),
+      costUsd: settleUsd,
+      rate: { usdNano: BigInt(q.rate.usdNano), yocto: BigInt(q.rate.yocto) },
+    });
+    const costUsd = s.known ? knownUsd(settleUsd) : null;
+    // The settlement is on disk before the refund intent: a restart in between
+    // finishes this settlement instead of refunding the whole deposit.
+    q = ledger.updateQuote(q.id, {
+      settlement: {
+        costUsd, exact: s.known ? res.costExact !== false && billedAs === "reported" : false,
+        billedAs, reportedUsd: reportedUsd ?? null,
+        costYocto: s.costYocto.toString(), feeYocto: s.feeYocto.toString(),
+        chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(),
+      },
+    });
+    results.set(q.id, body);
+    const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change" });
+    // Media-only results (links) may be kept; text output is the caller's paid content and stays in memory.
+    const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
+    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: persisted, finishedAt: now() });
+    ev("change", {
+      paymentId: q.id, tool: name, to: q.payer, costUsd,
+      chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(), status: rf.status, hash: rf.txHash || null,
+    });
+    return withReceipt(q, body);
+  }
+
+  /* ---------------- startup recovery ---------------- */
+
+  async function resume() {
+    const t = now();
+    for (const q of ledger.quotes()) {
+      if (q.status === "running") {
+        if (q.settlement) {
+          // The run finished and was settled; only the refund intent may be missing.
+          const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change" });
+          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: null, finishedAt: t });
+          log(`NEAR payment ${q.id}: settled after a restart (the result text was not kept)`);
+        } else {
+          const error = "The server restarted while this run was in progress.";
+          const done = ledger.updateQuote(q.id, { status: "failed", outcome: "interrupted", error, finishedAt: t });
+          const rf = await refundFor(done, q.payer, BigInt(q.paidYocto), "interrupted");
+          ledger.updateQuote(q.id, { refundId: rf.refundId });
+          log(`NEAR payment ${q.id}: interrupted by a restart — whole deposit refunded (${rf.status}), not re-run`);
+        }
+      } else if ((q.status === "failed" || q.status === "rejected") && q.paidYocto && !q.refundId) {
+        // Stopped between recording the outcome and recording the refund: owe it now.
+        const reason = q.outcome === "wrong_amount" || q.outcome === "late_payment" || q.outcome === "interrupted" ? q.outcome : "run_failed";
+        const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), reason);
+        if (rf.refundId) ledger.updateQuote(q.id, { refundId: rf.refundId });
+      } else if (q.status === "pending" && t > q.expiresAt) {
+        ledger.updateQuote(q.id, { status: "expired" });
+      }
+    }
+    await refunder.resume();
+    ledger.prune({ unpaidRetainMs: expiredRetainMs });
+  }
+
+  /* ---------------- registry wrapper ---------------- */
+
+  /** run_noodle / price_noodle argument descriptions as this paid server applies them. */
+  function nearGraphProps(props) {
+    const out = { ...props };
+    if (out.url) out.url = { ...out.url, description: "A full nanoodle share link with its #g=, #j= or #a= fragment (short links are refused here). Pass url OR graph." };
+    if (out.inputs) {
+      out.inputs = {
+        ...out.inputs,
+        description: 'Text inputs keyed by input name, e.g. { "Idea": "a lighthouse at dawn" }; this paid server accepts no media inputs. Omit to use the graph\'s saved text.',
+      };
+    }
+    return out;
+  }
+
+  function wrapRegistry(registry) {
+    const paidSaved = [];
+    for (const t of registry.tools) {
+      if (!t.wf || t.builtin || t.humanize) continue;
+      const c = checkGraphSafety(t.wf.graph, { limits: L });
+      if (c.ok) paidSaved.push(t.name);
+      else log(`NEAR mode: not offering ${t.name}: ${c.refusals[0].message}`);
+    }
+    const savedSet = new Set(paidSaved);
+    const paidNames = new Set([RUN_NOODLE, ...paidSaved]);
+    const offeredNames = new Set([...paidNames, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]);
+    const paidLine = `paid in NEAR on ${network}: a deposit is held up front, you are charged the actual model cost + 20% service fee, ` +
+      "and the rest is refunded automatically — call price_noodle first for the itemized estimate";
+
+    const listTools = () => registry.listTools()
+      .filter((t) => offeredNames.has(t.name))
+      .map((t) => {
+        if (t.name === PRICE_NOODLE_NAME) return { ...t, inputSchema: { ...t.inputSchema, properties: nearGraphProps(t.inputSchema.properties || {}) } };
+        if (!paidNames.has(t.name)) return t;
+        let description = t.description.replace(/every call spends real credit from [^;.]+/, paidLine);
+        let props = { ...(t.inputSchema.properties || {}) };
+        if (t.name === RUN_NOODLE) {
+          description = description.replace(/ Direct share links decode locally;.*$/, "").replace(", or a da.gd/TinyURL short link to one", "") +
+            " This paid server refuses short links, media inputs and node types it cannot price (see noodle_guide).";
+          props = nearGraphProps(props);
+        }
+        return {
+          ...t,
+          description,
+          inputSchema: {
+            ...t.inputSchema,
+            properties: {
+              ...props,
+              _payment_id: {
+                type: "string",
+                description: "The paymentId from this tool's quote. Pass it only on the paying call, with the same arguments plus _payment_tx and _payment_sender.",
+              },
+              _payment_tx: {
+                type: "string",
+                description: "Hash (base58) of your NEAR transfer that sent exactly the quoted amount to the quoted account in one Transfer action.",
+              },
+              _payment_sender: {
+                type: "string",
+                description: "The NEAR account you paid from. It locates the transaction; the refund goes to the transaction's signer.",
+              },
+            },
+          },
+        };
+      });
+
+    async function callTool(params, ctx = null) {
+      if (params == null || typeof params !== "object" || Array.isArray(params)) return registry.callTool(params);
+      const name = params.name;
+      if (name === NOODLE_GUIDE_NAME) return registry.callTool(params);
+      const rawArgs = params.arguments == null ? {} : params.arguments;
+      if (typeof rawArgs !== "object" || Array.isArray(rawArgs)) throw new ParamsError("tools/call arguments must be an object");
+      try {
+        if (name === PRICE_NOODLE_NAME) return await priceNear(rawArgs);
+        if (!paidNames.has(name)) {
+          throw new ParamsError(`unknown tool "${name}" — available: ${[...offeredNames].join(", ")}`);
+        }
+        const { _payment_id, _payment_tx, _payment_sender, ...args } = rawArgs;
+        const tool = savedSet.has(name) ? registry.tools.find((x) => x.name === name) : null;
+        if (_payment_id == null) {
+          if (_payment_tx != null || _payment_sender != null) {
+            throw new GraphArgsError("_payment_tx and _payment_sender go with _payment_id: call without all three to get a quote first");
+          }
+          return await quote(registry, name, args, tool);
+        }
+        const paymentId = String(_payment_id);
+        return await withLock(paymentId, () => pay(registry, {
+          name, args, argsHash: hashArgs(name, args), paymentId, tx: _payment_tx, sender: _payment_sender, ctx, tool,
+        }));
+      } catch (e) {
+        if (e instanceof GraphRefusedError) return refusedResult(e.refusals);
+        throw e;
+      }
+    }
+
+    return { listTools, callTool };
+  }
+
+  return { wrapRegistry, resume };
+}

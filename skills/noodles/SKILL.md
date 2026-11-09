@@ -67,3 +67,18 @@ path cannot handle. Decide, Clean voice (`cleanvoice`), 3D model (`model3d`),
 not skipped at startup. A closed Decide gate is a normal result (`gated`),
 not an error. Unknown node types are still skipped at startup with a stderr
 note.
+
+# Custom workflows and paying in NEAR
+
+`run_noodle` runs a share link (`url`) or a graph you composed (`graph`, a
+`{ nodes, links }` object), with `inputs`. Call `noodle_guide` (free) for the
+node types, wiring rules, an example graph and the priced models, then
+`price_noodle` (free) with the same `graph` and `inputs` to see the estimated
+cost per node, the 20% service fee, the deposit and the likely refund — fix
+anything it lists before running. On a NEAR-paid server a paid call without
+payment returns a quote: send ONE native NEAR transfer of exactly
+`payment.amountYocto` to `payment.payTo`, then repeat the call with the same
+arguments plus `_payment_id`, `_payment_tx` (the transaction hash) and
+`_payment_sender`; the result carries a receipt, and the unused deposit is
+refunded automatically. Repeating the paying call replays the result and never
+charges twice.

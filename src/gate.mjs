@@ -106,6 +106,12 @@ function usdToRaw(usdValue, pair, mode = "floor") {
   return mode === "ceil" ? (num + pair.usdNano - 1n) / pair.usdNano : num / pair.usdNano;
 }
 
+/**
+ * Free custom-workflow helpers (src/tools.mjs). This rail does not run custom
+ * graphs, so it withdraws them along with run_noodle.
+ */
+const FREE_DESIGN_TOOLS = new Set(["price_noodle", "noodle_guide"]);
+
 /** Deterministic hash of (tool, arguments) — a payment id is bound to exactly this call. */
 export function hashArgs(name, args) {
   const stable = (v) => {
@@ -1076,7 +1082,7 @@ export function createChargeGate({
 
       const listTools = () =>
         registry.listTools()
-          .filter((t) => t.name !== runNoodleName)
+          .filter((t) => t.name !== runNoodleName && !FREE_DESIGN_TOOLS.has(t.name))
           .map((t) => {
             const full = registry.tools.find((x) => x.name === t.name);
             const price = priceFor(t.name);
@@ -1120,6 +1126,10 @@ export function createChargeGate({
         if (params.name === runNoodleName) {
           return errResult("run_noodle is not available on this paid server — arbitrary share links can't be " +
             "priced up front. Use the listed tools, or run your own nanoodle-mcp (npx nanoodle-mcp) to run any link.");
+        }
+        if (FREE_DESIGN_TOOLS.has(params.name)) {
+          return errResult(`${params.name} is not available on this Nano-paid server — it does not run custom workflows. ` +
+            "Use the listed tools, or run your own nanoodle-mcp (npx nanoodle-mcp) to design and price workflows.");
         }
         const rawArgs = params.arguments == null ? {} : params.arguments;
         if (typeof rawArgs !== "object" || Array.isArray(rawArgs)) return registry.callTool(params);

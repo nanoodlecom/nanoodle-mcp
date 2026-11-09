@@ -237,7 +237,7 @@ function workflowSampleHtml(name, sample) {
     `<pre>${esc(JSON.stringify(sampleCall(name), null, 2))}</pre></details>`;
 }
 
-function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {} }) {
+function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const authored = authorCount(toolInfo);
@@ -325,6 +325,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
     <p class="tagline">No tab, no tip, no signup.</p>` : ""}
     ${receiptsHtml()}
+    ${paymentNote ? `<div class="card"><h2>What a call costs</h2><p class="muted">${esc(paymentNote)}</p></div>` : ""}
     ${charged ? `<div class="card"><h2>What a call costs</h2>
       <p class="muted">When a tool needs payment, your agent shows you a link with a QR code — scan it with
       any Nano wallet and the result streams back seconds later. What you pay up front is a
@@ -408,7 +409,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
 }
 
 /** The landing page's story as plain text — the version an agent should read. */
-function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] }) {
+function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null }) {
   const authored = authorCount(toolInfo);
   const tools = listTools().filter((t) => t.name !== "run_noodle");
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
@@ -443,6 +444,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [] 
       ``,
     );
   }
+  if (paymentNote) lines.push(`## Payment`, ``, paymentNote, ``);
   lines.push(...receiptsLines(), ``);
   lines.push(`## Tools`, ``);
   for (const t of tools) {
@@ -573,6 +575,8 @@ function payPageHtml(q) {
  * @param {string|null} [opts.commit]  short git sha for initialize serverInfo and GET /version.
  *                                     Omit to read this checkout; null to report commit: null.
  * @param {object|null} [opts.gate]  charge gate (createChargeGate) — null serves free
+ * @param {string|null} [opts.paymentNote]  how calls are paid when another rail (NEAR) gates them;
+ *                                   shown on the landing page and in /llms.txt. No pay page is served for it.
  * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402/card for the landing page and /graph/:name.json
  * @param {object} [opts.costs]  registry.costs — live last-observed-cost records, shown on the landing cards
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
@@ -594,6 +598,7 @@ export async function serveHttp({
   callTool,
   instructions,
   gate = null,
+  paymentNote = null,
   toolInfo = [],
   costs = {},
   outDir = null,
@@ -730,11 +735,11 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (url.pathname === "/") {
-        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs }), "text/html; charset=utf-8");
+        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote }), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/llms.txt") {
-        return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo }), "text/plain; charset=utf-8");
+        return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo, paymentNote }), "text/plain; charset=utf-8");
       }
 
       if (url.pathname === "/version") {
