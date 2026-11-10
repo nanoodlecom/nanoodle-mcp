@@ -63,7 +63,9 @@ const BIN = join(ROOT, "bin", "nanoodle-mcp.mjs");
 const MOCK_MODEL = "z-ai/glm-5.3-flash"; // priced by the local NanoGPT stand-in's catalog
 /** A cheap, non-reasoning chat model in NanoGPT's public catalog ($0.05 / $0.23 per 1M tokens when this was written). */
 export const DEFAULT_REAL_MODEL = "meta-llama/llama-3.3-70b-instruct";
-const ONE_MICRO_NEAR = 10n ** 18n;
+// Half a dust step: every quote is a whole number of 0.000001 NEAR steps, so an amount
+// short by this much can never be the exact amount of some other open quote.
+const HALF_STEP_YOCTO = 5n * 10n ** 17n;
 /** What the local NanoGPT stand-in (tests/fixtures/near-fake-chain.mjs) reports for one chat call. */
 export const MOCK_CHAT_COST_USD = 0.00041;
 
@@ -417,7 +419,7 @@ export async function runTestnetE2E(argv, { print = console.log, rpcFetch, sleep
     const q2r = await mcp.call("run_noodle", args2);
     const q2 = q2r?.structuredContent?.payment;
     if (!check("wrong", q2?.status === "payment_required", "second quote issued", q2 ? `${q2.amountNear} NEAR` : JSON.stringify(q2r?.rpcError || null))) { aborted = true; return finish(); }
-    const sent2 = BigInt(q2.amountYocto) - ONE_MICRO_NEAR;
+    const sent2 = BigInt(q2.amountYocto) - HALF_STEP_YOCTO;
     const P2 = await settledBalance(rpc, P, { sleep });
     let pay2;
     try {

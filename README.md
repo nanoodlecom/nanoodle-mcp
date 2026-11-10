@@ -921,7 +921,7 @@ node scripts/near-testnet-e2e.mjs --keys-dir ~/.near-testnet-nanoodle --mock-mod
 node scripts/near-testnet-e2e.mjs --keys-dir ~/.near-testnet-nanoodle
 ```
 
-Step 3 sends four testnet transactions: a payment, its refund, a payment 0.000001 NEAR
+Step 3 sends four testnet transactions: a payment, its refund, a payment 0.0000005 NEAR
 short (refused, refunded in full, nothing runs) and that refund. It checks the receipt
 against the chain to the yoctoNEAR (deposit − refund = charged), that the charge is the
 model cost + 20% at the quote's locked rate (with `--mock-model`, the stand-in's own

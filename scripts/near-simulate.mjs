@@ -216,10 +216,12 @@ export async function runSimulation({ print = console.log } = {}) {
     agentSees(unpriced);
     expect(unpriced.isError && /someone\/unlisted-model/.test(unpriced.content[0].text), "an unpriceable model is refused and named");
 
-    step("11. Underpay a quote by 0.000001 NEAR");
+    step("11. Underpay a quote by 0.0000005 NEAR");
     const args3 = { graph: WORKED_GRAPH, inputs: { Idea: "underpaid" } };
     const q3 = (await mcp.call("run_noodle", args3)).structuredContent.payment;
-    const short = BigInt(q3.amountYocto) - 10n ** 18n;
+    // Half a dust step: every quote is a whole number of 0.000001 NEAR steps, so this
+    // amount can never be the exact amount of some other open quote.
+    const short = BigInt(q3.amountYocto) - 5n * 10n ** 17n;
     const tx3 = chain.transfer(PAYER, MERCHANT, short);
     ledger.push({ kind: "deposit", yocto: short });
     const runs11 = nano.runs();
