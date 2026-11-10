@@ -1,0 +1,162 @@
+/**
+ * The Markdown deliverable and the buyer-facing messages for a market job.
+ *
+ * The cost section uses the pricing vocabulary of docs/near-payments.md
+ * (estimated cost, itemized per paid node; deposit; actual cost) through the
+ * formatters in src/custom-workflow.mjs, so a buyer reads the same terms here
+ * as from price_noodle.
+ */
+import { estUsd, exactUsd } from "../custom-workflow.mjs";
+import { BRIEF_TEMPLATE } from "./brief.mjs";
+
+/** Markdown hard limit is 256 KiB; stay under it with room for the cost section. */
+export const MAX_DELIVERABLE_BYTES = 240 * 1024;
+/** Text outputs above this many bytes in total go into an attached file instead of the Markdown. */
+export const MAX_INLINE_TEXT_BYTES = 180 * 1024;
+/** Files listed in `files` (the market accepts at most 5 the Markdown does not also link; all are linked too). */
+export const MAX_LISTED_FILES = 5;
+
+const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i;
+
+/** A fenced block that cannot be closed early by the text inside it. */
+function fence(text, info = "text") {
+  const runs = String(text).match(/`{3,}/g) || [];
+  const n = Math.max(3, ...runs.map((r) => r.length + 1));
+  const f = "`".repeat(n);
+  return `${f}${info}\n${text}\n${f}`;
+}
+
+const mdEscape = (s) => String(s).replace(/([\\[\]*_`<>])/g, "\\$1");
+
+/** The pricing summary kept on disk with a record (what priceGraph returned, minus the graph). */
+export function pricingSummary(pricing) {
+  return {
+    estimatedCostUsd: pricing.estimatedCostUsd,
+    fixedPrice: !!pricing.fixedPrice,
+    headroom: pricing.headroom,
+    depositUsd: pricing.depositUsd,
+    items: (pricing.items || []).map((i) => ({
+      nodeId: i.nodeId, node: i.node, type: i.type, model: i.model, basis: i.basis, usd: i.usd, fixedPrice: !!i.fixedPrice,
+    })),
+  };
+}
+
+function actualCostLine(run) {
+  if (run.costUsd == null) return "Actual cost: not reported by the provider for this run.";
+  if (!run.costExact) return `Actual cost: at least $${exactUsd(run.costUsd)} (some calls did not report a price, so this is a lower bound), as reported by NanoGPT.`;
+  return `Actual cost: $${exactUsd(run.costUsd)}, as reported by NanoGPT.`;
+}
+
+/** Lines of the "what this job consumed" section. */
+export function costLines(p, run, { budgetUsd, listingPriceUsd = null } = {}) {
+  const lines = [];
+  lines.push(listingPriceUsd != null
+    ? `You paid the listing's fixed price ($${exactUsd(listingPriceUsd)}) through the marketplace. These are the model costs this run consumed, in the same terms nanoodle-mcp uses for its pay-per-run quotes.`
+    : "You paid the listing's fixed price through the marketplace. These are the model costs this run consumed, in the same terms nanoodle-mcp uses for its pay-per-run quotes.");
+  lines.push("");
+  lines.push("Estimated cost (before the run):");
+  if (p.items.length) for (const i of p.items) lines.push(`- ${mdEscape(i.node)} (${mdEscape(i.model)}): $${estUsd(i.usd)} — ${mdEscape(i.basis)}`);
+  else lines.push("- no paid model steps");
+  lines.push(`- Total estimated cost: $${estUsd(p.estimatedCostUsd)}`);
+  lines.push(`- Deposit: $${exactUsd(p.depositUsd)}, the most this run could cost (estimated cost + 20%, × ${p.headroom === 1.25 ? "1.25 because every model here has a fixed price" : "2 because text, video and audio steps bill by what they produce"}, rounded up to the cent), checked against this agent's per-job budget of $${exactUsd(budgetUsd)} before the job was started.`);
+  lines.push("");
+  lines.push(actualCostLine(run));
+  return lines;
+}
+
+/**
+ * Build the deliverable Markdown.
+ * @param {object} o
+ * @param {object} o.record     the assignment record (pricing, run)
+ * @param {Array<{key, filename, fileUrl}>} o.files  uploaded media outputs, in output order
+ * @param {number} o.budgetUsd
+ * @param {number|null} [o.listingPriceUsd]
+ * @param {string|null} [o.textFileUrl]  when the text outputs were moved to an attached file: its fileUrl
+ */
+export function buildDeliverable({ record, files, budgetUsd, listingPriceUsd = null, textFileUrl = null }) {
+  const p = record.pricing;
+  const run = record.run;
+  const byKey = new Map(files.map((f) => [f.key + "\u0000" + f.filename, f]));
+  const out = [];
+  out.push("# Workflow result", "");
+  out.push(`Your nanoodle workflow ran once on NanoGPT (${run.outputs.length} output${run.outputs.length === 1 ? "" : "s"}). Files are attached to this delivery and linked below.`, "");
+  if (run.notices && run.notices.length) {
+    out.push("Notices from the run:");
+    for (const n of run.notices) out.push(`- ${mdEscape(n)}`);
+    out.push("");
+  }
+  out.push("## Outputs", "");
+  if (textFileUrl) out.push(`The text outputs are long, so they are in the attached file: [text-outputs.md](${textFileUrl})`, "");
+  for (const o of run.outputs) {
+    if (o.kind === "text") {
+      if (textFileUrl) continue;
+      out.push(`### ${mdEscape(o.key)}`, "", fence(o.text), "");
+    } else {
+      const f = byKey.get(o.key + "\u0000" + o.filename);
+      out.push(`### ${mdEscape(o.key)}`, "");
+      if (f && IMAGE_EXT.test(f.filename)) out.push(`![${mdEscape(o.key)}](${f.fileUrl})`, "");
+      out.push(f ? `[${mdEscape(f.filename)}](${f.fileUrl}) (${o.byteSize} bytes)` : `${mdEscape(o.filename)} (not uploaded)`, "");
+    }
+  }
+  if (!run.outputs.length) out.push("The workflow produced no outputs (a gate in the graph may have skipped them).", "");
+  out.push("## What this job consumed", "");
+  out.push(...costLines(p, run, { budgetUsd, listingPriceUsd }), "");
+  const receipt = {
+    nanoodleMarketReceipt: {
+      v: 1,
+      assignmentId: record.id,
+      estimatedCost: {
+        usd: estUsd(p.estimatedCostUsd),
+        fixedPrice: p.fixedPrice,
+        items: p.items.map((i) => ({ ...i, usd: estUsd(i.usd) })),
+      },
+      deposit: { usd: exactUsd(p.depositUsd), headroom: p.headroom === 1.25 ? "1.25" : "2", budgetUsd: exactUsd(budgetUsd) },
+      actualCost: { usd: run.costUsd == null ? null : exactUsd(run.costUsd), exact: !!run.costExact, reportedBy: "NanoGPT" },
+      outputs: run.outputs.map((o) => (o.kind === "text"
+        ? { key: o.key, kind: "text", chars: o.text.length }
+        : { key: o.key, kind: "file", filename: o.filename, byteSize: o.byteSize, fileUrl: (byKey.get(o.key + "\u0000" + o.filename) || {}).fileUrl || null })),
+    },
+  };
+  out.push("<details><summary>Machine-readable receipt</summary>", "", fence(JSON.stringify(receipt, null, 1), "json"), "", "</details>", "");
+  return out.join("\n");
+}
+
+/** Text outputs as one Markdown file, for runs whose text would not fit in the deliverable. */
+export function textOutputsFile(run) {
+  return run.outputs.filter((o) => o.kind === "text").map((o) => `## ${o.key}\n\n${fence(o.text)}\n`).join("\n");
+}
+
+const clip = (s, n) => (s.length <= n ? s : s.slice(0, n - 1) + "…");
+
+/** The decline detail for a brief with no usable request (<= 1000 chars). */
+export function briefDeclineDetail(message) {
+  const head = `Declined before any work; you are refunded in full. ${message}`;
+  const tail = `\n\nExample brief:\n${BRIEF_TEMPLATE}`;
+  return head.length + tail.length <= 1000 ? head + tail : clip(head, 1000);
+}
+
+/** The decline detail for a graph this agent will not run, or one over budget (<= 1000 chars). */
+export function refusalDeclineDetail(refusals, { budgetUsd }) {
+  const lines = [`Declined before any work; you are refunded in full. This workflow cannot run on this agent as written (per-job budget $${exactUsd(budgetUsd)}):`];
+  for (const r of refusals) lines.push(`- ${r.message}`);
+  lines.push("Check a graph for free with price_noodle (nanoodle-mcp), fix it, and hire again.");
+  return clip(lines.join("\n"), 1000);
+}
+
+/** The decline detail for a run that failed or was interrupted after start (<= 1000 chars). */
+export function failureDeclineDetail(kind, message = "") {
+  const why = kind === "interrupted"
+    ? "The worker restarted while your workflow was running. A workflow is never run twice on one hire, so this job is handed back."
+    : `The workflow run failed${message ? `: ${message}` : "."}`;
+  return clip(`${why} You are refunded in full; the model costs already spent are the operator's.`, 1000);
+}
+
+/** The first message on the thread after start. */
+export function startedMessage(p, { budgetUsd }) {
+  return `Started. Your workflow passed the safety checks and runs once now: estimated model cost $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"}, at most $${exactUsd(p.depositUsd)} (this agent's per-job budget is $${exactUsd(budgetUsd)}). The result and an itemized cost report follow as the delivery.`;
+}
+
+/** The thread message when the buyer asks for changes (or a dispute redo sends the job back). */
+export const REWORK_MESSAGE =
+  "This agent runs the submitted workflow exactly once per hire, so it does not run it again on a change request. " +
+  "The delivered result is submitted again unchanged. To run a changed workflow, hire the agent again with the new brief.";

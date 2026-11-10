@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+/**
+ * NEAR Agent Market worker for nanoodle workflows.
+ *
+ *   MARKET_AGENT_TOKEN=aat_… NANOGPT_API_KEY=… \
+ *     node scripts/market-worker.mjs --budget-usd 0.80 --listing-price-usd 1.00
+ *
+ * Polls the market for assignments of the agent the token belongs to, runs
+ * each job brief's workflow once on the operator's NanoGPT key (after the same
+ * safety and pricing checks as the NEAR gate), and submits the result. See
+ * docs/near-agent-market.md.
+ */
+import { parseArgs } from "node:util";
+import { readFileSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { createMarketClient } from "../src/market/client.mjs";
+import { openMarketState } from "../src/market/state.mjs";
+import { createWorkflowRunner } from "../src/market/runner.mjs";
+import { createMarketWorker, logSafe } from "../src/market/worker.mjs";
+
+/** The market's platform fee (GET /v1/platform/config: platform_fee_bps 500), taken from the price on acceptance. */
+export const PLATFORM_FEE_RATE = 0.05;
+
+const HELP = `Usage: node scripts/market-worker.mjs --budget-usd <usd> [options]
+
+Credentials (never logged, never accepted on the command line):
+  MARKET_AGENT_TOKEN        the agent's aat_… token, or
+  --token-file <path>       a file holding it (env MARKET_AGENT_TOKEN_FILE); must be mode 0600
+  NANOGPT_API_KEY           the operator's NanoGPT key, or
+  --nanogpt-key-file <path> a file holding it; must be mode 0600
+
+Options:
+  --budget-usd <n>          per-job budget (env MARKET_JOB_BUDGET_USD), required: a job whose deposit
+                            (the most its run can cost) is above this is declined before any work
+  --listing-price-usd <n>   the listing's price per hire (env MARKET_LISTING_PRICE_USD); when set, the
+                            worker refuses to start unless budget <= price x 0.95 (the market keeps 5%)
+  --base-url <url>          market API (env MARKET_BASE_URL, default https://market.near.ai)
+  --nanogpt-base <url>      NanoGPT API (env NANOGPT_BASE_URL, default https://nano-gpt.com)
+  --state-dir <dir>         durable state (env MARKET_STATE_DIR, default $XDG_STATE_HOME/nanoodle-market,
+                            else ~/.local/state/nanoodle-market); the same directory on every start
+  --poll-seconds <n>        poll interval (default 45; the market asks for 30-60)
+  --concurrency <n>         assignments handled at once (default 2, max 8)
+  --retain-days <n>         keep finished records and their files this long (default 30)
+  --once                    one poll, finish what it started, exit
+  --help`;
+
+const die = (msg) => { process.stderr.write(`market-worker: ${msg}\n`); process.exit(2); };
+
+function readSecretFile(path, what) {
+  let st;
+  try { st = statSync(path); } catch { die(`${what} file not found: ${path}`); }
+  if ((st.mode & 0o077) !== 0) die(`${what} file ${path} is readable by group or others; chmod 600 it`);
+  const v = readFileSync(path, "utf8").trim();
+  if (!v) die(`${what} file ${path} is empty`);
+  return v;
+}
+
+function num(v, name, { min = 0, int = false } = {}) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= min || (int && !Number.isInteger(n))) die(`--${name} must be a ${int ? "whole " : ""}number above ${min}`);
+  return n;
+}
+
+/**
+ * The default state directory: absolute and per user, never relative to the
+ * working directory, so a restart from another shell or from cron finds the
+ * same records (a fresh directory would not know which jobs already ran).
+ */
+export function defaultStateDir(env = process.env) {
+  const xdg = env.XDG_STATE_HOME;
+  return xdg && isAbsolute(xdg) ? join(xdg, "nanoodle-market") : join(homedir(), ".local", "state", "nanoodle-market");
+}
+
+export function readConfig(argv = process.argv.slice(2), env = process.env) {
+  let a;
+  try {
+    a = parseArgs({
+      args: argv,
+      options: {
+        "budget-usd": { type: "string" }, "listing-price-usd": { type: "string" },
+        "base-url": { type: "string" }, "nanogpt-base": { type: "string" },
+        "token-file": { type: "string" }, "nanogpt-key-file": { type: "string" },
+        "state-dir": { type: "string" }, "poll-seconds": { type: "string" },
+        concurrency: { type: "string" }, "retain-days": { type: "string" },
+        once: { type: "boolean" }, help: { type: "boolean" },
+      },
+      strict: true,
+    }).values;
+  } catch (e) { die(`${e.message}\n\n${HELP}`); }
+  if (a.help) { process.stdout.write(HELP + "\n"); process.exit(0); }
+
+  const budgetRaw = a["budget-usd"] ?? env.MARKET_JOB_BUDGET_USD;
+  if (budgetRaw == null) die("--budget-usd is required (the most one job's run may cost you)");
+  const budgetUsd = num(budgetRaw, "budget-usd");
+  const priceRaw = a["listing-price-usd"] ?? env.MARKET_LISTING_PRICE_USD;
+  const listingPriceUsd = priceRaw == null ? null : num(priceRaw, "listing-price-usd");
+  if (listingPriceUsd != null && budgetUsd > listingPriceUsd * (1 - PLATFORM_FEE_RATE) + 1e-9) {
+    die(`--budget-usd ${budgetUsd} is above what a $${listingPriceUsd} hire pays you after the market's 5% fee ($${(listingPriceUsd * (1 - PLATFORM_FEE_RATE)).toFixed(4)}); lower the budget or raise the price`);
+  }
+
+  const tokenFile = a["token-file"] ?? env.MARKET_AGENT_TOKEN_FILE;
+  const token = tokenFile ? readSecretFile(tokenFile, "token") : (env.MARKET_AGENT_TOKEN || "").trim();
+  if (!token) die("no agent token: set MARKET_AGENT_TOKEN or --token-file");
+  if (!/^aat_/.test(token)) process.stderr.write("market-worker: warning: the agent token does not start with aat_\n");
+  const keyFile = a["nanogpt-key-file"];
+  const apiKey = keyFile ? readSecretFile(keyFile, "NanoGPT key") : (env.NANOGPT_API_KEY || "").trim();
+  if (!apiKey) die("no NanoGPT key: set NANOGPT_API_KEY or --nanogpt-key-file");
+
+  const baseUrl = a["base-url"] ?? env.MARKET_BASE_URL ?? "https://market.near.ai";
+  if (!/^https?:\/\//.test(baseUrl)) die("--base-url must be an http(s) URL");
+  const pollSeconds = a["poll-seconds"] != null ? num(a["poll-seconds"], "poll-seconds") : 45;
+  const concurrency = a.concurrency != null ? num(a.concurrency, "concurrency", { int: true }) : 2;
+  if (concurrency > 8) die("--concurrency is at most 8");
+  return {
+    budgetUsd, listingPriceUsd, token, apiKey, baseUrl,
+    nanogptBase: a["nanogpt-base"] ?? env.NANOGPT_BASE_URL ?? undefined,
+    stateDir: resolve(a["state-dir"] ?? env.MARKET_STATE_DIR ?? defaultStateDir(env)),
+    pollMs: pollSeconds * 1000, concurrency,
+    retainMs: (a["retain-days"] != null ? num(a["retain-days"], "retain-days") : 30) * 86_400_000,
+    once: !!a.once,
+  };
+}
+
+/**
+ * The poll loop. On a fatal error (the market rejects the token, the state
+ * directory cannot be written) it stops polling but still waits for the runs
+ * already in flight: they are paid for, and killing them would hand the jobs
+ * back with a full refund after the model cost was spent. `done` resolves to
+ * the exit code (0, or 1 after a fatal error); `stop()` ends polling the same way.
+ * @param {{ tick: () => Promise<void>, drain: () => Promise<void> }} worker
+ * @param {{ close: () => void }} store
+ * @param {{ pollMs: number, once?: boolean, log: (l: string) => void }} o
+ */
+export function runLoop(worker, store, { pollMs, once = false, log }) {
+  let stopping = false;
+  let wake = null;
+  const stop = () => { stopping = true; if (wake) wake(); };
+  const done = (async () => {
+    let code = 0;
+    try {
+      while (!stopping) {
+        await worker.tick();
+        if (once) { await worker.drain(); await worker.tick(); await worker.drain(); break; }
+        await new Promise((r) => { wake = r; setTimeout(r, pollMs); });
+        wake = null;
+      }
+      await worker.drain();
+    } catch (e) {
+      code = 1;
+      log(`stopped: ${(e && e.message) || e}; no new polls, waiting for the runs in flight to finish`);
+      try { await worker.drain(); } catch (e2) { log(`while waiting: ${(e2 && e2.message) || e2}`); }
+    }
+    try { store.close(); } catch { /* already closed */ }
+    return code;
+  })();
+  return { done, stop };
+}
+
+async function main() {
+  const cfg = readConfig();
+  const log = (line) => process.stderr.write(`${new Date().toISOString()} market-worker: ${logSafe(line)}\n`);
+  let store;
+  try { store = openMarketState({ dir: cfg.stateDir }); } catch (e) { die(e.message); }
+  const client = createMarketClient({ baseUrl: cfg.baseUrl, token: cfg.token });
+  const runner = createWorkflowRunner({ apiKey: cfg.apiKey, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
+  const worker = createMarketWorker({
+    client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd,
+    concurrency: cfg.concurrency, retainMs: cfg.retainMs, log,
+  });
+  log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s; per-job budget $${cfg.budgetUsd}${cfg.listingPriceUsd != null ? `, listing price $${cfg.listingPriceUsd}` : ""}; state in ${cfg.stateDir}`);
+
+  const loop = runLoop(worker, store, { pollMs: cfg.pollMs, once: cfg.once, log });
+  let signalled = false;
+  const onSignal = (sig) => {
+    if (signalled) { log(`${sig} again: exiting now; a job that was running is handed back on the next start`); try { store.close(); } catch { /* closed */ } process.exit(1); }
+    signalled = true;
+    log(`${sig}: finishing the jobs in hand (send ${sig} again to exit now)`);
+    loop.stop();
+  };
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.exit(await loop.done);
+}
+
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("market-worker.mjs")) {
+  main();
+}
