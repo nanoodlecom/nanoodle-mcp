@@ -63,12 +63,17 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
 
     /**
      * Check and price a request. Never runs anything, never throws for a bad graph.
+     * @param {object} args
+     * @param {{ budgetUsd?: number }} [o]  the deposit cap for this request (default: the runner's
+     *   budgetUsd). A worker whose listing price changes passes the budget a job was accepted under.
      * @returns {Promise<{ ok: boolean, refusals: Array<{code,message}>, pricing: object|null, inputs: object }>}
      */
-    async price(args) {
+    async price(args, { budgetUsd: cap } = {}) {
+      if (cap !== undefined && !(Number.isFinite(cap) && cap > 0)) throw new TypeError("price: budgetUsd must be a positive number");
+      const limits = cap === undefined ? L : { ...L, maxDepositUsd: cap };
       let computed;
       try {
-        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits: L });
+        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits });
       } catch (e) {
         if (e instanceof GraphArgsError || e instanceof ParamsError) {
           return { ok: false, refusals: [{ code: "BAD_REQUEST", message: e.message }], pricing: null, inputs: {} };

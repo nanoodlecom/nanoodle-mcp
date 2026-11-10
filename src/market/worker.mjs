@@ -41,7 +41,7 @@ import { join } from "node:path";
 import { parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
 import {
-  pricingSummary, buildDeliverable, textOutputsFile, briefDeclineDetail, refusalDeclineDetail, failureDeclineDetail,
+  pricingSummary, buildDeliverable, textOutputsFile, briefDeclineDetail, refusalDeclineDetail, failureDeclineDetail, customNotOfferedDetail,
   startedMessage, REWORK_MESSAGE, MAX_INLINE_TEXT_BYTES, MAX_DELIVERABLE_BYTES, MAX_LISTED_FILES,
 } from "./deliverable.mjs";
 
@@ -71,6 +71,10 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  * @param {{graph: object, inputName: string, label: string}|null} [o.defaultWorkflow]
  *        when set, a brief with no workflow block runs this graph with the brief text as
  *        its `inputName` input (a buyer can hire in plain words)
+ * @param {boolean} [o.customWorkflows]  false: this listing runs only its default workflow; a brief with a
+ *        workflow block is declined before start (default true)
+ * @param {string|null} [o.customHandle]  with customWorkflows false: the handle of a listing that does run
+ *        buyers' own workflows, named in that decline
  * @param {number} [o.concurrency]  assignments advanced at once (default 2)
  * @param {number} [o.backoffMs]    first retry delay after a transient error (default 30 s, doubling to 10 min)
  * @param {number} [o.retainMs]     keep finished records this long (default 30 days)
@@ -79,10 +83,15 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  */
 export function createMarketWorker({
   client, store, runner, budgetUsd, listingPriceUsd = null, defaultWorkflow = null,
-  concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
+  customWorkflows = true, customHandle = null, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
   log: rawLog = () => {}, now = Date.now,
 }) {
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createMarketWorker needs a positive budgetUsd");
+  if (!customWorkflows && !defaultWorkflow) throw new TypeError("createMarketWorker: a listing without custom workflows needs a default workflow");
+  // The current budget and price. They can change while the worker runs (the listing's price
+  // on the market changed); a job keeps the budget it was accepted under (stored on its record).
+  let budgetNow = budgetUsd;
+  let priceNow = listingPriceUsd;
   const log = (line) => rawLog(logSafe(line));
   const inflight = new Map();
   /** Priced requests from this process, by assignment id: { pricing, inputs } (the bound graph is not persisted). */
@@ -105,6 +114,8 @@ export function createMarketWorker({
     return set(rec.id, { attempts, nextAttemptAt: now() + wait, lastError: errText(e) });
   }
   const ok = (fields) => ({ attempts: 0, nextAttemptAt: 0, lastError: null, ...fields });
+  /** The budget a job was accepted under (records from before this field existed: the current one). */
+  const budgetOf = (rec) => (Number.isFinite(rec.budgetUsd) && rec.budgetUsd > 0 ? rec.budgetUsd : budgetNow);
 
   async function progress(id, message, percent) {
     const t = now();
@@ -125,11 +136,22 @@ export function createMarketWorker({
 
   /* ------------------------------ phases ------------------------------ */
 
-  async function priceFromRow(rec, row) {
+  async function priceFromRow(rec, row, jobBudget) {
     let args;
     let usedDefault = false;
-    try { args = parseBrief(row.job && row.job.description); } catch (e) {
+    try {
+      args = parseBrief(row.job && row.job.description);
+      if (!customWorkflows) {
+        log(`assignment ${short(rec.id)}: brief refused (CUSTOM_NOT_OFFERED)`);
+        return { decline: { reason: "rejected", code: "CUSTOM_NOT_OFFERED", detail: customNotOfferedDetail({ label: defaultWorkflow.label, customHandle }) } };
+      }
+    } catch (e) {
       if (!(e instanceof BriefError)) throw e;
+      if (!customWorkflows && e.code !== "NO_REQUEST") {
+        // A workflow block that does not parse: the buyer meant a workflow, which this listing does not run.
+        log(`assignment ${short(rec.id)}: brief refused (CUSTOM_NOT_OFFERED, ${e.code})`);
+        return { decline: { reason: "rejected", code: "CUSTOM_NOT_OFFERED", detail: customNotOfferedDetail({ label: defaultWorkflow.label, customHandle }) } };
+      }
       // A brief in plain words (no workflow block at all) runs the operator's default
       // workflow, with the brief as its input. A block that is there but broken is still
       // refused: the buyer meant a specific workflow, and guessing would spend their hire.
@@ -142,24 +164,29 @@ export function createMarketWorker({
       usedDefault = true;
       log(`assignment ${short(rec.id)}: plain brief (${plain.length} characters) → default workflow ${JSON.stringify(defaultWorkflow.label)}`);
     }
-    const priced = await runner.price(args);
+    const priced = await runner.price(args, { budgetUsd: jobBudget });
     if (!priced.ok) {
       const transient = priced.refusals.some((r) => r.code === "CATALOG_UNAVAILABLE");
       if (transient) return { transient: new Error("the NanoGPT model catalog is unavailable") };
       const codes = [...new Set(priced.refusals.map((r) => r.code))];
       log(`assignment ${short(rec.id)}: workflow refused (${codes.join(", ")})`);
-      return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd }) } };
+      return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd: jobBudget }) } };
     }
     return { pricing: priced.pricing, inputs: priced.inputs, usedDefault };
   }
 
   async function phaseNew(rec, row) {
-    const r = await priceFromRow(rec, row);
+    const jobBudget = budgetNow;
+    const jobPrice = priceNow;
+    const r = await priceFromRow(rec, row, jobBudget);
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
     prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault });
-    log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, deposit $${r.pricing.depositUsd} within budget $${budgetUsd}`);
-    return set(rec.id, ok({ phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null }));
+    log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, deposit $${r.pricing.depositUsd} within budget $${jobBudget}`);
+    return set(rec.id, ok({
+      phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
+      budgetUsd: jobBudget, listingPriceUsd: jobPrice,
+    }));
   }
 
   async function phaseDeclining(rec) {
@@ -197,16 +224,18 @@ export function createMarketWorker({
   }
 
   async function phaseStarted(rec, row) {
+    const jobBudget = budgetOf(rec);
     let prep = prepared.get(rec.id);
     if (!prep) {
-      // Restarted between start and run: nothing ran yet. Price again from the brief.
-      const r = await priceFromRow(rec, row);
+      // Restarted between start and run: nothing ran yet. Price again from the brief,
+      // against the budget the job was accepted under.
+      const r = await priceFromRow(rec, row, jobBudget);
       if (r.transient) return backoff(rec, r.transient);
       if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
       prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
     }
     prepared.delete(rec.id);
-    await say(rec.id, startedMessage(prep.pricing, { budgetUsd, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null }), `nanoodle-start-${rec.id}`);
+    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null }), `nanoodle-start-${rec.id}`);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now() }));
     await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
@@ -286,7 +315,10 @@ export function createMarketWorker({
     const delivered = jobs.filter((j) => j.out && up[j.key] && up[j.key].completed)
       .map((j) => ({ key: j.out.key, filename: j.filename, fileUrl: up[j.key].fileUrl || up[j.key].fileId }));
     const textFileUrl = up.text && up.text.completed ? up.text.fileUrl || up.text.fileId : null;
-    let markdown = buildDeliverable({ record: rec, files: delivered, budgetUsd, listingPriceUsd, textFileUrl });
+    let markdown = buildDeliverable({
+      record: rec, files: delivered, budgetUsd: budgetOf(rec),
+      listingPriceUsd: rec.listingPriceUsd !== undefined ? rec.listingPriceUsd : priceNow, textFileUrl,
+    });
     if (Buffer.byteLength(markdown) > MAX_DELIVERABLE_BYTES) {
       markdown = markdown.slice(0, MAX_DELIVERABLE_BYTES / 2) + "\n\n(The deliverable was cut to fit the market's 256 KiB limit.)\n";
     }
@@ -455,5 +487,15 @@ export function createMarketWorker({
     while (inflight.size) await Promise.allSettled([...inflight.values()]);
   }
 
-  return { tick, drain, inflight: () => inflight.size };
+  /**
+   * Change the budget and price for jobs not yet accepted (the listing's price changed on the
+   * market). A job already accepted keeps the budget it was accepted under.
+   */
+  function setBudget({ budgetUsd: b, listingPriceUsd: p = priceNow }) {
+    if (!(Number.isFinite(b) && b > 0)) throw new TypeError("setBudget needs a positive budgetUsd");
+    budgetNow = b;
+    priceNow = p;
+  }
+
+  return { tick, drain, setBudget, budget: () => ({ budgetUsd: budgetNow, listingPriceUsd: priceNow }), inflight: () => inflight.size };
 }

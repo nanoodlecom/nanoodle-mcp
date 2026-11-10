@@ -76,6 +76,48 @@ test("the worker runs inside the server: a plain-language hire is delivered; SIG
   } finally { if (srv.child.exitCode === null) await srv.kill(); await m.close(); await nano.close(); hook.closeAllConnections?.(); await new Promise((r) => hook.close(r)); }
 });
 
+test("several listings inside the server (MARKET_AGENTS_FILE): each hire runs on its listing, the webhook names it, SIGTERM drains all", { timeout: 90_000 }, async () => {
+  const nano = nanoGptMock(); await nano.listen();
+  const TOKEN2 = "aat_" + "fedcba9876543210".repeat(2);
+  const m = createMarketMock({ handle: "img-one", priceAmount: "0.50" }); await m.listen();
+  m.addAgent({ handle: "wf-any", token: TOKEN2, priceAmount: "1.00" });
+  const dir = mkdtempSync(join(tmpdir(), "market-in-server-catalog-"));
+  const graph = join(dir, "img.json"); writeFileSync(graph, JSON.stringify({ ...WORKED_GRAPH, name: "Idea to image" }));
+  writeFileSync(join(dir, "img-one.token"), MOCK_TOKEN, { mode: 0o600 });
+  writeFileSync(join(dir, "wf-any.token"), TOKEN2, { mode: 0o600 });
+  const catalog = join(dir, "catalog.json");
+  writeFileSync(catalog, JSON.stringify({ agents: [
+    { handle: "img-one", tokenFile: join(dir, "img-one.token"), graph, custom: false },
+    { handle: "wf-any", tokenFile: join(dir, "wf-any.token"), graph: null, custom: true, priceUsd: 1 },
+    { handle: "not-yet", tokenFile: join(dir, "not-yet.token"), graph: null, custom: true, priceUsd: 1 },
+  ] }));
+  const pings = [];
+  const hook = http.createServer((req, res) => { let b = ""; req.on("data", (c) => { b += c; }); req.on("end", () => { pings.push(JSON.parse(b).text); res.end("ok"); }); });
+  await new Promise((r) => hook.listen(0, "127.0.0.1", r));
+  const hookUrl = `http://127.0.0.1:${hook.address().port}/services/T000/secret-path`;
+  const srv = await serve({ NANOGPT_BASE_URL: nano.url, MARKET_BASE_URL: m.url, MARKET_AGENTS_FILE: catalog, MARKET_POLL_SECONDS: "1", MARKET_NOTIFY_URL: hookUrl });
+  try {
+    await srv.until(/market worker: polling http\S+ every 1 s for 2 listings \(img-one, wf-any\)/);
+    assert.match(srv.stderr(), /market worker: \[not-yet\] skipped: no token file/);
+    assert.match(srv.stderr(), /market worker: \[img-one\] price \$0\.50 \(from the market\); per-job budget \$0\.47/);
+    assert.match(srv.stderr(), /market worker: the agents file replaces MARKET_DEFAULT_GRAPH; it is ignored/);
+    const a = m.hire({ agent: "img-one", description: "A poster for a small coffee shop opening on Saturday." });
+    const b = m.hire({ agent: "wf-any", description: `Run mine\n\n\`\`\`nanoodle\n${JSON.stringify({ graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } })}\n\`\`\`\n` });
+    const t0 = Date.now();
+    while (m.rows.get(a).assignment.status !== "submitted" || m.rows.get(b).assignment.status !== "submitted") {
+      if (Date.now() - t0 > 70_000) throw new Error("not delivered:\n" + srv.stderr());
+      await sleep(200);
+    }
+    for (let i = 0; i < 100 && pings.filter((t) => /: delivered$/.test(t)).length < 2; i++) await sleep(50);
+    assert.ok(pings.some((t) => /^nanoodle market: \[img-one\] assignment \w+: delivered$/.test(t)), JSON.stringify(pings));
+    assert.ok(pings.some((t) => /^nanoodle market: \[wf-any\] assignment \w+: delivered$/.test(t)), JSON.stringify(pings));
+    assert.ok(!srv.stderr().includes(MOCK_TOKEN) && !srv.stderr().includes(TOKEN2) && !srv.stderr().includes(NANO_KEY) && !srv.stderr().includes("secret-path"));
+    srv.child.kill("SIGTERM");
+    assert.deepEqual(await srv.exited, { code: 0, sig: null });
+    assert.deepEqual(m.violations, []);
+  } finally { if (srv.child.exitCode === null) await srv.kill(); await m.close(); await nano.close(); hook.closeAllConnections?.(); await new Promise((r) => hook.close(r)); }
+});
+
 test("a broken market setting leaves the MCP server serving with the worker off", { timeout: 60_000 }, async () => {
   const nano = nanoGptMock(); await nano.listen();
   // budget above what a $0.10 hire pays after the fee

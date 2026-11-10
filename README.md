@@ -103,8 +103,8 @@ claimed.
     agent composes.
   - `src/near-gate.mjs`: the NEAR payment gate, `run_noodle` with an inline `graph`, the
     free `price_noodle` and `noodle_guide` tools.
-  - `src/market/` and `scripts/market-*.mjs`: the NEAR Agent Market worker
-    ([docs/near-agent-market.md](docs/near-agent-market.md)).
+  - `src/market/` and `scripts/market-*`: the NEAR Agent Market worker, its listing catalog
+    and price check ([docs/near-agent-market.md](docs/near-agent-market.md)).
   - `scripts/near-simulate.mjs`, `scripts/near-check-tx.mjs`, `scripts/near-pay.mjs`,
     `scripts/near-testnet-*.mjs`, the tests for all of the above, and the docs.
   - `src/near/rates.mjs`: NEAR/USD, XNO/USD and the NEAR→XNO swap rate derived from

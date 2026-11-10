@@ -15,6 +15,14 @@
  * idempotent by clientRequestId; files are reserved, PUT to a presigned URL
  * with no extra headers, then completed; an identical resubmission while
  * `submitted` is a no-op; decline needs a reason and refunds the buyer.
+ *
+ * Listings and prices (for the catalog worker): GET /v1/agents/{id_or_handle},
+ * GET /v1/agents/{agent_id}/pricing-plans and PATCH /v1/pricing-plans/{id}, in
+ * the schemas AgentPublic / PricingPlan / PatchPricingPlanRequest (same file,
+ * read 2026-11-10; a live listing's answers were compared field by field).
+ * Visibility follows the OpenAPI notes: a non-live agent is 404 to the public
+ * and pricing plans are "public sees only live". What an agent token may read
+ * or change is NOT documented: `tokenReadsDraft` and `pricePatch` choose it.
  */
 import http from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -42,6 +50,23 @@ export const MARKET_SCHEMAS = Object.freeze({
   "CompleteFileResponse": {"type":"object","required":["fileId","filename","byteSize","sha256","contentType"],"properties":{"byteSize":{"type":"integer","format":"int64"},"contentType":{"type":"string"},"fileId":{"type":"string","format":"uuid"},"filename":{"type":"string"},"sha256":{"type":"string"}}},
   "SubmitRequest": {"type":"object","required":["deliverableMarkdown"],"properties":{"deliverableMarkdown":{"type":"string"},"files":{"type":"array","items":{"type":"string"}}}},
   "ThreadMessage": {"allOf":[{"$ref":"#/components/schemas/AssignmentMessage"},{"type":"object","required":["attachments"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/AttachmentBrief"}}}}]},
+  "AgentPublic": {"type":"object","required":["agent_id","owner_account_id","handle","name","category","tags","runtime","listing_status","delivered_jobs","sla_seconds","required_slots","funding_paused","availability","created_at","updated_at"],"properties":{"agent_id":{"type":"string","format":"uuid"},"availability":{"$ref":"#/components/schemas/AgentAvailability"},"available_now":{"type":["boolean","null"]},"avatar_url":{"type":["string","null"]},"bio_markdown":{"type":["string","null"]},"builder":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/BuilderSummary"}]},"category":{"$ref":"#/components/schemas/Category"},"created_at":{"type":"string","format":"date-time"},"delivered_jobs":{"type":"integer","format":"int32"},"description":{"type":["string","null"]},"funding_paused":{"type":"boolean"},"handle":{"type":"string"},"input_schema":{},"listing_status":{"$ref":"#/components/schemas/ListingStatus"},"media":{"type":"array","items":{"$ref":"#/components/schemas/AgentMediaPublic"}},"name":{"type":"string"},"output_schema":{},"owner_account_id":{"type":"string","format":"uuid"},"payable_with":{"type":["array","null"],"items":{"type":"string"}},"required_slots":{"type":"array","items":{"$ref":"#/components/schemas/RequiredSlot"}},"response_time_seconds_median":{"type":["integer","null"],"format":"int32"},"runtime":{"$ref":"#/components/schemas/Runtime"},"sla_seconds":{"type":"integer","format":"int32"},"success_rate":{"type":["integer","null"],"format":"int32"},"tags":{"type":"array","items":{"type":"string"}},"updated_at":{"type":"string","format":"date-time"}}},
+  "AgentAvailability": {"type":"string","enum":["available","paused","suspended","unavailable_funding"]},
+  "BuilderSummary": {"type":"object","required":["account_id","display_name","verification"],"properties":{"account_id":{"type":"string","format":"uuid"},"display_name":{"type":"string"},"proven":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/ProvenChip"}]},"verification":{"$ref":"#/components/schemas/BuilderVerification"}}},
+  "ProvenChip": {"type":"object","required":["jobs","acceptance_pct","buyers","dispute_window_days"],"properties":{"acceptance_pct":{"type":"integer","format":"int64"},"buyers":{"type":"integer","format":"int64"},"dispute_window_days":{"type":"integer","format":"int64"},"jobs":{"type":"integer","format":"int64"}}},
+  "BuilderVerification": {"type":"object","required":["level"],"properties":{"level":{"$ref":"#/components/schemas/VerificationLevel"},"since":{"type":["string","null"],"format":"date-time"}}},
+  "VerificationLevel": {"type":"string","enum":["none","verified","identity_verified"]},
+  "Category": {"type":"string","enum":["automation","creative","customer_support","data","dev_tools","events","finance","legal_compliance","marketing","operations","research","sales","travel","other"]},
+  "ListingStatus": {"type":"string","enum":["draft","live","paused","archived"]},
+  "AgentMediaPublic": {"type":"object","required":["media_id","kind","url"],"properties":{"caption":{"type":["string","null"]},"embed_url":{"type":["string","null"]},"height":{"type":["integer","null"],"format":"int32"},"kind":{"$ref":"#/components/schemas/AgentMediaKind"},"media_id":{"type":"string","format":"uuid"},"provider":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/VideoProvider"}]},"thumbnail_url":{"type":["string","null"]},"url":{"type":"string"},"width":{"type":["integer","null"],"format":"int32"}}},
+  "AgentMediaKind": {"type":"string","enum":["image","video"]},
+  "VideoProvider": {"type":"string","enum":["youtube","vimeo","loom"]},
+  "RequiredSlot": {"type":"object","required":["key","label"],"properties":{"access":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/SlotAccess"}]},"capability":{"type":["string","null"]},"connector_slugs":{"type":"array","items":{"type":"string"}},"hint":{"type":["string","null"]},"key":{"type":"string"},"label":{"type":"string"},"optional":{"type":"boolean"}}},
+  "SlotAccess": {"type":"string","enum":["read","full"]},
+  "Runtime": {"type":"string","enum":["http","managed","human"]},
+  "PricingPlan": {"type":"object","required":["pricing_plan_id","agent_id","model","price_amount","is_default","listing_status","created_at","updated_at"],"properties":{"agent_id":{"type":"string","format":"uuid"},"billing_period":{"type":["string","null"]},"config":{},"created_at":{"type":"string","format":"date-time"},"description":{"type":["string","null"]},"display_name":{"type":["string","null"]},"is_default":{"type":"boolean"},"listing_status":{"$ref":"#/components/schemas/ListingStatus"},"model":{"$ref":"#/components/schemas/PricingModel"},"price_amount":{"type":"string"},"pricing_plan_id":{"type":"string","format":"uuid"},"sla_seconds":{"type":["integer","null"],"format":"int32"},"task_unit":{"type":["string","null"]},"updated_at":{"type":"string","format":"date-time"}}},
+  "PricingModel": {"type":"string","enum":["per_call","per_task","subscription"]},
+  "PatchPricingPlanRequest": {"type":"object","properties":{"billing_period":{"type":["string","null"]},"config":{},"description":{"type":["string","null"]},"display_name":{"type":["string","null"]},"listing_status":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/ListingStatus"}]},"price_amount":{"type":["string","null"]},"sla_seconds":{"type":["integer","null"],"format":"int32"},"task_unit":{"type":["string","null"]}}},
 });
 
 /* ------------------------------------------------------------------ */
@@ -107,10 +132,38 @@ const MAX_FILE = 100 * 1024 * 1024;
  * fail: `drop` handles it and then cuts the connection with no answer (the
  * request took effect, the caller cannot know), `status` answers an error
  * without handling it.
+ *
+ * Agents: the mock starts with one agent (`token`, `handle`, `priceAmount`,
+ * `listingStatus`); `addAgent()` adds more, each with its own token. Every
+ * worker route acts only on the calling token's agent. `hire({ agent })` picks
+ * the agent by handle (default: the first).
+ *
+ * `tokenReadsDraft` (default true): an agent's own token reads its agent and
+ * plans when they are not live. `pricePatch`: "forbidden" (default; 403 to an
+ * agent token) or "allowed" (the token may change its own plans' price).
  */
-export function createMarketMock({ token = MOCK_TOKEN, now = () => Date.now() } = {}) {
-  const agentId = randomUUID();
+export function createMarketMock({
+  token = MOCK_TOKEN, handle = "nanoodle-test", priceAmount = "1.00", listingStatus = "live",
+  tokenReadsDraft = true, pricePatch = "forbidden", now = () => Date.now(),
+} = {}) {
   const ownerAccountId = randomUUID();
+  const agents = new Map(); // agentId -> { agentId, handle, token, listingStatus, plans: [PricingPlan] }
+  const iso0 = () => new Date(now()).toISOString();
+  function addAgent({ handle: h, token: t, priceAmount: price = "1.00", listingStatus: st = "live" }) {
+    const id = randomUUID();
+    const plan = {
+      pricing_plan_id: randomUUID(), agent_id: id, model: "per_call", display_name: "Default", description: null,
+      price_amount: String(price), sla_seconds: null, billing_period: null, task_unit: null, config: null,
+      is_default: true, listing_status: st, created_at: iso0(), updated_at: iso0(),
+    };
+    const ag = { agentId: id, handle: h, token: t, listingStatus: st, plans: [plan], createdAt: iso0() };
+    agents.set(id, ag);
+    return ag;
+  }
+  const agentByHandle = (h) => [...agents.values()].find((x) => x.handle === h) || null;
+  const primary = addAgent({ handle, token, priceAmount, listingStatus });
+  const agentId = primary.agentId;
+  const opts = { tokenReadsDraft, pricePatch };
   const rows = new Map(); // assignmentId -> { assignment, job, latestMessage, messages, progress, versions, lastProgressAt }
   const files = new Map(); // fileId -> { fileId, filename, byteSize, token, link, bytes, completed, jobId }
   const requests = [];
@@ -120,13 +173,15 @@ export function createMarketMock({ token = MOCK_TOKEN, now = () => Date.now() } 
   let server = null;
   const iso = (ms = now()) => new Date(ms).toISOString();
 
-  function hire({ title = "nanoodle workflow", description, priceUsd = "1.000000000000", escrowToken = "USD", slaSeconds = 3600, jobKind = "instant" }) {
+  function hire({ title = "nanoodle workflow", description, priceUsd = "1.000000000000", escrowToken = "USD", slaSeconds = 3600, jobKind = "instant", agent = null }) {
     const t = now();
+    const worker = agent ? agentByHandle(agent) : primary;
+    if (!worker) throw new Error(`mock: no agent ${agent}`);
     const assignmentId = randomUUID();
     const jobId = randomUUID();
     rows.set(assignmentId, {
       assignment: {
-        assignmentId, jobId, workerAgentId: agentId, bidId: null, status: "in_progress",
+        assignmentId, jobId, workerAgentId: worker.agentId, bidId: null, status: "in_progress",
         escrowAmount: priceUsd, escrowToken, slaSeconds, slaDeadlineAt: iso(t + slaSeconds * 1000),
         acceptanceWindowDays: 3, createdAt: iso(t), updatedAt: iso(t),
         startedAt: null, submittedAt: null, deliverableUrl: null, deliverableHash: null,
@@ -143,7 +198,7 @@ export function createMarketMock({ token = MOCK_TOKEN, now = () => Date.now() } 
   const pushMessage = (r, side, body, extra = {}) => {
     const m = {
       messageId: randomUUID(), assignmentId: r.assignment.assignmentId,
-      senderAccountId: side === "worker" ? ownerAccountId : randomUUID(), senderAgentId: side === "worker" ? agentId : null,
+      senderAccountId: side === "worker" ? ownerAccountId : randomUUID(), senderAgentId: side === "worker" ? r.assignment.workerAgentId : null,
       origin: "direct", body, createdAt: iso(), attachments: [], senderSide: side, ...extra,
     };
     r.messages.push(m);
@@ -218,7 +273,46 @@ export function createMarketMock({ token = MOCK_TOKEN, now = () => Date.now() } 
       return f ? { status: 200, raw: f.bytes, headers: { "content-type": contentTypeOf(f.filename) } } : { status: 404, text: "not found" };
     }
 
-    if (headers.authorization !== `Bearer ${token}`) return err(401, "unauthorized");
+    const caller = [...agents.values()].find((x) => headers.authorization === `Bearer ${x.token}`) || null;
+
+    // Listings and prices: public reads (an agent's own token may also see its drafts).
+    const publicAgent = (ag) => ({
+      agent_id: ag.agentId, owner_account_id: ownerAccountId, handle: ag.handle, name: ag.handle, description: null, bio_markdown: null,
+      avatar_url: null, category: "creative", tags: ["workflow"], runtime: "http", listing_status: ag.listingStatus,
+      delivered_jobs: 0, success_rate: null, response_time_seconds_median: null, sla_seconds: 3600, required_slots: [],
+      funding_paused: false, availability: "available", available_now: ag.listingStatus === "live", builder: null,
+      payable_with: ["USD", "USDC"], media: [], created_at: ag.createdAt, updated_at: ag.createdAt,
+    });
+    const ownerView = (ag) => caller && caller.agentId === ag.agentId && opts.tokenReadsDraft;
+    if (method === "GET" && (m = /^\/v1\/agents\/([^/]+)\/pricing-plans$/.exec(path))) {
+      if (!UUID.test(m[1])) return err(400, "validation_error", "agent_id must be a uuid");
+      const ag = agents.get(m[1]);
+      if (!ag || (ag.listingStatus !== "live" && !ownerView(ag))) return err(404, "not_found", "not found");
+      const plans = ownerView(ag) ? ag.plans : ag.plans.filter((p) => p.listing_status === "live");
+      return { status: 200, json: plans.map((p) => ({ ...p })), schema: { type: "array", items: { $ref: "#/components/schemas/PricingPlan" } } };
+    }
+    if (method === "GET" && (m = /^\/v1\/agents\/([^/]+)$/.exec(path)) && m[1] !== "me") {
+      const ag = agents.get(m[1]) || agentByHandle(m[1]);
+      if (!ag || (ag.listingStatus !== "live" && !ownerView(ag))) return err(404, "not_found", "not found");
+      return { status: 200, json: publicAgent(ag), schema: "AgentPublic" };
+    }
+    if (method === "PATCH" && (m = /^\/v1\/pricing-plans\/([^/]+)$/.exec(path))) {
+      if (!caller) return err(401, "unauthorized");
+      const ag = [...agents.values()].find((x) => x.plans.some((p) => p.pricing_plan_id === m[1]));
+      if (!ag) return err(404, "not_found");
+      if (opts.pricePatch !== "allowed" || ag.agentId !== caller.agentId) return err(403, "forbidden", "not a member of the owning account");
+      const bad = bodyCheck("PatchPricingPlanRequest"); if (bad) return bad;
+      const plan = ag.plans.find((p) => p.pricing_plan_id === m[1]);
+      if (body.price_amount != null) {
+        if (!/^\d+(\.\d{1,6})?$/.test(body.price_amount) || Number(body.price_amount) <= 0) return err(400, "validation_error", "unparseable price");
+        plan.price_amount = Number(body.price_amount).toFixed(4);
+      }
+      plan.updated_at = iso();
+      return { status: 200, json: { ...plan }, schema: "PricingPlan" };
+    }
+
+    if (!caller) return err(401, "unauthorized");
+    const mine = (r) => r && r.assignment.workerAgentId === caller.agentId;
 
     if (method === "GET" && path === "/v1/agents/me/assignments") {
       const status = query.get("status") || "in_progress";
@@ -227,13 +321,13 @@ export function createMarketMock({ token = MOCK_TOKEN, now = () => Date.now() } 
       if (!(Number.isInteger(limit) && limit >= 1 && limit <= 100) || !(Number.isInteger(offset) && offset >= 0)) return err(400, "validation_error", "limit 1..=100, offset >= 0");
       const statuses = MARKET_SCHEMAS.AssignmentStatus.enum;
       if (status !== "all" && !statuses.includes(status)) return err(400, "validation_error", "bad status filter");
-      const list = [...rows.values()].filter((r) => status === "all" || r.assignment.status === status).sort((a, b) => b.seq - a.seq);
+      const list = [...rows.values()].filter((r) => mine(r) && (status === "all" || r.assignment.status === status)).sort((a, b) => b.seq - a.seq);
       return { status: 200, json: { assignments: list.slice(offset, offset + limit).map(item) }, schema: "MyAssignmentsResponse" };
     }
 
     if ((m = /^\/v1\/assignments\/([^/]+)\/(start|decline|progress|messages|submit)$/.exec(path)) && method === "POST") {
       const r = rows.get(m[1]);
-      if (!r) return err(404, "not_found");
+      if (!r || !mine(r)) return err(404, "not_found");
       const a = r.assignment;
       switch (m[2]) {
         case "start": {
@@ -394,6 +488,18 @@ export function createMarketMock({ token = MOCK_TOKEN, now = () => Date.now() } 
 
   return {
     agentId,
+    agents,
+    /** Add a listing with its own token: { handle, token, priceAmount?, listingStatus? }. */
+    addAgent,
+    agent: agentByHandle,
+    /** Change a listing's default price on the market (as its owner would on the website). */
+    setPrice(h, amount) { const p = agentByHandle(h).plans.find((x) => x.is_default); p.price_amount = String(amount); p.updated_at = iso(); },
+    /** Change a listing's status (the agent and its plans), e.g. "draft" → "live". */
+    setListingStatus(h, st) { const ag = agentByHandle(h); ag.listingStatus = st; for (const p of ag.plans) p.listing_status = st; },
+    /** "allowed" | "forbidden": may an agent token PATCH its own plan's price. */
+    set pricePatch(v) { opts.pricePatch = v; },
+    get pricePatch() { return opts.pricePatch; },
+    set tokenReadsDraft(v) { opts.tokenReadsDraft = !!v; },
     rows,
     files,
     requests,

@@ -137,6 +137,18 @@ export function briefDeclineDetail(message) {
   return head.length + tail.length <= 1000 ? head + tail : clip(head, 1000);
 }
 
+/**
+ * The decline detail for a workflow block sent to a listing that runs only its own
+ * workflow (<= 1000 chars). Names the listing that runs buyers' workflows, on the market.
+ */
+export function customNotOfferedDetail({ label, customHandle = null }) {
+  const lines = [
+    `Declined before any work; you are refunded in full. This listing runs only its own workflow (${label}). Write your request in plain words, without a workflow block, and hire it again.`,
+  ];
+  if (customHandle) lines.push(`To run your own nanoodle workflow, hire https://market.near.ai/a/${customHandle} instead.`);
+  return clip(lines.join(" "), 1000);
+}
+
 /** The decline detail for a graph this agent will not run, or one over budget (<= 1000 chars). */
 export function refusalDeclineDetail(refusals, { budgetUsd }) {
   const lines = [`Declined before any work; you are refunded in full. This workflow cannot run on this agent as written (per-job budget $${exactUsd(budgetUsd)}):`];

@@ -5,6 +5,11 @@
  *   MARKET_AGENT_TOKEN=aat_… NANOGPT_API_KEY=… \
  *     node scripts/market-worker.mjs --budget-usd 0.80 --listing-price-usd 1.00
  *
+ * Several listings at once, each with its own token, workflow, state and the
+ * price read from the market:
+ *
+ *   NANOGPT_API_KEY=… node scripts/market-worker.mjs --agents-file scripts/market-catalog.json
+ *
  * Polls the market for assignments of the agent the token belongs to, runs
  * each job brief's workflow once on the operator's NanoGPT key (after the same
  * safety and pricing checks as the NEAR gate), and submits the result. See

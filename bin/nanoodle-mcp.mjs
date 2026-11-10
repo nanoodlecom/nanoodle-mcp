@@ -603,7 +603,7 @@ async function main() {
 
   // NEAR Agent Market worker, inside this server: it pays NanoGPT exactly as the server
   // does (API key, or the Nano wallet through x402) and shares the wallet's one send queue.
-  if (process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
+  if (process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
     await startMarketWorkerInServer({ apiKey, wallet });
   }
 }
@@ -611,8 +611,10 @@ async function main() {
 /**
  * Start the Agent Market worker in this process. A problem here never stops the
  * MCP server: it is logged as "market worker: OFF" and the server carries on.
- * Settings come from the environment only (MARKET_AGENT_TOKEN_FILE, MARKET_JOB_BUDGET_USD,
- * MARKET_LISTING_PRICE_USD, MARKET_DEFAULT_GRAPH, MARKET_DEFAULT_INPUT, MARKET_STATE_DIR).
+ * Settings come from the environment only: one listing (MARKET_AGENT_TOKEN_FILE, MARKET_JOB_BUDGET_USD,
+ * MARKET_LISTING_PRICE_USD, MARKET_DEFAULT_GRAPH, MARKET_DEFAULT_INPUT), or several from a catalog
+ * (MARKET_AGENTS_FILE, MARKET_PRICE_REFRESH_SECONDS, MARKET_AUTO_PRICE); and MARKET_STATE_DIR.
+ * With a catalog, log lines name the listing ("[handle] …") and SIGTERM drains every listing.
  */
 async function startMarketWorkerInServer({ apiKey, wallet }) {
   const say = (line) => console.error("nanoodle-mcp: market worker: " + line);

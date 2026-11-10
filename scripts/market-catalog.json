@@ -1,0 +1,14 @@
+{
+  "agents": [
+    { "handle": "nanoodle-song", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-song",
+      "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false },
+    { "handle": "nanoodle-image", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image",
+      "graph": "scripts/market-idea-to-image.json", "custom": false },
+    { "handle": "nanoodle-image-arena", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image-arena",
+      "graph": "scripts/market-image-arena.json", "custom": false },
+    { "handle": "nanoodle-clip", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-clip",
+      "graph": "scripts/market-idea-to-clip.json", "custom": false },
+    { "handle": "nanoodle-workflows", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-workflows",
+      "graph": null, "custom": true, "priceUsd": 1.00 }
+  ]
+}
