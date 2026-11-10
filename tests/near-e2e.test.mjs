@@ -13,7 +13,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runSimulation, startServer, mcpClient, freePort } from "../scripts/near-simulate.mjs";
-import { runDualSimulation } from "../scripts/dual-simulate.mjs";
+import { runDualSimulation, nanoNode } from "../scripts/dual-simulate.mjs";
+import { randomBytes } from "node:crypto";
 import { createFakeChain, throwawayNearKey, nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { parseNearToYocto } from "../src/near/amount.mjs";
 
@@ -142,5 +143,70 @@ test("NEAR mode refuses unsafe configurations at startup", { timeout: 60_000 }, 
   } finally {
     await mainnet.close();
     await testnet.close();
+  }
+});
+
+/** Start the bin with both rails and wait until it serves; resolves { stderr(), kill }. */
+async function startDual({ graphsDir, outDir, port, nearRpc, nanoRpc, nanoUrl, secretKey }) {
+  const child = spawn(process.execPath, [
+    BIN, "--graphs", graphsDir, "--out", outDir, "--serve", `127.0.0.1:${port}`,
+    "--charge-usd", "0.05", "--nano-rpc", nanoRpc, "--no-local-work", "--near-usd", "3.64",
+    "--near-merchant", "merchant.testnet", "--near-network", "testnet", "--near-rpc", nearRpc,
+  ], {
+    env: { PATH: process.env.PATH, HOME: outDir, NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: nanoUrl, NANO_SEED: randomBytes(32).toString("hex"), NEAR_PRIVATE_KEY: secretKey },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (c) => { stderr += c; });
+  const t0 = Date.now();
+  while (!/MCP over HTTP on/.test(stderr)) {
+    if (child.exitCode !== null) throw new Error("server exited during startup:\n" + stderr);
+    if (Date.now() - t0 > 30_000) { child.kill("SIGKILL"); throw new Error("server did not start:\n" + stderr); }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return { stderr: () => stderr, kill: () => new Promise((r) => { child.once("exit", r); child.kill("SIGKILL"); }) };
+}
+
+test("both rails: a dead first NEAR RPC fails over; a broken NEAR setup leaves Nano serving with NEAR off", { timeout: 90_000 }, async () => {
+  const { graphsDir, outDir } = await fixtureDirs();
+  const chain = createFakeChain();
+  const key = await throwawayNearKey();
+  chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
+  const nano = nanoGptMock();
+  await chain.listen();
+  await nano.listen();
+  const node = await nanoNode();
+  const dead = `http://127.0.0.1:${await freePort()}`; // nothing listens here
+  try {
+    // 1. first endpoint refuses connections, second is fine → NEAR is on
+    let port = await freePort();
+    let srv = await startDual({ graphsDir, outDir, port, nearRpc: `${dead},${chain.url}`, nanoRpc: node.url, nanoUrl: nano.url, secretKey: key.secretKey });
+    try {
+      assert.match(srv.stderr(), /failed \(RPC_HTTP\); trying the next endpoint/);
+      assert.match(srv.stderr(), /paid in Nano \(XNO to nano_\w+\) or in NEAR on testnet to merchant\.testnet/);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/rates`)).status, 200);
+    } finally { await srv.kill(); }
+
+    // 2. the key is not the merchant's → NEAR off, Nano still serves every saved tool
+    const other = await throwawayNearKey();
+    port = await freePort();
+    srv = await startDual({ graphsDir, outDir, port, nearRpc: chain.url, nanoRpc: node.url, nanoUrl: nano.url, secretKey: other.secretKey });
+    try {
+      assert.match(srv.stderr(), /NEAR PAYMENTS ARE OFF — the refund key ed25519:\w+ is not an access key of merchant\.testnet/);
+      assert.match(srv.stderr(), /the Nano rail is serving normally/);
+      assert.ok(!srv.stderr().includes(other.secretKey), "the secret key is never printed");
+      assert.doesNotMatch(srv.stderr(), /or in NEAR on/);
+      const mcp = mcpClient(`http://127.0.0.1:${port}`);
+      await mcp.initialize();
+      const names = (await mcp.list()).map((t) => t.name);
+      assert.ok(names.includes("idea_poster") || names.length >= 1, `tools listed: ${names}`);
+      assert.ok(!names.includes("price_noodle"), "NEAR-only tools are not offered while NEAR is off");
+      assert.equal((await fetch(`http://127.0.0.1:${port}/rates`)).status, 404);
+    } finally { await srv.kill(); }
+  } finally {
+    await chain.close();
+    await nano.close();
+    await node.close();
   }
 });

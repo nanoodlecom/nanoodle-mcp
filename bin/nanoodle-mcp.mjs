@@ -124,8 +124,9 @@ Paid in NEAR (custom workflows too; see docs/near-payments.md):
                      --charge-usd as well, one server accepts both: Nano by default, NEAR
                      with "_pay_with": "near". NanoGPT is still paid by your API key or Nano wallet.
   --near-network n   testnet (default) or mainnet (NEAR_NETWORK)
-  --near-rpc u       NEAR JSON-RPC endpoint you trust for finality (NEAR_RPC_URL;
-                     default fastnear's public RPC for the network)
+  --near-rpc u       NEAR JSON-RPC endpoint(s) you trust for finality, comma-separated,
+                     tried in order with failover (NEAR_RPC_URL; default fastnear's
+                     public RPC, then near.org's). No node of your own is needed.
   --near-key-file p  near-cli credentials JSON for the merchant's full-access key, used
                      to sign refunds; or NEAR_PRIVATE_KEY=ed25519:… in the env / --env-file.
                      Never accepted on the command line, never logged
@@ -469,14 +470,23 @@ async function main() {
   let nearInfo = null;
   let near = null;
   if (nearMode) {
-    near = await startNearMode({
-      registry, merchant: nearMerchant, network: nearNetwork, rpcFlag: nearRpcFlag, keyFile: nearKeyFile,
-      envText, envFile, usdText: nearUsdText, usdFlag: nearUsdFlag != null, spreadText: nearSpreadText, spreadFlag: nearSpreadFlag != null,
-      xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
-      modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
-      maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase, dual: chargeUsd != null,
-    });
-    ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
+    try {
+      near = await startNearMode({
+        registry, merchant: nearMerchant, network: nearNetwork, rpcFlag: nearRpcFlag, keyFile: nearKeyFile,
+        envText, envFile, usdText: nearUsdText, usdFlag: nearUsdFlag != null, spreadText: nearSpreadText, spreadFlag: nearSpreadFlag != null,
+        xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
+        modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
+        maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase, dual: chargeUsd != null,
+      });
+      ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
+    } catch (e) {
+      // Only reachable with both rails configured (NEAR alone exits inside startNearMode).
+      // The Nano rail is the production default; it keeps serving and NEAR stays off until a restart.
+      if (chargeUsd == null) throw e;
+      near = null;
+      console.error(`nanoodle-mcp: NEAR PAYMENTS ARE OFF — ${(e && e.message) || e}`);
+      console.error("nanoodle-mcp: the Nano rail is serving normally. Fix the NEAR setting above and restart to turn NEAR on.");
+    }
   }
   if (chargeUsd != null) {
     usagePath = join(resolvedOut, "usage.jsonl");
@@ -602,21 +612,46 @@ async function startNearMode({
   registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
   quoteTtlMin, refreshS, modelPayment, maxDepositUsd, outDir, publicBase, dual,
 }) {
-  const fail = (msg) => { console.error("nanoodle-mcp: " + msg); process.exit(1); };
+  // With both rails on one server a NEAR problem must never stop the Nano rail:
+  // there this throws, and main() carries on in Nano only. NEAR on its own exits.
+  const fail = (msg) => {
+    if (dual) throw Object.assign(new Error(msg), { nearStartup: true });
+    console.error("nanoodle-mcp: " + msg);
+    process.exit(1);
+  };
   const [near, { createNearGate }] = await loadNearMods();
   if (!near.isNearAccountId(merchant)) fail(`--near-merchant: "${merchant}" is not a NEAR account id`);
-  const rpcUrl = rpcFlag || process.env.NEAR_RPC_URL || near.NEAR_NETWORKS[network].rpcUrl;
+  // One or more endpoints, comma-separated, tried in order with failover.
+  const rpcUrls = near.parseRpcUrls(rpcFlag || process.env.NEAR_RPC_URL || near.NEAR_NETWORKS[network].rpcUrls);
+  const rpcUrl = rpcUrls.map(redactUrl).join(", ");
   let signer;
   try {
     signer = await near.loadNearSigner({ accountId: merchant, keyFile, envFileText: envText, env: process.env });
   } catch (e) { fail(`NEAR refund key: ${e.message}`); }
-  const rpc = near.createNearRpc({ url: rpcUrl });
-  let st;
-  try { st = await rpc.status(); } catch (e) { fail(`cannot reach the NEAR RPC at ${redactUrl(rpcUrl)}: ${e.message}`); }
-  if (st.chain_id !== network) fail(`--near-rpc ${redactUrl(rpcUrl)} is on "${st.chain_id}", not ${network}; point it at a ${network} RPC`);
+  let rpc;
+  try {
+    rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, log: (line) => console.error("nanoodle-mcp: " + line) });
+  } catch (e) { fail(`--near-rpc: ${e.message}`); }
+  // A public RPC can be briefly unreachable or rate limiting at boot; give it a few tries.
+  const transient = (e) => ["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"].includes(e?.code);
+  const patiently = async (fn) => {
+    for (let i = 0; ; i++) {
+      try { return await fn(); } catch (e) {
+        if (!transient(e) || i >= 4) throw e;
+        await new Promise((r) => setTimeout(r, 3_000 * (i + 1)));
+      }
+    }
+  };
+  try { await patiently(() => rpc.status()); } catch (e) {
+    fail(e?.code === "RPC_WRONG_NETWORK"
+      ? `--near-rpc ${rpcUrl}: ${e.message}; point it at a ${network} RPC`
+      : `cannot reach the NEAR RPC at ${rpcUrl}: ${e.message}`);
+  }
   let key;
-  try { key = await rpc.viewAccessKey({ accountId: merchant, publicKey: signer.publicKey }); } catch (e) {
-    fail(`the refund key ${signer.publicKey} is not an access key of ${merchant} on ${network} (${e.message})`);
+  try { key = await patiently(() => rpc.viewAccessKey({ accountId: merchant, publicKey: signer.publicKey })); } catch (e) {
+    fail(transient(e)
+      ? `cannot reach the NEAR RPC at ${rpcUrl}: ${e.message}`
+      : `the refund key ${signer.publicKey} is not an access key of ${merchant} on ${network} (${e.message})`);
   }
   if (key.permission !== "FullAccess") fail(`the refund key ${signer.publicKey} on ${merchant} is not a full-access key; refunds need one`);
 
@@ -692,7 +727,7 @@ async function startNearMode({
 
   log(`NEAR mode on ${network}: merchant ${merchant} (${near.explorerAccountUrl(network, merchant)})`);
   const rc = rates.config;
-  log(`NEAR RPC ${redactUrl(rpcUrl)}; NEAR/USD rate ${rc.nearUsd != null ? `static ${rc.nearUsd}` : "CoinGecko (60s cache, fails closed)"}; ` +
+  log(`NEAR RPC ${rpcUrl}; NEAR/USD rate ${rc.nearUsd != null ? `static ${rc.nearUsd}` : "CoinGecko (60s cache, fails closed)"}; ` +
     `XNO/USD ${rc.xnoUsd != null ? `static ${rc.xnoUsd}` : "NanoGPT x402 invoices, else CoinGecko"}${rc.xnoRequired ? " (required: runs are paid from the Nano wallet)" : " (informational)"}; ` +
     `swap margin ${rc.spreadBps} bps; quotes live ${quoteTtlMin} min; refund key ${signer.publicKey}`);
 

@@ -105,7 +105,7 @@ claimed.
     free `price_noodle` and `noodle_guide` tools.
   - `src/market/` and `scripts/market-*.mjs`: the NEAR Agent Market worker
     ([docs/near-agent-market.md](docs/near-agent-market.md)).
-  - `scripts/near-simulate.mjs`, `scripts/near-check-tx.mjs`,
+  - `scripts/near-simulate.mjs`, `scripts/near-check-tx.mjs`, `scripts/near-pay.mjs`,
     `scripts/near-testnet-*.mjs`, the tests for all of the above, and the docs.
   - `src/near/rates.mjs`: NEAR/USD, XNO/USD and the NEAR→XNO swap rate derived from
     them, an optional swap margin, background and forced refresh, `GET /rates`; receipts
@@ -991,7 +991,7 @@ should send from its key.
 |---|---|---|---|
 | `--near-merchant <account>` | `NEAR_MERCHANT` | off | Turns NEAR mode on. Needs `--serve`. With `--charge-usd` too, the server accepts either rail per call (below). |
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify payments and send refunds on. |
-| `--near-rpc <url>` | `NEAR_RPC_URL` | fastnear's public RPC | An RPC you trust to report finality. |
+| `--near-rpc <url[,url]>` | `NEAR_RPC_URL` | fastnear's public RPC, then near.org's | RPC endpoint(s) you trust to report finality, tried in order with failover. No node of your own is needed: the server looks up the one transaction each caller names. |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key: `ed25519:…` in the env, or a JSON key file with `account_id`, `public_key` and `private_key` (legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes). near-cli-rs key files have no `account_id`; use `NEAR_PRIVATE_KEY` for those. Never accepted on argv, never logged. |
 | `--near-usd <n>` | `NEAR_USD` (env or `--env-file`) | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
 | `--xno-usd <n>` | | live (NanoGPT x402 invoices, else CoinGecko) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet; informational with an API key. |
@@ -1077,8 +1077,23 @@ transfers (or an agent with a wallet tool) does steps 3–5 itself; clients that
 cannot sign need a bridge like the shell above.
 
 **Mainnet** is `--near-network mainnet` with a mainnet merchant account and key
-(and preferably your own RPC). Read the
+(and preferably a keyed RPC first in `--near-rpc`). Read the
 [limitations](docs/near-payments.md#limitations) first.
+
+**Pay one call on a running server** (testnet or mainnet), the way an agent would:
+
+```sh
+node scripts/near-pay.mjs --url https://your-server --network mainnet \
+  --payer you.near --payer-key-file ~/.near-credentials/mainnet/you.near.json
+```
+
+It asks for a quote, refuses to go on if the network differs or the amount is above
+`--max-near` (default 1), sends ONE transfer of exactly the quoted amount, makes the paid
+call, waits for the refund and checks deposit − refund = charged and both transfers on
+chain. It prints an explorer link for each transfer and ends `PASS` with exit 0.
+`--quote-only` stops before any funds move and needs no key. The default call is a tiny
+custom workflow (one chat model, 48 output tokens at most); `--tool <name> --args '<json>'`
+pays a saved tool instead.
 
 ### What a paid server will run
 

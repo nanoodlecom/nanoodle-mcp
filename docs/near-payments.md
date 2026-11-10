@@ -402,7 +402,7 @@ either rail per call (see [One server, both rails](#one-server-both-rails)).
 |---|---|---|---|
 | `--near-merchant <account>` | `NEAR_MERCHANT` | (none: NEAR mode off) | Account that receives payments and sends refunds. |
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify and refund on. |
-| `--near-rpc <url>` | `NEAR_RPC_URL` | testnet `https://test.rpc.fastnear.com`, mainnet `https://free.rpc.fastnear.com` | JSON-RPC endpoint. Use a provider you trust: it attests finality. |
+| `--near-rpc <url[,url]>` | `NEAR_RPC_URL` | testnet `https://test.rpc.fastnear.com`, then `https://rpc.testnet.near.org`; mainnet `https://free.rpc.fastnear.com`, then `https://rpc.mainnet.near.org` | JSON-RPC endpoint(s), comma-separated, tried in order. Use providers you trust: each one attests finality. See [The RPC](#the-rpc-no-node-of-your-own). |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (`ed25519:...`; also read from `--env-file`) | (required) | Full-access key of the merchant account, used to sign refunds. A key file is a JSON file with `account_id`, `public_key` and `private_key`: legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes. Its `account_id` must equal the merchant account. near-cli-rs key files have no `account_id` and are refused; use `NEAR_PRIVATE_KEY` for those. The key is never logged or echoed, and never accepted on the command line. |
 | `--near-usd <n>` | `NEAR_USD` (also read from `--env-file`) | (live) | Static NEAR/USD rate for tests and demos. Without it, the rate comes from CoinGecko's public simple-price endpoint. See [Rates](#rates-and-the-swap-margin). |
 | `--xno-usd <n>` | | (live) | Static XNO/USD rate; the same flag the Nano charge mode uses. Without it, XNO/USD comes from NanoGPT's own x402 invoices, else CoinGecko. |
@@ -498,6 +498,10 @@ NEAR per call. Each alone behaves exactly as before.
   payment callback as Nano-paid runs, when the server has no API key.
 - The server instructions, landing page and `/llms.txt` say both rails are accepted and
   where the rates are. `npm run simulate:dual` shows it end to end, offline.
+- A NEAR problem never stops the Nano rail. If NEAR cannot start (unreachable RPC after
+  several tries, a key that is not the merchant's, a state file for another account), the
+  server logs `NEAR PAYMENTS ARE OFF` with the reason and serves Nano only; restart it
+  after fixing the cause. With `--near-merchant` alone the same problem exits with status 1.
 
 ## Which graphs a paid server will run
 
@@ -703,6 +707,29 @@ After these checks:
 The RPC returns some numbers as JSON numbers beyond 2^53, such as `header.timestamp`. The
 client parses integers exactly and uses `timestamp_nanosec`, which is a string.
 
+### The RPC: no node of your own
+
+The server never listens to the chain. A caller names the one transaction that pays its
+quote, and the server looks that transaction up (`tx` with `wait_until: FINAL`, then its
+block). So it needs a JSON-RPC endpoint, not a node, an indexer or a websocket.
+
+`--near-rpc` takes one or more endpoints, tried in order:
+
+- A call moves to the next endpoint only when the first could not answer: a network
+  failure, a timeout, an unreadable body or a rate limit (HTTP 429, or JSON-RPC code
+  -429, which the free public endpoints return under load). An answer, including
+  "unknown transaction", is final for that call; the caller's own retry covers a node
+  that is a block behind.
+- A refund broadcast moves on only when the request was refused. The signed bytes are the
+  same everywhere, so a second submission is the same transaction, never a second refund.
+- An endpoint that failed rests for 30 seconds and is then tried first again.
+- Every endpoint must report the configured network before it is used. One on another
+  network is dropped: a testnet node can never vouch for a mainnet payment.
+
+Free public endpoints are enough for light traffic: a paid call is a handful of
+requests (look up the payment and its block, then sign and send the refund). They rate-limit by IP address, so a busy server should use
+a keyed endpoint first and keep a public one as the fallback.
+
 ## Refunds
 
 Refunds are native transfers from the merchant account. A queue in the server sends them
@@ -834,6 +861,8 @@ scripts/near-simulate.mjs   whole flow offline: the real server binary against a
                             chain stand-in and NanoGPT stand-in (npm run simulate:near)
 scripts/dual-simulate.mjs   one server with both rails, offline (npm run simulate:dual)
 scripts/near-check-tx.mjs   read-only: check a real transfer against the rules above
+scripts/near-pay.mjs        pay ONE call on any running server (testnet or mainnet) and
+                            check the payment, receipt and refund against the chain
 tests/fixtures/near-fake-chain.mjs  the chain and NanoGPT stand-ins the tests and the
                             simulation share
 ```

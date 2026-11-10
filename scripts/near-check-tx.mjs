@@ -17,7 +17,7 @@
  */
 import { readFile } from "node:fs/promises";
 import {
-  createNearRpc, readPaymentTransfer, formatYoctoAsNear, parseNearToYocto, isNearAccountId,
+  createNearRpcPool, readPaymentTransfer, formatYoctoAsNear, parseNearToYocto, isNearAccountId,
   NEAR_NETWORKS, explorerTxUrl,
 } from "../src/near/index.mjs";
 
@@ -55,8 +55,8 @@ if (opts.state) {
   consumedBy = (state.consumedTx || {})[opts.tx] || null;
 }
 
-const rpcUrl = opts.rpc || NEAR_NETWORKS[network].rpcUrl;
-const rpc = createNearRpc({ url: rpcUrl, timeoutMs: 45_000 });
+const rpcUrl = opts.rpc || NEAR_NETWORKS[network].rpcUrls.join(",");
+const rpc = createNearRpcPool({ urls: rpcUrl, chainId: network, timeoutMs: 45_000 });
 const results = [];
 const rule = (ok, text) => { results.push(ok); console.log(`${ok ? "PASS" : "FAIL"}  ${text}`); };
 const has = (o, k) => o !== null && typeof o === "object" && Object.hasOwn(o, k);

@@ -60,7 +60,7 @@ import {
 } from "./near-testnet-lib.mjs";
 
 const BIN = join(ROOT, "bin", "nanoodle-mcp.mjs");
-const MOCK_MODEL = "z-ai/glm-5.3-flash"; // priced by the local NanoGPT stand-in's catalog
+export const MOCK_MODEL = "z-ai/glm-5.3-flash"; // priced by the local NanoGPT stand-in's catalog
 /** A cheap, non-reasoning chat model in NanoGPT's public catalog ($0.05 / $0.23 per 1M tokens when this was written). */
 export const DEFAULT_REAL_MODEL = "meta-llama/llama-3.3-70b-instruct";
 // Half a dust step: every quote is a whole number of 0.000001 NEAR steps, so an amount

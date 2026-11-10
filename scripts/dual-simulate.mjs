@@ -34,7 +34,7 @@ const PAYER = "payer.testnet";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A Nano node stand-in: an opened account with no receivables; work requests are refused. */
-async function nanoNode() {
+export async function nanoNode() {
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);

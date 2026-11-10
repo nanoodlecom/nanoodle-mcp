@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createNearRpc, parseRpcJson } from "../src/near/rpc.mjs";
+import { createNearRpc, createNearRpcPool, parseRpcUrls, parseRpcJson } from "../src/near/rpc.mjs";
 
 const URL_ = "https://rpc.example.test";
 
@@ -196,4 +196,113 @@ test("timeout -> RPC_TIMEOUT (client default and per-call)", async () => {
 test("constructor checks", () => {
   assert.throws(() => createNearRpc({ url: "ftp://x", fetch: async () => {} }), TypeError);
   assert.throws(() => createNearRpc({ url: URL_, fetch: null }), TypeError);
+});
+
+/* ------------------------------ failover ------------------------------- */
+
+/** A mock fetch that answers per host: `hosts[host](req)` → {status, body} | {status, text} | throws. */
+function hostFetch(hosts) {
+  const calls = [];
+  const fetch = async (url, init) => {
+    const req = JSON.parse(init.body);
+    const host = new URL(url).host;
+    calls.push(`${host} ${req.method}`);
+    const a = await hosts[host](req);
+    const text = a.text ?? JSON.stringify({ jsonrpc: "2.0", id: req.id, ...a.body });
+    return new Response(text, { status: a.status ?? 200 });
+  };
+  return { fetch, calls };
+}
+const ok = (chain = "mainnet") => (req) => ({ body: { result: req.method === "status" ? { chain_id: chain } : { from: chain, method: req.method } } });
+const limited = () => ({ status: 429, text: JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -429, message: "Rate limits exceeded" } }) });
+
+test("a rate limit is a transport failure in both shapes public RPCs use", async () => {
+  let rpc = createNearRpc({ url: URL_, fetch: async () => new Response("slow down", { status: 429 }) });
+  await assert.rejects(rpc.status(), (e) => e.code === "RPC_HTTP" && e.data.status === 429);
+  // HTTP 200 with a JSON-RPC error whose code is -429 and whose id matches the request
+  const { fetch } = mockFetch(() => ({ body: { error: { code: -429, message: "Rate limits exceeded" } } }));
+  rpc = createNearRpc({ url: URL_, fetch });
+  await assert.rejects(rpc.status(), (e) => e.code === "RPC_HTTP" && e.data.status === 429);
+});
+
+test("parseRpcUrls splits, trims and drops duplicates", () => {
+  assert.deepEqual(parseRpcUrls(" https://a.test , https://b.test,,https://a.test "), ["https://a.test", "https://b.test"]);
+  assert.deepEqual(parseRpcUrls(["https://a.test"]), ["https://a.test"]);
+  assert.deepEqual(parseRpcUrls(null), []);
+  assert.throws(() => createNearRpcPool({ urls: "" }), TypeError);
+  assert.throws(() => createNearRpcPool({ urls: "https://a.test, ftp://b" }), TypeError);
+});
+
+test("pool: a rate-limited or dead endpoint fails over to the next; an answer does not", async () => {
+  const logs = [];
+  let t = 1_000;
+  const { fetch, calls } = hostFetch({ "a.test": limited, "b.test": ok() });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", fetch, now: () => t, log: (l) => logs.push(l) });
+  assert.equal(rpc.url, "https://a.test");
+  assert.deepEqual(rpc.urls, ["https://a.test", "https://b.test"]);
+  assert.deepEqual(await rpc.block({ finality: "final" }), { from: "mainnet", method: "block" });
+  // a: chain check is rate limited → b: chain check, then the call
+  assert.deepEqual(calls, ["a.test status", "b.test status", "b.test block"]);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /a\.test failed \(RPC_HTTP 429\)/);
+
+  // while a rests, calls go straight to b (already chain-checked)
+  calls.length = 0;
+  await rpc.txStatus({ txHash: "h", senderId: "s.near" });
+  assert.deepEqual(calls, ["b.test tx"]);
+
+  // after the rest, a is tried first again
+  t += 31_000;
+  calls.length = 0;
+  await rpc.status();
+  assert.deepEqual(calls, ["a.test status", "b.test status"]);
+});
+
+test("pool: a JSON-RPC answer such as UNKNOWN_TRANSACTION is final for the call", async () => {
+  const unknown = (req) => req.method === "status" ? ok()(req) : { body: { error: { name: "HANDLER_ERROR", cause: { name: "UNKNOWN_TRANSACTION", info: {} }, code: -32000, message: "Server error" } } };
+  const { fetch, calls } = hostFetch({ "a.test": unknown, "b.test": ok() });
+  const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet", fetch });
+  await assert.rejects(rpc.txStatus({ txHash: "h", senderId: "s.near" }), { code: "UNKNOWN_TRANSACTION" });
+  assert.deepEqual(calls, ["a.test status", "a.test tx"]);
+});
+
+test("pool: an endpoint on another network is never used; all wrong is RPC_WRONG_NETWORK", async () => {
+  const logs = [];
+  const { fetch, calls } = hostFetch({ "a.test": ok("testnet"), "b.test": ok("mainnet") });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", fetch, log: (l) => logs.push(l) });
+  assert.deepEqual(await rpc.block({ finality: "final" }), { from: "mainnet", method: "block" });
+  await rpc.block({ finality: "final" });
+  assert.deepEqual(calls, ["a.test status", "b.test status", "b.test block", "b.test block"]);
+  assert.match(logs[0], /a\.test is on "testnet", not mainnet/);
+
+  const wrong = hostFetch({ "a.test": ok("testnet") });
+  const only = createNearRpcPool({ urls: "https://a.test", chainId: "mainnet", fetch: wrong.fetch });
+  await assert.rejects(only.status(), { code: "RPC_WRONG_NETWORK" });
+  await assert.rejects(only.block({ finality: "final" }), { code: "RPC_WRONG_NETWORK" });
+  assert.deepEqual(wrong.calls, ["a.test status"]); // never asked again
+});
+
+test("pool: send_tx fails over on a refused request but not on a timeout", async () => {
+  const dead = (req) => req.method === "status" ? ok()(req) : (() => { throw new TypeError("fetch failed"); })();
+  let { fetch, calls } = hostFetch({ "a.test": dead, "b.test": ok() });
+  let rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", fetch });
+  assert.deepEqual(await rpc.sendTx("AAAA"), { from: "mainnet", method: "send_tx" });
+  assert.deepEqual(calls, ["a.test status", "a.test send_tx", "b.test status", "b.test send_tx"]);
+
+  const hang = (url, init) => new Promise((_, reject) => {
+    if (JSON.parse(init.body).method === "status") return reject(new Error("unused"));
+    init.signal.addEventListener("abort", () => reject(init.signal.reason));
+  });
+  const seen = [];
+  rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", fetch: (u, i) => { seen.push(new URL(u).host); return hang(u, i); }, timeoutMs: 20 });
+  await assert.rejects(rpc.sendTx("AAAA"), { code: "RPC_TIMEOUT" });
+  assert.deepEqual(seen, ["a.test"]); // the caller resolves a timed-out send by hash
+});
+
+test("pool: when every endpoint fails, the last transport error surfaces", async () => {
+  const { fetch } = hostFetch({ "a.test": limited, "b.test": () => ({ status: 503, text: "down" }) });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", fetch });
+  await assert.rejects(rpc.status(), (e) => e.code === "RPC_HTTP" && e.data.status === 503);
+  // both resting: still tried, in order, rather than refusing outright
+  await assert.rejects(rpc.status(), { code: "RPC_HTTP" });
 });

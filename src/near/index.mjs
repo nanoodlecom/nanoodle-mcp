@@ -7,7 +7,7 @@ export {
 export { base58Encode, base58Decode } from "./base58.mjs";
 export { parseNearSecretKey, loadNearSigner } from "./keys.mjs";
 export { serializeTransferTx, signTransfer } from "./tx.mjs";
-export { parseRpcJson, createNearRpc } from "./rpc.mjs";
+export { parseRpcJson, createNearRpc, createNearRpcPool, parseRpcUrls } from "./rpc.mjs";
 export { readPaymentTransfer } from "./verify.mjs";
 export { openNearLedger } from "./ledger.mjs";
 export { COINGECKO_NEAR_URL, createNearUsdRate } from "./rate.mjs";

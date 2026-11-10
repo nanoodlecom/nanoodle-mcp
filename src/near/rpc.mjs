@@ -6,7 +6,8 @@
  * those come back as exact decimal strings instead of rounded floats.
  *
  * Errors are NearError with:
- *   RPC_HTTP         non-2xx without a JSON-RPC error body, or a network failure
+ *   RPC_HTTP         non-2xx without a JSON-RPC error body, a network failure, or a
+ *                    rate limit (HTTP 429 or JSON-RPC code -429; `data.status` is 429)
  *   RPC_TIMEOUT      the request took longer than timeoutMs
  *   RPC_BAD_RESPONSE unparsable body, wrong envelope id, no result
  *   <cause name>     the JSON-RPC error's cause name verbatim (UNKNOWN_TRANSACTION,
@@ -71,6 +72,11 @@ export function createNearRpc({ url, fetch = globalThis.fetch, timeoutMs = 10_00
       body = null;
     }
     const envelope = body && typeof body === "object" && !Array.isArray(body) ? body : null;
+    // Public RPCs rate-limit with HTTP 429 and/or a JSON-RPC error with code -429.
+    // Either way it is a transport condition ("ask again, or ask another node"), not an answer.
+    if (res.status === 429 || envelope?.error?.code === -429) {
+      throw new NearError("RPC_HTTP", `NEAR RPC ${method} was rate limited`, { data: { status: 429 } });
+    }
     if (!res.ok) {
       if (envelope?.error && envelope.id === id) throw rpcError(envelope.error);
       throw new NearError("RPC_HTTP", `NEAR RPC ${method} answered HTTP ${res.status}`, { data: { status: res.status } });
@@ -88,9 +94,12 @@ export function createNearRpc({ url, fetch = globalThis.fetch, timeoutMs = 10_00
     return result;
   }
 
+  return { url, call, ...methods(call) };
+}
+
+/** The typed helpers every client shares, built over a `call(method, params, opts)`. */
+function methods(call) {
   return {
-    url,
-    call,
     status() {
       return call("status", []);
     },
@@ -109,4 +118,80 @@ export function createNearRpc({ url, fetch = globalThis.fetch, timeoutMs = 10_00
       return call("send_tx", { signed_tx_base64: signedTxBase64, wait_until: waitUntil }, { timeoutMs: perCall });
     },
   };
+}
+
+/** "a, b ,c" or ["a","b"] → ["a","b","c"], duplicates removed, order kept. */
+export function parseRpcUrls(value) {
+  const list = (Array.isArray(value) ? value : String(value ?? "").split(",")).map((u) => String(u).trim()).filter(Boolean);
+  return [...new Set(list)];
+}
+
+const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"]);
+
+/**
+ * The same client over several endpoints, tried in order with failover.
+ *
+ * There is no node to run: the server never listens to the chain. It looks up
+ * the one transaction a caller names, so any RPC it trusts will do, and a
+ * second one covers the first being down or rate limiting.
+ *
+ *  - A call moves to the next endpoint only on a transport failure (RPC_HTTP,
+ *    including rate limits; RPC_TIMEOUT; RPC_BAD_RESPONSE). An answer, including
+ *    "unknown transaction", is final for that call.
+ *  - `send_tx` moves on only for RPC_HTTP. The signed bytes are identical on
+ *    every endpoint, so a second submission is the same transaction, never a
+ *    second transfer; a timeout is left to the caller, which resolves it by hash.
+ *  - An endpoint that failed rests for `cooldownMs`, then is tried again in its
+ *    place, so a dead first entry does not slow every call.
+ *  - With `chainId`, an endpoint is used only after its own `status` reports that
+ *    chain. One on another network is dropped for good: a testnet node must
+ *    never vouch for a mainnet payment.
+ *
+ * Every endpoint is equally trusted for finality; list only ones you trust.
+ */
+export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, now = Date.now, log = () => {} } = {}) {
+  const list = parseRpcUrls(urls);
+  if (!list.length) throw new TypeError("createNearRpcPool needs at least one url");
+  const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checked: !chainId, wrongChain: false, downUntil: 0 }));
+  const host = (url) => { try { return new URL(url).host; } catch { return "rpc"; } };
+
+  function markWrong(ep, got) {
+    if (!ep.wrongChain) log(`NEAR RPC ${host(ep.url)} is on "${got}", not ${chainId}; it will not be used`);
+    ep.wrongChain = true;
+  }
+
+  async function call(method, params, opts) {
+    const usable = eps.filter((ep) => !ep.wrongChain);
+    if (!usable.length) throw new NearError("RPC_WRONG_NETWORK", `no NEAR RPC endpoint is on ${chainId}`);
+    const t = now();
+    const rested = usable.filter((ep) => ep.downUntil <= t);
+    const order = rested.length ? [...rested, ...usable.filter((ep) => ep.downUntil > t)] : usable;
+    let lastErr = null;
+    for (const ep of order) {
+      try {
+        if (!ep.checked && method !== "status") {
+          const st = await ep.client.call("status", []);
+          if (st.chain_id !== chainId) { markWrong(ep, st.chain_id); continue; }
+          ep.checked = true;
+        }
+        const result = await ep.client.call(method, params, opts);
+        if (method === "status" && chainId) {
+          if (result.chain_id !== chainId) { markWrong(ep, result.chain_id); continue; }
+          ep.checked = true;
+        }
+        ep.downUntil = 0;
+        return result;
+      } catch (e) {
+        const transport = TRANSPORT_CODES.has(e?.code);
+        if (!transport || (method === "send_tx" && e.code !== "RPC_HTTP")) throw e;
+        lastErr = e;
+        if (ep.downUntil <= now() && eps.length > 1) log(`NEAR RPC ${host(ep.url)} failed (${e.code}${e?.data?.status ? " " + e.data.status : ""}); trying the next endpoint`);
+        ep.downUntil = now() + cooldownMs;
+      }
+    }
+    if (lastErr) throw lastErr;
+    throw new NearError("RPC_WRONG_NETWORK", `no NEAR RPC endpoint is on ${chainId}`);
+  }
+
+  return { url: list[0], urls: list, call, ...methods(call) };
 }
