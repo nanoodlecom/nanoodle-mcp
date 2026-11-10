@@ -1,13 +1,13 @@
 {
   "agents": [
     { "handle": "nanoodle-song", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-song",
-      "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false },
+      "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false, "priceUsd": 0.40 },
     { "handle": "nanoodle-image", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image",
-      "graph": "scripts/market-idea-to-image.json", "custom": false },
+      "graph": "scripts/market-idea-to-image.json", "custom": false, "priceUsd": 0.05 },
     { "handle": "nanoodle-image-arena", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image-arena",
-      "graph": "scripts/market-image-arena.json", "custom": false },
+      "graph": "scripts/market-image-arena.json", "custom": false, "priceUsd": 0.45 },
     { "handle": "nanoodle-clip", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-clip",
-      "graph": "scripts/market-idea-to-clip.json", "custom": false },
+      "graph": "scripts/market-idea-to-clip.json", "custom": false, "priceUsd": 0.70 },
     { "handle": "nanoodle-workflows", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-workflows",
       "graph": null, "custom": true, "priceUsd": 1.00 }
   ]
