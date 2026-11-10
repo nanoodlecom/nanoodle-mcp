@@ -116,7 +116,7 @@ test("HTTP 503 -> RPC_UNAVAILABLE", async () => {
 });
 
 test("client timeout -> RPC_UNAVAILABLE", async () => {
-  const hang = (url, init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason)));
+  const hang = (url, init) => new Promise((_, reject) => { const keep = setInterval(() => {}, 1_000); /* Node 22 unrefs AbortSignal.timeout; a real fetch holds a socket */ init.signal.addEventListener("abort", () => { clearInterval(keep); reject(init.signal.reason); }); });
   const rpc = createNearRpc({ url: "https://rpc.example.test", fetch: hang });
   await assert.rejects(readPaymentTransfer({ rpc, ...ARGS, txTimeoutMs: 20 }), { code: "RPC_UNAVAILABLE" });
 });

@@ -116,6 +116,6 @@ test("HTTP error or junk with no cache -> RATE_UNAVAILABLE", async () => {
 });
 
 test("timeout -> RATE_UNAVAILABLE", async () => {
-  const fetch = (url, init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason)));
+  const fetch = (url, init) => new Promise((_, reject) => { const keep = setInterval(() => {}, 1_000); /* Node 22 unrefs AbortSignal.timeout; a real fetch holds a socket */ init.signal.addEventListener("abort", () => { clearInterval(keep); reject(init.signal.reason); }); });
   await assert.rejects(createNearUsdRate({ fetch, timeoutMs: 20 }).current(), { code: "RATE_UNAVAILABLE" });
 });

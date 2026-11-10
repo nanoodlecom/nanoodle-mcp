@@ -183,7 +183,8 @@ test("transport errors", async () => {
 
 test("timeout -> RPC_TIMEOUT (client default and per-call)", async () => {
   const hang = (url, init) => new Promise((_, reject) => {
-    init.signal.addEventListener("abort", () => reject(init.signal.reason));
+    const keep = setInterval(() => {}, 1_000); /* Node 22 unrefs AbortSignal.timeout; a real fetch holds a socket */ 
+    init.signal.addEventListener("abort", () => { clearInterval(keep); reject(init.signal.reason); });
   });
   const rpc = createNearRpc({ url: URL_, fetch: hang, timeoutMs: 20 });
   await assert.rejects(rpc.status(), { code: "RPC_TIMEOUT" });
@@ -291,7 +292,8 @@ test("pool: send_tx fails over on a refused request but not on a timeout", async
 
   const hang = (url, init) => new Promise((_, reject) => {
     if (JSON.parse(init.body).method === "status") return reject(new Error("unused"));
-    init.signal.addEventListener("abort", () => reject(init.signal.reason));
+    const keep = setInterval(() => {}, 1_000); /* Node 22 unrefs AbortSignal.timeout; a real fetch holds a socket */ 
+    init.signal.addEventListener("abort", () => { clearInterval(keep); reject(init.signal.reason); });
   });
   const seen = [];
   rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", fetch: (u, i) => { seen.push(new URL(u).host); return hang(u, i); }, timeoutMs: 20 });
