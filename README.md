@@ -28,6 +28,100 @@ signing Nano blocks — loaded only on the x402 paths, see
 machine to [nano-gpt.com](https://nano-gpt.com); it is never logged and never
 appears on stdout.
 
+## NEAR HACKATHON entry
+
+Built at [NEAR HACKATHON](https://nearhackathon.com) (2026-11-01 to 2026-11-14), track
+`agents` (Agent Economy). Only the NEAR integration described here is the entry; the rest
+of this README documents the product it was added to.
+
+**What it is.** nanoodle-mcp is an MCP server that runs nanoodle workflow graphs
+(multi-step pipelines of NanoGPT text, image, video, audio and 3D models) as tools. In the
+hackathon it gained a NEAR payment rail: an AI agent composes its own workflow, gets an
+itemized price for free, pays with one native NEAR transfer, receives the result, and gets
+the unused part of its deposit back on chain. A second piece, a worker for
+[NEAR Agent Market](https://market.near.ai), sells the same workflow runs as market jobs.
+
+**Problem.** An agent that wants to run a paid multi-model pipeline needs an account and
+an API key at the provider, and cannot tell what a multi-step run will cost before it
+starts. A fixed price per call means the buyer overpays or the seller loses money on
+expensive runs.
+
+**How NEAR fits.** NEAR carries the payment and the refund. The quote comes back inside
+the MCP tool answer: a payment id, the receiving account, an exact yoctoNEAR amount and a
+15-minute expiry. The agent sends one native `Transfer`. The server reads that transaction
+from NEAR RPC at FINAL finality, checks the receiver, the exact amount, the single action,
+the timing and that the hash was not used before, runs the workflow once, and signs a
+refund transfer of the deposit minus the actual cost. Finality in 2–3 seconds and gas of
+about 0.000045 NEAR per transfer make a deposit and refund per call practical. This is not
+x402: there is no HTTP 402 and no facilitator, only an in-band MCP quote paid by a plain
+transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md).
+
+**Status.**
+- Offline: the whole payment flow passes against a local NEAR chain stand-in and a local
+  NanoGPT stand-in (35 checks), and the market worker passes against a local market
+  stand-in that checks every request and answer against the market's OpenAPI file
+  (30 checks).
+- Real testnet, read-only: the transaction checker and the server's own payment verifier
+  read a real testnet transfer from public RPC and pass (step 4 below).
+- Not done yet: this code has **not moved real NEAR**. The first real testnet payment and
+  refund is the maintainer-run step 5 below. The market worker has not been run against
+  the live market. There is **no hosted NEAR-mode endpoint**; the hosted server at
+  `mcp.nanoodle.com` is the Nano-paid mode.
+- NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version` shows
+  0.7.0 or later, run it from a clone as below.
+
+**Try it: do X, see Y.** Node 22.23.4+, 24.22.1+ or 26.12.1+. Steps 1–3 need no network
+after `npm ci`, and no keys or funds.
+
+```bash
+git clone -b near-hackathon https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp && npm ci
+```
+
+| Do | See |
+|---|---|
+| 1. `npm run simulate:near` | The real server binary starts in NEAR mode against local stand-ins. An agent prices a custom `text → llm → image` graph, gets a quote, pays one transfer, receives the image and a receipt, and the rest of the deposit is refunded. Then replay, a reused transaction, an unsafe node, an unpriceable model, underpayment, a late payment, a failed run and a server killed mid-run and mid-refund. Ends `PASS: all 35 checks passed`. |
+| 2. `npm run simulate:market` | The Agent Market worker runs as a child process against a local market stand-in: a normal job, an unsafe graph, an over-budget graph, a malformed brief, a kill and restart mid-run, and a lost submit answer. Ends `30/30 checks passed.` |
+| 3. `npm test` | The full offline test suite. Ends with `ℹ fail 0` (681 tests when this was written). |
+| 4. `node scripts/near-check-tx.mjs --network testnet --rpc https://archival-rpc.testnet.fastnear.com --merchant tx-bench-buddy.testnet --tx 7wg9AhBTJvKoLCTvdwACzxjLdoPACFXV9hKD12aAxYZp --sender tx-bench.testnet --amount-yocto 1` | Read-only, no keys. The payment rules the server applies (final, succeeded, receiver, one `Transfer`, exact amount) and the server's own verifier, run on a real public testnet transfer of 1 yoctoNEAR between two accounts unrelated to this project. Ends `PASS — 7/7 rules passed`. The archival RPC is used because public RPC nodes drop transactions after a few days. |
+| 5. Real testnet payment and refund (maintainer-run; moves testnet NEAR, needs two funded testnet accounts and, for the last variant, a NanoGPT key) | [Prove it on testnet](#prove-it-on-testnet-turnkey): two scripts create the accounts, pay a quote, check the refund on chain and print explorer links. `--dry-run` stops before the first transfer. |
+
+**Built in the hackathon window, and before.** The diff of the entry is
+[`compare/pre-hackathon...hackathon-submission`](https://github.com/nanoodlecom/nanoodle-mcp/compare/pre-hackathon...hackathon-submission)
+(branch `near-hackathon`). The `pre-hackathon` tag is the last commit on `main` before the
+NEAR work (2026-11-06). Commits on `main` between the hackathon announcement (2026-10-19)
+and that tag are Nano-payment and maintenance work; they are counted as baseline and not
+claimed.
+
+- Before: the nanoodle workflow engine ([`nanoodle`](https://github.com/nanoodlecom/nanoodle-js))
+  and this server: saved graphs as typed MCP tools, BYOK, pay per call in Nano (x402),
+  serve mode, the hosted server, and `run_noodle` for share links.
+- In the window:
+  - `src/near/`: NEAR RPC client, payment verification, refund signing (ed25519 with
+    `node:crypto`, transactions serialized by hand), exact yoctoNEAR math, NEAR/USD rate,
+    durable payment ledger.
+  - `src/custom-workflow.mjs`: the safety allowlist and itemized pricing for workflows an
+    agent composes.
+  - `src/near-gate.mjs`: the NEAR payment gate, `run_noodle` with an inline `graph`, the
+    free `price_noodle` and `noodle_guide` tools.
+  - `src/market/` and `scripts/market-*.mjs`: the NEAR Agent Market worker
+    ([docs/near-agent-market.md](docs/near-agent-market.md)).
+  - `scripts/near-simulate.mjs`, `scripts/near-check-tx.mjs`,
+    `scripts/near-testnet-*.mjs`, the tests for all of the above, and the docs.
+
+**Declarations.**
+- Baseline (own, pre-hackathon, MIT): the nanoodle engine and the nanoodle-mcp server.
+- Libraries: no new dependencies. The two runtime dependencies predate the hackathon:
+  `nanoodle` (MIT, own) and `nanocurrency` (GPL-3.0, Nano signing; see
+  [Licensing](#licensing)). The NEAR code uses only Node built-ins. No NEAR SDK, no
+  templates, no boilerplate.
+- AI-generated code: most of the code, tests and documentation in the hackathon diff were
+  written with AI coding assistants, directed by the maintainer.
+- Other chains: the pre-existing product accepts payment in Nano (XNO) through x402. That
+  is not part of the entry.
+- External services the NEAR code calls: public NEAR RPC (fastnear by default), CoinGecko
+  for the NEAR/USD rate (can be pinned with `--near-usd`), NanoGPT for the models, and, in
+  the testnet scripts only, the NEAR testnet account helper.
+
 ## Example: a description becomes a playable fighter
 
 [Play Iron Verdict](https://nanoodle.com/examples/iron-verdict/): a furnace knight
@@ -671,7 +765,7 @@ to one. Direct links decode locally; only fragment-less short links trigger a
 network read, and it carries no credentials. Like every other tool, a run
 **spends real money** and ends with a `cost: $X.XXXX` line.
 
-`run_noodle` also takes a workflow you composed yourself: pass the graph JSON as
+From version 0.7.0, `run_noodle` also takes a workflow you composed yourself: pass the graph JSON as
 `graph` instead of `url`. Two free helpers sit next to it: `noodle_guide` explains
 the graph format, node types and priced models, and `price_noodle` returns the
 itemized estimated cost of a `graph` or `url` without running it.
@@ -686,14 +780,24 @@ back in NEAR. Nobody needs an account or an API key. Testnet is the default;
 mainnet is a flag. The full design (verification rules, durable state, threat
 model) is in [docs/near-payments.md](docs/near-payments.md).
 
-> NEAR mode is in this repository and not yet in a published npm release. Run it
-> from a clone (`node bin/nanoodle-mcp.mjs …`, as below); `npx nanoodle-mcp`
-> installs the registry release, which has no NEAR mode yet.
+> NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version`
+> shows 0.7.0 or later, `npx nanoodle-mcp` installs a release without NEAR mode: run it
+> from a clone (`node bin/nanoodle-mcp.mjs …`, as below). The scripts used below
+> (`scripts/…`) are not in the npm package at all; they need a clone.
+>
+> Status: the flow passes offline and the verifier passes read-only checks against a real
+> testnet transfer. This code has not yet moved real NEAR; the first real testnet run
+> is [Prove it on testnet](#prove-it-on-testnet-turnkey). No hosted NEAR-mode endpoint
+> exists yet.
+>
+> The same workflow runs can also be sold as jobs on NEAR Agent Market, paid by the
+> market's escrow instead of a transfer per call: see
+> [docs/near-agent-market.md](docs/near-agent-market.md).
 
 ### Try it in one command (offline)
 
 ```bash
-git clone https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp && npm install
+git clone -b near-hackathon https://github.com/nanoodlecom/nanoodle-mcp && cd nanoodle-mcp && npm ci
 node scripts/near-simulate.mjs      # or: npm run simulate:near
 ```
 
@@ -789,6 +893,46 @@ If the transaction is not final yet, the call says so and nothing is consumed:
 call again 3 seconds later (finality takes 2–3 s). A wrong amount or a payment
 after expiry is refunded in full and nothing runs.
 
+### Prove it on testnet (turnkey)
+
+Two scripts run the whole flow on real NEAR testnet with throwaway accounts: one
+creates the accounts, the other plays both the operator and the agent. They move
+testnet NEAR only. Keys stay in the directory you pass as `--keys-dir` (files mode
+0600; only public keys are sent or printed); use a directory outside the repository.
+
+```bash
+# 1. Two new testnet accounts (merchant + payer) through the testnet account helper
+node scripts/near-testnet-accounts.mjs --keys-dir ~/.near-testnet-nanoodle
+#    Ends with READY and exit 0. Exit 1: the helper refused (fallbacks are printed);
+#    exit 3: the accounts exist but need funding (merchant ≈0.05, payer ≈0.1 NEAR).
+#    No helper: add --implicit and fund the two printed accounts yourself.
+#    Own accounts: --use-existing --merchant <id> --merchant-key-file <p> --payer <id> --payer-key-file <p>
+
+# 2. Every check that moves no funds: keys, RPC, balances, rate, server, price, quote
+node scripts/near-testnet-e2e.mjs --keys-dir ~/.near-testnet-nanoodle --dry-run --mock-model
+#    "=== Transactions ===" lists "(none: no funds moved)"; the last line is
+#    "PASS: 14/14 checks passed (dry run: no funds moved)", exit 0.
+
+# 3. Real payment and refund, model replaced by a local stand-in (no NanoGPT key needed)
+node scripts/near-testnet-e2e.mjs --keys-dir ~/.near-testnet-nanoodle --mock-model
+
+# 4. The same with one real NanoGPT call (about $0.00002, capped at 48 output tokens);
+#    the server reads NANOGPT_API_KEY from .env (or pass --env-file <path>)
+node scripts/near-testnet-e2e.mjs --keys-dir ~/.near-testnet-nanoodle
+```
+
+Step 3 sends four testnet transactions: a payment, its refund, a payment 0.000001 NEAR
+short (refused, refunded in full, nothing runs) and that refund. It checks the receipt
+against the chain to the yoctoNEAR (deposit − refund = charged), that the charge is the
+model cost + 20% at the quote's locked rate (with `--mock-model`, the stand-in's own
+reported cost), both balances, replay
+(same receipt, no second refund) and reuse of a spent transaction, prints an explorer
+link and a `near-check-tx` command for every transaction, and ends `PASS` with exit 0.
+On any `FAIL` it exits 1 and prints what to check for each failed area. The server's
+state and money log stay in `nanoodle-out/near-testnet-e2e/<time>/`.
+
+The rest of this section does the same by hand, with your own server.
+
 ### Running a NEAR-paid server (testnet)
 
 From the cloned repository:
@@ -823,7 +967,7 @@ should send from its key.
 | `--near-merchant <account>` | `NEAR_MERCHANT` | off | Turns NEAR mode on. Needs `--serve`; not combinable with `--charge-usd`. |
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify payments and send refunds on. |
 | `--near-rpc <url>` | `NEAR_RPC_URL` | fastnear's public RPC | An RPC you trust to report finality. |
-| `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key (near-cli credentials JSON, or `ed25519:…`). Never accepted on argv, never logged. |
+| `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key: `ed25519:…` in the env, or a JSON key file with `account_id`, `public_key` and `private_key` (legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes). near-cli-rs key files have no `account_id`; use `NEAR_PRIVATE_KEY` for those. Never accepted on argv, never logged. |
 | `--near-usd <n>` | `NEAR_USD` | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
 | `--near-max-deposit-usd <n>` | | `2` | Refuse any call whose deposit would exceed this. |
 
@@ -873,7 +1017,9 @@ node scripts/near-check-tx.mjs --network testnet --merchant payer-name.testnet -
 ```
 
 It prints PASS/FAIL for each rule (final, succeeded, receiver, single transfer,
-exact amount, inside the quote's time window). An MCP client that can sign NEAR
+exact amount, inside the quote's time window). Public RPC nodes keep transactions
+for only a few days; to check an older one, add
+`--rpc https://archival-rpc.testnet.fastnear.com`. An MCP client that can sign NEAR
 transfers (or an agent with a wallet tool) does steps 3–5 itself; clients that
 cannot sign need a bridge like the shell above.
 
@@ -1040,7 +1186,9 @@ licence their authors give them.
 Nano keys, builds and signs blocks, and computes proof-of-work. It is used only
 by the optional x402 Nano wallet: [wallet mode](#wallet-mode--no-account-no-api-key-x402)
 (`NANO_SEED` / `NANO_PRIVATE_KEY`) and [charge mode](#charging-per-call---charge-usd)
-(`--charge-usd`).
+(`--charge-usd`). [NEAR mode](#pay-with-near--run-custom-workflows) (`--near-merchant`)
+loads it too, because it reuses two helpers from `src/gate.mjs`; the NEAR code itself
+does not call it.
 
 Be clear about what that means for you. **Every installer receives it.**
 `npm install nanoodle-mcp` and `npx -y nanoodle-mcp` both download and unpack

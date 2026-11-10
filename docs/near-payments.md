@@ -352,7 +352,7 @@ NEAR mode is opt-in. It requires `--serve` and cannot be combined with `--charge
 | `--near-merchant <account>` | `NEAR_MERCHANT` | (none: NEAR mode off) | Account that receives payments and sends refunds. |
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify and refund on. |
 | `--near-rpc <url>` | `NEAR_RPC_URL` | testnet `https://test.rpc.fastnear.com`, mainnet `https://free.rpc.fastnear.com` | JSON-RPC endpoint. Use a provider you trust: it attests finality. |
-| `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (`ed25519:...`; also read from `--env-file`) | (required) | Full-access key of the merchant account, used to sign refunds. A key file is a near-cli credentials JSON (`account_id`, `public_key`, `private_key`). Its `account_id` must equal the merchant account. The key is never logged or echoed, and never accepted on the command line. |
+| `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (`ed25519:...`; also read from `--env-file`) | (required) | Full-access key of the merchant account, used to sign refunds. A key file is a JSON file with `account_id`, `public_key` and `private_key`: legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes. Its `account_id` must equal the merchant account. near-cli-rs key files have no `account_id` and are refused; use `NEAR_PRIVATE_KEY` for those. The key is never logged or echoed, and never accepted on the command line. |
 | `--near-usd <n>` | `NEAR_USD` | (live) | Static NEAR/USD rate for tests and demos. Without it, the rate comes from CoinGecko's public simple-price endpoint. It is cached for 60 seconds and a stale copy is used for at most 5 minutes. After that, quoting **fails closed**: no quote is issued without a rate. |
 | `--near-max-deposit-usd <n>` | | `2` | Refuse any call whose deposit would exceed this. |
 
@@ -596,7 +596,9 @@ one at a time.
    operator. The money stays in the merchant account, and the receipt says to contact the
    operator.
 
-The merchant pays the refund's gas, about 0.00002 NEAR. A refund is not sent when it is
+The merchant pays the refund's gas, about 0.000045 NEAR per plain transfer (the
+transaction and its receipt each burn 0.0000223 NEAR at testnet's minimum gas price, as
+read from a real testnet transfer). A refund is not sent when it is
 smaller than 0.00001 NEAR (10^19 yocto). The receipt then shows `refund.status: "none"`,
 and the amount counts toward `charged`.
 

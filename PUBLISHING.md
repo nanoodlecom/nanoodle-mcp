@@ -11,8 +11,8 @@ that version's metadata
 A version npm has never seen returns 404 and the registry **refuses the entry**
 with `publish version 'X' before registering it`. So a wrong-order publish
 cannot leave a dangling registry entry — it just fails. Verified on
-2026-07-28: `registry.npmjs.org/nanoodle-mcp/0.6.0` → 404, while
-`registry.npmjs.org/nanoodle-mcp` → 200.
+2026-11-10: `registry.npmjs.org/nanoodle-mcp/0.7.0` → 404 (not published yet),
+while `registry.npmjs.org/nanoodle-mcp/0.6.0` → 200.
 
 ## 0. Preconditions (do these first)
 
@@ -70,11 +70,51 @@ prints the versions npm actually holds plus the 2 commands to run, instead of a
 node scripts/assert-npm-version.mjs
 ```
 
-**Version drift as of 2026-07-28.** This repo says 0.6.0. npm's latest is 0.4.0
-and npm has never held a 0.5.0 or a 0.6.0. The registry's current entry is
-0.3.0. So neither 0.5.0 nor 0.6.0 was ever published anywhere, and the next
-release must run `npm publish` first. The preflight above fails today, on
-purpose, until it does.
+**State as of 2026-11-10.** npm's `latest` is 0.6.0 (published 2026-08-13), and
+the registry's latest entry is 0.6.0 too. This repo now says **0.7.0**, the
+first release with NEAR mode (`--near-merchant`, `run_noodle` with an inline
+`graph`, `price_noodle`, `noodle_guide`). 0.7.0 is not on npm and not in the
+registry yet, so the preflight above fails today, on purpose, until `npm publish`
+lands. Nothing else in the release changes the Nano or BYOK paths.
+
+## 1a. Releasing 0.7.0 (owner actions, in this order)
+
+1. From a clean checkout of the release commit (the `hackathon-submission` tag or
+   `main` after it is merged), with Node 22.23.4+, 24.22.1+ or 26.12.1+:
+
+   ```bash
+   npm ci && npm test                         # ends with "fail 0"
+   npm run simulate:near                      # "PASS: all 35 checks passed"
+   npm pack --dry-run                         # src/near/, src/near-gate.mjs, src/custom-workflow.mjs are listed
+   ```
+
+2. `npm publish`, then check it landed:
+
+   ```bash
+   npm view nanoodle-mcp@0.7.0 version mcpName   # 0.7.0  io.github.nanoodlecom/nanoodle-mcp
+   node scripts/assert-npm-version.mjs           # now passes
+   ```
+
+3. Registry: run the `publish-mcp-registry` workflow (Actions → publish-mcp-registry →
+   Run workflow) on the release commit, or locally `mcp-publisher login github` then
+   `mcp-publisher publish`. Then check
+   `https://registry.modelcontextprotocol.io/v0/servers?search=nanoodle` lists 0.7.0
+   as latest.
+
+4. The Claude Code plugin needs nothing: it runs `npx -y nanoodle-mcp` with a
+   NanoGPT key (BYOK), whose behaviour did not change, so its version stays.
+
+Notes for this release:
+
+- The npm package carries the server (`src/`, `bin/`), not `scripts/` or `docs/`:
+  the simulations, the testnet scripts, the chain checker and the Agent Market
+  worker CLI run from a clone. The README says so.
+- `server.json`'s description stays under the registry's 100-character limit
+  (it is 99). NEAR payment is an in-band MCP quote paid by a native transfer, not
+  x402; do not describe it as x402 anywhere.
+- After the release, update the README notes that say "NEAR mode first ships in
+  npm version 0.7.0 … run it from a clone" if you want `npx` to be the primary
+  route.
 
 ## 2. Optional later: the `com.nanoodle/*` namespace
 
