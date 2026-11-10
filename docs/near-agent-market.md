@@ -399,14 +399,41 @@ node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --stat
 | `--base-url <url>` | `MARKET_BASE_URL` | `https://market.near.ai` | Market API; tests point it at the stand-in. |
 | `--nanogpt-base <url>` | `NANOGPT_BASE_URL` | `https://nano-gpt.com` | NanoGPT API. |
 | `--state-dir <dir>` | `MARKET_STATE_DIR` | `$XDG_STATE_HOME/nanoodle-market`, else `~/.local/state/nanoodle-market` | Durable state; created 0700. One worker per directory. Always absolute, never relative to the working directory: a restart must find the same records (the path is printed at startup). |
-| `--poll-seconds <n>` | | `45` | The market asks for 30–60 s. |
+| `--poll-seconds <n>` | `MARKET_POLL_SECONDS` | `45` | The market asks for 30–60 s. |
 | `--concurrency <n>` | | `2` | Assignments handled at once (max 8). |
 | `--retain-days <n>` | | `30` | Keep finished records and output files this long. |
 | `--once` | | | One poll, finish what it started, exit (for cron or tests). |
 
 Credentials are never accepted on the command line, never logged, and the token is sent
-only to the market's own origin (not to the presigned upload URL). NanoGPT is paid with the
-operator's API key; the Nano-wallet (x402) path is not wired into the worker.
+only to the market's own origin (not to the presigned upload URL). The standalone worker
+pays NanoGPT with the operator's API key and refuses to start if NanoGPT rejects it.
+
+### Inside the server, paid from its Nano wallet
+
+A server that pays NanoGPT from a Nano wallet (x402, no API key) should run the worker
+**inside the server process**, so market jobs are paid the same way as every other run:
+
+```bash
+MARKET_AGENT_TOKEN_FILE=/etc/nanoodle-mcp/market-token \
+MARKET_JOB_BUDGET_USD=0.50 MARKET_LISTING_PRICE_USD=1.00 \
+MARKET_STATE_DIR=/srv/nanoodle-mcp/market-state \
+MARKET_DEFAULT_GRAPH=scripts/market-idea-to-image.json \
+node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
+```
+
+- Setting `MARKET_AGENT_TOKEN_FILE` (or `MARKET_AGENT_TOKEN`) on a `--serve` server turns
+  the worker on. Its settings are the env names in the table above; there are no extra
+  flags. Log lines are prefixed `market worker:`.
+- With an API key the server's key pays; without one the server's wallet pays each
+  NanoGPT invoice. A wallet has one account chain, so the worker shares the server's send
+  queue. Do not open the same wallet from a second process.
+- A problem with the market settings never stops the MCP server: it logs
+  `market worker: OFF — <reason>` and serves as usual.
+- On SIGTERM the server stops taking market jobs and waits up to 20 seconds for one in
+  hand. A job still running then is handed back (refunded) on the next start, as after any
+  restart mid-run.
+- Keep `MARKET_STATE_DIR` outside the server's `--out` directory: `--out-ttl` deletes old
+  files there.
 
 Stop it with SIGTERM or Ctrl-C: it stops polling and finishes the jobs in hand. A second
 signal exits at once; a job that was running is then handed back (refunded) on the next

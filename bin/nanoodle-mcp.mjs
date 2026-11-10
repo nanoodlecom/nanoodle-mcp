@@ -600,6 +600,45 @@ async function main() {
   if (usagePath) console.error(`nanoodle-mcp: payments ledger: ${usagePath}`);
   if (near && near.usagePath !== usagePath) console.error(`nanoodle-mcp: NEAR payments ledger: ${near.usagePath}`);
   if (near) console.error(`nanoodle-mcp: rates: ${publicBase}/rates`);
+
+  // NEAR Agent Market worker, inside this server: it pays NanoGPT exactly as the server
+  // does (API key, or the Nano wallet through x402) and shares the wallet's one send queue.
+  if (process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
+    await startMarketWorkerInServer({ apiKey, wallet });
+  }
+}
+
+/**
+ * Start the Agent Market worker in this process. A problem here never stops the
+ * MCP server: it is logged as "market worker: OFF" and the server carries on.
+ * Settings come from the environment only (MARKET_AGENT_TOKEN_FILE, MARKET_JOB_BUDGET_USD,
+ * MARKET_LISTING_PRICE_USD, MARKET_DEFAULT_GRAPH, MARKET_DEFAULT_INPUT, MARKET_STATE_DIR).
+ */
+async function startMarketWorkerInServer({ apiKey, wallet }) {
+  const say = (line) => console.error("nanoodle-mcp: market worker: " + line);
+  try {
+    const [{ readConfig, startMarketService }, { logSafe }] = await Promise.all([
+      import("../src/market/service.mjs"), import("../src/market/worker.mjs"),
+    ]);
+    const env = apiKey ? { ...process.env, NANOGPT_API_KEY: apiKey } : { ...process.env, NANOGPT_API_KEY: "" };
+    const cfg = readConfig([], env, { needKey: !wallet });
+    const svc = await startMarketService(cfg, { payment: !cfg.apiKey && wallet ? wallet.payment : null, log: (l) => say(logSafe(l)) });
+    let stopping = false;
+    const onSignal = (sig) => {
+      if (stopping) process.exit(1);
+      stopping = true;
+      say(`${sig}: no new jobs; waiting up to 20 s for the job in hand (one still running then is handed back, refunded, on the next start)`);
+      svc.stop();
+      const t = setTimeout(() => process.exit(0), 20_000);
+      svc.done.then(() => { clearTimeout(t); process.exit(0); });
+    };
+    process.on("SIGTERM", () => onSignal("SIGTERM"));
+    process.on("SIGINT", () => onSignal("SIGINT"));
+    svc.done.then((code) => { if (!stopping) say(`stopped (status ${code}); the MCP server keeps serving. Restart the server to resume taking market jobs.`); });
+  } catch (e) {
+    say(`OFF — ${(e && e.message) || e}`);
+    say("the MCP server is serving normally. Fix the setting above and restart to take market jobs.");
+  }
 }
 
 /**

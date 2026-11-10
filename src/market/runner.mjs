@@ -42,15 +42,19 @@ export async function checkNanoGptKey({ apiKey, baseUrl = "https://nano-gpt.com"
 
 /**
  * @param {object} o
- * @param {string} o.apiKey        operator's NanoGPT API key (never logged)
+ * @param {string} [o.apiKey]      operator's NanoGPT API key (never logged), or
+ * @param {(invoice: object) => Promise<void>} [o.payment]  an x402 payment callback (the server's Nano wallet)
  * @param {number} o.budgetUsd     per-job budget: the most a run's deposit may be
  * @param {string} [o.baseUrl]     NanoGPT base URL (tests point it at a stand-in)
  * @param {typeof fetch} [o.fetch] for catalogs and share links
  * @param {object} [o.limits]      custom-workflow caps (maxDepositUsd is replaced by budgetUsd)
  * @param {(line: string) => void} [o.log]
  */
-export function createWorkflowRunner({ apiKey, budgetUsd, baseUrl, fetch = globalThis.fetch, limits = DEFAULT_LIMITS, log = () => {} }) {
-  if (typeof apiKey !== "string" || !apiKey) throw new TypeError("createWorkflowRunner needs the operator's NanoGPT API key");
+export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetch = globalThis.fetch, limits = DEFAULT_LIMITS, log = () => {} }) {
+  const keyed = typeof apiKey === "string" && !!apiKey;
+  if (!keyed && typeof payment !== "function") throw new TypeError("createWorkflowRunner needs the operator's NanoGPT API key or an x402 payment callback");
+  // A key always wins, as everywhere else in this package.
+  const funding = keyed ? { apiKey } : { payment };
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createWorkflowRunner needs a positive budgetUsd");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}), maxDepositUsd: budgetUsd };
 
@@ -90,7 +94,7 @@ export function createWorkflowRunner({ apiKey, budgetUsd, baseUrl, fetch = globa
     async run({ pricing, inputs, outDir }) {
       const { wf, inputs: resolved } = await prepareRunNoodle(
         { graph: pricing.boundGraph, inputs },
-        { apiKey, baseUrl, fetch, log, allowShortLinks: false },
+        { ...funding, baseUrl, fetch, log, allowShortLinks: false },
       );
       const { onProgress, notices } = runNotices(wf);
       let result;
