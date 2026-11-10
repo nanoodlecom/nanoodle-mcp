@@ -100,7 +100,9 @@ test("--mock-model: a charge that is not the model cost + 20% fails the run even
   const proxy = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
-    const up = await fetch(nano.url + req.url, { method: req.method, headers: { "content-type": "application/json" }, body: chunks.length ? Buffer.concat(chunks) : undefined });
+    // x-x402 marks the server's XNO/USD rate probe, which the stand-in answers without a run.
+    const headers = { "content-type": "application/json", ...(req.headers["x-x402"] ? { "x-x402": req.headers["x-x402"] } : {}) };
+    const up = await fetch(nano.url + req.url, { method: req.method, headers, body: chunks.length ? Buffer.concat(chunks) : undefined });
     let body = await up.text();
     if (req.url.includes("/chat/completions")) body = body.replace(/"costUsd":0\.00041/, '"costUsd":0.0009');
     res.writeHead(up.status, { "content-type": "application/json" });

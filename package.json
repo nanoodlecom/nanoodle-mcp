@@ -13,6 +13,7 @@
   "scripts": {
     "test": "node --test",
     "simulate:near": "node scripts/near-simulate.mjs",
+    "simulate:dual": "node scripts/dual-simulate.mjs",
     "simulate:market": "node scripts/market-simulate.mjs"
   },
   "files": [

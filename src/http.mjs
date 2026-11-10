@@ -299,7 +299,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
     </header>
     <p class="eyebrow">public MCP server</p>
-    <h1>${charged ? "AI workflows, paid in Nano over x402." : "AI media workflows over MCP."}</h1>
+    <h1>${charged && paymentNote ? "AI workflows, paid in Nano or NEAR." : charged ? "AI workflows, paid in Nano over x402." : "AI media workflows over MCP."}</h1>
     <p class="sub">Image, video, audio, and text pipelines behind one MCP endpoint.
       ${charged ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
@@ -325,7 +325,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
     <p class="tagline">No tab, no tip, no signup.</p>` : ""}
     ${receiptsHtml()}
-    ${paymentNote ? `<div class="card"><h2>What a call costs</h2><p class="muted">${esc(paymentNote)}</p></div>` : ""}
+    ${paymentNote ? `<div class="card"><h2>${charged ? "Or pay in NEAR" : "What a call costs"}</h2><p class="muted">${esc(paymentNote)}</p></div>` : ""}
     ${charged ? `<div class="card"><h2>What a call costs</h2>
       <p class="muted">When a tool needs payment, your agent shows you a link with a QR code — scan it with
       any Nano wallet and the result streams back seconds later. What you pay up front is a
@@ -444,7 +444,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
       ``,
     );
   }
-  if (paymentNote) lines.push(`## Payment`, ``, paymentNote, ``);
+  if (paymentNote) lines.push(charged ? `## Payment in NEAR` : `## Payment`, ``, paymentNote, ``);
   lines.push(...receiptsLines(), ``);
   lines.push(`## Tools`, ``);
   for (const t of tools) {
@@ -577,6 +577,8 @@ function payPageHtml(q) {
  * @param {object|null} [opts.gate]  charge gate (createChargeGate) — null serves free
  * @param {string|null} [opts.paymentNote]  how calls are paid when another rail (NEAR) gates them;
  *                                   shown on the landing page and in /llms.txt. No pay page is served for it.
+ * @param {object|null} [opts.rates]  NEAR-rail rates service (src/near/rates.mjs): serves GET /rates
+ *                                   (?refresh=1 forces a refetch, rate-limited by the service)
  * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402/card for the landing page and /graph/:name.json
  * @param {object} [opts.costs]  registry.costs — live last-observed-cost records, shown on the landing cards
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
@@ -599,6 +601,7 @@ export async function serveHttp({
   instructions,
   gate = null,
   paymentNote = null,
+  rates = null,
   toolInfo = [],
   costs = {},
   outDir = null,
@@ -740,6 +743,12 @@ export async function serveHttp({
 
       if (url.pathname === "/llms.txt") {
         return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo, paymentNote }), "text/plain; charset=utf-8");
+      }
+
+      if (url.pathname === "/rates" && rates) {
+        const force = ["1", "true", "yes"].includes(url.searchParams.get("refresh") || "");
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
+        return res.end(JSON.stringify(await rates.view({ refresh: force }), null, 2));
       }
 
       if (url.pathname === "/version") {

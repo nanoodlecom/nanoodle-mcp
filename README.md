@@ -48,7 +48,7 @@ expensive runs.
 
 **How NEAR fits.** NEAR carries the payment and the refund. The quote comes back inside
 the MCP tool answer: a payment id, the receiving account, an exact yoctoNEAR amount and a
-15-minute expiry. The agent sends one native `Transfer`. The server reads that transaction
+30-minute expiry. The agent sends one native `Transfer`. The server reads that transaction
 from NEAR RPC at FINAL finality, checks the receiver, the exact amount, the single action,
 the timing and that the hash was not used before, runs the workflow once, and signs a
 refund transfer of the deposit minus the actual cost. Finality in 2–3 seconds and gas of
@@ -81,7 +81,7 @@ git clone -b near-hackathon https://github.com/nanoodlecom/nanoodle-mcp && cd na
 |---|---|
 | 1. `npm run simulate:near` | The real server binary starts in NEAR mode against local stand-ins. An agent prices a custom `text → llm → image` graph, gets a quote, pays one transfer, receives the image and a receipt, and the rest of the deposit is refunded. Then replay, a reused transaction, an unsafe node, an unpriceable model, underpayment, a late payment, a failed run and a server killed mid-run and mid-refund. Ends `PASS: all 35 checks passed`. |
 | 2. `npm run simulate:market` | The Agent Market worker runs as a child process against a local market stand-in: a normal job, an unsafe graph, an over-budget graph, a malformed brief, a kill and restart mid-run, and a lost submit answer. Ends `30/30 checks passed.` |
-| 3. `npm test` | The full offline test suite. Ends with `ℹ fail 0` (681 tests when this was written). |
+| 3. `npm test` | The full offline test suite. Ends with `ℹ fail 0` (705 tests when this was written). |
 | 4. `node scripts/near-check-tx.mjs --network testnet --rpc https://archival-rpc.testnet.fastnear.com --merchant tx-bench-buddy.testnet --tx 7wg9AhBTJvKoLCTvdwACzxjLdoPACFXV9hKD12aAxYZp --sender tx-bench.testnet --amount-yocto 1` | Read-only, no keys. The payment rules the server applies (final, succeeded, receiver, one `Transfer`, exact amount) and the server's own verifier, run on a real public testnet transfer of 1 yoctoNEAR between two accounts unrelated to this project. Ends `PASS — 7/7 rules passed`. The archival RPC is used because public RPC nodes drop transactions after a few days. |
 | 5. Real testnet payment and refund (maintainer-run; moves testnet NEAR, needs two funded testnet accounts and, for the last variant, a NanoGPT key) | [Prove it on testnet](#prove-it-on-testnet-turnkey): two scripts create the accounts, pay a quote, check the refund on chain and print explorer links. `--dry-run` stops before the first transfer. |
 
@@ -107,6 +107,12 @@ claimed.
     ([docs/near-agent-market.md](docs/near-agent-market.md)).
   - `scripts/near-simulate.mjs`, `scripts/near-check-tx.mjs`,
     `scripts/near-testnet-*.mjs`, the tests for all of the above, and the docs.
+  - `src/near/rates.mjs`: NEAR/USD, XNO/USD and the NEAR→XNO swap rate derived from
+    them, an optional swap margin, background and forced refresh, `GET /rates`; receipts
+    with three money legs (caller payment, model payment, refund) and per-call operator
+    accounting in the ledger.
+  - `src/rail-router.mjs` and `scripts/dual-simulate.mjs`: one server that accepts Nano or
+    NEAR per call (`--charge-usd` together with `--near-merchant`).
 
 **Declarations.**
 - Baseline (own, pre-hackathon, MIT): the nanoodle engine and the nanoodle-mcp server.
@@ -824,7 +830,7 @@ descriptions:
 | **deposit** | The most you can be charged. It is held up front and is the amount you send: the likely charge × 2 (× 1.25 when every model has a fixed price), rounded up to the next cent, minimum $0.01. |
 | **charged** | Actual model cost + 20% service fee, capped at the deposit. If the provider does not report the full cost of a run, the estimated cost is charged instead. |
 | **refund** | The deposit minus what was charged, sent back to the paying account automatically. Exact in yoctoNEAR. |
-| **rate** | The NEAR/USD rate used, with its source and time. A quote locks it; settlement uses the locked rate. |
+| **rate** | The NEAR/USD rate used, with its source and time; when known also XNO/USD and the swap rate derived from the two ("1 NEAR = N XNO"), and the swap margin when it is not zero. A quote locks all of it for its lifetime; settlement uses the locked rate. |
 
 In `structuredContent.pricing`, a figure named after its term is `usd`
 (`estimatedCost.usd`, `likelyCharge.usd`, `deposit.usd`); a figure that is only
@@ -861,6 +867,25 @@ unique, so the amount identifies the quote; it comes back with the refund, which
 is why the refund is a little more than $0.03 − $0.011292. All on-chain math is
 exact integer yoctoNEAR. A run that fails refunds the whole deposit.
 
+The quote's rate line reads, for example, `Rate: 1 NEAR = $3.64 (coingecko, …); 1 XNO =
+$0.95 (nanogpt-x402, …), so 1 NEAR = 3.831578947 XNO, locked for this quote`. The swap
+rate is derived from the two USD rates; no swap venue is queried, and the server does
+not swap NEAR to XNO itself (refilling the Nano float from received NEAR is a manual
+operator task). `GET /rates` on the server shows the current rates, their sources and
+ages; `GET /rates?refresh=1` refetches them (at most once every 15 s).
+
+Every receipt ends with the three money legs, each with its own status:
+
+```
+Leg 1, caller payment: 0.008379 NEAR, tx 8PyS…, final.
+Leg 2, model payment to NanoGPT: $0.00941 (paid from the operator's NanoGPT balance).
+Leg 3, refund: ≈0.005277 NEAR, sent (tx 8yto…, https://testnet.nearblocks.io/txns/8yto…).
+```
+
+On a server that pays NanoGPT from its Nano wallet, leg 2 also gives the XNO amount,
+derived from the reported cost at the locked XNO/USD rate. An unknown cost stays
+"unknown", never zero.
+
 ### The agent's side
 
 1. **Design (free).** `noodle_guide` lists the node types this server runs, the
@@ -871,7 +896,7 @@ exact integer yoctoNEAR. A run that fails refunds the whole deposit.
    the deposit is over the server's cap).
 2. **Quote.** Call `run_noodle { graph, inputs }` (or a saved-graph tool) with no
    payment arguments. The answer is `structuredContent.payment`: `paymentId`,
-   `payTo`, `network`, `amountYocto`, `amountNear`, `expiresAt` (15 minutes) and
+   `payTo`, `network`, `amountYocto`, `amountNear`, `expiresAt` (30 minutes by default) and
    the `pricing`. Nothing is charged.
 3. **Pay.** Send **one** native transfer of exactly `amountNear` to `payTo`, for example with
    [near-cli-rs](https://github.com/near/near-cli-rs):
@@ -964,17 +989,45 @@ should send from its key.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--near-merchant <account>` | `NEAR_MERCHANT` | off | Turns NEAR mode on. Needs `--serve`; not combinable with `--charge-usd`. |
+| `--near-merchant <account>` | `NEAR_MERCHANT` | off | Turns NEAR mode on. Needs `--serve`. With `--charge-usd` too, the server accepts either rail per call (below). |
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify payments and send refunds on. |
 | `--near-rpc <url>` | `NEAR_RPC_URL` | fastnear's public RPC | An RPC you trust to report finality. |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key: `ed25519:…` in the env, or a JSON key file with `account_id`, `public_key` and `private_key` (legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes). near-cli-rs key files have no `account_id`; use `NEAR_PRIVATE_KEY` for those. Never accepted on argv, never logged. |
-| `--near-usd <n>` | `NEAR_USD` | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
+| `--near-usd <n>` | `NEAR_USD` (env or `--env-file`) | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
+| `--xno-usd <n>` | | live (NanoGPT x402 invoices, else CoinGecko) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet; informational with an API key. |
+| `--near-swap-spread-bps <n>` | `NEAR_SWAP_SPREAD_BPS` (env or `--env-file`) | `0` | Swap margin, 0–2000 basis points: NEAR amounts are computed at a NEAR/USD rate that much worse for the caller, to cover swapping NEAR to XNO. |
+| `--near-quote-ttl-min <n>` | `NEAR_QUOTE_TTL_MIN` | `30` | Quote lifetime, 1–120 minutes; the quote's rates stay locked for all of it. |
+| `--near-rates-refresh-s <n>` | `NEAR_RATES_REFRESH_S` | `60` | Background refresh of live rates; `0` turns the timer off. |
 | `--near-max-deposit-usd <n>` | | `2` | Refuse any call whose deposit would exceed this. |
 
 NanoGPT is still paid by your API key or Nano wallet, exactly as in the other
 modes; NEAR only changes how callers pay you. Money events go to
 `<out>/usage.jsonl` with `"rail": "near"`; durable payment state is
-`<out>/near-state.json` (one server per `--out` directory).
+`<out>/near-state.json` (one server per `--out` directory). Each settled call's
+`change` event records the locked rates, the NEAR charged and refunded, the USD model
+cost and, on a wallet-funded server, the XNO it cost (derived), each in its own unit, so
+you can total NEAR in against XNO out and decide when to swap
+([reading the ledger](docs/near-payments.md#reading-the-payments-ledger)). Those
+conversions are for reporting; nothing is swapped.
+
+`kill -HUP <pid>` re-reads `NEAR_USD` and `NEAR_SWAP_SPREAD_BPS` from the `--env-file`
+and refetches the live rates, without a restart; open quotes keep their locked rates.
+
+#### Running both rails on one server
+
+```bash
+node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 0.0.0.0:8402 --public-url https://your-host \
+  --charge-usd 0.05 --near-merchant merchant-name.testnet --env-file .env   # .env also holds NANO_SEED
+```
+
+Each call is paid in Nano by default, exactly as with `--charge-usd` alone. A saved tool
+the NEAR gate also sells says so in its description and takes `"_pay_with": "near"` for a
+NEAR quote; `run_noodle`, `price_noodle` and `noodle_guide` are NEAR-side tools. A Nano
+payment id starts with `pay_`, a NEAR one with `nq_`, and the server routes the paying
+call by it. The two rails keep separate state and ledgers (`usage.jsonl` and
+`near-usage.jsonl`). `npm run simulate:dual` shows it offline: a tool quoted in Nano, the
+same tool quoted and paid in NEAR, a NEAR-paid custom graph, `GET /rates` before and after
+a forced refresh, and a `SIGHUP` reload.
 
 ### Try it live on testnet
 
@@ -1070,6 +1123,9 @@ neither are the built-in tools.
 - No pay page or payment-watch stream: the caller presents the transaction hash.
 - A transfer for a quote that expired more than an hour earlier is not refunded
   automatically (the quote is gone); the operator sees it in the merchant account.
+- The NEAR→XNO swap rate is derived from two USD rates and the server never swaps; the
+  operator carries NEAR/XNO price movement for up to the quote lifetime (30 minutes by
+  default) and until it swaps by hand. The swap margin is the cushion for that.
 
 The full list is in [docs/near-payments.md](docs/near-payments.md#limitations).
 

@@ -12,7 +12,9 @@
 //   service fee     20% of the ACTUAL model cost
 //   deposit         the most you can be charged; held up front, the amount you send
 //   refund          deposit minus what was actually charged, sent back automatically
-//   rate            NEAR/USD used, with source and timestamp; locked by a quote
+//   rate            NEAR/USD used, with source and timestamp; when known also
+//                   XNO/USD and the swap rate derived from the two ("1 NEAR = N
+//                   XNO"), and the swap margin when non-zero; locked by a quote
 
 import {
   Workflow, NODE_TYPES, displayName, topoSort, estimateGraphCost, graphModelKinds, decodeShareUrl,
@@ -885,6 +887,38 @@ function structuredPricing(p, safety) {
   };
 }
 
+/** Optional rate fields (src/near/rates.mjs) carried after nearUsd/source/at. */
+export const RATE_EXTRA_KEYS = Object.freeze(["xnoUsd", "xnoSource", "xnoAt", "xnoPerNear", "nearPerXno", "spreadBps", "effectiveNearUsd"]);
+
+/** The optional rate fields present on a rate object (none for a NEAR/USD-only rate). */
+export function rateExtras(rate) {
+  const out = {};
+  if (rate && typeof rate === "object") for (const k of RATE_EXTRA_KEYS) if (k in rate) out[k] = rate[k];
+  return out;
+}
+
+const bpsPct = (bps) => {
+  const b = Math.trunc(Number(bps));
+  const frac = String(b % 100).padStart(2, "0").replace(/0+$/, "");
+  return frac ? `${Math.trunc(b / 100)}.${frac}` : `${Math.trunc(b / 100)}`;
+};
+
+/**
+ * The XNO/USD, swap-rate and margin part of the one rate line, "" when the
+ * rate carries none of them. Starts with "; ".
+ */
+export function rateExtrasText(x) {
+  if (!x) return "";
+  const parts = [];
+  if ("xnoUsd" in x) {
+    parts.push(x.xnoUsd != null
+      ? `1 XNO = $${x.xnoUsd} (${x.xnoSource}, ${x.xnoAt}), so 1 NEAR = ${x.xnoPerNear} XNO`
+      : "XNO/USD unavailable");
+  }
+  if (x.spreadBps) parts.push(`swap margin ${bpsPct(x.spreadBps)}%: NEAR amounts use 1 NEAR = $${x.effectiveNearUsd}`);
+  return parts.map((p) => `; ${p}`).join("");
+}
+
 const itemLine = (i) => `- ${i.node} (${i.model}): $${estUsd(i.usd)} — ${i.basis}`;
 
 function pricingLines(p, near) {
@@ -903,13 +937,14 @@ function pricingLines(p, near) {
     lines.push(`Deposit: $${exactUsd(p.depositUsd)}; the most you can be charged`);
   }
   lines.push(`Refund: the deposit minus what is actually charged, returned automatically (likely $${estUsd(Math.max(0, p.depositUsd - p.likelyChargeUsd))}${near && !near.depositApprox && near.dustNear ? " plus the dust" : ""})`);
-  if (near) lines.push(`Rate: 1 NEAR = $${near.nearUsd} (${near.rateSource}, ${near.rateAt}), ${near.depositApprox ? "locked when you ask for a quote" : "locked for this quote"}; network ${near.network}`);
+  if (near) lines.push(`Rate: 1 NEAR = $${near.nearUsd} (${near.rateSource}, ${near.rateAt})${rateExtrasText(near.rateExtras)}, ${near.depositApprox ? "locked when you ask for a quote" : "locked for this quote"}; network ${near.network}`);
   return lines;
 }
 
 /**
  * Text + structured pricing for price_noodle (and the pricing half of a quote).
- * near (optional, strings): { network, nearUsd, rateSource, rateAt, likelyChargeNear, depositNear }
+ * near (optional, strings): { network, nearUsd, rateSource, rateAt, likelyChargeNear, depositNear,
+ *   rateExtras? (XNO/USD, swap rate, margin; see rateExtras) }
  */
 export function pricingVocabulary(pricing, { near = null, safety = { ok: true, refusals: [] } } = {}) {
   const p = pricing;
@@ -920,7 +955,7 @@ export function pricingVocabulary(pricing, { near = null, safety = { ok: true, r
   if (near) {
     structured.near = {
       network: near.network,
-      rate: { nearUsd: near.nearUsd, source: near.rateSource, at: near.rateAt },
+      rate: { nearUsd: near.nearUsd, source: near.rateSource, at: near.rateAt, ...(near.rateExtras || {}) },
       likelyChargeNear: near.likelyChargeNear,
       depositNear: near.depositNear,
       ...(near.depositApprox ? { depositNearIsApproximate: true } : {}),
@@ -947,14 +982,14 @@ export function formatQuote({ pricing, payment, now = Date.now() }) {
   const pay = payment || {};
   const rate = pay.rate || {};
   const near = {
-    network: pay.network, nearUsd: rate.nearUsd, rateSource: rate.source, rateAt: rate.at,
+    network: pay.network, nearUsd: rate.nearUsd, rateSource: rate.source, rateAt: rate.at, rateExtras: rateExtras(rate),
     likelyChargeNear: pay.likelyChargeNear, depositNear: pay.amountNear,
     depositUsdSent: pay.depositUsdSent, dustNear: pay.dustNear,
   };
   const voc = pricingVocabulary(pricing, { near });
   const next = `Send exactly ${pay.amountNear} NEAR (${pay.amountYocto} yoctoNEAR) to ${pay.payTo} on ${pay.network} in ONE transfer, then call this tool again with the same arguments plus _payment_id, _payment_tx and _payment_sender.`;
   const left = Date.parse(pay.expiresAt) - now;
-  const mins = Number.isFinite(left) && left > 0 ? Math.max(1, Math.round(left / 60000)) : 15;
+  const mins = Number.isFinite(left) && left > 0 ? Math.max(1, Math.round(left / 60000)) : 30;
   const lines = [
     `PAYMENT REQUIRED (NEAR ${pay.network}) — ${summarySentence(pricing, near)}`,
     "",
@@ -1004,7 +1039,7 @@ export function formatReceipt(receipt) {
   const dep = r.deposit || {}, ref = r.refund || {}, ch = r.charged || {}, cost = r.actualCost || {}, rate = r.rate || {};
   const paid = `Paid ${shortNear(dep.near)} NEAR deposit (tx ${dep.txHash}${dep.explorerUrl ? `, ${dep.explorerUrl}` : ""}).`;
   const refundLine = `Refund ${shortNear(ref.near)} NEAR to ${ref.to}: ${refundStatusText(ref, r.paymentId)}.`;
-  const rateLine = `Rate ${rate.nearUsd} USD/NEAR (${rate.source}, ${rate.at}), locked when quoted.`;
+  const rateLine = `Rate ${rate.nearUsd} USD/NEAR (${rate.source}, ${rate.at})${rateExtrasText(rateExtras(rate))}, locked when quoted.`;
   const costKnown = knownUsd(cost.usd) != null;
   let body;
   switch (r.outcome) {
@@ -1034,7 +1069,30 @@ export function formatReceipt(receipt) {
     default:
       body = `${paid} Outcome: ${r.outcome}. Charged ${shortNear(ch.near ?? "0")} NEAR. ${refundLine}`;
   }
-  return { text: `${body} ${rateLine}`, structured: { receipt: r } };
+  const legs = Array.isArray(r.legs) ? legLines(r.legs, r.paymentId) : [];
+  return { text: [`${body} ${rateLine}`, ...legs].join("\n"), structured: { receipt: r } };
+}
+
+/** The receipt's three money legs as three short lines (r.legs from the NEAR gate). */
+function legLines(legs, paymentId) {
+  const [caller, model, refund] = legs;
+  const out = [];
+  if (caller) {
+    out.push(caller.status === "final"
+      ? `Leg 1, caller payment: ${shortNear(caller.amount)} NEAR, tx ${caller.txHash}, final.`
+      : `Leg 1, caller payment: none.`);
+  }
+  if (model) {
+    let t;
+    if (model.status === "none") t = "none (nothing ran)";
+    else if (model.status === "unknown") t = `unknown (${model.basis})`;
+    else t = `$${model.usd}${model.xno != null ? ` = ${model.xno} XNO` : ""} (${model.basis})`;
+    out.push(`Leg 2, model payment to NanoGPT: ${t}.`);
+  }
+  if (refund) {
+    out.push(`Leg 3, refund: ${shortNear(refund.amount)} NEAR, ${refundStatusText(refund, paymentId)}.`);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

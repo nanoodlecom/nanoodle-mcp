@@ -31,8 +31,9 @@ import {
 } from "./tools.mjs";
 import {
   DEFAULT_LIMITS, GraphArgsError, GraphRefusedError, readGraphArgs, assertGraphSafe, checkGraphSafety,
-  priceGraph, refusalsForQuote, formatQuote, formatReceipt, exactUsd, estUsd, shortNear,
+  priceGraph, refusalsForQuote, formatQuote, formatReceipt, exactUsd, estUsd, shortNear, rateExtras,
 } from "./custom-workflow.mjs";
+import { parseUsdNano } from "./gate.mjs";
 import {
   NearError, isNearAccountId, base58Decode, formatYoctoAsNear, usdToYocto, depositYocto, settleYocto,
   DUST_STEP_YOCTO, readPaymentTransfer, explorerTxUrl,
@@ -86,7 +87,9 @@ function strip(res) {
  * @param {object} opts.refunder     createRefunder()
  * @param {object} [opts.limits]     custom-workflow caps, incl. maxDepositUsd
  * @param {string} [opts.baseUrl]    NanoGPT base for the public model catalogs
- * @param {number} [opts.quoteTtlMs] quote lifetime (15 min)
+ * @param {number} [opts.quoteTtlMs] quote lifetime (30 min); the quote's rates stay locked for all of it
+ * @param {"wallet"|"api_key"|null} [opts.modelPayment]  how this server pays NanoGPT for runs:
+ *                                   from its Nano wallet (XNO) or its API key's balance; shown in receipts
  * @param {number} [opts.skewMs]     tolerated clock skew between the chain and this server
  * @param {(line: string) => void} [opts.log]
  * @param {(event: string, fields: object) => void} [opts.usage]  payments ledger (money events only)
@@ -104,7 +107,8 @@ export function createNearGate({
   refunder,
   limits = DEFAULT_LIMITS,
   baseUrl,
-  quoteTtlMs = 15 * 60_000,
+  quoteTtlMs = 30 * 60_000,
+  modelPayment = null,
   skewMs = 120_000,
   log = () => {},
   usage = () => {},
@@ -142,6 +146,57 @@ export function createNearGate({
   }
 
   /* ---------------- receipts ---------------- */
+
+  /**
+   * What this server paid NanoGPT for the run, in USD and (wallet-funded) XNO.
+   * The XNO figure is derived from the settled USD cost at the quote's locked
+   * XNO/USD rate; the wallet's actual invoice blocks are not attributed to a
+   * run. Unknown stays null, never zero.
+   */
+  function modelSpend(q) {
+    const s = q.settlement;
+    const ran = q.outcome === "succeeded" || q.outcome === "run_failed" || q.outcome === "interrupted";
+    const usd = s && s.costUsd != null ? exactUsd(s.costUsd) : null;
+    let xno = null;
+    if (usd != null && modelPayment === "wallet" && q.rate && q.rate.xnoUsd) {
+      try {
+        const xnoNano = parseUsdNano(q.rate.xnoUsd);
+        if (xnoNano > 0n) xno = ratioXno(parseUsdNano(usd), xnoNano);
+      } catch { xno = null; }
+    }
+    return { ran, usd, xno };
+  }
+
+  /** The three money legs of a receipt, each with its own honest status. */
+  function receiptLegs(q, r) {
+    const m = modelSpend(q);
+    const caller = {
+      leg: "caller payment", asset: "NEAR",
+      amount: r.deposit.near, yocto: r.deposit.yocto, txHash: r.deposit.txHash, explorerUrl: r.deposit.explorerUrl,
+      status: q.payTx ? "final" : "none",
+    };
+    let model;
+    if (!m.ran) {
+      model = { leg: "model payment", status: "none", usd: "0", xno: null, basis: "nothing ran", fundedBy: modelPayment };
+    } else if (m.usd == null) {
+      model = { leg: "model payment", status: "unknown", usd: null, xno: null, basis: q.outcome === "succeeded" ? "the provider reported no cost" : "the run did not complete; any provider cost is unknown and the operator's", fundedBy: modelPayment };
+    } else {
+      model = {
+        leg: "model payment", status: "paid", usd: m.usd,
+        xno: m.xno,
+        basis: modelPayment === "wallet"
+          ? (m.xno != null ? "XNO derived from the reported cost at the locked XNO/USD rate" : "paid in XNO from the operator's Nano wallet; XNO amount unknown (no XNO/USD rate was locked)")
+          : modelPayment === "api_key" ? "paid from the operator's NanoGPT balance" : "paid by the operator",
+        fundedBy: modelPayment,
+      };
+    }
+    const refund = {
+      leg: "refund", asset: "NEAR",
+      amount: r.refund.near, yocto: r.refund.yocto, to: r.refund.to, txHash: r.refund.txHash, explorerUrl: r.refund.explorerUrl,
+      status: r.refund.status,
+    };
+    return [caller, model, refund];
+  }
 
   function refundView(q) {
     if (!q.refundId) return { status: "none", txHash: null };
@@ -198,9 +253,10 @@ export function createNearGate({
         txHash: rv.txHash,
         explorerUrl: rv.txHash ? explorerTxUrl(network, rv.txHash) : null,
       },
-      rate: { nearUsd: q.rate.nearUsd, source: q.rate.source, at: q.rate.at },
+      rate: { nearUsd: q.rate.nearUsd, source: q.rate.source, at: q.rate.at, ...rateExtras(q.rate) },
       outcome: q.outcome,
     };
+    receipt.legs = receiptLegs(q, receipt);
     return formatReceipt(receipt);
   }
 
@@ -234,6 +290,24 @@ export function createNearGate({
     const head = q.error || "Nothing ran and nothing was charged.";
     const tail = q.outcome === "run_failed" ? `\n\n${details || ERROR_NOT_RETAINED}` : "";
     return errResult(`${head}\n\n${rc.text}${tail}`, rc.structured);
+  }
+
+  /**
+   * Operator accounting fields for the settle event: the locked rates, NEAR in
+   * and out, the USD model cost and (wallet-funded) the XNO it spent, derived.
+   * Each asset keeps its own unit; nothing is netted across assets, and no
+   * conversion here is an executed swap.
+   */
+  function accounting(q) {
+    const s = q.settlement || {};
+    const m = modelSpend(q);
+    const charged = BigInt(s.chargedYocto || "0"), refunded = BigInt(s.refundYocto || "0");
+    return {
+      paidYocto: q.paidYocto,
+      chargedNear: formatYoctoAsNear(charged), refundNear: formatYoctoAsNear(refunded),
+      modelUsd: m.usd, modelPayment, modelXno: m.xno, modelXnoBasis: m.xno != null ? "derived" : null,
+      rate: { nearUsd: q.rate.nearUsd, source: q.rate.source, ...rateExtras(q.rate) },
+    };
   }
 
   /* ---------------- refunds ---------------- */
@@ -317,7 +391,9 @@ export function createNearGate({
       r = await rate.current();
     } catch (e) {
       if (e instanceof NearError && e.code === "RATE_UNAVAILABLE") {
-        return errResult("Cannot quote in NEAR right now: no current NEAR/USD rate; try again shortly. Nothing was charged.");
+        const pair = (e.data && e.data.pair) || "NEAR/USD";
+        const why = pair === "XNO/USD" ? " (this server pays its model provider in XNO, so the NEAR to XNO swap rate is unknown)" : "";
+        return errResult(`Cannot quote in NEAR right now: no current ${pair} rate${why}; try again shortly. Nothing was charged.`);
       }
       throw e;
     }
@@ -340,13 +416,13 @@ export function createNearGate({
       amountYocto: amountYocto.toString(),
       depositUsd: exactUsd(pricing.depositUsd),
       estimatedCostUsd: exactUsd(pricing.estimatedCostUsd),
-      rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(), nearUsd: r.nearUsd, source: r.source, at: r.at },
+      rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(), nearUsd: r.nearUsd, source: r.source, at: r.at, ...rateExtras(r) },
       createdAt, expiresAt,
       payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
       settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
     };
     ledger.putQuote(record);
-    ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source });
+    ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source, ...rateExtras(r) });
     const likelyChargeNear = formatYoctoAsNear(usdToYocto(pricing.likelyChargeUsd, r, "ceil"), { maxDecimals: 6 });
     const baseYocto = stepUp(usdToYocto(pricing.depositUsd, r, "ceil"));
     const q = formatQuote({
@@ -359,7 +435,7 @@ export function createNearGate({
         depositUsdSent: estUsd(Number(yoctoToUsd(amountYocto, r.usdNano, r.yocto))),
         dustNear: formatYoctoAsNear(amountYocto - baseYocto),
         likelyChargeNear,
-        rate: { nearUsd: r.nearUsd, source: r.source, at: r.at },
+        rate: { nearUsd: r.nearUsd, source: r.source, at: r.at, ...rateExtras(r) },
         expiresAt: new Date(expiresAt).toISOString(),
       },
     });
@@ -377,7 +453,7 @@ export function createNearGate({
         const r = await rate.current();
         near = {
           network,
-          nearUsd: r.nearUsd, rateSource: r.source, rateAt: r.at,
+          nearUsd: r.nearUsd, rateSource: r.source, rateAt: r.at, rateExtras: rateExtras(r),
           likelyChargeNear: formatYoctoAsNear(usdToYocto(computed.pricing.likelyChargeUsd, r, "ceil"), { maxDecimals: 6 }),
           depositNear: formatYoctoAsNear(stepUp(usdToYocto(computed.pricing.depositUsd, r, "ceil")), { maxDecimals: 6 }),
           depositApprox: true,
@@ -385,11 +461,20 @@ export function createNearGate({
         note = `This server is paid in NEAR on ${network}. Call run_noodle with the same arguments for a quote; nothing is charged until you send the transfer.`;
       } catch (e) {
         if (!(e instanceof NearError && e.code === "RATE_UNAVAILABLE")) throw e;
-        note = "No current NEAR/USD rate is available, so the figures are in USD only; a quote needs a rate and will fail until one is available.";
+        const pair = (e.data && e.data.pair) || "NEAR/USD";
+        note = `No current ${pair} rate is available, so the figures are in USD only; a quote needs a rate and will fail until one is available.`;
       }
     }
     return priceNoodleResult(computed, { near, note });
   }
+
+  /** XNO amount (9 decimals, half-up) of a USD amount; both in nano-USD. */
+  const ratioXno = (usdNano, xnoUsdNano) => {
+    const scale = 10n ** 9n;
+    const q = (usdNano * scale * 2n + xnoUsdNano) / (2n * xnoUsdNano);
+    const frac = (q % scale).toString().padStart(9, "0").replace(/0+$/, "");
+    return frac ? `${q / scale}.${frac}` : `${q / scale}`;
+  };
 
   const stepUp = (y) => ((y + DUST_STEP_YOCTO - 1n) / DUST_STEP_YOCTO) * DUST_STEP_YOCTO;
 
@@ -534,6 +619,7 @@ export function createNearGate({
     ev("change", {
       paymentId: q.id, tool: name, to: q.payer, costUsd,
       chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(), status: rf.status, hash: rf.txHash || null,
+      ...accounting(q),
     });
     return withReceipt(q, body);
   }
@@ -663,7 +749,8 @@ export function createNearGate({
       }
     }
 
-    return { listTools, callTool };
+    // Which names this gate sells and which only it offers (the dual-rail router reads these).
+    return { listTools, callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]) };
   }
 
   return { wrapRegistry, resume };

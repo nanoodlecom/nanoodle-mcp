@@ -106,6 +106,47 @@ function usdToRaw(usdValue, pair, mode = "floor") {
   return mode === "ceil" ? (num + pair.usdNano - 1n) / pair.usdNano : num / pair.usdNano;
 }
 
+/** The NanoGPT endpoint the XNO/USD rate probe asks (default base https://nano-gpt.com). */
+export function x402ProbeUrl(base) {
+  return `${String(base || "https://nano-gpt.com").replace(/\/+$/, "")}/api/v1/chat/completions`;
+}
+
+const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
+
+/**
+ * The XNO/USD rate oracle: a keyless request with `x-x402: true` answers 402
+ * with the invoice pair (raw XNO amount + USD value) NanoGPT settles x402
+ * payments at. Returns that exact pair { usdNano, raw }. The probe invoice is
+ * never paid; it expires on their side. `signal` is optional (the charge gate
+ * passes none).
+ */
+export async function probeX402Pair({ fetch, url, signal }) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-x402": "true" },
+    body: JSON.stringify({ model: ORACLE_MODEL, messages: [{ role: "user", content: "x402 rate probe" }] }),
+    ...(signal ? { signal } : {}),
+  });
+  if (r.status !== 402) throw new Error(`expected 402 from x402 probe, got HTTP ${r.status}`);
+  const body = await r.json();
+  // Extract the pair straight off the wire, before anything Number()s it —
+  // amountUsd is a decimal string in the payload and we keep it exact.
+  const pay = body && body.payment;
+  const pool = [
+    ...(Array.isArray(body && body.accepts) ? body.accepts : []),
+    ...(Array.isArray(pay && pay.accepted) ? pay.accepted : []),
+  ];
+  const nano = pool.find((a) => a && a.scheme === "nano");
+  const rawStr = String((nano && (nano.maxAmountRequired || nano.amount)) || "");
+  const usdVal = nano && (nano.maxAmountRequiredUSD ?? nano.amountUsd ?? (pay && pay.amountUsd));
+  if (!/^\d+$/.test(rawStr) || BigInt(rawStr) <= 0n || usdVal == null) {
+    throw new Error("402 carried no usable XNO/USD pair");
+  }
+  const usdNano = parseUsdNano(usdVal);
+  if (usdNano <= 0n) throw new Error("402 USD amount parsed to zero");
+  return { usdNano, raw: BigInt(rawStr) };
+}
+
 /**
  * Free custom-workflow helpers (src/tools.mjs). This rail does not run custom
  * graphs, so it withdraws them along with run_noodle.
@@ -184,34 +225,8 @@ export function createChargeGate({
   // settle our downstream payments at — so we quote callers at the rate we pay,
   // not a market feed's. The probe invoice is never paid; it expires on their
   // side, and the 60s cache keeps probes to at most one a minute while quoting.
-  const oracleUrl = `${String(oracleBase || "https://nano-gpt.com").replace(/\/+$/, "")}/api/v1/chat/completions`;
-  const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
-
-  async function nanoGptPair() {
-    const r = await fetch(oracleUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-x402": "true" },
-      body: JSON.stringify({ model: ORACLE_MODEL, messages: [{ role: "user", content: "x402 rate probe" }] }),
-    });
-    if (r.status !== 402) throw new Error(`expected 402 from x402 probe, got HTTP ${r.status}`);
-    const body = await r.json();
-    // Extract the pair straight off the wire, before anything Number()s it —
-    // amountUsd is a decimal string in the payload and we keep it exact.
-    const pay = body && body.payment;
-    const pool = [
-      ...(Array.isArray(body && body.accepts) ? body.accepts : []),
-      ...(Array.isArray(pay && pay.accepted) ? pay.accepted : []),
-    ];
-    const nano = pool.find((a) => a && a.scheme === "nano");
-    const rawStr = String((nano && (nano.maxAmountRequired || nano.amount)) || "");
-    const usdVal = nano && (nano.maxAmountRequiredUSD ?? nano.amountUsd ?? (pay && pay.amountUsd));
-    if (!/^\d+$/.test(rawStr) || BigInt(rawStr) <= 0n || usdVal == null) {
-      throw new Error("402 carried no usable XNO/USD pair");
-    }
-    const usdNano = parseUsdNano(usdVal);
-    if (usdNano <= 0n) throw new Error("402 USD amount parsed to zero");
-    return { usdNano, raw: BigInt(rawStr) };
-  }
+  const oracleUrl = x402ProbeUrl(oracleBase);
+  const nanoGptPair = () => probeX402Pair({ fetch, url: oracleUrl });
 
   let rate = Number.isFinite(xnoUsd) && xnoUsd > 0
     ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: 10n ** 30n }, at: Infinity, source: "static" }

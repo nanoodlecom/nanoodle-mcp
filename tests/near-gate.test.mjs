@@ -124,7 +124,7 @@ test("a quote carries the exact deposit with dust, the locked rate and the itemi
   assert.equal(payment.rate.nearUsd, "3.64");
   assert.match(payment.paymentId, /^nq_[A-Za-z0-9_-]{12}$/);
   const rec = w.ledger.getQuote(payment.paymentId);
-  assert.equal(rec.expiresAt - rec.createdAt, 15 * 60_000);
+  assert.equal(rec.expiresAt - rec.createdAt, 30 * 60_000); // the default quote lifetime
   assert.equal(payment.expiresAt, new Date(rec.expiresAt).toISOString());
   assert.equal(pricing.estimatedCost.items.length, 2);
   assert.match(text(r), /Send exactly 0\.008379 NEAR \(8379000000000000000000 yoctoNEAR\) to merchant\.testnet on testnet/);
@@ -506,8 +506,8 @@ test("quotes are capped and stale unpaid quotes are pruned while the server runs
   assert.equal(busy.isError, true);
   assert.match(text(busy), /too many open quotes/);
   assert.equal(ledger.quotes().length, 2);
-  // quotes expire (15 min) and, past the retention, are pruned on the next quote
-  t += 15 * 60_000 + 60_000 + 61_000;
+  // quotes expire (30 min by default) and, past the retention, are pruned on the next quote
+  t += 30 * 60_000 + 60_000 + 61_000;
   assert.ok(!(await q(4)).isError);
   assert.deepEqual(ledger.quotes().map((x) => x.status), ["pending"]);
   // a stored quote keeps only what payment and settlement need

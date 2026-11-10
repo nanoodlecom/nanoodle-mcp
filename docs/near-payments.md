@@ -14,6 +14,8 @@ switch.
 - [Tools and arguments](#tools-and-arguments)
 - [Quote, receipt and price shapes](#quote-receipt-and-price-shapes)
 - [Configuration](#configuration)
+- [Rates and the swap margin](#rates-and-the-swap-margin)
+- [One server, both rails](#one-server-both-rails)
 - [Which graphs a paid server will run](#which-graphs-a-paid-server-will-run)
 - [Durable state](#durable-state)
 - [On-chain verification](#on-chain-verification)
@@ -31,7 +33,7 @@ agent                              nanoodle-mcp (NEAR mode)                NEAR 
   |<----------------------------------|                                        |
   |  run_noodle {graph, inputs}       |                                        |
   |---------------------------------->|  validate fully, price, lock rate,     |
-  |<---------- quote -----------------|  store quote (pending, 15 min)         |
+  |<---------- quote -----------------|  store quote (pending, 30 min)         |
   |                                                                            |
   |  ONE native transfer of exactly quote.amountYocto to quote.payTo --------->|
   |                                                                            |
@@ -61,7 +63,8 @@ agent                              nanoodle-mcp (NEAR mode)                NEAR 
    [On-chain verification](#on-chain-verification)). It records the transaction hash as
    consumed before anything runs, then runs the workflow once.
 4. **Settle.** The charge is `min(actual model cost + 20% service fee, deposit)`. It is
-   converted at the NEAR/USD rate locked into the quote. The graph that ran is the graph
+   converted at the NEAR/USD rate locked into the quote (with the swap margin, if the
+   operator set one; see [Rates and the swap margin](#rates-and-the-swap-margin)). The graph that ran is the graph
    that was priced (see [The run is bound to the price](#the-run-is-bound-to-the-price)). The server returns the rest to the
    paying account in one NEAR transfer. The result carries a receipt with the charge, the
    refund, both transaction hashes and explorer links.
@@ -84,7 +87,7 @@ Every price the server shows uses these terms, with the same meaning in
 | **deposit** | The most you can be charged. It is held up front and is the amount you send. |
 | **charged** | Actual model cost + 20% service fee, capped at the deposit. When the provider does not report a run's full cost, the estimated cost is charged instead (see below). |
 | **refund** | The deposit minus what was charged. It is sent back to the paying account automatically. |
-| **rate** | The NEAR/USD rate used, with its source and timestamp. A quote locks it, so settlement uses the same rate. |
+| **rate** | The NEAR/USD rate used, with its source and timestamp. When known, also the XNO/USD rate and the swap rate derived from the two ("1 NEAR = N XNO"), each with source and timestamp, and the swap margin when it is not zero. A quote locks all of it for its whole lifetime, so settlement uses the same rate. |
 
 In `structuredContent`, a figure named after its term is `usd` (`estimatedCost.usd`,
 `likelyCharge.usd`, `deposit.usd`, `charged.usd`); a figure only known after the run is
@@ -141,6 +144,8 @@ the locked rate (`0.03049956`), next to `deposit.quotedUsd` (`0.03`), so
 
 All on-chain arithmetic uses BigInt yoctoNEAR (1 NEAR = 10^24 yocto) and no floating point.
 The locked rate is stored as an exact pair: `usdNano` nano-dollars buy `yocto` yoctoNEAR.
+With no swap margin `yocto` is 10^24 (one NEAR); with a margin of `b` basis points it is
+`10^24 × (10000 + b) / 10000`, so every NEAR amount is `b` basis points larger.
 
 ```
 cost    = ceil(actual model cost USD × yocto / usdNano)    // as reported by NanoGPT
@@ -303,12 +308,24 @@ A refused paid call returns `isError: true` with `structuredContent.refusals`
     "depositUsdSent": "0.0305",
     "dustNear": "0.000137",
     "likelyChargeNear": "0.003172",
-    "rate": { "nearUsd": "3.64", "source": "coingecko", "at": "2026-11-09T12:00:00.000Z" },
-    "expiresAt": "2026-11-09T12:15:00.000Z",
+    "rate": { "nearUsd": "3.64", "source": "coingecko", "at": "2026-11-09T12:00:00.000Z",
+              "xnoUsd": "0.95", "xnoSource": "nanogpt-x402", "xnoAt": "2026-11-09T12:00:01.000Z",
+              "xnoPerNear": "3.831578947", "nearPerXno": "0.260989011", "spreadBps": 0 },
+    "expiresAt": "2026-11-09T12:30:00.000Z",
     "next": "Send exactly 0.008379 NEAR (8379000000000000000000 yoctoNEAR) to merchant.testnet on testnet in ONE transfer, then call this tool again with the same arguments plus _payment_id, _payment_tx and _payment_sender."
   }
 }
 ```
+
+The `rate` object keeps `nearUsd`, `source` and `at` and adds the XNO/USD and swap fields
+when the server has them (a NEAR/USD-only rate, or a quote stored before this version,
+has only the first three). `xnoUsd` and the swap fields are `null` when XNO/USD is
+unavailable on an API-key server; with a swap margin, `spreadBps` is non-zero and
+`effectiveNearUsd` is the NEAR/USD the amounts were computed at. The quote's text carries
+the same in its one rate line:
+
+> Rate: 1 NEAR = $3.64 (coingecko, 2026-11-09T12:00:00.000Z); 1 XNO = $0.95 (nanogpt-x402,
+> 2026-11-09T12:00:01.000Z), so 1 NEAR = 3.831578947 XNO, locked for this quote; network testnet
 
 ### Receipt (appended to a paid result)
 
@@ -325,10 +342,43 @@ A refused paid call returns `isError: true` with `structuredContent.refusals`
     "charged": { "yocto": "3102197802197802197803", "near": "0.003102197802197802197803", "usd": "0.011292", "capped": false },
     "refund": { "yocto": "5276802197802197802197", "near": "0.005276802197802197802197", "usd": "0.019207559",
                 "to": "payer.testnet", "status": "sent", "txHash": "...", "explorerUrl": "https://testnet.nearblocks.io/txns/..." },
-    "rate": { "nearUsd": "3.64", "source": "coingecko", "at": "2026-11-09T12:00:00.000Z" },
-    "outcome": "succeeded"
+    "rate": { "nearUsd": "3.64", "source": "coingecko", "at": "2026-11-09T12:00:00.000Z",
+              "xnoUsd": "0.95", "xnoSource": "nanogpt-x402", "xnoAt": "2026-11-09T12:00:01.000Z",
+              "xnoPerNear": "3.831578947", "nearPerXno": "0.260989011", "spreadBps": 0 },
+    "outcome": "succeeded",
+    "legs": [
+      { "leg": "caller payment", "asset": "NEAR", "amount": "0.008379", "yocto": "8379000000000000000000",
+        "txHash": "...", "explorerUrl": "https://testnet.nearblocks.io/txns/...", "status": "final" },
+      { "leg": "model payment", "status": "paid", "usd": "0.00941", "xno": "0.009905263",
+        "basis": "XNO derived from the reported cost at the locked XNO/USD rate", "fundedBy": "wallet" },
+      { "leg": "refund", "asset": "NEAR", "amount": "0.005276802197802197802197", "yocto": "5276802197802197802197",
+        "to": "payer.testnet", "txHash": "...", "explorerUrl": "https://testnet.nearblocks.io/txns/...", "status": "sent" }
+    ]
   }
 }
+```
+
+`legs` shows the three money movements of one call separately, each with its own status;
+nothing is labelled settled that is not:
+
+1. **caller payment**: the NEAR deposit, its transaction hash and explorer link; `final`
+   once the server has read it at FINAL finality.
+2. **model payment**: what the server paid NanoGPT for the run, in USD as NanoGPT reported
+   it. On a server that pays from its Nano wallet, `xno` is that cost converted at the
+   quote's locked XNO/USD rate, labelled as **derived**: the wallet pays NanoGPT per x402
+   invoice and its blocks are not attributed to a single run. On an API-key server the
+   basis is "paid from the operator's NanoGPT balance" and `xno` is `null`. When the cost
+   is not known (a failed or interrupted run, or a provider that reported nothing) the
+   status is `unknown` and `usd` is `null`, never zero; when nothing ran it is `none`.
+3. **refund**: the NEAR refund with its status (`sent`, `pending`, `none`,
+   `failed_permanent`) and hash.
+
+The receipt text ends with the same three legs on three short lines:
+
+```
+Leg 1, caller payment: 0.008379 NEAR, tx 8PyS…, final.
+Leg 2, model payment to NanoGPT: $0.00941 = 0.009905263 XNO (XNO derived from the reported cost at the locked XNO/USD rate).
+Leg 3, refund: ≈0.005277 NEAR, sent (tx 8yto…, https://testnet.nearblocks.io/txns/8yto…).
 ```
 
 The result's own text replaces the engine's `cost: $X` line (model cost only) with what was
@@ -345,7 +395,8 @@ or `interrupted` (the server restarted during the run; whole deposit refunded).
 
 ## Configuration
 
-NEAR mode is opt-in. It requires `--serve` and cannot be combined with `--charge-usd`.
+NEAR mode is opt-in and requires `--serve`. Combined with `--charge-usd`, one server takes
+either rail per call (see [One server, both rails](#one-server-both-rails)).
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
@@ -353,16 +404,100 @@ NEAR mode is opt-in. It requires `--serve` and cannot be combined with `--charge
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify and refund on. |
 | `--near-rpc <url>` | `NEAR_RPC_URL` | testnet `https://test.rpc.fastnear.com`, mainnet `https://free.rpc.fastnear.com` | JSON-RPC endpoint. Use a provider you trust: it attests finality. |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (`ed25519:...`; also read from `--env-file`) | (required) | Full-access key of the merchant account, used to sign refunds. A key file is a JSON file with `account_id`, `public_key` and `private_key`: legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes. Its `account_id` must equal the merchant account. near-cli-rs key files have no `account_id` and are refused; use `NEAR_PRIVATE_KEY` for those. The key is never logged or echoed, and never accepted on the command line. |
-| `--near-usd <n>` | `NEAR_USD` | (live) | Static NEAR/USD rate for tests and demos. Without it, the rate comes from CoinGecko's public simple-price endpoint. It is cached for 60 seconds and a stale copy is used for at most 5 minutes. After that, quoting **fails closed**: no quote is issued without a rate. |
+| `--near-usd <n>` | `NEAR_USD` (also read from `--env-file`) | (live) | Static NEAR/USD rate for tests and demos. Without it, the rate comes from CoinGecko's public simple-price endpoint. See [Rates](#rates-and-the-swap-margin). |
+| `--xno-usd <n>` | | (live) | Static XNO/USD rate; the same flag the Nano charge mode uses. Without it, XNO/USD comes from NanoGPT's own x402 invoices, else CoinGecko. |
+| `--near-swap-spread-bps <n>` | `NEAR_SWAP_SPREAD_BPS` (also read from `--env-file`) | `0` | Swap margin, 0 to 2000 basis points. NEAR amounts are computed at a NEAR/USD rate that much worse for the caller, to cover the cost of swapping received NEAR to XNO. |
+| `--near-quote-ttl-min <n>` | `NEAR_QUOTE_TTL_MIN` | `30` | Quote lifetime in minutes, 1 to 120. The quote's rates stay locked for all of it. |
+| `--near-rates-refresh-s <n>` | `NEAR_RATES_REFRESH_S` | `60` | Background refresh of the live rates every n seconds; `0` turns the timer off (quotes still refresh a rate older than 60 s). |
 | `--near-max-deposit-usd <n>` | | `2` | Refuse any call whose deposit would exceed this. |
 
 NanoGPT is paid exactly as it is today, with the operator's `NANOGPT_API_KEY` or Nano wallet.
 NEAR mode changes only how callers pay the operator.
 
 The state file is `<out>/near-state.json`. Money events are appended to `<out>/usage.jsonl`
-with `"rail": "near"` and the same event names as the Nano mode (`quote`, `paid`,
-`refund`, `change`). Use a **dedicated merchant account** whose key no other software uses.
-Refund nonces are managed by this server alone (see [Refunds](#refunds)).
+(`<out>/near-usage.jsonl` when both rails run) with `"rail": "near"` and the same event
+names as the Nano mode (`quote`, `paid`, `refund`, `change`). Use a **dedicated merchant
+account** whose key no other software uses. Refund nonces are managed by this server alone
+(see [Refunds](#refunds)).
+
+### Reading the payments ledger
+
+Each settled NEAR call writes one `change` event. Besides `chargedYocto` and `refundYocto`
+it carries `paidYocto`, `chargedNear`, `refundNear`, `modelUsd` (the USD model cost),
+`modelPayment` (`wallet` or `api_key`), `modelXno` (on a wallet-funded server: the XNO
+the run cost, derived from `modelUsd` at the locked XNO/USD rate, with `modelXnoBasis:
+"derived"`) and `rate` (the locked `nearUsd`, `xnoUsd`, `xnoPerNear`, `nearPerXno` and
+`spreadBps`). Every asset stays in its own unit and nothing is netted across assets. To
+decide when to swap, total `chargedYocto` over the `change` events (NEAR the operator kept)
+and `modelXno` (XNO the Nano float spent); compare them at today's rates on `GET /rates`.
+A conversion shown for reporting is never an executed swap: this server does not swap.
+
+## Rates and the swap margin
+
+Callers pay in NEAR. The server pays NanoGPT with its API key or in XNO from its Nano
+wallet, so in wallet mode the operator is in effect swapping NEAR for XNO. The server
+keeps three rates, each with its source and timestamp:
+
+| Rate | Source, in order |
+|---|---|
+| NEAR/USD | `--near-usd` / `NEAR_USD`, else CoinGecko's public simple price (`near`) |
+| XNO/USD | `--xno-usd`, else NanoGPT's own x402 invoice pair (the rate the Nano float is actually spent at; the same probe the Nano charge mode uses), else CoinGecko (`nano`) |
+| swap rate | derived: `xnoPerNear = nearUsd / xnoUsd` and `nearPerXno = xnoUsd / nearUsd` |
+
+The swap rate is **derived from the two USD rates; no swap venue is queried**, and the
+server does **not** swap NEAR to XNO itself. Replenishing the Nano float from the NEAR the
+merchant account received is a manual operator task. All rate math is exact (decimal
+strings and BigInt); no float feeds an amount.
+
+**Swap margin.** `--near-swap-spread-bps b` (default 0, at most 2000) makes NEAR amounts
+`b` basis points larger: the locked pair is `{ usdNano, yocto: 10^24 × (10000 + b) / 10000 }`.
+With 150 bps and NEAR at $3.64 the worked example's $0.03 deposit is 0.008366 NEAR before
+dust instead of 0.008242, and the charge for the same $0.00941 run is
+3148730769230769230769 yocto instead of 3102197802197802197803. The rate line then adds
+"swap margin 1.5%: NEAR amounts use 1 NEAR = $3.586206897". With 0 every number is exactly
+as without a margin.
+
+**Refresh.** Live rates refresh on a background timer (`--near-rates-refresh-s`, 60 s), a
+quote refetches a live rate older than 60 s, and a forced refresh refetches now:
+
+- `SIGHUP` re-reads `NEAR_USD` and `NEAR_SWAP_SPREAD_BPS` from the `--env-file` (a flag on
+  the command line still wins) and refetches the live rates, so an operator can change a
+  pinned rate or the margin without a restart. An invalid value changes nothing. Open
+  quotes keep the rate they locked.
+- `GET /rates` returns the current rates as JSON: `nearUsd`, `xnoUsd`, `xnoPerNear`,
+  `nearPerXno`, `spreadBps`, `effectiveNearUsd`, whether quoting is possible, each source
+  with `at`, `fetchedAt`, `ageSeconds` and its last error, and the next scheduled refresh.
+  `GET /rates?refresh=1` refetches at most once every 15 seconds; inside that window it
+  answers from cache and says so in `refresh.note`.
+
+**Fail closed.** Without a NEAR/USD rate younger than 5 minutes there is no NEAR quote.
+On a server that pays NanoGPT from its Nano wallet the same holds for XNO/USD (the swap
+rate is unknown). On an API-key server XNO/USD is informational: its absence never blocks
+a quote and the rate line says "XNO/USD unavailable".
+
+## One server, both rails
+
+`--charge-usd` and `--near-merchant` together run one server that accepts Nano (XNO) or
+NEAR per call. Each alone behaves exactly as before.
+
+- `tools/list` is the Nano charge mode's list, unchanged in names, prices and schemas,
+  plus the NEAR-only tools `run_noodle`, `price_noodle` and `noodle_guide`. Every saved
+  tool the NEAR gate also sells gains one sentence saying it can be paid in NEAR with
+  `"_pay_with": "near"`, and `_pay_with` (`nano` or `near`), `_payment_tx` and
+  `_payment_sender` in its schema.
+- A small router (`src/rail-router.mjs`) picks the gate: a NEAR-only tool, a `_payment_id`
+  starting `nq_`, or no payment id with `"_pay_with": "near"` go to the NEAR gate; a
+  `_payment_id` starting `pay_` and everything else go to the Nano gate. `_pay_with` is
+  removed before either gate sees the call, so the paying call hashes to the same
+  arguments whether or not it repeats it. `_pay_with: "near"` on a tool the NEAR gate does
+  not sell, and contradictory payment arguments (a `pay_` id with `_payment_tx`, an `nq_` id
+  with `_pay_with: "nano"`, `_payment_tx` without a NEAR quote), are refused with a clear
+  message before anything is quoted or consumed.
+- The gates keep separate state (`gate-state.json`, `near-state.json`) and ledgers
+  (`usage.jsonl`, `near-usage.jsonl`). NEAR-paid runs spend XNO through the same wallet
+  payment callback as Nano-paid runs, when the server has no API key.
+- The server instructions, landing page and `/llms.txt` say both rails are accepted and
+  where the rates are. `npm run simulate:dual` shows it end to end, offline.
 
 ## Which graphs a paid server will run
 
@@ -614,7 +749,9 @@ and the amount counts toward `charged`.
 | **Expired quote** | Before payment, the caller gets a fresh quote. A payment whose block time is after `expiresAt` is refunded in full (`late_payment`). |
 | **Restart mid-run** | The consumed hash and the `running` status are on disk before the run. On restart the quote becomes `interrupted` and is fully refunded, and it is never re-run. |
 | **Refund failure** | The signed refund is persisted with its hash and retried with the same bytes. It is re-signed only when the old transaction is provably dead. The receipt shows `pending` until it is sent. |
-| **Rate movement** | The quote locks the rate. Settlement uses that rate even if NEAR moves during the 15-minute window. A live rate older than 5 minutes stops quoting; it does not guess. |
+| **Rate movement** | The quote locks NEAR/USD, XNO/USD and the swap rate for its whole lifetime (30 minutes by default, `--near-quote-ttl-min`). Settlement uses them even if NEAR or XNO moves, so the operator carries NEAR/XNO price movement for up to the quote lifetime, and on a wallet-funded server until the received NEAR is swapped by hand. The swap margin (`--near-swap-spread-bps`) is the operator's cushion for it. |
+| **Stale rate** | A live NEAR/USD older than 5 minutes stops quoting; it does not guess. On a wallet-funded server the same applies to XNO/USD. Refreshes run every 60 s, lazily before a quote and on demand (`SIGHUP`, `/rates?refresh=1`, at most once per 15 s so the public endpoint cannot be used to hammer the rate sources). |
+| **Swap exposure** | The swap rate is derived from two USD prices, not quoted by a venue, and the server never swaps. The NEAR the operator receives and the XNO it spends are recorded separately in the ledger; a real swap can cost more than the derived rate (fees, slippage, delay). Size the swap margin for that. |
 | **Malicious graph** | Allowlisted nodes only, typed wiring, no URL or data fields, no `modelOpts`/`extraJson`, fragment-only share links, and caps on size (checked before a share link is inflated), nodes, inputs and deposit. The run is bound to the priced graph. Everything is checked before a quote exists, so nobody pays for a call that could not run. |
 | **Quote spam** | Quotes are free. At most 1,000 unpaid quotes are open at once; unpaid quotes are pruned an hour after expiry; a stored quote is a few hundred bytes. A flood can make the server answer "busy" for a while (denial of service), but it cannot grow the state file without bound or block payments already quoted. There is no per-client rate limit; put one in front of the server if that matters. |
 | **Lying RPC** | Out of scope. The configured RPC is trusted to report finality honestly. Use a provider you trust, or your own node. |
@@ -645,7 +782,21 @@ These are deliberate cuts for this version.
   NEAR mode.
 - There is no pay page, QR code or payment-watch stream for NEAR. The caller presents the
   transaction hash itself.
-- The live rate comes from a single public source (CoinGecko). Use `--near-usd` to pin it.
+- With both rails on one server, a NanoGPT max-cost refund to the shared Nano wallet is a
+  receive like any caller payment; the Nano gate matches receives by amount, so such a
+  refund can in rare cases match an open Nano quote's amount. This is the same exposure the
+  Nano charge mode already has for its own runs; NEAR-paid runs on a wallet-funded server
+  add more of those refunds. An API-key-funded server has none.
+- The live NEAR/USD rate comes from a single public source (CoinGecko). Use `--near-usd` to pin it.
+- The swap rate is derived from two USD rates; no swap venue is queried, and the server
+  does not swap NEAR to XNO. Replenishing the Nano float is a manual operator task.
+- On a wallet-funded server the receipt's XNO figure is derived from the reported USD cost
+  at the locked rate, not read from the wallet's invoice blocks (the wallet pays per
+  invoice and does not attribute blocks to a run).
+- `--xno-usd` is a command-line flag only; `SIGHUP` reloads `NEAR_USD` and
+  `NEAR_SWAP_SPREAD_BPS` from the env file, not a pinned XNO/USD.
+- The background rate refresh asks NanoGPT for an x402 invoice (never paid) and CoinGecko
+  once per interval while any rate is live.
 - Everything is exercised offline against a local chain stand-in that speaks the public RPC
   wire format, plus read-only queries against public testnet RPC. Testnet is the intended
   first live network; mainnet works by configuration only.
@@ -670,14 +821,18 @@ src/near/rpc.mjs         JSON-RPC client with injected fetch, exact integers, ty
 src/near/verify.mjs      read and check a payment transaction
 src/near/ledger.mjs      durable quotes / consumed hashes / refunds (sync atomic JSON file)
 src/near/rate.mjs        NEAR/USD: static or CoinGecko, cached, fail closed
+src/near/rates.mjs       NEAR/USD + XNO/USD + derived swap rate, swap margin, timer,
+                         forced refresh, reload; what the NEAR gate and GET /rates use
 src/near/refunds.mjs     serialized refund sender with persist-before-broadcast
 src/near/explorer.mjs    per-network defaults (RPC, explorer) and nearblocks.io links
 src/near/index.mjs       re-exports
 src/custom-workflow.mjs  graph args, safety allowlist + caps, itemized pricing,
                          deposit, pricing-vocabulary formatters, authoring guide
 src/near-gate.mjs        quote -> verify -> run once -> settle -> refund -> replay
+src/rail-router.mjs      one server, both rails: picks the Nano or the NEAR gate per call
 scripts/near-simulate.mjs   whole flow offline: the real server binary against a local
                             chain stand-in and NanoGPT stand-in (npm run simulate:near)
+scripts/dual-simulate.mjs   one server with both rails, offline (npm run simulate:dual)
 scripts/near-check-tx.mjs   read-only: check a real transfer against the rules above
 tests/fixtures/near-fake-chain.mjs  the chain and NanoGPT stand-ins the tests and the
                             simulation share

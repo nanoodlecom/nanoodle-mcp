@@ -6,6 +6,8 @@
  *   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
  *   nanoodle-mcp --graphs <dir> --serve [host:]port --near-merchant <account> [--near-network testnet|mainnet]
  *                [--near-rpc url] [--near-key-file path] [--near-usd n] [--near-max-deposit-usd n]
+ *                [--near-swap-spread-bps n] [--near-quote-ttl-min n] [--near-rates-refresh-s n]
+ *   --charge-usd and --near-merchant together: one server, callers pay each call in Nano or NEAR.
  *
  * Default transport is MCP over stdio. --serve speaks MCP over streamable HTTP
  * instead — host a directory of noodles as a service — and --charge-usd puts an
@@ -62,6 +64,7 @@ function usage(code = 1) {
   nanoodle-mcp --graphs <dir> --serve [host:]port [--charge-usd n] [--public-url u] [--nano-ws url]
   nanoodle-mcp --graphs <dir> --serve [host:]port --near-merchant acct [--near-network n] [--near-rpc u]
                [--near-key-file p] [--near-usd n] [--near-max-deposit-usd n] [--public-url u]
+               [--near-swap-spread-bps n] [--near-quote-ttl-min n] [--near-rates-refresh-s n]
   nanoodle-mcp --version
 
   --graphs dir   directory of noodle-graph.json saves — each becomes an MCP tool (required;
@@ -108,7 +111,8 @@ Serve mode (host your noodles over HTTP instead of stdio):
                    polling via --nano-rpc is the always-on fallback (NANO_WS_URL —
                    env or --env-file — keeps a key-bearing ws URL off the command line)
   --xno-usd n      static XNO/USD rate override (default: NanoGPT's own x402 invoices
-                   are the rate oracle — the rate we pay is the rate we charge; cached 60s)
+                   are the rate oracle — the rate we pay is the rate we charge; cached 60s).
+                   The NEAR rail uses it too, for its XNO/USD and NEAR→XNO swap rate
 
 Paid in NEAR (custom workflows too; see docs/near-payments.md):
   --near-merchant a  sell tool calls for native NEAR, paid to account a (NEAR_MERCHANT).
@@ -116,8 +120,9 @@ Paid in NEAR (custom workflows too; see docs/near-payments.md):
                      again with _payment_id/_payment_tx/_payment_sender; the run settles at
                      actual model cost + 20% service fee and the rest is refunded in NEAR.
                      run_noodle runs callers' own graphs (allowlisted node types only);
-                     price_noodle and noodle_guide stay free. Requires --serve; not with
-                     --charge-usd. NanoGPT is still paid by your API key or Nano wallet.
+                     price_noodle and noodle_guide stay free. Requires --serve. With
+                     --charge-usd as well, one server accepts both: Nano by default, NEAR
+                     with "_pay_with": "near". NanoGPT is still paid by your API key or Nano wallet.
   --near-network n   testnet (default) or mainnet (NEAR_NETWORK)
   --near-rpc u       NEAR JSON-RPC endpoint you trust for finality (NEAR_RPC_URL;
                      default fastnear's public RPC for the network)
@@ -127,6 +132,15 @@ Paid in NEAR (custom workflows too; see docs/near-payments.md):
   --near-usd n       static NEAR/USD rate (NEAR_USD) for tests and demos; default is
                      CoinGecko's public price, cached 60s, quoting stops when it is stale
   --near-max-deposit-usd n  refuse any call whose deposit would exceed $n (default 2)
+  --near-swap-spread-bps n  swap margin, 0-2000 basis points (NEAR_SWAP_SPREAD_BPS; default 0):
+                     NEAR amounts are computed at a NEAR/USD rate n bps worse for the caller,
+                     to cover swapping received NEAR to XNO (a manual operator task)
+  --near-quote-ttl-min n    NEAR quote lifetime in minutes, 1-120 (NEAR_QUOTE_TTL_MIN; default 30);
+                     a quote's rates stay locked for all of it
+  --near-rates-refresh-s n  background refresh of live rates every n seconds (NEAR_RATES_REFRESH_S;
+                     default 60, 0 disables). GET /rates shows them; /rates?refresh=1 refetches
+                     (at most once per 15s); SIGHUP re-reads NEAR_USD / NEAR_SWAP_SPREAD_BPS
+                     from --env-file and refetches
 
 No API key? Set NANO_SEED or NANO_PRIVATE_KEY (env or --env-file) to run accountless:
 each call's HTTP 402 invoice is paid in Nano (XNO) from that wallet via x402.
@@ -143,6 +157,7 @@ async function main() {
   let outDir = null, keyFlag = null, envFile = null, nanoRpcFlag = null, workRpcFlag = null, maxUsdFlag = null, outTtlFlag = null;
   let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null, noLocalWork = false;
   let nearMerchantFlag = null, nearNetworkFlag = null, nearRpcFlag = null, nearKeyFile = null, nearUsdFlag = null, nearMaxDepositFlag = null;
+  let nearSpreadFlag = null, nearQuoteTtlFlag = null, nearRefreshFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -174,6 +189,9 @@ async function main() {
     else if (a === "--near-key-file") nearKeyFile = val("--near-key-file");
     else if (a === "--near-usd") nearUsdFlag = val("--near-usd");
     else if (a === "--near-max-deposit-usd") nearMaxDepositFlag = val("--near-max-deposit-usd");
+    else if (a === "--near-swap-spread-bps") nearSpreadFlag = val("--near-swap-spread-bps");
+    else if (a === "--near-quote-ttl-min") nearQuoteTtlFlag = val("--near-quote-ttl-min");
+    else if (a === "--near-rates-refresh-s") nearRefreshFlag = val("--near-rates-refresh-s");
     else if (a === "--near-key" || a === "--near-private-key") {
       console.error(`${a} is not accepted: a key on the command line leaks via ps and shell history. ` +
         "Use --near-key-file <near-cli credentials JSON> or NEAR_PRIVATE_KEY in the environment or --env-file.");
@@ -213,16 +231,27 @@ async function main() {
   const nearMerchant = nearMerchantFlag || process.env.NEAR_MERCHANT || null;
   const nearMode = !!nearMerchant;
   const nearNetwork = nearNetworkFlag || process.env.NEAR_NETWORK || "testnet";
-  const nearUsdText = nearUsdFlag ?? process.env.NEAR_USD ?? null;
+  let nearUsdText = nearUsdFlag ?? process.env.NEAR_USD ?? null;
+  let nearSpreadText = nearSpreadFlag ?? process.env.NEAR_SWAP_SPREAD_BPS ?? null;
   const nearMaxDeposit = positive("--near-max-deposit-usd", nearMaxDepositFlag);
-  if (!nearMode && (nearNetworkFlag || nearRpcFlag || nearKeyFile || nearUsdFlag || nearMaxDepositFlag)) {
+  if (!nearMode && (nearNetworkFlag || nearRpcFlag || nearKeyFile || nearUsdFlag || nearMaxDepositFlag || nearSpreadFlag || nearQuoteTtlFlag || nearRefreshFlag)) {
     console.error("the --near-* options need --near-merchant <account> (or NEAR_MERCHANT)"); usage();
   }
+  let nearQuoteTtlMin = 30, nearRefreshS = 60;
   if (nearMode) {
     if (serveSpec === null) { console.error("--near-merchant only makes sense with --serve (NEAR payments are for a hosted server)"); usage(); }
-    if (chargeUsd != null) { console.error("--near-merchant and --charge-usd are two payment rails; pick one"); usage(); }
     if (nearNetwork !== "testnet" && nearNetwork !== "mainnet") { console.error(`--near-network must be testnet or mainnet, got "${nearNetwork}"`); usage(); }
     if (nearUsdText != null) positive("--near-usd", nearUsdText);
+    const ttl = nearQuoteTtlFlag ?? process.env.NEAR_QUOTE_TTL_MIN ?? null;
+    if (ttl != null) {
+      nearQuoteTtlMin = Number(ttl);
+      if (!Number.isInteger(nearQuoteTtlMin) || nearQuoteTtlMin < 1 || nearQuoteTtlMin > 120) { console.error("--near-quote-ttl-min expects a whole number of minutes from 1 to 120"); usage(); }
+    }
+    const rs = nearRefreshFlag ?? process.env.NEAR_RATES_REFRESH_S ?? null;
+    if (rs != null) {
+      nearRefreshS = Number(rs);
+      if (!Number.isInteger(nearRefreshS) || nearRefreshS < 0 || nearRefreshS > 86_400) { console.error("--near-rates-refresh-s expects a whole number of seconds from 0 to 86400 (0 disables)"); usage(); }
+    }
   }
 
   // --out-ttl: auto-delete generated media older than N hours (fractions allowed; 0 disables).
@@ -264,10 +293,17 @@ async function main() {
     if (!workRpcFlag) workUrl = entry("NANO_WORK_URL") ?? workUrl;
     workKey = entry("NANO_WORK_KEY") ?? workKey;
     if (!nanoWsFlag) nanoWs = entry("NANO_WS_URL") ?? nanoWs;
+    // Pinned NEAR-rail values: a flag wins, then the env file, then the environment (SIGHUP re-reads the file).
+    if (nearUsdFlag == null) nearUsdText = entry("NEAR_USD") ?? nearUsdText;
+    if (nearSpreadFlag == null) nearSpreadText = entry("NEAR_SWAP_SPREAD_BPS") ?? nearSpreadText;
+    if (nearMode && nearUsdText != null) positive("--near-usd (NEAR_USD)", nearUsdText);
     if (!fileKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined && !(nearMode && /^\s*(?:export\s+)?NEAR_PRIVATE_KEY\s*=/m.test(envText))) {
       console.error(`--env-file: no NANOGPT_API_KEY, NANO_SEED, or NANO_PRIVATE_KEY entry in ${envFile}`);
       process.exit(1);
     }
+  }
+  if (nearMode && nearSpreadText != null && !(/^\d{1,4}$/.test(String(nearSpreadText).trim()) && Number(String(nearSpreadText).trim()) <= 2000)) {
+    console.error("--near-swap-spread-bps (NEAR_SWAP_SPREAD_BPS): the swap spread must be a whole number of basis points from 0 to 2000"); usage();
   }
 
   // The wallet exists for two independent jobs: paying NanoGPT x402 invoices when
@@ -431,12 +467,18 @@ async function main() {
   let instructions;
   let paymentNote = null;
   let nearInfo = null;
+  let near = null;
   if (nearMode) {
-    ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = await startNearMode({
+    near = await startNearMode({
       registry, merchant: nearMerchant, network: nearNetwork, rpcFlag: nearRpcFlag, keyFile: nearKeyFile,
-      envText, usdText: nearUsdText, maxDepositUsd: nearMaxDeposit, outDir: resolvedOut,
-    }));
-  } else if (chargeUsd != null) {
+      envText, envFile, usdText: nearUsdText, usdFlag: nearUsdFlag != null, spreadText: nearSpreadText, spreadFlag: nearSpreadFlag != null,
+      xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
+      modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
+      maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase, dual: chargeUsd != null,
+    });
+    ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
+  }
+  if (chargeUsd != null) {
     usagePath = join(resolvedOut, "usage.jsonl");
     let usageChain = Promise.resolve();
     usageLog = (event, fields) => {
@@ -478,8 +520,9 @@ async function main() {
       log: (line) => console.error("nanoodle-mcp: " + line),
       usage: usageLog,
     });
-    ({ listTools, callTool } = gate.wrapRegistry(registry));
-    instructions =
+    const nanoWrapped = gate.wrapRegistry(registry);
+    ({ listTools, callTool } = nanoWrapped);
+    const nanoInstructions =
       "Every tool on this server is paid per call in Nano (XNO) — no account or API key needed. " +
       "When a tools/call returns PAYMENT REQUIRED it HANGS UP with a payUrl and a watchUrl. " +
       "On that payment link: show your user ONLY the payUrl (QR; confirms on-screen when paid) — never the watch URL or wallet address — " +
@@ -492,7 +535,23 @@ async function main() {
       "workflow's author when its graph names a payout address, and to the operator when it does not), and the difference " +
       "is sent back to the paying wallet as change after the run. " +
       "Quotes expire after 15 minutes. If a run fails after payment, the whole payment is refunded automatically.";
-  } else {
+    instructions = nanoInstructions;
+    if (near) {
+      // Both rails on one server: a small router sends each call to the gate that issued (or will issue) its quote.
+      const { createRailRouter } = await import("../src/rail-router.mjs");
+      const router = createRailRouter({ nano: nanoWrapped, near: near.wrapped });
+      ({ listTools, callTool } = router);
+      instructions =
+        "This server accepts two payment rails per call: Nano (XNO) over x402, the default, and native NEAR. " +
+        "NANO (default): " + nanoInstructions.replace(/^Every tool on this server is paid per call in Nano \(XNO\) — no account or API key needed\. /, "") +
+        " NEAR: " + near.instructions +
+        ` A saved tool whose description says it can be paid in NEAR takes "_pay_with": "near" for a NEAR quote; ` +
+        "run_noodle (custom workflows), price_noodle and noodle_guide are NEAR-side tools. " +
+        "A Nano payment id starts with pay_, a NEAR one with nq_; pass the id back unchanged.";
+      paymentNote = near.paymentNote;
+      usagePath = join(resolvedOut, "usage.jsonl");
+    }
+  } else if (!near) {
     // Free serve mode writes NO usage.jsonl — no money moves, so there is no
     // payments ledger, and we deliberately don't log run telemetry either
     // (which tool ran, or upstream error text that can quote user content).
@@ -510,6 +569,7 @@ async function main() {
     instructions,
     gate,
     paymentNote,
+    rates: near ? near.rates : null,
     toolInfo: registry.tools,
     costs: registry.costs,
     outDir: resolvedOut,
@@ -517,7 +577,9 @@ async function main() {
     log: (...a) => console.error(...a),
   });
   console.error(`nanoodle-mcp: MCP over HTTP on http://${serveHost}:${servePort}/mcp` +
-    (nearInfo
+    (nearInfo && chargeUsd != null
+      ? ` — paid in Nano (XNO to ${wallet.address}) or in NEAR on ${nearInfo.network} to ${nearInfo.merchant}`
+      : nearInfo
       ? ` — paid in NEAR on ${nearInfo.network} to ${nearInfo.merchant}`
       : chargeUsd != null
       ? ` — charging $${chargeUsd}/call in XNO to ${wallet.address}`
@@ -526,6 +588,8 @@ async function main() {
   console.error(`nanoodle-mcp:             or: grok mcp add --transport http noodles ${publicBase}/mcp`);
   // The ledger records money only, and only exists in charge mode.
   if (usagePath) console.error(`nanoodle-mcp: payments ledger: ${usagePath}`);
+  if (near && near.usagePath !== usagePath) console.error(`nanoodle-mcp: NEAR payments ledger: ${near.usagePath}`);
+  if (near) console.error(`nanoodle-mcp: rates: ${publicBase}/rates`);
 }
 
 /**
@@ -534,7 +598,10 @@ async function main() {
  * durable state, finish anything a previous run left in flight, and wrap the
  * registry in the NEAR gate. Exits with a clear error on any misconfiguration.
  */
-async function startNearMode({ registry, merchant, network, rpcFlag, keyFile, envText, usdText, maxDepositUsd, outDir }) {
+async function startNearMode({
+  registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
+  quoteTtlMin, refreshS, modelPayment, maxDepositUsd, outDir, publicBase, dual,
+}) {
   const fail = (msg) => { console.error("nanoodle-mcp: " + msg); process.exit(1); };
   const [near, { createNearGate }] = await loadNearMods();
   if (!near.isNearAccountId(merchant)) fail(`--near-merchant: "${merchant}" is not a NEAR account id`);
@@ -553,7 +620,8 @@ async function startNearMode({ registry, merchant, network, rpcFlag, keyFile, en
   }
   if (key.permission !== "FullAccess") fail(`the refund key ${signer.publicKey} on ${merchant} is not a full-access key; refunds need one`);
 
-  const usagePath = join(outDir, "usage.jsonl");
+  // With both rails on one server, each gate keeps its own payments ledger.
+  const usagePath = join(outDir, dual ? "near-usage.jsonl" : "usage.jsonl");
   let usageChain = Promise.resolve();
   const usage = (event, fields) => {
     const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
@@ -564,32 +632,75 @@ async function startNearMode({ registry, merchant, network, rpcFlag, keyFile, en
   };
   const log = (line) => console.error("nanoodle-mcp: " + line);
 
-  // Catalogs clamp payloads and price every quote; refreshed hourly as in charge mode.
+  // Catalogs clamp payloads and price every quote; refreshed hourly as in charge mode
+  // (which does the same refresh itself when both rails run).
   const catalogBase = process.env.NANOGPT_BASE_URL || "https://nano-gpt.com";
-  const refresh = () => attachEstimates(registry, { baseUrl: catalogBase, log }).catch(() => {});
-  await refresh();
-  const timer = setInterval(refresh, 60 * 60 * 1000);
-  if (timer.unref) timer.unref();
+  if (!dual) {
+    const refresh = () => attachEstimates(registry, { baseUrl: catalogBase, log }).catch(() => {});
+    await refresh();
+    const timer = setInterval(refresh, 60 * 60 * 1000);
+    if (timer.unref) timer.unref();
+  }
 
   let ledger;
   try {
     ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant });
   } catch (e) { fail(e.message); }
-  const rate = near.createNearUsdRate(usdText != null ? { staticUsd: String(usdText).trim() } : {});
+  // NEAR/USD, XNO/USD and the swap rate derived from them. When runs are paid
+  // from the Nano wallet, XNO/USD is required to quote; with an API key it is informational.
+  let rates;
+  try {
+    rates = near.createNearRates({
+      nearUsd: usdText, xnoUsd: xnoUsdText, spreadBps: spreadText, xnoRequired: modelPayment === "wallet",
+      refreshMs: refreshS * 1000, nanoGptBase: process.env.NANOGPT_BASE_URL || undefined, log,
+    });
+  } catch (e) { fail(e.message); }
+  await rates.start(); // first fetch before serving, so the first quote is warm (bounded by the fetch timeouts)
+  // SIGHUP: re-read pinned values from --env-file (a flag still wins) and refetch the live ones.
+  process.on("SIGHUP", async () => {
+    let values = rates.config;
+    if (envFile) {
+      try {
+        const text = await readFile(envFile, "utf8");
+        const entry = (name) => {
+          const m = text.match(new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*"?([^"\\n]*)"?`, "m"));
+          return m && m[1].trim() !== "" ? m[1].trim() : null;
+        };
+        values = {
+          ...values,
+          nearUsd: usdFlag ? values.nearUsd : entry("NEAR_USD") ?? process.env.NEAR_USD ?? null,
+          spreadBps: spreadFlag ? values.spreadBps : entry("NEAR_SWAP_SPREAD_BPS") ?? process.env.NEAR_SWAP_SPREAD_BPS ?? 0,
+        };
+      } catch (e) { log(`SIGHUP: cannot read ${envFile} (${e.message}); keeping the current rate settings`); }
+    }
+    try {
+      const applied = await rates.reload(values);
+      const v = await rates.view();
+      log(`SIGHUP: rates reloaded — NEAR/USD ${applied.nearUsd != null ? `static ${applied.nearUsd}` : `live ${v.nearUsd ?? "unavailable"}`}, ` +
+        `XNO/USD ${applied.xnoUsd != null ? `static ${applied.xnoUsd}` : `live ${v.xnoUsd ?? "unavailable"}`}, swap margin ${applied.spreadBps} bps`);
+    } catch (e) { log(`SIGHUP: rate settings not changed: ${e.message}`); }
+  });
   const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log });
   const gate = createNearGate({
-    merchantId: merchant, network, rpc, ledger, rate, refunder,
+    merchantId: merchant, network, rpc, ledger, rate: rates, refunder,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
-    baseUrl: catalogBase, log, usage,
+    baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment,
   });
-  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const wrapped = gate.wrapRegistry(registry);
+  const { listTools, callTool } = wrapped;
   await gate.resume(); // before serving: a run a previous process left in flight is refunded, never re-run
 
   log(`NEAR mode on ${network}: merchant ${merchant} (${near.explorerAccountUrl(network, merchant)})`);
-  log(`NEAR RPC ${redactUrl(rpcUrl)}; NEAR/USD rate ${usdText != null ? `static ${usdText}` : "CoinGecko (60s cache, fails closed)"}; refund key ${signer.publicKey}`);
+  const rc = rates.config;
+  log(`NEAR RPC ${redactUrl(rpcUrl)}; NEAR/USD rate ${rc.nearUsd != null ? `static ${rc.nearUsd}` : "CoinGecko (60s cache, fails closed)"}; ` +
+    `XNO/USD ${rc.xnoUsd != null ? `static ${rc.xnoUsd}` : "NanoGPT x402 invoices, else CoinGecko"}${rc.xnoRequired ? " (required: runs are paid from the Nano wallet)" : " (informational)"}; ` +
+    `swap margin ${rc.spreadBps} bps; quotes live ${quoteTtlMin} min; refund key ${signer.publicKey}`);
 
+  const ratesLine = ` Current NEAR/USD, XNO/USD and swap rates: ${publicBase}/rates.`;
   const instructions =
-    `Tools on this server are paid per call in native NEAR on ${network}; no account or API key is needed. ` +
+    (dual
+      ? `Paying in native NEAR on ${network}: no account or API key is needed. `
+      : `Tools on this server are paid per call in native NEAR on ${network}; no account or API key is needed. `) +
     "price_noodle (free) returns the itemized estimated cost, the 20% service fee, the deposit and the likely refund of any workflow; " +
     "noodle_guide (free) explains how to compose a custom workflow graph for run_noodle. " +
     "Calling a paid tool without payment returns a quote: send ONE native NEAR transfer of exactly payment.amountYocto to payment.payTo " +
@@ -597,13 +708,15 @@ async function startNearMode({ registry, merchant, network, rpcFlag, keyFile, en
     "(the transaction hash) and _payment_sender (the account you paid from). " +
     "The amount you send is a deposit, the most you can be charged; you will most likely pay the estimated cost plus the 20% service fee, " +
     "and the rest is refunded to the paying account automatically after the run. If the run fails, the whole deposit is refunded. " +
-    "Repeating the paying call returns the stored result and never charges again. Quotes expire after 15 minutes.";
+    `Repeating the paying call returns the stored result and never charges again. Quotes expire after ${quoteTtlMin} minutes.` + ratesLine;
   const paymentNote =
-    `Every call is paid in native NEAR on ${network}. A call without payment returns a quote with an exact deposit; ` +
+    (dual
+      ? `Calls can also be paid in native NEAR on ${network}: add "_pay_with": "near" to a saved tool's arguments (run_noodle is NEAR-paid). A call without payment returns a quote with an exact deposit; `
+      : `Every call is paid in native NEAR on ${network}. A call without payment returns a quote with an exact deposit; `) +
     `send one transfer of that amount to ${merchant} and call again with the transaction hash. You are charged the ` +
     "actual model cost plus a 20% service fee, and the rest of the deposit is refunded automatically. price_noodle " +
-    "(free) shows the itemized estimate first; run_noodle also runs workflow graphs you compose yourself.";
-  return { listTools, callTool, instructions, paymentNote, nearInfo: { network, merchant }, usagePath };
+    "(free) shows the itemized estimate first; run_noodle also runs workflow graphs you compose yourself." + ratesLine;
+  return { listTools, callTool, wrapped, rates, instructions, paymentNote, nearInfo: { network, merchant }, usagePath };
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });

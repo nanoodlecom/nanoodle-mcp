@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runSimulation, startServer, mcpClient, freePort } from "../scripts/near-simulate.mjs";
+import { runDualSimulation } from "../scripts/dual-simulate.mjs";
 import { createFakeChain, throwawayNearKey, nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { parseNearToYocto } from "../src/near/amount.mjs";
 
@@ -26,6 +27,13 @@ test("the simulated agent conversation passes every check (quote, pay, receipt, 
   assert.equal(facts.receipt.charged.yocto, "3102197802197802197803");
   assert.equal(facts.receipt.outcome, "succeeded");
   assert.match(lines.join("\n"), /PASS: all \d+ checks passed/);
+});
+
+test("one server, both rails: Nano and NEAR quotes for one tool, a NEAR-paid custom graph, /rates refresh and SIGHUP reload", { timeout: 120_000 }, async () => {
+  const lines = [];
+  const { failures, checks } = await runDualSimulation({ print: (l) => lines.push(l) });
+  assert.deepEqual(failures, [], lines.join("\n"));
+  assert.ok(checks >= 20, `ran ${checks} checks`);
 });
 
 async function fixtureDirs() {
@@ -87,9 +95,25 @@ test("NEAR mode refuses unsafe configurations at startup", { timeout: 60_000 }, 
   assert.equal(r.code, 1);
   assert.match(r.stderr, /--near-merchant only makes sense with --serve/);
 
+  // Both rails together are allowed (one server, Nano or NEAR per call), but the Nano rail still needs its wallet.
   r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", "--charge-usd", "0.05"]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /two payment rails; pick one/);
+  assert.doesNotMatch(r.stderr, /pick one/);
+  assert.match(r.stderr, /--charge-usd needs a Nano wallet/);
+
+  for (const [flag, v, msg] of [
+    ["--near-swap-spread-bps", "2001", /swap spread must be a whole number of basis points from 0 to 2000/],
+    ["--near-quote-ttl-min", "0", /--near-quote-ttl-min expects a whole number of minutes from 1 to 120/],
+    ["--near-quote-ttl-min", "121", /--near-quote-ttl-min expects/],
+    ["--near-rates-refresh-s", "-1", /--near-rates-refresh-s expects/],
+  ]) {
+    r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", flag, v], { NEAR_PRIVATE_KEY: key.secretKey });
+    assert.equal(r.code, 1, flag);
+    assert.match(r.stderr, msg, flag);
+  }
+  r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-swap-spread-bps", "100"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /the --near-\* options need --near-merchant/);
 
   r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", "--near-key", "ed25519:abc"]);
   assert.equal(r.code, 1);

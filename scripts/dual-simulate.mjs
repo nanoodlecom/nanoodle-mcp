@@ -1,0 +1,205 @@
+#!/usr/bin/env node
+/**
+ * Offline simulation of ONE nanoodle-mcp server that accepts Nano or NEAR per call.
+ *
+ *   node scripts/dual-simulate.mjs        (npm run simulate:dual)
+ *
+ * Starts the real server (bin/nanoodle-mcp.mjs --serve --charge-usd … --near-merchant …)
+ * as a child process against local stand-ins: a NEAR chain, a Nano node and
+ * NanoGPT (catalogs, chat, image and the x402 rate probe). Then, as an agent
+ * over MCP-over-HTTP: a saved tool quoted in Nano, the same tool quoted in NEAR
+ * with "_pay_with": "near" and paid, a NEAR-paid custom graph, GET /rates before
+ * and after a forced refresh (and the refresh rate limit), and a SIGHUP that
+ * re-reads a pinned NEAR/USD rate from the --env-file.
+ *
+ * No network, no real keys or funds: the merchant key and the Nano seed are
+ * throwaways generated in this process. No Nano payment is made (the Nano
+ * stand-in only answers the gate's polls). Exits non-zero on any failed check.
+ */
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { createFakeChain, throwawayNearKey, nanoGptMock, WORKED_GRAPH } from "../tests/fixtures/near-fake-chain.mjs";
+import { parseNearToYocto } from "../src/near/amount.mjs";
+import { freePort, mcpClient } from "./near-simulate.mjs";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const BIN = join(ROOT, "bin", "nanoodle-mcp.mjs");
+const MERCHANT = "merchant.testnet";
+const PAYER = "payer.testnet";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A Nano node stand-in: an opened account with no receivables; work requests are refused. */
+async function nanoNode() {
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    let body = {};
+    try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { body = {}; }
+    const answer = {
+      account_info: { frontier: "0".repeat(64), balance: "0", representative: body.account },
+      receivable: { blocks: "" },
+      account_history: { history: "" },
+    }[body.action] || { error: "stand-in: not supported" };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(answer));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); } };
+}
+
+export async function runDualSimulation({ print = console.log } = {}) {
+  const failures = [];
+  let checks = 0;
+  const expect = (ok, what) => {
+    checks++;
+    if (ok) print(`  ✓ ${what}`);
+    else { failures.push(what); print(`  ✗ ${what}`); }
+  };
+  const step = (title) => print(`\n=== ${title} ===`);
+  const show = (r, max = 40) => {
+    const txt = (r.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n").split("\n");
+    print((r.isError ? "  agent sees (isError):\n" : "  agent sees:\n") + txt.slice(0, max).map((l) => "  | " + l).join("\n") + (txt.length > max ? "\n  | …" : ""));
+  };
+
+  const work = await mkdtemp(join(tmpdir(), "dual-sim-"));
+  const graphsDir = join(work, "noodles"), outDir = join(work, "out"), envFile = join(work, "server.env");
+  await mkdir(graphsDir, { recursive: true });
+  await writeFile(join(graphsDir, "idea-poster.json"), JSON.stringify(WORKED_GRAPH, null, 2));
+  await writeFile(envFile, "NANOGPT_API_KEY=sim-api-key\nNEAR_USD=3.64\n");
+
+  const chain = createFakeChain();
+  const key = await throwawayNearKey();
+  chain.addAccount(MERCHANT, parseNearToYocto("10"), key.publicKey);
+  chain.addAccount(PAYER, parseNearToYocto("5"));
+  const nano = nanoGptMock();
+  await chain.listen();
+  await nano.listen();
+  const node = await nanoNode();
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  let child = null, stderr = "";
+
+  print("nanoodle-mcp dual-rail simulation — one server, Nano or NEAR per call; offline stand-ins, throwaway keys.");
+  try {
+    step("1. Start one server with both rails: --charge-usd 0.05 --near-merchant merchant.testnet");
+    child = spawn(process.execPath, [
+      BIN, "--graphs", graphsDir, "--out", outDir, "--serve", `127.0.0.1:${port}`, "--public-url", base,
+      "--env-file", envFile, "--charge-usd", "0.05", "--nano-rpc", node.url, "--no-local-work",
+      "--near-merchant", MERCHANT, "--near-network", "testnet", "--near-rpc", chain.url,
+    ], {
+      env: {
+        PATH: process.env.PATH, HOME: outDir, NANOGPT_BASE_URL: nano.url,
+        NANO_SEED: randomBytes(32).toString("hex"), // a throwaway: this wallet never holds funds
+        NEAR_PRIVATE_KEY: key.secretKey, // a throwaway generated by this script
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (c) => { stderr += c; });
+    const t0 = Date.now();
+    while (!/MCP over HTTP on/.test(stderr)) {
+      if (child.exitCode !== null) throw new Error("server exited during startup:\n" + stderr);
+      if (Date.now() - t0 > 20_000) throw new Error("server did not start:\n" + stderr);
+      await sleep(25);
+    }
+    print(stderr.split("\n").filter((l) => /MCP over HTTP|XNO\/USD|rates:|ledger/.test(l)).map((l) => "  [server] " + l.replace(/^nanoodle-mcp:\s*/, "")).join("\n"));
+    expect(/paid in Nano \(XNO to nano_\w+\) or in NEAR on testnet to merchant\.testnet/.test(stderr), "the server says it takes Nano or NEAR");
+
+    const mcp = mcpClient(base);
+    const init = await mcp.initialize();
+    print("  initialize → instructions (start):\n  | " + init.result.instructions.slice(0, 220) + "…");
+    expect(/accepts two payment rails per call: Nano \(XNO\) over x402, the default, and native NEAR/.test(init.result.instructions) &&
+      init.result.instructions.includes(`${base}/rates`), "instructions name both rails and where the rates are");
+
+    step("2. Discover tools");
+    const tools = await mcp.list();
+    for (const t of tools) print(`  - ${t.name}${t.inputSchema.properties._pay_with ? "  (Nano or NEAR)" : ""}`);
+    const poster = tools.find((t) => t.name === "idea-poster");
+    expect(!!poster && /paid in Nano \(XNO\)/.test(poster.description) && /can also be paid in NEAR/.test(poster.description), "the saved tool is priced in Nano and says it can be paid in NEAR");
+    expect(["run_noodle", "price_noodle", "noodle_guide"].every((n) => tools.some((t) => t.name === n)), "run_noodle, price_noodle and noodle_guide are offered (NEAR side)");
+
+    const args = { Idea: "a lighthouse at dawn" };
+    step("3. The saved tool, quoted in Nano (the default): idea-poster { Idea }");
+    const nq = await mcp.call("idea-poster", args);
+    show(nq, 3);
+    const x402 = nq.structuredContent && nq.structuredContent.x402;
+    expect(!nq.isError && x402 && /^pay_/.test(x402.paymentId) && /^\d+\.\d+$/.test(x402.amountXno), `Nano quote ${x402 && x402.paymentId}: ${x402 && x402.amountXno} XNO`);
+
+    step('4. The same tool, quoted in NEAR: idea-poster { Idea, "_pay_with": "near" }');
+    const runs0 = nano.runs();
+    const q = await mcp.call("idea-poster", { ...args, _pay_with: "near" });
+    show(q, 6);
+    const pay = q.structuredContent && q.structuredContent.payment;
+    expect(!q.isError && pay && /^nq_/.test(pay.paymentId) && pay.payTo === MERCHANT, `NEAR quote ${pay && pay.paymentId}: ${pay && pay.amountNear} NEAR`);
+    expect(pay && pay.rate.xnoUsd === "0.95" && pay.rate.xnoPerNear === "3.831578947", "the quote locks NEAR/USD 3.64, XNO/USD 0.95 and 1 NEAR = 3.831578947 XNO");
+    expect(nano.runs() === runs0, "quoting in either rail ran nothing");
+
+    step("5. Pay the NEAR quote with one transfer; the paying call leaves out _pay_with");
+    const tx = chain.transfer(PAYER, MERCHANT, BigInt(pay.amountYocto));
+    const paid = await mcp.call("idea-poster", { ...args, _payment_id: pay.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+    show(paid, 12);
+    const rc = paid.structuredContent && paid.structuredContent.receipt;
+    expect(rc && rc.outcome === "succeeded" && rc.charged.yocto === "3102197802197802197803", "paid in NEAR: charged the worked example's 3102197802197802197803 yocto");
+    expect(rc && rc.legs.length === 3 && rc.legs[1].basis === "paid from the operator's NanoGPT balance", "receipt shows the three legs; the model leg is paid from the operator's NanoGPT balance");
+    expect(nano.runs() === runs0 + 1, "it ran once");
+
+    step("6. A NEAR-paid custom graph: run_noodle { graph, inputs }");
+    const cargs = { graph: WORKED_GRAPH, inputs: { Idea: "a red kite over dunes" } };
+    const cq = await mcp.call("run_noodle", cargs);
+    const cp = cq.structuredContent.payment;
+    const ctx = chain.transfer(PAYER, MERCHANT, BigInt(cp.amountYocto));
+    const cr = await mcp.call("run_noodle", { ...cargs, _payment_id: cp.paymentId, _payment_tx: ctx, _payment_sender: PAYER });
+    expect(cr.structuredContent && cr.structuredContent.receipt.outcome === "succeeded", `custom graph paid in NEAR (${cp.amountNear} NEAR deposit) and settled`);
+
+    step("7. GET /rates, then XNO/USD moves and a forced refresh picks it up");
+    const r1 = await (await fetch(base + "/rates")).json();
+    print(`  /rates: NEAR/USD ${r1.nearUsd} (${r1.sources.nearUsd.source}), XNO/USD ${r1.xnoUsd} (${r1.sources.xnoUsd.source}), 1 NEAR = ${r1.xnoPerNear} XNO, next refresh ${r1.refresh.nextAt}`);
+    expect(r1.nearUsd === "3.64" && r1.xnoUsd === "0.95" && r1.xnoPerNear === "3.831578947" && r1.quoting === true, "before: 3.64 USD/NEAR, 0.95 USD/XNO, 1 NEAR = 3.831578947 XNO");
+    nano.setXnoProbe({ raw: "10000000000000000000000000000", usd: "0.0091" }); // 1 XNO = $0.91
+    const r2 = await (await fetch(base + "/rates?refresh=1")).json();
+    print(`  /rates?refresh=1: XNO/USD ${r2.xnoUsd}, 1 NEAR = ${r2.xnoPerNear} XNO, refreshed ${r2.refresh.refreshed}`);
+    expect(r2.refresh.refreshed === true && r2.xnoUsd === "0.91" && r2.xnoPerNear === "4", "after a forced refresh: 0.91 USD/XNO, 1 NEAR = 4 XNO");
+    const r3 = await (await fetch(base + "/rates?refresh=1")).json();
+    print(`  /rates?refresh=1 again: refreshed ${r3.refresh.refreshed} — ${r3.refresh.note}`);
+    expect(r3.refresh.refreshed === false && /at most once every 15 s/.test(r3.refresh.note), "a second forced refresh within 15 s is answered from cache");
+
+    step("8. SIGHUP re-reads the pinned NEAR/USD from --env-file");
+    await writeFile(envFile, "NANOGPT_API_KEY=sim-api-key\nNEAR_USD=4.10\nNEAR_SWAP_SPREAD_BPS=100\n");
+    child.kill("SIGHUP");
+    const t1 = Date.now();
+    while (!/SIGHUP: rates reloaded/.test(stderr) && Date.now() - t1 < 10_000) await sleep(25);
+    print(stderr.split("\n").filter((l) => /SIGHUP/.test(l)).map((l) => "  [server] " + l.replace(/^nanoodle-mcp:\s*/, "")).join("\n"));
+    const r4 = await (await fetch(base + "/rates")).json();
+    expect(r4.nearUsd === "4.10" && r4.spreadBps === 100 && r4.effectiveNearUsd === "4.059405941", "after SIGHUP: NEAR/USD 4.10 with a 1% swap margin (NEAR amounts at 4.059405941), no restart");
+    const q2 = await mcp.call("idea-poster", { Idea: "after the reload", _pay_with: "near" });
+    expect(q2.structuredContent.payment.rate.nearUsd === "4.10" && /swap margin 1%/.test(q2.content[0].text), "new quotes lock the reloaded rate and show the margin");
+    const old = await mcp.call("idea-poster", { ...args, _payment_id: pay.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+    expect(old.structuredContent.receipt.rate.nearUsd === "3.64", "the earlier receipt still shows the rate it was locked at");
+
+    step("9. Landing page and llms.txt");
+    const landing = await (await fetch(base + "/")).text();
+    const llms = await (await fetch(base + "/llms.txt")).text();
+    expect(/paid in Nano or NEAR/.test(landing) && /Or pay in NEAR/.test(landing) && landing.includes(`${base}/rates`), "the landing page says both rails are accepted and links the rates");
+    expect(/## Payment \(x402, Nano\/XNO\)/.test(llms) && /## Payment in NEAR/.test(llms), "llms.txt describes both rails");
+  } catch (e) {
+    failures.push(`simulation aborted: ${(e && e.message) || e}`);
+    print(`  ✗ simulation aborted: ${(e && e.stack) || e}\n${stderr}`);
+  } finally {
+    if (child && child.exitCode === null) await new Promise((r) => { child.once("exit", r); child.kill("SIGKILL"); });
+    await chain.close();
+    await nano.close();
+    await node.close();
+  }
+  print(failures.length ? `\nFAIL: ${failures.length} of ${checks} checks failed` : `\nPASS: all ${checks} checks passed`);
+  return { failures, checks };
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+  const { failures } = await runDualSimulation();
+  process.exit(failures.length ? 1 : 0);
+}

@@ -298,6 +298,9 @@ export const WORKED_CATALOGS = Object.freeze({
   image: [{ id: "blackforestlabs/flux-3/klein/text-to-image", pricing: { per_image: { "1024x1024": 0.009 }, currency: "USD" }, supported_parameters: { max_output_images: 4 } }],
 });
 
+/** The stand-in's x402 rate-probe invoice: 0.01 XNO (10^28 raw) for $0.0095, so 1 XNO = $0.95. */
+export const XNO_PROBE = Object.freeze({ raw: "10000000000000000000000000000", usd: "0.0095" });
+
 /** 1x1 PNG. */
 const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
@@ -306,6 +309,8 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * reports $0.00041 and the image $0.009, so the worked example's actual model
  * cost is $0.00941. A prompt containing "FAIL" gets a 400 (the run fails); one
  * containing "HOLD" never answers (a run in flight when the server dies).
+ * A keyless `x-x402: true` chat request is the XNO/USD rate probe: it gets a
+ * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
 export function nanoGptMock() {
@@ -313,8 +318,14 @@ export function nanoGptMock() {
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
   const json = (status, obj) => ({ status, body: JSON.stringify(obj) });
-  async function handle(method, path, body) {
+  let probes = 0;
+  let probe = XNO_PROBE;
+  async function handle(method, path, body, headers = {}) {
     const p = path.replace(/^https?:\/\/[^/]+/, "");
+    if (method === "POST" && p === "/api/v1/chat/completions" && String(headers["x-x402"] || "") === "true") {
+      probes++;
+      return json(402, { accepts: [{ scheme: "nano", maxAmountRequired: probe.raw, maxAmountRequiredUSD: probe.usd }] });
+    }
     if (method === "GET" && p === "/api/v1/models?detailed=true") return json(200, { data: WORKED_CATALOGS.chat });
     if (method === "GET" && p === "/api/v1/image-models") return json(200, { data: WORKED_CATALOGS.image });
     if (method === "GET" && /^\/api\/v1\/(video|audio|3d)-models$/.test(p)) return json(200, { data: [] });
@@ -333,13 +344,19 @@ export function nanoGptMock() {
   return {
     REPLY,
     runs: () => chatRuns,
+    /** XNO/USD rate probes answered (never runs). */
+    probes: () => probes,
+    /** Change the probe invoice (a moving XNO/USD rate): { raw, usd }. */
+    setXnoProbe: (p) => { probe = { raw: String(p.raw), usd: String(p.usd) }; },
     /** Every chat request body, in order. */
     chatBodies: () => chatBodies,
     async fetch(url, init = {}) {
       const method = (init.method || "GET").toUpperCase();
       let body = null;
       try { body = init.body ? JSON.parse(init.body) : null; } catch { body = null; }
-      const r = await handle(method, String(url), body);
+      const h = {};
+      for (const [k, v] of new Headers(init.headers || {})) h[k] = v;
+      const r = await handle(method, String(url), body, h);
       return new Response(r.body, { status: r.status, headers: { "content-type": "application/json" } });
     },
     async listen() {
@@ -348,7 +365,7 @@ export function nanoGptMock() {
         for await (const c of req) chunks.push(c);
         let body = null;
         try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { body = null; }
-        const r = await handle(req.method, req.url, body);
+        const r = await handle(req.method, req.url, body, req.headers);
         res.writeHead(r.status, { "content-type": "application/json" });
         res.end(r.body);
       });

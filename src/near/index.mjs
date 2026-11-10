@@ -11,5 +11,8 @@ export { parseRpcJson, createNearRpc } from "./rpc.mjs";
 export { readPaymentTransfer } from "./verify.mjs";
 export { openNearLedger } from "./ledger.mjs";
 export { COINGECKO_NEAR_URL, createNearUsdRate } from "./rate.mjs";
+export {
+  COINGECKO_RATES_URL, MAX_SPREAD_BPS, createNearRates, parseSpreadBps, spreadPair, ratioDecimal, bpsPercent,
+} from "./rates.mjs";
 export { createRefunder } from "./refunds.mjs";
 export { NEAR_NETWORKS, explorerTxUrl, explorerAccountUrl } from "./explorer.mjs";
