@@ -68,6 +68,9 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  * @param {object} o.runner       createWorkflowRunner()
  * @param {number} o.budgetUsd    per-job budget (also the runner's deposit cap)
  * @param {number|null} [o.listingPriceUsd]  shown in the deliverable when set
+ * @param {{graph: object, inputName: string, label: string}|null} [o.defaultWorkflow]
+ *        when set, a brief with no workflow block runs this graph with the brief text as
+ *        its `inputName` input (a buyer can hire in plain words)
  * @param {number} [o.concurrency]  assignments advanced at once (default 2)
  * @param {number} [o.backoffMs]    first retry delay after a transient error (default 30 s, doubling to 10 min)
  * @param {number} [o.retainMs]     keep finished records this long (default 30 days)
@@ -75,7 +78,7 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  * @param {() => number} [o.now]
  */
 export function createMarketWorker({
-  client, store, runner, budgetUsd, listingPriceUsd = null,
+  client, store, runner, budgetUsd, listingPriceUsd = null, defaultWorkflow = null,
   concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
   log: rawLog = () => {}, now = Date.now,
 }) {
@@ -124,10 +127,20 @@ export function createMarketWorker({
 
   async function priceFromRow(rec, row) {
     let args;
+    let usedDefault = false;
     try { args = parseBrief(row.job && row.job.description); } catch (e) {
       if (!(e instanceof BriefError)) throw e;
-      log(`assignment ${short(rec.id)}: brief refused (${e.code})`);
-      return { decline: { reason: "rejected", code: e.code, detail: briefDeclineDetail(e.message) } };
+      // A brief in plain words (no workflow block at all) runs the operator's default
+      // workflow, with the brief as its input. A block that is there but broken is still
+      // refused: the buyer meant a specific workflow, and guessing would spend their hire.
+      const plain = String((row.job && row.job.description) || "").trim() || String((row.job && row.job.title) || "").trim();
+      if (!(defaultWorkflow && e.code === "NO_REQUEST" && plain)) {
+        log(`assignment ${short(rec.id)}: brief refused (${e.code})`);
+        return { decline: { reason: "rejected", code: e.code, detail: briefDeclineDetail(e.message) } };
+      }
+      args = { graph: defaultWorkflow.graph, inputs: { [defaultWorkflow.inputName]: plain } };
+      usedDefault = true;
+      log(`assignment ${short(rec.id)}: plain brief (${plain.length} characters) → default workflow ${JSON.stringify(defaultWorkflow.label)}`);
     }
     const priced = await runner.price(args);
     if (!priced.ok) {
@@ -137,16 +150,16 @@ export function createMarketWorker({
       log(`assignment ${short(rec.id)}: workflow refused (${codes.join(", ")})`);
       return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd }) } };
     }
-    return { pricing: priced.pricing, inputs: priced.inputs };
+    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault };
   }
 
   async function phaseNew(rec, row) {
     const r = await priceFromRow(rec, row);
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
-    prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs });
+    prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault });
     log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, deposit $${r.pricing.depositUsd} within budget $${budgetUsd}`);
-    return set(rec.id, ok({ phase: "starting", pricing: pricingSummary(r.pricing) }));
+    return set(rec.id, ok({ phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null }));
   }
 
   async function phaseDeclining(rec) {
@@ -190,10 +203,10 @@ export function createMarketWorker({
       const r = await priceFromRow(rec, row);
       if (r.transient) return backoff(rec, r.transient);
       if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
-      prep = { pricing: r.pricing, inputs: r.inputs };
+      prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
     }
     prepared.delete(rec.id);
-    await say(rec.id, startedMessage(prep.pricing, { budgetUsd }), `nanoodle-start-${rec.id}`);
+    await say(rec.id, startedMessage(prep.pricing, { budgetUsd, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null }), `nanoodle-start-${rec.id}`);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now() }));
     await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);

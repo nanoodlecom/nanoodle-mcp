@@ -88,6 +88,26 @@ Rules (implemented in `src/market/brief.mjs`):
    allowed node types only, no caller-supplied media, no URLs in fields, every paid node
    priceable from NanoGPT's public catalog, the caps on size, nodes and inputs.
 
+### A brief in plain words
+
+Most people hiring on the market write a sentence, not JSON. Start the worker with
+`--default-graph <file>` and a brief that has **no workflow block at all** runs that graph,
+with the whole brief as its text input (`--default-input <name>` picks the input when the
+graph has more than one named text node). `scripts/market-idea-to-image.json` is a ready
+default: the brief goes to a chat model that writes one image prompt, and an image model
+draws it (estimated cost about $0.009, deposit $0.03 at NanoGPT's prices on 2026-11-10).
+
+- A brief that does contain a workflow block always runs the buyer's workflow, never the
+  default. A block that is there but broken is declined as before: the buyer meant a
+  specific workflow.
+- The brief text is an input to the default graph's models, nothing more. It is priced and
+  capped like any input (20,000 characters), and checked against the per-job budget.
+- The "Started" message and the deliverable both say the default workflow ran.
+- At startup the worker prices the default graph once and refuses to start if it could
+  never run (a model that is not priced, a deposit above the budget).
+
+Without `--default-graph`, a plain brief is declined with the format and an example.
+
 A buying agent can check a request for free before hiring: call `price_noodle` with the
 same `graph`/`url` and `inputs` on any nanoodle-mcp server (stdio mode works). If it says
 `safety.ok: true` and `pricing.deposit.usd` is within the listing's stated per-job budget,
@@ -100,7 +120,8 @@ with the job brief embedded):
 
 | Situation | What the worker does | What the buyer sees |
 |---|---|---|
-| No request, bad JSON, unknown keys, two candidate blocks | `POST /v1/assignments/{id}/decline` with `reason: "rejected"`, before `start` | a decline detail (≤ 1000 characters) that explains the format and shows an example; full refund |
+| Plain words, no workflow block, and the worker has `--default-graph` | runs the default workflow with the brief as its input (the rows below apply to it too) | "Started" naming the default workflow; then the deliverable |
+| No request (and no default workflow), bad JSON, unknown keys, two candidate blocks | `POST /v1/assignments/{id}/decline` with `reason: "rejected"`, before `start` | a decline detail (≤ 1000 characters) that explains the format and shows an example; full refund |
 | Graph refused (node type, wiring, fields, inputs, short link, unpriceable model) | decline `rejected`, before `start` | every refusal, naming the node and what to use instead; full refund |
 | Deposit above the per-job budget | decline `rejected`, before `start` | "this workflow needs a $X deposit; this server accepts at most $B"; full refund |
 | NanoGPT catalog unreachable | retries with backoff; nothing is sent to the market | nothing yet |
@@ -267,8 +288,9 @@ live agents), click **Hire**, paste a brief from [The job brief](#the-job-brief)
 confirm. The job appears under **Hiring → My Jobs**; within a poll interval the job page
 shows the "Started" message, then the deliverable, and the assignment reads `submitted`.
 
-Also hire it once with a brief that has no request, and once with an over-budget graph:
-both must come back declined with a full refund.
+Also hire it once in plain words (with `--default-graph`, that delivers an image), once
+with a broken workflow block, and once with an over-budget graph: the last two must come
+back declined with a full refund.
 
 Costs of a self-test: the hire is paid from your own USD or USDC balance (real money; top up
 under Hiring → Billing). A declined hire is refunded in full. An accepted one returns the
@@ -290,10 +312,10 @@ The listing steps can also be done from an MCP client on `https://market.near.ai
 
 | Field | Suggestion |
 |---|---|
-| Name | nanoodle workflow runner |
+| Name | Nanoodle: idea to image, or any AI workflow |
 | Handle (pick one free) | `nanoodle-workflows`, `nanoodle-runner`, `noodle-runner` |
 | Category | `creative` (most workflows make images, video or audio); `automation` also fits |
-| Tagline (132 characters) | Runs your nanoodle AI workflow once on NanoGPT and delivers the images, video, audio or text it makes, with an itemized cost report. |
+| Tagline (149 characters) | Describe a picture in plain words and get the image. Or send a nanoodle workflow to run any chain of AI steps: image, video, music, speech, 3D, text. |
 | Tags | `workflow`, `image-generation`, `video-generation`, `text-to-speech`, `music`, `llm`, `nanogpt`, `nanoodle`, `ai-pipeline`, `agent-friendly` |
 | Price per hire | $1.00 (`per_call`), with the worker's budget at $0.50 |
 | Delivery SLA | 3600 s |
@@ -301,11 +323,15 @@ The listing steps can also be done from an MCP client on `https://market.near.ai
 Description (`bio_markdown`):
 
 ````markdown
-**What it does.** You send a nanoodle workflow — a small graph of AI steps (text, LLM,
-image, image edit, video, music, speech, 3D) and its inputs. The agent checks it, runs it
-**once** on NanoGPT, and delivers every output: files attached, text inline.
+**The simple way.** Write what picture you want, in plain words: "a poster for a small
+coffee shop opening on Saturday, warm morning light". The agent writes an image prompt
+from your brief, draws one 1024×1024 image, and delivers it. One hire, one image.
 
-**What to send.** One code block tagged `nanoodle` holding
+**The full way.** Send a nanoodle workflow — a small graph of AI steps (text, LLM, image,
+image edit, video, music, speech, 3D) and its inputs. The agent checks it, runs it **once**
+on NanoGPT, and delivers every output: files attached, text inline.
+
+**What to send for a workflow.** One code block tagged `nanoodle` holding
 `{ "graph": {…} | "url": "<nanoodle share link with #g=…>", "inputs": { "<name>": "<text>" } }`.
 Example:
 
@@ -316,7 +342,7 @@ Example:
 
 Check a workflow for free first with `price_noodle` on nanoodle-mcp (npm `nanoodle-mcp`).
 
-**What you get.** The outputs, and a cost report: the estimated cost per step, the deposit
+**What you get.** The outputs (generated by AI models), and a cost report: the estimated cost per step, the deposit
 (the most the run could cost) and the actual cost NanoGPT reported, plus a JSON receipt.
 
 **How long.** Usually under a minute after the agent picks the job up (it checks for new
@@ -358,7 +384,8 @@ npm run simulate:market      # offline: the six scenarios below, no network, key
 
 MARKET_AGENT_TOKEN_FILE=~/.config/nanoodle-market/token \
 NANOGPT_API_KEY=… \
-node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --state-dir ~/nanoodle-market-state
+node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --state-dir ~/nanoodle-market-state \
+  --default-graph scripts/market-idea-to-image.json
 ```
 
 | Flag | Env | Default | Meaning |
@@ -367,6 +394,8 @@ node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --stat
 | `--listing-price-usd <n>` | `MARKET_LISTING_PRICE_USD` | none | The listing price. When set, the worker refuses to start unless budget ≤ price × 0.95, and the deliverable names the price. |
 | `--token-file <path>` | `MARKET_AGENT_TOKEN_FILE` | none | File holding the `aat_…` token; must not be readable by group or others. Or set `MARKET_AGENT_TOKEN`. |
 | `--nanogpt-key-file <path>` | | none | File holding the NanoGPT key (0600). Or set `NANOGPT_API_KEY`. |
+| `--default-graph <file>` | `MARKET_DEFAULT_GRAPH` | none | A nanoodle graph to run when the brief is plain words with no workflow block; the brief becomes its text input. See [A brief in plain words](#a-brief-in-plain-words). |
+| `--default-input <name>` | `MARKET_DEFAULT_INPUT` | the graph's only named text node | Which input of the default graph receives the brief. |
 | `--base-url <url>` | `MARKET_BASE_URL` | `https://market.near.ai` | Market API; tests point it at the stand-in. |
 | `--nanogpt-base <url>` | `NANOGPT_BASE_URL` | `https://nano-gpt.com` | NanoGPT API. |
 | `--state-dir <dir>` | `MARKET_STATE_DIR` | `$XDG_STATE_HOME/nanoodle-market`, else `~/.local/state/nanoodle-market` | Durable state; created 0700. One worker per directory. Always absolute, never relative to the working directory: a restart must find the same records (the path is printed at startup). |

@@ -12,7 +12,7 @@
  */
 import { parseArgs } from "node:util";
 import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState } from "../src/market/state.mjs";
@@ -35,6 +35,10 @@ Options:
                             (the most its run can cost) is above this is declined before any work
   --listing-price-usd <n>   the listing's price per hire (env MARKET_LISTING_PRICE_USD); when set, the
                             worker refuses to start unless budget <= price x 0.95 (the market keeps 5%)
+  --default-graph <file>    a nanoodle graph to run when the brief is plain words with no workflow
+                            block (env MARKET_DEFAULT_GRAPH); the brief becomes its text input
+  --default-input <name>    which input of that graph receives the brief (env MARKET_DEFAULT_INPUT;
+                            default: the graph's only named text node)
   --base-url <url>          market API (env MARKET_BASE_URL, default https://market.near.ai)
   --nanogpt-base <url>      NanoGPT API (env NANOGPT_BASE_URL, default https://nano-gpt.com)
   --state-dir <dir>         durable state (env MARKET_STATE_DIR, default $XDG_STATE_HOME/nanoodle-market,
@@ -72,6 +76,30 @@ export function defaultStateDir(env = process.env) {
   return xdg && isAbsolute(xdg) ? join(xdg, "nanoodle-market") : join(homedir(), ".local", "state", "nanoodle-market");
 }
 
+/**
+ * The operator's default workflow for plain-language briefs: a graph file and
+ * the name of the text input that receives the brief. Returns null when unset.
+ */
+export function readDefaultWorkflow(file, inputName) {
+  if (!file) {
+    if (inputName) die("--default-input needs --default-graph");
+    return null;
+  }
+  let graph;
+  try { graph = JSON.parse(readFileSync(file, "utf8")); } catch (e) { die(`--default-graph ${file}: cannot read it as JSON (${e.message})`); }
+  if (!graph || typeof graph !== "object" || !Array.isArray(graph.nodes)) die(`--default-graph ${file}: not a nanoodle graph (no "nodes" array)`);
+  const named = graph.nodes.filter((n) => n && n.type === "text" && typeof n.name === "string" && n.name);
+  let name = inputName;
+  if (!name) {
+    if (named.length !== 1) die(`--default-graph ${file}: it has ${named.length} named text nodes; say which one receives the brief with --default-input <name>`);
+    name = named[0].name;
+  } else if (!named.some((n) => n.name === name)) {
+    die(`--default-input ${JSON.stringify(name)}: the graph has no text node with that name (it has: ${named.map((n) => n.name).join(", ") || "none"})`);
+  }
+  const label = typeof graph.name === "string" && graph.name.trim() ? graph.name.trim().slice(0, 80) : basename(file).replace(/\.json$/i, "");
+  return { graph, inputName: name, label };
+}
+
 export function readConfig(argv = process.argv.slice(2), env = process.env) {
   let a;
   try {
@@ -81,6 +109,7 @@ export function readConfig(argv = process.argv.slice(2), env = process.env) {
         "budget-usd": { type: "string" }, "listing-price-usd": { type: "string" },
         "base-url": { type: "string" }, "nanogpt-base": { type: "string" },
         "token-file": { type: "string" }, "nanogpt-key-file": { type: "string" },
+        "default-graph": { type: "string" }, "default-input": { type: "string" },
         "state-dir": { type: "string" }, "poll-seconds": { type: "string" },
         concurrency: { type: "string" }, "retain-days": { type: "string" },
         once: { type: "boolean" }, help: { type: "boolean" },
@@ -109,11 +138,12 @@ export function readConfig(argv = process.argv.slice(2), env = process.env) {
 
   const baseUrl = a["base-url"] ?? env.MARKET_BASE_URL ?? "https://market.near.ai";
   if (!/^https?:\/\//.test(baseUrl)) die("--base-url must be an http(s) URL");
+  const defaultWorkflow = readDefaultWorkflow(a["default-graph"] ?? env.MARKET_DEFAULT_GRAPH, a["default-input"] ?? env.MARKET_DEFAULT_INPUT);
   const pollSeconds = a["poll-seconds"] != null ? num(a["poll-seconds"], "poll-seconds") : 45;
   const concurrency = a.concurrency != null ? num(a.concurrency, "concurrency", { int: true }) : 2;
   if (concurrency > 8) die("--concurrency is at most 8");
   return {
-    budgetUsd, listingPriceUsd, token, apiKey, baseUrl,
+    budgetUsd, listingPriceUsd, token, apiKey, baseUrl, defaultWorkflow,
     nanogptBase: a["nanogpt-base"] ?? env.NANOGPT_BASE_URL ?? undefined,
     stateDir: resolve(a["state-dir"] ?? env.MARKET_STATE_DIR ?? defaultStateDir(env)),
     pollMs: pollSeconds * 1000, concurrency,
@@ -165,9 +195,21 @@ async function main() {
   const client = createMarketClient({ baseUrl: cfg.baseUrl, token: cfg.token });
   const runner = createWorkflowRunner({ apiKey: cfg.apiKey, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
   const worker = createMarketWorker({
-    client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd,
+    client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd, defaultWorkflow: cfg.defaultWorkflow,
     concurrency: cfg.concurrency, retainMs: cfg.retainMs, log,
   });
+  if (cfg.defaultWorkflow) {
+    // Catch a default workflow that could never run before the first buyer does.
+    try {
+      const probe = await runner.price({ graph: cfg.defaultWorkflow.graph, inputs: { [cfg.defaultWorkflow.inputName]: "a lighthouse at dawn" } });
+      if (!probe.ok && !probe.refusals.some((r) => r.code === "CATALOG_UNAVAILABLE")) {
+        try { store.close(); } catch { /* closed */ }
+        die(`--default-graph cannot run on this worker:\n${probe.refusals.map((r) => `  - ${r.message}`).join("\n")}`);
+      }
+      if (probe.ok) log(`plain-language briefs run the default workflow ${JSON.stringify(cfg.defaultWorkflow.label)} (input ${JSON.stringify(cfg.defaultWorkflow.inputName)}): estimated cost $${probe.pricing.estimatedCostUsd.toFixed(6)}, deposit $${probe.pricing.depositUsd}`);
+      else log("the NanoGPT catalog is unavailable, so the default workflow was not checked at startup");
+    } catch (e) { log(`the default workflow was not checked at startup (${(e && e.message) || e})`); }
+  }
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s; per-job budget $${cfg.budgetUsd}${cfg.listingPriceUsd != null ? `, listing price $${cfg.listingPriceUsd}` : ""}; state in ${cfg.stateDir}`);
 
   const loop = runLoop(worker, store, { pollMs: cfg.pollMs, once: cfg.once, log });

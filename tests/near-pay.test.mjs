@@ -17,7 +17,8 @@ import { loadNearSigner } from "../src/near/keys.mjs";
 import { sendTransfer, rpcFor } from "../scripts/near-testnet-lib.mjs";
 
 const MERCHANT = "merchant.testnet", PAYER = "payer.testnet";
-const noSleep = async () => {};
+// Short real waits, not zero: the script polls for the refund, and the server needs real time to send it.
+const noSleep = (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 60)));
 
 async function setup() {
   const dir = await mkdtemp(join(tmpdir(), "near-pay-"));
@@ -100,7 +101,7 @@ test("near-pay: a wallet-paid quote is finished with --payment-id/--payment-tx; 
     // 1. quote only, then "the wallet" pays exactly that amount
     let r = await pay([...common, "--quote-only"]);
     assert.equal(r.code, 0, r.out);
-    const m = r.out.match(/— ([\d.]+) NEAR to (\S+), id (nq_\w+),/);
+    const m = r.out.match(/— ([\d.]+) NEAR to (\S+), id (nq_[\w-]+),/);
     assert.ok(m, r.out);
     const signer = await loadNearSigner({ accountId: PAYER, keyFile: s.pFile, env: {} });
     const sent = await sendTransfer({ rpc: rpcFor(s.chain.url), signer, signerId: PAYER, receiverId: m[2], amountYocto: parseNearToYocto(m[1]), sleep: noSleep });
