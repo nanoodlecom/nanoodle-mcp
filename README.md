@@ -1095,6 +1095,10 @@ chain. It prints an explorer link for each transfer and ends `PASS` with exit 0.
 custom workflow (one chat model, 48 output tokens at most); `--tool <name> --args '<json>'`
 pays a saved tool instead.
 
+To pay from a wallet app instead of a key file: run it with `--quote-only`, send exactly
+the quoted amount to the pay-to account from the wallet, then run it again with
+`--payment-id <nq_…> --payment-tx <hash>` in place of the key file.
+
 ### What a paid server will run
 
 Strangers' graphs run on your server, so NEAR mode accepts only node types whose

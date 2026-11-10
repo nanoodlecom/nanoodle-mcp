@@ -13,6 +13,8 @@ import { startServer, freePort } from "../scripts/near-simulate.mjs";
 import { MOCK_MODEL } from "../scripts/near-testnet-e2e.mjs";
 import { runNearPay } from "../scripts/near-pay.mjs";
 import { parseNearToYocto } from "../src/near/amount.mjs";
+import { loadNearSigner } from "../src/near/keys.mjs";
+import { sendTransfer, rpcFor } from "../scripts/near-testnet-lib.mjs";
 
 const MERCHANT = "merchant.testnet", PAYER = "payer.testnet";
 const noSleep = async () => {};
@@ -88,5 +90,33 @@ test("near-pay: refuses to send on the wrong network or above --max-near, and re
     assert.equal((await pay(["--url", s.base, "--payer", PAYER])).code, 2);
     assert.equal((await pay(["--url", s.base, "--network", "testnet", "--payer", PAYER])).code, 2); // no key, not quote-only
     assert.equal((await pay(["--network", "testnet", "--payer", PAYER, "--quote-only"])).code, 2);
+  } finally { await s.close(); }
+});
+
+test("near-pay: a wallet-paid quote is finished with --payment-id/--payment-tx; a near-cli-rs key file works", { timeout: 120_000 }, async () => {
+  const s = await setup();
+  try {
+    const common = ["--url", s.base, "--network", "testnet", "--rpc", s.chain.url, "--payer", PAYER, "--model", MOCK_MODEL];
+    // 1. quote only, then "the wallet" pays exactly that amount
+    let r = await pay([...common, "--quote-only"]);
+    assert.equal(r.code, 0, r.out);
+    const m = r.out.match(/— ([\d.]+) NEAR to (\S+), id (nq_\w+),/);
+    assert.ok(m, r.out);
+    const signer = await loadNearSigner({ accountId: PAYER, keyFile: s.pFile, env: {} });
+    const sent = await sendTransfer({ rpc: rpcFor(s.chain.url), signer, signerId: PAYER, receiverId: m[2], amountYocto: parseNearToYocto(m[1]), sleep: noSleep });
+
+    assert.equal((await pay([...common, "--payment-id", m[3]])).code, 2); // the two go together
+    r = await pay([...common, "--payment-id", m[3], "--payment-tx", sent.txHash]);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /PASS {2}the wallet transfer is FINAL on testnet, signed by payer\.testnet/);
+    assert.match(r.out, /PASS {2}the refund is FINAL on chain/);
+    assert.doesNotMatch(r.out, /^FAIL/m);
+
+    // 2. a near-cli-rs key file has no account_id; --payer names the account
+    const rsFile = s.pFile.replace(/\.json$/, "-rs.json");
+    await writeFile(rsFile, JSON.stringify({ public_key: s.pk.publicKey, private_key: s.pk.secretKey }), { mode: 0o600 });
+    r = await pay([...common, "--payer-key-file", rsFile]);
+    assert.equal(r.code, 0, r.out);
+    assert.ok(!r.out.includes(s.pk.secretKey));
   } finally { await s.close(); }
 });
