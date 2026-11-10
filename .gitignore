@@ -4,3 +4,5 @@ nanoodle-out/
 .agents/
 .claude/
 skills-lock.json
+.near-testnet/
+market-state/
