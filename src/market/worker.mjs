@@ -418,7 +418,8 @@ export function createMarketWorker({
             lastError: "already started when first seen; not run", finishedAt: now(),
           });
         } else {
-          log(`assignment ${short(a.assignmentId)}: new hire ${JSON.stringify(String((row.job && row.job.title) || "").slice(0, 60))}`);
+          log(`assignment ${short(a.assignmentId)}: new hire ${JSON.stringify(String((row.job && row.job.title) || "").slice(0, 60))}` +
+            (a.escrowAmount != null ? ` for ${String(a.escrowAmount).replace(/(\.\d*?[1-9])0+$|\.0+$/, "$1")} ${a.escrowToken || ""}`.trimEnd() : ""));
           store.create(a.assignmentId, { phase: "new", jobId: a.jobId, epoch: String(a.slaDeadlineAt || "") });
         }
       } else if (rec.phase === "submitted" && a.status === "in_progress" && !inflight.has(a.assignmentId)) {

@@ -93,9 +93,20 @@ Rules (implemented in `src/market/brief.mjs`):
 Most people hiring on the market write a sentence, not JSON. Start the worker with
 `--default-graph <file>` and a brief that has **no workflow block at all** runs that graph,
 with the whole brief as its text input (`--default-input <name>` picks the input when the
-graph has more than one named text node). `scripts/market-idea-to-image.json` is a ready
-default: the brief goes to a chat model that writes one image prompt, and an image model
-draws it (estimated cost about $0.009, deposit $0.03 at NanoGPT's prices on 2026-11-10).
+graph has more than one named text node). Two ready defaults ship in `scripts/`
+(prices from NanoGPT's catalog on 2026-11-10):
+
+| File | The brief is | Delivers | Estimated cost | Deposit | Typical time |
+|---|---|---|---|---|---|
+| `market-sing.json` (`--default-input "Song idea"`) | a song idea | a sung track (mp3) and its lyrics | $0.151 | $0.37 | about 2.5 minutes |
+| `market-idea-to-image.json` | a picture idea | one 1024×1024 image | $0.009 | $0.03 | under a minute |
+
+`market-sing.json` is **Sing** from
+[awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), the most used workflow
+on the hosted nanoodle-mcp server: three chat calls write the lyrics, arrange the song and
+name what would clash with the arrangement, then MiniMax Music 3 sings it. Two changes for
+hires in plain words: the band references default to "choose what fits the idea" instead of
+a fixed set of bands, and the lyrics are delivered as a second output.
 
 - A brief that does contain a workflow block always runs the buyer's workflow, never the
   default. A block that is there but broken is declined as before: the buyer meant a
@@ -288,7 +299,7 @@ live agents), click **Hire**, paste a brief from [The job brief](#the-job-brief)
 confirm. The job appears under **Hiring → My Jobs**; within a poll interval the job page
 shows the "Started" message, then the deliverable, and the assignment reads `submitted`.
 
-Also hire it once in plain words (with `--default-graph`, that delivers an image), once
+Also hire it once in plain words (with `--default-graph`, that delivers the default workflow's result), once
 with a broken workflow block, and once with an over-budget graph: the last two must come
 back declined with a full refund.
 
@@ -312,24 +323,28 @@ The listing steps can also be done from an MCP client on `https://market.near.ai
 
 | Field | Suggestion |
 |---|---|
-| Name | Nanoodle: idea to image, or any AI workflow |
+| Name | Nanoodle: idea to song, or any AI workflow |
 | Handle (pick one free) | `nanoodle-workflows`, `nanoodle-runner`, `noodle-runner` |
 | Category | `creative` (most workflows make images, video or audio); `automation` also fits |
-| Tagline (149 characters) | Describe a picture in plain words and get the image. Or send a nanoodle workflow to run any chain of AI steps: image, video, music, speech, 3D, text. |
-| Tags | `workflow`, `image-generation`, `video-generation`, `text-to-speech`, `music`, `llm`, `nanogpt`, `nanoodle`, `ai-pipeline`, `agent-friendly` |
+| Tagline (162 characters) | Send a song idea in plain words, get a finished sung track with lyrics. Or send your own nanoodle workflow: any chain of image, video, music, speech and 3D steps. |
+| Tags | `song`, `music-generation`, `workflow`, `image-generation`, `video-generation`, `text-to-speech`, `llm`, `nanogpt`, `nanoodle`, `agent-friendly` |
 | Price per hire | $1.00 (`per_call`), with the worker's budget at $0.50 |
 | Delivery SLA | 3600 s |
 
 Description (`bio_markdown`):
 
 ````markdown
-**The simple way.** Write what picture you want, in plain words: "a poster for a small
-coffee shop opening on Saturday, warm morning light". The agent writes an image prompt
-from your brief, draws one 1024×1024 image, and delivers it. One hire, one image.
+**The simple way: a song.** Write a song idea in plain words: "an upbeat birthday song
+for my mum, who loves gardening and bad puns". The agent writes the lyrics, arranges the
+song, and has a music model sing it. You get the track (mp3) and the lyrics. One hire, one
+song, in about three minutes. Name bands or a genre in the brief if you want a certain sound.
 
-**The full way.** Send a nanoodle workflow — a small graph of AI steps (text, LLM, image,
-image edit, video, music, speech, 3D) and its inputs. The agent checks it, runs it **once**
-on NanoGPT, and delivers every output: files attached, text inline.
+**The powerful way: your own workflow.** Send a nanoodle workflow — a small graph of AI
+steps (text, LLM, image, image edit, video, music, speech, 3D) and its inputs — and the
+agent runs exactly that instead: an image from four models side by side, a still animated
+into a clip, a talking script, a 3D model. It checks the workflow, runs it **once** on
+NanoGPT, and delivers every output: files attached, text inline. Build and try workflows
+in the open at nanoodle.com.
 
 **What to send for a workflow.** One code block tagged `nanoodle` holding
 `{ "graph": {…} | "url": "<nanoodle share link with #g=…>", "inputs": { "<name>": "<text>" } }`.
@@ -345,8 +360,9 @@ Check a workflow for free first with `price_noodle` on nanoodle-mcp (npm `nanood
 **What you get.** The outputs (generated by AI models), and a cost report: the estimated cost per step, the deposit
 (the most the run could cost) and the actual cost NanoGPT reported, plus a JSON receipt.
 
-**How long.** Usually under a minute after the agent picks the job up (it checks for new
-jobs every 45 seconds). It posts "Started" with the estimate when it begins.
+**How long.** A song takes about three minutes; an image workflow under a minute; video
+a few minutes. The agent checks for new jobs every 45 seconds and posts "Started" with the
+estimate when it begins.
 
 **What the price covers.** One run of one workflow whose deposit is at most $0.50. Larger
 workflows are declined at once with the exact figure, and you are refunded in full. A change
@@ -385,7 +401,7 @@ npm run simulate:market      # offline: the six scenarios below, no network, key
 MARKET_AGENT_TOKEN_FILE=~/.config/nanoodle-market/token \
 NANOGPT_API_KEY=… \
 node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --state-dir ~/nanoodle-market-state \
-  --default-graph scripts/market-idea-to-image.json
+  --default-graph scripts/market-sing.json --default-input "Song idea"
 ```
 
 | Flag | Env | Default | Meaning |
@@ -396,6 +412,7 @@ node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --stat
 | `--nanogpt-key-file <path>` | | none | File holding the NanoGPT key (0600). Or set `NANOGPT_API_KEY`. |
 | `--default-graph <file>` | `MARKET_DEFAULT_GRAPH` | none | A nanoodle graph to run when the brief is plain words with no workflow block; the brief becomes its text input. See [A brief in plain words](#a-brief-in-plain-words). |
 | `--default-input <name>` | `MARKET_DEFAULT_INPUT` | the graph's only named text node | Which input of the default graph receives the brief. |
+| | `MARKET_NOTIFY_URL` | none | Env only. A webhook that receives `{"text": "…"}` when a job is hired (with the price), delivered, declined, fails or needs the operator. A Slack incoming webhook works as is. The URL is a credential: it is never logged. Buyer-written text is escaped. |
 | `--base-url <url>` | `MARKET_BASE_URL` | `https://market.near.ai` | Market API; tests point it at the stand-in. |
 | `--nanogpt-base <url>` | `NANOGPT_BASE_URL` | `https://nano-gpt.com` | NanoGPT API. |
 | `--state-dir <dir>` | `MARKET_STATE_DIR` | `$XDG_STATE_HOME/nanoodle-market`, else `~/.local/state/nanoodle-market` | Durable state; created 0700. One worker per directory. Always absolute, never relative to the working directory: a restart must find the same records (the path is printed at startup). |
@@ -417,7 +434,7 @@ A server that pays NanoGPT from a Nano wallet (x402, no API key) should run the 
 MARKET_AGENT_TOKEN_FILE=/etc/nanoodle-mcp/market-token \
 MARKET_JOB_BUDGET_USD=0.50 MARKET_LISTING_PRICE_USD=1.00 \
 MARKET_STATE_DIR=/srv/nanoodle-mcp/market-state \
-MARKET_DEFAULT_GRAPH=scripts/market-idea-to-image.json \
+MARKET_DEFAULT_GRAPH=scripts/market-sing.json MARKET_DEFAULT_INPUT="Song idea" \
 node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
 ```
 
@@ -448,6 +465,18 @@ tests/market-*.test.mjs` covers the same paths plus a failed run, a 503 on submi
 uncertain start, a change request, the concurrency bound, the state-file and lock rules, a
 job already started by a worker whose state is gone, local errors kept from the buyer,
 forged log lines, a fatal poll error with a run in flight, and the CLI's refusals.
+
+## Knowing when a job comes in
+
+- **The log.** Every hire writes `assignment <id>: new hire "<title>" for <price> <USD|USDC>`,
+  then `accepted`, `running the workflow`, `run finished — actual cost $…` and `delivered`
+  (or `declined (…)`). Standalone: the worker's stderr. Inside the server:
+  `journalctl -u <unit> | grep "market worker"`.
+- **A push message.** Set `MARKET_NOTIFY_URL` to a webhook (a Slack incoming webhook works)
+  and the hire, the delivery, a decline, a failed run and anything marked `NEEDS OPERATOR`
+  are posted there as they happen.
+- **The market.** Building → Your agents shows the agent's jobs and their state; the balance
+  shows what was released after the buyer accepted (or after the acceptance window passed).
 
 ## Durable state and exactly-once
 

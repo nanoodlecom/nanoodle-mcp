@@ -38,6 +38,8 @@ Options:
                             block (env MARKET_DEFAULT_GRAPH); the brief becomes its text input
   --default-input <name>    which input of that graph receives the brief (env MARKET_DEFAULT_INPUT;
                             default: the graph's only named text node)
+  MARKET_NOTIFY_URL         (env only) a webhook that receives {"text": "…"} when a job is hired,
+                            delivered, declined, fails or needs the operator (Slack-style incoming webhook)
   --base-url <url>          market API (env MARKET_BASE_URL, default https://market.near.ai)
   --nanogpt-base <url>      NanoGPT API (env NANOGPT_BASE_URL, default https://nano-gpt.com)
   --state-dir <dir>         durable state (env MARKET_STATE_DIR, default $XDG_STATE_HOME/nanoodle-market,
@@ -147,13 +149,15 @@ export function readConfig(argv = process.argv.slice(2), env = process.env, { ne
 
   const baseUrl = a["base-url"] ?? env.MARKET_BASE_URL ?? "https://market.near.ai";
   if (!/^https?:\/\//.test(baseUrl)) die("--base-url must be an http(s) URL");
+  const notifyUrl = (env.MARKET_NOTIFY_URL || "").trim() || null;
+  if (notifyUrl && !/^https:\/\/|^http:\/\/(127\.0\.0\.1|localhost)[:/]/.test(notifyUrl)) die("MARKET_NOTIFY_URL must be an https URL");
   const defaultWorkflow = readDefaultWorkflow(a["default-graph"] ?? env.MARKET_DEFAULT_GRAPH, a["default-input"] ?? env.MARKET_DEFAULT_INPUT);
   const pollRaw = a["poll-seconds"] ?? env.MARKET_POLL_SECONDS;
   const pollSeconds = pollRaw != null ? num(pollRaw, "poll-seconds") : 45;
   const concurrency = a.concurrency != null ? num(a.concurrency, "concurrency", { int: true }) : 2;
   if (concurrency > 8) die("--concurrency is at most 8");
   return {
-    budgetUsd, listingPriceUsd, token, apiKey: apiKey || null, baseUrl, defaultWorkflow,
+    budgetUsd, listingPriceUsd, token, apiKey: apiKey || null, baseUrl, defaultWorkflow, notifyUrl,
     nanogptBase: a["nanogpt-base"] ?? env.NANOGPT_BASE_URL ?? undefined,
     stateDir: resolve(a["state-dir"] ?? env.MARKET_STATE_DIR ?? defaultStateDir(env)),
     pollMs: pollSeconds * 1000, concurrency,
@@ -198,6 +202,27 @@ export function runLoop(worker, store, { pollMs, once = false, log }) {
 }
 
 
+/** Log lines worth an operator's attention the moment they happen. */
+export const NOTIFY_LINES = /: new hire |: delivered$|: declined \(|: run failed|: sent back by the buyer|NEEDS OPERATOR|^stopped:/;
+
+/**
+ * A best-effort webhook: POST {"text": line}. Never throws, never delays the worker,
+ * never logs the URL (it is a credential). Buyer-written text in a line is escaped so
+ * it cannot mention a channel or forge a link in Slack-style renderers.
+ */
+export function createNotifier({ url, fetch = globalThis.fetch, log = () => {}, timeoutMs = 10_000 }) {
+  const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return (line) => {
+    Promise.resolve()
+      .then(() => fetch(url, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: `nanoodle market: ${esc(line)}` }), signal: AbortSignal.timeout(timeoutMs), redirect: "error",
+      }))
+      .then((res) => { if (!res.ok) log(`notification not delivered (HTTP ${res.status})`); })
+      .catch((e) => log(`notification not delivered (${(e && e.name) || "error"})`));
+  };
+}
+
 /**
  * Open the state, check what can be checked before a buyer depends on it, and
  * start polling. Throws MarketConfigError when the worker cannot run as configured.
@@ -207,7 +232,9 @@ export function runLoop(worker, store, { pollMs, once = false, log }) {
  * @param {(line: string) => void} o.log
  * @returns {Promise<{ done: Promise<number>, stop: () => void, store: object }>}
  */
-export async function startMarketService(cfg, { payment = null, log }) {
+export async function startMarketService(cfg, { payment = null, log: baseLog }) {
+  const notify = cfg.notifyUrl ? createNotifier({ url: cfg.notifyUrl, log: baseLog }) : null;
+  const log = notify ? (line) => { baseLog(line); if (NOTIFY_LINES.test(line)) notify(line); } : baseLog;
   if (!cfg.apiKey && typeof payment !== "function") die("no NanoGPT funding source: an API key or a wallet payment callback is needed");
   let store;
   try { store = openMarketState({ dir: cfg.stateDir }); } catch (e) { die(e.message); }
@@ -238,6 +265,7 @@ export async function startMarketService(cfg, { payment = null, log }) {
     if (probe && probe.ok) log(`plain-language briefs run the default workflow ${JSON.stringify(cfg.defaultWorkflow.label)} (input ${JSON.stringify(cfg.defaultWorkflow.inputName)}): estimated cost $${probe.pricing.estimatedCostUsd.toFixed(6)}, deposit $${probe.pricing.depositUsd}`);
     else if (probe) log("the NanoGPT catalog is unavailable, so the default workflow was not checked at startup");
   }
+  if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s; per-job budget $${cfg.budgetUsd}${cfg.listingPriceUsd != null ? `, listing price $${cfg.listingPriceUsd}` : ""}; state in ${cfg.stateDir}`);
   const loop = runLoop(worker, store, { pollMs: cfg.pollMs, once: cfg.once, log });
   return { done: loop.done, stop: loop.stop, store };
