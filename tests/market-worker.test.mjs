@@ -14,7 +14,7 @@ import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
 import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
-import { createWorkflowRunner } from "../src/market/runner.mjs";
+import { createWorkflowRunner, checkNanoGptKey, isOperatorSideFailure } from "../src/market/runner.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
 
@@ -391,4 +391,15 @@ test("CLI: --default-graph is read and checked; a bad file or input name is refu
   r = spawnSync(process.execPath, [bin, "--budget-usd", "0.5", "--default-input", "Idea", "--once"], { env, encoding: "utf8" });
   assert.equal(r.status, 2); assert.match(r.stderr, /--default-input needs --default-graph/);
   assert.ok(!r.stderr.includes(NANO_KEY) && !r.stderr.includes(MOCK_TOKEN));
+});
+
+test("operator-side failures are told apart, and a rejected NanoGPT key is caught before any hire", async () => {
+  assert.ok(isOperatorSideFailure('run failed at "Writer": API key rejected (HTTP 401) — check your NanoGPT key / NANOGPT_API_KEY'));
+  assert.ok(isOperatorSideFailure("Insufficient balance for this request"));
+  assert.ok(!isOperatorSideFailure('run failed at "Image": the prompt was blocked by the content filter'));
+  const answer = (status) => async () => new Response("{}", { status });
+  assert.deepEqual(await checkNanoGptKey({ apiKey: "k", fetch: answer(401) }), { ok: false, status: 401, detail: "NanoGPT rejected the API key" });
+  assert.equal((await checkNanoGptKey({ apiKey: "k", fetch: answer(200) })).ok, true);
+  assert.equal((await checkNanoGptKey({ apiKey: "k", fetch: answer(404) })).ok, true, "an unknown status does not block start-up");
+  assert.equal((await checkNanoGptKey({ apiKey: "k", fetch: async () => { throw new TypeError("fetch failed"); } })).ok, true);
 });

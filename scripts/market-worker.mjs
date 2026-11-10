@@ -16,7 +16,7 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState } from "../src/market/state.mjs";
-import { createWorkflowRunner } from "../src/market/runner.mjs";
+import { createWorkflowRunner, checkNanoGptKey } from "../src/market/runner.mjs";
 import { createMarketWorker, logSafe } from "../src/market/worker.mjs";
 
 /** The market's platform fee (GET /v1/platform/config: platform_fee_bps 500), taken from the price on acceptance. */
@@ -198,6 +198,10 @@ async function main() {
     client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd, defaultWorkflow: cfg.defaultWorkflow,
     concurrency: cfg.concurrency, retainMs: cfg.retainMs, log,
   });
+  // A rejected key would fail every hire after the buyer has paid; stop here instead.
+  const keyCheck = await checkNanoGptKey({ apiKey: cfg.apiKey, baseUrl: cfg.nanogptBase });
+  if (!keyCheck.ok) { try { store.close(); } catch { /* closed */ } die(`${keyCheck.detail} (HTTP ${keyCheck.status}); set a working NANOGPT_API_KEY or --nanogpt-key-file`); }
+  log(`NanoGPT key: ${keyCheck.detail}`);
   if (cfg.defaultWorkflow) {
     // Catch a default workflow that could never run before the first buyer does.
     try {

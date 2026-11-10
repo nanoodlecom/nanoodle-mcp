@@ -18,6 +18,28 @@ import { MediaRef } from "nanoodle";
 import { computePrice, prepareRunNoodle, describeRunFailure, runNotices, extForMedia, ParamsError } from "../tools.mjs";
 import { DEFAULT_LIMITS, GraphArgsError, GraphRefusedError } from "../custom-workflow.mjs";
 
+/** A run failure caused by the operator's NanoGPT account, not by the buyer's workflow. */
+export function isOperatorSideFailure(message) {
+  return /API key rejected|NANOGPT_API_KEY|HTTP 40[123]\b|insufficient (balance|funds|credit)|payment required/i.test(String(message || ""));
+}
+
+/**
+ * Ask NanoGPT whether the key is accepted, before any buyer depends on it.
+ * @returns {Promise<{ ok: boolean, status: number|null, detail: string }>} ok=false only on a
+ *   definite rejection (401/403); a network error or any other status is "unknown" and ok.
+ */
+export async function checkNanoGptKey({ apiKey, baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, timeoutMs = 15_000 }) {
+  try {
+    const res = await fetch(new URL("/api/check-balance", baseUrl), {
+      method: "POST", headers: { "x-api-key": apiKey }, signal: AbortSignal.timeout(timeoutMs), redirect: "error",
+    });
+    if (res.status === 401 || res.status === 403) return { ok: false, status: res.status, detail: "NanoGPT rejected the API key" };
+    return { ok: true, status: res.status, detail: res.ok ? "accepted" : `not checked (HTTP ${res.status})` };
+  } catch (e) {
+    return { ok: true, status: null, detail: `not checked (${(e && e.name) || "error"})` };
+  }
+}
+
 /**
  * @param {object} o
  * @param {string} o.apiKey        operator's NanoGPT API key (never logged)
@@ -78,7 +100,9 @@ export function createWorkflowRunner({ apiKey, budgetUsd, baseUrl, fetch = globa
         const d = describeRunFailure(e);
         // describeRunFailure returns a new error only when the engine reported per-step
         // (provider) errors; that text may go to the buyer. Anything else stays operator-only.
-        if (d !== e) d.buyerMessage = d.message;
+        // ...unless the failure is the operator's own (a rejected key, an empty balance):
+        // the buyer cannot act on it and should not read about the operator's account.
+        if (d !== e && !isOperatorSideFailure(d.message)) d.buyerMessage = d.message;
         throw d;
       }
       const outputs = [];
