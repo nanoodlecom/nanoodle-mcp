@@ -34,7 +34,7 @@ export const PRICE_REFRESH_SECONDS = 600;
 /** The brief used to price a listing's own workflow: as long as a brief may be (the input cap), so the estimate is for the longest brief. */
 export const PROBE_BRIEF = "a lighthouse at dawn, ".repeat(1000).slice(0, 20_000);
 
-const AGENT_KEYS = new Set(["handle", "tokenFile", "graph", "input", "custom", "priceUsd", "fields"]);
+const AGENT_KEYS = new Set(["handle", "tokenFile", "webhookSecretFile", "graph", "input", "custom", "priceUsd", "fields"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const die = (msg) => { throw new MarketConfigError(msg); };
 
@@ -117,7 +117,7 @@ export function priceVerdict({ priceUsd, depositUsd }) {
  * token is not there yet is skipped when the worker starts, not refused here).
  * @param {string} file
  * @param {{ root?: string }} [o]  where relative graph paths resolve (default: the package directory)
- * @returns {{ file: string, agents: Array<{ handle, tokenFile, graphFile, input, custom, priceUsd, defaultWorkflow }> }}
+ * @returns {{ file: string, agents: Array<{ handle, tokenFile, webhookSecretFile, graphFile, input, custom, priceUsd, defaultWorkflow }> }}
  * @throws {MarketConfigError}
  */
 export function readCatalog(file, { root = REPO_ROOT } = {}) {
@@ -140,6 +140,7 @@ export function readCatalog(file, { root = REPO_ROOT } = {}) {
     if (seen.has(a.handle)) bad(`${where}: handle ${a.handle} appears twice`);
     seen.add(a.handle);
     if (typeof a.tokenFile !== "string" || !isAbsolute(a.tokenFile)) bad(`${where}: "tokenFile" must be an absolute path`);
+    if (a.webhookSecretFile !== undefined && (typeof a.webhookSecretFile !== "string" || !isAbsolute(a.webhookSecretFile))) bad(`${where}: "webhookSecretFile" must be an absolute path`);
     if (a.custom !== undefined && typeof a.custom !== "boolean") bad(`${where}: "custom" must be true or false`);
     const custom = a.custom === true;
     if (a.graph !== undefined && a.graph !== null && (typeof a.graph !== "string" || !a.graph)) bad(`${where}: "graph" must be a file path or null`);
@@ -172,7 +173,7 @@ export function readCatalog(file, { root = REPO_ROOT } = {}) {
       }
       defaultWorkflow = { ...defaultWorkflow, fieldSpecs: a.fields };
     }
-    return { handle: a.handle, tokenFile: a.tokenFile, graphFile, input: defaultWorkflow ? defaultWorkflow.inputName : null, custom, priceUsd: a.priceUsd ?? null, defaultWorkflow };
+    return { handle: a.handle, tokenFile: a.tokenFile, webhookSecretFile: a.webhookSecretFile ?? null, graphFile, input: defaultWorkflow ? defaultWorkflow.inputName : null, custom, priceUsd: a.priceUsd ?? null, defaultWorkflow };
   });
   return { file: path, agents };
 }

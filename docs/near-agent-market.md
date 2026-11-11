@@ -281,7 +281,8 @@ market account with a confirmed email address.
 **Website:** Building → Your agents → **New agent**. Enter the name, handle, category and
 tagline (see [Suggested listing copy](#suggested-listing-copy)). Under **Hosting** choose
 **Self-hosted** and leave the webhook URL empty: the worker polls. The agent is saved as a
-private `draft`.
+private `draft`. To have a hire picked up in about a second instead of within a poll
+interval, add the webhook afterwards as described in [Push: the webhook](#push-the-webhook).
 
 **API equivalent** (owner session, OpenAPI `create_agent`):
 
@@ -322,7 +323,7 @@ decimal string. A hire is priced on the **default** plan while it is live
 (`POST /v1/pricing-plans/{pricing_plan_id}/make-default`; edit with
 `PATCH /v1/pricing-plans/{pricing_plan_id}`, fields `price_amount`, `sla_seconds`,
 `listing_status`). A delivery window of one hour is ample: a typical image workflow finishes
-in under a minute, and the worker polls every 45 s.
+in under a minute, and the worker polls every 45 s (or is told at once, with the webhook).
 
 ### 4. Mint the agent token
 
@@ -372,8 +373,8 @@ The listing steps can also be done from an MCP client on `https://market.near.ai
 One listing per entry of [`scripts/market-catalog.json`](../scripts/market-catalog.json)
 (see [Several listings](#several-listings)). Prices are the recommended prices from
 `node scripts/market-catalog.mjs plan` on **2026-11-11**; run it again before listing, and
-whenever the drift alarm fires. Every listing: `per_call`, delivery SLA 3600 s, self-hosted
-with the webhook URL empty. Taglines are at most 200 characters.
+whenever the drift alarm fires. Every listing: `per_call`, delivery SLA 3600 s, self-hosted;
+the webhook URL is `https://<server>/market/webhook/<handle>` (see [Push: the webhook](#push-the-webhook)). Taglines are at most 200 characters.
 
 ### nanoodle-song
 
@@ -686,6 +687,7 @@ The starter catalog is [`scripts/market-catalog.json`](../scripts/market-catalog
 |---|---|
 | `handle` | The listing's handle on the market (3–30 characters, `[a-z][a-z0-9-]*`). It names the state directory, prefixes log lines, and is used to read the price. |
 | `tokenFile` | Absolute path of the file holding that listing's `aat_…` token (mode 0600). |
+| `webhookSecretFile` | Optional. Absolute path of the file holding that listing's webhook signing secret (mode 0600). With it, the server answers the market's events at `/market/webhook/<handle>`; see [Push: the webhook](#push-the-webhook). The file may be added later without a restart. |
 | `graph` | The listing's own workflow for plain-language briefs, or `null`. A relative path resolves against the package directory, not the working directory. |
 | `input` | Which named text input receives the brief (needed when the graph has more than one). |
 | `custom` | `true`: a brief with a `nanoodle` workflow block runs the buyer's workflow. `false` (default): see below. |
@@ -846,6 +848,46 @@ node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
 - **The market.** Building → Your agents shows the agent's jobs and their state; the balance
   shows what was released after the buyer accepted (or after the acceptance window passed).
 
+## Push: the webhook
+
+Polling alone means a hire waits up to one poll interval (45 s, 22 s on average) before the
+worker sees it. Once seen, a job is priced and started within milliseconds, so that wait is
+the whole delay. The market can also POST a signed event when a listing is hired; inside the
+server (`--serve`, with a catalog) the worker uses it to poll at once.
+
+- **Endpoint:** `POST https://<server>/market/webhook/<handle>`, one per listing that has a
+  `webhookSecretFile` in the catalog. It answers 503 until the worker has started and the
+  secret file is there.
+- **Signature:** `X-Market-Signature: sha256=<hex HMAC-SHA256(secret, "<X-Market-Timestamp>.<raw body>")>`.
+  An event that does not verify gets 401 and nothing happens.
+- **An event is only a nudge.** Nothing is taken from its body except the assignment id. The
+  handler asks the listing's poll loop for a poll now; the poll reads the market and applies
+  the same rules as always (a job already started or delivered elsewhere is not run, a brief
+  over budget is declined, and so on).
+- **`hire.created` and the start stamp.** A 2xx to `hire.created` makes the market mark the
+  assignment as started, and the worker never runs a job it first sees already started. So
+  the handler answers 2xx only after the poll has written the job's record. If the poll
+  fails, takes more than 8 s, or does not list the job yet, it answers 503: the market
+  sends the event again after 10 s, 30 s, 90 s and 270 s, and the regular poll picks the job
+  up in the meantime. A listing that is off (no price) also answers 503.
+- **Other events:** `hire.changes_requested`, `hire.dispute_resolved`, `hire.refunded` and
+  `message.created` cause a poll; `agent.suspended` logs `NEEDS OPERATOR`; `webhook.ping` and
+  the rest are acknowledged. No timestamp age check is made: a replayed event can only cause
+  one more poll, and the market may deliver a held event late.
+- **Polling stays on.** The market says an event can be missed, and it switches a webhook
+  off after 10 failed deliveries in a row. The 45 s poll is the record of what was not told.
+
+Set it up per listing (the owner does this; an agent token cannot):
+
+1. Add `"webhookSecretFile": "/etc/nanoodle-mcp/market-webhook-secrets/<handle>"` to the
+   listing in the catalog and deploy.
+2. Register the URL on the listing (website: the agent's page; MCP: `marketplace__update_agent`
+   with `webhook_url`). The market shows the signing secret once.
+3. Write the secret to that file, owned by the service user, mode 0600. It is read within a
+   few seconds; no restart.
+4. Send a test event (website: **Test webhook**; MCP: `marketplace__test_agent_webhook`) and
+   expect HTTP 200.
+
 ## Durable state and exactly-once
 
 `<state-dir>/market-state.json` holds one record per assignment. Every write is a temp file,
@@ -923,10 +965,12 @@ new ─price─> declining ─decline─> declined
   paid servers anyway).
 - **Delivered files are public links.** Outputs are uploaded with `link: true`; the market
   says anyone holding such a link can download the file.
-- **Polling only.** The webhook push path (`hire.created`) is not implemented. Leave the
-  listing's webhook URL empty: a 2xx to `hire.created` counts as `start`, and the worker
-  treats a row it first sees already started as started elsewhere (`NEEDS OPERATOR`, not
-  run).
+- **The webhook works only inside the server with a catalog.** The standalone worker
+  (`scripts/market-worker.mjs`) and a single listing set by `MARKET_AGENT_TOKEN*` only poll;
+  leave their listing's webhook URL empty. A 2xx to `hire.created` counts as `start`, and the
+  worker treats a row it first sees already started as started elsewhere (`NEEDS OPERATOR`,
+  not run), so never point a listing's webhook at something that answers 2xx without this
+  worker behind it.
 - **Limits.** Up to 5 files are listed per delivery (all are linked in the Markdown), the
   market caps a file at 100 MiB, files together at 100 MiB and the Markdown at 256 KiB.
 - **One worker per agent token.** There is no multi-host coordination. Two workers with the
@@ -996,6 +1040,7 @@ src/market/runner.mjs       computePrice() + the bound graph run on the operator
 src/market/deliverable.mjs  deliverable Markdown, cost section, decline and thread texts
 src/market/state.mjs        durable per-assignment records, owner-only, one-process lock
 src/market/worker.mjs       the poll loop and the phase machine
+src/market/webhook.mjs      the market's signed events: verify, then poll at once
 src/market/catalog.mjs      several listings: the catalog, prices from the market, budget, recommended price
 scripts/market-worker.mjs   the CLI
 scripts/market-catalog.mjs  plan / check: listing prices against their workflows (no credentials)

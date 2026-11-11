@@ -569,6 +569,8 @@ async function main() {
     callTool = (params) => registry.callTool(params).then(({ costUsd, costExact, textOutput, ...r }) => r);
   }
 
+  // Filled in when the Agent Market worker has started (below); until then the route answers 503.
+  const marketWebhook = { handle: null };
   await serveHttp({
     host: serveHost,
     port: servePort,
@@ -584,6 +586,7 @@ async function main() {
     costs: registry.costs,
     outDir: resolvedOut,
     publicBase,
+    marketWebhook,
     log: (...a) => console.error(...a),
   });
   console.error(`nanoodle-mcp: MCP over HTTP on http://${serveHost}:${servePort}/mcp` +
@@ -604,7 +607,7 @@ async function main() {
   // NEAR Agent Market worker, inside this server: it pays NanoGPT exactly as the server
   // does (API key, or the Nano wallet through x402) and shares the wallet's one send queue.
   if (process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
-    await startMarketWorkerInServer({ apiKey, wallet });
+    await startMarketWorkerInServer({ apiKey, wallet, marketWebhook });
   }
 }
 
@@ -616,7 +619,7 @@ async function main() {
  * (MARKET_AGENTS_FILE, MARKET_PRICE_REFRESH_SECONDS, MARKET_AUTO_PRICE); and MARKET_STATE_DIR.
  * With a catalog, log lines name the listing ("[handle] …") and SIGTERM drains every listing.
  */
-async function startMarketWorkerInServer({ apiKey, wallet }) {
+async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook }) {
   const say = (line) => console.error("nanoodle-mcp: market worker: " + line);
   try {
     const [{ readConfig, startMarketService }, { logSafe }] = await Promise.all([
@@ -625,6 +628,8 @@ async function startMarketWorkerInServer({ apiKey, wallet }) {
     const env = apiKey ? { ...process.env, NANOGPT_API_KEY: apiKey } : { ...process.env, NANOGPT_API_KEY: "" };
     const cfg = readConfig([], env, { needKey: !wallet });
     const svc = await startMarketService(cfg, { payment: !cfg.apiKey && wallet ? wallet.payment : null, log: (l) => say(logSafe(l)) });
+    // The HTTP server is already listening; from here it passes the market's events on.
+    if (svc.webhook) marketWebhook.handle = svc.webhook;
     let stopping = false;
     const onSignal = (sig) => {
       if (stopping) process.exit(1);

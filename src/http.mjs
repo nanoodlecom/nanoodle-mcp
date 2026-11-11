@@ -47,6 +47,7 @@ import { workflowExample } from "./workflow-examples.mjs";
 import { MEDIA_EXTS } from "./sweep.mjs";
 
 const MAX_BODY = 32 * 1024 * 1024; // media inputs may ride inline as data: URLs
+const MARKET_WEBHOOK_MAX_BODY = 256 * 1024; // an Agent Market event: a brief of at most 10,000 characters plus a file list
 
 const OUT_MIME = {
   png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp",
@@ -641,6 +642,7 @@ export async function serveHttp({
   costs = {},
   outDir = null,
   publicBase,
+  marketWebhook = null,
   progressMs = 10_000,
   maxStreams = 4096,
   log = (...a) => console.error(...a),
@@ -678,6 +680,23 @@ export async function serveHttp({
           "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version",
         });
         return res.end();
+      }
+
+      // NEAR Agent Market events for the worker in this process (src/market/webhook.mjs).
+      // The handler is set once the worker has started; it checks the signature itself.
+      const hookMatch = url.pathname.match(/^\/market\/webhook\/([a-z][a-z0-9-]{2,29})$/);
+      if (hookMatch) {
+        if (req.method !== "POST") return send(405, JSON.stringify({ error: "POST only" }));
+        if (!marketWebhook || typeof marketWebhook.handle !== "function") return send(503, JSON.stringify({ error: "webhook not configured" }));
+        const chunks = [];
+        let len = 0;
+        for await (const c of req) {
+          len += c.length;
+          if (len > MARKET_WEBHOOK_MAX_BODY) return send(413, JSON.stringify({ error: "body too large" }));
+          chunks.push(c);
+        }
+        const r = await marketWebhook.handle(hookMatch[1], req.headers, Buffer.concat(chunks));
+        return send(r.status, r.body);
       }
 
       if (url.pathname === "/mcp") {

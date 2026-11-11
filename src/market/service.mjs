@@ -17,6 +17,7 @@ import { createMarketClient } from "./client.mjs";
 import { openMarketState } from "./state.mjs";
 import { createWorkflowRunner, checkNanoGptKey } from "./runner.mjs";
 import { createMarketWorker, logSafe } from "./worker.mjs";
+import { createWebhookHandler, secretFileReader } from "./webhook.mjs";
 import {
   readCatalog, fetchListingPrice, patchListingPrice, budgetFromPrice, recommendPrice, fmtUsd, usdMicros,
   PRICE_REFRESH_SECONDS, PROBE_BRIEF,
@@ -221,33 +222,49 @@ function readCatalogConfig(a, env, agentsFile, { needKey }) {
  * already in flight: they are paid for, and killing them would hand the jobs
  * back with a full refund after the model cost was spent. `done` resolves to
  * the exit code (0, or 1 after a fatal error); `stop()` ends polling the same way.
+ * `poke()` asks for a poll now, without waiting out the interval: it resolves when a
+ * poll that began after the call has finished (or at once when polling has ended).
  * @param {{ tick: () => Promise<void>, drain: () => Promise<void> }} worker
  * @param {{ close: () => void }} store
  * @param {{ pollMs: number, once?: boolean, log: (l: string) => void }} o
  */
 export function runLoop(worker, store, { pollMs, once = false, log }) {
   let stopping = false;
+  let ended = false;
   let wake = null;
+  let pokes = []; // resolvers of poke() calls not yet served by a poll
   const stop = () => { stopping = true; if (wake) wake(); };
+  const poke = () => (ended || stopping ? Promise.resolve() : new Promise((r) => { pokes.push(r); if (wake) wake(); }));
   const done = (async () => {
     let code = 0;
     try {
       while (!stopping) {
-        await worker.tick();
+        // Only the pokes made before this poll starts are served by it.
+        const served = pokes;
+        pokes = [];
+        try { await worker.tick(); } finally { for (const r of served) r(); }
         if (once) { await worker.drain(); await worker.tick(); await worker.drain(); break; }
-        await new Promise((r) => { wake = r; setTimeout(r, pollMs); });
-        wake = null;
+        if (!pokes.length && !stopping) {
+          let timer;
+          await new Promise((r) => { wake = r; timer = setTimeout(r, pollMs); });
+          clearTimeout(timer);
+          wake = null;
+        }
       }
+      ended = true;
+      for (const r of pokes.splice(0)) r();
       await worker.drain();
     } catch (e) {
       code = 1;
+      ended = true;
+      for (const r of pokes.splice(0)) r();
       log(`stopped: ${(e && e.message) || e}; no new polls, waiting for the runs in flight to finish`);
       try { await worker.drain(); } catch (e2) { log(`while waiting: ${(e2 && e2.message) || e2}`); }
     }
     try { store.close(); } catch { /* already closed */ }
     return code;
   })();
-  return { done, stop };
+  return { done, stop, poke };
 }
 
 
@@ -472,7 +489,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
     tick: async () => { if (worker) await worker.tick(); },
     drain: async () => { if (worker) await worker.drain(); },
   };
-  return { handle: agent.handle, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
+  return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
 }
 
 async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }) {
@@ -511,5 +528,15 @@ async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }
   const loops = listings.map((l) => runLoop(l.gate, l.store, { pollMs: cfg.pollMs, once: cfg.once, log: l.log }));
   const done = Promise.all(loops.map((x) => x.done)).then((codes) => { stopped = true; clearTimeout(timer); return Math.max(0, ...codes); });
   const stop = () => { stopped = true; clearTimeout(timer); for (const x of loops) x.stop(); };
-  return { done, stop, store: { close: closeAll }, listings };
+
+  // Push: the market's signed events make a listing poll at once (webhook.mjs). Only
+  // listings with a "webhookSecretFile" have an endpoint; the others are polled as before.
+  const hooked = new Map();
+  listings.forEach((l, i) => {
+    if (!l.webhookSecretFile) return;
+    hooked.set(l.handle, { secret: secretFileReader(l.webhookSecretFile), store: l.store, poke: loops[i].poke, active: l.active, log: l.log });
+  });
+  const webhook = hooked.size && !cfg.once ? createWebhookHandler({ listings: hooked }) : null;
+  if (webhook) log(`webhooks: ${[...hooked.keys()].join(", ")} also poll at once on a signed event at /market/webhook/<handle>`);
+  return { done, stop, store: { close: closeAll }, listings, webhook };
 }
