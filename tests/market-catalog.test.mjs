@@ -151,7 +151,15 @@ test("catalog validation: a malformed catalog is a MarketConfigError naming the 
     [{ agents: [{ ...ok, priceUsd: "1" }] }, /"priceUsd" must be a number above 0/],
     [{ agents: [{ ...ok, priceUsd: 0.01 }] }, /leaves no budget/],
     [{ agents: [{ ...ok, graph: "scripts/nope.json" }] }, /good-one.*cannot read it as JSON/],
-    [{ agents: [{ ...ok, graph: "scripts/market-sing.json" }] }, /2 named text nodes/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json" }] }, /3 named text nodes/],
+    [{ agents: [{ ...ok, fields: { Idea: { seconds: { min: 1, max: 2, defaultMin: 1, defaultMax: 2 } } } }] }, /"fields" names "Idea", which is not a named text input of the graph besides the brief's \(it has: none\)/],
+    [{ agents: [{ handle: "no-graph", tokenFile: "/x", custom: true, fields: {} }] }, /"fields" needs a "graph"/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json", input: "Song idea", fields: [] }] }, /"fields" must be an object/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json", input: "Song idea", fields: { Tempo: { seconds: { min: 1, max: 2, defaultMin: 1, defaultMax: 2 } } } }] }, /"fields" names "Tempo".*\(it has: Style, Duration\)/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json", input: "Song idea", fields: { Duration: { seconds: { min: 30, max: 240 } } } }] }, /field "Duration" must be \{ "seconds": \{ "min", "max", "defaultMin", "defaultMax" \} \} with whole seconds above 0/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json", input: "Song idea", fields: { Duration: { minutes: { min: 1, max: 2, defaultMin: 1, defaultMax: 2 } } } }] }, /field "Duration" must be/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json", input: "Song idea", fields: { Duration: { seconds: { min: 30, max: 240, defaultMin: 1.5, defaultMax: 240 } } } }] }, /with whole seconds above 0/],
+    [{ agents: [{ ...ok, graph: "scripts/market-sing.json", input: "Song idea", fields: { Duration: { seconds: { min: 30, max: 240, defaultMin: 120, defaultMax: 300 } } } }] }, /needs min <= defaultMin <= defaultMax <= max/],
     [{ agents: [{ ...ok, input: "Nope" }] }, /no text node with that name/],
   ];
   for (const [doc, re] of cases) {
@@ -186,6 +194,10 @@ test("the shipped catalog and its graph files load; each graph has one empty nam
     ["nanoodle-workflows", true, null, null],
   ]);
   for (const a of c.agents) assert.equal(a.tokenFile, `/etc/nanoodle-mcp/market-tokens/${a.handle}`);
+  // The song takes a Style and a typed Duration; no other listing has extra fields.
+  assert.deepEqual(c.agents[0].defaultWorkflow.fieldNames, ["Style", "Duration"]);
+  assert.deepEqual(c.agents[0].defaultWorkflow.fieldSpecs, { Duration: { seconds: { min: 30, max: 240, defaultMin: 120, defaultMax: 240 } } });
+  for (const a of c.agents.slice(1).filter((x) => x.defaultWorkflow)) { assert.deepEqual(a.defaultWorkflow.fieldNames, []); assert.equal(a.defaultWorkflow.fieldSpecs, undefined); }
   assert.equal(c.agents[4].priceUsd, 1);
   for (const a of c.agents.filter((x) => x.defaultWorkflow)) {
     const g = a.defaultWorkflow.graph;

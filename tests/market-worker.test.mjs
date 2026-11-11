@@ -469,3 +469,41 @@ test("a plain brief with a \"Style:\" line sets the workflow's Style input; the 
   assert.deepEqual(market.violations, []);
   store.close(); await market.close();
 });
+
+test("a typed Duration field: the buyer's length is used, none given picks one for the job, and the buyer is told either way", async () => {
+  const market = createMarketMock();
+  await market.listen();
+  const store = openMarketState({ dir: mkdtempSync(join(tmpdir(), "market-duration-")) });
+  const seen = [];
+  const pricing = { estimatedCostUsd: 0.001, fixedPrice: true, headroom: 1.25, depositUsd: 0.01, items: [], boundGraph: {} };
+  const runner = {
+    price: async (args) => { seen.push(args.inputs); return { ok: true, refusals: [], inputs: args.inputs, pricing }; },
+    run: async () => ({ costUsd: 0.001, costExact: true, notices: [], outputs: [{ key: "Lyrics", kind: "text", text: "la la" }] }),
+  };
+  const graph = { v: 1, name: "Idea to song", nodes: [{ id: "n1", type: "text", name: "Song idea", fields: { text: "" } }, { id: "n5", type: "text", name: "Style", fields: { text: "x" } }, { id: "n6", type: "text", name: "Duration", fields: { text: "180 seconds" } }], links: [] };
+  const worker = createMarketWorker({
+    client: createMarketClient({ baseUrl: market.url, token: MOCK_TOKEN }), store, runner, budgetUsd: 0.5, customWorkflows: false,
+    defaultWorkflow: { graph, inputName: "Song idea", label: "Idea to song", fieldNames: ["Style", "Duration"], fieldSpecs: { Duration: { seconds: { min: 30, max: 240, defaultMin: 120, defaultMax: 240 } } } },
+  });
+  const short = market.hire({ description: "A jingle for my bakery.\nDuration: 45 seconds\nStyle: cheerful ukulele" });
+  await worker.tick(); await worker.drain();
+  // Every pricing of this job (there may be more than one) saw the same inputs.
+  const mine = seen.filter((i) => i["Song idea"] === "A jingle for my bakery.");
+  assert.ok(mine.length >= 1);
+  for (const i of mine) assert.deepEqual(i, { "Song idea": "A jingle for my bakery.", Style: "cheerful ukulele", Duration: "45 seconds" });
+  const row = market.rows.get(short);
+  assert.equal(row.assignment.status, "submitted");
+  assert.match(row.messages.map((m) => m.body).join("\n"), /with your brief as its input and Style, Duration as you set them:.*Duration: aiming for about 45 seconds, as you asked\. The result/s);
+  assert.match(row.versions[0].markdown, /and Style, Duration as you set them \(1 output\)\. Duration: aiming for about 45 seconds, as you asked\. Files are attached/);
+  // None given: one length for the job (the same in both pricings), between 120 and 240, and said to the buyer.
+  const plain = market.hire({ description: "An upbeat birthday song for my mum." });
+  await worker.tick(); await worker.drain();
+  const picks = seen.filter((i) => i["Song idea"] === "An upbeat birthday song for my mum.").map((i) => i.Duration);
+  assert.ok(picks.length >= 1 && new Set(picks).size === 1, JSON.stringify(picks));
+  const n = parseInt(picks[0], 10);
+  assert.ok(n >= 120 && n <= 240 && picks[0] === `${n} seconds`, picks[0]);
+  const md = market.rows.get(plain).versions[0].markdown;
+  assert.match(md, new RegExp(`with your brief as the input \\(1 output\\)\\. Duration: none given, so it aims for about ${n} seconds \\(picked between 120 and 240\\)\\. Files`));
+  assert.deepEqual(market.violations, []);
+  store.close(); await market.close();
+});

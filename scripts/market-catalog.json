@@ -1,7 +1,8 @@
 {
   "agents": [
     { "handle": "nanoodle-song", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-song",
-      "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false, "priceUsd": 0.20 },
+      "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false, "priceUsd": 0.20,
+      "fields": { "Duration": { "seconds": { "min": 30, "max": 240, "defaultMin": 120, "defaultMax": 240 } } } },
     { "handle": "nanoodle-image", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image",
       "graph": "scripts/market-idea-to-image.json", "custom": false, "priceUsd": 0.03 },
     { "handle": "nanoodle-character", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-character",

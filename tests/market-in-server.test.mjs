@@ -159,11 +159,11 @@ test("notifications: which lines are sent, buyer text is escaped, a dead webhook
 
 test("the hosted song workflow: the brief goes to Song idea, Style is a settable field; the lyrics are delivered as well as the song", () => {
   const file = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "market-sing.json");
-  assert.throws(() => readDefaultWorkflow(file), (e) => e instanceof MarketConfigError && /2 named text nodes/.test(e.message));
+  assert.throws(() => readDefaultWorkflow(file), (e) => e instanceof MarketConfigError && /3 named text nodes/.test(e.message));
   const d = readDefaultWorkflow(file, "Song idea");
   assert.equal(d.label, "Idea to song");
   assert.equal(d.inputName, "Song idea");
-  assert.deepEqual(d.fieldNames, ["Style"]);
+  assert.deepEqual(d.fieldNames, ["Style", "Duration"]);
   const byName = Object.fromEntries(d.graph.nodes.filter((n) => n.name).map((n) => [n.name, n]));
   assert.equal(byName["Song idea"].fields.text, "");
   // With no "Style:" line the workflow picks a style itself; no band is named anywhere in the graph.
@@ -172,6 +172,16 @@ test("the hosted song workflow: the brief goes to Song idea, Style is a settable
   assert.doesNotMatch(JSON.stringify(d.graph), /Portishead|Massive Attack|Tricky/);
   assert.equal(byName["Idea + style"].fields.sep, "\n\nStyle:\n");
   assert.ok(d.graph.links.some((l) => l.from.node === byName.Style.id && l.to.node === byName["Idea + style"].id));
+  // Duration is a text input too: MiniMax Music 3 takes no length setting, so the target
+  // length reaches the lyric writer and the arranger as text, joined after idea and style.
+  assert.equal(byName.Duration.fields.text, "180 seconds");
+  const len = byName["Idea + style + length"];
+  assert.equal(len.fields.sep, "\n\nTarget length:\n");
+  assert.ok(d.graph.links.some((l) => l.from.node === byName["Idea + style"].id && l.to.node === len.id && l.to.port === "a"));
+  assert.ok(d.graph.links.some((l) => l.from.node === byName.Duration.id && l.to.node === len.id && l.to.port === "b"));
+  assert.ok(d.graph.links.some((l) => l.from.node === len.id && l.to.node === byName["Write lyrics"].id));
+  assert.ok(!d.graph.links.some((l) => l.from.node === byName["Idea + style"].id && l.to.node !== len.id), "idea + style is only read through the length join");
+  assert.ok(!("duration" in byName.Sing.fields), "no duration field is sent to the music model");
   assert.equal(byName.Sing.type, "music");
   // "Lyrics" is a sink (nothing reads it), so the engine returns it as an output.
   assert.equal(byName.Lyrics.type, "join");

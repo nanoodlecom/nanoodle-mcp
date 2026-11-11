@@ -34,7 +34,7 @@ export const PRICE_REFRESH_SECONDS = 600;
 /** The brief used to price a listing's own workflow: as long as a brief may be (the input cap), so the estimate is for the longest brief. */
 export const PROBE_BRIEF = "a lighthouse at dawn, ".repeat(1000).slice(0, 20_000);
 
-const AGENT_KEYS = new Set(["handle", "tokenFile", "graph", "input", "custom", "priceUsd"]);
+const AGENT_KEYS = new Set(["handle", "tokenFile", "graph", "input", "custom", "priceUsd", "fields"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const die = (msg) => { throw new MarketConfigError(msg); };
 
@@ -157,6 +157,20 @@ export function readCatalog(file, { root = REPO_ROOT } = {}) {
         if (!(e instanceof MarketConfigError)) throw e;
         bad(`${where}: ${e.message.replace(/--default-graph |--default-input /g, "")}`);
       }
+    }
+    if (a.fields !== undefined) {
+      if (!a.fields || typeof a.fields !== "object" || Array.isArray(a.fields)) bad(`${where}: "fields" must be an object { "<input name>": { "seconds": { … } } }`);
+      if (!defaultWorkflow) bad(`${where}: "fields" needs a "graph"`);
+      for (const [name, spec] of Object.entries(a.fields)) {
+        if (!defaultWorkflow.fieldNames.includes(name)) bad(`${where}: "fields" names ${JSON.stringify(name)}, which is not a named text input of the graph besides the brief's (it has: ${defaultWorkflow.fieldNames.join(", ") || "none"})`);
+        const s = spec && typeof spec === "object" && !Array.isArray(spec) && Object.keys(spec).length === 1 ? spec.seconds : null;
+        const ints = s && typeof s === "object" ? ["min", "max", "defaultMin", "defaultMax"].map((k) => s[k]) : [];
+        if (ints.length !== 4 || !ints.every((n) => Number.isInteger(n) && n > 0) || Object.keys(s).length !== 4) {
+          bad(`${where}: field ${JSON.stringify(name)} must be { "seconds": { "min", "max", "defaultMin", "defaultMax" } } with whole seconds above 0`);
+        }
+        if (!(s.min <= s.defaultMin && s.defaultMin <= s.defaultMax && s.defaultMax <= s.max)) bad(`${where}: field ${JSON.stringify(name)} needs min <= defaultMin <= defaultMax <= max`);
+      }
+      defaultWorkflow = { ...defaultWorkflow, fieldSpecs: a.fields };
     }
     return { handle: a.handle, tokenFile: a.tokenFile, graphFile, input: defaultWorkflow ? defaultWorkflow.inputName : null, custom, priceUsd: a.priceUsd ?? null, defaultWorkflow };
   });
