@@ -255,6 +255,20 @@ export function createMarketWorker({
       }));
     }
     log(`assignment ${short(rec.id)}: run finished — actual cost ${run.costUsd == null ? "not reported" : `$${run.costUsd}`}${run.costExact ? "" : " (lower bound)"}`);
+    // A run whose every output is empty text is not a result to charge for (seen live:
+    // a reasoning model that spends its whole maxTokens thinking returns ""). The buyer
+    // is refunded; the model cost is the operator's. A run with no outputs at all (a gate
+    // skipped them) is still delivered as before.
+    if (run.outputs.length > 0 && run.outputs.every((o) => o.kind === "text" && !String(o.text || "").trim())) {
+      log(`assignment ${short(rec.id)}: run failed (every output is empty text); handing it back`);
+      return set(rec.id, ok({
+        phase: "declining", outcome: "run_failed", runFinishedAt: now(), run: { error: "every output is empty text", costUsd: run.costUsd },
+        decline: {
+          reason: "failed", code: "EMPTY_RESULT",
+          detail: failureDeclineDetail("failed", "the workflow finished but every output was empty text. A reasoning model can spend its whole maxTokens thinking: raise maxTokens or set \"reasoningEffort\": \"low\" on the llm node."),
+        },
+      }));
+    }
     return set(rec.id, ok({ phase: "delivering", outcome: "ran", runFinishedAt: now(), run, uploads: {} }));
   }
 

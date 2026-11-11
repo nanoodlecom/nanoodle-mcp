@@ -26,7 +26,7 @@ export const BRIEF_KEYS = Object.freeze(["graph", "url", "inputs"]);
 /** The shortest correct brief, for decline messages and the listing description. */
 export const BRIEF_TEMPLATE = [
   "```nanoodle",
-  '{ "graph": { "v": 1, "nodes": [ { "id": "n1", "type": "text", "name": "Idea", "fields": { "text": "" } }, { "id": "n2", "type": "llm", "fields": { "model": "z-ai/glm-5.3-flash", "maxTokens": 400 } } ], "links": [ { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n2", "port": "prompt" } } ] },',
+  '{ "graph": { "v": 1, "nodes": [ { "id": "n1", "type": "text", "name": "Idea", "fields": { "text": "" } }, { "id": "n2", "type": "llm", "fields": { "model": "z-ai/glm-5.3-flash", "reasoningEffort": "low", "maxTokens": 400 } } ], "links": [ { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n2", "port": "prompt" } } ] },',
   '  "inputs": { "Idea": "a lighthouse at dawn" } }',
   "```",
 ].join("\n");

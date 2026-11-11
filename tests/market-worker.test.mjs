@@ -403,3 +403,32 @@ test("operator-side failures are told apart, and a rejected NanoGPT key is caugh
   assert.equal((await checkNanoGptKey({ apiKey: "k", fetch: answer(404) })).ok, true, "an unknown status does not block start-up");
   assert.equal((await checkNanoGptKey({ apiKey: "k", fetch: async () => { throw new TypeError("fetch failed"); } })).ok, true);
 });
+
+test("a run whose every output is empty text is handed back with a refund; one real output is still delivered", async () => {
+  const market = createMarketMock();
+  await market.listen();
+  const store = openMarketState({ dir: mkdtempSync(join(tmpdir(), "market-empty-")) });
+  const pricing = { estimatedCostUsd: 0.001, fixedPrice: true, headroom: 1.25, depositUsd: 0.01, items: [], boundGraph: {} };
+  let outputs = [{ key: "LLM", kind: "text", text: "" }, { key: "Other", kind: "text", text: "  \n" }];
+  const runner = {
+    price: async () => ({ ok: true, refusals: [], inputs: {}, pricing }),
+    run: async () => ({ costUsd: 0.0001, costExact: true, notices: [], outputs }),
+  };
+  const logs = [];
+  const worker = createMarketWorker({ client: createMarketClient({ baseUrl: market.url, token: MOCK_TOKEN }), store, runner, budgetUsd: 0.5, log: (l) => logs.push(l) });
+  const empty = market.hire({ description: WORKED() });
+  await worker.tick(); await worker.drain();
+  const a = market.rows.get(empty).assignment;
+  assert.equal(a.status, "cancelled");
+  assert.equal(a.cancelReason, "failed");
+  assert.match(a.cancelDetail, /every output was empty text.*reasoningEffort.*You are refunded in full/s);
+  assert.equal(store.get(empty).decline.code, "EMPTY_RESULT");
+  assert.ok(logs.some((l) => /run failed \(every output is empty text\); handing it back/.test(l)));
+  // One non-empty output beside an empty one is a result: delivered.
+  outputs = [{ key: "LLM", kind: "text", text: "" }, { key: "Haiku", kind: "text", text: "pale light on the rocks" }];
+  const partial = market.hire({ description: WORKED() });
+  await worker.tick(); await worker.drain();
+  assert.equal(market.rows.get(partial).assignment.status, "submitted");
+  assert.deepEqual(market.violations, []);
+  store.close(); await market.close();
+});

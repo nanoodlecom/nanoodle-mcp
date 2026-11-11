@@ -59,7 +59,7 @@ Please draw this for me.
     "v": 1,
     "nodes": [
       { "id": "n1", "type": "text",  "name": "Idea", "fields": { "text": "" } },
-      { "id": "n2", "type": "llm",   "fields": { "model": "z-ai/glm-5.3-flash", "maxTokens": 400,
+      { "id": "n2", "type": "llm",   "fields": { "model": "z-ai/glm-5.3-flash", "reasoningEffort": "low", "maxTokens": 400,
           "system": "Write one vivid image prompt for the idea. Reply with the prompt only." } },
       { "id": "n3", "type": "image", "fields": { "model": "blackforestlabs/flux-3/klein/text-to-image", "size": "1024x1024" } }
     ],
@@ -142,6 +142,7 @@ with the job brief embedded):
 | NanoGPT catalog unreachable | retries with backoff; nothing is sent to the market | nothing yet |
 | Accepted | `POST /v1/assignments/{id}/start`, one message on the thread, one progress report, runs the priced graph once, uploads media (`POST /v1/files` → PUT → `POST /v1/files/{id}/complete`), `POST /v1/assignments/{id}/submit` | a "Started" message with the estimated model cost, the number of paid steps and the per-job budget; then the deliverable |
 | Run fails | decline `reason: "failed"` | the provider's error for the failing step (any other error, such as a local disk error, is only logged for the operator: the buyer reads "The workflow run failed."), and a full refund; the model cost is the operator's |
+| Run finishes but every output is empty text (`EMPTY_RESULT`) | decline `reason: "failed"` | "the workflow finished but every output was empty text", with the hint to raise `maxTokens` or set `"reasoningEffort": "low"`; full refund. A reasoning model can spend its whole `maxTokens` thinking and return nothing. |
 | Worker restarted while the run was in flight | decline `reason: "failed"`; the run is **never** repeated | "the worker restarted while your workflow was running…"; full refund |
 | Already started when this state directory first sees it (another worker, or a lost or different `--state-dir`) | nothing: the record goes to `stuck` and the log says `NEEDS OPERATOR`; the workflow is **not** run | whatever the other worker did; the operator delivers or declines by hand |
 | Buyer requests changes, or a dispute ruling sends the job back | one message saying a hire buys one run, then the same result is submitted again (marked as resubmitted) | the explanation; to run a changed workflow, hire again |
@@ -457,7 +458,8 @@ Time: a few minutes after the job is picked up.
 
 Based on "Neon shrine duel" from awesome-noodles (MIT licence), with neutral prompts.
 
-Not included: attached images or videos are not read; no sound; one clip per hire. A
+Not included: attached images or videos are not read; one clip per hire. The video model adds
+its own sound to the clip; you cannot choose it. A
 nanoodle workflow block in the brief is declined (refunded in full). A run that fails is
 refunded in full.
 ```
@@ -483,7 +485,7 @@ What to send: one code block tagged `nanoodle` holding
 `{ "graph": {…} | "url": "<nanoodle share link with #g=…>", "inputs": { "<name>": "<text>" } }`.
 
 ```nanoodle
-{ "graph": { "v": 1, "nodes": [ { "id": "n1", "type": "text", "name": "Idea", "fields": { "text": "" } }, { "id": "n2", "type": "llm", "fields": { "model": "z-ai/glm-5.3-flash", "maxTokens": 400 } } ], "links": [ { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n2", "port": "prompt" } } ] },
+{ "graph": { "v": 1, "nodes": [ { "id": "n1", "type": "text", "name": "Idea", "fields": { "text": "" } }, { "id": "n2", "type": "llm", "fields": { "model": "z-ai/glm-5.3-flash", "reasoningEffort": "low", "maxTokens": 400 } } ], "links": [ { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n2", "port": "prompt" } } ] },
   "inputs": { "Idea": "a lighthouse at dawn" } }
 ```
 
