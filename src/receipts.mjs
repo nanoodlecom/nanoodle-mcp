@@ -106,16 +106,16 @@ export const RECEIPTS_CSS = `
   .receipts .lead{color:var(--muted);text-align:center;max-width:38rem;margin:0 auto 1.3rem;text-wrap:pretty}
   .receipts a.hero,.receipts a.note,.receipts a.guide{color:inherit;text-decoration:none}
   .receipts a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
-  .hero{display:grid;grid-template-columns:minmax(0,1.18fr) minmax(0,.92fr);background:var(--card);border:1px solid var(--accent);border-radius:16px;overflow:hidden;box-shadow:0 0 28px rgba(45,212,191,.16)}
+  .hero{display:grid;grid-template-columns:minmax(0,1.18fr) minmax(0,.92fr);background:var(--card);border:1px solid var(--accent);border-radius:16px;overflow:hidden;box-shadow:0 0 28px rgba(124,140,255,.18)}
   .hero:hover .cta{filter:brightness(1.08)}
-  .shot{position:relative;display:block;min-height:220px;background:#0b1016}
+  .shot{position:relative;display:block;min-height:220px;background:#0b0d12}
   .shot img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
   .copy{padding:1.15rem 1.2rem 1.25rem;display:flex;flex-direction:column;align-items:flex-start;gap:.5rem;min-width:0}
   .meta{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;font-size:.84rem}
   .hero h3{margin:0;font-size:clamp(1.15rem,2vw,1.38rem);line-height:1.28;letter-spacing:-.02em;text-wrap:balance}
   .copy p{margin:0;color:var(--muted);font-size:.92rem}
-  .receipts .chip{background:rgba(45,212,191,.13);color:#5eead4;border:1px solid rgba(45,212,191,.28)}
-  .cta{display:inline-block;margin-top:.2rem;font-weight:700;font-size:.92rem;line-height:1.2;padding:.5rem .95rem;border-radius:10px;background:var(--accent);color:#04201d}
+  .receipts .chip{background:rgba(124,140,255,.14);color:#a9b6ff;border:1px solid rgba(124,140,255,.30)}
+  .cta{display:inline-block;margin-top:.2rem;font-weight:700;font-size:.92rem;line-height:1.2;padding:.5rem .95rem;border-radius:10px;background:var(--accent);color:#0b0d12}
   .cols{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,.9fr);gap:1.6rem 1.75rem;margin-top:1.35rem}
   .cols h3{font-size:.98rem;font-weight:600;margin:0 0 .3rem}
   .cols h3 .muted{font-weight:500}
@@ -125,7 +125,7 @@ export const RECEIPTS_CSS = `
   .note .what,.guide .title{min-width:0}
   .note .title,.guide .title{font-weight:600;line-height:1.35}
   .note .chip{justify-self:end}
-  .note:hover,.guide:hover{background:rgba(45,212,191,.05)}
+  .note:hover,.guide:hover{background:rgba(124,140,255,.05)}
   .note:hover .title,.guide:hover .title{color:var(--accent)}
   .guide{grid-template-columns:3.25rem minmax(0,1fr) auto;column-gap:.65rem;align-items:center}
   .guide .arr{color:var(--accent)}

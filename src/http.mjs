@@ -65,6 +65,8 @@ const ASSETS = {
   "/apple-touch-icon.png": "image/png",
   "/icon-512.png": "image/png",
   "/og.jpg": "image/jpeg",
+  "/righteous-latin.woff2": "font/woff2",
+  "/righteous-latin-ext.woff2": "font/woff2",
 };
 const ICON_LINKS =
   `<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">` +
@@ -112,49 +114,71 @@ const PAGE_CSS = `
  * its job is a first impression, and the hero is one copyable command.
  */
 const LANDING_CSS = `
-  :root{--fg:#e6edf3;--bg:#0d1117;--muted:#8b949e;--card:#161b22;--edge:#2a313a;--accent:#2dd4bf}
+  /* Brand: nanoodle's own tokens (nanoodle.com :root) — same bg/panel/ink/line,
+     periwinkle accent with the pink gradient end, port colours on the chips,
+     Righteous for the wordmark and headings, and the editor canvas's dot grid
+     behind the page. The 255labs touch is confined to the footer lockup:
+     Signal #d7ff3f on Ink, set in Space Grotesk per branding.255labs.xyz. */
+  @font-face{font-family:'Righteous';font-style:normal;font-weight:400;font-display:swap;
+    src:url(/righteous-latin.woff2) format('woff2');
+    unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+  @font-face{font-family:'Righteous';font-style:normal;font-weight:400;font-display:swap;
+    src:url(/righteous-latin-ext.woff2) format('woff2');
+    unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+  :root{color-scheme:dark;--fg:#eef1f7;--bg:#0b0d12;--muted:#aeb7c8;--card:#12151d;--card2:#171b25;--edge:#262c3a;
+    --accent:#7c8cff;--accent-ink:#a9b6ff;--accent2:#ff79c6;--signal:#d7ff3f;--labs-ink:#101110;--paper:#f1f2ea}
   *{box-sizing:border-box}
-  body{margin:0;font:16px/1.55 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+  ::selection{background:rgba(124,140,255,.35)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  body{margin:0;font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:var(--bg);
+    background-image:radial-gradient(rgba(174,183,200,.05) 1px,transparent 1.3px);background-size:24px 24px}
   main{max-width:56rem;margin:0 auto;padding:1.25rem 1rem 3rem}
-  a{color:var(--accent)}
-  code{font:.85em/1.5 ui-monospace,monospace;background:rgba(139,148,158,.14);border-radius:6px;padding:.1rem .35rem;word-break:break-all}
-  pre{font:.85rem/1.5 ui-monospace,monospace;background:rgba(139,148,158,.14);border-radius:6px;padding:.75rem 1rem;overflow-x:auto}
+  a{color:var(--accent-ink)}
+  a:hover{color:var(--accent2)}
+  code{font:.85em/1.5 ui-monospace,monospace;background:rgba(124,140,255,.10);border-radius:6px;padding:.1rem .35rem;word-break:break-all}
+  pre{font:.85rem/1.5 ui-monospace,monospace;background:rgba(124,140,255,.10);border-radius:6px;padding:.75rem 1rem;overflow-x:auto}
   .muted{color:var(--muted);font-size:.9rem}
-  .top{display:flex;align-items:baseline;gap:.75rem;padding-bottom:2rem}
+  .top{display:flex;align-items:baseline;gap:.75rem;padding-bottom:1.1rem;border-bottom:1px solid var(--edge)}
   .top .v{color:var(--muted);font-size:.85rem}
   .top nav{margin-left:auto;display:flex;gap:1rem;font-size:.9rem}
   .top nav a{color:var(--muted);text-decoration:none}
   .top nav a:hover{color:var(--fg)}
-  .brand{font-weight:700;font-size:1.05rem;color:var(--fg);text-decoration:none;display:inline-flex;align-items:center;gap:.5rem}
+  .brand{font-family:"Righteous",ui-sans-serif,system-ui,sans-serif;font-weight:400;font-size:1.3rem;color:var(--fg);text-decoration:none;display:inline-flex;align-items:center;gap:.5rem}
   .brand img{width:22px;height:22px;border-radius:6px;display:block}
-  .eyebrow{color:var(--accent);font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;text-align:center;margin:1.5rem 0 .6rem}
-  h1{font-size:clamp(2rem,6vw,3rem);margin:0;text-align:center;letter-spacing:-.02em}
+  .brand .bname{background:linear-gradient(90deg,#67e8f9,#7c8cff 70%);-webkit-background-clip:text;background-clip:text;
+    color:transparent;font-weight:900;filter:drop-shadow(0 0 9px #7c8cff77);white-space:nowrap}
+  @media (max-width:600px){.top{flex-wrap:wrap}.top nav{margin-left:0}}
+  .eyebrow{color:var(--accent-ink);font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;text-align:center;margin:1.5rem 0 .6rem}
+  h1{font-family:"Righteous",ui-sans-serif,system-ui,sans-serif;font-weight:400;font-size:clamp(2.1rem,6vw,3.1rem);margin:0;text-align:center;letter-spacing:.01em}
   .sub{color:var(--muted);text-align:center;margin:.75rem auto 2rem;max-width:40rem}
   .connect-wrap{display:flex;flex-direction:column;gap:.65rem}
   .tabs{display:flex;justify-content:center;gap:.35rem}
   .tabs .tab{font:inherit;font-size:.8rem;padding:.35rem .85rem;border-radius:999px;border:1px solid var(--edge);
     background:transparent;color:var(--muted);cursor:pointer}
-  .tabs .tab:hover{border-color:var(--accent);color:var(--fg)}
-  .tabs .tab.on{border-color:var(--accent);background:rgba(45,212,191,.12);color:var(--accent)}
+  .tabs .tab:hover{border-color:#3a425a;color:var(--fg)}
+  .tabs .tab.on{border-color:var(--accent);background:rgba(124,140,255,.14);color:var(--accent-ink)}
   .connect{display:flex;align-items:center;gap:1rem;background:var(--card);border:1px solid var(--accent);
-    border-radius:14px;box-shadow:0 0 28px rgba(45,212,191,.16);padding:1rem 1.25rem}
-  .connect pre{margin:0;padding:0;background:none;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:hidden;font-size:.95rem;color:var(--accent)}
-  button{font:inherit;font-size:.85rem;padding:.4rem .9rem;border-radius:8px;border:1px solid var(--edge);
-    background:var(--card);color:var(--fg);cursor:pointer;flex:none}
-  button:hover{border-color:var(--accent)}
+    border-radius:.8rem;box-shadow:0 0 28px rgba(124,140,255,.18);padding:1rem 1.25rem}
+  .connect pre{margin:0;padding:0;background:none;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:hidden;font-size:.95rem;color:var(--accent-ink)}
+  button{font:inherit;font-size:.85rem;padding:.4rem .9rem;border-radius:.5rem;border:1px solid var(--edge);
+    background:var(--card2);color:var(--fg);cursor:pointer;flex:none}
+  button:hover{border-color:#3a425a}
+  .connect button{background:linear-gradient(90deg,var(--accent),var(--accent2));border:none;color:#0b0d12;font-weight:700}
+  .connect button:hover{border-color:transparent;filter:brightness(1.08)}
   .hint{color:var(--muted);font-size:.85rem;text-align:center;margin:.75rem 0 2.25rem}
   .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));gap:1rem;margin-bottom:2.25rem}
-  .step{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1rem 1.1rem}
-  .step .n{display:inline-block;background:rgba(45,212,191,.14);color:var(--accent);border-radius:6px;
+  .step{background:var(--card);border:1px solid var(--edge);border-radius:.6rem;padding:1rem 1.1rem}
+  .step .n{display:inline-block;background:rgba(124,140,255,.15);color:var(--accent-ink);border-radius:.4rem;
     font:600 .78rem/1 ui-monospace,monospace;padding:.3rem .45rem;margin-right:.5rem}
   .step p{margin:.6rem 0 0;color:var(--muted);font-size:.85rem}
   .flow{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:.6rem;background:var(--card);
-    border:1px solid var(--edge);border-radius:12px;padding:.9rem 1rem;font:.85rem/1.5 ui-monospace,monospace}
-  .flow .arr{color:var(--accent)}
+    border:1px solid var(--edge);border-radius:.6rem;padding:.9rem 1rem;font:.85rem/1.5 ui-monospace,monospace}
+  .flow .arr{color:var(--accent2)}
   .tagline{text-align:center;color:var(--muted);font-size:.9rem;margin:.75rem 0 0}
-  h2{font-size:1.15rem;margin:2.5rem 0 .5rem}
+  h2{font-family:"Righteous",ui-sans-serif,system-ui,sans-serif;font-weight:400;font-size:1.35rem;letter-spacing:.01em;margin:2.5rem 0 .5rem}
   .tools{display:grid;grid-template-columns:repeat(auto-fill,minmax(19rem,1fr));gap:1rem;padding:0;margin:1rem 0 0;list-style:none}
-  .tool{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column}
+  .tool{background:var(--card);border:1px solid var(--edge);border-radius:.6rem;padding:1rem 1.1rem;display:flex;flex-direction:column}
+  .tool:hover{border-color:#3a425a}
   .tool p{margin:.5rem 0}
   .tool .links{font-size:.85rem;white-space:nowrap}
   .tool .thead{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem}
@@ -163,22 +187,28 @@ const LANDING_CSS = `
   .tool .intent{color:var(--muted);font-size:.88rem;margin:.45rem 0 .7rem}
   .chain{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .35rem;margin:0 0 .8rem}
   .chain .arr{color:var(--muted);font-size:.75rem}
-  .chip{font:.72rem/1 ui-monospace,monospace;padding:.28rem .45rem;border-radius:7px;background:rgba(139,148,158,.14);color:#9aa4ae;white-space:nowrap}
-  .chip.k-text{background:rgba(167,139,250,.14);color:#c4b5fd}
-  .chip.k-llm{background:rgba(45,212,191,.13);color:#5eead4}
-  .chip.k-image{background:rgba(251,191,36,.12);color:#fcd34d}
-  .chip.k-video{background:rgba(251,113,133,.13);color:#fda4af}
-  .chip.k-audio{background:rgba(74,222,128,.12);color:#86efac}
+  .chip{font:.72rem/1 ui-monospace,monospace;padding:.28rem .45rem;border-radius:7px;background:rgba(174,183,200,.12);color:#aeb7c8;white-space:nowrap}
+  .chip.k-text{background:rgba(124,140,255,.15);color:#a9b6ff}
+  .chip.k-llm{background:rgba(167,139,250,.15);color:#c4b5fd}
+  .chip.k-image{background:rgba(255,121,198,.13);color:#ffa9dc}
+  .chip.k-video{background:rgba(90,209,230,.13);color:#8fe3f2}
+  .chip.k-audio{background:rgba(61,220,151,.13);color:#7fe7b6}
   .tool .tfoot{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.25rem .75rem;margin-top:auto}
   .tool .cost{font:.75rem/1.4 ui-monospace,monospace;color:var(--muted);white-space:nowrap}
   .tool .example{border-top:1px solid var(--edge);margin-top:1rem;padding-top:.5rem;font-size:.85rem}
   .tool .example img{display:block;width:100%;height:auto;border-radius:8px;margin:.6rem 0}
   .tool .sample{font-size:.85rem;border-top:1px solid var(--edge);margin:.7rem 0;padding-top:.7rem}
-  .tool .sample summary{cursor:pointer;color:var(--accent)}
+  .tool .sample summary{cursor:pointer;color:var(--accent-ink)}
   .tool .sample pre{white-space:pre-wrap;overflow-wrap:anywhere}
-  .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:1.25rem 1.4rem;margin-top:1rem}
+  .card{background:var(--card);border:1px solid var(--edge);border-radius:.6rem;padding:1.25rem 1.4rem;margin-top:1rem}
   .card h2{margin-top:0}
   footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--edge);color:var(--muted);font-size:.85rem;text-align:center}
+  .labs{display:flex;align-items:center;justify-content:center;gap:.6rem;margin-top:1.15rem}
+  .labs .ff{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;
+    background:var(--signal);color:var(--labs-ink);border-radius:6px;
+    font:700 .92rem/1 "Space Grotesk",ui-sans-serif,system-ui,sans-serif;letter-spacing:.02em}
+  .labs .lname{font:600 1rem/1 "Space Grotesk",ui-sans-serif,system-ui,sans-serif;color:var(--paper)}
+  .labs .ltag{font:.78rem/1 ui-monospace,monospace;color:var(--muted)}
   ${RECEIPTS_CSS}
 `;
 
@@ -295,7 +325,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
     <header class="top">
-      <a class="brand" href="/"><img src="/favicon.png" alt="">${esc(name)}</a><span class="v">v${esc(version)}</span>
+      <a class="brand" href="/"><img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span></a><span class="v">v${esc(version)}</span>
       <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
     </header>
     <p class="eyebrow">public MCP server</p>
@@ -385,7 +415,9 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
     </div>
-    <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a></footer>
+    <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a>
+      <div class="labs"><span class="ff" aria-hidden="true">FF</span><span class="lname">255labs</span><span class="ltag">Full signal. Zero noise. · 0xFF</span></div>
+    </footer>
     <script>
       const CMDS = ${JSON.stringify(cmds)};
       function selectClient(btn){
