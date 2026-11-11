@@ -79,9 +79,10 @@ const short = (id) => String(id).slice(0, 8);
  * @param {Map<string, { secret: { read: () => string|null, problem: () => string|null }, store: { get: (id: string) => object|null },
  *        poke: () => Promise<void>, active: () => boolean, log: (line: string) => void }>} o.listings  by handle
  * @param {number} [o.waitMs]  how long a `hire.created` waits for the poll before answering 503
+ * @param {() => number} [o.now]
  * @returns {(handle: string, headers: object, rawBody: Buffer) => Promise<{ status: number, body: string }>}
  */
-export function createWebhookHandler({ listings, waitMs = 8_000 }) {
+export function createWebhookHandler({ listings, waitMs = 8_000, now = Date.now }) {
   const said = new Map(); // handle → the last problem logged, so a retried event does not repeat it
   const once = (handle, log, line) => { if (said.get(handle) !== line) { said.set(handle, line); log(line); } };
 
@@ -109,11 +110,16 @@ export function createWebhookHandler({ listings, waitMs = 8_000 }) {
         once(handle, l.log, "webhook: hired, but this listing is off (no price); answered 503 so the job is not marked started");
         return reply(503, { error: "listing is not taking jobs" });
       }
+      const arrived = now();
       let timer;
       const timeout = new Promise((r) => { timer = setTimeout(r, waitMs); });
       try { await Promise.race([l.poke(), timeout]); } catch { /* answered below */ } finally { clearTimeout(timer); }
       if (l.store.get(id)) {
         said.delete(handle);
+        // The market's own stamp shows how long the event was on its way; the rest is this server's poll.
+        const sentAgo = Math.round(arrived / 1000 - Number(headers["x-market-timestamp"]));
+        l.log(`webhook: assignment ${short(id)}: hire event acknowledged ${now() - arrived} ms after it arrived` +
+          (Number.isFinite(sentAgo) && Math.abs(sentAgo) < 86_400 ? ` (the market stamped it ${sentAgo} s before that)` : ""));
         return reply(200, { ok: true });
       }
       once(handle, l.log, `webhook: assignment ${short(id)} was not on the market's list yet; answered 503, the market sends the event again`);
