@@ -18,8 +18,8 @@ import { readCatalog, fetchListingPrice, priceVerdict, recommendPrice, budgetFro
 
 const USAGE = `Usage: node scripts/market-catalog.mjs plan|check [--agents-file <file>] [--base-url <url>] [--nanogpt-base <url>]
 
-  plan    for each listing with a workflow: estimated cost, deposit (the most a run can cost),
-          the recommended price (smallest multiple of $0.05 whose 95% covers the deposit),
+  plan    for each listing with a workflow: estimated cost, estimated cost + 20%,
+          the recommended price (smallest whole-cent price whose 95% covers cost + 20%),
           the market's current price when it can be read, and a verdict. Exits 0.
   check   the same, and exits 1 if any listing's price is too low for its own workflow.
 
@@ -55,7 +55,7 @@ export async function plan({ file, baseUrl, nanogptBase, out = (l) => process.st
     }
     const v = priceVerdict({ priceUsd: priceUsd ?? null, depositUsd: r.pricing.depositUsd });
     out(`  estimated cost  $${r.pricing.estimatedCostUsd.toFixed(6)}`);
-    out(`  deposit         $${fmtUsd(r.pricing.depositUsd)} (the most a run can cost)`);
+    out(`  cost + 20%      $${fmtUsd(r.pricing.depositUsd)} (what the payout must cover)`);
     out(`  recommended     $${fmtUsd(recommendPrice({ depositUsd: r.pricing.depositUsd }))}`);
     out(`  price           ${priceLine}`);
     out(`  verdict         ${v.text}`);

@@ -2,7 +2,7 @@
  * The Markdown deliverable and the buyer-facing messages for a market job.
  *
  * The cost section uses the pricing vocabulary of docs/near-payments.md
- * (estimated cost, itemized per paid node; deposit; actual cost) through the
+ * (estimated cost, itemized per paid node; actual cost) through the
  * formatters in src/custom-workflow.mjs, so a buyer reads the same terms here
  * as from price_noodle.
  */
@@ -58,7 +58,7 @@ export function costLines(p, run, { budgetUsd, listingPriceUsd = null } = {}) {
   if (p.items.length) for (const i of p.items) lines.push(`- ${mdEscape(i.node)} (${mdEscape(i.model)}): $${estUsd(i.usd)} — ${mdEscape(i.basis)}`);
   else lines.push("- no paid model steps");
   lines.push(`- Total estimated cost: $${estUsd(p.estimatedCostUsd)}`);
-  lines.push(`- Deposit: $${exactUsd(p.depositUsd)}, the most this run could cost (estimated cost + 20%, × ${p.headroom === 1.25 ? "1.25 because every model here has a fixed price" : "2 because text, video and audio steps bill by what they produce"}, rounded up to the cent), checked against this agent's per-job budget of $${exactUsd(budgetUsd)} before the job was started.`);
+  lines.push(`- Estimated cost + 20%: $${exactUsd(p.depositUsd)} (rounded up to the cent), checked against this agent's per-job budget of $${exactUsd(budgetUsd)} before the job was started.`);
   lines.push("");
   lines.push(actualCostLine(run));
   return lines;
@@ -112,7 +112,7 @@ export function buildDeliverable({ record, files, budgetUsd, listingPriceUsd = n
         fixedPrice: p.fixedPrice,
         items: p.items.map((i) => ({ ...i, usd: estUsd(i.usd) })),
       },
-      deposit: { usd: exactUsd(p.depositUsd), headroom: p.headroom === 1.25 ? "1.25" : "2", budgetUsd: exactUsd(budgetUsd) },
+      budget: { neededUsd: exactUsd(p.depositUsd), rule: "estimated cost + 20%, rounded up to the cent", budgetUsd: exactUsd(budgetUsd) },
       actualCost: { usd: run.costUsd == null ? null : exactUsd(run.costUsd), exact: !!run.costExact, reportedBy: "NanoGPT" },
       outputs: run.outputs.map((o) => (o.kind === "text"
         ? { key: o.key, kind: "text", chars: o.text.length }
@@ -170,7 +170,7 @@ export function startedMessage(p, { budgetUsd, defaultLabel = null }) {
   const which = defaultLabel
     ? `Your brief has no workflow block, so this agent's default workflow (${mdEscape(defaultLabel)}) runs once now with your brief as its input:`
     : "Your workflow passed the safety checks and runs once now:";
-  return `Started. ${which} estimated model cost $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"}, at most $${exactUsd(p.depositUsd)} (this agent's per-job budget is $${exactUsd(budgetUsd)}). The result and an itemized cost report follow as the delivery.`;
+  return `Started. ${which} estimated model cost $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"} (this agent's per-job budget is $${exactUsd(budgetUsd)}). The result and an itemized cost report follow as the delivery.`;
 }
 
 /** The thread message when the buyer asks for changes (or a dispute redo sends the job back). */

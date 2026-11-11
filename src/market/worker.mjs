@@ -66,7 +66,7 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  * @param {object} o.client       createMarketClient()
  * @param {object} o.store        openMarketState()
  * @param {object} o.runner       createWorkflowRunner()
- * @param {number} o.budgetUsd    per-job budget (also the runner's deposit cap)
+ * @param {number} o.budgetUsd    per-job budget (the most a job's estimated cost + 20% may be)
  * @param {number|null} [o.listingPriceUsd]  shown in the deliverable when set
  * @param {{graph: object, inputName: string, label: string}|null} [o.defaultWorkflow]
  *        when set, a brief with no workflow block runs this graph with the brief text as
@@ -182,7 +182,7 @@ export function createMarketWorker({
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
     prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault });
-    log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, deposit $${r.pricing.depositUsd} within budget $${jobBudget}`);
+    log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, with 20% $${r.pricing.depositUsd}, within budget $${jobBudget}`);
     return set(rec.id, ok({
       phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
       budgetUsd: jobBudget, listingPriceUsd: jobPrice,

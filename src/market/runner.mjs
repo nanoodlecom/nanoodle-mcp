@@ -6,8 +6,12 @@
  *     price_noodle and the NEAR quote check. It reads the graph or share link
  *     (fragment links only), applies the custom-workflow safety allowlist and
  *     caps, checks the inputs, prices every paid node from NanoGPT's public
- *     catalog, and adds the quote refusals (live-priced or unpriced models, a
- *     deposit over the cap). Here the cap is the operator's per-job budget.
+ *     catalog, and adds the quote refusals (live-priced or unpriced models).
+ *   - what a job needs: NOT the direct rails' deposit. A market buyer pays a
+ *     flat price and nothing can be refunded in part, so there is no deposit.
+ *     A job needs its estimated model cost plus 20% (marketNeedUsd), and is
+ *     refused when that is above the operator's per-job budget. The returned
+ *     pricing carries that figure as `depositUsd`.
  *   - run: the priced graph with every bound quantity written in
  *     (pricing.boundGraph from priceGraph/bindPaidGraph), through
  *     prepareRunNoodle() and the engine, exactly as the NEAR gate runs it.
@@ -16,7 +20,19 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MediaRef } from "nanoodle";
 import { computePrice, prepareRunNoodle, describeRunFailure, runNotices, extForMedia, ParamsError } from "../tools.mjs";
-import { DEFAULT_LIMITS, GraphArgsError, GraphRefusedError } from "../custom-workflow.mjs";
+import { DEFAULT_LIMITS, GraphArgsError, GraphRefusedError, exactUsd } from "../custom-workflow.mjs";
+
+/** The operator's margin on a market job, on top of the estimated model cost. */
+export const MARKET_MARGIN_RATE = 0.2;
+
+/**
+ * What a job needs on the market: the estimated model cost plus 20%, rounded up
+ * to the cent, at least $0.01. (Rounded at 1e-8 first, so 0.25 × 1.2 is 0.30, not 0.31.)
+ */
+export function marketNeedUsd(estimatedCostUsd) {
+  if (!(typeof estimatedCostUsd === "number" && Number.isFinite(estimatedCostUsd) && estimatedCostUsd >= 0)) throw new TypeError("marketNeedUsd needs an estimated cost in USD");
+  return Math.max(0.01, Math.ceil(Math.round(estimatedCostUsd * (1 + MARKET_MARGIN_RATE) * 1e8) / 1e6) / 100);
+}
 
 /** A run failure caused by the operator's NanoGPT account, not by the buyer's workflow. */
 export function isOperatorSideFailure(message) {
@@ -44,7 +60,7 @@ export async function checkNanoGptKey({ apiKey, baseUrl = "https://nano-gpt.com"
  * @param {object} o
  * @param {string} [o.apiKey]      operator's NanoGPT API key (never logged), or
  * @param {(invoice: object) => Promise<void>} [o.payment]  an x402 payment callback (the server's Nano wallet)
- * @param {number} o.budgetUsd     per-job budget: the most a run's deposit may be
+ * @param {number} o.budgetUsd     per-job budget: the most a job may need (estimated cost + 20%)
  * @param {string} [o.baseUrl]     NanoGPT base URL (tests point it at a stand-in)
  * @param {typeof fetch} [o.fetch] for catalogs and share links
  * @param {object} [o.limits]      custom-workflow caps (maxDepositUsd is replaced by budgetUsd)
@@ -64,13 +80,15 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
     /**
      * Check and price a request. Never runs anything, never throws for a bad graph.
      * @param {object} args
-     * @param {{ budgetUsd?: number }} [o]  the deposit cap for this request (default: the runner's
+     * @param {{ budgetUsd?: number }} [o]  the budget for this request (default: the runner's
      *   budgetUsd). A worker whose listing price changes passes the budget a job was accepted under.
      * @returns {Promise<{ ok: boolean, refusals: Array<{code,message}>, pricing: object|null, inputs: object }>}
      */
     async price(args, { budgetUsd: cap } = {}) {
       if (cap !== undefined && !(Number.isFinite(cap) && cap > 0)) throw new TypeError("price: budgetUsd must be a positive number");
-      const limits = cap === undefined ? L : { ...L, maxDepositUsd: cap };
+      const budget = cap === undefined ? L.maxDepositUsd : cap;
+      // The direct rails' deposit check is switched off; the market rule is applied below.
+      const limits = { ...L, maxDepositUsd: Number.MAX_SAFE_INTEGER };
       let computed;
       try {
         computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits });
@@ -81,10 +99,22 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
         if (e instanceof GraphRefusedError) return { ok: false, refusals: e.refusals, pricing: null, inputs: {} };
         throw e;
       }
+      const refusals = [...(computed.safety.refusals || [])];
+      let pricing = computed.pricing;
+      if (pricing) {
+        const need = marketNeedUsd(pricing.estimatedCostUsd);
+        pricing = { ...pricing, depositUsd: need };
+        if (need > budget) {
+          refusals.push({
+            code: "OVER_BUDGET",
+            message: `this workflow's estimated cost plus 20% is $${exactUsd(need)}; this listing covers at most $${exactUsd(budget)} — use cheaper models, fewer paid nodes or a lower maxTokens`,
+          });
+        }
+      }
       return {
-        ok: !!computed.safety.ok,
-        refusals: computed.safety.refusals || [],
-        pricing: computed.pricing,
+        ok: !!computed.safety.ok && refusals.length === 0,
+        refusals,
+        pricing,
         inputs: (computed.read && computed.read.inputs) || {},
       };
     },

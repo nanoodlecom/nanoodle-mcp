@@ -63,7 +63,7 @@ test("a normal job: started, run once, outputs uploaded, Markdown with itemized 
   assert.match(md, /LLM \(z-ai\/glm-5\.3-flash\): \$0\.000622 — up to 223 input \+ 2000 output tokens/);
   assert.match(md, /Image \(blackforestlabs\/flux-3\/klein\/text-to-image\): \$0\.009 — 1 image at 1024x1024 \(fixed price\)/);
   assert.match(md, /Total estimated cost: \$0\.00962/);
-  assert.match(md, /Deposit: \$0\.03, the most this run could cost/);
+  assert.match(md, /Estimated cost \+ 20%: \$0\.02 \(rounded up to the cent\), checked against this agent's per-job budget/);
   assert.match(md, /per-job budget of \$0\.5/);
   assert.match(md, /Actual cost: \$0\.00941, as reported by NanoGPT\./);
   assert.match(md, /"nanoodleMarketReceipt"/);
@@ -127,18 +127,18 @@ test("an unsafe graph is declined (rejected) before start, naming the node; noth
   store.close(); await m.close();
 });
 
-test("a graph whose deposit exceeds the per-job budget is declined with the figures; nothing runs", async () => {
-  const { m, store, once } = await rig({ budgetUsd: 0.02 });
+test("a graph whose estimated cost plus 20% exceeds the per-job budget is declined with the figures; nothing runs", async () => {
+  const { m, store, once } = await rig({ budgetUsd: 0.01 });
   const runs0 = nano.runs();
   const id = m.hire({ description: WORKED() });
   await once();
   const a = m.rows.get(id).assignment;
   assert.equal(a.status, "cancelled");
   assert.equal(a.cancelReason, "rejected");
-  assert.match(a.cancelDetail, /needs a \$0\.03 deposit; this server accepts at most \$0\.02/);
+  assert.match(a.cancelDetail, /estimated cost plus 20% is \$0\.02; this listing covers at most \$0\.01/);
   assert.equal(a.startedAt, null);
   assert.equal(nano.runs(), runs0);
-  assert.match(store.get(id).decline.code, /DEPOSIT_TOO_HIGH/);
+  assert.match(store.get(id).decline.code, /OVER_BUDGET/);
   store.close(); await m.close();
 });
 

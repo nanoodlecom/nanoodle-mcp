@@ -109,7 +109,7 @@ const unsafe = market.hire({
 
 /* 3 ─────────────────────────────────────────────────────────────── */
 const big = structuredClone(WORKED_GRAPH);
-big.nodes[1].fields.maxTokens = 1000000;
+big.nodes[1].fields.maxTokens = 2000000;
 const over = market.hire({ title: "Long essay", description: brief({ graph: big, inputs: { Idea: "everything" } }, "A long one please.") });
 
 /* 4 ─────────────────────────────────────────────────────────────── */
@@ -121,11 +121,11 @@ ex = await w.done;
 showLog(w);
 for (const [n, id, title, rx] of [
   [2, unsafe, "unsafe graph", /Exfil[\s\S]*endpoint/],
-  [3, over, "over-budget graph", /needs a \$0\.75 deposit; this server accepts at most \$0\.5/],
+  [3, over, "over-budget graph", /estimated cost plus 20% is \$0\.74; this listing covers at most \$0\.5/],
   [4, malformed, "malformed brief", /no workflow request[\s\S]*```nanoodle/],
 ]) {
   const a = market.rows.get(id).assignment;
-  if (n === 3) step(3, "A graph whose deposit ($0.75) is above the per-job budget ($0.50)");
+  if (n === 3) step(3, "A graph whose estimated cost plus 20% ($0.74) is above the per-job budget ($0.50)");
   if (n === 4) step(4, "A brief with no workflow request in it");
   console.log("    What the buyer reads (decline detail):");
   console.log(indent(a.cancelDetail || "(none)"));

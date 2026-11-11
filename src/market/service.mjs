@@ -43,8 +43,8 @@ Credentials (never logged, never accepted on the command line):
   --nanogpt-key-file <path> a file holding it; must be mode 0600
 
 Options:
-  --budget-usd <n>          per-job budget (env MARKET_JOB_BUDGET_USD), required: a job whose deposit
-                            (the most its run can cost) is above this is declined before any work
+  --budget-usd <n>          per-job budget (env MARKET_JOB_BUDGET_USD), required: a job whose estimated
+                            model cost plus 20% is above this is declined before any work
   --listing-price-usd <n>   the listing's price per hire (env MARKET_LISTING_PRICE_USD); when set, the
                             worker refuses to start unless budget <= price x 0.95 (the market keeps 5%)
   --default-graph <file>    a nanoodle graph to run when the brief is plain words with no workflow
@@ -310,7 +310,7 @@ export async function startMarketService(cfg, { payment = null, log: baseLog, fe
     if (probe && !probe.ok && !probe.refusals.some((r) => r.code === "CATALOG_UNAVAILABLE")) {
       fail(`--default-graph cannot run on this worker:\n${probe.refusals.map((r) => `  - ${r.message}`).join("\n")}`);
     }
-    if (probe && probe.ok) log(`plain-language briefs run the default workflow ${JSON.stringify(cfg.defaultWorkflow.label)} (input ${JSON.stringify(cfg.defaultWorkflow.inputName)}): estimated cost $${probe.pricing.estimatedCostUsd.toFixed(6)}, deposit $${probe.pricing.depositUsd}`);
+    if (probe && probe.ok) log(`plain-language briefs run the default workflow ${JSON.stringify(cfg.defaultWorkflow.label)} (input ${JSON.stringify(cfg.defaultWorkflow.inputName)}): estimated cost $${probe.pricing.estimatedCostUsd.toFixed(6)}, with 20% $${probe.pricing.depositUsd}`);
     else if (probe) log("the NanoGPT catalog is unavailable, so the default workflow was not checked at startup");
   }
   if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
@@ -422,7 +422,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
       const budgetUsd = budgetFromPrice(price.priceUsd);
       if (!(budgetUsd > 0)) {
         // Under $0.02: nothing is left after the fee. Every hire is declined (a budget of a
-        // millionth of a dollar fits no deposit) until the price is raised.
+        // millionth of a dollar fits no job) until the price is raised.
         if (problem !== "zero-budget") {
           L(`NEEDS OPERATOR — price $${fmtUsd(price.priceUsd)} leaves no budget after the market's 5% fee; ${worker ? "every hire is declined" : "this listing takes no jobs"} until it is raised`);
           problem = "zero-budget";
@@ -444,7 +444,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
       const announce = `${price.priceUsd}|${budgetUsd}|${price.source}`;
       if (announce !== lastAnnounced) {
         L(`price $${fmtUsd(price.priceUsd)} (from ${price.source}); per-job budget $${fmtUsd(budgetUsd)}` +
-          (pricing ? `; its workflow ${JSON.stringify(agent.defaultWorkflow.label)}: estimated cost $${pricing.estimatedCostUsd.toFixed(6)}, worst case $${fmtUsd(pricing.depositUsd)}, recommended price $${fmtUsd(recommendPrice({ depositUsd: pricing.depositUsd }))}` : ""));
+          (pricing ? `; its workflow ${JSON.stringify(agent.defaultWorkflow.label)}: estimated cost $${pricing.estimatedCostUsd.toFixed(6)}, with 20% $${fmtUsd(pricing.depositUsd)}, recommended price $${fmtUsd(recommendPrice({ depositUsd: pricing.depositUsd }))}` : ""));
         lastAnnounced = announce;
       }
       known = price;
@@ -453,11 +453,11 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
         if (Math.round(d * 100) > Math.round(budgetUsd * 100)) {
           const key = `${fmtUsd(price.priceUsd)}|${fmtUsd(d)}`;
           if (key !== alarm) {
-            L(`NEEDS OPERATOR — price $${fmtUsd(price.priceUsd)} no longer covers this listing's workflow (worst case $${fmtUsd(d)}); raise it to $${fmtUsd(recommendPrice({ depositUsd: d }))} on the market`);
+            L(`NEEDS OPERATOR — price $${fmtUsd(price.priceUsd)} no longer covers this listing's workflow (estimated cost + 20% is $${fmtUsd(d)}); raise it to $${fmtUsd(recommendPrice({ depositUsd: d }))} on the market`);
             alarm = key;
           }
         } else if (alarm) {
-          L(`price $${fmtUsd(price.priceUsd)} covers this listing's workflow again (worst case $${fmtUsd(d)})`);
+          L(`price $${fmtUsd(price.priceUsd)} covers this listing's workflow again (estimated cost + 20% is $${fmtUsd(d)})`);
           alarm = null;
         }
       }

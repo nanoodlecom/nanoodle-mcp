@@ -28,10 +28,10 @@ export const HANDLE_RE = /^[a-z][a-z0-9-]{2,29}$/;
 /** The market keeps 5% of the price (GET /v1/platform/config: platform_fee_bps 500). */
 const FEE_BPS = 500;
 /** Prices are recommended in steps of this many cents. */
-const STEP_CENTS = 5;
+const MIN_PRICE_CENTS = 2; // at $0.01 nothing is left after the market's 5% fee
 /** The default refresh of the market price. */
 export const PRICE_REFRESH_SECONDS = 600;
-/** The brief used to price a listing's own workflow: as long as a brief may be (the input cap), so the deposit is the worst case. */
+/** The brief used to price a listing's own workflow: as long as a brief may be (the input cap), so the estimate is for the longest brief. */
 export const PROBE_BRIEF = "a lighthouse at dawn, ".repeat(1000).slice(0, 20_000);
 
 const AGENT_KEYS = new Set(["handle", "tokenFile", "graph", "input", "custom", "priceUsd"]);
@@ -78,20 +78,21 @@ export function budgetFromPrice(priceUsd) {
 }
 
 /**
- * The smallest price, in steps of $0.05 and at least $0.05, whose payout after
- * the market's 5% fee covers the deposit (the most the listing's own workflow
- * can cost): 0.95 × price ≥ deposit.
+ * The smallest price, in whole cents and at least $0.02, whose payout after
+ * the market's 5% fee covers what the listing's own workflow needs (its
+ * estimated cost + 20%, runner.mjs marketNeedUsd): 0.95 × price ≥ need.
+ * `depositUsd` is that need; the name is the pricing object's field.
  * @param {{ depositUsd: number }} o
  * @returns {number} dollars
  */
 export function recommendPrice({ depositUsd }) {
-  if (!(typeof depositUsd === "number" && Number.isFinite(depositUsd) && depositUsd >= 0)) throw new TypeError("recommendPrice needs a deposit in USD");
-  // Micro-dollars, rounded UP (a deposit is never underestimated): 0.37 → 370000.
+  if (!(typeof depositUsd === "number" && Number.isFinite(depositUsd) && depositUsd >= 0)) throw new TypeError("recommendPrice needs the job's need in USD");
+  // Micro-dollars, rounded UP (a need is never underestimated): 0.37 → 370000.
   // (The float is first rounded at 1e-8, so 0.37 × 1e6 = 370000.00000000006 is not taken for 370001.)
   const d = Math.ceil(Math.round(depositUsd * 1e8) / 100);
-  // price = k × 5 cents = 50000k micro-dollars; 0.95 × 50000k = 47500k ≥ d.
-  const k = Math.max(1, Math.ceil(d / 47_500));
-  return (k * STEP_CENTS) / 100;
+  // price = c cents = 10000c micro-dollars; 0.95 × 10000c = 9500c ≥ d.
+  const c = Math.max(MIN_PRICE_CENTS, Math.ceil(d / 9_500));
+  return c / 100;
 }
 
 /**

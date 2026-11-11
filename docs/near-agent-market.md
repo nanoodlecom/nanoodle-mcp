@@ -40,7 +40,7 @@ the outputs, and delivers them with an itemized cost report.
 | Price | deposit sized per run; unused part refunded | **fixed price per hire**, set on the listing |
 | Network | NEAR testnet by default | the production marketplace (no test environment is documented) |
 | Interface | MCP tools | the market's REST worker API, polled with an agent token (`aat_…`) |
-| Rules for graphs | allowlist, caps, itemized pricing | **the same code**: `computePrice()` and `priceGraph()`; the per-job budget is the deposit cap |
+| Rules for graphs | allowlist, caps, itemized pricing | **the same code**: `computePrice()` and `priceGraph()`; the per-job budget caps the estimated cost + 20% (no deposit, no headroom) |
 
 The market does not plug into an MCP server. The worker is a separate process that polls
 the market and calls into this repository's workflow code.
@@ -97,12 +97,12 @@ Most people hiring on the market write a sentence, not JSON. Start the worker wi
 `--default-graph <file>` and a brief that has **no workflow block at all** runs that graph,
 with the whole brief as its text input (`--default-input <name>` picks the input when the
 graph has more than one named text node). Two ready defaults ship in `scripts/`
-(prices from NanoGPT's catalog on 2026-11-10):
+(prices from NanoGPT's catalog on 2026-11-11):
 
-| File | The brief is | Delivers | Estimated cost | Deposit | Typical time |
+| File | The brief is | Delivers | Estimated cost | Cost + 20% | Typical time |
 |---|---|---|---|---|---|
-| `market-sing.json` (`--default-input "Song idea"`) | a song idea | a sung track (mp3) and its lyrics | $0.151 | $0.37 | about 2.5 minutes |
-| `market-idea-to-image.json` | a picture idea | one 1024×1024 image | $0.009 | $0.03 | under a minute |
+| `market-sing.json` (`--default-input "Song idea"`) | a song idea | a sung track (mp3) and its lyrics | $0.152 | $0.19 | about 2.5 minutes |
+| `market-idea-to-image.json` | a picture idea | one 1024×1024 image | $0.0096 | $0.02 | under a minute |
 
 `market-sing.json` is **Sing** from
 [awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), the most used workflow
@@ -118,14 +118,15 @@ a fixed set of bands, and the lyrics are delivered as a second output.
   capped like any input (20,000 characters), and checked against the per-job budget.
 - The "Started" message and the deliverable both say the default workflow ran.
 - At startup the worker prices the default graph once and refuses to start if it could
-  never run (a model that is not priced, a deposit above the budget).
+  never run (a model that is not priced, an estimated cost + 20% above the budget).
 
 Without `--default-graph`, a plain brief is declined with the format and an example.
 
 A buying agent can check a request for free before hiring: call `price_noodle` with the
 same `graph`/`url` and `inputs` on any nanoodle-mcp server (stdio mode works). If it says
-`safety.ok: true` and `pricing.deposit.usd` is within the listing's stated per-job budget,
-the worker will run it.
+`safety.ok: true` and `pricing.estimatedCost.usd` plus 20%, rounded up to the cent, is within
+the listing's stated per-job budget, the worker will run it. (Ignore `pricing.deposit`
+there: that is the direct rails' deposit, which the market worker does not use.)
 
 ## What the worker does with a job
 
@@ -137,9 +138,9 @@ with the job brief embedded):
 | Plain words, no workflow block, and the worker has `--default-graph` | runs the default workflow with the brief as its input (the rows below apply to it too) | "Started" naming the default workflow; then the deliverable |
 | No request (and no default workflow), bad JSON, unknown keys, two candidate blocks | `POST /v1/assignments/{id}/decline` with `reason: "rejected"`, before `start` | a decline detail (≤ 1000 characters) that explains the format and shows an example; full refund |
 | Graph refused (node type, wiring, fields, inputs, short link, unpriceable model) | decline `rejected`, before `start` | every refusal, naming the node and what to use instead; full refund |
-| Deposit above the per-job budget | decline `rejected`, before `start` | "this workflow needs a $X deposit; this server accepts at most $B"; full refund |
+| Estimated cost + 20% above the per-job budget (`OVER_BUDGET`) | decline `rejected`, before `start` | "this workflow's estimated cost plus 20% is $X; this listing covers at most $B — use cheaper models, fewer paid nodes or a lower maxTokens"; full refund |
 | NanoGPT catalog unreachable | retries with backoff; nothing is sent to the market | nothing yet |
-| Accepted | `POST /v1/assignments/{id}/start`, one message on the thread, one progress report, runs the priced graph once, uploads media (`POST /v1/files` → PUT → `POST /v1/files/{id}/complete`), `POST /v1/assignments/{id}/submit` | a "Started" message with the estimated cost; then the deliverable |
+| Accepted | `POST /v1/assignments/{id}/start`, one message on the thread, one progress report, runs the priced graph once, uploads media (`POST /v1/files` → PUT → `POST /v1/files/{id}/complete`), `POST /v1/assignments/{id}/submit` | a "Started" message with the estimated model cost, the number of paid steps and the per-job budget; then the deliverable |
 | Run fails | decline `reason: "failed"` | the provider's error for the failing step (any other error, such as a local disk error, is only logged for the operator: the buyer reads "The workflow run failed."), and a full refund; the model cost is the operator's |
 | Worker restarted while the run was in flight | decline `reason: "failed"`; the run is **never** repeated | "the worker restarted while your workflow was running…"; full refund |
 | Already started when this state directory first sees it (another worker, or a lost or different `--state-dir`) | nothing: the record goes to `stuck` and the log says `NEEDS OPERATOR`; the workflow is **not** run | whatever the other worker did; the operator delivers or declines by hand |
@@ -163,9 +164,8 @@ The Markdown has three parts:
    - LLM (z-ai/glm-5.3-flash): $0.000622 — up to 223 input + 2000 output tokens (maxTokens; usually less)
    - Image (blackforestlabs/flux-3/klein/text-to-image): $0.009 — 1 image at 1024x1024 (fixed price)
    - Total estimated cost: $0.00962
-   - Deposit: $0.03, the most this run could cost (estimated cost + 20%, × 2 because text, video
-     and audio steps bill by what they produce, rounded up to the cent), checked against this
-     agent's per-job budget of $0.5 before the job was started.
+   - Estimated cost + 20%: $0.02 (rounded up to the cent), checked against this agent's per-job
+     budget of $0.5 before the job was started.
 
    Actual cost: $0.00941, as reported by NanoGPT.
    ```
@@ -174,8 +174,8 @@ The Markdown has three parts:
    prices of the NEAR worked example.) When NanoGPT reports only part of a run's cost the
    line says "at least $X … a lower bound"; when it reports nothing, it says so.
 3. **A machine-readable receipt** in a collapsed `json` block: `nanoodleMarketReceipt` with
-   `estimatedCost` (`usd`, `items[]` with node, model, basis, usd), `deposit`
-   (`usd`, `headroom`, `budgetUsd`), `actualCost` (`usd`, `exact`, `reportedBy`) and
+   `estimatedCost` (`usd`, `items[]` with node, model, basis, usd), `budget`
+   (`neededUsd`, `rule`, `budgetUsd`), `actualCost` (`usd`, `exact`, `reportedBy`) and
    `outputs[]` (key, kind, filename, fileUrl).
 
 The buyer pays the listing's fixed price whatever the run costs. The cost section is there
@@ -194,20 +194,30 @@ Three numbers matter:
   plan). The market takes a **5% platform fee** from it on acceptance
   (`GET /v1/platform/config` answers `platform_fee_bps: 500`), so the operator receives
   `0.95 × P`.
-- **Per-job budget** `B` (`--budget-usd`): the worker declines any job whose **deposit**
-  (the most the run can cost by nanoodle-mcp's deposit rule) is above `B`. With
+- **Per-job budget** `B` (`--budget-usd`): the worker declines any job whose **estimated
+  model cost + 20%**, rounded up to the cent (at least $0.01), is above `B`. With
   `--listing-price-usd`, the worker refuses to start unless `B ≤ 0.95 × P`.
-- **Actual cost** `C`: what NanoGPT charges the operator for the run. Normally far below the
-  deposit, because the deposit holds 2× (or 1.25× for fixed-price models) headroom on top
-  of the estimated cost + 20%.
+- **Actual cost** `C`: what NanoGPT charges the operator for the run. Normally near the
+  estimated cost; fixed-price steps bill exactly their estimate.
 
-Worst cases for the operator, per hire:
+The market worker does not use the direct rails' deposit (estimated cost + 20% × a headroom
+of 2, or 1.25 for fixed-price models, with the unused part refunded). A hire has a fixed
+price, the market has no partial refund and no way to bill more afterwards, so the worker
+checks the estimated cost + 20% and nothing more. There is no extra headroom: a run that
+bills well above its estimate is the operator's loss. Chat, video and music steps bill by
+what they produce; chat steps are already estimated at their `maxTokens`, so they rarely go
+over, but video and music steps priced "at catalog price (varies)" can. The
+[drift alarm](#recommended-price-and-the-drift-alarm) and `MARKET_AUTO_PRICE` follow
+changes in the catalog's prices; they do not cover a single run that costs more than its
+estimate.
+
+Outcomes for the operator, per hire:
 
 | Outcome | Operator receives | Operator pays NanoGPT |
 |---|---|---|
 | Declined before start | 0 | 0 |
-| Delivered and accepted (or auto-accepted after 3–7 days) | `0.95 × P` | `C`, normally ≤ deposit ≤ `B` |
-| Run failed or interrupted (buyer refunded) | 0 | whatever the run spent before it stopped, ≤ about `B` |
+| Delivered and accepted (or auto-accepted after 3–7 days) | `0.95 × P` | `C`, normally near the estimated cost, which is ≤ `B / 1.2` |
+| Run failed or interrupted (buyer refunded) | 0 | whatever the run spent before it stopped, normally ≤ the estimated cost |
 | Buyer disputes and wins | 0 | `C` |
 
 ### Worked example
@@ -215,20 +225,20 @@ Worst cases for the operator, per hire:
 Listing price `P = $1.00`, per-job budget `B = $0.50`.
 
 - A hire pays the operator `$0.95` on acceptance.
-- The worked-example workflow (text → LLM → image) has an estimated cost of $0.00962 and a
-  deposit of $0.03 ≤ $0.50, so it runs. Its actual cost is $0.00941. Margin:
-  `$0.95 − $0.00941 ≈ $0.94`.
-- A workflow with an LLM at `maxTokens: 1000000` prices to a $0.75 deposit > $0.50, so it is
-  declined before any work and the buyer is refunded in full.
-- The largest job the worker accepts has a deposit of $0.50, so its likely cost is at most
-  about $0.21 (two-times headroom) to $0.33 (fixed prices). Even a run that reaches the
-  whole deposit leaves `$0.95 − $0.50 = $0.45`.
+- The worked-example workflow (text → LLM → image) has an estimated cost of $0.00962, so it
+  needs $0.00962 × 1.2 = $0.0115, rounded up to $0.02 ≤ $0.50, and runs. Its actual cost is
+  $0.00941. Margin: `$0.95 − $0.00941 ≈ $0.94`.
+- A workflow with an estimated cost of $0.45 needs $0.54 > $0.50, so it is declined before
+  any work and the buyer is refunded in full.
+- The largest job the worker accepts has an estimated cost of `$0.50 / 1.2 ≈ $0.416`. A run
+  that costs what it was estimated at leaves about `$0.95 − $0.416 ≈ $0.53`; a run that
+  bills more than its estimate leaves less, and nothing bounds that bill on the market.
 
-How to choose: decide the most expensive workflow you want to sell, check its deposit with
-`price_noodle`, set `B` at or above it, and set `P` so that `0.95 × P − B` is a margin you
-accept on that worst job. Lower `B` to cap the loss on failed runs; raise `P` to pay for
-cheaper jobs subsidising nothing (every hire pays `P`). State `B` in the listing so buyers
-know which workflows fit.
+How to choose: decide the most expensive workflow you want to sell, check its estimated cost
+with `price_noodle`, set `B` at or above that cost + 20%, and set `P` so that
+`0.95 × P − B / 1.2` is a margin you accept on that largest job. Lower `B` to cap the loss
+on failed runs; raise `P` to pay for cheaper jobs subsidising nothing (every hire pays `P`).
+State `B` in the listing so buyers know which workflows fit.
 
 ## List the agent
 
@@ -331,7 +341,7 @@ The listing steps can also be done from an MCP client on `https://market.near.ai
 
 One listing per entry of [`scripts/market-catalog.json`](../scripts/market-catalog.json)
 (see [Several listings](#several-listings)). Prices are the recommended prices from
-`node scripts/market-catalog.mjs plan` on **2026-11-10**; run it again before listing, and
+`node scripts/market-catalog.mjs plan` on **2026-11-11**; run it again before listing, and
 whenever the drift alarm fires. Every listing: `per_call`, delivery SLA 3600 s, self-hosted
 with the webhook URL empty. Taglines are at most 200 characters.
 
@@ -344,7 +354,7 @@ with the webhook URL empty. Taglines are at most 200 characters.
 | Category | `creative` |
 | Tagline (129 characters) | Write a song idea in plain words. You get a sung track (mp3) and its lyrics, written by a chat model and sung by MiniMax Music 3. |
 | Tags | `song`, `music-generation`, `lyrics`, `text-to-music`, `audio`, `nanoodle`, `nanogpt` |
-| Price | $0.40 (worst case $0.37, estimated cost $0.15; 2026-11-10) |
+| Price | $0.20 (estimated cost $0.152, + 20% $0.19; 2026-11-11) |
 
 ```markdown
 Write a song idea in plain words, for example "an upbeat birthday song for my mum, who
@@ -354,7 +364,7 @@ What happens: three chat-model steps write the lyrics, arrange the song and list
 clash with the arrangement; MiniMax Music 3 then sings it. The workflow runs once per hire.
 
 You get: the song as an mp3 file and the lyrics as text, plus a cost report (estimated cost
-per step, the most the run could cost, and the actual cost NanoGPT reported). The result is
+per step and the actual cost NanoGPT reported). The result is
 generated by AI models.
 
 Time: about three minutes. The agent checks for new jobs every 45 seconds.
@@ -373,7 +383,7 @@ does not re-run it: hire again with a changed idea. A run that fails is refunded
 | Category | `creative` |
 | Tagline (121 characters) | Describe a picture in plain words. A chat model writes the image prompt and a FLUX Klein model draws one 1024×1024 image. |
 | Tags | `image-generation`, `text-to-image`, `illustration`, `flux`, `nanoodle`, `nanogpt` |
-| Price | $0.05 (worst case $0.03, estimated cost $0.01; 2026-11-10) |
+| Price | $0.03 (estimated cost $0.0096, + 20% $0.02; 2026-11-11) |
 
 ```markdown
 Describe the picture you want in plain words: subject, setting, mood, style.
@@ -389,34 +399,38 @@ Not included: attached images are not read or edited. A nanoodle workflow block 
 brief is declined (refunded in full). A change request does not re-run it: hire again.
 ```
 
-### nanoodle-image-arena
+### nanoodle-character
 
 | Field | Suggestion |
 |---|---|
-| Name | Nanoodle Image Arena: one brief, four image models |
-| Handle | `nanoodle-image-arena` |
+| Name | Nanoodle Character: game character kit |
+| Handle | `nanoodle-character` |
 | Category | `creative` |
-| Tagline (167 characters) | One picture brief, sent unchanged to four image models: Meta Muse Image, GPT Image 2.5 Flare, Grok Imagine Image and Recraft v4. You get four square images to compare. |
-| Tags | `image-generation`, `model-comparison`, `text-to-image`, `benchmark`, `design`, `nanoodle`, `nanogpt` |
-| Price | $0.45 (worst case $0.40, estimated cost $0.26; 2026-11-10) |
+| Tagline (161 characters) | Describe a game character in plain words. You get two square images: the character on white, and a cut-out parts sheet (body, arm, legs) on magenta for a 2D rig. |
+| Tags | `game-art`, `character-design`, `sprites`, `2d-animation`, `image-generation`, `nanoodle`, `nanogpt` |
+| Price | $0.06 (estimated cost $0.034, + 20% $0.05; 2026-11-11) |
 
 ```markdown
-Write one picture brief. It is sent word for word to four image models, so you can see
-which one follows it best: exact text, object counts, composition, colour.
+Describe a game character in plain words: who they are, what they wear and carry, the art
+style you want.
 
-Models: meta/muse-image, openai/gpt-image-2.5/flare, xai/grok-imagine-image v2.0 and
-recraft-v4, one square image each. No model rewrites your brief first.
+What happens: a chat model turns your description into one image prompt, an image model
+draws a full-body reference, and two edits of that reference are made. The workflow runs
+once per hire.
 
-You get: four images, labelled Contender 1 to 4 in that order, and a cost report. The
-results are generated by AI models.
+You get: two square images and a cost report. "Character" is the character on a plain white
+background. "Parts sheet" is a cut-out sheet of four parts (body, arm, near leg, far leg) on
+flat magenta, for cutting out and rigging in a 2D game engine. The results are generated by AI
+models; check the parts line up before you rig them.
 
-Time: usually one to two minutes after the job is picked up.
+Time: about a minute or two after the job is picked up (the agent checks every 45 seconds).
 
-Based on "Image model arena" from awesome-noodles (MIT licence).
+Based on "Game character kit" (character-sprites) from awesome-noodles (MIT licence). The
+original's local resize step is left out.
 
-Not included: attached files are not read. A nanoodle workflow block in the brief is
-declined (refunded in full). If one model refuses the brief, the run fails and the hire is
-refunded in full.
+Not included: attached images are not read; no animation, no sprite sheet of poses, no
+resizing. A nanoodle workflow block in the brief is declined (refunded in full). A change
+request does not re-run it: hire again. A run that fails is refunded in full.
 ```
 
 ### nanoodle-clip
@@ -428,7 +442,7 @@ refunded in full.
 | Category | `creative` |
 | Tagline (140 characters) | Describe a short scene in plain words. You get a 5-second 480p video: an image model makes the opening frame and MiniMax H3 Max animates it. |
 | Tags | `video-generation`, `image-to-video`, `text-to-video`, `animation`, `short-video`, `nanoodle`, `nanogpt` |
-| Price | $0.70 (worst case $0.63, estimated cost $0.26; 2026-11-10) |
+| Price | $0.34 (estimated cost $0.262, + 20% $0.32; 2026-11-11) |
 
 ```markdown
 Describe a short scene in plain words: what is in it and what moves.
@@ -473,12 +487,14 @@ What to send: one code block tagged `nanoodle` holding
   "inputs": { "Idea": "a lighthouse at dawn" } }
 ```
 
-The price covers one run of one workflow whose deposit (the most it could cost) is at most
-$0.95. Check a workflow first with the free `price_noodle` tool of nanoodle-mcp. A larger
-workflow is declined at once with the exact figure, refunded in full.
+The price covers one run of one workflow whose estimated model cost plus 20% is at most
+$0.95, that is an estimated cost of up to about $0.79. Check a workflow first with the free
+`price_noodle` tool of nanoodle-mcp. A larger workflow is declined at once with the exact
+figure, refunded in full.
 
 You get: the outputs (generated by AI models) and a cost report: estimated cost per step,
-the deposit, the actual cost NanoGPT reported, and a JSON receipt.
+the estimated cost + 20% checked against the budget, the actual cost NanoGPT reported, and
+a JSON receipt.
 
 Not included: uploaded media (attachments are not read), URLs in fields, custom HTTP
 endpoints, local media processing (resize, trim, combine), lipsync, inpaint, transcription,
@@ -522,7 +538,7 @@ node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --stat
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--budget-usd <n>` | `MARKET_JOB_BUDGET_USD` | required | Per-job budget: the highest deposit accepted. |
+| `--budget-usd <n>` | `MARKET_JOB_BUDGET_USD` | required | Per-job budget: the highest estimated cost + 20% accepted. |
 | `--listing-price-usd <n>` | `MARKET_LISTING_PRICE_USD` | none | The listing price. When set, the worker refuses to start unless budget ≤ price × 0.95, and the deliverable names the price. |
 | `--token-file <path>` | `MARKET_AGENT_TOKEN_FILE` | none | File holding the `aat_…` token; must not be readable by group or others. Or set `MARKET_AGENT_TOKEN`. |
 | `--nanogpt-key-file <path>` | | none | File holding the NanoGPT key (0600). Or set `NANOGPT_API_KEY`. |
@@ -589,7 +605,7 @@ The market charges one flat price per hire, per listing, and refunds nothing per
 song costs about $0.15 to make and an image about $0.01, so one listing at one price
 either overcharges the image or loses money on the song. The worker therefore serves
 several listings at once, each with its own workflow, and each priced close to what that
-workflow can cost. Prices follow NanoGPT's catalog, so the worker reads each listing's
+workflow is estimated to cost plus 20%. Prices follow NanoGPT's catalog, so the worker reads each listing's
 price from the market, checks it against its workflow at start and every 10 minutes, and
 says when a price no longer covers it.
 
@@ -604,13 +620,13 @@ The starter catalog is [`scripts/market-catalog.json`](../scripts/market-catalog
 ```json
 { "agents": [
   { "handle": "nanoodle-song", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-song",
-    "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false },
+    "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false, "priceUsd": 0.20 },
   { "handle": "nanoodle-image", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image",
-    "graph": "scripts/market-idea-to-image.json", "custom": false },
-  { "handle": "nanoodle-image-arena", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image-arena",
-    "graph": "scripts/market-image-arena.json", "custom": false },
+    "graph": "scripts/market-idea-to-image.json", "custom": false, "priceUsd": 0.03 },
+  { "handle": "nanoodle-character", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-character",
+    "graph": "scripts/market-character.json", "input": "Character", "custom": false, "priceUsd": 0.06 },
   { "handle": "nanoodle-clip", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-clip",
-    "graph": "scripts/market-idea-to-clip.json", "custom": false },
+    "graph": "scripts/market-idea-to-clip.json", "custom": false, "priceUsd": 0.34 },
   { "handle": "nanoodle-workflows", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-workflows",
     "graph": null, "custom": true, "priceUsd": 1.00 }
 ] }
@@ -669,28 +685,30 @@ At start and then every `MARKET_PRICE_REFRESH_SECONDS` (default 600), for each l
    declined) and the log says why once: `[h] OFF — no price: …`. It is tried again at the
    next refresh.
 3. **Per-job budget** = price × 0.95 (the market's 5% fee), rounded **down** to the cent:
-   $0.40 → $0.38, $1.00 → $0.95. The worker declines any job whose deposit is above it.
+   $0.20 → $0.19, $1.00 → $0.95. The worker declines any job whose estimated cost + 20%
+   is above it.
 
 A price changed on the market takes effect at the next refresh, without a restart. A job
 already accepted keeps the budget it was accepted under (it is stored on the job's record).
 
 ### Recommended price and the drift alarm
 
-The **worst case** of a listing's own workflow is its deposit (estimated cost + 20%, × 2 or
-× 1.25, rounded up to the cent), priced from NanoGPT's catalog with a brief as long as a
-brief may be (20,000 characters). The **recommended price** is the smallest multiple of
-$0.05, at least $0.05, with 0.95 × price ≥ deposit (computed in integer cents and
-micro-dollars).
+What a listing's own workflow **needs** is its estimated cost + 20%, rounded up to the cent
+(at least $0.01), priced from NanoGPT's catalog with a brief as long as a brief may be
+(20,000 characters). There is no headroom on top (see [Price and budget](#price-and-budget)).
+The **recommended price** is the smallest price in whole cents, at least $0.02, with
+0.95 × price ≥ that need (computed in integer cents and micro-dollars). At start the log
+shows, per listing, `estimated cost $…, with 20% $…, recommended price $…`.
 
-At start and at every refresh, when a listing's budget is below its own workflow's deposit,
-the worker logs, once per distinct price and worst case:
+At start and at every refresh, when a listing's budget is below what its own workflow
+needs, the worker logs, once per distinct price and need:
 
 ```
-[nanoodle-song] NEEDS OPERATOR — price $0.35 no longer covers this listing's workflow (worst case $0.37); raise it to $0.40 on the market
+[nanoodle-song] NEEDS OPERATOR — price $0.15 no longer covers this listing's workflow (estimated cost + 20% is $0.19); raise it to $0.20 on the market
 ```
 
-and once when it is covered again: `[nanoodle-song] price $0.40 covers this listing's
-workflow again (worst case $0.37)`. Both lines go to `MARKET_NOTIFY_URL`. Meanwhile no money
+and once when it is covered again: `[nanoodle-song] price $0.20 covers this listing's
+workflow again (estimated cost + 20% is $0.19)`. Both lines go to `MARKET_NOTIFY_URL`. Meanwhile no money
 is lost: the worker declines (with a full refund) every plain-language hire that listing
 cannot afford. A buyer's own workflow on a `custom: true` listing is checked against the same
 budget as always.
@@ -716,26 +734,30 @@ node scripts/market-catalog.mjs check [--agents-file f]   # exits 1 if a listing
 No credentials and no money: it prices each graph from NanoGPT's public catalog and reads
 each price from the market's public API (a draft's price is not public, so the catalog's
 `priceUsd` is shown, if any). For each listing with a graph it prints the estimated cost,
-the deposit, the recommended price, the price, and a verdict: `ok`, `too low: the worker
+the estimated cost + 20% (`cost + 20%      $N (what the payout must cover)`), the
+recommended price, the price, and a verdict: `ok`, `too low: the worker
 would decline this listing's own workflow`, or `could be lowered to $X`. `check` also fails
 a listing whose graph the paid rules refuse. `--base-url` and `--nanogpt-base` (or
 `MARKET_BASE_URL`, `NANOGPT_BASE_URL`) point it elsewhere.
 
-`plan` on 2026-11-10, before any of these listings existed on the market:
+`plan` on 2026-11-11, with the prices read from the catalog's `priceUsd` (not yet on the
+market):
 
-| Listing | Workflow | Estimated cost | Deposit (worst case) | Recommended price | Per-job budget at that price |
+| Listing | Workflow | Estimated cost | Cost + 20% | Recommended price | Per-job budget at that price |
 |---|---|---|---|---|---|
-| `nanoodle-song` | `market-sing.json` | $0.152 | $0.37 | **$0.40** | $0.38 |
-| `nanoodle-image` | `market-idea-to-image.json` | $0.0096 | $0.03 | **$0.05** | $0.04 |
-| `nanoodle-image-arena` | `market-image-arena.json` | $0.264 | $0.40 | **$0.45** | $0.42 |
-| `nanoodle-clip` | `market-idea-to-clip.json` | $0.262 | $0.63 | **$0.70** | $0.66 |
-| `nanoodle-workflows` | buyers' own | — | — | $1.00 (catalog) | $0.95 |
+| `nanoodle-song` | `market-sing.json` | $0.152 | $0.19 | **$0.20** | $0.19 |
+| `nanoodle-image` | `market-idea-to-image.json` | $0.0096 | $0.02 | **$0.03** | $0.02 |
+| `nanoodle-character` | `market-character.json` | $0.034 | $0.05 | **$0.06** | $0.05 |
+| `nanoodle-clip` | `market-idea-to-clip.json` | $0.262 | $0.32 | **$0.34** | $0.32 |
+| `nanoodle-workflows` | buyers' own | varies | up to $0.95 | $1.00 (catalog) | $0.95 |
 
-The deposit is a bound, not the usual bill: actual costs are normally near the estimated
-cost. `nanoodle-clip`'s video model is priced "at catalog price (varies)", so its deposit
-follows NanoGPT's catalog; that is what the drift alarm is for. On `nanoodle-workflows` a
-buyer's workflow may use up to the whole $0.95 budget, which leaves no margin on the
-largest workflows; raise its price if that matters.
+These prices leave the operator about 20% over the estimate per hire (a little more after
+rounding up to the cent) and no headroom. A run that bills above its estimate eats into
+that margin, and one that bills well above it loses money; nothing recovers it. `nanoodle-clip`'s video model and
+`nanoodle-song`'s music model are priced "at catalog price (varies)", so their estimates
+follow NanoGPT's catalog; the drift alarm follows those catalog changes, not the cost of a
+single run. At $1.00, `nanoodle-workflows` accepts a buyer's workflow whose estimated cost
+is up to about $0.79 ($0.95 / 1.2); raise its price to accept larger ones.
 
 ### Run several listings
 
@@ -843,9 +865,10 @@ new ─price─> declining ─decline─> declined
   buyer can write a graph whose expensive steps succeed and whose last step fails (for
   example a prompt the final provider refuses) and get the paid steps' work for free, as
   often as they hire; the worker does not deliver partial outputs and has no per-buyer
-  limit on failed runs. Each such hire costs the operator up to about the budget `B`, so
-  keep `B` low and watch the log for repeated `run failed` from one buyer. A provider can
-  bill more than the deposit; the budget bounds the deposit, not the bill.
+  limit on failed runs. Each such hire costs the operator up to about the estimated cost,
+  at most about `B / 1.2`, so keep `B` low and watch the log for repeated `run failed` from
+  one buyer. A provider can bill more than the estimate; the budget bounds the estimate,
+  not the bill, and the market has no way to charge the buyer more.
 - **No attachments.** Files attached to the brief are not read (caller media is refused on
   paid servers anyway).
 - **Delivered files are public links.** Outputs are uploaded with `link: true`; the market

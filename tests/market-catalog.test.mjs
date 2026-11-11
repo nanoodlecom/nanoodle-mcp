@@ -34,7 +34,7 @@ const brief = (req) => `Please run my workflow.\n\n\`\`\`nanoodle\n${JSON.string
 const WORKED = (idea = "a lighthouse at dawn") => brief({ graph: WORKED_GRAPH, inputs: { Idea: idea } });
 
 let nano;
-let DEPOSIT; // the worst case of WORKED_GRAPH as a listing's own workflow, at the stand-in's prices
+let DEPOSIT; // what WORKED_GRAPH needs as a listing's own workflow (estimated cost + 20%), at the stand-in's prices
 before(async () => {
   nano = nanoGptMock(); await nano.listen();
   const r = await createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 5, baseUrl: nano.url }).price({ graph: WORKED_GRAPH, inputs: { Idea: PROBE_BRIEF } });
@@ -88,20 +88,20 @@ const count = (logs, re) => logs.filter((l) => re.test(l)).length;
 
 /* ------------------------------ money ------------------------------ */
 
-test("recommendPrice: the smallest multiple of $0.05 whose 95% covers the deposit, at least $0.05, in integer arithmetic", () => {
+test("recommendPrice: the smallest whole-cent price whose 95% covers the need, at least $0.02, in integer arithmetic", () => {
   const cases = [
-    [0, 0.05], [0.01, 0.05], [0.03, 0.05], [0.0475, 0.05], [0.0476, 0.10], [0.05, 0.10],
-    [0.285, 0.30], [0.1 + 0.2, 0.35], [0.37, 0.40], [0.38, 0.40], [0.381, 0.45], [0.40, 0.45],
-    [0.63, 0.70], [0.95, 1.00], [0.951, 1.05], [1.9, 2.00], [2.85, 3.00],
+    [0, 0.02], [0.01, 0.02], [0.019, 0.02], [0.02, 0.03], [0.03, 0.04], [0.05, 0.06],
+    [0.19, 0.20], [0.285, 0.30], [0.1 + 0.2, 0.32], [0.32, 0.34], [0.37, 0.39], [0.38, 0.40], [0.381, 0.41],
+    [0.95, 1.00], [0.951, 1.01], [1.9, 2.00], [2.85, 3.00],
   ];
   for (const [d, want] of cases) {
     const got = recommendPrice({ depositUsd: d });
-    assert.equal(got, want, `deposit ${d}`);
-    // In cents and micro-dollars: 0.95 × price ≥ deposit, and $0.05 less would not do.
+    assert.equal(got, want, `need ${d}`);
+    // In cents and micro-dollars: 0.95 × price ≥ need, and one cent less would not do.
     const gotC = Math.round(got * 100);
     const dM = Math.round(d * 1e6);
-    assert.ok(gotC % 5 === 0 && gotC * 9500 >= dM, `${got} covers ${d}`);
-    if (gotC > 5) assert.ok((gotC - 5) * 9500 < dM, `${got} is the smallest for ${d}`);
+    assert.ok(gotC * 9500 >= dM, `${got} covers ${d}`);
+    if (gotC > 2) assert.ok((gotC - 1) * 9500 < dM, `${got} is the smallest for ${d}`);
   }
   for (const bad of [-0.01, NaN, Infinity, "0.3", undefined]) assert.throws(() => recommendPrice({ depositUsd: bad }), TypeError);
 });
@@ -122,8 +122,8 @@ test("priceVerdict: too low, ok, could be lowered, unknown", () => {
   assert.equal(priceVerdict({ priceUsd: 0.39, depositUsd: 0.37 }).verdict, "ok"); // 0.3705 → 0.37 covers 0.37
   assert.equal(priceVerdict({ priceUsd: 0.38, depositUsd: 0.37 }).verdict, "too-low");
   assert.match(priceVerdict({ priceUsd: 0.38, depositUsd: 0.37 }).text, /^too low: the worker would decline this listing's own workflow$/);
-  assert.equal(priceVerdict({ priceUsd: 0.40, depositUsd: 0.37 }).verdict, "ok");
-  assert.deepEqual(priceVerdict({ priceUsd: 1, depositUsd: 0.37 }), { verdict: "lower", recommendedUsd: 0.4, budgetUsd: 0.95, text: "could be lowered to $0.40" });
+  assert.equal(priceVerdict({ priceUsd: 0.40, depositUsd: 0.37 }).verdict, "lower");
+  assert.deepEqual(priceVerdict({ priceUsd: 1, depositUsd: 0.37 }), { verdict: "lower", recommendedUsd: 0.39, budgetUsd: 0.95, text: "could be lowered to $0.39" });
   assert.equal(priceVerdict({ priceUsd: null, depositUsd: 0.37 }).verdict, "unknown");
 });
 
@@ -181,7 +181,7 @@ test("the shipped catalog and its graph files load; each graph has one empty nam
   assert.deepEqual(c.agents.map((a) => [a.handle, a.custom, a.defaultWorkflow && a.defaultWorkflow.label, a.input]), [
     ["nanoodle-song", false, "Idea to song", "Song idea"],
     ["nanoodle-image", false, "Idea to image", "Idea"],
-    ["nanoodle-image-arena", false, "Image model arena", "Shared test brief"],
+    ["nanoodle-character", false, "Game character kit", "Character"],
     ["nanoodle-clip", false, "Idea to short video clip", "Idea"],
     ["nanoodle-workflows", true, null, null],
   ]);
@@ -195,10 +195,17 @@ test("the shipped catalog and its graph files load; each graph has one empty nam
       assert.ok(!("modelOpts" in (n.fields || {})) && !("loras" in (n.fields || {})), `${a.handle}: ${n.id} has no modelOpts or loras`);
     }
   }
-  const arena = c.agents[2].defaultWorkflow.graph;
-  assert.deepEqual(arena.nodes.filter((n) => n.type === "image").map((n) => n.fields.model),
-    ["meta/muse-image/text-to-image", "openai/gpt-image-2.5/flare/text-to-image", "xai/grok-imagine-image/v2.0/text-to-image", "recraft-v4"]);
-  assert.match(arena.nodes.find((n) => n.type === "comment").fields.text, /awesome-noodles.*image-model-arena.*MIT/);
+  const character = c.agents[2].defaultWorkflow.graph;
+  assert.deepEqual(character.nodes.filter((n) => n.type !== "comment").map((n) => [n.type, n.name]),
+    [["text", "Character"], ["llm", "Character designer"], ["image", "Reference"], ["edit", "Character"], ["edit", "Parts sheet"]]);
+  // Both edits read the reference and nothing reads them, so both are delivered.
+  const refId = character.nodes.find((n) => n.name === "Reference").id;
+  for (const name of ["Character", "Parts sheet"]) {
+    const id = character.nodes.find((n) => n.type === "edit" && n.name === name).id;
+    assert.ok(character.links.some((l) => l.from.node === refId && l.to.node === id && l.to.port === "image"), name);
+    assert.ok(!character.links.some((l) => l.from.node === id), name);
+  }
+  assert.match(character.nodes.find((n) => n.type === "comment").fields.text, /awesome-noodles.*character-sprites.*MIT/);
   const clip = c.agents[3].defaultWorkflow.graph;
   const byName = Object.fromEntries(clip.nodes.filter((n) => n.name).map((n) => [n.name, n]));
   assert.deepEqual(byName.Clip.fields, { model: "minimax/h3-max", prompt: "", resolution: "480p", duration: "5" });
@@ -301,7 +308,7 @@ test("several listings: each runs on its own token and state; custom:false decli
 
     // Logs name the listing.
     assert.equal(count(logs, /^\[later-one\] skipped: no token file at .*later-one \(add it and restart to serve this listing\)$/), 1);
-    assert.match(logs.join("\n"), /^\[img-one\] price \$0\.50 \(from the market\); per-job budget \$0\.47; its workflow "Idea to image": estimated cost \$[\d.]+, worst case \$[\d.]+, recommended price \$[\d.]+$/m);
+    assert.match(logs.join("\n"), /^\[img-one\] price \$0\.50 \(from the market\); per-job budget \$0\.47; its workflow "Idea to image": estimated cost \$[\d.]+, with 20% \$[\d.]+, recommended price \$[\d.]+$/m);
     assert.match(logs.join("\n"), /\[wf-any\] price \$1\.00 \(from the market\); per-job budget \$0\.95$/m);
     assert.match(logs.join("\n"), /\[img-one\] assignment \w+: new hire "Poster"/);
     assert.match(logs.join("\n"), /\[wf-any\] assignment \w+: delivered/);
@@ -322,7 +329,7 @@ test("a job keeps the budget it was accepted under when the listing's budget cha
     async price(args, { budgetUsd } = {}) {
       seen.push(budgetUsd);
       const pricing = { estimatedCostUsd: 0.01, fixedPrice: true, headroom: 1.25, depositUsd: 0.03, items: [], boundGraph: {} };
-      if (0.03 > budgetUsd) return { ok: false, refusals: [{ code: "DEPOSIT_TOO_HIGH", message: `this workflow needs a $0.03 deposit; this server accepts at most $${budgetUsd}` }], pricing, inputs: {} };
+      if (0.03 > budgetUsd) return { ok: false, refusals: [{ code: "OVER_BUDGET", message: `this workflow's estimated cost plus 20% is $0.03; this listing covers at most $${budgetUsd}` }], pricing, inputs: {} };
       return { ok: true, refusals: [], inputs: {}, pricing };
     },
     async run() { await gate; return { costUsd: 0.01, costExact: true, notices: [], outputs: [{ key: "t", kind: "text", text: "ok" }] }; },
@@ -350,14 +357,14 @@ test("a job keeps the budget it was accepted under when the listing's budget cha
   } finally { store.close(); await m.close(); }
 });
 
-test("price refresh: a price changed on the market takes effect; the drift alarm is logged once per price/worst case and once on recovery", async () => {
-  const low = fmtUsd(DEPOSIT); // budget = floor(0.95 × deposit) < deposit
+test("price refresh: a price changed on the market takes effect; the drift alarm is logged once per price/need and once on recovery", async () => {
+  const low = fmtUsd(DEPOSIT); // budget = floor(0.95 × need) < need
   const rec = recommendPrice({ depositUsd: DEPOSIT });
   const m = createMarketMock({ handle: "img-one", priceAmount: low });
   await m.listen();
   const files = catalogFiles([{ handle: "img-one", token: MOCK_TOKEN, graph: "default" }]);
   const { svc, logs } = await startCatalog(m, files);
-  const alarm = `[img-one] NEEDS OPERATOR — price $${low} no longer covers this listing's workflow (worst case $${fmtUsd(DEPOSIT)}); raise it to $${fmtUsd(rec)} on the market`;
+  const alarm = `[img-one] NEEDS OPERATOR — price $${low} no longer covers this listing's workflow (estimated cost + 20% is $${fmtUsd(DEPOSIT)}); raise it to $${fmtUsd(rec)} on the market`;
   try {
     assert.equal(logs.filter((l) => l === alarm).length, 1, logs.join("\n"));
     assert.ok(NOTIFY_LINES.test(alarm), "the alarm reaches the webhook");
@@ -367,7 +374,7 @@ test("price refresh: a price changed on the market takes effect; the drift alarm
     const runs0 = nano.runs();
     const tooLow = m.hire({ agent: "img-one", description: "a lighthouse at dawn" });
     await until(() => m.rows.get(tooLow).assignment.status === "cancelled", "the over-budget job declined");
-    assert.match(m.rows.get(tooLow).assignment.cancelDetail, /deposit/);
+    assert.match(m.rows.get(tooLow).assignment.cancelDetail, /estimated cost plus 20%/);
     assert.equal(nano.runs(), runs0);
     // Several refreshes later: still one alarm line.
     const n0 = m.calls("GET", /pricing-plans$/).length;
@@ -375,7 +382,7 @@ test("price refresh: a price changed on the market takes effect; the drift alarm
     assert.equal(logs.filter((l) => l === alarm).length, 1);
 
     m.setPrice("img-one", fmtUsd(rec));
-    const recovered = `[img-one] price $${fmtUsd(rec)} covers this listing's workflow again (worst case $${fmtUsd(DEPOSIT)})`;
+    const recovered = `[img-one] price $${fmtUsd(rec)} covers this listing's workflow again (estimated cost + 20% is $${fmtUsd(DEPOSIT)})`;
     await until(() => logs.includes(recovered), "the recovery line");
     assert.ok(NOTIFY_LINES.test(recovered));
     assert.equal(listing.worker().budget().budgetUsd, budgetFromPrice(rec));
@@ -530,8 +537,8 @@ test("configuration: the agents file replaces the single-listing settings; no li
 
 test("notifications: listing-prefixed lines still match; the webhook gets them and its URL is never logged", async () => {
   for (const l of ["[nanoodle-song] assignment ab12: new hire \"x\" for 1 USD", "[nanoodle-song] assignment ab12: delivered", "[nanoodle-song] stopped: 401; no new polls",
-    "[nanoodle-song] NEEDS OPERATOR — price $0.30 no longer covers this listing's workflow (worst case $0.37); raise it to $0.40 on the market",
-    "[nanoodle-song] price $0.40 covers this listing's workflow again (worst case $0.37)", "[nanoodle-song] price raised on the market from $0.30 to $0.40 (MARKET_AUTO_PRICE)"]) {
+    "[nanoodle-song] NEEDS OPERATOR — price $0.30 no longer covers this listing's workflow (estimated cost + 20% is $0.37); raise it to $0.40 on the market",
+    "[nanoodle-song] price $0.40 covers this listing's workflow again (estimated cost + 20% is $0.37)", "[nanoodle-song] price raised on the market from $0.30 to $0.40 (MARKET_AUTO_PRICE)"]) {
     assert.ok(NOTIFY_LINES.test(l), l);
   }
   for (const l of ["[nanoodle-song] price $0.40 (from the market); per-job budget $0.38", "[nanoodle-song] skipped: no token file at /x", "[nanoodle-song] assignment ab12: running the workflow"]) {
@@ -594,7 +601,7 @@ test("market-worker.mjs --agents-file: serves the listings with a token, skips t
   } finally { await m.close(); }
 });
 
-test("market-catalog.mjs plan and check: cost, deposit, recommendation, the market's price and a verdict; check fails a listing priced too low", { timeout: 60_000 }, async () => {
+test("market-catalog.mjs plan and check: cost, cost + 20%, recommendation, the market's price and a verdict; check fails a listing priced too low", { timeout: 60_000 }, async () => {
   const rec = recommendPrice({ depositUsd: DEPOSIT });
   const m = createMarketMock({ handle: "img-ok", priceAmount: fmtUsd(rec) });
   await m.listen();
@@ -609,7 +616,7 @@ test("market-catalog.mjs plan and check: cost, deposit, recommendation, the mark
     const rows = await plan({ file: files.file, baseUrl: m.url, nanogptBase: nano.url, out: (l) => out.push(l) });
     assert.deepEqual(rows.map((r) => [r.handle, r.verdict]), [["img-ok", "ok"], ["img-rich", "lower"], ["img-low", "too-low"], ["img-draft", "ok"], ["wf-any", "n/a"]]);
     const text = out.join("\n");
-    assert.match(text, new RegExp(`img-rich  Idea to image\\n  estimated cost  \\$[\\d.]+\\n  deposit         \\$${fmtUsd(DEPOSIT).replace(".", "\\.")} \\(the most a run can cost\\)\\n  recommended     \\$${fmtUsd(rec).replace(".", "\\.")}\\n  price           \\$2\\.00 \\(market, live\\); per-job budget \\$1\\.90\\n  verdict         could be lowered to \\$${fmtUsd(rec).replace(".", "\\.")}`));
+    assert.match(text, new RegExp(`img-rich  Idea to image\\n  estimated cost  \\$[\\d.]+\\n  cost \\+ 20%      \\$${fmtUsd(DEPOSIT).replace(".", "\\.")} \\(what the payout must cover\\)\\n  recommended     \\$${fmtUsd(rec).replace(".", "\\.")}\\n  price           \\$2\\.00 \\(market, live\\); per-job budget \\$1\\.90\\n  verdict         could be lowered to \\$${fmtUsd(rec).replace(".", "\\.")}`));
     assert.match(text, /img-low[\s\S]*verdict         too low: the worker would decline this listing's own workflow/);
     assert.match(text, /img-draft[\s\S]*price           \$[\d.]+ \(catalog priceUsd; not read on the market\)/);
     assert.match(text, /wf-any  \(buyers' own workflows only\)\n  price           \$1\.00 \(catalog priceUsd; not read on the market\); per-job budget \$0\.95/);
@@ -627,4 +634,25 @@ test("market-catalog.mjs plan and check: cost, deposit, recommendation, the mark
     assert.equal((await runNode([bin, "nope"])).status, 2);
     assert.equal(REPO_ROOT.replace(/\/$/, ""), ROOT.replace(/\/$/, ""));
   } finally { await m.close(); }
+});
+
+test("marketNeedUsd: estimated cost + 20%, rounded up to the cent, at least $0.01; no headroom on top", async () => {
+  const { marketNeedUsd, MARKET_MARGIN_RATE, createWorkflowRunner } = await import("../src/market/runner.mjs");
+  assert.equal(MARKET_MARGIN_RATE, 0.2);
+  for (const [est, want] of [[0, 0.01], [0.001, 0.01], [0.009648, 0.02], [0.033841, 0.05], [0.151844, 0.19], [0.25, 0.30], [0.262269, 0.32], [0.5, 0.60], [1, 1.20]]) {
+    assert.equal(marketNeedUsd(est), want, `estimate ${est}`);
+  }
+  for (const bad of [-1, NaN, Infinity, "0.1", undefined]) assert.throws(() => marketNeedUsd(bad), TypeError);
+  // The runner reports that figure (not the direct rails' deposit) and refuses on it alone.
+  const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 5, baseUrl: nano.url });
+  const args = { graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse at dawn" } };
+  const fits = await runner.price(args);
+  assert.equal(fits.ok, true);
+  assert.equal(fits.pricing.depositUsd, marketNeedUsd(fits.pricing.estimatedCostUsd));
+  const exact = await runner.price(args, { budgetUsd: fits.pricing.depositUsd });
+  assert.equal(exact.ok, true, "a budget equal to cost + 20% is enough");
+  const under = await runner.price(args, { budgetUsd: fits.pricing.depositUsd - 0.01 });
+  assert.equal(under.ok, false);
+  assert.deepEqual(under.refusals.map((r) => r.code), ["OVER_BUDGET"]);
+  assert.match(under.refusals[0].message, /estimated cost plus 20% is \$[\d.]+; this listing covers at most \$[\d.]+/);
 });
