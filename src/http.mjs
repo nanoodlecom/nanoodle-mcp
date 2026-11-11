@@ -72,8 +72,9 @@ const ICON_LINKS =
   `<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">` +
   `<link rel="icon" type="image/png" href="/favicon.png">` +
   `<link rel="apple-touch-icon" href="/apple-touch-icon.png">`;
-const OG_IMAGE_ALT = "A glowing teal bowl of noodles on a dark background, a Nano coin dropping in, " +
-  "noodle strands wiring it to image, video, text, and audio nodes.";
+const OG_IMAGE_ALT = "nanoodle-mcp share card on a near-black dot grid: the noodle-bowl icon beside a " +
+  "cyan-to-periwinkle gradient wordmark, the headline 'AI workflows, paid in Nano over x402.', the " +
+  "connect command in a bordered pill, and text, image, video, and audio port dots.";
 
 /** QR matrix → crisp inline SVG (one path, viewBox-scaled). */
 export function qrSvg(text) {
@@ -125,7 +126,7 @@ const LANDING_CSS = `
   @font-face{font-family:'Righteous';font-style:normal;font-weight:400;font-display:swap;
     src:url(/righteous-latin-ext.woff2) format('woff2');
     unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
-  :root{color-scheme:dark;--fg:#eef1f7;--bg:#0b0d12;--muted:#aeb7c8;--card:#12151d;--card2:#171b25;--edge:#262c3a;
+  :root{color-scheme:dark;--fg:#eef1f7;--bg:#0b0d12;--muted:#c3c9d6;--card:#12151d;--card2:#171b25;--edge:#262c3a;
     --accent:#7c8cff;--accent-ink:#a9b6ff;--accent2:#ff79c6;--signal:#d7ff3f;--labs-ink:#101110;--paper:#f1f2ea}
   *{box-sizing:border-box}
   ::selection{background:rgba(124,140,255,.35)}
@@ -153,14 +154,14 @@ const LANDING_CSS = `
   .sub{color:var(--muted);text-align:center;margin:.75rem auto 2rem;max-width:40rem}
   .connect-wrap{display:flex;flex-direction:column;gap:.65rem}
   .tabs{display:flex;justify-content:center;gap:.35rem}
-  .tabs .tab{font:inherit;font-size:.8rem;padding:.35rem .85rem;border-radius:999px;border:1px solid var(--edge);
+  .tabs .tab{font:inherit;font-size:.82rem;padding:.5rem .95rem;border-radius:999px;border:1px solid var(--edge);
     background:transparent;color:var(--muted);cursor:pointer}
   .tabs .tab:hover{border-color:#3a425a;color:var(--fg)}
   .tabs .tab.on{border-color:var(--accent);background:rgba(124,140,255,.14);color:var(--accent-ink)}
   .connect{display:flex;align-items:center;gap:1rem;background:var(--card);border:1px solid var(--accent);
     border-radius:.8rem;box-shadow:0 0 28px rgba(124,140,255,.18);padding:1rem 1.25rem}
   .connect pre{margin:0;padding:0;background:none;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;overflow-x:hidden;font-size:.95rem;color:var(--accent-ink)}
-  button{font:inherit;font-size:.85rem;padding:.4rem .9rem;border-radius:.5rem;border:1px solid var(--edge);
+  button{font:inherit;font-size:.85rem;padding:.5rem .95rem;border-radius:.5rem;border:1px solid var(--edge);
     background:var(--card2);color:var(--fg);cursor:pointer;flex:none}
   button:hover{border-color:#3a425a}
   .connect button{background:linear-gradient(90deg,var(--accent),var(--accent2));border:none;color:#0b0d12;font-weight:700}
@@ -183,11 +184,11 @@ const LANDING_CSS = `
   .tool .links{font-size:.85rem;white-space:nowrap}
   .tool .thead{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem}
   .tool .tname{font-weight:700;font-size:1.02rem}
-  .tool .tid{font-size:.72rem;color:var(--muted)}
+  .tool .tid{font-size:.76rem;color:var(--muted)}
   .tool .intent{color:var(--muted);font-size:.88rem;margin:.45rem 0 .7rem}
   .chain{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .35rem;margin:0 0 .8rem}
   .chain .arr{color:var(--muted);font-size:.75rem}
-  .chip{font:.72rem/1 ui-monospace,monospace;padding:.28rem .45rem;border-radius:7px;background:rgba(174,183,200,.12);color:#aeb7c8;white-space:nowrap}
+  .chip{font:.78rem/1 ui-monospace,monospace;padding:.34rem .5rem;border-radius:7px;background:rgba(195,201,214,.12);color:#c3c9d6;white-space:nowrap}
   .chip.k-text{background:rgba(124,140,255,.15);color:#a9b6ff}
   .chip.k-llm{background:rgba(167,139,250,.15);color:#c4b5fd}
   .chip.k-image{background:rgba(255,121,198,.13);color:#ffa9dc}
@@ -310,6 +311,8 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     ? "AI workflows paid in Nano over x402 — image, video, audio, and text pipelines behind one MCP endpoint. No account, no API key."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
   const ogHead =
+    `<meta name="theme-color" content="#0b0d12">` +
+    `<link rel="preload" href="/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
     `<meta name="description" content="${esc(desc)}">` +
     `<meta property="og:type" content="website">` +
     `<meta property="og:site_name" content="${esc(name)}">` +

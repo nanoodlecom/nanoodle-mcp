@@ -12,8 +12,9 @@ this server hosts:
 - **Icon** (`icon-512.png` and the favicons cut from it): the
   [favicon](https://github.com/nanoodlecom/awesome-noodles/blob/main/graphs/favicon.noodle-graph.json)
   noodle — brand description in, one bold square glyph out.
-- **OG card** (`og.jpg`, 1200×630): an og-card noodle (brand copy + house style
-  → LLM art direction → image model → 1200×630 crop).
+- **OG card** (`og.jpg`, 1200×630): rendered from the landing page's own brand
+  (dot grid, gradient Righteous wordmark, port-colour dots) so the share card
+  matches the page it links to. Earlier versions came from an og-card noodle.
 
 To regenerate, run the favicon graph with your own brand text and resize the
 result (e.g. `magick icon.jpg -resize 48x48 favicon.png`,
