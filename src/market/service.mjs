@@ -115,7 +115,9 @@ export function readDefaultWorkflow(file, inputName) {
     die(`--default-input ${JSON.stringify(name)}: the graph has no text node with that name (it has: ${named.map((n) => n.name).join(", ") || "none"})`);
   }
   const label = typeof graph.name === "string" && graph.name.trim() ? graph.name.trim().slice(0, 80) : basename(file).replace(/\.json$/i, "");
-  return { graph, inputName: name, label };
+  // Every other named text node can be set by a "Name: value" line in the brief.
+  const fieldNames = named.filter((n) => n.name !== name).map((n) => n.name);
+  return { graph, inputName: name, label, fieldNames };
 }
 
 /**

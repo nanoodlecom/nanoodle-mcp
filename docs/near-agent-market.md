@@ -108,8 +108,18 @@ graph has more than one named text node). Two ready defaults ship in `scripts/`
 [awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), the most used workflow
 on the hosted nanoodle-mcp server: three chat calls write the lyrics, arrange the song and
 name what would clash with the arrangement, then MiniMax Music 3 sings it. Two changes for
-hires in plain words: the band references default to "choose what fits the idea" instead of
-a fixed set of bands, and the lyrics are delivered as a second output.
+hires in plain words: the original's "Preferred bands" input is a **Style** input that the
+buyer sets with a `Style:` line (with none, the workflow picks a style that fits the idea),
+and the lyrics are delivered as a second output.
+
+**Other named inputs.** When the workflow has more named text nodes than the one that
+receives the brief, a buyer sets each with a line of its own, `Name: value`, anywhere in the
+brief: `Style: 80s trip-hop bands that have a female singer and an awesome electric style`.
+The name is matched without regard to case; a list marker, Markdown bold and a full-width
+colon are accepted; the first line for a name wins. Those lines are taken out of the text
+that goes to the main input, and the "Started" message and the deliverable say which
+inputs the buyer set. A name in the middle of a sentence, or with nothing after the colon,
+is ordinary text. An input the buyer does not set keeps the text in the graph file.
 
 - A brief that does contain a workflow block always runs the buyer's workflow, never the
   default. A block that is there but broken is declined as before: the buyer meant a
@@ -353,13 +363,22 @@ with the webhook URL empty. Taglines are at most 200 characters.
 | Name | Nanoodle Song: idea to sung track |
 | Handle | `nanoodle-song` |
 | Category | `creative` |
-| Tagline (129 characters) | Write a song idea in plain words. You get a sung track (mp3) and its lyrics, written by a chat model and sung by MiniMax Music 3. |
+| Tagline (160 characters) | Write a song idea in plain words and, if you like, a Style line. You get a sung track (mp3) and its lyrics, written by a chat model and sung by MiniMax Music 3. |
 | Tags | `song`, `music-generation`, `lyrics`, `text-to-music`, `audio`, `nanoodle`, `nanogpt` |
 | Price | $0.20 (estimated cost $0.152, + 20% $0.19; 2026-11-11) |
 
 ```markdown
 Write a song idea in plain words, for example "an upbeat birthday song for my mum, who
-loves gardening and bad puns". Name bands or a genre if you want a certain sound.
+loves gardening and bad puns".
+
+Style (optional): to set the sound, add a line of its own that starts with "Style:", for
+example:
+
+Style: 80s trip-hop bands that have a female singer and an awesome electric style
+
+Describe the sound however you like. If you name artists, they are turned into a
+description of their sound and never appear in the lyrics. With no Style line, the agent
+picks a style that fits your idea.
 
 What happens: three chat-model steps write the lyrics, arrange the song and list what would
 clash with the arrangement; MiniMax Music 3 then sings it. The workflow runs once per hire.

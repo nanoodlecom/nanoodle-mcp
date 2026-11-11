@@ -31,6 +31,33 @@ export const BRIEF_TEMPLATE = [
   "```",
 ].join("\n");
 
+/**
+ * Split a brief in plain words into its main text and the listing workflow's other
+ * named inputs, given as lines of the form "Name: value" (for example "Style: slow
+ * country ballad"). Only the names passed in are recognised, case-insensitively; the
+ * first line for a name wins (later ones are dropped); a line with nothing after the
+ * colon is ordinary text. Recognised lines are taken out of the main text.
+ * @param {string} text
+ * @param {string[]} [fieldNames]
+ * @returns {{ main: string, fields: Record<string, string> }}
+ */
+export function splitPlainBrief(text, fieldNames = []) {
+  const fields = {};
+  const raw = String(text || "");
+  if (!fieldNames.length) return { main: raw.trim(), fields };
+  const byLower = new Map(fieldNames.map((n) => [String(n).trim().toLowerCase(), n]));
+  const kept = [];
+  for (const line of raw.split(/\r?\n/)) {
+    // "Style: x", "- Style: x", "**Style:** x", "Style： x" (full-width colon)
+    const m = /^\s*(?:[-*•]\s+)?\**\s*([^:：*\n]{1,60}?)\s*\**\s*[:：]\s*\**\s*(.*)$/.exec(line);
+    const name = m ? byLower.get(m[1].trim().toLowerCase()) : undefined;
+    const value = m ? m[2].trim() : "";
+    if (name !== undefined && value) { if (!(name in fields)) fields[name] = value; continue; }
+    kept.push(line);
+  }
+  return { main: kept.join("\n").trim(), fields };
+}
+
 const HOW = "Put ONE fenced code block tagged nanoodle in the brief, holding a JSON object with \"graph\" (a nanoodle graph) or \"url\" (a full nanoodle share link with its #g= fragment), plus \"inputs\" (name -> text).";
 
 export class BriefError extends Error {

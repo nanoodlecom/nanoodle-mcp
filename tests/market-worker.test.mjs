@@ -432,3 +432,40 @@ test("a run whose every output is empty text is handed back with a refund; one r
   assert.deepEqual(market.violations, []);
   store.close(); await market.close();
 });
+
+test("a plain brief with a \"Style:\" line sets the workflow's Style input; the messages say so; without it the default stays", async () => {
+  const market = createMarketMock();
+  await market.listen();
+  const store = openMarketState({ dir: mkdtempSync(join(tmpdir(), "market-fields-")) });
+  const seen = [];
+  const pricing = { estimatedCostUsd: 0.001, fixedPrice: true, headroom: 1.25, depositUsd: 0.01, items: [], boundGraph: {} };
+  const runner = {
+    price: async (args) => { seen.push(args.inputs); return { ok: true, refusals: [], inputs: args.inputs, pricing }; },
+    run: async () => ({ costUsd: 0.001, costExact: true, notices: [], outputs: [{ key: "Lyrics", kind: "text", text: "la la" }] }),
+  };
+  const graph = { v: 1, name: "Idea to song", nodes: [{ id: "n1", type: "text", name: "Song idea", fields: { text: "" } }, { id: "n5", type: "text", name: "Style", fields: { text: "No style given." } }], links: [] };
+  const logs = [];
+  const worker = createMarketWorker({
+    client: createMarketClient({ baseUrl: market.url, token: MOCK_TOKEN }), store, runner, budgetUsd: 0.5, customWorkflows: false,
+    defaultWorkflow: { graph, inputName: "Song idea", label: "Idea to song", fieldNames: ["Style"] }, log: (l) => logs.push(l),
+  });
+  const styled = market.hire({ description: "A wistful song about the singularity.\nStyle: 80s trip-hop bands that have a female singer and an awesome electric style" });
+  await worker.tick(); await worker.drain();
+  assert.deepEqual(seen.at(-1), { "Song idea": "A wistful song about the singularity.", Style: "80s trip-hop bands that have a female singer and an awesome electric style" });
+  const row = market.rows.get(styled);
+  assert.equal(row.assignment.status, "submitted");
+  assert.match(row.messages.map((m) => m.body).join("\n"), /runs once now with your brief as its input and Style as you set it:/);
+  assert.match(row.versions[0].markdown, /with your brief as the input and Style as you set it \(1 output\)/);
+  assert.ok(logs.some((l) => /plain brief \(37 characters; also set: Style\) → default workflow "Idea to song"/.test(l)), logs.join("\n"));
+  // No Style line: only the main input is sent, so the graph's own default Style text is used.
+  const plain = market.hire({ description: "An upbeat birthday song for my mum." });
+  await worker.tick(); await worker.drain();
+  assert.deepEqual(seen.at(-1), { "Song idea": "An upbeat birthday song for my mum." });
+  assert.doesNotMatch(market.rows.get(plain).versions[0].markdown, /as you set/);
+  // Only a Style line: the job title is the song idea.
+  const onlyStyle = market.hire({ title: "Rainy day song", description: "Style: slow country ballad" });
+  await worker.tick(); await worker.drain();
+  assert.deepEqual(seen.at(-1), { "Song idea": "Rainy day song", Style: "slow country ballad" });
+  assert.deepEqual(market.violations, []);
+  store.close(); await market.close();
+});

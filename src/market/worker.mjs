@@ -38,7 +38,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseBrief, BriefError } from "./brief.mjs";
+import { splitPlainBrief, parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
 import {
   pricingSummary, buildDeliverable, textOutputsFile, briefDeclineDetail, refusalDeclineDetail, failureDeclineDetail, customNotOfferedDetail,
@@ -68,7 +68,7 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  * @param {object} o.runner       createWorkflowRunner()
  * @param {number} o.budgetUsd    per-job budget (the most a job's estimated cost + 20% may be)
  * @param {number|null} [o.listingPriceUsd]  shown in the deliverable when set
- * @param {{graph: object, inputName: string, label: string}|null} [o.defaultWorkflow]
+ * @param {{graph: object, inputName: string, label: string, fieldNames?: string[]}|null} [o.defaultWorkflow]
  *        when set, a brief with no workflow block runs this graph with the brief text as
  *        its `inputName` input (a buyer can hire in plain words)
  * @param {boolean} [o.customWorkflows]  false: this listing runs only its default workflow; a brief with a
@@ -139,6 +139,7 @@ export function createMarketWorker({
   async function priceFromRow(rec, row, jobBudget) {
     let args;
     let usedDefault = false;
+    let usedFields = [];
     try {
       args = parseBrief(row.job && row.job.description);
       if (!customWorkflows) {
@@ -155,14 +156,17 @@ export function createMarketWorker({
       // A brief in plain words (no workflow block at all) runs the operator's default
       // workflow, with the brief as its input. A block that is there but broken is still
       // refused: the buyer meant a specific workflow, and guessing would spend their hire.
-      const plain = String((row.job && row.job.description) || "").trim() || String((row.job && row.job.title) || "").trim();
+      // "Name: value" lines set the workflow's other named inputs (a song's "Style: ...").
+      const split = splitPlainBrief((row.job && row.job.description) || "", (defaultWorkflow && defaultWorkflow.fieldNames) || []);
+      const plain = split.main || String((row.job && row.job.title) || "").trim();
       if (!(defaultWorkflow && e.code === "NO_REQUEST" && plain)) {
         log(`assignment ${short(rec.id)}: brief refused (${e.code})`);
         return { decline: { reason: "rejected", code: e.code, detail: briefDeclineDetail(e.message) } };
       }
-      args = { graph: defaultWorkflow.graph, inputs: { [defaultWorkflow.inputName]: plain } };
+      args = { graph: defaultWorkflow.graph, inputs: { ...split.fields, [defaultWorkflow.inputName]: plain } };
       usedDefault = true;
-      log(`assignment ${short(rec.id)}: plain brief (${plain.length} characters) → default workflow ${JSON.stringify(defaultWorkflow.label)}`);
+      usedFields = Object.keys(split.fields);
+      log(`assignment ${short(rec.id)}: plain brief (${plain.length} characters${usedFields.length ? `; also set: ${usedFields.join(", ")}` : ""}) → default workflow ${JSON.stringify(defaultWorkflow.label)}`);
     }
     const priced = await runner.price(args, { budgetUsd: jobBudget });
     if (!priced.ok) {
@@ -172,7 +176,7 @@ export function createMarketWorker({
       log(`assignment ${short(rec.id)}: workflow refused (${codes.join(", ")})`);
       return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd: jobBudget }) } };
     }
-    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault };
+    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault, usedFields };
   }
 
   async function phaseNew(rec, row) {
@@ -181,10 +185,11 @@ export function createMarketWorker({
     const r = await priceFromRow(rec, row, jobBudget);
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
-    prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault });
+    prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault, usedFields: r.usedFields });
     log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, with 20% $${r.pricing.depositUsd}, within budget $${jobBudget}`);
     return set(rec.id, ok({
       phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
+      defaultFields: r.usedDefault ? r.usedFields : [],
       budgetUsd: jobBudget, listingPriceUsd: jobPrice,
     }));
   }
@@ -235,7 +240,7 @@ export function createMarketWorker({
       prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
     }
     prepared.delete(rec.id);
-    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null }), `nanoodle-start-${rec.id}`);
+    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null, fields: prep.usedDefault ? prep.usedFields || [] : [] }), `nanoodle-start-${rec.id}`);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now() }));
     await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);

@@ -157,15 +157,21 @@ test("notifications: which lines are sent, buyer text is escaped, a dead webhook
   assert.throws(() => readConfig([], { MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.5", NANOGPT_API_KEY: "k", MARKET_NOTIFY_URL: "http://example.test/x" }), /must be an https URL/);
 });
 
-test("the hosted song workflow: the brief goes to Song idea; the lyrics are delivered as well as the song", () => {
+test("the hosted song workflow: the brief goes to Song idea, Style is a settable field; the lyrics are delivered as well as the song", () => {
   const file = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "market-sing.json");
   assert.throws(() => readDefaultWorkflow(file), (e) => e instanceof MarketConfigError && /2 named text nodes/.test(e.message));
   const d = readDefaultWorkflow(file, "Song idea");
   assert.equal(d.label, "Idea to song");
   assert.equal(d.inputName, "Song idea");
+  assert.deepEqual(d.fieldNames, ["Style"]);
   const byName = Object.fromEntries(d.graph.nodes.filter((n) => n.name).map((n) => [n.name, n]));
   assert.equal(byName["Song idea"].fields.text, "");
-  assert.doesNotMatch(byName["Preferred bands"].fields.text, /Portishead/);
+  // With no "Style:" line the workflow picks a style itself; no band is named anywhere in the graph.
+  assert.equal(byName.Style.fields.text, "No style given. Choose a style that fits the song idea.");
+  assert.ok(!("Preferred bands" in byName));
+  assert.doesNotMatch(JSON.stringify(d.graph), /Portishead|Massive Attack|Tricky/);
+  assert.equal(byName["Idea + style"].fields.sep, "\n\nStyle:\n");
+  assert.ok(d.graph.links.some((l) => l.from.node === byName.Style.id && l.to.node === byName["Idea + style"].id));
   assert.equal(byName.Sing.type, "music");
   // "Lyrics" is a sink (nothing reads it), so the engine returns it as an output.
   assert.equal(byName.Lyrics.type, "join");

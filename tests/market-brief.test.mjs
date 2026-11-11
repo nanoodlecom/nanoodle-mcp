@@ -1,7 +1,7 @@
 // The job-brief format the Agent Market worker accepts (src/market/brief.mjs).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseBrief, BriefError, BRIEF_TEMPLATE, fencedBlocks } from "../src/market/brief.mjs";
+import { parseBrief, BriefError, BRIEF_TEMPLATE, fencedBlocks, splitPlainBrief } from "../src/market/brief.mjs";
 
 const REQ = { graph: { v: 1, nodes: [], links: [] }, inputs: { Idea: "x" } };
 const code = (fn) => { try { fn(); } catch (e) { assert.ok(e instanceof BriefError, String(e)); return e.code; } return null; };
@@ -51,4 +51,26 @@ test("the published template parses", () => {
 
 test("an unclosed fence runs to the end of the brief", () => {
   assert.deepEqual(fencedBlocks("```nanoodle\n{}\n"), [{ info: "nanoodle", body: "{}\n" }]);
+});
+
+test("splitPlainBrief: \"Name: value\" lines set a listing workflow's other named inputs", () => {
+  const S = ["Style"];
+  assert.deepEqual(splitPlainBrief("A wistful song about the singularity.\nStyle: 80s trip-hop bands that have a female singer", S),
+    { main: "A wistful song about the singularity.", fields: { Style: "80s trip-hop bands that have a female singer" } });
+  // Case, spacing, a list marker, Markdown bold and a full-width colon are all accepted.
+  for (const line of ["style : slow country ballad", "- Style: slow country ballad", "**Style:** slow country ballad", "**STYLE**: slow country ballad", "Style： slow country ballad"]) {
+    assert.deepEqual(splitPlainBrief(`${line}\r\nA song about rain`, S), { main: "A song about rain", fields: { Style: "slow country ballad" } }, line);
+  }
+  // The first line for a name wins and later ones are dropped; unknown names stay in the text.
+  assert.deepEqual(splitPlainBrief("Style: funk\nMood: happy\nstyle: jazz\nA song", S), { main: "Mood: happy\nA song", fields: { Style: "funk" } });
+  // Nothing after the colon, or a name in the middle of a sentence, is ordinary text.
+  assert.deepEqual(splitPlainBrief("Style:\njust text", S), { main: "Style:\njust text", fields: {} });
+  assert.deepEqual(splitPlainBrief("A song about my cat. Style: funk", S), { main: "A song about my cat. Style: funk", fields: {} });
+  // Only field lines: the main text is empty (the worker then falls back to the job title).
+  assert.deepEqual(splitPlainBrief("Style: funk", S), { main: "", fields: { Style: "funk" } });
+  // A workflow with no other named input: the brief is untouched.
+  assert.deepEqual(splitPlainBrief("  Style: funk\nA song  ", []), { main: "Style: funk\nA song", fields: {} });
+  assert.deepEqual(splitPlainBrief(undefined, S), { main: "", fields: {} });
+  // Several names, with spaces in a name.
+  assert.deepEqual(splitPlainBrief("Art style: ink\nMain colour: teal\nA fox", ["Art style", "Main colour"]), { main: "A fox", fields: { "Art style": "ink", "Main colour": "teal" } });
 });
