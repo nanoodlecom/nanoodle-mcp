@@ -18,6 +18,7 @@ import { openMarketState } from "./state.mjs";
 import { createWorkflowRunner, checkNanoGptKey } from "./runner.mjs";
 import { createMarketWorker, logSafe } from "./worker.mjs";
 import { createWebhookHandler, secretFileReader } from "./webhook.mjs";
+import { createBidder, openBidState } from "./bidder.mjs";
 import {
   readCatalog, fetchListingPrice, patchListingPrice, budgetFromPrice, recommendPrice, fmtUsd, usdMicros,
   PRICE_REFRESH_SECONDS, PROBE_BRIEF,
@@ -34,6 +35,7 @@ file, workflow, state directory (<state-dir>/<handle>) and price; the budget com
 listing's price on the market. It replaces --budget-usd, --listing-price-usd, --token-file,
 --default-graph and --default-input. See docs/near-agent-market.md.
   MARKET_PRICE_REFRESH_SECONDS  (env only) how often each listing's price is read again (default 600)
+  MARKET_BID_POLL_SECONDS       (env only) how often a listing with "bids": true reads the job board (default 60)
   MARKET_AUTO_PRICE=1           (env only) try to raise a listing's price that is below what its own
                                 workflow needs, with the agent's token (the market may refuse)
 
@@ -207,11 +209,14 @@ function readCatalogConfig(a, env, agentsFile, { needKey }) {
   const refreshRaw = env.MARKET_PRICE_REFRESH_SECONDS;
   const refreshSeconds = refreshRaw != null && refreshRaw !== "" ? Number(refreshRaw) : PRICE_REFRESH_SECONDS;
   if (!(Number.isFinite(refreshSeconds) && refreshSeconds > 0)) die("MARKET_PRICE_REFRESH_SECONDS must be a number above 0");
+  const bidRaw = env.MARKET_BID_POLL_SECONDS;
+  const bidSeconds = bidRaw != null && bidRaw !== "" ? Number(bidRaw) : 60;
+  if (!(Number.isFinite(bidSeconds) && bidSeconds > 0)) die("MARKET_BID_POLL_SECONDS must be a number above 0");
   const auto = (env.MARKET_AUTO_PRICE || "").trim();
   if (auto && auto !== "0" && auto !== "1") die("MARKET_AUTO_PRICE must be 1 or 0");
   return {
     catalog, ignored, apiKey: apiKey || null,
-    priceRefreshMs: refreshSeconds * 1000, autoPrice: auto === "1",
+    priceRefreshMs: refreshSeconds * 1000, bidPollMs: bidSeconds * 1000, autoPrice: auto === "1",
     ...commonConfig(a, env),
   };
 }
@@ -455,6 +460,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
         worker = createMarketWorker({
           client, store, runner, budgetUsd, listingPriceUsd: price.priceUsd,
           defaultWorkflow: agent.defaultWorkflow, customWorkflows: agent.custom, customHandle: agent.custom ? null : customHandle,
+          bidTerms: agent.bids ? bidTerms : null,
           concurrency: cfg.concurrency, retainMs: cfg.retainMs, log: L,
         });
       } else {
@@ -485,11 +491,36 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
     }
   }
 
+  // A job awarded from one of this listing's bids: its escrow is the quoted price.
+  const bidTerms = (escrowAmount) => {
+    const micros = usdMicros(escrowAmount);
+    return micros != null && micros > 0 ? { priceUsd: micros / 1e6, budgetUsd: budgetFromPrice(micros / 1e6) } : null;
+  };
+  let bidder = null;
+  let bidProblem = null;
+  /** One pass over the job board (only for a listing with "bids": true that is taking jobs). Never throws. */
+  async function bidTick() {
+    if (!agent.bids || !worker) return;
+    try {
+      if (!bidder) {
+        bidder = createBidder({
+          client, runner, state: openBidState(join(cfg.stateDir, agent.handle, "bids.json")),
+          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, log: (line) => L(`bids: ${line}`),
+        });
+      }
+      await bidder.tick();
+      bidProblem = null;
+    } catch (e) {
+      const why = String((e && e.message) || e);
+      if (why !== bidProblem) { L(`bids: NEEDS OPERATOR — ${why}`); bidProblem = why; }
+    }
+  }
+
   const gate = {
     tick: async () => { if (worker) await worker.tick(); },
     drain: async () => { if (worker) await worker.drain(); },
   };
-  return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
+  return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
 }
 
 async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }) {
@@ -527,7 +558,21 @@ async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }
   schedule();
   const loops = listings.map((l) => runLoop(l.gate, l.store, { pollMs: cfg.pollMs, once: cfg.once, log: l.log }));
   const done = Promise.all(loops.map((x) => x.done)).then((codes) => { stopped = true; clearTimeout(timer); return Math.max(0, ...codes); });
-  const stop = () => { stopped = true; clearTimeout(timer); for (const x of loops) x.stop(); };
+  // Quotes: listings with "bids": true read the job board and bid on jobs that carry a workflow (bidder.mjs).
+  const bidders = listings.filter((l) => l.bids);
+  let bidTimer = null;
+  const bidPass = async () => {
+    for (const l of bidders) { if (stopped) return; await l.bidTick(); }
+    if (stopped || cfg.once) return;
+    bidTimer = setTimeout(bidPass, cfg.bidPollMs);
+    bidTimer.unref?.();
+  };
+  if (bidders.length) {
+    log(`bids: ${bidders.map((l) => l.handle).join(", ")} read${bidders.length === 1 ? "s" : ""} the job board every ${cfg.bidPollMs / 1000} s and bid${bidders.length === 1 ? "s" : ""} on jobs that carry a nanoodle workflow`);
+    bidPass();
+  }
+  done.then(() => clearTimeout(bidTimer));
+  const stop = () => { stopped = true; clearTimeout(timer); clearTimeout(bidTimer); for (const x of loops) x.stop(); };
 
   // Push: the market's signed events make a listing poll at once (webhook.mjs). Only
   // listings with a "webhookSecretFile" have an endpoint; the others are polled as before.

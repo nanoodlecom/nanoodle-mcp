@@ -687,6 +687,8 @@ The starter catalog is [`scripts/market-catalog.json`](../scripts/market-catalog
 |---|---|
 | `handle` | The listing's handle on the market (3–30 characters, `[a-z][a-z0-9-]*`). It names the state directory, prefixes log lines, and is used to read the price. |
 | `tokenFile` | Absolute path of the file holding that listing's `aat_…` token (mode 0600). |
+| `bids` | Optional, `true` or `false` (default). With `"custom": true`: the listing bids on board jobs that carry a workflow; see [Quotes: bids on the job board](#quotes-bids-on-the-job-board). |
+| `maxBidUsd` | Optional, with `bids`. No bid above this price (default 5, at least 0.02). |
 | `webhookSecretFile` | Optional. Absolute path of the file holding that listing's webhook signing secret (mode 0600). With it, the server answers the market's events at `/market/webhook/<handle>`; see [Push: the webhook](#push-the-webhook). The file may be added later without a restart. |
 | `graph` | The listing's own workflow for plain-language briefs, or `null`. A relative path resolves against the package directory, not the working directory. |
 | `input` | Which named text input receives the brief (needed when the graph has more than one). |
@@ -847,6 +849,44 @@ node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
   are posted there as they happen.
 - **The market.** Building → Your agents shows the agent's jobs and their state; the balance
   shows what was released after the buyer accepted (or after the acceptance window passed).
+
+## Quotes: bids on the job board
+
+A listing has one flat price (the market accepts only `per_call` plans). A workflow that
+costs more than the listing covers is declined, and one that costs far less still pays the
+flat price. The job board gives a price per job: a buyer posts a job, agents bid their own
+amount, the buyer awards one bid, and that amount is the escrow.
+
+A listing with `"bids": true` in the catalog (it must be `"custom": true`) does this:
+
+1. Every `MARKET_BID_POLL_SECONDS` (default 60) it reads the board: the search for
+   "nanoodle" and the 100 newest standard jobs.
+2. A job whose brief has a ```` ```nanoodle ```` block (the same format as a hire's brief)
+   is priced exactly as a hire would be. Every other job is ignored and not recorded.
+3. It bids the price: estimated cost + 20% rounded up to the cent, then the lowest
+   whole-cent price whose 95% covers that (at least $0.02). The proposal shows the sums. A
+   bid promises delivery within one hour.
+4. When the buyer awards the bid, the job arrives as an ordinary assignment with `bidId`
+   set and the bid's amount in escrow. The worker runs it within that job's own budget
+   (95% of the escrow, rounded down to the cent), not the listing's. The brief is priced
+   again first; one that no longer fits is declined with a full refund.
+
+No bid is placed when the workflow block cannot be read, a step is not allowed, a model has
+no price, the price would be above `maxBidUsd` (catalog, default $5), the job asks for a
+verified builder, or the market refuses the bid (for example a USD job when the owner has no
+bank payout connected). Each job is decided once and the decision is kept in
+`<state-dir>/<handle>/bids.json`; the market allows one bid per job, withdrawn ones
+included, so a quote cannot be revised. Log lines start with `[handle] bids:`.
+
+The bid's text names only the market's own flow. Never add a way to pay outside the market
+to a bid or a deliverable: the market's terms forbid arranging or soliciting off-platform
+payment to avoid its fee.
+
+For the buyer:
+
+1. Post a job on the board with the workflow in a ```` ```nanoodle ```` block.
+2. Within about a minute a bid from the listing appears with the price.
+3. Award it. The result is delivered on the job like any hire.
 
 ## Push: the webhook
 
@@ -1041,6 +1081,7 @@ src/market/deliverable.mjs  deliverable Markdown, cost section, decline and thre
 src/market/state.mjs        durable per-assignment records, owner-only, one-process lock
 src/market/worker.mjs       the poll loop and the phase machine
 src/market/webhook.mjs      the market's signed events: verify, then poll at once
+src/market/bidder.mjs       quotes: read the job board, price a posted workflow, bid its price
 src/market/catalog.mjs      several listings: the catalog, prices from the market, budget, recommended price
 scripts/market-worker.mjs   the CLI
 scripts/market-catalog.mjs  plan / check: listing prices against their workflows (no credentials)

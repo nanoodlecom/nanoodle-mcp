@@ -75,6 +75,9 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  *        workflow block is declined before start (default true)
  * @param {string|null} [o.customHandle]  with customWorkflows false: the handle of a listing that does run
  *        buyers' own workflows, named in that decline
+ * @param {((escrowAmount: string) => { priceUsd: number, budgetUsd: number }|null)|null} [o.bidTerms]
+ *        for a job awarded from a bid (the row has a bidId): the price and budget its escrow gives.
+ *        Unset, such a job runs within the listing's budget like any other.
  * @param {number} [o.concurrency]  assignments advanced at once (default 2)
  * @param {number} [o.backoffMs]    first retry delay after a transient error (default 30 s, doubling to 10 min)
  * @param {number} [o.retainMs]     keep finished records this long (default 30 days)
@@ -83,7 +86,7 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  */
 export function createMarketWorker({
   client, store, runner, budgetUsd, listingPriceUsd = null, defaultWorkflow = null,
-  customWorkflows = true, customHandle = null, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
+  customWorkflows = true, customHandle = null, bidTerms = null, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
   log: rawLog = () => {}, now = Date.now,
 }) {
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createMarketWorker needs a positive budgetUsd");
@@ -184,8 +187,13 @@ export function createMarketWorker({
   }
 
   async function phaseNew(rec, row) {
-    const jobBudget = budgetNow;
-    const jobPrice = priceNow;
+    // A job awarded from a bid was quoted its own price: its budget is what that escrow leaves
+    // after the fee, not the listing's.
+    const a = (row && row.assignment) || {};
+    const quoted = bidTerms && a.bidId ? bidTerms(a.escrowAmount) : null;
+    const jobBudget = quoted ? Math.max(quoted.budgetUsd, 1e-6) : budgetNow;
+    const jobPrice = quoted ? quoted.priceUsd : priceNow;
+    if (quoted) log(`assignment ${short(rec.id)}: awarded from a bid at $${quoted.priceUsd}; its budget is $${quoted.budgetUsd}`);
     const r = await priceFromRow(rec, row, jobBudget);
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
@@ -194,7 +202,7 @@ export function createMarketWorker({
     return set(rec.id, ok({
       phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
       defaultFields: r.usedDefault ? r.usedFields : [], defaultNotes: r.usedDefault ? r.fieldNotes : [],
-      budgetUsd: jobBudget, listingPriceUsd: jobPrice,
+      budgetUsd: jobBudget, listingPriceUsd: jobPrice, quoted: !!quoted,
     }));
   }
 
@@ -340,7 +348,7 @@ export function createMarketWorker({
     const textFileUrl = up.text && up.text.completed ? up.text.fileUrl || up.text.fileId : null;
     let markdown = buildDeliverable({
       record: rec, files: delivered, budgetUsd: budgetOf(rec),
-      listingPriceUsd: rec.listingPriceUsd !== undefined ? rec.listingPriceUsd : priceNow, textFileUrl,
+      listingPriceUsd: rec.listingPriceUsd !== undefined ? rec.listingPriceUsd : priceNow, textFileUrl, quoted: !!rec.quoted,
     });
     if (Buffer.byteLength(markdown) > MAX_DELIVERABLE_BYTES) {
       markdown = markdown.slice(0, MAX_DELIVERABLE_BYTES / 2) + "\n\n(The deliverable was cut to fit the market's 256 KiB limit.)\n";

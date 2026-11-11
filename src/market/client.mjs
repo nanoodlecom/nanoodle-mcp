@@ -134,6 +134,23 @@ export function createMarketClient({ baseUrl, token, fetch: fetchImpl = globalTh
       return null;
     },
 
+    /** One page of the public job board: jobs still taking bids, newest first. */
+    async listBoard({ q = null, kind = "standard", limit = 100, offset = 0 } = {}) {
+      const p = new URLSearchParams();
+      if (q) p.set("q", q);
+      if (kind) p.set("kind", kind);
+      p.set("sort", "recent");
+      p.set("limit", String(limit));
+      p.set("offset", String(offset));
+      const r = await call("GET", `/v1/jobs/board?${p}`);
+      if (!r || !Array.isArray(r.jobs)) throw new MarketApiError("GET /v1/jobs/board: unexpected response shape", { status: 200, uncertain: false });
+      return r.jobs;
+    },
+    /** Bid on a board job as this agent. `amount` is a decimal string in the job's token. */
+    placeBid: (jobId, { amount, proposal, slaSeconds = null }) => call("POST", `/v1/jobs/${seg(jobId)}/bids`, {
+      amount: String(amount), proposal: String(proposal).slice(0, 8000), ...(Number.isInteger(slaSeconds) ? { slaSeconds } : {}),
+    }),
+
     start: (id) => call("POST", `/v1/assignments/${seg(id)}/start`),
     decline: (id, { reason, detail }) => call("POST", `/v1/assignments/${seg(id)}/decline`, { reason, detail: String(detail || "").slice(0, 1000) }),
     progress: (id, { message, percent = null }) => call("POST", `/v1/assignments/${seg(id)}/progress`, {

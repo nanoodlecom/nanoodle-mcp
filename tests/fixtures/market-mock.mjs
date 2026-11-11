@@ -28,6 +28,9 @@ import http from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 export const MARKET_SCHEMAS = Object.freeze({
+  "Bid": {"type":"object","required":["bidId","jobId","bidderAgentId","amount","proposal","verifiableOffered","status","createdAt","updatedAt"],"properties":{"amount":{"type":"string","example":"25.000000000000"},"bidId":{"type":"string","format":"uuid"},"bidderAgentId":{"type":"string","format":"uuid"},"createdAt":{"type":"string","format":"date-time"},"jobId":{"type":"string","format":"uuid"},"proposal":{"type":"string"},"slaSeconds":{"type":["integer","null"],"format":"int32","description":"The delivery window this bid promises; `None` means the agent's default `sla_seconds`."},"status":{"$ref":"#/components/schemas/BidStatus"},"updatedAt":{"type":"string","format":"date-time"},"verifiableOffered":{"type":"boolean"}}},
+  "BidStatus": {"type":"string","description":"`Pending -> Accepted | Rejected | Withdrawn`; a bid still pending when its job ends is rejected.","enum":["pending","accepted","rejected","withdrawn"]},
+  "PlaceBidRequest": {"type":"object","description":"Request body for placing a bid.","required":["amount","proposal"],"properties":{"agentId":{"type":["string","null"],"format":"uuid","description":"The bidding agent, for account callers bidding through one of their agents. Optional\nfor `aat_` agent callers \u2014 the bidder is pinned from the token; a mismatched explicit\nvalue is a 400."},"amount":{"type":"string","example":"25.00"},"asSelf":{"type":"boolean","description":"Bid as the account itself (`docs/human-worker-plan.md`): the person's worker row is\ncreated on the first such bid. Session callers only; exclusive with `agentId`."},"handle":{"type":["string","null"],"description":"With `asSelf` on a first bid: the previewed handle the person approved\n(`GET /v1/me/worker`). A stale preview answers 409 `handle_taken`."},"proposal":{"type":"string"},"slaSeconds":{"type":["integer","null"],"format":"int32","description":"The delivery window this bid promises, in seconds (1 to 30 days), snapshotted onto the\nassignment at award. Omitted: the agent's default `sla_seconds`."},"verifiableOffered":{"type":"boolean"}}},
   "MyAssignmentsResponse": {"type":"object","required":["assignments"],"properties":{"assignments":{"type":"array","items":{"$ref":"#/components/schemas/MyAssignmentItem"}}}},
   "MyAssignmentItem": {"type":"object","required":["assignment","job"],"properties":{"assignment":{"$ref":"#/components/schemas/JobAssignment"},"autoAcceptAt":{"type":["string","null"],"format":"date-time"},"job":{"$ref":"#/components/schemas/WorkerJobBrief"},"latestMessage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/LatestMessageBrief"}]}}},
   "JobAssignment": {"type":"object","required":["assignmentId","jobId","workerAgentId","status","escrowAmount","escrowToken","slaSeconds","slaDeadlineAt","acceptanceWindowDays","createdAt","updatedAt"],"properties":{"acceptanceWindowDays":{"type":"integer","format":"int32"},"assignmentId":{"type":"string","format":"uuid"},"bidId":{"type":["string","null"],"format":"uuid"},"cancelDetail":{"type":["string","null"]},"cancelReason":{"type":["string","null"]},"createdAt":{"type":"string","format":"date-time"},"deliverableHash":{"type":["string","null"]},"deliverableUrl":{"type":["string","null"]},"escrowAmount":{"type":"string"},"escrowToken":{"type":"string"},"finalizedAt":{"type":["string","null"],"format":"date-time"},"jobId":{"type":"string","format":"uuid"},"slaDeadlineAt":{"type":"string","format":"date-time"},"slaSeconds":{"type":"integer","format":"int32"},"startedAt":{"type":["string","null"],"format":"date-time"},"status":{"$ref":"#/components/schemas/AssignmentStatus"},"submittedAt":{"type":["string","null"],"format":"date-time"},"updatedAt":{"type":"string","format":"date-time"},"workerAgentId":{"type":"string","format":"uuid"}}},
@@ -194,6 +197,34 @@ export function createMarketMock({
     return assignmentId;
   }
 
+  const board = new Map(); // jobId -> { job (JobView), bids: [Bid] }
+  /** Post a public job on the board. */
+  function postJob({ title = "Run my workflow", description, budgetAmount = null, budgetToken = "USDC", minBuilderVerification = "none", jobKind = "standard" }) {
+    const jobId = randomUUID();
+    board.set(jobId, {
+      job: {
+        jobId, title, description, budgetAmount, budgetToken, minBuilderVerification, jobKind, status: "open", isPrivate: false, isTestRun: false,
+        maxSlots: 1, currentMaxSlots: 1, tags: [], acceptanceWindowDays: 3, entriesCloseAt: null, createdAt: iso(), updatedAt: iso(),
+      },
+      bids: [],
+    });
+    return jobId;
+  }
+  /** Award a bid: the job leaves the board and becomes an assignment with the bid's amount in escrow. */
+  function award(jobId, bidId) {
+    const b = board.get(jobId);
+    const bid = b && b.bids.find((x) => x.bidId === bidId);
+    if (!bid || bid.status !== "pending") throw new Error("mock: no pending bid to award");
+    bid.status = "accepted";
+    b.job.status = "in_progress";
+    const id = hire({ title: b.job.title, description: b.job.description, priceUsd: bid.amount, escrowToken: b.job.budgetToken, jobKind: "standard", agent: [...agents.values()].find((x) => x.agentId === bid.bidderAgentId).handle, slaSeconds: bid.slaSeconds || 3600 });
+    const r = rows.get(id);
+    r.assignment.bidId = bidId;
+    r.assignment.jobId = jobId;
+    r.job.jobId = jobId;
+    return id;
+  }
+
   const touch = (r) => { r.assignment.updatedAt = iso(); };
   const pushMessage = (r, side, body, extra = {}) => {
     const m = {
@@ -313,6 +344,32 @@ export function createMarketMock({
 
     if (!caller) return err(401, "unauthorized");
     const mine = (r) => r && r.assignment.workerAgentId === caller.agentId;
+
+    if (method === "GET" && path === "/v1/jobs/board") {
+      const q = (query.get("q") || "").toLowerCase();
+      const kind = query.get("kind");
+      const limit = query.has("limit") ? Number(query.get("limit")) : 50;
+      if (!(Number.isInteger(limit) && limit >= 1 && limit <= 100)) return err(400, "validation_error", "limit 1..=100");
+      const jobs = [...board.values()].map((b) => b.job)
+        .filter((j) => (j.status === "open" || j.status === "filling") && (!kind || j.jobKind === kind) && (!q || `${j.title}\n${j.description}`.toLowerCase().includes(q)))
+        .reverse().slice(0, limit).map((j) => ({ ...j }));
+      return { status: 200, json: { jobs } };
+    }
+    if (method === "POST" && (m = /^\/v1\/jobs\/([^/]+)\/bids$/.exec(path))) {
+      const b = board.get(m[1]);
+      if (!b) return err(404, "not_found", "no such job");
+      const bad = bodyCheck("PlaceBidRequest"); if (bad) return bad;
+      if (b.job.status !== "open" && b.job.status !== "filling") return err(400, "invalid_state_transition", "the job takes no bids");
+      if (b.job.minBuilderVerification !== "none") return err(400, "builder_verification_required", `this job asks for ${b.job.minBuilderVerification}; your owner holds none`);
+      if (!/^\d+(\.\d{1,6})?$/.test(body.amount) || Number(body.amount) <= 0) return err(400, "validation_error", "amount must be greater than zero");
+      if (b.bids.some((x) => x.bidderAgentId === caller.agentId)) return err(409, "duplicate_bid", "one bid per job");
+      const bid = {
+        bidId: randomUUID(), jobId: m[1], bidderAgentId: caller.agentId, amount: Number(body.amount).toFixed(12), proposal: body.proposal,
+        slaSeconds: body.slaSeconds ?? null, verifiableOffered: false, status: "pending", createdAt: iso(), updatedAt: iso(),
+      };
+      b.bids.push(bid);
+      return { status: 201, json: { ...bid }, schema: "Bid" };
+    }
 
     if (method === "GET" && path === "/v1/agents/me/assignments") {
       const status = query.get("status") || "in_progress";
@@ -504,7 +561,7 @@ export function createMarketMock({
     files,
     requests,
     violations,
-    hire, requestChanges, accept, cancel,
+    hire, requestChanges, accept, cancel, postJob, award, board,
     get url() { return url; },
     /** Make the next `times` requests matching method + path fail. mode "drop" (handled, no answer) or "status". */
     fault({ method, path, mode = "drop", status = 503, body = null, times = 1 }) {

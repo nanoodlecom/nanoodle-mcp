@@ -48,9 +48,11 @@ function actualCostLine(run) {
 }
 
 /** Lines of the "what this job consumed" section. */
-export function costLines(p, run, { budgetUsd, listingPriceUsd = null } = {}) {
+export function costLines(p, run, { budgetUsd, listingPriceUsd = null, quoted = false } = {}) {
   const lines = [];
-  lines.push(listingPriceUsd != null
+  lines.push(quoted && listingPriceUsd != null
+    ? `You paid the price quoted in the bid you awarded ($${exactUsd(listingPriceUsd)}) through the marketplace. These are the model costs this run consumed.`
+    : listingPriceUsd != null
     ? `You paid the listing's fixed price ($${exactUsd(listingPriceUsd)}) through the marketplace. These are the model costs this run consumed, in the same terms nanoodle-mcp uses for its pay-per-run quotes.`
     : "You paid the listing's fixed price through the marketplace. These are the model costs this run consumed, in the same terms nanoodle-mcp uses for its pay-per-run quotes.");
   lines.push("");
@@ -73,7 +75,7 @@ export function costLines(p, run, { budgetUsd, listingPriceUsd = null } = {}) {
  * @param {number|null} [o.listingPriceUsd]
  * @param {string|null} [o.textFileUrl]  when the text outputs were moved to an attached file: its fileUrl
  */
-export function buildDeliverable({ record, files, budgetUsd, listingPriceUsd = null, textFileUrl = null }) {
+export function buildDeliverable({ record, files, budgetUsd, listingPriceUsd = null, textFileUrl = null, quoted = false }) {
   const p = record.pricing;
   const run = record.run;
   const byKey = new Map(files.map((f) => [f.key + "\u0000" + f.filename, f]));
@@ -102,7 +104,7 @@ export function buildDeliverable({ record, files, budgetUsd, listingPriceUsd = n
   }
   if (!run.outputs.length) out.push("The workflow produced no outputs (a gate in the graph may have skipped them).", "");
   out.push("## What this job consumed", "");
-  out.push(...costLines(p, run, { budgetUsd, listingPriceUsd }), "");
+  out.push(...costLines(p, run, { budgetUsd, listingPriceUsd, quoted }), "");
   const receipt = {
     nanoodleMarketReceipt: {
       v: 1,

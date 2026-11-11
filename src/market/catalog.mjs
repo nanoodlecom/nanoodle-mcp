@@ -34,7 +34,7 @@ export const PRICE_REFRESH_SECONDS = 600;
 /** The brief used to price a listing's own workflow: as long as a brief may be (the input cap), so the estimate is for the longest brief. */
 export const PROBE_BRIEF = "a lighthouse at dawn, ".repeat(1000).slice(0, 20_000);
 
-const AGENT_KEYS = new Set(["handle", "tokenFile", "webhookSecretFile", "graph", "input", "custom", "priceUsd", "fields"]);
+const AGENT_KEYS = new Set(["handle", "tokenFile", "webhookSecretFile", "graph", "input", "custom", "priceUsd", "fields", "bids", "maxBidUsd"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const die = (msg) => { throw new MarketConfigError(msg); };
 
@@ -146,6 +146,10 @@ export function readCatalog(file, { root = REPO_ROOT } = {}) {
     if (a.graph !== undefined && a.graph !== null && (typeof a.graph !== "string" || !a.graph)) bad(`${where}: "graph" must be a file path or null`);
     const graphFile = a.graph ? (isAbsolute(a.graph) ? a.graph : resolve(root, a.graph)) : null;
     if (!graphFile && !custom) bad(`${where}: a listing needs a "graph", or "custom": true (or both)`);
+    if (a.bids !== undefined && typeof a.bids !== "boolean") bad(`${where}: "bids" must be true or false`);
+    if (a.bids && !custom) bad(`${where}: "bids" needs "custom": true (a bid quotes a buyer's own workflow)`);
+    if (a.maxBidUsd !== undefined && !(typeof a.maxBidUsd === "number" && Number.isFinite(a.maxBidUsd) && a.maxBidUsd >= 0.02)) bad(`${where}: "maxBidUsd" must be a number of at least 0.02`);
+    if (a.maxBidUsd !== undefined && !a.bids) bad(`${where}: "maxBidUsd" needs "bids": true`);
     if (a.input !== undefined && (typeof a.input !== "string" || !a.input)) bad(`${where}: "input" must be the name of a text input`);
     if (a.input && !graphFile) bad(`${where}: "input" needs a "graph"`);
     if (a.priceUsd !== undefined && a.priceUsd !== null && !(typeof a.priceUsd === "number" && Number.isFinite(a.priceUsd) && a.priceUsd > 0)) {
@@ -173,7 +177,7 @@ export function readCatalog(file, { root = REPO_ROOT } = {}) {
       }
       defaultWorkflow = { ...defaultWorkflow, fieldSpecs: a.fields };
     }
-    return { handle: a.handle, tokenFile: a.tokenFile, webhookSecretFile: a.webhookSecretFile ?? null, graphFile, input: defaultWorkflow ? defaultWorkflow.inputName : null, custom, priceUsd: a.priceUsd ?? null, defaultWorkflow };
+    return { handle: a.handle, tokenFile: a.tokenFile, webhookSecretFile: a.webhookSecretFile ?? null, bids: a.bids === true, maxBidUsd: a.maxBidUsd ?? 5, graphFile, input: defaultWorkflow ? defaultWorkflow.inputName : null, custom, priceUsd: a.priceUsd ?? null, defaultWorkflow };
   });
   return { file: path, agents };
 }

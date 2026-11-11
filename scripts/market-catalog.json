@@ -10,6 +10,6 @@
     { "handle": "nanoodle-clip", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-clip", "webhookSecretFile": "/etc/nanoodle-mcp/market-webhook-secrets/nanoodle-clip",
       "graph": "scripts/market-idea-to-clip.json", "custom": false, "priceUsd": 0.34 },
     { "handle": "nanoodle-workflows", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-workflows", "webhookSecretFile": "/etc/nanoodle-mcp/market-webhook-secrets/nanoodle-workflows",
-      "graph": null, "custom": true, "priceUsd": 1.00 }
+      "graph": null, "custom": true, "priceUsd": 1.00, "bids": true, "maxBidUsd": 2 }
   ]
 }
