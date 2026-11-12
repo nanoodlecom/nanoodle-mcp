@@ -97,6 +97,7 @@ function strip(res) {
  * @param {(min: number, max: number) => number} [opts.randomInt]  dust source; tests pin it
  * @param {number} [opts.maxOpenQuotes]   unexpired unpaid quotes held at once (default 1000); more are refused as busy
  * @param {number} [opts.expiredRetainMs] how long an expired, unpaid quote is kept so a late transfer is still refunded (1 h)
+ * @param {string|null} [opts.publicBase] public origin for wallet pay pages and payment monitoring
  */
 export function createNearGate({
   merchantId,

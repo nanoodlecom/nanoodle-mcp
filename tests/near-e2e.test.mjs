@@ -8,6 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -225,6 +226,29 @@ test("NEAR hostname shares one process: wallet page, confirmation, monitor, auto
     assert.match(nanoQ.structuredContent.x402.paymentId, /^pay_/);
   } finally {
     await srv.kill(); await chain.close(); await nano.close(); await node.close();
+  }
+});
+
+test("a busy secondary port leaves the primary paid MCP listener serving", { timeout: 60_000 }, async () => {
+  const { graphsDir, outDir } = await fixtureDirs();
+  const chain = createFakeChain();
+  const key = await throwawayNearKey();
+  chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
+  const nano = nanoGptMock();
+  await chain.listen(); await nano.listen();
+  const node = await nanoNode();
+  const occupied = http.createServer((req, res) => res.end("another service"));
+  await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve));
+  const port = await freePort();
+  const srv = await startDual({ graphsDir, outDir, port, nearPort: occupied.address().port, nearRpc: chain.url, nanoRpc: node.url, nanoUrl: nano.url, secretKey: key.secretKey });
+  try {
+    assert.match(srv.stderr(), /NEAR endpoint .*could not listen.*EADDRINUSE/);
+    assert.match(srv.stderr(), /primary MCP listener remains available/);
+    const q = await mcpClient(`http://127.0.0.1:${port}`).call("idea-poster", { Idea: "a lighthouse" });
+    assert.match(q.structuredContent.x402.paymentId, /^pay_/);
+  } finally {
+    await srv.kill(); await chain.close(); await nano.close(); await node.close();
+    await new Promise((resolve) => occupied.close(resolve));
   }
 });
 

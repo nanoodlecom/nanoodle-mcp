@@ -622,18 +622,23 @@ async function main() {
     // Advertise no runnable tools if merchant verification fails; the Nano
     // endpoint continues serving while the NEAR account awaits funding.
     const unavailable = () => ({ content: [{ type: "text", text: "NEAR payments are unavailable. The merchant account must be funded and its refund key verified before any workflows can run." }], isError: true });
-    await serveHttp({
-      host: nearServeHost, port: nearServePort, name: "nanoodle-mcp", version: pkg.version,
-      listTools: near ? near.wrapped.listTools : () => [],
-      callTool: near ? near.wrapped.callTool : unavailable,
-      instructions: near ? near.nearInstructions : unavailable().content[0].text,
-      paymentNote: near ? near.nearPaymentNote : unavailable().content[0].text,
-      nearGate: near?.gate || null, rates: near?.rates || null,
-      toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
-      publicBase: nearPublicUrl.replace(/\/+$/, ""),
-      log: (...a) => console.error(...a),
-    });
-    console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl}/mcp on ${nearServeHost}:${nearServePort} — shared Nano funding pool${near ? "" : "; NEAR payments unavailable"}`);
+    try {
+      await serveHttp({
+        host: nearServeHost, port: nearServePort, name: "nanoodle-mcp", version: pkg.version,
+        listTools: near ? near.wrapped.listTools : () => [],
+        callTool: near ? near.wrapped.callTool : unavailable,
+        instructions: near ? near.nearInstructions : unavailable().content[0].text,
+        paymentNote: near ? near.nearPaymentNote : unavailable().content[0].text,
+        nearGate: near?.gate || null, rates: near?.rates || null,
+        toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
+        publicBase: nearPublicUrl.replace(/\/+$/, ""),
+        log: (...a) => console.error(...a),
+      });
+      console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl}/mcp on ${nearServeHost}:${nearServePort} — shared Nano funding pool${near ? "" : "; NEAR payments unavailable"}`);
+    } catch (e) {
+      console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl} could not listen on ${nearServeHost}:${nearServePort}: ${e.message}`);
+      console.error("nanoodle-mcp: the primary MCP listener remains available; fix --near-serve and restart to enable the second endpoint.");
+    }
   }
   console.error(`nanoodle-mcp: MCP over HTTP on http://${serveHost}:${servePort}/mcp` +
     (nearInfo && chargeUsd != null

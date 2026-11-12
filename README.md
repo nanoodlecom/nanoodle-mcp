@@ -88,7 +88,7 @@ git clone -b near-hackathon https://github.com/nanoodlecom/nanoodle-mcp && cd na
 | 5. Real testnet payment and refund (maintainer-run; moves testnet NEAR, needs two funded testnet accounts and, for the last variant, a NanoGPT key) | [Prove it on testnet](#prove-it-on-testnet-turnkey): two scripts create the accounts, pay a quote, check the refund on chain and print explorer links. `--dry-run` stops before the first transfer. |
 
 **Built in the hackathon window, and before.** The diff of the entry is
-[`compare/pre-hackathon...hackathon-submission`](https://github.com/nanoodlecom/nanoodle-mcp/compare/pre-hackathon...hackathon-submission)
+[`compare/pre-hackathon...near-hackathon`](https://github.com/nanoodlecom/nanoodle-mcp/compare/pre-hackathon...near-hackathon)
 (branch `near-hackathon`). The `pre-hackathon` tag is the last commit on `main` before the
 NEAR work (2026-11-06). Commits on `main` between the hackathon announcement (2026-10-19)
 and that tag are Nano-payment and maintenance work; they are counted as baseline and not

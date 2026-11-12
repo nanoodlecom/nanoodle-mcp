@@ -88,7 +88,7 @@ On an existing Nano-paid deployment, add these variables to its service environm
 NEAR_MERCHANT=your-merchant.near
 NEAR_NETWORK=mainnet
 NEAR_PRIVATE_KEY=ed25519:YOUR_MERCHANT_REFUND_KEY
-NEAR_SERVE=127.0.0.1:8403
+NEAR_SERVE=127.0.0.1:18403
 NEAR_PUBLIC_URL=https://mcp-near.nanoodle.com
 ```
 
@@ -104,13 +104,16 @@ second listener. For Caddy:
 
 ```caddyfile
 mcp-near.nanoodle.com {
-    reverse_proxy localhost:8403
+    reverse_proxy localhost:18403
 }
 ```
 
 Connect an agent to `https://mcp-near.nanoodle.com/mcp`. No `_pay_with` argument
 is needed there. The primary endpoint continues to default to Nano; its NEAR
 quotes link to the same NEAR payment page.
+
+Choose a free local port for the second listener. If that port cannot bind,
+the server logs the error and keeps the primary paid endpoint serving.
 
 1. A paid tool returns `payment.payUrl`, `payment.watchUrl` and
    `payment.statusUrl`, alongside the exact amount and expiry.
