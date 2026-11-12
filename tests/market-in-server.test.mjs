@@ -172,7 +172,7 @@ test("the hosted song workflow: the brief goes to Song idea, Style is a settable
   assert.doesNotMatch(JSON.stringify(d.graph), /Portishead|Massive Attack|Tricky/);
   assert.equal(byName["Idea + style"].fields.sep, "\n\nStyle:\n");
   assert.ok(d.graph.links.some((l) => l.from.node === byName.Style.id && l.to.node === byName["Idea + style"].id));
-  // Duration is a text input too: MiniMax Music 3 takes no length setting, so the target
+  // Duration is a text input too: Mureka 9.5 takes no length setting, so the target
   // length reaches the lyric writer and the arranger as text, joined after idea and style.
   assert.equal(byName.Duration.fields.text, "180 seconds");
   const len = byName["Idea + style + length"];
@@ -183,6 +183,7 @@ test("the hosted song workflow: the brief goes to Song idea, Style is a settable
   assert.ok(!d.graph.links.some((l) => l.from.node === byName["Idea + style"].id && l.to.node !== len.id), "idea + style is only read through the length join");
   assert.ok(!("duration" in byName.Sing.fields), "no duration field is sent to the music model");
   assert.equal(byName.Sing.type, "music");
+  assert.equal(byName.Sing.fields.model, "mureka-ai/mureka-v9.5/generate-song", "the hosted song is sung by Mureka 9.5");
   // "Lyrics" is a sink (nothing reads it), so the engine returns it as an output.
   assert.equal(byName.Lyrics.type, "join");
   assert.ok(d.graph.links.some((l) => l.to.node === byName.Lyrics.id && l.from.node === byName["Write lyrics"].id));

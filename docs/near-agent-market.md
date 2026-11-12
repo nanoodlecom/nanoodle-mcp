@@ -101,13 +101,14 @@ graph has more than one named text node). Two ready defaults ship in `scripts/`
 
 | File | The brief is | Delivers | Estimated cost | Cost + 20% | Typical time |
 |---|---|---|---|---|---|
-| `market-sing.json` (`--default-input "Song idea"`) | a song idea | a sung track (mp3) and its lyrics | $0.152 | $0.19 | about 2.5 minutes |
+| `market-sing.json` (`--default-input "Song idea"`) | a song idea | a sung track (mp3) and its lyrics | $0.227 | $0.28 | about 2.5 minutes |
 | `market-idea-to-image.json` | a picture idea | one 1024×1024 image | $0.0096 | $0.02 | under a minute |
 
 `market-sing.json` is **Sing** from
 [awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), the most used workflow
 on the hosted nanoodle-mcp server: three chat calls write the lyrics, arrange the song and
-name what would clash with the arrangement, then MiniMax Music 3 sings it. Two changes for
+name what would clash with the arrangement, then Mureka 9.5 sings it (NanoGPT model
+`mureka-ai/mureka-v9.5/generate-song`, $0.225 per song; the original uses MiniMax Music 3). Two changes for
 hires in plain words: the original's "Preferred bands" input is a **Style** input that the
 buyer sets with a `Style:` line (with none, the workflow picks a style that fits the idea),
 and the lyrics are delivered as a second output.
@@ -135,10 +136,11 @@ between `defaultMin` and `defaultMax`; the pick is derived from the assignment i
 job always gets the same length. The "Started" message and the deliverable tell the buyer
 which length is aimed for and why.
 
-The song's Duration is a target, not a setting: MiniMax Music 3 takes no length parameter
+The song's Duration is a target, not a setting: Mureka 9.5 takes no length parameter
 (NanoGPT's catalog lists none for it), so the workflow passes the target to the lyric
 writer, which sizes the lyrics at about 1.1 words per second, and to the arranger, which
-states it in the music prompt. The model decides the final length.
+states it in the music prompt. The model decides the final length, and it is loose: the
+first run with Mureka 9.5 (2026-11-12) was asked for 120 seconds and came back at 241.
 
 - A brief that does contain a workflow block always runs the buyer's workflow, never the
   default. A block that is there but broken is declined as before: the buyer meant a
@@ -383,9 +385,9 @@ the webhook URL is `https://<server>/market/webhook/<handle>` (see [Push: the we
 | Name | Nanoodle Song: idea to sung track |
 | Handle | `nanoodle-song` |
 | Category | `creative` |
-| Tagline (158 characters) | Write a song idea in plain words, with optional Style and Duration lines. You get a sung track (mp3) and its lyrics, written by AI and sung by MiniMax Music 3. |
+| Tagline (154 characters) | Write a song idea in plain words, with optional Style and Duration lines. You get a sung track (mp3) and its lyrics, written by AI and sung by Mureka 9.5. |
 | Tags | `song`, `music-generation`, `lyrics`, `text-to-music`, `audio`, `nanoodle`, `nanogpt` |
-| Price | $0.20 (estimated cost $0.152, + 20% $0.19; 2026-11-11) |
+| Price | $0.30 (estimated cost $0.227, of which Mureka 9.5 is $0.225; + 20% $0.28; 2026-11-12) |
 
 ```markdown
 Write a song idea in plain words, for example "an upbeat birthday song for my mum, who
@@ -405,12 +407,16 @@ for example:
 
 Duration: 90 seconds
 
-The length is a target: the lyrics are sized to it and the music model is told it, but the
-model decides the final length, so expect it to be approximate. With no Duration line, the
-agent aims for a length between 2 and 4 minutes.
+The length is a loose target: the lyrics are sized to it and the music model is told it, but
+the model decides the final length and often runs longer (a 2-minute target has come back
+as a 4-minute song). With no Duration line, the agent aims for a length between 2 and 4
+minutes.
 
 What happens: three chat-model steps write the lyrics, arrange the song and list what would
-clash with the arrangement; MiniMax Music 3 then sings it. The workflow runs once per hire.
+clash with the arrangement; Mureka 9.5 then sings it. The workflow runs once per hire.
+
+The singer is Mureka 9.5 (model `mureka-ai/mureka-v9.5/generate-song` on NanoGPT). It costs
+$0.225 per song, which is most of this listing's price.
 
 You get: the song as an mp3 file and the lyrics as text, plus a cost report (estimated cost
 per step and the actual cost NanoGPT reported). The result is
@@ -670,7 +676,7 @@ The starter catalog is [`scripts/market-catalog.json`](../scripts/market-catalog
 ```json
 { "agents": [
   { "handle": "nanoodle-song", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-song",
-    "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false, "priceUsd": 0.20,
+    "graph": "scripts/market-sing.json", "input": "Song idea", "custom": false, "priceUsd": 0.30,
     "fields": { "Duration": { "seconds": { "min": 30, "max": 240, "defaultMin": 120, "defaultMax": 240 } } } },
   { "handle": "nanoodle-image", "tokenFile": "/etc/nanoodle-mcp/market-tokens/nanoodle-image",
     "graph": "scripts/market-idea-to-image.json", "custom": false, "priceUsd": 0.03 },
@@ -758,11 +764,11 @@ At start and at every refresh, when a listing's budget is below what its own wor
 needs, the worker logs, once per distinct price and need:
 
 ```
-[nanoodle-song] NEEDS OPERATOR — price $0.15 no longer covers this listing's workflow (estimated cost + 20% is $0.19); raise it to $0.20 on the market
+[nanoodle-song] NEEDS OPERATOR — price $0.20 no longer covers this listing's workflow (estimated cost + 20% is $0.28); raise it to $0.30 on the market
 ```
 
-and once when it is covered again: `[nanoodle-song] price $0.20 covers this listing's
-workflow again (estimated cost + 20% is $0.19)`. Both lines go to `MARKET_NOTIFY_URL`. Meanwhile no money
+and once when it is covered again: `[nanoodle-song] price $0.30 covers this listing's
+workflow again (estimated cost + 20% is $0.28)`. Both lines go to `MARKET_NOTIFY_URL`. Meanwhile no money
 is lost: the worker declines (with a full refund) every plain-language hire that listing
 cannot afford. A buyer's own workflow on a `custom: true` listing is checked against the same
 budget as always.
@@ -794,12 +800,11 @@ would decline this listing's own workflow`, or `could be lowered to $X`. `check`
 a listing whose graph the paid rules refuse. `--base-url` and `--nanogpt-base` (or
 `MARKET_BASE_URL`, `NANOGPT_BASE_URL`) point it elsewhere.
 
-`plan` on 2026-11-11, with the prices read from the catalog's `priceUsd` (not yet on the
-market):
+`plan` on 2026-11-12 (the song with Mureka 9.5):
 
 | Listing | Workflow | Estimated cost | Cost + 20% | Recommended price | Per-job budget at that price |
 |---|---|---|---|---|---|
-| `nanoodle-song` | `market-sing.json` | $0.152 | $0.19 | **$0.20** | $0.19 |
+| `nanoodle-song` | `market-sing.json` | $0.227 | $0.28 | **$0.30** | $0.28 |
 | `nanoodle-image` | `market-idea-to-image.json` | $0.0096 | $0.02 | **$0.03** | $0.02 |
 | `nanoodle-character` | `market-character.json` | $0.034 | $0.05 | **$0.06** | $0.05 |
 | `nanoodle-clip` | `market-idea-to-clip.json` | $0.262 | $0.32 | **$0.34** | $0.32 |
