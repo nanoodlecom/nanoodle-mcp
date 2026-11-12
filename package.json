@@ -14,7 +14,8 @@
     "test": "node --test",
     "simulate:near": "node scripts/near-simulate.mjs",
     "simulate:dual": "node scripts/dual-simulate.mjs",
-    "simulate:market": "node scripts/market-simulate.mjs"
+    "simulate:market": "node scripts/market-simulate.mjs",
+    "build:near-wallet": "esbuild src/near-pay-browser.mjs --bundle --platform=browser --target=es2022 --format=esm --minify --outfile=assets/near-wallet.js --banner:js=\"/*! Includes NEAR Connect 0.12.0, MIT, HOT Labs. See /near-wallet.LICENSE.txt */\""
   },
   "files": [
     "src",
@@ -59,5 +60,9 @@
   },
   "bugs": {
     "url": "https://github.com/nanoodlecom/nanoodle-mcp/issues"
+  },
+  "devDependencies": {
+    "@hot-labs/near-connect": "0.12.0",
+    "esbuild": "0.28.2"
   }
 }

@@ -68,6 +68,8 @@ const ASSETS = {
   "/og.jpg": "image/jpeg",
   "/righteous-latin.woff2": "font/woff2",
   "/righteous-latin-ext.woff2": "font/woff2",
+  "/near-wallet.js": "text/javascript; charset=utf-8",
+  "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
 };
 const ICON_LINKS =
   `<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">` +
@@ -269,8 +271,8 @@ function workflowSampleHtml(name, sample) {
     `<pre>${esc(JSON.stringify(sampleCall(name), null, 2))}</pre></details>`;
 }
 
-function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null }) {
-  const tools = listTools().filter((t) => t.name !== "run_noodle");
+function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null, near = false }) {
+  const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const authored = authorCount(toolInfo);
   const cmds = connectCmds(publicBase);
@@ -307,8 +309,10 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
       `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${workflowSampleHtml(t.name, card.sample)}${workflowExampleHtml(t.name)}${author}</li>`;
   }).join("");
-  const tagline = charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
-  const desc = charged
+  const tagline = near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}` : charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
+  const desc = near
+    ? "AI workflows paid in native NEAR with automatic change — image, video, audio, and text pipelines. Connect your wallet, pay a deposit, and receive unused NEAR back on chain."
+    : charged
     ? "AI workflows paid in Nano over x402 — image, video, audio, and text pipelines behind one MCP endpoint. No account, no API key."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
   const ogHead =
@@ -333,9 +337,9 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
     </header>
     <p class="eyebrow">public MCP server</p>
-    <h1>${charged && paymentNote ? "AI workflows, paid in Nano or NEAR." : charged ? "AI workflows, paid in Nano over x402." : "AI media workflows over MCP."}</h1>
+    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "AI workflows, paid in Nano over x402." : "AI media workflows over MCP."}</h1>
     <p class="sub">Image, video, audio, and text pipelines behind one MCP endpoint.
-      ${charged ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
+      ${charged || near ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
     <div class="connect-wrap">
       <div class="tabs" role="tablist" aria-label="MCP client">
@@ -350,11 +354,12 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         <p>one line registers every workflow with your agent.</p></div>
       <div class="step"><span class="n">02</span><b>ask for what you want</b>
         <p>your agent picks a workflow and calls it — a poster, a soundtrack, an OG card.</p></div>
-      ${charged ? `<div class="step"><span class="n">03</span><b>pay per call</b>
-        <p>settled automatically in Nano. failed runs are refunded.</p></div>`
+      ${charged || near ? `<div class="step"><span class="n">03</span><b>pay per call</b>
+        <p>settled automatically in ${near ? charged ? "Nano or NEAR" : "NEAR" : "Nano"}. unused deposits return to your wallet.</p></div>`
       : `<div class="step"><span class="n">03</span><b>results stream back</b>
         <p>media arrives as links, usually in seconds.</p></div>`}
     </div>
+    ${near && !charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>deposit quote</span><span class="arr">→</span><span>pay in your NEAR wallet</span><span class="arr">→</span><span>result + automatic NEAR change</span></div>` : ""}
     ${charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>402 payment quote</span>
       <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
     <p class="tagline">No tab, no tip, no signup.</p>` : ""}
@@ -445,14 +450,16 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
 }
 
 /** The landing page's story as plain text — the version an agent should read. */
-function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null }) {
+function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null, near = false }) {
   const authored = authorCount(toolInfo);
-  const tools = listTools().filter((t) => t.name !== "run_noodle");
+  const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const lines = [
     `# ${name} v${version}`,
     ``,
-    charged
+    near && !charged
+      ? `Public MCP server: AI workflows paid per call in native NEAR, with automatic NEAR refunds — built with nanoodle (https://nanoodle.com).`
+      : charged
       ? `Public MCP server: AI workflows (image, video, audio, text) paid per call in Nano over x402 — built with nanoodle (https://nanoodle.com).`
       : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
     ``,
@@ -461,6 +468,13 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
     `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
     ``,
   ];
+  if (near) lines.push(
+    `NEAR payment flow: show payment.payUrl to the user and immediately open payment.watchUrl (SSE), or poll payment.statusUrl?wait=1.`,
+    `The user connects a NEAR wallet and approves the exact deposit on the pay page. Once the monitor closes with status paid and done:true, call the original tool with the same arguments plus _payment_id. No transaction hash needs to be copied from the user.`,
+    `Agents with a wallet can also pay directly and supply _payment_id, _payment_tx and _payment_sender.`,
+    `Unused NEAR returns to the transaction signer automatically. A failed run refunds the whole deposit. The shared Nano wallet funds the model provider.`,
+    ``,
+  );
   if (charged) {
     lines.push(
       `## Payment (x402, Nano/XNO)`,
@@ -527,6 +541,32 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
     ``,
   );
   return lines.join("\n");
+}
+
+function nearPayPageHtml(q) {
+  return htmlPage("Pay in NEAR · nanoodle", `
+    <a href="/">nanoodle-mcp</a>
+    <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
+      <h1>Pay in NEAR</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
+      <div class="card">
+        <h2>Deposit ${esc(q.amountNear)} NEAR</h2>
+        <p>You pay the model cost + 20%. Unused NEAR returns to the wallet that pays. A failed run refunds the whole deposit.</p>
+        <p class="muted">Send on <strong>${esc(q.network)}</strong> to:</p><code>${esc(q.payTo)}</code>
+        <p><button id="near-pay" type="button">Connect wallet &amp; pay</button></p>
+        <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
+        <p id="near-error" role="alert"></p>
+      </div>
+      <details><summary>Already paid with another wallet?</summary>
+        <p>Send exactly <code>${esc(q.amountNear)}</code> NEAR in one native transfer, then confirm its transaction here.</p>
+        <form id="near-confirm">
+          <p><label>Your NEAR account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
+          <p><label>Transaction hash <input name="txHash" required autocomplete="off"></label></p>
+          <button type="submit">Confirm payment</button>
+        </form>
+      </details>
+      <p class="muted">Keep this page open. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
+    </div><script type="module" src="/near-wallet.js"></script>
+  `);
 }
 
 function payPageHtml(q) {
@@ -636,6 +676,7 @@ export async function serveHttp({
   callTool,
   instructions,
   gate = null,
+  nearGate = null,
   paymentNote = null,
   rates = null,
   toolInfo = [],
@@ -670,7 +711,7 @@ export async function serveHttp({
       const url = new URL(req.url, "http://localhost");
       // Check before preflight or dispatch. Do not derive trust from Host or
       // forwarded headers supplied by the request being authorized.
-      if (url.pathname === "/mcp" && req.headers.origin !== undefined && req.headers.origin !== publicOrigin) {
+      if ((url.pathname === "/mcp" || url.pathname.startsWith("/near/pay/")) && req.headers.origin !== undefined && req.headers.origin !== publicOrigin) {
         return send(403, JSON.stringify({ error: "Origin is not allowed" }));
       }
       if (req.method === "OPTIONS") {
@@ -680,6 +721,23 @@ export async function serveHttp({
           "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version",
         });
         return res.end();
+      }
+
+      const nearPayMatch = url.pathname.match(/^\/near\/pay\/([^/]+)$/);
+      if (nearPayMatch && nearGate) {
+        if (req.method !== "POST") return send(405, JSON.stringify({ error: "POST only" }));
+        if (!/^application\/json\b/.test(req.headers["content-type"] || "")) return send(415, JSON.stringify({ error: "Content-Type must be application/json" }));
+        let body = "";
+        for await (const c of req) {
+          body += c;
+          if (Buffer.byteLength(body) > 4096) return send(413, JSON.stringify({ error: "body too large" }));
+        }
+        let args;
+        try { args = JSON.parse(body); } catch { return send(400, JSON.stringify({ error: "Invalid JSON" })); }
+        if (!args || typeof args !== "object" || Array.isArray(args)) return send(400, JSON.stringify({ error: "Expected txHash and senderId" }));
+        const state = await nearGate.confirmPayment(decodeURIComponent(nearPayMatch[1]), args.txHash, args.senderId);
+        res.setHeader("Cache-Control", "no-store");
+        return send(state.error ? 400 : 200, JSON.stringify(state));
       }
 
       // NEAR Agent Market events for the worker in this process (src/market/webhook.mjs).
@@ -792,11 +850,11 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (url.pathname === "/") {
-        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote }), "text/html; charset=utf-8");
+        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote, near: !!nearGate }), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/llms.txt") {
-        return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo, paymentNote }), "text/plain; charset=utf-8");
+        return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate }), "text/plain; charset=utf-8");
       }
 
       if (url.pathname === "/rates" && rates) {
@@ -829,24 +887,30 @@ export async function serveHttp({
       }
 
       const payMatch = url.pathname.match(/^\/pay\/([^/]+)$/);
-      if (payMatch && gate) {
-        const q = gate.quote(decodeURIComponent(payMatch[1]));
+      if (payMatch && (gate || nearGate)) {
+        const id = decodeURIComponent(payMatch[1]);
+        const q = id.startsWith("nq_") ? nearGate?.quote(id) : gate?.quote(id);
         if (!q) return send(404, htmlPage("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
-        return send(200, payPageHtml(q), "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        return send(200, id.startsWith("nq_") ? nearPayPageHtml(q) : payPageHtml(q), "text/html; charset=utf-8");
       }
 
-      const statusMatch = url.pathname.match(/^\/x402\/status\/([^/]+)$/);
-      if (statusMatch && gate) {
-        const id = decodeURIComponent(statusMatch[1]);
+      const statusMatch = url.pathname.match(/^\/(x402|near)\/status\/([^/]+)$/);
+      const statusGate = statusMatch?.[1] === "near" ? nearGate : gate;
+      if (statusMatch && statusGate) {
+        const id = decodeURIComponent(statusMatch[2]);
         if (url.searchParams.get("wait")) {
           const stop = new AbortController();
           const leave = () => stop.abort();
           res.once("close", leave);
-          try { await gate.waitForPayment(id, 25_000, { signal: stop.signal }); }
+          try { await statusGate.waitForPayment(id, 25_000, { signal: stop.signal }); }
           finally { res.off("close", leave); }
           if (res.destroyed) return;
         }
-        const q = gate.quote(id);
+        const q = statusGate.quote(id);
+        res.setHeader("Cache-Control", "no-store");
+        if (statusMatch[1] === "near") return send(q ? 200 : 404, JSON.stringify(q || { status: "unknown", done: true, next: "Ask your agent for a fresh quote." }));
         // Terminal quotes carry done + next (agent instructions for the result stream).
         return send(200, JSON.stringify(q
           ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.done ? { done: true, next: q.next } : {}) }
@@ -863,9 +927,10 @@ export async function serveHttp({
        * gate's shared waiter list; at the held-connection cap it 503s so the
        * caller falls back to polling.
        */
-      const watchMatch = url.pathname.match(/^\/x402\/watch\/([^/]+)$/);
-      if (watchMatch && gate) {
-        const id = decodeURIComponent(watchMatch[1]);
+      const watchMatch = url.pathname.match(/^\/(x402|near)\/watch\/([^/]+)$/);
+      const watchGate = watchMatch?.[1] === "near" ? nearGate : gate;
+      if (watchMatch && watchGate) {
+        const id = decodeURIComponent(watchMatch[2]);
         if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: "too many open streams — poll /x402/status instead" }));
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -880,6 +945,7 @@ export async function serveHttp({
         // done + next so the agent knows how to access the result stream after close.
         const frame = (q) => {
           if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
+          if (watchMatch[1] === "near") return q;
           const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
           if (q.done) { f.done = true; if (q.next) f.next = q.next; }
           return f;
@@ -896,17 +962,17 @@ export async function serveHttp({
         };
         res.once("close", leave);
         try {
-          let q = gate.quote(id);
+          let q = watchGate.quote(id);
           sse("status", frame(q));
           // Hold the stream open across state changes until the quote settles or
           // the client leaves. Each wait resolves on the shared watcher firing
           // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
           // dropped connection be noticed and cleaned up.
-          const deadline = Date.now() + 20 * 60 * 1000; // never outlive a quote (15m TTL + slack)
+          const deadline = watchMatch[1] === "near" ? Date.parse(q?.expiresAt) : Date.now() + 20 * 60 * 1000;
           while (alive && q && q.status === "pending" && Date.now() < deadline) {
-            await gate.waitForPayment(id, 25_000, { signal: stop.signal });
+            await watchGate.waitForPayment(id, 25_000, { signal: stop.signal });
             if (!alive) break;
-            q = gate.quote(id);
+            q = watchGate.quote(id);
             if (q) sse("status", frame(q));
             // On settle the final frame already carried done+next; the loop exits
             // and finally{} closes the stream — that close IS the acknowledgment.

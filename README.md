@@ -65,8 +65,10 @@ transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md
   read a real testnet transfer from public RPC and pass (step 4 below).
 - Not done yet: this code has **not moved real NEAR**. The first real testnet payment and
   refund is the maintainer-run step 5 below. The market worker has not been run against
-  the live market. There is **no hosted NEAR-mode endpoint**; the hosted server at
-  `mcp.nanoodle.com` is the Nano-paid mode.
+  the live market. The hosted server at `mcp.nanoodle.com` defaults to Nano.
+  The NEAR-first listener and wallet payment page are implemented; hosting requires
+  a funded merchant and DNS for `mcp-near.nanoodle.com` (see
+  [deployment instructions](docs/near-payments.md#near-endpoint-and-wallet-payments)).
 - NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version` shows
   0.7.0 or later, run it from a clone as below.
 
@@ -116,10 +118,11 @@ claimed.
 
 **Declarations.**
 - Baseline (own, pre-hackathon, MIT): the nanoodle engine and the nanoodle-mcp server.
-- Libraries: no new dependencies. The two runtime dependencies predate the hackathon:
+- Libraries: the two Node runtime dependencies predate the hackathon:
   `nanoodle` (MIT, own) and `nanocurrency` (GPL-3.0, Nano signing; see
-  [Licensing](#licensing)). The NEAR code uses only Node built-ins. No NEAR SDK, no
-  templates, no boilerplate.
+  [Licensing](#licensing)). Server-side NEAR verification and signing use Node built-ins.
+  The wallet payment page bundles NEAR Connect 0.12.0 (MIT, HOT Labs), with esbuild
+  as a build tool; both are pinned development dependencies. See [assets/README.md](assets/README.md).
 - AI-generated code: most of the code, tests and documentation in the hackathon diff were
   written with AI coding assistants, directed by the maintainer.
 - Other chains: the pre-existing product accepts payment in Nano (XNO) through x402. That
@@ -793,8 +796,9 @@ model) is in [docs/near-payments.md](docs/near-payments.md).
 >
 > Status: the flow passes offline and the verifier passes read-only checks against a real
 > testnet transfer. This code has not yet moved real NEAR; the first real testnet run
-> is [Prove it on testnet](#prove-it-on-testnet-turnkey). No hosted NEAR-mode endpoint
-> exists yet.
+> is [Prove it on testnet](#prove-it-on-testnet-turnkey). For the NEAR-first hostname,
+> shared Nano pool and connected-wallet payment flow, see
+> [NEAR endpoint and wallet payments](docs/near-payments.md#near-endpoint-and-wallet-payments).
 >
 > The same workflow runs can also be sold as jobs on NEAR Agent Market, paid by the
 > market's escrow instead of a transfer per call: see
@@ -1139,7 +1143,8 @@ neither are the built-in tools.
   absorbs the rest.
 - Text results stay in memory only; a replay after a restart returns the receipt
   and says the text was not kept.
-- No pay page or payment-watch stream: the caller presents the transaction hash.
+- Wallet payments have a pay page and monitoring stream. A transfer sent outside
+  that page must be confirmed with its sender and hash.
 - A transfer for a quote that expired more than an hour earlier is not refunded
   automatically (the quote is gone); the operator sees it in the merchant account.
 - The NEAR→XNO swap rate is derived from two USD rates and the server never swaps; the

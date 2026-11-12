@@ -118,6 +118,7 @@ export function createNearGate({
   randomInt,
   maxOpenQuotes = 1000,
   expiredRetainMs = 3_600_000,
+  publicBase = null,
 }) {
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
@@ -130,6 +131,10 @@ export function createNearGate({
   const results = new Map();
   /** Per-payment-id serialization: one paying call at a time per id. */
   const locks = new Map();
+  const waiters = new Map();
+  function changed(id) {
+    for (const wake of waiters.get(id) || []) wake();
+  }
   async function withLock(key, fn) {
     const prev = locks.get(key) || Promise.resolve();
     let release;
@@ -142,6 +147,7 @@ export function createNearGate({
     } finally {
       release();
       if (locks.get(key) === chained) locks.delete(key);
+      changed(key);
     }
   }
 
@@ -437,6 +443,11 @@ export function createNearGate({
         likelyChargeNear,
         rate: { nearUsd: r.nearUsd, source: r.source, at: r.at, ...rateExtras(r) },
         expiresAt: new Date(expiresAt).toISOString(),
+        ...(publicBase ? {
+          payUrl: `${publicBase}/pay/${id}`,
+          watchUrl: `${publicBase}/near/watch/${id}`,
+          statusUrl: `${publicBase}/near/status/${id}`,
+        } : {}),
       },
     });
     return { content: [{ type: "text", text: q.text }], structuredContent: q.structured };
@@ -480,19 +491,8 @@ export function createNearGate({
 
   /* ---------------- pay → run → settle ---------------- */
 
-  async function pay(registry, { name, args, argsHash, paymentId, tx, sender, ctx, tool }) {
-    const q0 = ledger.getQuote(paymentId);
-    if (!q0) return errResult(`Unknown or expired payment id "${paymentId}" — call again without _payment_id for a fresh quote.`);
-    if (q0.tool !== name || q0.argsHash !== argsHash) {
-      return errResult(`payment ${q0.id} was issued for a different call (tool/arguments changed) — ` +
-        "call again without _payment_id to get a quote for these arguments.");
-    }
-    if (FINAL.has(q0.status)) return replay(q0);
-    if (q0.status === "running") {
-      return errResult(`payment ${q0.id} is still being processed — call again in a moment with the same arguments.`);
-    }
-
-    // pending or expired: verify the transfer
+  async function acceptPayment(q0, tx, sender, ctx = null) {
+    if (q0.status === "paid" || q0.status === "running" || FINAL.has(q0.status)) return null;
     if (typeof tx !== "string" || !tx.trim() || typeof sender !== "string" || !sender.trim()) {
       throw new GraphArgsError("the paying call needs _payment_tx (your transfer's transaction hash) and _payment_sender (the account you paid from) together with _payment_id");
     }
@@ -539,17 +539,11 @@ export function createNearGate({
         `so it was not used for this one (which asks for ${formatYoctoAsNear(BigInt(q0.amountYocto))} NEAR). Nothing was consumed.`);
     }
 
-    // Re-check the call and rebuild the graph to run before taking the payment.
-    // The quote already passed these checks; this only fails if the catalog changed.
-    let prepared = null, prepError = null;
-    if (!wrongAmount && t.blockTimeMs <= q0.expiresAt) {
-      try { prepared = await prepare(registry, name, args, tool); } catch (e) { prepError = e; }
-    }
-    const fresh = ledger.getQuote(q0.id);
-    if (!fresh || fresh.status !== q0.status) return replay(fresh || q0);
-
     // From here to updateQuote there is no await: the consume and the status
     // change cannot interleave with another call.
+    if (!ledger.getQuote(q0.id)) {
+      return errResult("This quote expired while the transfer was being checked. Nothing was consumed; contact the operator if you already paid.");
+    }
     if (consumed !== q0.id && !ledger.consumeTx(txHash, q0.id)) {
       return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
     }
@@ -560,14 +554,95 @@ export function createNearGate({
         ? `The quote asked for exactly ${formatYoctoAsNear(BigInt(q0.amountYocto))} NEAR.`
         : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`;
       let q = ledger.updateQuote(q0.id, { ...paidFields, status: "rejected", outcome: reject, error, finishedAt: now() });
-      ev("paid", { paymentId: q.id, tool: name, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
+      ev("paid", { paymentId: q.id, tool: q.tool, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
       const rf = await refundFor(q, t.payer, t.amountYocto, reject);
       q = ledger.updateQuote(q.id, { refundId: rf.refundId });
       return replay(q);
     }
-    let q = ledger.updateQuote(q0.id, { ...paidFields, status: "running" });
-    ev("paid", { paymentId: q.id, tool: name, ok: true, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
-    note(`payment verified — running ${name}`);
+    const q = ledger.updateQuote(q0.id, { ...paidFields, status: "paid" });
+    ev("paid", { paymentId: q.id, tool: q.tool, ok: true, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
+    return null;
+  }
+
+  /** Public payment state contains no workflow inputs or result text. */
+  function paymentView(id) {
+    const q = ledger.getQuote(id);
+    if (!q) return null;
+    const status = q.status === "pending" && now() > q.expiresAt ? "expired" : q.status;
+    const paid = status === "paid" || status === "running" || status === "settled";
+    return {
+      paymentId: q.id, tool: q.tool, network, payTo: merchantId,
+      amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)),
+      depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
+      done: status !== "pending",
+      next: paid
+        ? `Payment confirmed. Call ${q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`
+        : status === "pending" ? "Pay this deposit in your wallet; keep monitoring until payment is confirmed."
+        : "Ask your agent for a fresh quote. Do not pay this quote again.",
+      ...(q.payTx ? { txHash: q.payTx } : {}),
+      ...(FINAL.has(status) ? { receipt: receiptFor(q).structured.receipt } : {}),
+    };
+  }
+
+  /** A wallet confirms a deposit; only the original bound MCP call can run it. */
+  async function confirmPayment(id, tx, sender) {
+    return withLock(id, async () => {
+      const q = ledger.getQuote(id);
+      if (!q) return { error: "Unknown payment id. Ask your agent for a fresh quote." };
+      try {
+        const refused = await acceptPayment(q, tx, sender);
+        const view = paymentView(id);
+        return refused?.isError
+          ? { ...view, error: refused.content.map((c) => c.text || "").join("\n") }
+          : view;
+      } catch (e) {
+        if (e instanceof GraphArgsError) return { ...paymentView(id), error: e.message };
+        throw e;
+      }
+    });
+  }
+
+  function waitForPayment(id, timeoutMs = 25_000, { signal } = {}) {
+    if (signal?.aborted || paymentView(id)?.status !== "pending") return Promise.resolve();
+    return new Promise((resolve) => {
+      const set = waiters.get(id) || new Set();
+      waiters.set(id, set);
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        set.delete(done);
+        if (!set.size) waiters.delete(id);
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref?.();
+      set.add(done);
+      signal?.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  async function pay(registry, { name, args, argsHash, paymentId, tx, sender, ctx, tool }) {
+    const q0 = ledger.getQuote(paymentId);
+    if (!q0) return errResult(`Unknown or expired payment id "${paymentId}" — call again without _payment_id for a fresh quote.`);
+    if (q0.tool !== name || q0.argsHash !== argsHash) {
+      return errResult(`payment ${q0.id} was issued for a different call (tool/arguments changed) — ` +
+        "call again without _payment_id to get a quote for these arguments.");
+    }
+    if (FINAL.has(q0.status)) return replay(q0);
+    if (q0.status === "running") {
+      return errResult(`payment ${q0.id} is still being processed — call again in a moment with the same arguments.`);
+    }
+
+    const refused = await acceptPayment(q0, tx, sender, ctx);
+    if (refused) return refused;
+    let q = ledger.getQuote(q0.id);
+    if (FINAL.has(q.status)) return replay(q);
+    // The payment page accepts the deposit without executing or retaining inputs.
+    // The bound MCP call is still checked before any model work can begin.
+    let prepared = null, prepError = null;
+    try { prepared = await prepare(registry, name, args, tool); } catch (e) { prepError = e; }
+    q = ledger.updateQuote(q.id, { status: "running" });
+    if (ctx?.announce) ctx.announce(`payment verified — running ${name}`);
 
     let res;
     try {
@@ -705,7 +780,7 @@ export function createNearGate({
               ...props,
               _payment_id: {
                 type: "string",
-                description: "The paymentId from this tool's quote. Pass it only on the paying call, with the same arguments plus _payment_tx and _payment_sender.",
+                description: "The paymentId from this tool's quote. After the pay page confirms payment, repeat the original arguments plus this id. Agents paying directly also supply _payment_tx and _payment_sender.",
               },
               _payment_tx: {
                 type: "string",
@@ -753,5 +828,5 @@ export function createNearGate({
     return { listTools, callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]) };
   }
 
-  return { wrapRegistry, resume };
+  return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment };
 }

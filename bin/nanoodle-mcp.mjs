@@ -124,6 +124,10 @@ Paid in NEAR (custom workflows too; see docs/near-payments.md):
                      --charge-usd as well, one server accepts both: Nano by default, NEAR
                      with "_pay_with": "near". NanoGPT is still paid by your API key or Nano wallet.
   --near-network n   testnet (default) or mainnet (NEAR_NETWORK)
+  --near-serve [h:]p second HTTP listener, NEAR by default (NEAR_SERVE); shares the
+                     existing Nano funding wallet and NEAR ledger in this process
+  --near-public-url u public origin for that listener (NEAR_PUBLIC_URL), e.g.
+                     https://mcp-near.nanoodle.com; requires --near-serve
   --near-rpc u       NEAR JSON-RPC endpoint(s) you trust for finality, comma-separated,
                      tried in order with failover (NEAR_RPC_URL; default fastnear's
                      public RPC, then near.org's). No node of your own is needed.
@@ -159,6 +163,7 @@ async function main() {
   let serveSpec = null, chargeUsdFlag = null, publicUrlFlag = null, nanoWsFlag = null, xnoUsdFlag = null, noLocalWork = false;
   let nearMerchantFlag = null, nearNetworkFlag = null, nearRpcFlag = null, nearKeyFile = null, nearUsdFlag = null, nearMaxDepositFlag = null;
   let nearSpreadFlag = null, nearQuoteTtlFlag = null, nearRefreshFlag = null;
+  let nearServeFlag = null, nearPublicFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -185,6 +190,8 @@ async function main() {
     else if (a === "--xno-usd") xnoUsdFlag = val("--xno-usd");
     else if (a === "--no-local-work") noLocalWork = true;
     else if (a === "--near-merchant") nearMerchantFlag = val("--near-merchant");
+    else if (a === "--near-serve") nearServeFlag = val("--near-serve");
+    else if (a === "--near-public-url") nearPublicFlag = val("--near-public-url");
     else if (a === "--near-network") nearNetworkFlag = val("--near-network");
     else if (a === "--near-rpc") nearRpcFlag = val("--near-rpc");
     else if (a === "--near-key-file") nearKeyFile = val("--near-key-file");
@@ -235,8 +242,29 @@ async function main() {
   let nearUsdText = nearUsdFlag ?? process.env.NEAR_USD ?? null;
   let nearSpreadText = nearSpreadFlag ?? process.env.NEAR_SWAP_SPREAD_BPS ?? null;
   const nearMaxDeposit = positive("--near-max-deposit-usd", nearMaxDepositFlag);
-  if (!nearMode && (nearNetworkFlag || nearRpcFlag || nearKeyFile || nearUsdFlag || nearMaxDepositFlag || nearSpreadFlag || nearQuoteTtlFlag || nearRefreshFlag)) {
+  if (!nearMode && (nearNetworkFlag || nearRpcFlag || nearKeyFile || nearUsdFlag || nearMaxDepositFlag || nearSpreadFlag || nearQuoteTtlFlag || nearRefreshFlag || nearServeFlag || nearPublicFlag)) {
     console.error("the --near-* options need --near-merchant <account> (or NEAR_MERCHANT)"); usage();
+  }
+  // Two listeners, one wallet queue and one NEAR ledger. A separate wallet
+  // process for the NEAR hostname would race the existing Nano account.
+  const nearServeSpec = nearServeFlag ?? process.env.NEAR_SERVE ?? null;
+  const nearPublicUrl = nearPublicFlag ?? process.env.NEAR_PUBLIC_URL ?? null;
+  let nearServeHost = "127.0.0.1", nearServePort = null;
+  if (nearServeSpec !== null) {
+    const m = nearServeSpec.match(/^(?:([^:]+):)?(\d+)$/);
+    if (!nearMode || !m || Number(m[2]) < 1 || Number(m[2]) > 65535 || !nearPublicUrl) {
+      console.error("--near-serve (NEAR_SERVE) needs --near-merchant, [host:]port (1-65535), and --near-public-url (NEAR_PUBLIC_URL)"); usage();
+    }
+    nearServeHost = m[1] || nearServeHost;
+    nearServePort = Number(m[2]);
+    if (nearServePort === servePort && nearServeHost === serveHost) { console.error("--near-serve must use a different listener from --serve"); usage(); }
+  }
+  if (nearPublicUrl != null) {
+    let u;
+    try { u = new URL(nearPublicUrl); } catch { /* rejected below */ }
+    if (!nearMode || !nearServePort || !u || !["https:", "http:"].includes(u.protocol) || u.username || u.password || u.pathname !== "/" || u.search || u.hash) {
+      console.error("--near-public-url (NEAR_PUBLIC_URL) must be an HTTP(S) origin and needs --near-serve"); usage();
+    }
   }
   let nearQuoteTtlMin = 30, nearRefreshS = 60;
   if (nearMode) {
@@ -476,7 +504,7 @@ async function main() {
         envText, envFile, usdText: nearUsdText, usdFlag: nearUsdFlag != null, spreadText: nearSpreadText, spreadFlag: nearSpreadFlag != null,
         xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
         modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
-        maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase, dual: chargeUsd != null,
+        maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
       });
       ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
     } catch (e) {
@@ -580,6 +608,7 @@ async function main() {
     callTool,
     instructions,
     gate,
+    nearGate: near?.gate || null,
     paymentNote,
     rates: near ? near.rates : null,
     toolInfo: registry.tools,
@@ -589,6 +618,23 @@ async function main() {
     marketWebhook,
     log: (...a) => console.error(...a),
   });
+  if (nearServePort) {
+    // Advertise no runnable tools if merchant verification fails; the Nano
+    // endpoint continues serving while the NEAR account awaits funding.
+    const unavailable = () => ({ content: [{ type: "text", text: "NEAR payments are unavailable. The merchant account must be funded and its refund key verified before any workflows can run." }], isError: true });
+    await serveHttp({
+      host: nearServeHost, port: nearServePort, name: "nanoodle-mcp", version: pkg.version,
+      listTools: near ? near.wrapped.listTools : () => [],
+      callTool: near ? near.wrapped.callTool : unavailable,
+      instructions: near ? near.nearInstructions : unavailable().content[0].text,
+      paymentNote: near ? near.nearPaymentNote : unavailable().content[0].text,
+      nearGate: near?.gate || null, rates: near?.rates || null,
+      toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
+      publicBase: nearPublicUrl.replace(/\/+$/, ""),
+      log: (...a) => console.error(...a),
+    });
+    console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl}/mcp on ${nearServeHost}:${nearServePort} — shared Nano funding pool${near ? "" : "; NEAR payments unavailable"}`);
+  }
   console.error(`nanoodle-mcp: MCP over HTTP on http://${serveHost}:${servePort}/mcp` +
     (nearInfo && chargeUsd != null
       ? ` — paid in Nano (XNO to ${wallet.address}) or in NEAR on ${nearInfo.network} to ${nearInfo.merchant}`
@@ -765,7 +811,7 @@ async function startNearMode({
   const gate = createNearGate({
     merchantId: merchant, network, rpc, ledger, rate: rates, refunder,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
-    baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment,
+    baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
   });
   const wrapped = gate.wrapRegistry(registry);
   const { listTools, callTool } = wrapped;
@@ -784,7 +830,10 @@ async function startNearMode({
       : `Tools on this server are paid per call in native NEAR on ${network}; no account or API key is needed. `) +
     "price_noodle (free) returns the itemized estimated cost, the 20% service fee, the deposit and the likely refund of any workflow; " +
     "noodle_guide (free) explains how to compose a custom workflow graph for run_noodle. " +
-    "Calling a paid tool without payment returns a quote: send ONE native NEAR transfer of exactly payment.amountYocto to payment.payTo " +
+    "For a human payer, show payment.payUrl and immediately open payment.watchUrl to monitor payment. " +
+    "The user connects a wallet and approves the deposit there. When the monitor closes with status paid and done:true, " +
+    "repeat the original tool call with identical arguments plus _payment_id; continue automatically without another confirmation. " +
+    "Alternatively, an agent paying directly can send ONE native NEAR transfer of exactly payment.amountYocto to payment.payTo " +
     "(one Transfer action, nothing else), then call the same tool again with identical arguments plus _payment_id, _payment_tx " +
     "(the transaction hash) and _payment_sender (the account you paid from). " +
     "The amount you send is a deposit, the most you can be charged; you will most likely pay the estimated cost plus the 20% service fee, " +
@@ -796,8 +845,13 @@ async function startNearMode({
       : `Every call is paid in native NEAR on ${network}. A call without payment returns a quote with an exact deposit; `) +
     `send one transfer of that amount to ${merchant} and call again with the transaction hash. You are charged the ` +
     "actual model cost plus a 20% service fee, and the rest of the deposit is refunded automatically. price_noodle " +
-    "(free) shows the itemized estimate first; run_noodle also runs workflow graphs you compose yourself." + ratesLine;
-  return { listTools, callTool, wrapped, rates, instructions, paymentNote, nearInfo: { network, merchant }, usagePath };
+    "(free) shows the itemized estimate first; run_noodle also runs workflow graphs you compose yourself. " +
+    "The quote also includes a wallet payment link and monitor, so human payers can connect a wallet and the agent resumes automatically." + ratesLine;
+  const nearInstructions = instructions.replace(`Paying in native NEAR on ${network}:`, `Tools on this server are paid per call in native NEAR on ${network};`);
+  const nearPaymentNote = `Every call is paid in native NEAR on ${network}. Your agent shows a payment link: connect your wallet, approve the deposit, ` +
+    "and the result streams back automatically. You pay actual model cost plus a 20% service fee; unused NEAR returns to the paying wallet on chain. " +
+    "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." + ratesLine;
+  return { listTools, callTool, wrapped, gate, rates, instructions, paymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });

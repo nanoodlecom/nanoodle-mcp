@@ -987,16 +987,24 @@ export function formatQuote({ pricing, payment, now = Date.now() }) {
     depositUsdSent: pay.depositUsdSent, dustNear: pay.dustNear,
   };
   const voc = pricingVocabulary(pricing, { near });
-  const next = `Send exactly ${pay.amountNear} NEAR (${pay.amountYocto} yoctoNEAR) to ${pay.payTo} on ${pay.network} in ONE transfer, then call this tool again with the same arguments plus _payment_id, _payment_tx and _payment_sender.`;
+  const next = pay.payUrl
+    ? `Show ${pay.payUrl} to the user and immediately open ${pay.watchUrl} to monitor payment. When it closes with status paid, call this tool with the original arguments plus _payment_id: "${pay.paymentId}". Paying authorizes the run; continue automatically. Agents with their own wallet can instead send the exact transfer and supply _payment_tx and _payment_sender.`
+    : `Send exactly ${pay.amountNear} NEAR (${pay.amountYocto} yoctoNEAR) to ${pay.payTo} on ${pay.network} in ONE transfer, then call this tool again with the same arguments plus _payment_id, _payment_tx and _payment_sender.`;
   const left = Date.parse(pay.expiresAt) - now;
   const mins = Number.isFinite(left) && left > 0 ? Math.max(1, Math.round(left / 60000)) : 30;
   const lines = [
     `PAYMENT REQUIRED (NEAR ${pay.network}) — ${summarySentence(pricing, near)}`,
     "",
-    `Send exactly ${pay.amountNear} NEAR (${pay.amountYocto} yoctoNEAR) to ${pay.payTo} on ${pay.network}: one transfer, no other actions.`,
-    `Then call this tool again with the same arguments plus _payment_id: "${pay.paymentId}", _payment_tx: <your transaction hash> and _payment_sender: <the account you paid from>.`,
+    ...(pay.payUrl ? [
+      `Pay in your wallet: ${pay.payUrl}`,
+      `The page sends exactly ${pay.amountNear} NEAR to ${pay.payTo} on ${pay.network}. Your agent monitors payment and resumes automatically with _payment_id: "${pay.paymentId}".`,
+    ] : [
+      `Send exactly ${pay.amountNear} NEAR (${pay.amountYocto} yoctoNEAR) to ${pay.payTo} on ${pay.network}: one transfer, no other actions.`,
+      `Then call this tool again with the same arguments plus _payment_id: "${pay.paymentId}", _payment_tx: <your transaction hash> and _payment_sender: <the account you paid from>.`,
+    ]),
     `The payment id is a secret; do not share it. The quote expires in about ${mins} minute${mins === 1 ? "" : "s"} (${pay.expiresAt}).`,
     `If the run fails, the whole deposit is refunded.`,
+    ...(pay.payUrl ? ["", next] : []),
     "",
     depositWhySentence(pricing),
     "",

@@ -1,5 +1,12 @@
 # Brand assets
 
+`near-wallet.js` is the NEAR payment page's browser bundle. Rebuild it with
+`npm ci && npm run build:near-wallet`. Its source is `src/near-pay-browser.mjs`;
+it includes NEAR Connect 0.12.0 (MIT, HOT Labs), pinned as a build dependency.
+The Node server keeps its existing two runtime dependencies. Wallet discovery
+and wallet executors come from NEAR Connect's upstream manifest; the payer's
+private keys stay in their wallet. Attribution is in `near-wallet.LICENSE.txt`.
+
 Served by `--serve` at `/favicon.ico`, `/favicon.png`, `/apple-touch-icon.png`,
 `/icon-512.png`, and `/og.jpg` (the landing page's social card), plus
 `/righteous-latin.woff2` and `/righteous-latin-ext.woff2` — the Righteous

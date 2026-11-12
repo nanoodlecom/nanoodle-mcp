@@ -37,7 +37,7 @@ before(async () => {
 });
 after(() => { globalThis.fetch = realFetch; });
 
-async function world({ limits, dust = 137 } = {}) {
+async function world({ limits, dust = 137, publicBase } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
@@ -55,7 +55,7 @@ async function world({ limits, dust = 137 } = {}) {
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
       rate: createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: mock.fetch, randomInt: () => dust++,
+      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase,
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -67,6 +67,59 @@ async function world({ limits, dust = 137 } = {}) {
 
 const call = (w, name, args) => w.callTool({ name, arguments: args });
 const text = (r) => r.content.map((c) => c.text || "").join("\n");
+
+test("wallet page confirms payment without running; the original MCP call resumes with only its id", async () => {
+  const w = await world({ publicBase: "https://mcp-near.nanoodle.com" });
+  const q = await call(w, "idea-poster", INPUTS);
+  const p = q.structuredContent.payment;
+  assert.equal(p.payUrl, `https://mcp-near.nanoodle.com/pay/${p.paymentId}`);
+  assert.match(p.next, /monitor payment/);
+  const tx = w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto));
+  const before = mock.runs();
+  const waiting = w.gate.waitForPayment(p.paymentId);
+  const confirmed = await w.gate.confirmPayment(p.paymentId, tx, PAYER);
+  await waiting;
+  assert.equal(confirmed.status, "paid");
+  assert.equal(confirmed.done, true);
+  assert.equal(w.ledger.consumedBy(tx), p.paymentId);
+  assert.equal(mock.runs(), before, "confirming must not run models");
+  assert.ok(!JSON.stringify(confirmed).includes(INPUTS.Idea), "payment surface has no workflow inputs");
+  const mismatched = await call(w, "idea-poster", { Idea: "a different idea", _payment_id: p.paymentId });
+  assert.ok(mismatched.isError);
+  assert.equal(w.gate.quote(p.paymentId).status, "paid");
+  const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(result.structuredContent.receipt.refund.status, "sent");
+  assert.equal(w.gate.quote(p.paymentId).status, "settled");
+  const repeated = await w.gate.confirmPayment(p.paymentId, tx, PAYER);
+  assert.equal(repeated.status, "settled");
+});
+
+test("wallet confirmation persists across restart and retains transaction reuse protection", async () => {
+  const w = await world();
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  assert.equal((await w.gate.confirmPayment(p.paymentId, tx, PAYER)).status, "paid");
+  const n = await w.restart();
+  assert.equal(n.gate.quote(p.paymentId).status, "paid");
+  const second = (await call(n, "idea-poster", INPUTS)).structuredContent.payment;
+  assert.match((await n.gate.confirmPayment(second.paymentId, tx, PAYER)).error, /already used/);
+  const result = await call(n, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+});
+
+test("wallet confirmation refunds wrong and late transfers without running a model", async () => {
+  for (const late of [false, true]) {
+    const w = await world();
+    const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS, late
+      ? { blockTimeMs: Date.now() + 31 * 60_000 }
+      : { amount: 1_000_000_000_000_000_000_000n });
+    const confirmed = await w.gate.confirmPayment(p.paymentId, tx, PAYER);
+    assert.equal(confirmed.status, "rejected");
+    assert.equal(confirmed.receipt.refund.status, "sent");
+    assert.equal(confirmed.receipt.charged.yocto, "0");
+    assert.equal(confirmed.receipt.outcome, late ? "late_payment" : "wrong_amount");
+  }
+});
 
 async function quoteAndPay(w, name, args, { amount, blockTimeMs } = {}) {
   const q = await call(w, name, args);

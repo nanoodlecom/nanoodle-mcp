@@ -16,6 +16,7 @@ switch.
 - [Configuration](#configuration)
 - [Rates and the swap margin](#rates-and-the-swap-margin)
 - [One server, both rails](#one-server-both-rails)
+- [NEAR endpoint and wallet payments](#near-endpoint-and-wallet-payments)
 - [Which graphs a paid server will run](#which-graphs-a-paid-server-will-run)
 - [Durable state](#durable-state)
 - [On-chain verification](#on-chain-verification)
@@ -73,6 +74,67 @@ agent                              nanoodle-mcp (NEAR mode)                NEAR 
 
 A run that fails refunds the **whole deposit**. This matches the Nano (XNO) charge mode.
 Provider costs already incurred are the operator's loss, never the caller's.
+
+## NEAR endpoint and wallet payments
+
+The same server process can expose a second hostname where NEAR is the default.
+Both listeners use the **same Nano funding wallet**, serialized wallet queue,
+workflow registry, generated files and NEAR ledger. Do not start another process
+with the same Nano seed or state directory.
+
+On an existing Nano-paid deployment, add these variables to its service environment:
+
+```dotenv
+NEAR_MERCHANT=your-merchant.near
+NEAR_NETWORK=mainnet
+NEAR_PRIVATE_KEY=ed25519:YOUR_MERCHANT_REFUND_KEY
+NEAR_SERVE=127.0.0.1:8403
+NEAR_PUBLIC_URL=https://mcp-near.nanoodle.com
+```
+
+Keep the existing `NANO_SEED` / `NANO_PRIVATE_KEY` and primary `--serve` /
+`--charge-usd` settings. `--near-serve` and `--near-public-url` are equivalent
+CLI flags. Fund the merchant with NEAR before enabling it: the server verifies
+its full-access refund key on chain, and the merchant pays refund gas. An
+unfunded implicit account does not yet exist. If verification fails on a dual
+deployment, Nano keeps serving and the NEAR listener offers no runnable tools.
+
+Point the new hostname at the existing host, terminate HTTPS, and proxy to the
+second listener. For Caddy:
+
+```caddyfile
+mcp-near.nanoodle.com {
+    reverse_proxy localhost:8403
+}
+```
+
+Connect an agent to `https://mcp-near.nanoodle.com/mcp`. No `_pay_with` argument
+is needed there. The primary endpoint continues to default to Nano; its NEAR
+quotes link to the same NEAR payment page.
+
+1. A paid tool returns `payment.payUrl`, `payment.watchUrl` and
+   `payment.statusUrl`, alongside the exact amount and expiry.
+2. The agent shows **only the pay URL** to the user, then opens the watch URL
+   (SSE), or long-polls the status URL with `?wait=1`.
+3. The user connects a NEAR wallet on the payment page and approves **one
+   native Transfer** of the exact deposit. NEAR Connect handles wallet selection;
+   no private key or access key is given to this server. A manual transfer can
+   also be confirmed on that page with its sender account and hash.
+4. The page submits the hash to `POST /near/pay/:id`. The existing FINAL
+   verification, transaction reuse checks and wrong/late-payment refund rules
+   apply. Acceptance is persisted as `paid`, without running a model or storing
+   workflow inputs. A reload retries confirmation of the saved transaction;
+   an uncertain wallet result does not offer another payment automatically.
+5. The monitor ends with `status: "paid"`, `done: true` and `next`. The agent
+   repeats the original tool call with **only `_payment_id` added**. The server
+   runs once, pays models from the shared Nano pool, and returns unused NEAR
+   to the actual transaction signer. The original arguments remain bound to
+   the quote, and accepted payments survive restarts.
+
+Agents with their own signing wallet can still pay directly with
+`_payment_id`, `_payment_tx` and `_payment_sender`. There is no automatic
+NEAR-to-Nano swap: NEAR is received and refunded natively; the existing Nano
+float pays model invoices.
 
 ## Pricing vocabulary
 
@@ -807,8 +869,8 @@ These are deliberate cuts for this version.
   only.
 - Built-in tools (`subnano_comment`, `sfw_check`, `humanize-comment`) are not sold in
   NEAR mode.
-- There is no pay page, QR code or payment-watch stream for NEAR. The caller presents the
-  transaction hash itself.
+- The NEAR pay page connects a wallet rather than using a universal payment QR code.
+  A transfer sent outside that page must be confirmed with its sender and hash.
 - With both rails on one server, a NanoGPT max-cost refund to the shared Nano wallet is a
   receive like any caller payment; the Nano gate matches receives by amount, so such a
   refund can in rare cases match an open Nano quote's amount. This is the same exposure the
