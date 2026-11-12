@@ -28,7 +28,7 @@ const WORKFLOW_EXAMPLES = {
   "deslop": reviewedSample("deslop", "A repair-booking announcement rewritten in plain language while retaining the supplied facts. Compare the source and result in the sample; this is an editorial workflow, not an authorship detector."),
   "render-a-mockup": reviewedSample("render-a-mockup", "A repair-shop dashboard concept with the requested navigation, date, three appointment rows, names, statuses and totals. This is a rendered screen concept; implementation and interaction are separate work.", "Repair-shop dashboard concept with three appointment rows"),
   "sing": {
-    ...reviewedSample("sing", "A 170-second generated closing-credits song. Gemini 3.8 Flash reported clear gentle acoustic vocals and a chorus matching the supplied lyrics. This is model-assisted audio review, not human listening sign-off."),
+    ...reviewedSample("sing", "A 170-second generated closing-credits song. Gemini 3.8 Flash reported clear gentle acoustic vocals and a chorus matching the supplied lyrics. This sample was recorded with MiniMax Music 3, before the tool moved to Mureka 9.5. This is model-assisted audio review, not human listening sign-off."),
     title: "Audio sample",
   },
   "talking-avatar": {

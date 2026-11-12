@@ -108,7 +108,8 @@ graph has more than one named text node). Two ready defaults ship in `scripts/`
 [awesome-noodles](https://github.com/nanoodlecom/awesome-noodles), the most used workflow
 on the hosted nanoodle-mcp server: three chat calls write the lyrics, arrange the song and
 name what would clash with the arrangement, then Mureka 9.5 sings it (NanoGPT model
-`mureka-ai/mureka-v9.5/generate-song`, $0.225 per song; the original uses MiniMax Music 3). Two changes for
+`mureka-ai/mureka-v9.5/generate-song`, $0.225 per song; the original uses the same model since
+2026-11-12). Two changes for
 hires in plain words: the original's "Preferred bands" input is a **Style** input that the
 buyer sets with a `Style:` line (with none, the workflow picks a style that fits the idea),
 and the lyrics are delivered as a second output.
