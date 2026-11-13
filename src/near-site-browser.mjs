@@ -100,7 +100,7 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
         const restored = [];
         for (const session of previous.slice(-10)) {
           if (!session?.payment || session.payment.payTo !== config.merchant || !/^nq_[A-Za-z0-9_-]+$/.test(session.payment.paymentId)
-            || !session.args || typeof session.args !== "object" || !["run_noodle", ...config.tools.map(t => t.name)].includes(session.name)) continue;
+            || !session.args || typeof session.args !== "object" || typeof session.name !== "string" || !/^[A-Za-z0-9_-]+$/.test(session.name)) continue;
           restored.push(session);
         }
         sessions.push(...restored);
