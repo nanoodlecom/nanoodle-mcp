@@ -6,7 +6,7 @@ import vm from "node:vm";
 const source = (await readFile(new URL("../src/near-pay-browser.mjs", import.meta.url), "utf8"))
   .replace('import { NearConnector } from "@hot-labs/near-connect";', "");
 
-function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null, asset = {} } = {}) {
+function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null, asset = {}, finalStatus = "paid" } = {}) {
   const payment = { paymentId: "nq_test", status: "pending", network: "testnet", payTo: "merchant.testnet", amountYocto: "12345678901234567890123", ...asset };
   const state = { ...payment };
   const events = new Map();
@@ -30,7 +30,7 @@ function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = n
     EventSource: class { addEventListener() {} close() {} },
     fetch: async (url, args) => {
       if (args?.method === "POST") {
-        confirmed.push(JSON.parse(args.body)); state.status = "paid";
+        confirmed.push(JSON.parse(args.body)); state.status = finalStatus;
       }
       return { ok: true, json: async () => ({ ...state }) };
     },
@@ -66,10 +66,11 @@ test("uncertain wallet outcome is retained so a refresh cannot request a second 
 });
 
 test("USDC wallet payment signs one ft_transfer to the quoted token contract, with one yoctoNEAR attached", async () => {
-  const p = page({ asset: { asset: "USDC", tokenContract: "circle-usdc.testnet", amountAtomic: "10347" } });
+  const p = page({ asset: { asset: "USDC", tokenContract: "circle-usdc.testnet", amountAtomic: "10347" }, finalStatus: "settled" });
   await p.click();
   assert.deepEqual(JSON.parse(JSON.stringify(p.sent)), [{ network: "testnet", signerId: "payer.testnet", receiverId: "circle-usdc.testnet",
     actions: [{ type: "FunctionCall", params: { methodName: "ft_transfer", args: { receiver_id: "merchant.testnet", amount: "10347" }, gas: "30000000000000", deposit: "1" } }] }]);
   assert.deepEqual(p.confirmed, [{ senderId: "payer.testnet", txHash: "transfer-hash" }]);
+  assert.match(p.elements.get("#near-status").textContent, /Unused USDC is returned/);
   await p.click(); assert.equal(p.sent.length, 1);
 });
