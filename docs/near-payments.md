@@ -165,9 +165,15 @@ detection unavailable; the payment page's explicit confirmation remains usable.
 
 For an existing named merchant such as `nanoodle.near`, open `/setup` on the
 NEAR endpoint. The page displays the exact account, public server key, network
-and Full Access permission. The owner connects Meteor Wallet and approves one
-`AddKey` transaction on that account. It does not remove the existing wallet
-key or request its seed phrase/private key.
+and Full Access permission. Meteor blocks app-initiated Full Access requests;
+the setup page only copies the public key and checks its authorization. Use the
+wallet's own Settings → Security and Recovery → Manage Full Access Keys. If
+the wallet supports adding a custom public key, authorize the displayed server
+key on the exact merchant account, preserving the existing owner key. Meteor's
+documented recovery-key generator is not a custom-key importer; if that is the
+only option available, arrange credential provisioning privately with the
+server operator rather than entering private keys or recovery phrases on the
+setup page or in chat.
 
 Full Access controls the entire merchant account; it is necessary for plain
 native NEAR refund transfers, which function-call keys cannot sign. Use a

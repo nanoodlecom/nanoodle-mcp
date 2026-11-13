@@ -581,7 +581,10 @@ function nearSetupPageHtml(setup) {
         <p>Payments go to this account on ${esc(setup.network)}. The server needs a signing key to return unused NEAR automatically.</p>
         <p>Authorize this server public key:</p><code>${esc(setup.publicKey)}</code>
         <p><strong>Permission: Full Access.</strong> This gives the server control of this account, including transfers and key management. Use an account dedicated to Nanoodle. Your existing wallet key stays in place.</p>
-        <p><button id="near-authorize" type="button">Authorize refund key in Meteor Wallet</button></p>
+        <p>Meteor blocks Full Access requests from apps. Manage this key in the wallet's own settings: <strong>Settings → Security and Recovery → Manage Full Access Keys</strong>.</p>
+        <p>If your wallet offers a custom public-key option, add the public key above with Full Access on this exact merchant account. Keep your existing owner key. If it only offers to generate a recovery key, stop here and arrange setup privately with your server operator.</p>
+        <p>This page never asks for a recovery phrase or private key. It checks the public key on chain automatically.</p>
+        <p><button id="near-copy-key" type="button">Copy public key</button></p>
         <p id="near-setup-status" role="status" aria-live="polite">Checking authorization…</p>
         <p id="near-setup-error" role="alert"></p>
       </div>

@@ -317,6 +317,8 @@ test("both rails: a dead first NEAR RPC fails over; a broken NEAR setup leaves N
       const disabledBase = `http://127.0.0.1:${disabledNearPort}`;
       const setupPage = await (await fetch(disabledBase + "/setup")).text();
       assert.match(setupPage, /Permission: Full Access/);
+      assert.match(setupPage, /Meteor blocks Full Access requests from apps/);
+      assert.ok(!setupPage.includes('id="near-authorize"'), "unsupported app authorization is not offered");
       assert.ok(setupPage.includes(other.publicKey));
       assert.ok(!setupPage.includes(other.secretKey), "only the public refund key is exposed");
       assert.equal((await (await fetch(disabledBase + "/setup/status")).json()).authorized, false);
