@@ -116,6 +116,7 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
         refusals,
         pricing,
         inputs: (computed.read && computed.read.inputs) || {},
+        x402: computed.read?.graph?.x402 || null,
       };
     },
 

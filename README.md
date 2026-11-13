@@ -552,6 +552,59 @@ customer refund. Authored workflows are refused before quoting if no Nano payout
 wallet or current XNO/USD rate is available. API-key-funded servers can configure
 `NANO_SEED` or `NANO_PRIVATE_KEY` for these payouts too.
 
+#### Hosted creator workflows
+
+On [near.nanoodle.com/creators](https://near.nanoodle.com/creators), upload a
+Nanoodle graph with your embedded `x402.author` Nano address. Nanoodle stores
+the recipe, funds the model calls from its shared pool, and supplies a run page
+and a dedicated MCP endpoint. The creator supplies the workflow, not a server,
+provider key or marketplace token. Customers pay NEAR or USDC; successful runs
+pay the creator in Nano using the rules above.
+
+Named text and choice nodes become customer inputs. Model configuration stays
+in the stored recipe; callers cannot replace the graph or payout address.
+Uploads are immutable and deduplicated: a revision gets a new link. Public
+pages and MCP discovery do not distribute the graph. Hosting the platform
+yourself remains supported by this open-source repository.
+
+`POST /creators/check` validates and prices without executing; `POST
+/creators/workflows` hosts it. Both accept `{graph, name, description,
+inputName}`; `inputName` selects the named text node that receives a marketplace
+brief. A successful upload returns `/workflows/wf_…` and
+`/workflows/wf_…/mcp`. The endpoint offers `run_workflow` and free
+`price_workflow`, using the same NEAR/USDC gate, execution graph, receipt and
+result components as the main service. `/workflows/wf_…/llms.txt` explains
+automatic payment continuation for that endpoint.
+
+Marketplace publication is an operator review step. On the host, run the
+following as the service user, with its private hosted-workflow directory:
+
+```sh
+node scripts/hosted-workflows.mjs list /srv/nanoodle-mcp/out/hosted-workflows
+node scripts/hosted-workflows.mjs register /srv/nanoodle-mcp/out/hosted-workflows wf_ID
+node scripts/hosted-workflows.mjs adoption /srv/nanoodle-mcp/out/hosted-workflows wf_ID
+# Open the private, expiring adoption URL while signed into Nanoodle's owner account.
+# Set MARKET_HOSTED_OWNER_ACCOUNT_ID to that verified account UUID, then:
+node scripts/hosted-workflows.mjs publish /srv/nanoodle-mcp/out/hosted-workflows wf_ID
+```
+
+Registration credentials and adoption links are private operator capabilities,
+never returned to creators. The publisher requires verified adoption into the
+configured Nanoodle owner account, reprices the graph, creates its per-call
+plan and emits the existing marketplace worker catalog. Until publication,
+the direct run page works and honestly shows marketplace publication pending.
+Published workers start in the same Nanoodle process without a restart and
+use the shared Nano payment queue. They accept the customer's text brief,
+never a replacement workflow. Shutdown drains these workers too.
+
+For market hires, the creator payout becomes owed only after **acceptance**.
+It is 20% of actual model cost, capped by accepted proceeds after model costs,
+converted at the XNO/USD rate locked before execution. Refunded hires and
+unknown model costs create no payout. The common durable Nano outbox retries
+pending sends without rerunning the workflow or paying a settled assignment
+twice. The marketplace's own fee and cent rounding can reduce the payout.
+Official registration/adoption flow: [market.near.ai agent guide](https://market.near.ai/skill/flows/a2a-x402.md).
+
 A run costing more than its deposit keeps the whole deposit and the operator
 absorbs the excess; a run whose model reports no cost settles at $0 and the
 whole deposit is returned (the caller is never billed off a number the meter
