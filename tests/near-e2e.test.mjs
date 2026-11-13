@@ -166,7 +166,10 @@ test("a native wallet transfer is discovered automatically and unblocks the MCP 
     assert.equal(result.structuredContent.receipt.refund.status, "sent");
     const health = await (await fetch(base + "/near/health")).json();
     assert.equal(health.watcher.listening, true);
-    assert.equal((await (await fetch(base + "/setup/status")).json()).authorized, true);
+    assert.equal(health.active, true);
+    for (const path of ["/setup", "/setup/status", "/near-setup.js"]) {
+      assert.equal((await fetch(base + path)).status, 404, "merchant setup is not exposed");
+    }
   } finally { await srv.kill(); await chain.close(); await nano.close(); }
 });
 
@@ -315,13 +318,12 @@ test("both rails: a dead first NEAR RPC fails over; a broken NEAR setup leaves N
       assert.deepEqual(await disabledNear.list(), [], "unavailable NEAR endpoint must expose no runnable workflows");
       assert.equal((await disabledNear.call("run_noodle", { graph: WORKED_GRAPH })).isError, true, "NEAR failure must not make workflow execution free");
       const disabledBase = `http://127.0.0.1:${disabledNearPort}`;
-      const setupPage = await (await fetch(disabledBase + "/setup")).text();
-      assert.match(setupPage, /Permission: Full Access/);
-      assert.match(setupPage, /Meteor blocks Full Access requests from apps/);
-      assert.ok(!setupPage.includes('id="near-authorize"'), "unsupported app authorization is not offered");
-      assert.ok(setupPage.includes(other.publicKey));
-      assert.ok(!setupPage.includes(other.secretKey), "only the public refund key is exposed");
-      assert.equal((await (await fetch(disabledBase + "/setup/status")).json()).authorized, false);
+      for (const path of ["/setup", "/setup/status", "/near-setup.js"]) {
+        assert.equal((await fetch(disabledBase + path)).status, 404, "merchant setup is not exposed when NEAR is inactive");
+      }
+      const health = await fetch(disabledBase + "/near/health");
+      assert.equal(health.status, 503);
+      assert.equal((await health.json()).active, false);
     } finally { await srv.kill(); }
   } finally {
     await chain.close();

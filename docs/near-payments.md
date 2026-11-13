@@ -163,24 +163,20 @@ detection unavailable; the payment page's explicit confirmation remains usable.
 
 ### Authorize the merchant refund key
 
-For an existing named merchant such as `nanoodle.near`, open `/setup` on the
-NEAR endpoint. The page displays the exact account, public server key, network
-and Full Access permission. Meteor blocks app-initiated Full Access requests;
-the setup page only copies the public key and checks its authorization. Use the
-wallet's own Settings → Security and Recovery → Manage Full Access Keys. If
-the wallet supports adding a custom public key, authorize the displayed server
-key on the exact merchant account, preserving the existing owner key. Meteor's
-documented recovery-key generator is not a custom-key importer; if that is the
-only option available, arrange credential provisioning privately with the
-server operator rather than entering private keys or recovery phrases on the
-setup page or in chat.
+Provision the dedicated server refund key on the merchant account privately,
+using the owner's wallet key management or a trusted local NEAR signing tool.
+Meteor blocks app-initiated Full Access requests. There is no public merchant
+setup page. Preserve the owner's existing wallet key; the server only needs
+its own dedicated signing key, not the owner's recovery phrase.
 
 Full Access controls the entire merchant account; it is necessary for plain
 native NEAR refund transfers, which function-call keys cannot sign. Use a
 dedicated merchant account. The server's private refund key remains in its
-existing protected environment file. `/setup/status` checks the public key on
-chain; restart the service once authorized. No paid workflows are offered on
-the NEAR listener until this verification succeeds.
+existing protected environment file. On startup the service checks that this
+public key is a Full Access key on the merchant account on the chosen network.
+Restart after authorization, then check `/near/health` for the active listener
+and watcher status. No paid workflows are offered on the NEAR listener until
+startup verification succeeds. Never put credentials in chat or version control.
 
 ## Pricing vocabulary
 

@@ -72,7 +72,6 @@ const ASSETS = {
   "/righteous-latin-ext.woff2": "font/woff2",
   "/near-wallet.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
-  "/near-setup.js": "text/javascript; charset=utf-8",
 };
 const ICON_LINKS =
   `<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">` +
@@ -572,26 +571,6 @@ function nearPayPageHtml(q) {
   `);
 }
 
-function nearSetupPageHtml(setup) {
-  const config = { merchant: setup.merchant, network: setup.network, publicKey: setup.publicKey };
-  return htmlPage("Authorize NEAR refunds · nanoodle", `
-    <a href="/">nanoodle-mcp</a><h1>Enable NEAR payments and change</h1>
-    <div id="near-setup" data-setup="${esc(JSON.stringify(config))}">
-      <div class="card"><h2>Merchant: ${esc(setup.merchant)}</h2>
-        <p>Payments go to this account on ${esc(setup.network)}. The server needs a signing key to return unused NEAR automatically.</p>
-        <p>Authorize this server public key:</p><code>${esc(setup.publicKey)}</code>
-        <p><strong>Permission: Full Access.</strong> This gives the server control of this account, including transfers and key management. Use an account dedicated to Nanoodle. Your existing wallet key stays in place.</p>
-        <p>Meteor blocks Full Access requests from apps. Manage this key in the wallet's own settings: <strong>Settings → Security and Recovery → Manage Full Access Keys</strong>.</p>
-        <p>If your wallet offers a custom public-key option, add the public key above with Full Access on this exact merchant account. Keep your existing owner key. If it only offers to generate a recovery key, stop here and arrange setup privately with your server operator.</p>
-        <p>This page never asks for a recovery phrase or private key. It checks the public key on chain automatically.</p>
-        <p><button id="near-copy-key" type="button">Copy public key</button></p>
-        <p id="near-setup-status" role="status" aria-live="polite">Checking authorization…</p>
-        <p id="near-setup-error" role="alert"></p>
-      </div>
-    </div><script type="module" src="/near-setup.js"></script>
-  `);
-}
-
 function payPageHtml(q) {
   const statusUrl = `/x402/status/${encodeURIComponent(q.id)}?wait=1`;
   const watchUrl = `/x402/watch/${encodeURIComponent(q.id)}`;
@@ -700,7 +679,7 @@ export async function serveHttp({
   instructions,
   gate = null,
   nearGate = null,
-  nearSetup = null,
+  nearHealth = null,
   nearWatcher = null,
   paymentNote = null,
   rates = null,
@@ -887,19 +866,9 @@ export async function serveHttp({
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
         return res.end(JSON.stringify(await rates.view({ refresh: force }), null, 2));
       }
-      if (url.pathname === "/setup" && nearSetup) {
+      if (url.pathname === "/near/health" && nearHealth) {
         res.setHeader("Cache-Control", "no-store");
-        res.setHeader("Referrer-Policy", "no-referrer");
-        return send(200, nearSetupPageHtml(nearSetup), "text/html; charset=utf-8");
-      }
-      if (url.pathname === "/setup/status" && nearSetup) {
-        res.setHeader("Cache-Control", "no-store");
-        const authorized = await nearSetup.authorized();
-        return send(200, JSON.stringify({ merchant: nearSetup.merchant, network: nearSetup.network, authorized, active: !!nearGate }));
-      }
-      if (url.pathname === "/near/health" && nearSetup) {
-        res.setHeader("Cache-Control", "no-store");
-        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearSetup.merchant, network: nearSetup.network, active: !!nearGate, watcher: nearWatcher?.status() || null }));
+        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearHealth.merchant, network: nearHealth.network, active: !!nearGate, watcher: nearWatcher?.status() || null }));
       }
 
       if (url.pathname === "/version") {

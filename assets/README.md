@@ -1,10 +1,8 @@
 # Brand assets
 
-`near-wallet.js` is the NEAR payment page's browser bundle; `near-setup.js`
-copies the merchant's public refund key and checks its authorization, without
-requesting wallet transactions. Rebuild both with
-`npm ci && npm run build:near-wallet`. Their sources are `src/near-pay-browser.mjs`
-and `src/near-setup-browser.mjs`. The payment bundle includes NEAR Connect 0.12.0
+`near-wallet.js` is the NEAR payment page's browser bundle. Rebuild it with
+`npm ci && npm run build:near-wallet`. Its source is `src/near-pay-browser.mjs`.
+The payment bundle includes NEAR Connect 0.12.0
 (MIT, HOT Labs), pinned as a build dependency.
 The Node server keeps its existing two runtime dependencies. Wallet discovery
 and wallet executors come from NEAR Connect's upstream manifest; the payer's

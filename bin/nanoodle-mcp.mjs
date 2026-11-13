@@ -497,7 +497,7 @@ async function main() {
   let paymentNote = null;
   let nearInfo = null;
   let near = null;
-  let nearSetup = null;
+  const nearHealth = nearMode ? { merchant: nearMerchant, network: nearNetwork } : null;
   if (nearMode) {
     try {
       near = await startNearMode({
@@ -508,13 +508,11 @@ async function main() {
         maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
       });
       ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
-      nearSetup = near.nearSetup;
     } catch (e) {
       // Only reachable with both rails configured (NEAR alone exits inside startNearMode).
       // The Nano rail is the production default; it keeps serving and NEAR stays off until a restart.
       if (chargeUsd == null) throw e;
       near = null;
-      nearSetup = e.nearSetup || null;
       console.error(`nanoodle-mcp: NEAR PAYMENTS ARE OFF — ${(e && e.message) || e}`);
       console.error("nanoodle-mcp: the Nano rail is serving normally. Fix the NEAR setting above and restart to turn NEAR on.");
     }
@@ -612,7 +610,7 @@ async function main() {
     instructions,
     gate,
     nearGate: near?.gate || null,
-    nearSetup, nearWatcher: near?.watcher || null,
+    nearHealth, nearWatcher: near?.watcher || null,
     paymentNote,
     rates: near ? near.rates : null,
     toolInfo: registry.tools,
@@ -634,7 +632,7 @@ async function main() {
         instructions: near ? near.nearInstructions : unavailable().content[0].text,
         paymentNote: near ? near.nearPaymentNote : unavailable().content[0].text,
         nearGate: near?.gate || null, rates: near?.rates || null,
-        nearSetup, nearWatcher: near?.watcher || null,
+        nearHealth, nearWatcher: near?.watcher || null,
         toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
         publicBase: nearPublicUrl.replace(/\/+$/, ""),
         log: (...a) => console.error(...a),
@@ -714,11 +712,10 @@ async function startNearMode({
   registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
   quoteTtlMin, refreshS, modelPayment, maxDepositUsd, outDir, publicBase, dual,
 }) {
-  let setup = null;
   // With both rails on one server a NEAR problem must never stop the Nano rail:
   // there this throws, and main() carries on in Nano only. NEAR on its own exits.
   const fail = (msg) => {
-    if (dual) throw Object.assign(new Error(msg), { nearStartup: true, nearSetup: setup });
+    if (dual) throw Object.assign(new Error(msg), { nearStartup: true });
     console.error("nanoodle-mcp: " + msg);
     process.exit(1);
   };
@@ -735,22 +732,6 @@ async function startNearMode({
   try {
     rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, log: (line) => console.error("nanoodle-mcp: " + line) });
   } catch (e) { fail(`--near-rpc: ${e.message}`); }
-  let authRead = null, authReadAt = 0;
-  setup = {
-    merchant, network, publicKey: signer.publicKey,
-    async authorized() {
-      if (!authRead || Date.now() - authReadAt > 5000) {
-        authReadAt = Date.now();
-        authRead = rpc.viewAccessKey({ accountId: merchant, publicKey: signer.publicKey })
-          .then((key) => key.permission === "FullAccess")
-          .catch((e) => {
-            if (["QUERY_ERROR", "UNKNOWN_ACCESS_KEY", "UNKNOWN_ACCOUNT"].includes(e.code)) return false;
-            authRead = null; throw e;
-          });
-      }
-      return authRead;
-    },
-  };
   // A public RPC can be briefly unreachable or rate limiting at boot; give it a few tries.
   const transient = (e) => ["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"].includes(e?.code);
   const patiently = async (fn) => {
@@ -883,7 +864,7 @@ async function startNearMode({
   const nearPaymentNote = `Every call is paid in native NEAR on ${network}. Your agent shows a payment link: connect your wallet, approve the deposit, ` +
     "and the result streams back automatically. You pay actual model cost plus a 20% service fee; unused NEAR returns to the paying wallet on chain. " +
     "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." + ratesLine;
-  return { listTools, callTool, wrapped, gate, watcher, rates, instructions, paymentNote, nearInstructions, nearPaymentNote, nearSetup: setup, nearInfo: { network, merchant }, usagePath };
+  return { listTools, callTool, wrapped, gate, watcher, rates, instructions, paymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
