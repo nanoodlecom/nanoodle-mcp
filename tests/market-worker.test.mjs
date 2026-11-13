@@ -17,6 +17,8 @@ import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner, checkNanoGptKey, isOperatorSideFailure } from "../src/market/runner.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
+import { createMarketCreatorPayments } from "../src/market/creators.mjs";
+import { deriveAddress, derivePublicKey, deriveSecretKey } from "nanocurrency";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NANO_KEY = "nanogpt-test-key-do-not-log";
@@ -29,7 +31,7 @@ before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
 /** A market, a state dir and a worker wired together. */
-async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null } = {}) {
+async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true } = {}) {
   const m = market || createMarketMock();
   if (!market) await m.listen();
   const stateDir = dir || mkdtempSync(join(tmpdir(), "market-worker-"));
@@ -37,7 +39,7 @@ async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, 
   const store = openMarketState({ dir: stateDir });
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
   const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nano.url });
-  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, log: (l) => logs.push(l) });
+  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, log: (l) => logs.push(l) });
   const once = async () => { await worker.tick(); await worker.drain(); };
   return { m, store, worker, once, logs, stateDir };
 }
@@ -47,6 +49,64 @@ const noSecrets = (logs) => {
   assert.ok(!all.includes(MOCK_TOKEN), "the agent token appears in the log");
   assert.ok(!all.includes(NANO_KEY), "the NanoGPT key appears in the log");
 };
+
+test("accepted market hires pay the embedded Nano author once, at the locked rate, including after restart", async () => {
+  const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
+  const owed = new Map(); let xnoUsd = "0.5";
+  const creatorPayments = createMarketCreatorPayments({ rates: { currentUsdc: async () => ({ xnoUsd }) },
+    payouts: { enqueue: intent => { assert.ok(!owed.has(intent.paymentId), "must not enqueue a settled assignment twice"); owed.set(intent.paymentId, intent); }, tick: async () => {} } });
+  const r = await rig({ creatorPayments });
+  const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author } }, inputs: { Idea: "a lighthouse" } }) });
+  const before = nano.runs(); await r.once();
+  assert.equal(r.store.get(id).creator.status, "awaiting_acceptance"); assert.equal(owed.size, 0);
+  xnoUsd = "1"; r.m.accept(id); await r.once();
+  assert.equal(owed.size, 1); const intent = owed.get(`market_${id}`);
+  assert.equal(intent.to, author); assert.equal(BigInt(intent.amountRaw), 3764n * 10n ** 24n);
+  assert.equal(r.store.get(id).creator.status, "queued");
+  r.store.close();
+  const restarted = await rig({ creatorPayments, dir: r.stateDir, market: r.m }); await restarted.once();
+  assert.equal(owed.size, 1); assert.equal(nano.runs() - before, 1);
+  restarted.store.close(); await r.m.close();
+});
+
+test("creator workflows are refused before running when Nano payouts are unavailable", async () => {
+  const r = await rig(), before = nano.runs();
+  const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author: "nano_missing" } }, inputs: { Idea: "a lighthouse" } }) });
+  await r.once(); assert.equal(r.store.get(id).phase, "declined"); assert.equal(nano.runs(), before);
+  assert.equal(r.store.get(id).decline.code, "CREATOR_PAYOUT_UNAVAILABLE"); r.store.close(); await r.m.close();
+});
+
+test("market creator amounts are capped after model costs and never pay on an unknown cost", () => {
+  const payments = createMarketCreatorPayments({});
+  assert.equal(payments.amount({ xnoUsd: "0.5" }, { costUsd: 1, proceedsUsd: 1.1 }), String(2n * 10n ** 29n));
+  assert.equal(payments.amount({ xnoUsd: "0.5" }, { costUsd: 1, proceedsUsd: 0.9 }), "0");
+  assert.equal(payments.amount({ xnoUsd: "0.5" }, { costUsd: null, proceedsUsd: 1 }), "0");
+});
+
+test("hosted marketplace briefs cannot replace the workflow or its embedded creator; cancelled hires never owe a payout", async () => {
+  const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
+  const payouts = [], creatorPayments = createMarketCreatorPayments({ rates: { currentUsdc: async () => ({ xnoUsd: "0.5" }) }, payouts: { enqueue: intent => payouts.push(intent), tick: async () => {} } });
+  const r = await rig({ customWorkflows: false, creatorPayments, defaultWorkflow: { graph: { ...WORKED_GRAPH, x402: { author } }, inputName: "Idea", label: "Hosted poster" } });
+  try {
+    const malicious = r.m.hire({ description: WORKED() }), before = nano.runs(); await r.once();
+    assert.equal(r.store.get(malicious).phase, "declined"); assert.equal(nano.runs(), before);
+    const id = r.m.hire({ description: "A lighthouse at dawn" }); await r.once(); assert.equal(r.store.get(id).creator.author, author);
+    r.m.cancel(id); await r.once(); assert.equal(r.store.get(id).creator.status, "cancelled"); assert.equal(payouts.length, 0);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("an accepted creator debt survives an outbox failure and restart without repeating model execution", async () => {
+  let fail = true; const paid = [], creatorPayments = {
+    prepare: async () => ({ author: "test-author", xnoUsd: "0.5", status: "awaiting_acceptance" }), amount: () => "100",
+    enqueue: (id, terms) => { if (fail) throw new Error("disk unavailable"); paid.push({ id, ...terms }); },
+  };
+  const r = await rig({ creatorPayments });
+  const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author: "test-author" } }, inputs: { Idea: "a lighthouse" } }) });
+  const before = nano.runs(); await r.once(); r.m.accept(id); await r.once(); assert.equal(r.store.get(id).creator.status, "owed"); r.store.close();
+  fail = false; const resumed = await rig({ creatorPayments, dir: r.stateDir, market: r.m });
+  try { await resumed.once(); await resumed.once(); assert.equal(paid.length, 1); assert.equal(resumed.store.get(id).creator.status, "queued"); assert.equal(nano.runs() - before, 1); }
+  finally { resumed.store.close(); await r.m.close(); }
+});
 
 test("a normal job: started, run once, outputs uploaded, Markdown with itemized and actual cost submitted", async () => {
   const { m, store, once, logs } = await rig();

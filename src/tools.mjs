@@ -463,7 +463,7 @@ function authorOptional(wf, inp) {
 }
 
 /** Derived inputs paired with schema-safe keys ("System prompt" → "System_prompt"), deduped. */
-function keyedInputs(wf) {
+export function keyedInputs(wf) {
   const used = new Map();
   return wf.inputs.map((inp) => {
     let safe = schemaKey(inp.key);
@@ -478,7 +478,7 @@ function keyedInputs(wf) {
   });
 }
 
-function buildInputSchema(wf) {
+export function buildInputSchema(wf) {
   const properties = {};
   const required = [];
   for (const { inp, safe, optional, hasDef } of keyedInputs(wf)) {

@@ -88,6 +88,7 @@ export function createMarketWorker({
   client, store, runner, budgetUsd, listingPriceUsd = null, defaultWorkflow = null,
   customWorkflows = true, customHandle = null, bidTerms = null, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
   log: rawLog = () => {}, now = Date.now,
+  creatorPayments = null,
 }) {
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createMarketWorker needs a positive budgetUsd");
   if (!customWorkflows && !defaultWorkflow) throw new TypeError("createMarketWorker: a listing without custom workflows needs a default workflow");
@@ -183,7 +184,7 @@ export function createMarketWorker({
       log(`assignment ${short(rec.id)}: workflow refused (${codes.join(", ")})`);
       return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd: jobBudget }) } };
     }
-    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault, usedFields, fieldNotes };
+    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault, usedFields, fieldNotes, x402: priced.x402 };
   }
 
   async function phaseNew(rec, row) {
@@ -197,12 +198,22 @@ export function createMarketWorker({
     const r = await priceFromRow(rec, row, jobBudget);
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
+    let creator = null;
+    if (r.x402?.author != null && r.x402.author !== "") {
+      if (!creatorPayments) return set(rec.id, ok({ phase: "declining", decline: { reason: "rejected", code: "CREATOR_PAYOUT_UNAVAILABLE", detail: "This workflow names a creator, but Nano creator payouts are not configured. Nothing was run; your payment is refunded in full." } }));
+      try { creator = await creatorPayments.prepare(r.x402); }
+      catch (e) {
+        if (e instanceof TypeError) return set(rec.id, ok({ phase: "declining", decline: { reason: "rejected", code: "BAD_AUTHOR", detail: "The workflow's x402.author must be a valid Nano address. Nothing was run; your payment is refunded in full." } }));
+        return backoff(rec, new Error("Creator exchange rate is unavailable"));
+      }
+    }
     prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault, usedFields: r.usedFields, fieldNotes: r.fieldNotes });
     log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, with 20% $${r.pricing.depositUsd}, within budget $${jobBudget}`);
     return set(rec.id, ok({
       phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
       defaultFields: r.usedDefault ? r.usedFields : [], defaultNotes: r.usedDefault ? r.fieldNotes : [],
       budgetUsd: jobBudget, listingPriceUsd: jobPrice, quoted: !!quoted,
+      ...(creator ? { creator } : {}),
     }));
   }
 
@@ -452,6 +463,22 @@ export function createMarketWorker({
   }
 
   /** One poll: list actionable assignments, record new ones, and advance everything that is due. */
+  async function reconcileCreator(rec) {
+    if (!rec.creator || ["queued", "none", "cancelled"].includes(rec.creator.status) || rec.phase !== "submitted") return;
+    if (!creatorPayments) return; // Keep the debt until the payout wallet is configured again.
+    if (rec.creator.status === "awaiting_acceptance") {
+      const row = await lookup(rec.id);
+      if (row?.assignment?.status === "cancelled") { set(rec.id, { creator: { ...rec.creator, status: "cancelled" } }); return; }
+      if (row?.assignment?.status !== "accepted") return;
+      const amountRaw = creatorPayments.amount(rec.creator, { costUsd: rec.run?.costUsd, proceedsUsd: budgetOf(rec) });
+      rec = set(rec.id, { creator: { ...rec.creator, amountRaw, status: amountRaw === "0" ? "none" : "owed" } });
+    }
+    if (rec.creator.status === "owed") {
+      creatorPayments.enqueue(rec.id, rec.creator);
+      set(rec.id, { creator: { ...rec.creator, status: "queued" } });
+    }
+  }
+
   async function tick() {
     let rows = null;
     try { rows = await client.listActionable(); } catch (e) {
@@ -510,7 +537,11 @@ export function createMarketWorker({
       }
       launch(rec.id, row);
     }
-    try { store.prune(now() - retainMs, (r) => r.phase === "declined" || r.phase === "gone" || r.phase === "ignored" || r.phase === "submitted"); } catch { /* next time */ }
+    for (const rec of store.all()) {
+      try { await reconcileCreator(rec); } catch { log(`assignment ${short(rec.id)}: creator settlement is pending; will retry`); }
+    }
+    try { store.prune(now() - retainMs, (r) => ["declined", "gone", "ignored", "submitted"].includes(r.phase)
+      && (!r.creator || ["queued", "none", "cancelled"].includes(r.creator.status))); } catch { /* next time */ }
   }
 
   /** Wait for every assignment being advanced right now. */

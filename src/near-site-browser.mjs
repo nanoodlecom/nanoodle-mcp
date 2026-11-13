@@ -2,9 +2,9 @@ import { WORKFLOW_META_KEY } from "./workflow-progress.mjs";
 import { createRunView, resultText } from "./run-view.mjs";
 export { resultText } from "./run-view.mjs";
 let rpcId = 0;
-export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch } = {}) {
+export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch, endpoint = "/mcp" } = {}) {
   const id = ++rpcId;
-  const response = await request("/mcp", { method: "POST", headers: { "Content-Type": "application/json", Accept: args._payment_id ? "text/event-stream" : "application/json" },
+  const response = await request(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Accept: args._payment_id ? "text/event-stream" : "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args, ...(args._payment_id ? { _meta: { progressToken: `studio:${id}` } } : {}) } }) });
   if (!response.ok) throw new Error(`The server could not complete this request (${response.status}).`);
   const unwrap = message => { if (message.error) throw new Error(message.error.message); return message.result; };
@@ -42,7 +42,9 @@ export function savedInputs(schema) {
 
 export function startStudio({ config, rpc = callMcp, status, update, storage, pause = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const sessions = [], monitoring = new Set();
-  const persist = () => { try { storage?.setItem("nanoodle-near-studio:v1", JSON.stringify(sessions.map(({ result, ...session }) => session))); } catch {} };
+  const storageKey = `nanoodle-near-studio:v1${config.hosted ? `:${config.hosted}` : ""}`;
+  const request = (name, args, options) => rpc(name, args, { ...options, endpoint: config.mcpPath || "/mcp" });
+  const persist = () => { try { storage?.setItem(storageKey, JSON.stringify(sessions.map(({ result, ...session }) => session))); } catch {} };
   const changed = session => { persist(); update(session, sessions); };
   async function monitor(session) {
     const id = session.payment.paymentId;
@@ -58,7 +60,7 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
           if (view.status === "expired") { session.phase = "finished"; changed(session); break; }
           if (["paid", "settled", "rejected", "failed"].includes(view.status) && !session.result) {
             session.phase = "running"; changed(session);
-            const result = await rpc(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); },
+            const result = await request(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); },
               onWorkflow: workflow => { session.workflow = workflow; changed(session); } });
             if (result.isError && !result.structuredContent?.receipt) throw new Error((result.content || []).map(c => c.text || "").join("\n"));
             session.result = result; session.message = "";
@@ -76,7 +78,7 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
     async quote(name, args, { title } = {}) {
       if (sessions.filter(s => s.phase !== "finished").length >= 10) throw new Error("This tab already has ten open quotes. Finish a payment or wait for an earlier quote to expire.");
       const snapshot = JSON.parse(JSON.stringify(args));
-      const result = await rpc(name, snapshot), payment = result.structuredContent?.payment;
+      const result = await request(name, snapshot), payment = result.structuredContent?.payment;
       if (result.isError || !payment || payment.status !== "payment_required") throw new Error((result.content || []).map(c => c.text || "").join("\n") || "This workflow could not be quoted.");
       if (payment.payTo !== config.merchant || !/^nq_[A-Za-z0-9_-]+$/.test(payment.paymentId)) throw new Error("The server returned an unexpected payment destination.");
       const session = { name, args: snapshot, payment, pricing: result.structuredContent.pricing, ...(title ? { title } : {}), phase: "waiting" };
@@ -84,7 +86,7 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
     },
     restore() {
       try {
-        const previous = JSON.parse(storage?.getItem("nanoodle-near-studio:v1") || "[]");
+        const previous = JSON.parse(storage?.getItem(storageKey) || "[]");
         if (!Array.isArray(previous)) return;
         const restored = [];
         for (const session of previous.slice(-10)) {
@@ -170,7 +172,8 @@ function mount(root) {
       summary.textContent = "Advanced instructions"; advanced.append(summary); advanced.className = "form-help";
       for (const [key, field] of Object.entries(schema?.properties || {})) {
         if (key.startsWith("_")) continue;
-        const label = document.createElement("label"), input = document.createElement("textarea");
+        const label = document.createElement("label"), input = document.createElement(field.enum ? "select" : "textarea");
+        if (field.enum) for (const value of field.enum) { const option = document.createElement("option"); option.value = option.textContent = value; input.append(option); }
         label.textContent = key.replace(/_/g, " "); input.id = `saved-${key}`; label.htmlFor = input.id;
         input.dataset.input = key; input.rows = 2; input.dataset.type = field.type;
         input.value = defaults[key] ?? ""; input.required = schema.required?.includes(key) || false;
@@ -203,7 +206,7 @@ function mount(root) {
     } catch (error) { node("studio-error").textContent = error.message; }
     finally { quoting = false; node("studio-quote").disabled = false; }
   });
-  const command = () => node("connect-client").value === "url" ? `${config.publicBase}/mcp` : `${node("connect-client").value} mcp add --transport http nanoodle ${config.publicBase}/mcp`;
+  const command = () => node("connect-client").value === "url" ? `${config.publicBase}${config.mcpPath || "/mcp"}` : `${node("connect-client").value} mcp add --transport http nanoodle ${config.publicBase}${config.mcpPath || "/mcp"}`;
   node("connect-client").addEventListener("change", () => { node("connect-command").textContent = command(); });
   node("connect-copy").addEventListener("click", async () => { try { await navigator.clipboard.writeText(command()); node("connect-copy").textContent = "Copied"; } catch { node("connect-copy").textContent = "Select the command to copy"; } });
   setInterval(() => {

@@ -433,7 +433,7 @@ export function createNearGate({
     return { pricing, author, run: { name: RUN_NOODLE, arguments: { graph: pricing.boundGraph, inputs } } };
   }
 
-  async function quote(registry, name, args, tool, asset = "near") {
+  async function quote(registry, name, args, tool, asset = "near", resumeTool = null) {
     if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server. Request a NEAR quote instead.");
     const { pricing, author } = await prepare(registry, name, args, tool);
     if (author && !authorPayouts) return errResult("This workflow names a Nano author but the server has no Nano payout wallet configured. Nothing was quoted or charged.");
@@ -472,7 +472,7 @@ export function createNearGate({
     const expiresAt = createdAt + quoteTtlMs;
     // Only what payment and settlement need is stored; the itemized pricing is in the answer.
     const record = {
-      id, tool: name, argsHash: hashArgs(name, args), status: "pending", author,
+      id, tool: name, ...(resumeTool ? { resumeTool } : {}), argsHash: hashArgs(name, args), status: "pending", author,
       ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
       amountYocto: amountYocto.toString(),
       depositUsd: exactUsd(pricing.depositUsd),
@@ -640,13 +640,13 @@ export function createNearGate({
     const status = q.status === "pending" && now() > q.expiresAt ? "expired" : q.status;
     const paid = status === "paid" || status === "running" || status === "settled";
     return {
-      paymentId: q.id, tool: q.tool, network, payTo: merchantId,
+      paymentId: q.id, tool: q.resumeTool || q.tool, network, payTo: merchantId,
       ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
       done: status !== "pending",
       ...(workflows.has(id) ? { workflow: workflows.get(id) } : {}),
       next: paid
-        ? `Payment confirmed. Call ${q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`
+        ? `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`
         : status === "pending" ? "Pay this deposit in your wallet; keep monitoring until payment is confirmed."
         : "Ask your agent for a fresh quote. Do not pay this quote again.",
       ...(q.payTx ? { txHash: q.payTx } : {}),
@@ -933,7 +933,7 @@ export function createNearGate({
           if (_payment_tx != null || _payment_sender != null) {
             throw new GraphArgsError("_payment_tx and _payment_sender go with _payment_id: call without all three to get a quote first");
           }
-          return await quote(registry, name, args, tool, _pay_with || "near");
+          return await quote(registry, name, args, tool, _pay_with || "near", /^[a-zA-Z0-9_-]{1,64}$/.test(ctx?.paymentTool || "") ? ctx.paymentTool : null);
         }
         const paymentId = String(_payment_id);
         const existing = ledger.getQuote(paymentId);
@@ -952,7 +952,7 @@ export function createNearGate({
       assets: new Set(["near", ...(usdcEnabled ? ["usdc"] : [])]) };
   }
 
-  return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment, waitForUpdate, pendingQuotes, observeTransfer,
+  return { wrapRegistry, resume, authorPayouts, quote: paymentView, confirmPayment, waitForPayment, waitForUpdate, pendingQuotes, observeTransfer,
     // The private payment URL is also the capability to read this paid result.
     // This getter never runs a workflow, accepts payment or changes settlement.
     result(id) { const q = ledger.getQuote(id); return q && FINAL.has(q.status) ? replay(q) : null; },
