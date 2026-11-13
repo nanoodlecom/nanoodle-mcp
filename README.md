@@ -516,6 +516,8 @@ Direct-wallet spending has no cap and is not refunded. A short comment
 is not asked for the longest comment's hold. The graph's `usd` is only the
 ceiling for that longest request, used when a model has no price.
 
+#### Workflow creator payouts
+
 `usd` overrides the deposit for every other tool. `author` routes **the 20% markup of every
 successful call to that address** — computed on what the run *actually* cost,
 never on the deposit, and capped by whatever the deposit has left once the cost
@@ -531,6 +533,24 @@ markup = cost / 5                    (20%, integer floor)
 take   = min(markup, deposit − cost) → author (or kept, if no author field)
 change = deposit − cost − take       → back to the payer
 ```
+
+The same `x402.author` field also works on the NEAR service, for both saved workflows
+and custom graphs passed to `run_noodle`. The customer pays in **NEAR or USDC on NEAR**;
+the author still receives **Nano**, from the same Nano wallet pool used to fund models.
+The payout converts only the collected markup at the quote's locked XNO/USD rate,
+using integer arithmetic and rounding down to raw. It is capped by what remains of
+the deposit after model costs. There is no additional creator fee. Customer change
+and failure refunds stay in the customer's original asset. Without `x402.author`,
+the operator keeps the markup.
+
+NEAR creator payouts use a durable outbox: the debt and signed Nano block are recorded
+before publication, and retries replay that same block. A replacement is allowed only
+when a different, confirmed successor proves the original block can never land.
+Pending payouts survive restarts and quote pruning; receipts expose the author,
+exact Nano amount, status and block hash. Payout retries do not block the result or
+customer refund. Authored workflows are refused before quoting if no Nano payout
+wallet or current XNO/USD rate is available. API-key-funded servers can configure
+`NANO_SEED` or `NANO_PRIVATE_KEY` for these payouts too.
 
 A run costing more than its deposit keeps the whole deposit and the operator
 absorbs the excess; a run whose model reports no cost settles at $0 and the

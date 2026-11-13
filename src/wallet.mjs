@@ -29,10 +29,20 @@ import {
   deriveAddress,
   derivePublicKey,
   deriveSecretKey,
+  hashBlock,
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
+
+/** Creator metadata is shared by Nano and NEAR-paid workflows. */
+export function authorAddress(metadata) {
+  if (metadata?.author != null && typeof metadata.author !== "string") throw new TypeError("x402.author must be a valid Nano address");
+  const author = typeof metadata?.author === "string" ? metadata.author.trim() : "";
+  if (!author) return null;
+  if (!checkAddress(author)) throw new TypeError("x402.author must be a valid Nano address");
+  return author;
+}
 
 /**
  * Default read/publish endpoint chain, tried in order with failover. The whole
@@ -396,24 +406,25 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
    * lost-response republish and the one stale-frontier rebuild. Returns the
    * block hash. `describe` labels the log line ("paid", "refunded", …).
    */
+  async function prepareSend(state, to, amount) {
+    if (amount > state.balance) throw new Error("insufficient Nano wallet balance for transfer");
+    const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
+    const prepared = createBlock(secretKey, {
+      work, previous: state.frontier, representative: state.representative,
+      balance: (state.balance - amount).toString(), link: to,
+    });
+    prepared.block.account = address;
+    prepared.block.link_as_account = to;
+    return prepared;
+  }
+
   async function sendFrom(state, to, amount, describe = "sent", extra = "") {
     const insufficient = () => new Error(
       `insufficient wallet balance: send is ${rawToXno(amount)} XNO` +
       ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
     if (amount > state.balance) throw insufficient();
     for (let attempt = 0; ; attempt++) {
-      const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
-      const { hash, block } = createBlock(secretKey, {
-        work,
-        previous: state.frontier,
-        representative: state.representative,
-        balance: (state.balance - amount).toString(),
-        link: to,
-      });
-      // createBlock renders addresses with the legacy xrb_ prefix; same account, and the
-      // signature covers the public key, so normalizing the display form is safe
-      block.account = address;
-      block.link_as_account = to;
+      const { hash, block } = await prepareSend(state, to, amount);
       precomputeWork(hash); // next block's work computes while this one publishes
       try {
         await rpc({ action: "process", json_block: "true", subtype: "send", block });
@@ -444,6 +455,34 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       chain = { frontier: hash, balance: state.balance - amount, representative: state.representative };
       log(`x402: ${describe} ${rawToXno(amount)} XNO${extra} to ${to} (block ${hash})`);
       return hash;
+    }
+  }
+
+  /**
+   * Publish a journaled send. Confirmation of a DIFFERENT successor proves
+   * this block cannot land, and is the only condition allowing a replacement.
+   * Nano RPC block_info exposes successor (v23+) and confirmed (v19+):
+   * https://docs.nano.org/commands/rpc-protocol/#block_info
+   */
+  async function publishOnce(prepared) {
+    const { hash, block } = prepared;
+    let error;
+    try { await rpc({ action: "process", json_block: "true", subtype: "send", block }); }
+    catch (e) { error = e; }
+    chain = null; // Other jobs must read the actual frontier after this replay.
+    try {
+      const info = await rpc({ action: "block_info", hash, json_block: "true" });
+      if (info.confirmed === "true" || info.confirmed === true) return hash;
+      throw new Error("Nano payout is awaiting confirmation");
+    } catch (e) {
+      if (!e.authoritative || !/block not found|unknown block/i.test(e.message)) throw e;
+      // A negative lookup alone is never sufficient to sign a second payment.
+      const prev = await rpc({ action: "block_info", hash: block.previous, json_block: "true" });
+      if (/^[0-9A-F]{64}$/i.test(prev.successor || "") && !/^0+$/.test(prev.successor) && prev.successor !== hash) {
+        const successor = await rpc({ action: "block_info", hash: prev.successor, json_block: "true" });
+        if (successor.confirmed === "true" || successor.confirmed === true) return null;
+      }
+      throw error || e;
     }
   }
 
@@ -536,6 +575,24 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
      */
     ops: {
       rpc,
+      // The journal callback MUST persist the signed block before returning.
+      // Retrying after a lost response or a restart uses the same block hash.
+      transferOnce: (to, amountRaw, { prepared = null, onPrepared } = {}) => enqueue(async () => {
+        if (!checkAddress(String(to || "")) || !/^\d+$/.test(String(amountRaw)) || BigInt(amountRaw) <= 0n || typeof onPrepared !== "function") throw new Error("invalid durable Nano transfer");
+        if (prepared) {
+          if (prepared.block?.account !== address || prepared.block.link_as_account !== to || hashBlock(prepared.block) !== prepared.hash) throw new Error("journaled Nano transfer does not match this wallet");
+          const sent = await publishOnce(prepared);
+          if (sent) return sent;
+        }
+        const state = await pocketReceivables(false, (s) => urgentWaiting() && BigInt(amountRaw) <= s.balance);
+        prepared = await prepareSend(state, to, BigInt(amountRaw));
+        await onPrepared(prepared);
+        precomputeWork(prepared.hash);
+        const sent = await publishOnce(prepared);
+        if (!sent) throw new Error("Nano transfer was built on a stale frontier; queued for retry");
+        log(`x402: author payout: ${rawToXno(amountRaw)} XNO to ${to} (block ${sent})`);
+        return sent;
+      }),
       transfer: (to, amountRaw, describe = "sent") => enqueue(async () => {
         if (!checkAddress(String(to || ""))) throw new Error(`not a valid Nano address: ${to}`);
         // sweep first (a refund's source funds usually ARE a pending receivable),

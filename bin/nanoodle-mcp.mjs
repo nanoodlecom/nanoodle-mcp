@@ -338,10 +338,10 @@ async function main() {
 
   // The wallet exists for two independent jobs: paying NanoGPT x402 invoices when
   // there's no API key (a key always wins for runs, matching the library), and — in
-  // --charge-usd mode — receiving callers' payments and sending refunds/payouts,
-  // which is needed even when an API key funds the runs themselves.
+  // --charge-usd mode — receiving callers' payments and sending refunds/payouts.
+  // NEAR creator payouts share that wallet too, including API-key-funded runs.
   let wallet = null;
-  if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null)) {
+  if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null || nearMode)) {
     try {
       const { createNanoWallet, resolveWalletKey } = await loadWalletMod();
       wallet = createNanoWallet({
@@ -355,7 +355,7 @@ async function main() {
       });
     } catch (e) { console.error("nanoodle-mcp: " + e.message); process.exit(1); }
   }
-  if (apiKey && (nanoKey || nanoSeed) && chargeUsd == null) {
+  if (apiKey && (nanoKey || nanoSeed) && chargeUsd == null && !nearMode) {
     console.error("nanoodle-mcp: both an API key and a Nano wallet are configured — using the key (wallet ignored)");
   }
   if (chargeUsd != null && !wallet) {
@@ -506,6 +506,7 @@ async function main() {
         envText, envFile, usdText: nearUsdText, usdFlag: nearUsdFlag != null, spreadText: nearSpreadText, spreadFlag: nearSpreadFlag != null,
         xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
         modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
+        nanoOps: wallet?.ops,
         maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
       });
       ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
@@ -713,7 +714,7 @@ async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook }) {
  */
 async function startNearMode({
   registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
-  quoteTtlMin, refreshS, modelPayment, maxDepositUsd, outDir, publicBase, dual,
+  quoteTtlMin, refreshS, modelPayment, nanoOps, maxDepositUsd, outDir, publicBase, dual,
 }) {
   // With both rails on one server a NEAR problem must never stop the Nano rail:
   // there this throws, and main() carries on in Nano only. NEAR on its own exits.
@@ -829,8 +830,10 @@ async function startNearMode({
   }
   const usdc = { enabled: usdcEnabled, tokenContract: usdcToken, decimals: 6 };
   const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken });
+  const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
+  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage }) : null;
   const gate = createNearGate({
-    merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled,
+    merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled, authorPayouts,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
   });

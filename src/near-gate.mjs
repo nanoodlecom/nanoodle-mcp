@@ -40,6 +40,8 @@ import {
 } from "./near/index.mjs";
 import { knownUsd } from "./usd.mjs";
 import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
+import { authorPayoutRaw } from "./author-payouts.mjs";
+import { rawToXno, authorAddress } from "./wallet.mjs";
 
 const RUN_NOODLE = "run_noodle";
 const FINAL = new Set(["settled", "failed", "rejected"]);
@@ -123,6 +125,7 @@ export function createNearGate({
   publicBase = null,
   usdcToken = null,
   usdcEnabled = false,
+  authorPayouts = null,
 }) {
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
@@ -222,7 +225,27 @@ export function createNearGate({
       to: r.refund.to, txHash: r.refund.txHash, explorerUrl: r.refund.explorerUrl,
       status: r.refund.status,
     };
-    return [caller, model, refund];
+    return [caller, model, refund, ...(r.authorPayout ? [{ leg: "author payout", ...r.authorPayout }] : [])];
+  }
+
+  function payoutView(q) {
+    const intent = q.settlement?.authorPayout;
+    if (!intent) return null;
+    const rec = ledger.getPayout(q.id);
+    return { asset: "XNO", to: intent.to, amountRaw: intent.amountRaw, amount: rawToXno(intent.amountRaw, 30),
+      status: rec?.status === "sent" ? "sent" : "pending", txHash: rec?.txHash || null,
+      explorerUrl: rec?.txHash ? `https://nanexplorer.com/nano/block/${rec.txHash}` : null };
+  }
+
+  function ensureAuthorPayout(q) {
+    const intent = q.settlement?.authorPayout;
+    if (!intent) return;
+    if (ledger.getPayout(q.id)?.status === "sent") return;
+    if (!authorPayouts) throw new Error("A Nano creator payout is owed; configure the original Nano wallet to recover it");
+    authorPayouts.enqueue({ paymentId: q.id, ...intent });
+    // Independent of customer delivery and same-asset change. The durable
+    // outbox retains a failed send even after this quote is pruned.
+    authorPayouts.tick().catch(() => log("Nano creator payout retry is pending"));
   }
 
   function refundView(q) {
@@ -280,6 +303,7 @@ export function createNearGate({
       },
       rate: rateView(q),
       outcome: q.outcome,
+      ...(payoutView(q) ? { authorPayout: payoutView(q) } : {}),
     };
     receipt.legs = receiptLegs(q, receipt);
     return formatReceipt(receipt);
@@ -383,7 +407,7 @@ export function createNearGate({
    * Throws GraphArgsError / ParamsError / GraphRefusedError.
    */
   async function prepare(registry, name, args, tool) {
-    let graph, inputs, catalogs;
+    let graph, inputs, catalogs, metadata;
     if (name === RUN_NOODLE) {
       const read = await readGraphArgs(args, { allowShortLinks: false, fetch, limits: L });
       assertGraphSafe(read.graph, { inputs: read.inputs, limits: L });
@@ -391,23 +415,28 @@ export function createNearGate({
       graph = prep.workflowGraph;
       inputs = read.inputs;
       catalogs = prep.catalogs;
+      metadata = read.graph.x402;
     } else {
       assertGraphSafe(tool.wf.graph, { inputs: args, limits: L });
       await registry.prepareCall({ name, arguments: args });
       graph = tool.wf.graph;
       inputs = args;
       catalogs = await catalogsFor(graph);
+      metadata = tool.x402;
     }
     const pricing = priceGraph(graph, catalogs, { inputs });
     const refusals = refusalsForQuote(pricing, { maxDepositUsd: L.maxDepositUsd });
     if (refusals.length) throw new GraphRefusedError(refusals);
     // The run executes exactly the priced graph, through run_noodle, for saved tools too.
-    return { pricing, run: { name: RUN_NOODLE, arguments: { graph: pricing.boundGraph, inputs } } };
+    let author;
+    try { author = authorAddress(metadata); } catch (e) { throw new GraphArgsError(e.message); }
+    return { pricing, author, run: { name: RUN_NOODLE, arguments: { graph: pricing.boundGraph, inputs } } };
   }
 
   async function quote(registry, name, args, tool, asset = "near") {
     if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server. Request a NEAR quote instead.");
-    const { pricing } = await prepare(registry, name, args, tool);
+    const { pricing, author } = await prepare(registry, name, args, tool);
+    if (author && !authorPayouts) return errResult("This workflow names a Nano author but the server has no Nano payout wallet configured. Nothing was quoted or charged.");
     maybePrune();
     if (openQuoteCount() >= maxOpenQuotes) {
       return errResult("This server is holding too many open quotes right now; try again in a few minutes. Nothing was charged.");
@@ -424,6 +453,7 @@ export function createNearGate({
       }
       throw e;
     }
+    if (author && !(r.xnoUsd != null && parseUsdNano(r.xnoUsd) > 0n)) return errResult("Cannot quote this authored workflow without a current XNO/USD rate for its Nano creator payout. Try again shortly. Nothing was charged.");
     const taken = openAmounts(asset);
     let amountYocto;
     try {
@@ -442,7 +472,7 @@ export function createNearGate({
     const expiresAt = createdAt + quoteTtlMs;
     // Only what payment and settlement need is stored; the itemized pricing is in the answer.
     const record = {
-      id, tool: name, argsHash: hashArgs(name, args), status: "pending",
+      id, tool: name, argsHash: hashArgs(name, args), status: "pending", author,
       ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
       amountYocto: amountYocto.toString(),
       depositUsd: exactUsd(pricing.depositUsd),
@@ -468,6 +498,7 @@ export function createNearGate({
           : { amountYocto: record.amountYocto, amountNear: formatYoctoAsNear(amountYocto), dustNear: formatYoctoAsNear(amountYocto - baseYocto),
               likelyChargeNear: formatYoctoAsNear(likelyCharge, { maxDecimals: 6 }) }),
         depositUsd: record.depositUsd,
+        ...(author ? { authorPayout: { asset: "XNO", to: author, basis: "the collected 20% markup, paid in Nano at the locked XNO/USD rate" } } : {}),
         depositUsdSent: estUsd(Number(yoctoToUsd(amountYocto, r.usdNano, r.yocto))),
         rate: rateView(record),
         expiresAt: new Date(expiresAt).toISOString(),
@@ -749,6 +780,7 @@ export function createNearGate({
       ...(assetOf(q) === "usdc" ? { minRefundYocto: 1n } : {}),
     });
     const costUsd = s.known ? knownUsd(settleUsd) : null;
+    const authorRaw = q.author ? authorPayoutRaw(s, q.rate, parseUsdNano(q.rate.xnoUsd)) : 0n;
     // The settlement is on disk before the refund intent: a restart in between
     // finishes this settlement instead of refunding the whole deposit.
     q = ledger.updateQuote(q.id, {
@@ -757,8 +789,10 @@ export function createNearGate({
         billedAs, reportedUsd: reportedUsd ?? null,
         costYocto: s.costYocto.toString(), feeYocto: s.feeYocto.toString(),
         chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(),
+        ...(authorRaw > 0n ? { authorPayout: { to: q.author, amountRaw: authorRaw.toString() } } : {}),
       },
     });
+    ensureAuthorPayout(q);
     results.set(q.id, body);
     const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change", ...refundAsset(q) });
     // Media-only results (links) may be kept; text output is the caller's paid content and stays in memory.
@@ -775,12 +809,14 @@ export function createNearGate({
   /* ---------------- startup recovery ---------------- */
 
   async function resume() {
+    if (!authorPayouts && ledger.payouts().some(p => p.status !== "sent")) throw new Error("Nano creator payouts are owed; configure the original Nano wallet before resuming");
     const t = now();
     for (const q of ledger.quotes()) {
       if (q.asset != null && !["near", "usdc"].includes(q.asset)) throw new NearError("STATE_UNREADABLE", "A stored quote has an unknown asset");
       if (q.asset === "usdc" && q.tokenContract !== usdcToken) throw new NearError("STATE_MISMATCH", "A stored USDC quote belongs to a different token contract");
       if (q.status === "running") {
         if (q.settlement) {
+          ensureAuthorPayout(q);
           // The run finished and was settled; only the refund intent may be missing.
           const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change", ...refundAsset(q) });
           ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: null, finishedAt: t });
@@ -800,8 +836,10 @@ export function createNearGate({
       } else if (q.status === "pending" && t > q.expiresAt) {
         ledger.updateQuote(q.id, { status: "expired" });
       }
+      if (q.status === "settled") ensureAuthorPayout(q);
     }
     await refunder.resume();
+    await authorPayouts?.resume();
     ledger.prune({ unpaidRetainMs: expiredRetainMs });
   }
 

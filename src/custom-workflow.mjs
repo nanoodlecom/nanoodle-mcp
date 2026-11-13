@@ -1112,7 +1112,7 @@ export function formatReceipt(receipt) {
 
 /** The receipt's three money legs as three short lines (r.legs from the NEAR gate). */
 function legLines(legs, paymentId) {
-  const [caller, model, refund] = legs;
+  const [caller, model, refund, author] = legs;
   const out = [];
   if (caller) {
     out.push(caller.status === "final"
@@ -1129,6 +1129,7 @@ function legLines(legs, paymentId) {
   if (refund) {
     out.push(`Leg 3, refund: ${shortNear(refund.amount)} ${refund.asset || "NEAR"}, ${refundStatusText(refund, paymentId)}.`);
   }
+  if (author) out.push(`Leg 4, workflow author: ${author.amount} XNO to ${author.to}, ${author.status}${author.txHash ? `, block ${author.txHash}` : ""}.`);
   return out;
 }
 
