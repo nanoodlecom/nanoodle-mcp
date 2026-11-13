@@ -61,14 +61,46 @@ test("expired quotes never execute and unexpected destinations are refused", asy
 });
 
 test("streamed results survive split frames and progress without confusing notifications with the result", async () => {
-  const progress = [], encoder = new TextEncoder();
-  const wire = 'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"Rendering"}}\n\n' +
+  const progress = [], workflows = [], encoder = new TextEncoder();
+  const wire = 'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"Rendering","_meta":{"com.nanoodle/workflow":{"v":1,"nodes":[],"links":[]}}}}\n\n' +
     'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Done ✓"}]}}\n\n';
   const response = new Response(new ReadableStream({ start(controller) {
     const bytes = encoder.encode(wire); for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.slice(i, i + 7)); controller.close();
   } }), { headers: { "Content-Type": "text/event-stream" } });
-  const r = await callMcp("poster", { _payment_id: "nq_test" }, { fetch: async () => response, onProgress: p => progress.push(p) });
+  const r = await callMcp("poster", { _payment_id: "nq_test" }, { fetch: async (url, request) => {
+    const body = JSON.parse(request.body);
+    assert.equal(typeof body.params._meta.progressToken, "string", "request the channel that carries progress, not only SSE comments");
+    assert.deepEqual(body.params.arguments, { _payment_id: "nq_test" }, "progress metadata cannot change the paid argument hash");
+    return response;
+  }, onProgress: p => progress.push(p), onWorkflow: w => workflows.push(w) });
   assert.deepEqual(progress, ["Rendering"]); assert.equal(r.content[0].text, "Done ✓");
+  assert.equal(workflows.length, 1);
+});
+
+test("reload attaches to a running workflow and receives its snapshot without executing again", async () => {
+  const storage = store(); let check = 0, finish; const seen = [];
+  const workflow = { v: 1, nodes: [{ id: "arbitrary", status: "running" }], links: [] };
+  storage.setItem("nanoodle-near-studio:v1", JSON.stringify([{ name: "poster", args: { Idea: "original" }, payment, phase: "running" }]));
+  const done = new Promise(resolve => { finish = resolve; }); let calls = 0;
+  const studio = startStudio({ config, storage, pause: async () => {},
+    status: async () => ++check === 1 ? { status: "running", workflow } : { status: "settled", receipt },
+    rpc: async () => { calls++; assert.ok(check > 1); return complete; },
+    update: session => { seen.push(session.workflow); if (session.phase === "finished") finish(); } });
+  studio.restore(); await done;
+  assert.ok(seen.includes(workflow)); assert.equal(calls, 1, "only replay the completed result");
+});
+
+test("restoring multiple quotes selects the latest unfinished run first", async () => {
+  const storage = store(), updates = []; let finish;
+  const old = { name: "poster", args: {}, payment: { ...payment, paymentId: "nq_old" }, phase: "finished" };
+  const current = { ...old, payment: { ...payment, paymentId: "nq_current" }, phase: "running" };
+  storage.setItem("nanoodle-near-studio:v1", JSON.stringify([old, current]));
+  const done = new Promise(resolve => { finish = resolve; });
+  const studio = startStudio({ config, storage, pause: async () => {}, status: async () => ({ status: "settled", receipt }),
+    rpc: async () => complete, update: session => { updates.push(session.payment.paymentId); if (session.payment.paymentId === "nq_current" && session.phase === "finished") finish(); } });
+  studio.restore(); await done;
+  assert.equal(updates[0], "nq_current");
+  assert.deepEqual(studio.sessions.map(s => s.payment.paymentId), ["nq_old", "nq_current"], "history retains chronological order");
 });
 
 test("saved workflow inputs omit payment fields and honor required choices/defaults", () => {

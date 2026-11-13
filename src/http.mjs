@@ -36,6 +36,7 @@
  * clients without Origin still work; payment authorizes paid calls.
  */
 import http from "node:http";
+import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { constants, createReadStream, existsSync } from "node:fs";
 import { open } from "node:fs/promises";
@@ -838,9 +839,10 @@ export async function serveHttp({
           const event = (obj) => { if (!res.writableEnded && !res.destroyed) res.write(`event: message\ndata: ${JSON.stringify(obj)}\n\n`); };
           const t0 = Date.now();
           let ticks = 0;
+          let workflowState;
           const emitProgress = (message) => {
             if (progressToken === undefined) return false; // no progress channel on this call
-            event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message } });
+            event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message, ...(workflowState ? { _meta: { [WORKFLOW_META_KEY]: workflowState } } : {}) } });
             return true;
           };
           /*
@@ -856,6 +858,7 @@ export async function serveHttp({
             status: "working",
             report(s) { this.status = s; },
             announce(s) { this.status = s; return emitProgress(s); },
+            workflow(state) { workflowState = state; this.announce(workflowMessage(state)); },
           };
           const beat = setInterval(() => {
             const line = `${ctx.status} (${Math.round((Date.now() - t0) / 1000)}s elapsed)`;

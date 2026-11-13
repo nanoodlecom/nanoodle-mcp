@@ -19,6 +19,7 @@ import { randomBytes } from "node:crypto";
 import { createFakeChain, throwawayNearKey, nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { parseNearToYocto } from "../src/near/amount.mjs";
 import { USDC_CONTRACTS } from "../src/near/ft.mjs";
+import { callMcp } from "../src/near-site-browser.mjs";
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "nanoodle-mcp.mjs");
 
@@ -46,6 +47,47 @@ async function fixtureDirs() {
   await writeFile(join(graphsDir, "idea-poster.json"), JSON.stringify(WORKED_GRAPH));
   return { graphsDir, outDir };
 }
+
+for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receives real node progress before the paid result, and reload can attach`, { timeout: 30_000 }, async () => {
+  const { graphsDir, outDir } = await fixtureDirs();
+  const chain = createFakeChain(), key = await throwawayNearKey();
+  chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
+  chain.addAccount("payer.testnet", parseNearToYocto("2"));
+  let releaseChat, gotRunning;
+  const held = new Promise(resolve => { releaseChat = resolve; });
+  const running = new Promise(resolve => { gotRunning = resolve; });
+  const nano = nanoGptMock({ beforeChat: () => held });
+  await chain.listen(); await nano.listen();
+  const port = await freePort();
+  const srv = await startServer({ graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: key.secretKey, port });
+  const base = `http://127.0.0.1:${port}`, snapshots = [];
+  try {
+    const args = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "PRIVATE BRIEF" } } : { Idea: "PRIVATE BRIEF" };
+    const quote = await mcpClient(base).call(name, args), p = quote.structuredContent.payment;
+    chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto), { blockTimeMs: Date.now() + 1 });
+    const status = await (await fetch(p.statusUrl + "?wait=1")).json();
+    assert.equal(status.status, "paid");
+    let completed = false;
+    const result = callMcp(name, { ...args, _payment_id: p.paymentId }, {
+      fetch: (url, init) => fetch(base + url, init),
+      onWorkflow: state => { snapshots.push(state); if (state.nodes.find(n => n.id === "n2")?.status === "running") gotRunning(); },
+    }).then(r => { completed = true; return r; });
+    await running;
+    assert.equal(completed, false, "a real running node reaches the browser while its provider is still blocked");
+    const attached = await (await fetch(p.statusUrl)).json();
+    assert.equal(attached.status, "running");
+    assert.equal(attached.workflow.nodes.find(n => n.id === "n2").status, "running");
+    assert.equal(attached.workflow.nodes.find(n => n.id === "n1").status, "done");
+    assert.doesNotMatch(JSON.stringify(attached.workflow), /PRIVATE BRIEF|fields|prompt|runId/);
+    releaseChat();
+    const done = await result;
+    assert.equal(done.structuredContent.receipt.outcome, "succeeded");
+    assert.equal(snapshots.at(-1).status, "succeeded");
+    assert.ok(snapshots.at(-1).nodes.every(n => n.status === "done"));
+    await mcpClient(base).call(name, { ...args, _payment_id: p.paymentId });
+    assert.equal(nano.runs(), 1, "reconnecting or replaying never starts another model call");
+  } finally { releaseChat(); await srv.kill(); await chain.close(); await nano.close(); }
+});
 
 /** Run the bin to completion (for configurations it must refuse). */
 function runBin(args, env = {}) {

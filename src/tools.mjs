@@ -20,6 +20,7 @@ import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
+import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
 import { readGraphArgs, checkGraphSafety, priceGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
@@ -674,10 +675,12 @@ export function describeRunFailure(e) {
  *
  * Returns { onProgress, notices } — pass onProgress to wf.run and notices to emitResult.
  */
-export function runNotices(wf) {
+export function runNotices(wf, ctx = null) {
+  const progress = createWorkflowProgress(wf.graph, { publish: state => ctx?.workflow?.(state) });
   const notices = [];
   const byId = new Map((((wf && wf.graph) || {}).nodes || []).map((n) => [n.id, n]));
   const onProgress = (evt) => {
+    progress.event(evt);
     if (!evt || evt.type !== "prompt-trimmed") return;
     const node = byId.get(evt.nodeId);
     const model = node && node.fields && node.fields.model ? ` (${shortModel(node.fields.model)})` : "";
@@ -686,7 +689,7 @@ export function runNotices(wf) {
       `accepts at most ${evt.cap}, so nanoodle cut it to ${evt.to} characters at a sentence boundary. ` +
       `The run used the shortened prompt.`);
   };
-  return { onProgress, notices };
+  return { onProgress, notices, finish: (result, error) => progress.finish(result, error) };
 }
 
 /**
@@ -838,10 +841,11 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch =
   return { graph: r.graph, workflowGraph: wf.graph, inputs, wf, catalogs, source: r.source, url: r.url };
 }
 
-async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs }) {
+async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx }) {
   const { wf, inputs } = await prepareRunNoodle(params.arguments, { apiKey, payment, baseUrl, log, catalogTimeoutMs, allowShortLinks: true });
-  const { onProgress, notices } = runNotices(wf);
-  const result = await wf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+  const { onProgress, notices, finish } = runNotices(wf, ctx);
+  const result = await wf.run(inputs, { onProgress }).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
+  finish(result);
   return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices });
 }
 
@@ -1248,9 +1252,9 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     },
 
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
-    async callTool(params) {
+    async callTool(params, ctx = null) {
       if (params != null && typeof params === "object" && !Array.isArray(params)) {
-        if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs });
+        if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx });
         if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
         if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
       }
@@ -1268,7 +1272,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
 
       // Everything past this point is a run failure, not a protocol error → isError content.
       const t0 = Date.now();
-      const { onProgress, notices } = runNotices(tool.wf);
+      const { onProgress, notices, finish } = runNotices(tool.wf, ctx);
       // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
       // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
       let runWf = tool.wf, hf = null;
@@ -1327,7 +1331,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
         runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
       }
-      const result = await runWf.run(inputs, { onProgress }).catch((e) => { throw describeRunFailure(e); });
+      const result = await runWf.run(inputs, { onProgress }).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
+      finish(result);
       if (tool.humanize) {
         notices.push(...humanizeRunNotes(hf.state));
         const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered, hf.state);

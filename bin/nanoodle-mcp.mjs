@@ -468,7 +468,7 @@ async function main() {
       version: pkg.version,
       listTools: () => registry.listTools(),
       // strip the gate-facing sidecars (costUsd, costExact, textOutput) — stdio clients get pure MCP content
-      callTool: (params) => registry.callTool(params).then(({ costUsd, costExact, textOutput, ...r }) => r),
+      callTool: (params, ctx) => registry.callTool(params, ctx).then(({ costUsd, costExact, textOutput, ...r }) => r),
     });
     // A run's observed cost lands in the tool's description — tell the client to re-list.
     registry.onToolsChanged = () => srv.notify("notifications/tools/list_changed");
@@ -596,7 +596,7 @@ async function main() {
     // payments ledger, and we deliberately don't log run telemetry either
     // (which tool ran, or upstream error text that can quote user content).
     // Strip the gate-facing sidecars (costUsd, costExact, textOutput) so HTTP clients get pure MCP.
-    callTool = (params) => registry.callTool(params).then(({ costUsd, costExact, textOutput, ...r }) => r);
+    callTool = (params, ctx) => registry.callTool(params, ctx).then(({ costUsd, costExact, textOutput, ...r }) => r);
   }
 
   // Filled in when the Agent Market worker has started (below); until then the route answers 503.

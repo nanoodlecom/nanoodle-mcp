@@ -144,6 +144,8 @@ export function createNearGate({
 
   /** Full results (incl. text) of finished calls in this process, by payment id. */
   const results = new Map();
+  // Safe execution snapshots only, in memory like paid output. Never persist prompts.
+  const workflows = new Map();
   /** Per-payment-id serialization: one paying call at a time per id. */
   const locks = new Map();
   const waiters = new Map();
@@ -611,6 +613,7 @@ export function createNearGate({
       ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
       done: status !== "pending",
+      ...(workflows.has(id) ? { workflow: workflows.get(id) } : {}),
       next: paid
         ? `Payment confirmed. Call ${q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`
         : status === "pending" ? "Pay this deposit in your wallet; keep monitoring until payment is confirmed."
@@ -713,7 +716,10 @@ export function createNearGate({
     let res;
     try {
       if (prepError) throw prepError;
-      res = await registry.callTool(prepared.run);
+      res = await registry.callTool(prepared.run, {
+        ...ctx,
+        workflow(state) { workflows.set(q.id, state); ctx?.workflow?.(state); },
+      });
     } catch (e) {
       const msg = String((e && e.message) || e);
       const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
