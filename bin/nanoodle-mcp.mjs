@@ -508,6 +508,7 @@ async function main() {
         maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
       });
       ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
+      nearHealth.usdc = near.usdc;
     } catch (e) {
       // Only reachable with both rails configured (NEAR alone exits inside startNearMode).
       // The Nano rail is the production default; it keeps serving and NEAR stays off until a restart.
@@ -610,7 +611,7 @@ async function main() {
     instructions,
     gate,
     nearGate: near?.gate || null,
-    nearHealth, nearWatcher: near?.watcher || null,
+    nearHealth, nearWatcher: near?.watcher || null, usdc: near?.usdc || null,
     paymentNote,
     rates: near ? near.rates : null,
     toolInfo: registry.tools,
@@ -632,7 +633,8 @@ async function main() {
         instructions: near ? near.nearInstructions : unavailable().content[0].text,
         paymentNote: near ? near.nearPaymentNote : unavailable().content[0].text,
         nearGate: near?.gate || null, rates: near?.rates || null,
-        nearHealth, nearWatcher: near?.watcher || null,
+        nearHealth, nearWatcher: near?.watcher || null, usdc: near?.usdc || null,
+        allowedOrigins: (process.env.NEAR_PUBLIC_ALIASES || "").split(",").map((s) => s.trim()).filter(Boolean),
         toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
         publicBase: nearPublicUrl.replace(/\/+$/, ""),
         log: (...a) => console.error(...a),
@@ -815,9 +817,17 @@ async function startNearMode({
         `XNO/USD ${applied.xnoUsd != null ? `static ${applied.xnoUsd}` : `live ${v.xnoUsd ?? "unavailable"}`}, swap margin ${applied.spreadBps} bps`);
     } catch (e) { log(`SIGHUP: rate settings not changed: ${e.message}`); }
   });
-  const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log });
+  const usdcToken = near.USDC_CONTRACTS[network];
+  const usdcSetting = envText?.match(/^\s*(?:export\s+)?NEAR_USDC\s*=\s*["']?([^\s"']+)/m)?.[1] ?? process.env.NEAR_USDC ?? "0";
+  let usdcEnabled = false;
+  if (["1", "true"].includes(usdcSetting)) {
+    try { await near.checkUsdcMerchant({ rpc, network, merchantId: merchant }); usdcEnabled = true; }
+    catch (e) { log(`USDC payments are off (${e.code || "unavailable"}): ${e.message}. Native NEAR continues.`); }
+  }
+  const usdc = { enabled: usdcEnabled, tokenContract: usdcToken, decimals: 6 };
+  const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken });
   const gate = createNearGate({
-    merchantId: merchant, network, rpc, ledger, rate: rates, refunder,
+    merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
   });
@@ -826,7 +836,7 @@ async function startNearMode({
   await gate.resume(); // before serving: a run a previous process left in flight is refunded, never re-run
   const watcher = near.createNearWatcher({
     rpc, ledger, merchantId: merchant, pendingQuotes: gate.pendingQuotes,
-    observeTransfer: gate.observeTransfer, log,
+    observeTransfer: gate.observeTransfer, log, tokenContracts: [usdcToken],
   });
   await watcher.start();
 
@@ -851,7 +861,10 @@ async function startNearMode({
     "(the transaction hash) and _payment_sender (the account you paid from). " +
     "The amount you send is a deposit, the most you can be charged; you will most likely pay the estimated cost plus the 20% service fee, " +
     "and the rest is refunded to the paying account automatically after the run. If the run fails, the whole deposit is refunded. " +
-    `Repeating the paying call returns the stored result and never charges again. Quotes expire after ${quoteTtlMin} minutes.` + ratesLine;
+    `Repeating the paying call returns the stored result and never charges again. Quotes expire after ${quoteTtlMin} minutes.` +
+    (usdcEnabled ? ` This server also accepts Circle-issued USDC on NEAR: add _pay_with: "usdc" when quoting custom or predefined workflows. ` +
+      `The quote names the exact USDC token contract, six-decimal amount and pay URL. Use one ft_transfer with 1 yoctoNEAR attached; gas is separate. ` +
+      `The watcher detects it automatically and change/refunds return in USDC. Never replace USDC token units with yoctoNEAR. ` : "") + ratesLine;
   const paymentNote =
     (dual
       ? `Calls can also be paid in native NEAR on ${network}: add "_pay_with": "near" to a saved tool's arguments (run_noodle is NEAR-paid). A call without payment returns a quote with an exact deposit; `
@@ -863,8 +876,9 @@ async function startNearMode({
   const nearInstructions = instructions.replace(`Paying in native NEAR on ${network}:`, `Tools on this server are paid per call in native NEAR on ${network};`);
   const nearPaymentNote = `Every call is paid in native NEAR on ${network}. Your agent shows a payment link: connect your wallet, approve the deposit, ` +
     "and the result streams back automatically. You pay actual model cost plus a 20% service fee; unused NEAR returns to the paying wallet on chain. " +
-    "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." + ratesLine;
-  return { listTools, callTool, wrapped, gate, watcher, rates, instructions, paymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
+    "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." +
+    (usdcEnabled ? ` Choose _pay_with: "usdc" for Circle-issued USDC on NEAR, including USDC change and refunds; otherwise the quote is in native NEAR.` : "") + ratesLine;
+  return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions, paymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });

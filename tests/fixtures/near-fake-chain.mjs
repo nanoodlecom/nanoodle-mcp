@@ -29,6 +29,7 @@ function readBorshTransfer(buf) {
   let o = 0;
   const u32 = () => { const v = buf.readUInt32LE(o); o += 4; return v; };
   const str = () => { const n = u32(); const s = buf.subarray(o, o + n).toString("utf8"); o += n; return s; };
+  const u128 = () => { const n = buf.readBigUInt64LE(o) + (buf.readBigUInt64LE(o + 8) << 64n); o += 16; return n; };
   const bytes = (n) => { const b = buf.subarray(o, o + n); o += n; return b; };
   const signerId = str();
   const keyType = buf[o++];
@@ -40,9 +41,12 @@ function readBorshTransfer(buf) {
   const actions = [];
   for (let i = 0; i < nActions; i++) {
     const tag = buf[o++];
-    if (tag !== 3) throw new Error(`fake chain: only Transfer actions are supported (tag ${tag})`);
-    const lo = buf.readBigUInt64LE(o), hi = buf.readBigUInt64LE(o + 8); o += 16;
-    actions.push({ Transfer: { deposit: ((hi << 64n) + lo).toString() } });
+    if (tag === 3) actions.push({ Transfer: { deposit: u128().toString() } });
+    else if (tag === 2) {
+      const method_name = str(), args = Buffer.from(bytes(u32())).toString("base64");
+      const gas = buf.readBigUInt64LE(o); o += 8;
+      actions.push({ FunctionCall: { method_name, args, gas: Number(gas), deposit: u128().toString() } });
+    } else throw new Error(`fake chain: unsupported action ${tag}`);
   }
   const txEnd = o;
   const sigType = buf[o++];
@@ -55,6 +59,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
   const accounts = new Map(); // id -> { balance: bigint, keys: Map<publicKey, { nonce: bigint }> }
   const blocks = new Map();   // hash -> block
   const txs = new Map();      // hash -> FINAL tx result
+  const tokens = new Map();
   let height = 230_000_000;
   const log = [];             // every RPC call: { method, params }
   const chain = {
@@ -99,8 +104,21 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     return a;
   };
   chain.balance = (id) => (accounts.get(id) ? accounts.get(id).balance : 0n);
+  chain.addFt = (contract, balances) => {
+    if (!accounts.has(contract)) chain.addAccount(contract);
+    tokens.set(contract, new Map(Object.entries(balances).map(([id, amount]) => [id, BigInt(amount)])));
+  };
+  chain.ftBalance = (contract, id) => tokens.get(contract)?.get(id) ?? 0n;
+  const ftLog = (from, to, amount) => 'EVENT_JSON:' + JSON.stringify({ standard: 'nep141', version: '1.0.0', event: 'ft_transfer',
+    data: [{ old_owner_id: from, new_owner_id: to, amount: String(amount) }] });
+  function moveFt(contract, from, to, amount) {
+    const balances = tokens.get(contract), n = BigInt(amount);
+    if (!balances?.has(to) || (balances.get(from) ?? 0n) < n) throw new Error("fake chain: FT balance/storage");
+    balances.set(from, balances.get(from) - n); balances.set(to, balances.get(to) + n);
+    return ftLog(from, to, amount);
+  }
 
-  function record({ hash, signerId, publicKey, nonce, receiverId, actions, signature, blockTimeMs, success = true }) {
+  function record({ hash, signerId, publicKey, nonce, receiverId, actions, signature, blockTimeMs, success = true, logs = [] }) {
     const block = newBlock(blockTimeMs ?? now());
     head = block;
     const receiptId = rid();
@@ -124,7 +142,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
       receipts_outcome: [{
         id: receiptId,
         outcome: {
-          logs: [], receipt_ids: [], gas_burnt: 223_182_562_500, tokens_burnt: "0",
+          logs, receipt_ids: [], gas_burnt: 223_182_562_500, tokens_burnt: "0",
           executor_id: receiverId, status: success ? { SuccessValue: "" } : { Failure: {} }, metadata: meta,
         },
         block_hash: block.header.hash,
@@ -152,6 +170,14 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     move(from, to, total);
     const hash = rid();
     record({ hash, signerId: from, publicKey: "ed25519:" + rid(), nonce: 1n, receiverId: to, actions: acts, signature: "ed25519:" + rid(), blockTimeMs });
+    return hash;
+  };
+  chain.ftTransfer = (contract, from, to, amount, { blockTimeMs } = {}) => {
+    const event = moveFt(contract, from, to, amount);
+    move(from, contract, 1n);
+    const hash = rid();
+    record({ hash, signerId: from, publicKey: "ed25519:" + rid(), nonce: 1n, receiverId: contract, signature: "ed25519:" + rid(), blockTimeMs,
+      actions: [{ FunctionCall: { method_name: "ft_transfer", args: Buffer.from(JSON.stringify({ receiver_id: to, amount: String(amount) })).toString("base64"), gas: 30000000000000, deposit: "1" } }], logs: [event] });
     return hash;
   };
 
@@ -200,6 +226,17 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     }
     if (method === "query") {
       const acct = accounts.get(params.account_id);
+      if (params.request_type === "call_function") {
+        const balances = tokens.get(params.account_id);
+        if (!balances) return rpcError(id, "UNKNOWN_ACCOUNT", "unknown token");
+        const args = JSON.parse(Buffer.from(params.args_base64, "base64").toString());
+        let value;
+        if (params.method_name === "ft_metadata") value = { spec: "ft-1.0.0", symbol: "USDC", decimals: 6 };
+        else if (params.method_name === "ft_balance_of") value = String(balances.get(args.account_id) ?? 0n);
+        else if (params.method_name === "storage_balance_of") value = balances.has(args.account_id) ? { total: "1250000000000000000000", available: "0" } : null;
+        else return rpcError(id, "UNSUPPORTED", "unknown FT view");
+        return ok(id, { result: [...Buffer.from(JSON.stringify(value))], logs: [], block_hash: head.header.hash, block_height: head.header.height });
+      }
       if (params.request_type === "view_account") {
         if (!acct) return rpcError(id, "UNKNOWN_ACCOUNT", `account ${params.account_id} does not exist while viewing`);
         return ok(id, { amount: acct.balance.toString(), locked: "0", code_hash: "11111111111111111111111111111111", storage_usage: 182, block_height: head.header.height, block_hash: head.header.hash });
@@ -240,10 +277,17 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
         return rpcError(id, "INVALID_TRANSACTION", { TxExecutionError: { InvalidTxError: "Expired" } });
       }
       key.nonce = t.nonce;
-      move(t.signerId, t.receiverId, t.actions[0].Transfer.deposit);
+      let logs = [];
+      if (t.actions[0].Transfer) move(t.signerId, t.receiverId, t.actions[0].Transfer.deposit);
+      else {
+        const call = t.actions[0].FunctionCall, args = JSON.parse(Buffer.from(call.args, "base64").toString());
+        if (call.method_name !== "ft_transfer" || call.deposit !== "1") return rpcError(id, "UNSUPPORTED", "unsupported contract call");
+        logs = [moveFt(t.receiverId, t.signerId, args.receiver_id, args.amount)];
+        move(t.signerId, t.receiverId, 1n);
+      }
       const r = record({
         hash, signerId: t.signerId, publicKey: pk, nonce: t.nonce, receiverId: t.receiverId,
-        actions: t.actions, signature: "ed25519:" + base58Encode(t.signature),
+        actions: t.actions, signature: "ed25519:" + base58Encode(t.signature), logs,
       });
       return ok(id, r);
     }

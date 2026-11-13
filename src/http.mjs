@@ -546,20 +546,23 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
 }
 
 function nearPayPageHtml(q) {
-  return htmlPage("Pay in NEAR · nanoodle", `
+  const asset = q.asset === "USDC" ? "USDC" : "NEAR";
+  const amount = q.amount ?? q.amountNear;
+  return htmlPage(`Pay in ${asset} · nanoodle on NEAR`, `
     <a href="/">nanoodle-mcp</a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
-      <h1>Pay in NEAR</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
+      <h1>Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · NEAR ${esc(q.network)}</p>
       <div class="card">
-        <h2>Deposit ${esc(q.amountNear)} NEAR</h2>
-        <p>You pay the model cost + 20%. Unused NEAR returns to the wallet that pays. A failed run refunds the whole deposit.</p>
+        <h2>Deposit ${esc(amount)} ${asset}</h2>
+        <p>You pay the model cost + 20%. Unused ${asset} returns to the wallet that pays. A failed run refunds the whole deposit.</p>
         <p class="muted">Send on <strong>${esc(q.network)}</strong> to:</p><code>${esc(q.payTo)}</code>
+        ${asset === "USDC" ? `<p class="muted">Circle-issued USDC on NEAR · six decimals. Network gas is paid separately in NEAR.</p>` : ""}
         <p><button id="near-pay" type="button">Connect wallet &amp; pay</button></p>
         <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
         <p id="near-error" role="alert"></p>
       </div>
       <details><summary>Already paid with another wallet?</summary>
-        <p>Send exactly <code>${esc(q.amountNear)}</code> NEAR in one native transfer. The server detects the payment automatically. You can also confirm its transaction here.</p>
+        <p>Send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The server detects the payment automatically. You can also confirm its transaction here.</p>
         <form id="near-confirm">
           <p><label>Your NEAR account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
           <p><label>Transaction hash <input name="txHash" required autocomplete="off"></label></p>
@@ -681,6 +684,8 @@ export async function serveHttp({
   nearGate = null,
   nearHealth = null,
   nearWatcher = null,
+  usdc = null,
+  allowedOrigins = [],
   paymentNote = null,
   rates = null,
   toolInfo = [],
@@ -694,6 +699,11 @@ export async function serveHttp({
 }) {
   const sha = commit === undefined ? gitShortSha() : (commit || null);
   const publicOrigin = new URL(publicBase || `http://${host}:${port}`).origin;
+  const trustedOrigins = new Set([publicOrigin, ...allowedOrigins.map((value) => {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || value !== url.origin) throw new TypeError("Allowed origins must be exact HTTP(S) origins");
+    return url.origin;
+  })]);
   const dispatch = createDispatcher({ name, version, commit: sha, listTools, callTool, instructions, log });
   const graphByName = new Map(toolInfo.filter((t) => t.rawText).map((t) => [t.name, t.rawText]));
 
@@ -715,7 +725,7 @@ export async function serveHttp({
       const url = new URL(req.url, "http://localhost");
       // Check before preflight or dispatch. Do not derive trust from Host or
       // forwarded headers supplied by the request being authorized.
-      if ((url.pathname === "/mcp" || url.pathname.startsWith("/near/pay/")) && req.headers.origin !== undefined && req.headers.origin !== publicOrigin) {
+      if ((url.pathname === "/mcp" || url.pathname.startsWith("/near/pay/")) && req.headers.origin !== undefined && !trustedOrigins.has(req.headers.origin)) {
         return send(403, JSON.stringify({ error: "Origin is not allowed" }));
       }
       if (req.method === "OPTIONS") {
@@ -868,7 +878,7 @@ export async function serveHttp({
       }
       if (url.pathname === "/near/health" && nearHealth) {
         res.setHeader("Cache-Control", "no-store");
-        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearHealth.merchant, network: nearHealth.network, active: !!nearGate, watcher: nearWatcher?.status() || null }));
+        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearHealth.merchant, network: nearHealth.network, active: !!nearGate, watcher: nearWatcher?.status() || null, ...(usdc ? { usdc } : {}) }));
       }
 
       if (url.pathname === "/version") {

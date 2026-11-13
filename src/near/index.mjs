@@ -6,7 +6,8 @@ export {
 } from "./amount.mjs";
 export { base58Encode, base58Decode } from "./base58.mjs";
 export { parseNearSecretKey, loadNearSigner } from "./keys.mjs";
-export { serializeTransferTx, signTransfer } from "./tx.mjs";
+export { serializeTransferTx, signTransfer, signFunctionCall } from "./tx.mjs";
+export { USDC_CONTRACTS, checkUsdcMerchant, ftView, signFtTransfer } from "./ft.mjs";
 export { parseRpcJson, createNearRpc, createNearRpcPool, parseRpcUrls } from "./rpc.mjs";
 export { readPaymentTransfer } from "./verify.mjs";
 export { openNearLedger } from "./ledger.mjs";

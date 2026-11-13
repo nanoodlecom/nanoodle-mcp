@@ -980,6 +980,24 @@ export function pricingVocabulary(pricing, { near = null, safety = { ok: true, r
  */
 export function formatQuote({ pricing, payment, now = Date.now() }) {
   const pay = payment || {};
+  if (pay.asset === "USDC") {
+    const voc = pricingVocabulary(pricing);
+    const next = pay.payUrl
+      ? `Show ${pay.payUrl} and monitor ${pay.watchUrl}. When status is paid, repeat the original call with _payment_id: "${pay.paymentId}". Continue automatically; do not pay again.`
+      : `Call ft_transfer on ${pay.tokenContract} with receiver_id ${pay.payTo}, amount "${pay.amountAtomic}" and exactly 1 yoctoNEAR attached. Then resume the original call with _payment_id, _payment_tx and _payment_sender.`;
+    return {
+      text: [
+        `PAYMENT REQUIRED (USDC on NEAR ${pay.network}) — deposit ${pay.amount} USDC to ${pay.payTo}.`,
+        `The deposit is the most you can be charged. Pay actual model cost + 20% service fee; unused USDC returns to the paying NEAR account. A failed run refunds the whole deposit.`,
+        ...(pay.payUrl ? [`Pay in your wallet: ${pay.payUrl}`] : []), next,
+        `Token contract: ${pay.tokenContract}. Amount: ${pay.amountAtomic} integer units (${pay.amount} USDC, six decimals).`,
+        `Quoted in USDC at 1 USD per USDC. Includes ${pay.dustAmount} USDC of unique refundable dust. Network gas is paid separately in NEAR.`,
+        `Quote expires ${pay.expiresAt}. The payment id is a secret; do not share it.`,
+        "", ...pricingLines(pricing),
+      ].join("\n"),
+      structured: { pricing: voc.structured.pricing, payment: { rail: "near", status: "payment_required", ...pay, next } },
+    };
+  }
   const rate = pay.rate || {};
   const near = {
     network: pay.network, nearUsd: rate.nearUsd, rateSource: rate.source, rateAt: rate.at, rateExtras: rateExtras(rate),
@@ -1022,7 +1040,7 @@ function refundStatusText(refund, paymentId) {
   switch (r.status) {
     case "sent": return `sent (tx ${r.txHash}${link})`;
     case "pending": return `pending, queued for retry${r.txHash ? ` (tx ${r.txHash}${link})` : ""}`;
-    case "none": return "none (nothing to return, or below the 0.00001 NEAR minimum refund)";
+    case "none": return r.asset === "USDC" ? "none (nothing to return)" : "none (nothing to return, or below the 0.00001 NEAR minimum refund)";
     case "failed_permanent": return `could not be sent; contact the operator with payment id ${paymentId}`;
     default: return String(r.status || "unknown");
   }
@@ -1045,6 +1063,17 @@ export function shortNear(near) {
 export function formatReceipt(receipt) {
   const r = receipt || {};
   const dep = r.deposit || {}, ref = r.refund || {}, ch = r.charged || {}, cost = r.actualCost || {}, rate = r.rate || {};
+  if (r.asset === "USDC") {
+    const charge = cost.usd == null ? "No model cost was reported, so nothing was charged."
+      : `Model cost $${cost.usd}; charged ${ch.amount} USDC including the 20% service fee, rounded to token precision${ch.capped ? " and capped at the deposit" : ""}.`;
+    const outcome = r.outcome === "succeeded" ? charge : "The workflow did not run successfully. Nothing was charged; the whole received deposit is refunded.";
+    return { text: [
+      `Paid ${dep.amount} USDC on NEAR ${r.network} (tx ${dep.txHash}${dep.explorerUrl ? ", " + dep.explorerUrl : ""}). ${outcome}`,
+      `Refund ${ref.amount} USDC to ${ref.to}: ${refundStatusText(ref, r.paymentId)}.`,
+      `Token: ${r.tokenContract}. Quote denomination: 1 USD per USDC; network gas is separate.`,
+      ...legLines(r.legs || [], r.paymentId),
+    ].join("\n"), structured: { receipt: r } };
+  }
   const paid = `Paid ${shortNear(dep.near)} NEAR deposit (tx ${dep.txHash}${dep.explorerUrl ? `, ${dep.explorerUrl}` : ""}).`;
   const refundLine = `Refund ${shortNear(ref.near)} NEAR to ${ref.to}: ${refundStatusText(ref, r.paymentId)}.`;
   const rateLine = `Rate ${rate.nearUsd} USD/NEAR (${rate.source}, ${rate.at})${rateExtrasText(rateExtras(rate))}, locked when quoted.`;
@@ -1087,7 +1116,7 @@ function legLines(legs, paymentId) {
   const out = [];
   if (caller) {
     out.push(caller.status === "final"
-      ? `Leg 1, caller payment: ${shortNear(caller.amount)} NEAR, tx ${caller.txHash}, final.`
+      ? `Leg 1, caller payment: ${shortNear(caller.amount)} ${caller.asset || "NEAR"}, tx ${caller.txHash}, final.`
       : `Leg 1, caller payment: none.`);
   }
   if (model) {
@@ -1098,7 +1127,7 @@ function legLines(legs, paymentId) {
     out.push(`Leg 2, model payment to NanoGPT: ${t}.`);
   }
   if (refund) {
-    out.push(`Leg 3, refund: ${shortNear(refund.amount)} NEAR, ${refundStatusText(refund, paymentId)}.`);
+    out.push(`Leg 3, refund: ${shortNear(refund.amount)} ${refund.asset || "NEAR"}, ${refundStatusText(refund, paymentId)}.`);
   }
   return out;
 }

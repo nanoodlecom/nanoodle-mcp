@@ -79,8 +79,10 @@ button.addEventListener("click", async () => {
     // result must not invite a second payment on reload.
     remember({ senderId });
     const outcome = await wallet.signAndSendTransaction({
-      network: quote.network, signerId: senderId, receiverId: quote.payTo,
-      actions: [{ type: "Transfer", params: { deposit: quote.amountYocto } }],
+      network: quote.network, signerId: senderId, receiverId: quote.asset === "USDC" ? quote.tokenContract : quote.payTo,
+      actions: quote.asset === "USDC"
+        ? [{ type: "FunctionCall", params: { methodName: "ft_transfer", args: { receiver_id: quote.payTo, amount: quote.amountAtomic }, gas: "30000000000000", deposit: "1" } }]
+        : [{ type: "Transfer", params: { deposit: quote.amountYocto } }],
     });
     const txHash = outcome?.transaction?.hash;
     if (!txHash) throw new Error("Check your wallet history and confirm the transaction below. Do not send the deposit again.");

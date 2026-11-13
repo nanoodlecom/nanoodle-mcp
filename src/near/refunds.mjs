@@ -25,6 +25,7 @@ import { randomBytes } from "node:crypto";
 import { assertNearAccountId } from "./account.mjs";
 import { MIN_REFUND_YOCTO, formatYoctoAsNear } from "./amount.mjs";
 import { signTransfer } from "./tx.mjs";
+import { signFtTransfer, hasFtTransfer, formatUsdc } from "./ft.mjs";
 
 const REASONS = new Set(["change", "run_failed", "wrong_amount", "late_payment", "interrupted"]);
 
@@ -45,6 +46,7 @@ function publicStatus(rec) {
 function view(rec) {
   return { refundId: rec.id, status: publicStatus(rec), txHash: rec.txHash ?? null };
 }
+const amountLabel = (rec) => rec.asset === "usdc" ? `${formatUsdc(rec.amountYocto)} USDC` : `${formatYoctoAsNear(rec.amountYocto)} NEAR`;
 
 export function createRefunder({
   rpc,
@@ -54,6 +56,7 @@ export function createRefunder({
   now = Date.now,
   log = () => {},
   minRefundYocto = MIN_REFUND_YOCTO,
+  usdcToken = null,
   backoffMs = [30_000, 60_000, 120_000, 300_000, 600_000],
   maxAttempts = 100,
   resignWindowMs = 36 * 3_600_000,
@@ -75,11 +78,14 @@ export function createRefunder({
 
   /** Sign a fresh transfer for `rec` and persist it before returning. */
   async function signFor(rec) {
+    if (rec.asset != null && !["near", "usdc"].includes(rec.asset)) throw new Error("Unknown refund asset in ledger");
     const key = await rpc.viewAccessKey({ accountId, publicKey: signer.publicKey });
     const chainNonce = BigInt(key.nonce);
     const lastNonce = BigInt(ledger.getMeta("lastNonce") ?? 0);
     const nonce = (chainNonce > lastNonce ? chainNonce : lastNonce) + 1n;
-    const signed = signTransfer({
+    if (rec.asset === "usdc" && (!usdcToken || rec.tokenContract !== usdcToken)) throw new Error("USDC refund contract does not match this server");
+    const signed = rec.asset === "usdc" ? signFtTransfer({ signer, signerId: accountId, tokenContract: usdcToken,
+      to: rec.to, amount: BigInt(rec.amountYocto), nonce, blockHash: key.block_hash }) : signTransfer({
       signer,
       signerId: accountId,
       receiverId: rec.to,
@@ -105,7 +111,7 @@ export function createRefunder({
     const attempts = (rec.attempts || 0) + 1;
     if (attempts >= maxAttempts) {
       const done = ledger.updateRefund(rec.id, { status: "failed_permanent", attempts, nextAttemptAt: null, lastError: String(err?.code || "error"), finishedAt: now() });
-      log(`NEAR refund failed permanently after ${attempts} attempts: payment ${rec.paymentId}, ${formatYoctoAsNear(rec.amountYocto)} NEAR to ${rec.to}. The funds remain in ${accountId}; send them manually.`);
+      log(`NEAR refund failed permanently after ${attempts} attempts: payment ${rec.paymentId}, ${amountLabel(rec)} to ${rec.to}. The funds remain in ${accountId}; send them manually.`);
       return view(done);
     }
     const delay = backoffMs[Math.min(attempts - 1, backoffMs.length - 1)];
@@ -127,10 +133,12 @@ export function createRefunder({
   }
 
   function markSent(rec, result) {
-    const failed = failedOutcome(result);
+    const failed = failedOutcome(result) || rec.asset === "usdc" && !hasFtTransfer(result, {
+      tokenContract: usdcToken, from: accountId, to: rec.to, amount: rec.amountYocto,
+    });
     if (failed) {
       const done = ledger.updateRefund(rec.id, { status: "failed_permanent", nextAttemptAt: null, lastError: "TX_FAILED", finishedAt: now() });
-      log(`NEAR refund transaction ${rec.txHash} failed on chain: payment ${rec.paymentId}, ${formatYoctoAsNear(rec.amountYocto)} NEAR to ${rec.to}. The funds remain in ${accountId}; send them manually.`);
+      log(`NEAR refund transaction ${rec.txHash} failed on chain: payment ${rec.paymentId}, ${amountLabel(rec)} to ${rec.to}. The funds remain in ${accountId}; send them manually.`);
       return view(done);
     }
     return view(ledger.updateRefund(rec.id, { status: "sent", nextAttemptAt: null, sentAt: now() }));
@@ -179,7 +187,7 @@ export function createRefunder({
           // hash being "unknown" proves nothing; re-signing could pay twice.
           const done = ledger.updateRefund(rec.id, { status: "failed_permanent", nextAttemptAt: null, lastError: "UNPROVABLE", finishedAt: now() });
           log(`NEAR refund ${rec.txHash} for payment ${rec.paymentId} could not be confirmed (signed too long ago for the RPC to remember). ` +
-            `Check ${accountId}'s history on an explorer or an archival RPC; if no transfer of ${formatYoctoAsNear(rec.amountYocto)} NEAR to ${rec.to} landed, send it manually.`);
+            `Check ${accountId}'s history on an explorer or an archival RPC; if no transfer of ${amountLabel(rec)} to ${rec.to} landed, send it manually.`);
           return view(done);
         }
         let fresh;
@@ -199,12 +207,14 @@ export function createRefunder({
     return markSent(rec, result);
   }
 
-  async function refund({ paymentId, to, amountYocto, reason }) {
+  async function refund({ paymentId, to, amountYocto, reason, asset = "near", tokenContract = null }) {
     if (typeof paymentId !== "string" || !paymentId) throw new TypeError("refund needs a paymentId");
     if (typeof amountYocto !== "bigint" || amountYocto < 0n) throw new TypeError("amountYocto must be a non-negative bigint");
     if (!REASONS.has(reason)) throw new TypeError(`unknown refund reason: ${String(reason)}`);
     assertNearAccountId(to);
-    if (amountYocto < minRefundYocto) return { refundId: null, status: "none", txHash: null };
+    if (asset !== "near" && asset !== "usdc") throw new TypeError("Unknown refund asset");
+    if (asset === "usdc" && (!usdcToken || tokenContract !== usdcToken)) throw new TypeError("Unknown USDC contract");
+    if (amountYocto < (asset === "usdc" ? 1n : minRefundYocto)) return { refundId: null, status: "none", txHash: null };
     return serialized(async () => {
       const existing = ledger.refundForPayment(paymentId);
       if (existing) return view(existing);
@@ -213,6 +223,7 @@ export function createRefunder({
         paymentId,
         to,
         amountYocto: amountYocto.toString(),
+        ...(asset === "usdc" ? { asset, tokenContract } : {}),
         reason,
         status: "queued",
         txHash: null,

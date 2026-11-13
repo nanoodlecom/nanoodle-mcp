@@ -253,6 +253,15 @@ export function createNearRates({
     return build(near, x);
   }
 
+  /** USDC is the quote denomination; a NEAR spot price is not needed. */
+  async function currentUsdc() {
+    if (xnoLive() && due(xno, now())) await refresh();
+    const x = usable(xno, now()) ? xno : null;
+    if (!x && xnoRequired) throw new NearError("RATE_UNAVAILABLE", "No current provider funding rate is available", { data: { pair: "XNO/USD" } });
+    return { usdNano: NANO_PER_USD, yocto: 1_000_000n, usdcUsd: "1", source: "USDC denomination", at: iso(now()),
+      xnoUsd: x?.usd ?? null, xnoSource: x?.source ?? null, xnoAt: x?.at ?? null, spreadBps: 0 };
+  }
+
   function sourceView(rec, err, live, t) {
     const age = rec && rec.fetchedAt !== Infinity ? Math.max(0, Math.round((t - rec.fetchedAt) / 1000)) : null;
     return {
@@ -343,7 +352,7 @@ export function createNearRates({
   }
 
   return {
-    current, refresh, view, start, stop, reload,
+    current, currentUsdc, refresh, view, start, stop, reload,
     get config() { return { nearUsd: cfg.nearStatic, xnoUsd: cfg.xnoStatic, spreadBps: cfg.spreadBps, xnoRequired }; },
   };
 }

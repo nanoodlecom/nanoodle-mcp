@@ -39,6 +39,7 @@ import {
   DUST_STEP_YOCTO, readPaymentTransfer, explorerTxUrl,
 } from "./near/index.mjs";
 import { knownUsd } from "./usd.mjs";
+import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
 
 const RUN_NOODLE = "run_noodle";
 const FINAL = new Set(["settled", "failed", "rejected"]);
@@ -120,10 +121,23 @@ export function createNearGate({
   maxOpenQuotes = 1000,
   expiredRetainMs = 3_600_000,
   publicBase = null,
+  usdcToken = null,
+  usdcEnabled = false,
 }) {
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   const L = { ...DEFAULT_LIMITS, ...(limits || {}) };
+  if (usdcEnabled && !isNearAccountId(usdcToken)) throw new TypeError("USDC needs a verified token contract");
+  const assetOf = (q) => q.asset === "usdc" ? "usdc" : "near";
+  const symbol = (q) => assetOf(q) === "usdc" ? "USDC" : "NEAR";
+  const amountText = (q, amount) => assetOf(q) === "usdc" ? formatUsdc(amount) : formatYoctoAsNear(amount);
+  const amountFields = (q, amount) => assetOf(q) === "usdc"
+    ? { asset: "USDC", amountAtomic: String(amount), amount: formatUsdc(amount), tokenContract: q.tokenContract, decimals: 6 }
+    : { yocto: String(amount), near: formatYoctoAsNear(amount) };
+  const refundAsset = (q) => assetOf(q) === "usdc" ? { asset: "usdc", tokenContract: q.tokenContract } : {};
+  const rateView = (q) => assetOf(q) === "usdc"
+    ? { usdcUsd: "1", source: q.rate.source, at: q.rate.at, ...rateExtras(q.rate) }
+    : { nearUsd: q.rate.nearUsd, source: q.rate.source, at: q.rate.at, ...rateExtras(q.rate) };
   const ev = (event, fields) => {
     try { usage(event, { rail: "near", ...fields }); } catch { /* the ledger sink never breaks a call */ }
   };
@@ -178,8 +192,10 @@ export function createNearGate({
   function receiptLegs(q, r) {
     const m = modelSpend(q);
     const caller = {
-      leg: "caller payment", asset: "NEAR",
-      amount: r.deposit.near, yocto: r.deposit.yocto, txHash: r.deposit.txHash, explorerUrl: r.deposit.explorerUrl,
+      leg: "caller payment", asset: symbol(q),
+      amount: amountText(q, r.deposit.amountAtomic ?? r.deposit.yocto),
+      ...(assetOf(q) === "usdc" ? { amountAtomic: r.deposit.amountAtomic, tokenContract: q.tokenContract } : { yocto: r.deposit.yocto }),
+      txHash: r.deposit.txHash, explorerUrl: r.deposit.explorerUrl,
       status: q.payTx ? "final" : "none",
     };
     let model;
@@ -198,8 +214,10 @@ export function createNearGate({
       };
     }
     const refund = {
-      leg: "refund", asset: "NEAR",
-      amount: r.refund.near, yocto: r.refund.yocto, to: r.refund.to, txHash: r.refund.txHash, explorerUrl: r.refund.explorerUrl,
+      leg: "refund", asset: symbol(q),
+      amount: amountText(q, r.refund.amountAtomic ?? r.refund.yocto),
+      ...(assetOf(q) === "usdc" ? { amountAtomic: r.refund.amountAtomic, tokenContract: q.tokenContract } : { yocto: r.refund.yocto }),
+      to: r.refund.to, txHash: r.refund.txHash, explorerUrl: r.refund.explorerUrl,
       status: r.refund.status,
     };
     return [caller, model, refund];
@@ -229,9 +247,9 @@ export function createNearGate({
       rail: "near",
       network,
       paymentId: q.id,
+      ...(assetOf(q) === "usdc" ? { asset: "USDC", tokenContract: q.tokenContract } : {}),
       deposit: {
-        yocto: paid.toString(),
-        near: formatYoctoAsNear(paid),
+        ...amountFields(q, paid),
         // What was actually sent, at the locked rate (the quote's USD deposit plus the dust).
         usd: yoctoToUsd(paid, usdNano, rateYocto),
         quotedUsd: q.depositUsd,
@@ -244,23 +262,21 @@ export function createNearGate({
         billedAs: costKnown ? s.billedAs || "reported" : null,
         reportedUsd: s && s.reportedUsd != null ? exactUsd(s.reportedUsd) : null,
       },
-      serviceFee: { usd: costKnown ? exactUsd(s.costUsd * 0.2) : "0" },
+      serviceFee: { usd: costKnown ? assetOf(q) === "usdc" ? yoctoToUsd(BigInt(s.feeYocto), usdNano, rateYocto) : exactUsd(s.costUsd * 0.2) : "0" },
       charged: {
-        yocto: chargedYocto.toString(),
-        near: formatYoctoAsNear(chargedYocto),
-        usd: costKnown && !capped ? exactUsd(s.costUsd * 1.2) : yoctoToUsd(chargedYocto, usdNano, rateYocto),
+        ...amountFields(q, chargedYocto),
+        usd: assetOf(q) === "near" && costKnown && !capped ? exactUsd(s.costUsd * 1.2) : yoctoToUsd(chargedYocto, usdNano, rateYocto),
         capped,
       },
       refund: {
-        yocto: refundYocto.toString(),
-        near: formatYoctoAsNear(refundYocto),
+        ...amountFields(q, refundYocto),
         usd: yoctoToUsd(refundYocto, usdNano, rateYocto),
         to: q.payer,
         status: refundYocto === 0n ? "none" : rv.status,
         txHash: rv.txHash,
         explorerUrl: rv.txHash ? explorerTxUrl(network, rv.txHash) : null,
       },
-      rate: { nearUsd: q.rate.nearUsd, source: q.rate.source, at: q.rate.at, ...rateExtras(q.rate) },
+      rate: rateView(q),
       outcome: q.outcome,
     };
     receipt.legs = receiptLegs(q, receipt);
@@ -275,8 +291,8 @@ export function createNearGate({
   function withReceipt(q, body, extraNote = null) {
     const rc = receiptFor(q);
     const r = rc.structured.receipt;
-    const charged = `charged: $${r.charged.usd} (${shortNear(r.charged.near)} NEAR): model cost $${r.actualCost.usd ?? "0"} + 20% service fee; ` +
-      `refund ${shortNear(r.refund.near)} NEAR ${r.refund.status}`;
+    const charged = `charged: $${r.charged.usd} (${shortNear(r.charged.amount ?? r.charged.near)} ${symbol(q)}): model cost $${r.actualCost.usd ?? "0"} + 20% service fee; ` +
+      `refund ${shortNear(r.refund.amount ?? r.refund.near)} ${symbol(q)} ${r.refund.status}`;
     const content = (body.content || []).map((c) => (c && c.type === "text" && /^cost: \$/.test(c.text) ? { type: "text", text: charged } : c));
     if (extraNote) content.push({ type: "text", text: extraNote });
     content.push({ type: "text", text: rc.text });
@@ -311,16 +327,17 @@ export function createNearGate({
     const charged = BigInt(s.chargedYocto || "0"), refunded = BigInt(s.refundYocto || "0");
     return {
       paidYocto: q.paidYocto,
-      chargedNear: formatYoctoAsNear(charged), refundNear: formatYoctoAsNear(refunded),
+      ...(assetOf(q) === "usdc" ? { asset: "USDC", chargedUsdc: formatUsdc(charged), refundUsdc: formatUsdc(refunded) }
+        : { chargedNear: formatYoctoAsNear(charged), refundNear: formatYoctoAsNear(refunded) }),
       modelUsd: m.usd, modelPayment, modelXno: m.xno, modelXnoBasis: m.xno != null ? "derived" : null,
-      rate: { nearUsd: q.rate.nearUsd, source: q.rate.source, ...rateExtras(q.rate) },
+      rate: rateView(q),
     };
   }
 
   /* ---------------- refunds ---------------- */
 
   async function refundFor(q, to, amountYocto, reason) {
-    const r = await refunder.refund({ paymentId: q.id, to, amountYocto, reason });
+    const r = await refunder.refund({ paymentId: q.id, to, amountYocto, reason, ...refundAsset(q) });
     ev("refund", { paymentId: q.id, tool: q.tool, reason, to, amountYocto: amountYocto.toString(), status: r.status, hash: r.txHash || null });
     return r;
   }
@@ -328,11 +345,11 @@ export function createNearGate({
   /* ---------------- quote ---------------- */
 
   /** Deposit amounts of unpaid quotes still held (open, or expired within expiredRetainMs). */
-  function openAmounts() {
+  function openAmounts(asset = "near") {
     const t = now();
     const taken = new Set();
     for (const q of ledger.quotes()) {
-      if ((q.status === "pending" || q.status === "expired") && t <= q.expiresAt + expiredRetainMs) taken.add(q.amountYocto);
+      if (assetOf(q) === asset && (q.status === "pending" || q.status === "expired") && t <= q.expiresAt + expiredRetainMs) taken.add(q.amountYocto);
     }
     return taken;
   }
@@ -386,7 +403,8 @@ export function createNearGate({
     return { pricing, run: { name: RUN_NOODLE, arguments: { graph: pricing.boundGraph, inputs } } };
   }
 
-  async function quote(registry, name, args, tool) {
+  async function quote(registry, name, args, tool, asset = "near") {
+    if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server. Request a NEAR quote instead.");
     const { pricing } = await prepare(registry, name, args, tool);
     maybePrune();
     if (openQuoteCount() >= maxOpenQuotes) {
@@ -395,19 +413,22 @@ export function createNearGate({
 
     let r;
     try {
-      r = await rate.current();
+      r = asset === "usdc" ? await rate.currentUsdc() : await rate.current();
     } catch (e) {
       if (e instanceof NearError && e.code === "RATE_UNAVAILABLE") {
         const pair = (e.data && e.data.pair) || "NEAR/USD";
         const why = pair === "XNO/USD" ? " (this server pays its model provider in XNO, so the NEAR to XNO swap rate is unknown)" : "";
-        return errResult(`Cannot quote in NEAR right now: no current ${pair} rate${why}; try again shortly. Nothing was charged.`);
+        return errResult(`Cannot quote in ${asset === "usdc" ? "USDC" : "NEAR"} right now: no current ${pair} rate${why}; try again shortly. Nothing was charged.`);
       }
       throw e;
     }
-    const taken = openAmounts();
+    const taken = openAmounts(asset);
     let amountYocto;
     try {
-      amountYocto = depositYocto(pricing.depositUsd, r, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []));
+      const makeDeposit = asset === "usdc" ? usdcDeposit : depositYocto;
+      amountYocto = asset === "usdc"
+        ? makeDeposit(pricing.depositUsd, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []))
+        : makeDeposit(pricing.depositUsd, r, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []));
     } catch (e) {
       if (e instanceof NearError && e.code === "NO_UNIQUE_AMOUNT") {
         return errResult("This server is holding too many open quotes at this price right now; try again in a few minutes. Nothing was charged.");
@@ -420,29 +441,33 @@ export function createNearGate({
     // Only what payment and settlement need is stored; the itemized pricing is in the answer.
     const record = {
       id, tool: name, argsHash: hashArgs(name, args), status: "pending",
+      ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
       amountYocto: amountYocto.toString(),
       depositUsd: exactUsd(pricing.depositUsd),
       estimatedCostUsd: exactUsd(pricing.estimatedCostUsd),
-      rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(), nearUsd: r.nearUsd, source: r.source, at: r.at, ...rateExtras(r) },
+      rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(),
+        ...(asset === "usdc" ? { usdcUsd: "1" } : { nearUsd: r.nearUsd }), source: r.source, at: r.at, ...rateExtras(r) },
       createdAt, expiresAt,
       payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
       settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
     };
     ledger.putQuote(record);
     ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source, ...rateExtras(r) });
-    const likelyChargeNear = formatYoctoAsNear(usdToYocto(pricing.likelyChargeUsd, r, "ceil"), { maxDecimals: 6 });
-    const baseYocto = stepUp(usdToYocto(pricing.depositUsd, r, "ceil"));
+    const likelyCharge = usdToYocto(pricing.likelyChargeUsd, r, "ceil");
+    const baseYocto = asset === "usdc" ? usdToYocto(pricing.depositUsd, r, "ceil") : stepUp(usdToYocto(pricing.depositUsd, r, "ceil"));
     const q = formatQuote({
       pricing,
       now: createdAt,
       payment: {
         network, paymentId: id, payTo: merchantId,
-        amountYocto: record.amountYocto, amountNear: formatYoctoAsNear(amountYocto),
+        ...(asset === "usdc"
+          ? { asset: "USDC", amountAtomic: record.amountYocto, amount: formatUsdc(amountYocto), tokenContract: usdcToken, decimals: 6,
+              dustAmount: formatUsdc(amountYocto - baseYocto), likelyCharge: formatUsdc(likelyCharge) }
+          : { amountYocto: record.amountYocto, amountNear: formatYoctoAsNear(amountYocto), dustNear: formatYoctoAsNear(amountYocto - baseYocto),
+              likelyChargeNear: formatYoctoAsNear(likelyCharge, { maxDecimals: 6 }) }),
         depositUsd: record.depositUsd,
         depositUsdSent: estUsd(Number(yoctoToUsd(amountYocto, r.usdNano, r.yocto))),
-        dustNear: formatYoctoAsNear(amountYocto - baseYocto),
-        likelyChargeNear,
-        rate: { nearUsd: r.nearUsd, source: r.source, at: r.at, ...rateExtras(r) },
+        rate: rateView(record),
         expiresAt: new Date(expiresAt).toISOString(),
         ...(publicBase ? {
           payUrl: `${publicBase}/pay/${id}`,
@@ -457,8 +482,16 @@ export function createNearGate({
   /* ---------------- price_noodle with NEAR figures ---------------- */
 
   async function priceNear(args) {
+    const { _pay_with = "near", ...priceArgs } = args;
+    if (!["near", "usdc"].includes(_pay_with)) throw new GraphArgsError("_pay_with must be near or usdc");
+    if (_pay_with === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server");
     // computePrice also reports what stops a quote: live-priced or unpriced models, a deposit over the cap.
-    const computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits: L });
+    const computed = await computePrice(priceArgs, { baseUrl, fetch, log, allowShortLinks: false, limits: L });
+    if (_pay_with === "usdc") {
+      const result = priceNoodleResult(computed, { note: "Request a USDC quote with _pay_with: usdc. Amounts use six decimal places; unused USDC returns on NEAR." });
+      result.structuredContent.usdc = { network, tokenContract: usdcToken, decimals: 6, usdcUsd: "1", pricingBasis: "USDC denomination" };
+      return result;
+    }
     let note = null, near = null;
     if (computed.pricing) {
       try {
@@ -513,14 +546,16 @@ export function createNearGate({
     note(`checking payment ${q0.id} on NEAR ${network}`);
     let t;
     try {
-      t = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
+      t = await readPaymentTransfer({ rpc, txHash, senderId, merchantId,
+        ...(assetOf(q0) === "usdc" ? { tokenContract: q0.tokenContract } : {}), ...(txTimeoutMs ? { txTimeoutMs } : {}) });
     } catch (e) {
       if (!(e instanceof NearError)) throw e;
       const why = {
         TX_NOT_FOUND: `Transaction ${txHash} was not found as final on ${network}. If you just sent it, wait 3 seconds and call again (finality takes about 2-3 s; retry for up to 30 s). If it still fails, check that _payment_tx is the hash your wallet printed, that _payment_sender is the account that signed it, and that you paid on ${network}. Nothing was consumed.`,
         TX_NOT_FINAL: `Transaction ${txHash} is not final on ${network} yet — wait a few seconds and call again. Nothing was consumed.`,
-        TX_FAILED: `Transaction ${txHash} failed on chain, so no NEAR arrived. Send a new transfer of exactly the quoted amount.`,
-        NOT_A_SINGLE_TRANSFER: `Transaction ${txHash} is not exactly one native NEAR transfer (one Transfer action, nothing else). Send a plain transfer of exactly the quoted amount.`,
+        TX_FAILED: `Transaction ${txHash} did not prove a successful ${symbol(q0)} payment. Send a new transfer of exactly the quoted amount.`,
+        NOT_A_SINGLE_TRANSFER: assetOf(q0) === "usdc" ? `Transaction ${txHash} must contain exactly one ft_transfer on the quoted USDC contract with the exact recipient and amount.`
+          : `Transaction ${txHash} is not exactly one native NEAR transfer (one Transfer action, nothing else). Send a plain transfer of exactly the quoted amount.`,
         WRONG_RECEIVER: `Transaction ${txHash} does not pay ${merchantId}. Send exactly the quoted amount to ${merchantId}.`,
         TX_MISMATCH: "The NEAR RPC returned a different transaction than the one asked for; try again.",
         RPC_UNAVAILABLE: "The NEAR RPC could not be reached to check the payment; try again shortly. Nothing was consumed.",
@@ -532,12 +567,12 @@ export function createNearGate({
     }
 
     const wrongAmount = t.amountYocto !== BigInt(q0.amountYocto);
-    if (wrongAmount && openAmounts().has(t.amountYocto.toString())) {
+    if (wrongAmount && openAmounts(assetOf(q0)).has(t.amountYocto.toString())) {
       // The transfer carries the exact amount of ANOTHER open quote: it belongs to
       // that quote's payer. Consuming it here would let anyone who sees a payment
       // on chain burn it against a free quote of their own, so it is left untouched.
-      return errResult(`Transaction ${txHash} sent ${formatYoctoAsNear(t.amountYocto)} NEAR, the exact amount of a different quote, ` +
-        `so it was not used for this one (which asks for ${formatYoctoAsNear(BigInt(q0.amountYocto))} NEAR). Nothing was consumed.`);
+      return errResult(`Transaction ${txHash} sent ${amountText(q0, t.amountYocto)} ${symbol(q0)}, the exact amount of a different quote, ` +
+        `so it was not used for this one (which asks for ${amountText(q0, q0.amountYocto)} ${symbol(q0)}). Nothing was consumed.`);
     }
 
     // From here to updateQuote there is no await: the consume and the status
@@ -552,7 +587,7 @@ export function createNearGate({
     const reject = wrongAmount ? "wrong_amount" : t.blockTimeMs > q0.expiresAt ? "late_payment" : null;
     if (reject) {
       const error = reject === "wrong_amount"
-        ? `The quote asked for exactly ${formatYoctoAsNear(BigInt(q0.amountYocto))} NEAR.`
+        ? `The quote asked for exactly ${amountText(q0, q0.amountYocto)} ${symbol(q0)}.`
         : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`;
       let q = ledger.updateQuote(q0.id, { ...paidFields, status: "rejected", outcome: reject, error, finishedAt: now() });
       ev("paid", { paymentId: q.id, tool: q.tool, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
@@ -573,7 +608,7 @@ export function createNearGate({
     const paid = status === "paid" || status === "running" || status === "settled";
     return {
       paymentId: q.id, tool: q.tool, network, payTo: merchantId,
-      amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)),
+      ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
       done: status !== "pending",
       next: paid
@@ -615,10 +650,17 @@ export function createNearGate({
     try {
       transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
     } catch (e) {
-      if (["NOT_A_SINGLE_TRANSFER", "WRONG_RECEIVER", "TX_FAILED"].includes(e.code)) return;
-      throw e; // finality/RPC failures retry the same finalized block
+      if (["NOT_A_SINGLE_TRANSFER", "WRONG_RECEIVER"].includes(e.code)) {
+        if (!usdcToken || !pendingQuotes().some((q) => q.asset === "usdc")) return;
+        try { transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract: usdcToken, ...(txTimeoutMs ? { txTimeoutMs } : {}) }); }
+        catch (ftError) {
+          if (["NOT_A_SINGLE_TRANSFER", "WRONG_RECEIVER", "TX_FAILED"].includes(ftError.code)) return;
+          throw ftError;
+        }
+      } else if (e.code === "TX_FAILED") return;
+      else throw e;
     }
-    const q = pendingQuotes().find((q) => q.amountYocto === transfer.amountYocto.toString()
+    const q = pendingQuotes().find((q) => assetOf(q) === (transfer.asset || "near") && q.amountYocto === transfer.amountYocto.toString()
       && transfer.blockTimeMs >= q.createdAt);
     if (q) {
       const result = await confirmPayment(q.id, txHash, senderId);
@@ -698,6 +740,7 @@ export function createNearGate({
       depositYocto: BigInt(q.paidYocto),
       costUsd: settleUsd,
       rate: { usdNano: BigInt(q.rate.usdNano), yocto: BigInt(q.rate.yocto) },
+      ...(assetOf(q) === "usdc" ? { minRefundYocto: 1n } : {}),
     });
     const costUsd = s.known ? knownUsd(settleUsd) : null;
     // The settlement is on disk before the refund intent: a restart in between
@@ -711,7 +754,7 @@ export function createNearGate({
       },
     });
     results.set(q.id, body);
-    const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change" });
+    const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change", ...refundAsset(q) });
     // Media-only results (links) may be kept; text output is the caller's paid content and stays in memory.
     const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
     q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: persisted, finishedAt: now() });
@@ -728,10 +771,12 @@ export function createNearGate({
   async function resume() {
     const t = now();
     for (const q of ledger.quotes()) {
+      if (q.asset != null && !["near", "usdc"].includes(q.asset)) throw new NearError("STATE_UNREADABLE", "A stored quote has an unknown asset");
+      if (q.asset === "usdc" && q.tokenContract !== usdcToken) throw new NearError("STATE_MISMATCH", "A stored USDC quote belongs to a different token contract");
       if (q.status === "running") {
         if (q.settlement) {
           // The run finished and was settled; only the refund intent may be missing.
-          const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change" });
+          const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change", ...refundAsset(q) });
           ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: null, finishedAt: t });
           log(`NEAR payment ${q.id}: settled after a restart (the result text was not kept)`);
         } else {
@@ -759,6 +804,7 @@ export function createNearGate({
   /** run_noodle / price_noodle argument descriptions as this paid server applies them. */
   function nearGraphProps(props) {
     const out = { ...props };
+    if (usdcEnabled) out._pay_with = { type: "string", enum: ["near", "usdc"], description: "Payment asset on NEAR. Default near; choose usdc for a USDC quote. The quoted asset also determines the refund asset." };
     if (out.url) out.url = { ...out.url, description: "A full nanoodle share link with its #g=, #j= or #a= fragment (short links are refused here). Pass url OR graph." };
     if (out.inputs) {
       out.inputs = {
@@ -780,7 +826,7 @@ export function createNearGate({
     const savedSet = new Set(paidSaved);
     const paidNames = new Set([RUN_NOODLE, ...paidSaved]);
     const offeredNames = new Set([...paidNames, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]);
-    const paidLine = `paid in NEAR on ${network}: a deposit is held up front, you are charged the actual model cost + 20% service fee, ` +
+    const paidLine = `paid in ${usdcEnabled ? "NEAR or USDC" : "NEAR"} on ${network}: a deposit is held up front, you are charged the actual model cost + 20% service fee, ` +
       "and the rest is refunded automatically — call price_noodle first for the itemized estimate";
 
     const listTools = () => registry.listTools()
@@ -802,13 +848,14 @@ export function createNearGate({
             ...t.inputSchema,
             properties: {
               ...props,
+              ...(usdcEnabled ? { _pay_with: { type: "string", enum: ["near", "usdc"], description: "Choose the payment asset. Default near; usdc pays and refunds Circle-issued USDC on NEAR." } } : {}),
               _payment_id: {
                 type: "string",
                 description: "The paymentId from this tool's quote. After the pay page confirms payment, repeat the original arguments plus this id. Agents paying directly also supply _payment_tx and _payment_sender.",
               },
               _payment_tx: {
                 type: "string",
-                description: "Hash (base58) of your NEAR transfer that sent exactly the quoted amount to the quoted account in one Transfer action.",
+                description: "Hash (base58) of the exact quoted payment: one native Transfer for NEAR, or one ft_transfer on the quoted token contract for USDC.",
               },
               _payment_sender: {
                 type: "string",
@@ -830,15 +877,18 @@ export function createNearGate({
         if (!paidNames.has(name)) {
           throw new ParamsError(`unknown tool "${name}" — available: ${[...offeredNames].join(", ")}`);
         }
-        const { _payment_id, _payment_tx, _payment_sender, ...args } = rawArgs;
+        const { _payment_id, _payment_tx, _payment_sender, _pay_with, ...args } = rawArgs;
+        if (_pay_with != null && !["near", "usdc"].includes(_pay_with)) throw new GraphArgsError("_pay_with must be near or usdc");
         const tool = savedSet.has(name) ? registry.tools.find((x) => x.name === name) : null;
         if (_payment_id == null) {
           if (_payment_tx != null || _payment_sender != null) {
             throw new GraphArgsError("_payment_tx and _payment_sender go with _payment_id: call without all three to get a quote first");
           }
-          return await quote(registry, name, args, tool);
+          return await quote(registry, name, args, tool, _pay_with || "near");
         }
         const paymentId = String(_payment_id);
+        const existing = ledger.getQuote(paymentId);
+        if (_pay_with != null && existing && _pay_with !== assetOf(existing)) throw new GraphArgsError("The payment asset cannot change after quoting. Resume with the quoted asset or omit _pay_with.");
         return await withLock(paymentId, () => pay(registry, {
           name, args, argsHash: hashArgs(name, args), paymentId, tx: _payment_tx, sender: _payment_sender, ctx, tool,
         }));
@@ -849,7 +899,8 @@ export function createNearGate({
     }
 
     // Which names this gate sells and which only it offers (the dual-rail router reads these).
-    return { listTools, callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]) };
+    return { listTools, callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]),
+      assets: new Set(["near", ...(usdcEnabled ? ["usdc"] : [])]) };
   }
 
   return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment, pendingQuotes, observeTransfer };

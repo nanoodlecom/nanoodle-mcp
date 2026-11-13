@@ -18,6 +18,7 @@ import { runDualSimulation, nanoNode } from "../scripts/dual-simulate.mjs";
 import { randomBytes } from "node:crypto";
 import { createFakeChain, throwawayNearKey, nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { parseNearToYocto } from "../src/near/amount.mjs";
+import { USDC_CONTRACTS } from "../src/near/ft.mjs";
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "nanoodle-mcp.mjs");
 
@@ -174,14 +175,15 @@ test("a native wallet transfer is discovered automatically and unblocks the MCP 
 });
 
 /** Start the bin with both rails and wait until it serves; resolves { stderr(), kill }. */
-async function startDual({ graphsDir, outDir, port, nearRpc, nanoRpc, nanoUrl, secretKey, nearPort }) {
+async function startDual({ graphsDir, outDir, port, nearRpc, nanoRpc, nanoUrl, secretKey, nearPort, usdc = false, aliases = "" }) {
   const child = spawn(process.execPath, [
     BIN, "--graphs", graphsDir, "--out", outDir, "--serve", `127.0.0.1:${port}`,
     "--charge-usd", "0.05", "--nano-rpc", nanoRpc, "--no-local-work", "--near-usd", "3.64",
     "--near-merchant", "merchant.testnet", "--near-network", "testnet", "--near-rpc", nearRpc,
     ...(nearPort ? ["--near-serve", `127.0.0.1:${nearPort}`, "--near-public-url", `http://127.0.0.1:${nearPort}`] : []),
   ], {
-    env: { PATH: process.env.PATH, HOME: outDir, NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: nanoUrl, NANO_SEED: randomBytes(32).toString("hex"), NEAR_PRIVATE_KEY: secretKey },
+    env: { PATH: process.env.PATH, HOME: outDir, NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: nanoUrl, NANO_SEED: randomBytes(32).toString("hex"), NEAR_PRIVATE_KEY: secretKey,
+      NEAR_USDC: usdc ? "1" : "0", NEAR_PUBLIC_ALIASES: aliases },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";
@@ -330,4 +332,40 @@ test("both rails: a dead first NEAR RPC fails over; a broken NEAR setup leaves N
     await nano.close();
     await node.close();
   }
+});
+
+test("USDC over real HTTP: custom and saved workflows detect token payments, execute and return USDC change", { timeout: 60_000 }, async () => {
+  const { graphsDir, outDir } = await fixtureDirs(), chain = createFakeChain(), key = await throwawayNearKey();
+  chain.addAccount("merchant.testnet", parseNearToYocto("2"), key.publicKey);
+  chain.addAccount("payer.testnet", parseNearToYocto("2"));
+  chain.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 1_000_000n });
+  const nano = nanoGptMock(), node = await nanoNode(); await chain.listen(); await nano.listen();
+  const port = await freePort(), nearPort = await freePort();
+  const srv = await startDual({ graphsDir, outDir, port, nearPort, nearRpc: chain.url, nanoRpc: node.url, nanoUrl: nano.url,
+    secretKey: key.secretKey, usdc: true, aliases: "https://mcp-near.nanoodle.com" });
+  const base = `http://127.0.0.1:${nearPort}`, mcp = mcpClient(base);
+  try {
+    const health = await (await fetch(base + "/near/health")).json(); assert.equal(health.usdc.enabled, true);
+    const primary = mcpClient(`http://127.0.0.1:${port}`);
+    const saved = (await primary.list()).find(t => t.name === "idea-poster");
+    assert.deepEqual(saved.inputSchema.properties._pay_with.enum, ["nano", "near", "usdc"]);
+    const q = await primary.call("run_noodle", { graph: WORKED_GRAPH, inputs: { Idea: "test" }, _pay_with: "usdc" });
+    assert.equal(q.structuredContent.payment.asset, "USDC", "primary router preserves USDC selection");
+    for (const name of ["run_noodle", "idea-poster"]) {
+      const args = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } } : { Idea: "a lighthouse" };
+      const p = (await mcp.call(name, { ...args, _pay_with: "usdc" })).structuredContent.payment;
+      const page = await (await fetch(p.payUrl)).text(); assert.match(page, /Pay in USDC/); assert.ok(page.includes(p.tokenContract));
+      const frames = (await fetch(p.watchUrl)).text();
+      chain.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(p.amountAtomic), { blockTimeMs: Date.now() + 1 });
+      assert.match(await frames, /"status":"paid"/);
+      const result = await mcp.call(name, { ...args, _payment_id: p.paymentId });
+      assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+      assert.equal(result.structuredContent.receipt.refund.asset, "USDC");
+      assert.equal(result.structuredContent.receipt.refund.status, "sent");
+    }
+    const message = { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} };
+    for (const [origin, status] of [["https://mcp-near.nanoodle.com", 200], ["https://attacker.example", 403]]) {
+      assert.equal((await fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify(message) })).status, status);
+    }
+  } finally { await srv.kill(); await chain.close(); await nano.close(); await node.close(); }
 });

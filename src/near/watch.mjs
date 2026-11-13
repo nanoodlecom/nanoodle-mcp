@@ -12,6 +12,7 @@ const timeMs = (block) => Number(BigInt(block.header.timestamp_nanosec) / 1_000_
 
 export function createNearWatcher({
   rpc, ledger, merchantId, pendingQuotes, observeTransfer,
+  tokenContracts = [],
   pollMs = 2000, maxBlocksPerTick = 25, log = () => {},
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   cancel = clearTimeout,
@@ -26,14 +27,15 @@ export function createNearWatcher({
 
   async function inspect(block) {
     if (!pendingQuotes().length) return;
+    const accounts = [merchantId, ...tokenContracts.filter((token) => pendingQuotes().some((q) => q.asset === "usdc" && q.tokenContract === token))];
     const changes = await rpc.call("EXPERIMENTAL_changes", {
-      changes_type: "account_changes", account_ids: [merchantId], block_id: block.header.hash,
+      changes_type: "account_changes", account_ids: accounts, block_id: block.header.hash,
     });
     if (changes.block_hash !== block.header.hash || !Array.isArray(changes.changes)) {
       throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received changes for a different block");
     }
     const receipts = new Set(changes.changes
-      .filter((c) => c.change?.account_id === merchantId && c.cause?.type === "receipt_processing")
+      .filter((c) => accounts.includes(c.change?.account_id) && c.cause?.type === "receipt_processing")
       .map((c) => c.cause.receipt_hash).filter((id) => typeof id === "string"));
     const transactions = new Set();
     for (const receiptId of receipts) {

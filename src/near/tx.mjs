@@ -79,6 +79,25 @@ export function signTransfer({ signer, signerId, receiverId, nonce, blockHash, a
     blockHash: base58Decode(blockHash, 32),
     amountYocto,
   });
+  return signBytes(signer, txBytes, nonce, blockHash);
+}
+
+/** One NEAR FunctionCall, used for NEP-141 transfers and storage registration. */
+export function signFunctionCall({ signer, signerId, receiverId, nonce, blockHash, methodName, args, gas = 30_000_000_000_000n, depositYocto = 1n }) {
+  assertNearAccountId(signerId);
+  assertNearAccountId(receiverId);
+  if (typeof methodName !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(methodName)) throw new TypeError("invalid FunctionCall method");
+  const argBytes = Buffer.from(JSON.stringify(args));
+  if (argBytes.length > 16_384) throw new RangeError("FunctionCall arguments too large");
+  const txBytes = Buffer.concat([
+    str(signerId), Buffer.from([0]), bytes32(signer.publicKeyBytes, "publicKeyBytes"), u64(nonce), str(receiverId),
+    bytes32(base58Decode(blockHash, 32), "blockHash"), u32(1), Buffer.from([2]), str(methodName),
+    u32(argBytes.length), argBytes, u64(gas), u128(depositYocto),
+  ]);
+  return signBytes(signer, txBytes, nonce, blockHash);
+}
+
+function signBytes(signer, txBytes, nonce, blockHash) {
   const digest = createHash("sha256").update(txBytes).digest();
   const signature = signer.sign(digest);
   if (!(signature instanceof Uint8Array) || signature.length !== 64) throw new NearError("BAD_KEY", "signer returned a malformed signature");

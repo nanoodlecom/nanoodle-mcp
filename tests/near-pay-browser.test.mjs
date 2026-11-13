@@ -6,8 +6,8 @@ import vm from "node:vm";
 const source = (await readFile(new URL("../src/near-pay-browser.mjs", import.meta.url), "utf8"))
   .replace('import { NearConnector } from "@hot-labs/near-connect";', "");
 
-function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null } = {}) {
-  const payment = { paymentId: "nq_test", status: "pending", network: "testnet", payTo: "merchant.testnet", amountYocto: "12345678901234567890123" };
+function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null, asset = {} } = {}) {
+  const payment = { paymentId: "nq_test", status: "pending", network: "testnet", payTo: "merchant.testnet", amountYocto: "12345678901234567890123", ...asset };
   const state = { ...payment };
   const events = new Map();
   const elements = new Map();
@@ -63,4 +63,13 @@ test("uncertain wallet outcome is retained so a refresh cannot request a second 
   const reloaded = page({ stored: retained });
   await reloaded.click();
   assert.equal(reloaded.sent.length, 0);
+});
+
+test("USDC wallet payment signs one ft_transfer to the quoted token contract, with one yoctoNEAR attached", async () => {
+  const p = page({ asset: { asset: "USDC", tokenContract: "circle-usdc.testnet", amountAtomic: "10347" } });
+  await p.click();
+  assert.deepEqual(JSON.parse(JSON.stringify(p.sent)), [{ network: "testnet", signerId: "payer.testnet", receiverId: "circle-usdc.testnet",
+    actions: [{ type: "FunctionCall", params: { methodName: "ft_transfer", args: { receiver_id: "merchant.testnet", amount: "10347" }, gas: "30000000000000", deposit: "1" } }] }]);
+  assert.deepEqual(p.confirmed, [{ senderId: "payer.testnet", txHash: "transfer-hash" }]);
+  await p.click(); assert.equal(p.sent.length, 1);
 });

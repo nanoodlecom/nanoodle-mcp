@@ -16,7 +16,7 @@
  */
 import { ParamsError } from "./tools.mjs";
 
-const PAY_WITH = new Set(["nano", "near"]);
+const PAY_WITH = new Set(["nano", "near", "usdc"]);
 const NEAR_FIELDS = ["_payment_tx", "_payment_sender"];
 
 const refuse = (text) => ({ content: [{ type: "text", text }], isError: true });
@@ -40,10 +40,11 @@ export function createRailRouter({ nano, near }) {
     }
     const args = raw == null ? {} : raw;
     const { _pay_with: payWith, ...rest } = args;
+    if (payWith === "usdc" && !near.assets?.has("usdc")) return { refusal: "USDC payments are not enabled on this server. Request a NEAR quote instead." };
     if (payWith !== undefined && !PAY_WITH.has(payWith)) {
-      return { refusal: `_pay_with must be "nano" or "near", got ${JSON.stringify(payWith).slice(0, 40)}. Nothing was charged.` };
+      return { refusal: `_pay_with must be ${near.assets?.has("usdc") ? '"nano", "near" or "usdc"' : '"nano" or "near"'}, got ${JSON.stringify(payWith).slice(0, 40)}. Nothing was charged.` };
     }
-    const stripped = raw == null && payWith === undefined ? params : { ...params, arguments: rest };
+    const stripped = raw == null && payWith === undefined ? params : { ...params, arguments: payWith === "usdc" ? { ...rest, _pay_with: "usdc" } : rest };
     const pid = rest._payment_id;
     const hasNearFields = NEAR_FIELDS.some((k) => rest[k] != null);
 
@@ -60,15 +61,15 @@ export function createRailRouter({ nano, near }) {
         return { gate: "near", params: stripped };
       }
       if (id.startsWith("pay_")) {
-        if (payWith === "near" || hasNearFields) {
+        if (payWith === "near" || payWith === "usdc" || hasNearFields) {
           return { refusal: `payment id ${id} is a Nano (XNO) quote; it takes no "_pay_with": "near", _payment_tx or _payment_sender. Call again with the same arguments plus only "_payment_id". Nothing was consumed.` };
         }
         return { gate: "nano", params: stripped };
       }
       // An id neither gate issued: let the chosen gate answer "unknown payment id".
-      return { gate: payWith === "near" || hasNearFields ? "near" : "nano", params: stripped };
+      return { gate: payWith === "near" || payWith === "usdc" || hasNearFields ? "near" : "nano", params: stripped };
     }
-    if (payWith === "near") {
+    if (payWith === "near" || payWith === "usdc") {
       if (!near.sells(name)) {
         return { refusal: `${name} cannot be paid in NEAR on this server. Pay in Nano (XNO) instead: call it again without "_pay_with". Nothing was charged.` };
       }
@@ -82,8 +83,8 @@ export function createRailRouter({ nano, near }) {
 
   const PAY_WITH_SCHEMA = {
     type: "string",
-    enum: ["nano", "near"],
-    description: 'Payment rail for the quote: "nano" (default, XNO over x402) or "near" (native NEAR). Only needed to ask for a NEAR quote.',
+    enum: ["nano", "near", ...(near.assets?.has("usdc") ? ["usdc"] : [])],
+    description: 'Payment rail for the quote: "nano" (default, XNO over x402), "near" (native NEAR)' + (near.assets?.has("usdc") ? ' or "usdc" (Circle-issued USDC on NEAR).' : '.'),
   };
   const NEAR_SENTENCE = ' It can also be paid in NEAR: add "_pay_with": "near" for a NEAR quote, send the exact amount in one transfer, ' +
     "then call again with the same arguments plus _payment_id, _payment_tx and _payment_sender.";

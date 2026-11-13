@@ -10,6 +10,7 @@
 import { assertNearAccountId } from "./account.mjs";
 import { base58Decode } from "./base58.mjs";
 import { NearError } from "./errors.mjs";
+import { hasFtTransfer } from "./ft.mjs";
 
 const TRANSPORT = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"]);
 const NOT_FOUND = new Set(["UNKNOWN_TRANSACTION", "TIMEOUT_ERROR"]);
@@ -23,7 +24,7 @@ function hasKey(obj, key) {
  * never seen is held by the RPC node (about 30 s on public testnet RPC) before it
  * answers TIMEOUT_ERROR, so the default leaves room for that answer.
  */
-export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, txTimeoutMs = 40_000 }) {
+export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract = null, txTimeoutMs = 40_000 }) {
   base58Decode(txHash, 32);
   assertNearAccountId(senderId);
   assertNearAccountId(merchantId);
@@ -48,17 +49,34 @@ export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, t
   const tx = r.transaction;
   if (!tx || tx.hash !== txHash) throw new NearError("TX_MISMATCH", "the RPC returned a different transaction than the one asked for");
   const actions = tx.actions;
-  const deposit = Array.isArray(actions) && actions.length === 1 && actions[0] && typeof actions[0] === "object"
+  let deposit = Array.isArray(actions) && actions.length === 1 && actions[0] && typeof actions[0] === "object"
     && Object.keys(actions[0]).length === 1 && hasKey(actions[0], "Transfer")
     ? actions[0].Transfer?.deposit
     : undefined;
-  if (typeof deposit !== "string" || !/^\d+$/.test(deposit)) {
+  const payer = assertNearAccountId(tx.signer_id);
+  if (tokenContract) {
+    const call = Array.isArray(actions) && actions.length === 1 && Object.keys(actions[0] || {}).join(",") === "FunctionCall" ? actions[0].FunctionCall : null;
+    if (tx.receiver_id !== tokenContract) throw new NearError("WRONG_RECEIVER", "The payment was not sent to the quoted USDC contract");
+    let args;
+    try {
+      if (typeof call?.args !== "string" || call.args.length > 8192 || Buffer.from(call.args, "base64").toString("base64") !== call.args) throw new Error();
+      args = JSON.parse(Buffer.from(call.args, "base64").toString("utf8"));
+    } catch { throw new NearError("NOT_A_SINGLE_TRANSFER", "The payment must be one USDC ft_transfer call"); }
+    if (call.method_name !== "ft_transfer" || call.deposit !== "1" || typeof args?.amount !== "string"
+      || !/^[1-9]\d{0,38}$/.test(args.amount) || BigInt(args.amount) >= 1n << 128n) {
+      throw new NearError("NOT_A_SINGLE_TRANSFER", "The payment must be one USDC ft_transfer with exactly 1 yoctoNEAR attached");
+    }
+    if (args.receiver_id !== merchantId) throw new NearError("WRONG_RECEIVER", "The USDC transfer pays a different account");
+    if (!hasFtTransfer(r, { tokenContract, from: payer, to: merchantId, amount: args.amount })) {
+      throw new NearError("TX_FAILED", "The USDC contract did not emit the exact quoted transfer");
+    }
+    deposit = args.amount;
+  } else if (typeof deposit !== "string" || !/^\d+$/.test(deposit)) {
     throw new NearError("NOT_A_SINGLE_TRANSFER", `transaction ${txHash} is not exactly one native NEAR transfer`);
   }
-  if (tx.receiver_id !== merchantId) {
+  if (!tokenContract && tx.receiver_id !== merchantId) {
     throw new NearError("WRONG_RECEIVER", `transaction ${txHash} pays ${String(tx.receiver_id)}, not ${merchantId}`);
   }
-  const payer = assertNearAccountId(tx.signer_id);
 
   const blockHash = r.transaction_outcome?.block_hash;
   if (typeof blockHash !== "string") throw new NearError("RPC_UNAVAILABLE", "the RPC returned no block for the transaction");
@@ -74,8 +92,9 @@ export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, t
   return {
     txHash,
     payer,
-    receiver: tx.receiver_id,
+    receiver: tokenContract ? merchantId : tx.receiver_id,
     amountYocto: BigInt(deposit),
+    ...(tokenContract ? { asset: "usdc", tokenContract } : {}),
     blockHash,
     blockTimeMs: Number(BigInt(ns) / 1_000_000n),
   };
