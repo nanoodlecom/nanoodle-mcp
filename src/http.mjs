@@ -78,6 +78,7 @@ const ASSETS = {
   "/icon-512.png": "image/png",
   "/og.jpg": "image/jpeg",
   "/examples/neon-shrine-duel.webp": "image/webp",
+  "/examples/nanoodle-editor.webp": "image/webp",
   "/examples/neon-shrine-duel.mp4": "video/mp4",
   "/examples/idea-to-3d-model.png": "image/png",
   "/examples/idea-to-3d-model.mp4": "video/mp4",
