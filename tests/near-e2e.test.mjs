@@ -64,6 +64,27 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receive
   try {
     const args = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "PRIVATE BRIEF" } } : { Idea: "PRIVATE BRIEF" };
     const quote = await mcpClient(base).call(name, args), p = quote.structuredContent.payment;
+    const unpaidResult = await fetch(`${base}/near/result/${p.paymentId}`);
+    assert.equal(unpaidResult.status, 202, "reading a result never starts unpaid work");
+    assert.equal(nano.runs(), 0);
+    const watching = await fetch(`${base}/near/watch/${p.paymentId}?run=1`);
+    const runFrames = [], reader = watching.body.getReader(), decoder = new TextDecoder();
+    let stream = "", sawRunning;
+    const runningOnPaymentPage = new Promise(resolve => { sawRunning = resolve; });
+    const follow = (async () => {
+      for (;;) {
+        const chunk = await reader.read(); if (chunk.done) break;
+        stream += decoder.decode(chunk.value, { stream: true });
+        let end;
+        while ((end = stream.indexOf("\n\n")) >= 0) {
+          const frame = stream.slice(0, end); stream = stream.slice(end + 2);
+          const data = frame.split("\n").find(line => line.startsWith("data: "));
+          if (!data) continue;
+          const state = JSON.parse(data.slice(6)); runFrames.push(state);
+          if (state.status === "running" && state.workflow?.nodes.some(n => n.status === "running")) sawRunning();
+        }
+      }
+    })();
     chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto), { blockTimeMs: Date.now() + 1 });
     const status = await (await fetch(p.statusUrl + "?wait=1")).json();
     assert.equal(status.status, "paid");
@@ -73,6 +94,8 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receive
       onWorkflow: state => { snapshots.push(state); if (state.nodes.find(n => n.id === "n2")?.status === "running") gotRunning(); },
     }).then(r => { completed = true; return r; });
     await running;
+    await runningOnPaymentPage;
+    assert.equal(runFrames.find(frame => frame.status === "paid").done, false, "payment-page subscription remains open after payment");
     assert.equal(completed, false, "a real running node reaches the browser while its provider is still blocked");
     const attached = await (await fetch(p.statusUrl)).json();
     assert.equal(attached.status, "running");
@@ -81,6 +104,11 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receive
     assert.doesNotMatch(JSON.stringify(attached.workflow), /PRIVATE BRIEF|fields|prompt|runId/);
     releaseChat();
     const done = await result;
+    await follow;
+    assert.equal(runFrames.at(-1).status, "settled"); assert.equal(runFrames.at(-1).done, true);
+    const paidResult = await fetch(`${base}/near/result/${p.paymentId}`);
+    assert.equal(paidResult.status, 200); assert.equal(paidResult.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await paidResult.json(), done, "private payment page receives the same paid result as the MCP caller");
     assert.equal(done.structuredContent.receipt.outcome, "succeeded");
     assert.equal(snapshots.at(-1).status, "succeeded");
     assert.ok(snapshots.at(-1).nodes.every(n => n.status === "done"));

@@ -1,6 +1,8 @@
 // Built into assets/near-wallet.js by npm run build:near-wallet. Wallet keys
 // stay in the selected wallet; this page requests one NEAR or USDC transfer.
 import { NearConnector } from "@hot-labs/near-connect";
+import { createRunView } from "./run-view.mjs";
+import { monitorPaymentRun } from "./payment-run.mjs";
 
 const root = document.querySelector("#near-payment");
 const quote = JSON.parse(root.dataset.payment);
@@ -10,6 +12,8 @@ const error = document.querySelector("#near-error");
 const form = document.querySelector("#near-confirm");
 const key = `nanoodle-near:${quote.paymentId}`;
 let current = quote;
+let paidResult = null;
+const runView = createRunView("pay");
 let busy = false;
 let saved = null;
 try { saved = JSON.parse(localStorage.getItem(key)); } catch { /* storage may be disabled */ }
@@ -35,6 +39,16 @@ function render(state) {
     unknown: "Unknown payment. Ask your agent for a fresh quote.",
   };
   status.textContent = messages[state.status] || state.status;
+  const final = ["settled", "failed", "rejected"].includes(state.status);
+  document.querySelector("#near-title").textContent = state.status === "pending" ? `Pay in ${asset}` : final ? state.receipt?.outcome === "succeeded" ? "Your result" : "Run finished" : "Your workflow";
+  document.querySelector("#near-deposit").open = state.status === "pending";
+  document.querySelector("#near-manual").hidden = state.status !== "pending";
+  document.querySelector("#near-note").textContent = state.status === "pending"
+    ? "Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment."
+    : state.status === "paid" ? "Waiting for your agent to start this paid workflow. No further payment is needed."
+    : state.status === "running" ? "Follow each step here. Your result appears on this page when it is ready."
+    : "This page shows the result and receipt for your original payment. Refreshing never starts another run.";
+  runView.render({ payment: quote, workflow: state.workflow, receipt: state.receipt, result: paidResult });
   if (state.receipt?.refund?.status === "pending") status.textContent += " The refund is pending; it will retry automatically.";
   if (state.receipt?.refund?.status === "failed_permanent") status.textContent += ` Contact the operator with payment id ${quote.paymentId} about the refund.`;
   button.disabled = busy || state.status !== "pending" || !!saved;
@@ -119,18 +133,5 @@ if (saved?.txHash) {
   form.elements.txHash.value = saved.txHash;
   if (current.status === "pending") confirm(saved.txHash, saved.senderId).catch((e) => { error.textContent = e.message; });
 }
-const watch = new EventSource(`/near/watch/${encodeURIComponent(quote.paymentId)}`);
-watch.addEventListener("status", (event) => {
-  const state = JSON.parse(event.data);
-  render(state);
-  if (state.done) watch.close();
-});
-watch.onerror = async () => {
-  watch.close();
-  while (current.status === "pending") {
-    try {
-      const response = await fetch(`/near/status/${encodeURIComponent(quote.paymentId)}?wait=1`, { cache: "no-store" });
-      render(await response.json());
-    } catch { await new Promise((resolve) => setTimeout(resolve, 3000)); }
-  }
-};
+monitorPaymentRun({ initial: quote, update(state, result) { paidResult = result; render(state); } });
+setInterval(() => { if (current.workflow && !current.workflow.finishedAt) runView.elapsed(current.workflow); }, 1000);

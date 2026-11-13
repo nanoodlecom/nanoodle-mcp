@@ -1,5 +1,6 @@
 import { WORKFLOW_META_KEY } from "./workflow-progress.mjs";
-import { renderWorkflow, displayAmount } from "./workflow-view.mjs";
+import { createRunView, resultText } from "./run-view.mjs";
+export { resultText } from "./run-view.mjs";
 let rpcId = 0;
 export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch } = {}) {
   const id = ++rpcId;
@@ -37,18 +38,6 @@ export function savedInputs(schema) {
     result[key] = field.default ?? field.enum?.[0] ?? (field.type === "number" || field.type === "integer" ? field.minimum ?? 1 : "a lighthouse at dawn");
   }
   return result;
-}
-
-export function resultText(result) {
-  const content = [...(result.content || [])];
-  // The gate appends its receipt after the paid output. Render that current
-  // structured receipt separately, so an earlier "pending" line cannot linger
-  // after a refund has been confirmed by the monitor.
-  if (result.structuredContent?.receipt?.outcome === "succeeded" && /^Paid [\d.]+ (?:USDC|NEAR)\b/.test(content.at(-1)?.text || "")) {
-    content.pop();
-    if (content.at(-1)?.type === "text" && /^charged: \$/.test(content.at(-1).text)) content.pop();
-  }
-  return content.filter(c => c.type === "text").map(c => c.text).join("\n\n");
 }
 
 export function startStudio({ config, rpc = callMcp, status, update, storage, pause = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
@@ -125,7 +114,8 @@ function mount(root) {
     { id: "topic", type: "text", name: "Topic", fields: { text: "" } },
     { id: "writer", type: "llm", fields: { model: "meta-llama/llama-3.3-70b-instruct", system: "Reply with one vivid sentence about the topic.", maxTokens: 48 } },
   ], links: [{ id: "topic-writer", from: { node: "topic", port: "text" }, to: { node: "writer", port: "prompt" } }] };
-  let mode = "saved", selected = null, quoting = false, renderedResult = null, renderedWorkflow = null, workflowDisplayKey = null;
+  let mode = "saved", selected = null, quoting = false;
+  const runView = createRunView("studio");
   const safeUrl = value => {
     const url = new URL(value, location.origin), canonical = new URL(config.publicBase).origin;
     if (![location.origin, canonical].includes(url.origin) || !["http:", "https:"].includes(url.protocol)) throw new Error("Unexpected payment URL.");
@@ -158,65 +148,7 @@ function mount(root) {
       ? `${receipt.outcome === "succeeded" ? "Your result is ready." : "This run did not complete."} ${refundMessage}`
       : session.message || (session.phase === "waiting" ? "Pay the exact deposit in your wallet to start." : session.phase === "running" ? "Payment confirmed. Preparing your workflow…" : `Quote ${session.view?.status || "finished"}.`);
     node("studio-payment-note").hidden = session.phase !== "waiting";
-    node("studio-totals").hidden = !receipt;
-    if (receipt) {
-      for (const [id, amount] of [["paid", receipt.deposit], ["charged", receipt.charged], ["returned", receipt.refund]]) {
-        const exact = amount?.amount ?? amount?.near ?? "0";
-        node(`studio-total-${id}`).textContent = `${displayAmount(exact)} ${p.asset || "NEAR"}`;
-        node(`studio-total-${id}`).title = `${exact} ${p.asset || "NEAR"} (exact)`;
-      }
-      node("studio-refund-state").textContent = receipt.refund.status === "sent" ? "Back in your wallet" : receipt.refund.status === "pending" ? "Returning to your wallet…" : receipt.refund.status === "skipped" ? "No change due" : `Refund ${receipt.refund.status}`;
-    }
-    node("studio-workflow").hidden = !session.workflow;
-    if (session.workflow) {
-      if (renderedWorkflow !== session.workflow) { renderWorkflow(node("studio-workflow-graph"), session.workflow); renderedWorkflow = session.workflow; }
-      const wf = session.workflow, finished = wf.nodes.filter(n => ["done", "skipped", "gated", "error"].includes(n.status)).length;
-      const displayKey = `${p.paymentId}:${!!wf.finishedAt}`;
-      if (workflowDisplayKey !== displayKey) { node("studio-workflow").open = !wf.finishedAt; workflowDisplayKey = displayKey; }
-      node("studio-workflow-count").textContent = `${finished} / ${wf.nodes.length} steps finished`;
-      const elapsed = Math.max(0, Math.floor(((wf.finishedAt || Date.now()) - wf.startedAt) / 1000));
-      node("studio-elapsed").textContent = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
-    }
-    node("studio-result").hidden = !session.result;
-    if (session.result) {
-      const text = resultText(session.result);
-      const newOutput = renderedResult !== session.result;
-      if (newOutput) {
-        // Media already has a player/preview and download action. Keep its raw
-        // URL in details rather than repeating it in the main result.
-        const readable = text.split("\n").filter(line => !/^[^\n]*https?:\/\/[^\s]+\/out\/[^\s]+$/.test(line.trim())).join("\n").trim();
-        node("studio-output").textContent = readable; node("studio-output").hidden = !readable;
-        node("studio-raw-output").textContent = text;
-        node("studio-media").replaceChildren(); renderedResult = session.result;
-      }
-      node("studio-receipt").textContent = JSON.stringify(receipt, null, 2);
-      node("studio-output-links").replaceChildren();
-      for (const value of [...new Set(text.match(/https?:\/\/[^\s<>"')]+/g) || [])]) {
-        const url = new URL(value), a = document.createElement("a");
-        // Both hostnames serve the same output directory. Preview only local
-        // generated files; never fetch an arbitrary model-supplied media host.
-        const media = /^\/out\/[^/]+\.(png|jpe?g|webp|gif|mp4|webm|mp3|wav|ogg)$/i.exec(url.pathname);
-        const model = /^\/out\/[^/]+\.(glb|gltf|obj|stl|ply|fbx|zip)$/i.test(url.pathname);
-        const resultUrl = media || model ? new URL(url.pathname, location.origin).href : url.href;
-        if (media && newOutput) {
-          const kind = /^(png|jpe?g|webp|gif)$/i.test(media[1]) ? "img" : /^(mp4|webm)$/i.test(media[1]) ? "video" : "audio";
-          const preview = document.createElement(kind); preview.src = resultUrl;
-          if (kind === "img") { preview.alt = "Generated workflow result"; preview.loading = "lazy"; }
-          else { preview.controls = true; preview.preload = "metadata"; }
-          node("studio-media").append(preview);
-        }
-        a.href = resultUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = model ? "Download 3D model ↗" : media ? "Download result ↗" : "Open result ↗";
-        if (model) a.download = url.pathname.split("/").at(-1);
-        node("studio-output-links").append(a);
-      }
-      node("studio-transactions").replaceChildren();
-      for (const [label, leg] of [["Payment", receipt?.deposit], ["Refund", receipt?.refund]]) {
-        if (!leg?.explorerUrl) continue;
-        const url = new URL(leg.explorerUrl);
-        if (!["https:", "http:"].includes(url.protocol)) continue;
-        const a = document.createElement("a"); a.href = url.href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = `${label} transaction ↗`; node("studio-transactions").append(a);
-      }
-    }
+    runView.render({ ...session, receipt });
   }
   let tabStorage = null; try { tabStorage = sessionStorage; } catch {}
   const studio = startStudio({ config, storage: tabStorage, update: render, status: async payment => {
