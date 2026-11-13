@@ -732,7 +732,9 @@ async function startNearMode({
   } catch (e) { fail(`NEAR refund key: ${e.message}`); }
   let rpc;
   try {
-    rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, log: (line) => console.error("nanoodle-mcp: " + line) });
+    const localRpc = rpcUrls.every(url => ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname));
+    rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, minIntervalMs: localRpc ? 0 : 100,
+      log: (line) => console.error("nanoodle-mcp: " + line) });
   } catch (e) { fail(`--near-rpc: ${e.message}`); }
   // A public RPC can be briefly unreachable or rate limiting at boot; give it a few tries.
   const transient = (e) => ["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"].includes(e?.code);

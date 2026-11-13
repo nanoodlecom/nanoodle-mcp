@@ -78,7 +78,9 @@ test("NEAR mode serves llms.txt and the landing page with the NEAR payment note"
     assert.match(llms, /## Payment\n\nEvery call is paid in native NEAR on testnet/);
     assert.doesNotMatch(llms, /Payment \(x402, Nano\/XNO\)/, "no Nano payment story on a NEAR server");
     const landing = await (await fetch(base + "/")).text();
-    assert.match(landing, /paid in native NEAR on testnet/);
+    assert.match(landing, /Nanoodle is NEAR/);
+    assert.match(landing, /id="near-studio"/);
+    assert.doesNotMatch(landing, /option value="usdc"/, "USDC is offered only when enabled");
     const tools = await mcpClient(base).list();
     assert.ok(tools.some((t) => t.name === "price_noodle"));
     assert.doesNotMatch(srv.stderr, new RegExp(key.secretKey.slice(8, 30)), "the key is never logged");
@@ -225,7 +227,7 @@ test("NEAR hostname shares one process: wallet page, confirmation, monitor, auto
     assert.equal(page.headers.get("referrer-policy"), "no-referrer");
     assert.match(await page.text(), /Connect wallet &amp; pay/);
     assert.equal((await fetch(base + "/near-wallet.js")).status, 200);
-    assert.match(await (await fetch(base + "/")).text(), /AI workflows, paid in NEAR/);
+    assert.match(await (await fetch(base + "/")).text(), /Nanoodle is NEAR/);
     assert.match(await (await fetch(base + "/llms.txt")).text(), /No transaction hash needs to be copied/);
     const txHash = chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto));
     const submit = (body, headers = {}) => fetch(`${base}/near/pay/${p.paymentId}`, {
@@ -346,6 +348,10 @@ test("USDC over real HTTP: custom and saved workflows detect token payments, exe
   const base = `http://127.0.0.1:${nearPort}`, mcp = mcpClient(base);
   try {
     const health = await (await fetch(base + "/near/health")).json(); assert.equal(health.usdc.enabled, true);
+    const landing = await (await fetch(base + "/")).text();
+    assert.match(landing, /option value="usdc">USDC on NEAR/);
+    assert.match(landing, /src="\/near-site.js"/);
+    assert.equal((await fetch(base + "/near-site.js")).status, 200);
     const primary = mcpClient(`http://127.0.0.1:${port}`);
     const saved = (await primary.list()).find(t => t.name === "idea-poster");
     assert.deepEqual(saved.inputSchema.properties._pay_with.enum, ["nano", "near", "usdc"]);

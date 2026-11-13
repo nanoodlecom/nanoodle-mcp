@@ -149,11 +149,21 @@ const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"])
  *
  * Every endpoint is equally trusted for finality; list only ones you trust.
  */
-export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, now = Date.now, log = () => {} } = {}) {
+export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, minIntervalMs = 0, now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), log = () => {} } = {}) {
   const list = parseRpcUrls(urls);
   if (!list.length) throw new TypeError("createNearRpcPool needs at least one url");
+  if (!Number.isFinite(minIntervalMs) || minIntervalMs < 0 || minIntervalMs > 60_000) throw new TypeError("minIntervalMs must be between 0 and 60000");
   const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checked: !chainId, wrongChain: false, downUntil: 0 }));
   const host = (url) => { try { return new URL(url).host; } catch { return "rpc"; } };
+  let nextStart = 0;
+  async function request(ep, method, params, opts) {
+    if (minIntervalMs) {
+      const at = Math.max(now(), nextStart), delay = at - now();
+      nextStart = at + minIntervalMs; // reserve before awaiting: concurrent callers share the budget
+      if (delay > 0) await pause(delay);
+    }
+    return ep.client.call(method, params, opts);
+  }
 
   function markWrong(ep, got) {
     if (!ep.wrongChain) log(`NEAR RPC ${host(ep.url)} is on "${got}", not ${chainId}; it will not be used`);
@@ -170,11 +180,11 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
     for (const ep of order) {
       try {
         if (!ep.checked && method !== "status") {
-          const st = await ep.client.call("status", []);
+          const st = await request(ep, "status", []);
           if (st.chain_id !== chainId) { markWrong(ep, st.chain_id); continue; }
           ep.checked = true;
         }
-        const result = await ep.client.call(method, params, opts);
+        const result = await request(ep, method, params, opts);
         if (method === "status" && chainId) {
           if (result.chain_id !== chainId) { markWrong(ep, result.chain_id); continue; }
           ep.checked = true;

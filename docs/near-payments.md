@@ -1,14 +1,17 @@
 # Paying for custom workflows in NEAR
 
-nanoodle-mcp can sell workflow runs for native NEAR. An agent can compose its own
+nanoodle-mcp sells workflow runs for native NEAR or Circle-issued USDC on NEAR. An agent can compose its own
 workflow graph, ask what it will cost, pay one NEAR transfer, get the result, and
-receive the unused part of its deposit back in NEAR. Nobody needs an account or API key.
+receive the unused part of its deposit back in the same asset. Nobody needs a Nanoodle account or API key.
+
+The native NEAR examples below retain their original amount fields. See
+[USDC on NEAR](#usdc-on-near) for token payments and [the browser studio](#browser-studio) for the website.
 
 This document covers the design and how to operate it. It describes NEAR **testnet** by
 default. Mainnet is a configuration change; read [Limitations](#limitations) before you
 switch.
 
-The hosted mainnet endpoint is **https://mcp-near.nanoodle.com/mcp**, with
+The hosted mainnet endpoint is **https://near.nanoodle.com/mcp**, with
 `nanoodle.near` as the merchant. A real payment, automatic detection, workflow
 run and refund were verified on 2026-11-13; see [Live mainnet verification](#live-mainnet-verification).
 
@@ -21,6 +24,8 @@ run and refund were verified on 2026-11-13; see [Live mainnet verification](#liv
 - [Rates and the swap margin](#rates-and-the-swap-margin)
 - [One server, both rails](#one-server-both-rails)
 - [NEAR endpoint and wallet payments](#near-endpoint-and-wallet-payments)
+- [USDC on NEAR](#usdc-on-near)
+- [Browser studio](#browser-studio)
 - [Which graphs a paid server will run](#which-graphs-a-paid-server-will-run)
 - [Durable state](#durable-state)
 - [On-chain verification](#on-chain-verification)
@@ -93,7 +98,9 @@ NEAR_MERCHANT=your-merchant.near
 NEAR_NETWORK=mainnet
 NEAR_PRIVATE_KEY=ed25519:YOUR_MERCHANT_REFUND_KEY
 NEAR_SERVE=127.0.0.1:18403
-NEAR_PUBLIC_URL=https://mcp-near.nanoodle.com
+NEAR_PUBLIC_URL=https://near.nanoodle.com
+NEAR_PUBLIC_ALIASES=https://mcp-near.nanoodle.com
+NEAR_USDC=1
 ```
 
 Keep the existing `NANO_SEED` / `NANO_PRIVATE_KEY` and primary `--serve` /
@@ -107,12 +114,13 @@ Point the new hostname at the existing host, terminate HTTPS, and proxy to the
 second listener. For Caddy:
 
 ```caddyfile
-mcp-near.nanoodle.com {
+near.nanoodle.com, mcp-near.nanoodle.com {
     reverse_proxy localhost:18403
 }
 ```
 
-Connect an agent to `https://mcp-near.nanoodle.com/mcp`. No `_pay_with` argument
+The old `mcp-near.nanoodle.com` hostname remains an alias. Connect an agent to
+`https://near.nanoodle.com/mcp`. No `_pay_with` argument
 is needed there. The primary endpoint continues to default to Nano; its NEAR
 quotes link to the same NEAR payment page.
 
@@ -180,6 +188,72 @@ verifier passed, including exact balance arithmetic and the refund recipient.
 The temporary payer's remaining balance was returned to the merchant and its
 account was closed. This verifies one real run; failure/restart scenarios remain
 covered by local chain/provider simulations.
+
+## USDC on NEAR
+
+The hosted endpoint accepts **Circle-issued USDC** alongside native NEAR. Operators
+opt in with `NEAR_USDC=1`. Startup verifies the fixed network-specific contract's
+`ft-1.0.0` metadata, USDC symbol, six decimals and the merchant's storage registration.
+A failed check disables new USDC quotes while native NEAR keeps serving.
+
+The canonical mainnet contract is
+`17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`;
+testnet uses `3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af`.
+These are [Circle's published USDC contracts](https://developers.circle.com/stablecoins/usdc-contract-addresses).
+The merchant must register token storage using `storage_deposit` before enabling USDC.
+`nanoodle.near` is registered on mainnet.
+
+Call a saved tool or `run_noodle` with `_pay_with: "usdc"`. The quote carries
+`asset: "USDC"`, `amountAtomic` (a decimal string of micro-USDC), `amount` (the
+six-decimal human amount), `tokenContract`, and `decimals: 6`. It deliberately has
+no `amountYocto` or `amountNear` fields. A small unique amount suffix identifies
+the quote. USDC quotes use a denomination of **1 USD per USDC**, not a live peg
+price; no NEAR/USD conversion is involved. The provider still uses the existing
+Nano funding pool and requires its fresh XNO/USD rate.
+
+Send one transaction to the quoted token contract with one `FunctionCall` action:
+
+```json
+{
+  "methodName": "ft_transfer",
+  "args": { "receiver_id": "nanoodle.near", "amount": "EXACT_QUOTED_amountAtomic" },
+  "gas": "30000000000000",
+  "deposit": "1"
+}
+```
+
+The attached deposit is **one yoctoNEAR**, as required by the
+[NEAR fungible-token standard](https://docs.near.org/primitives/ft/standard).
+The payer also needs NEAR for network gas. The wallet page builds this exact
+transaction. Token transfers are discovered automatically through finalized
+changes to the token account, then verified at FINAL: exact contract, action,
+amount, recipient and one matching NEP-141 transfer event from the contract.
+An arbitrary token with symbol USDC is never accepted.
+
+Repeat the original tool arguments with `_payment_id` after payment. The receipt
+uses `asset`, `amountAtomic` and `amount` for deposits, charges and refunds. The
+charge rounds down to six-decimal token precision; unused micro-USDC returns to
+the transaction signer. Native and USDC refunds share **one durable signing
+queue**, so they cannot race the same access-key nonce. Replays do not execute
+or refund again. A quote is bound to its asset and exact original request;
+wrong amounts or late matched payments refund in the payment asset. Disabling
+new USDC quotes does not discard outstanding token refund obligations.
+
+## Browser studio
+
+**https://near.nanoodle.com** presents Nanoodle on NEAR and offers NEAR or USDC
+only when enabled. Ready-made workflows have editable named inputs; the custom
+tab accepts graph JSON and text inputs. Getting a quote never executes a model.
+The pay link opens the wallet page, while the original tab watches the payment
+and resumes the exact snapshotted request automatically. Results and refund
+status appear in that tab. Multiple quotes retain their own request and result.
+
+The tab keeps quote/request history in `sessionStorage` so a reload resumes the
+same payment instead of requesting another. That browser storage can contain
+the inputs you entered; generated result text is not persisted there. Server
+logs do not retain prompts. Paid execution remains idempotent if a connection
+fails or the tab reloads. Keep the result tab open; generated media expires after
+24 hours and text results do not survive a server restart.
 
 ### Authorize the merchant refund key
 
@@ -534,6 +608,8 @@ either rail per call (see [One server, both rails](#one-server-both-rails)).
 | `--near-quote-ttl-min <n>` | `NEAR_QUOTE_TTL_MIN` | `30` | Quote lifetime in minutes, 1 to 120. The quote's rates stay locked for all of it. |
 | `--near-rates-refresh-s <n>` | `NEAR_RATES_REFRESH_S` | `60` | Background refresh of the live rates every n seconds; `0` turns the timer off (quotes still refresh a rate older than 60 s). |
 | `--near-max-deposit-usd <n>` | | `2` | Refuse any call whose deposit would exceed this. |
+| | `NEAR_USDC` | off | Set `1` to accept verified Circle USDC, with token refunds. |
+| | `NEAR_PUBLIC_ALIASES` | none | Comma-separated exact HTTP(S) origin aliases for the NEAR listener. |
 
 NanoGPT is paid exactly as it is today, with the operator's `NANOGPT_API_KEY` or Nano wallet.
 NEAR mode changes only how callers pay the operator.
@@ -919,8 +995,8 @@ These are deliberate cuts for this version.
   custom `endpoint` in NEAR mode.
 - Fragment-less short links are refused in NEAR mode. Paste the long share link or pass
   `graph`.
-- Native NEAR only. There is no NEP-141 token support (such as USDC), and meta-transactions
-  are refused: a relayed `Delegate` action is not exactly one `Transfer`.
+- Native NEAR and opt-in Circle-issued USDC only. Other tokens and meta-transactions
+  are refused; the verifier accepts only the exact action for the quoted asset.
 - The configured RPC is trusted for finality. There is no light-client proof.
 - One server process per state file. There is no multi-instance coordination.
 - Deposits are bounds built from the public catalog, not guarantees. Text steps are bounded
