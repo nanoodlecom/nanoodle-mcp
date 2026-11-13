@@ -84,13 +84,13 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
   }
   return {
     sessions,
-    async quote(name, args) {
+    async quote(name, args, { title } = {}) {
       if (sessions.filter(s => s.phase !== "finished").length >= 10) throw new Error("This tab already has ten open quotes. Finish a payment or wait for an earlier quote to expire.");
       const snapshot = JSON.parse(JSON.stringify(args));
       const result = await rpc(name, snapshot), payment = result.structuredContent?.payment;
       if (result.isError || !payment || payment.status !== "payment_required") throw new Error((result.content || []).map(c => c.text || "").join("\n") || "This workflow could not be quoted.");
       if (payment.payTo !== config.merchant || !/^nq_[A-Za-z0-9_-]+$/.test(payment.paymentId)) throw new Error("The server returned an unexpected payment destination.");
-      const session = { name, args: snapshot, payment, pricing: result.structuredContent.pricing, phase: "waiting" };
+      const session = { name, args: snapshot, payment, pricing: result.structuredContent.pricing, ...(title ? { title } : {}), phase: "waiting" };
       sessions.push(session); changed(session); void monitor(session); return session;
     },
     restore() {
@@ -137,13 +137,13 @@ function mount(root) {
     for (const item of sessions) {
       const button = document.createElement("button"); button.type = "button";
       button.setAttribute("aria-pressed", String(item === selected));
-      button.textContent = `${item.name.replace(/[-_]/g, " ")} · ${item.payment.asset || "NEAR"} · ${item.phase}`;
+      button.textContent = `${item.title || item.name.replace(/[-_]/g, " ")} · ${item.payment.asset || "NEAR"} · ${item.phase}`;
       button.addEventListener("click", () => { selected = item; render(item, sessions); }); node("studio-history").append(button);
     }
     if (session !== selected) return;
     node("studio-empty").hidden = true; node("studio-payment").hidden = false;
     const p = session.payment, receipt = session.receipt || session.result?.structuredContent?.receipt;
-    const title = session.name === "run_noodle" ? "Your workflow" : config.tools.find(t => t.name === session.name)?.title || session.name.replace(/[-_]/g, " ");
+    const title = session.title || (session.name === "run_noodle" ? "Your workflow" : config.tools.find(t => t.name === session.name)?.title || session.name.replace(/[-_]/g, " "));
     node("studio-quoted-tool").textContent = title;
     const stage = receipt ? receipt.outcome === "succeeded" ? "Complete" : "Run failed" : session.phase === "waiting" ? "Awaiting payment" : session.phase === "running" ? "Running workflow" : "Quote expired";
     node("studio-stage").textContent = stage;
@@ -196,7 +196,8 @@ function mount(root) {
         // Both hostnames serve the same output directory. Preview only local
         // generated files; never fetch an arbitrary model-supplied media host.
         const media = /^\/out\/[^/]+\.(png|jpe?g|webp|gif|mp4|webm|mp3|wav|ogg)$/i.exec(url.pathname);
-        const resultUrl = media ? new URL(url.pathname, location.origin).href : url.href;
+        const model = /^\/out\/[^/]+\.(glb|gltf|obj|stl|ply|fbx|zip)$/i.test(url.pathname);
+        const resultUrl = media || model ? new URL(url.pathname, location.origin).href : url.href;
         if (media && newOutput) {
           const kind = /^(png|jpe?g|webp|gif)$/i.test(media[1]) ? "img" : /^(mp4|webm)$/i.test(media[1]) ? "video" : "audio";
           const preview = document.createElement(kind); preview.src = resultUrl;
@@ -204,7 +205,8 @@ function mount(root) {
           else { preview.controls = true; preview.preload = "metadata"; }
           node("studio-media").append(preview);
         }
-        a.href = resultUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = media ? "Download result ↗" : "Open result ↗";
+        a.href = resultUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = model ? "Download 3D model ↗" : media ? "Download result ↗" : "Open result ↗";
+        if (model) a.download = url.pathname.split("/").at(-1);
         node("studio-output-links").append(a);
       }
       node("studio-transactions").replaceChildren();
@@ -231,7 +233,7 @@ function mount(root) {
     if (mode === "saved") {
       const schema = config.tools.find(t => t.name === node("studio-tool").value)?.schema;
       const fields = node("studio-saved-inputs"); fields.replaceChildren();
-      const defaults = savedInputs(schema);
+      const defaults = { ...savedInputs(schema), ...config.tools.find(t => t.name === node("studio-tool").value)?.defaults };
       const advanced = document.createElement("details"), summary = document.createElement("summary");
       summary.textContent = "Advanced instructions"; advanced.append(summary); advanced.className = "form-help";
       for (const [key, field] of Object.entries(schema?.properties || {})) {
@@ -262,9 +264,10 @@ function mount(root) {
         [...node("studio-saved-inputs").querySelectorAll("[data-input]")].filter(input => input.value.trim()).map(input => [input.dataset.input,
           ["integer", "number"].includes(input.dataset.type) ? Number(input.value) : input.value]));
       if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) throw new Error("Inputs must be a JSON object.");
-      const name = mode === "custom" ? "run_noodle" : node("studio-tool").value;
-      const args = mode === "custom" ? { graph: JSON.parse(node("studio-graph").value), inputs } : inputs;
-      const session = await studio.quote(name, { ...args, _pay_with: node("studio-asset").value }); selected = session; render(session, studio.sessions);
+      const template = mode === "saved" ? config.tools.find(t => t.name === node("studio-tool").value) : null;
+      const name = mode === "custom" || template?.graph ? "run_noodle" : node("studio-tool").value;
+      const args = mode === "custom" ? { graph: JSON.parse(node("studio-graph").value), inputs } : template?.graph ? { graph: template.graph, inputs } : inputs;
+      const session = await studio.quote(name, { ...args, _pay_with: node("studio-asset").value }, { title: template?.title }); selected = session; render(session, studio.sessions);
     } catch (error) { node("studio-error").textContent = error.message; }
     finally { quoting = false; node("studio-quote").disabled = false; }
   });

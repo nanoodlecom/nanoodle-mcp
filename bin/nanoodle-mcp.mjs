@@ -35,6 +35,7 @@
  * leaks via `ps`. NANO_RPC_URL / --nano-rpc picks the Nano node (default rpc.nano.to);
  * --max-usd refuses any single invoice above $n.
  */
+import { nearAgentGuide } from "../src/near/agent-guide.mjs";
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
@@ -875,12 +876,14 @@ async function startNearMode({
     "actual model cost plus a 20% service fee, and the rest of the deposit is refunded automatically. price_noodle " +
     "(free) shows the itemized estimate first; run_noodle also runs workflow graphs you compose yourself. " +
     "The quote also includes a wallet payment link and monitor, so human payers can connect a wallet and the agent resumes automatically." + ratesLine;
-  const nearInstructions = instructions.replace(`Paying in native NEAR on ${network}:`, `Tools on this server are paid per call in native NEAR on ${network};`);
-  const nearPaymentNote = `Every call is paid in native NEAR on ${network}. Your agent shows a payment link: connect your wallet, approve the deposit, ` +
-    "and the result streams back automatically. You pay actual model cost plus a 20% service fee; unused NEAR returns to the paying wallet on chain. " +
+  const nearInstructions = nearAgentGuide({ publicBase, usdc: usdcEnabled, network }) + "\n" + instructions.replace(`Paying in native NEAR on ${network}:`, `Tools on this server are paid per call in native NEAR on ${network};`);
+  const nearPaymentNote = (usdcEnabled ? `Every paid call accepts NEAR or USDC on NEAR ${network}. ` : `Every call is paid in native NEAR on ${network}. `) +
+    "Get a quote, pay directly from an authorized agent wallet or approve the wallet payment link, and continue the same call automatically. " +
+    "You pay actual model cost plus a 20% service fee; unused funds return to the paying wallet in the same asset. " +
     "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." +
     (usdcEnabled ? ` Choose _pay_with: "usdc" for Circle-issued USDC on NEAR, including USDC change and refunds; otherwise the quote is in native NEAR.` : "") + ratesLine;
-  return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions, paymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
+  return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions: dual ? instructions : nearInstructions,
+    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });

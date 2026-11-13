@@ -39,3 +39,15 @@ identity, dark dot canvas and model-port colors while using the brand kit’s
 body type, labels, focus color and original 255labs endorsement. Essential
 controls are at least 44px high. The primary MCP page presents Nano; the NEAR
 page presents NEAR and enabled USDC.
+
+`examples/neon-shrine-duel.mp4` and its WebP poster are the published action
+workflow result from `nanoodlecom/nanoodle` commit
+`1b8ed79548d4d98a9a5ee5ff4f3edf85b905f46e`, under
+`examples/gallery/neon-shrine-duel/` (MIT). The video is remuxed with faststart
+for playback; its video/audio streams are unchanged. It is a recorded real
+workflow result, with no new generation charge. Videos use `preload="none"`.
+`examples/idea-to-3d-model.mp4` comes from the same pinned source commit's
+`examples/gallery/idea-to-3d-model/turntable.mp4`; its PNG poster is frame 0.
+The NEAR page reuses the mounted graph as a ready-made `run_noodle` template,
+omitting unpriced `modelOpts` so live runs use priced provider defaults. The
+original Nano graph remains available through its original tool.
