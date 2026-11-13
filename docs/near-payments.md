@@ -200,6 +200,27 @@ service recovered from its durable cursor after switching to verified dRPC with
 FASTNEAR fallback. Public requests are paced. A long outage prioritizes new
 finalized transfers while older pending quotes backfill within the same scan budget.
 
+The complete mainnet matrix also passed on 2026-11-13. Each payment was detected
+without submitting its hash, each workflow ran against the real provider from
+the same Nano funding pool, and each same-asset refund was checked at FINAL.
+The saved workflow was `mix-the-references` (four image generations followed
+by one editing step); the custom workflow was a small text-to-LLM graph.
+Replaying all four calls returned the original refund hash without another run.
+
+| Workflow / payment | Deposit | Charged | Returned | On-chain proof |
+|---|---:|---:|---:|---|
+| Custom text · USDC | 0.010358 | 0.000015 | 0.010343 | [payment](https://nearblocks.io/txns/GQtma288xJxXafx7pM6E2Tm3CRTQLj8vqTB9iT22FN3b) · [refund](https://nearblocks.io/txns/DcX8qB65MPa9gCti3Qk1ucVbvKURPb9dcnZo9dvCzjhr) |
+| Saved scene · USDC | 0.080595 | 0.0636 | 0.016995 | [payment](https://nearblocks.io/txns/AwGoqbaWiJjfQSmVTgADS5gGs3egncfySGTZU9jpyhUp) · [refund](https://nearblocks.io/txns/9dpYPrhmYesCs2mLk6mCuu5GBUmhBPVJd7x3JGswMnws) |
+| Custom text · NEAR | 0.003185 | 0.00000436332378223495702 | 0.00318063667621776504298 | [payment](https://nearblocks.io/txns/DamLnLz6MwDG7bjC5j8GnesvzvxPpzi7qAvxyw6oSV1n) · [refund](https://nearblocks.io/txns/FShUDcU6eBQjyvujs8XAyeVaxRtYV4jr2KUaFpeowU1j) |
+| Saved scene · NEAR | 0.022986 | 0.018171428571428571428571 | 0.004814571428571428571429 | [payment](https://nearblocks.io/txns/F3VJUC3pLzMKFd8A4jj5z4YPJq3S7STNKw3CyjiL14Yt) · [refund](https://nearblocks.io/txns/B43QRp5nJUgmC2htVJ7Pbc274uZFgkLifiu2N94YMLyL) |
+
+The paid USDC saved result was also resumed in the real browser studio; its
+media link returned HTTP 200 and its refund status reached sent. The temporary
+payer returned its remaining USDC, unregistered token storage and closed its
+NEAR account with the merchant as beneficiary. All unused test funds returned;
+the merchant's USDC balance was unchanged by the round trip. These are live
+functional checks, not a load test.
+
 ## USDC on NEAR
 
 The hosted endpoint accepts **Circle-issued USDC** alongside native NEAR. Operators

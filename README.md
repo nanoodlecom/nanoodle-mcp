@@ -69,8 +69,8 @@ transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md
   [0.003192 NEAR payment](https://nearblocks.io/txns/qF4e5cGJDBqXdoqpmLnQrrtBi7XR2NSeF6orRHcR5LT)
   was detected without submitting its hash, a text workflow succeeded, and
   [0.00318950963855421686747 NEAR was refunded](https://nearblocks.io/txns/54CkAs3dK2Tf1u4LNX2Hn5qTCvKkW5ncPYmABMrjhQxs)
-  at FINAL finality. All 13 payment/receipt/refund checks passed. A real USDC custom
-  workflow also passed automatic discovery, execution, same-token refund and replay;
+  at FINAL finality. All 13 payment/receipt/refund checks passed. Custom and saved workflows paid in NEAR and USDC also passed automatic
+  discovery, execution, same-asset refund and replay;
   [USDC verification](docs/near-payments.md#live-mainnet-verification) includes the
   payment and refund transactions. The primary endpoint
   at `mcp.nanoodle.com` continues to default to Nano.

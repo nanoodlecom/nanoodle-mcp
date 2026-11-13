@@ -36,7 +36,7 @@
  * clients without Origin still work; payment authorizes paid calls.
  */
 import http from "node:http";
-import { nearSitePage } from "./near-site.mjs";
+import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { constants, createReadStream, existsSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
@@ -74,6 +74,14 @@ const ASSETS = {
   "/near-wallet.js": "text/javascript; charset=utf-8",
   "/near-site.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
+  [`${BRAND_BASE}/255labs-tokens.css`]: "text/css; charset=utf-8",
+  [`${BRAND_BASE}/255labs-ui.css`]: "text/css; charset=utf-8",
+  [`${BRAND_BASE}/255labs-lockup-paper.svg`]: "image/svg+xml",
+  [`${BRAND_BASE}/255labs-manifest.json`]: "application/json; charset=utf-8",
+  [`${BRAND_BASE}/fonts/manrope-latin-variable.woff2`]: "font/woff2",
+  [`${BRAND_BASE}/fonts/ibm-plex-mono-latin-400.woff2`]: "font/woff2",
+  [`${BRAND_BASE}/fonts/Manrope-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${BRAND_BASE}/fonts/IBM-Plex-Mono-OFL.txt`]: "text/plain; charset=utf-8",
 };
 const ICON_LINKS =
   `<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">` +
@@ -125,8 +133,8 @@ const LANDING_CSS = `
   /* Brand: nanoodle's own tokens (nanoodle.com :root) — same bg/panel/ink/line,
      periwinkle accent with the pink gradient end, port colours on the chips,
      Righteous for the wordmark and headings, and the editor canvas's dot grid
-     behind the page. The 255labs touch is confined to the footer lockup:
-     Signal #d7ff3f on Ink, set in Space Grotesk per branding.255labs.xyz. */
+     behind the page. The 255labs endorsement uses the official v1.1.0 SVG lockup.
+     Product surfaces add the brand kit’s Manrope/IBM Plex type and control tokens. */
   @font-face{font-family:'Righteous';font-style:normal;font-weight:400;font-display:swap;
     src:url(/righteous-latin.woff2) format('woff2');
     unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
@@ -276,12 +284,14 @@ function workflowSampleHtml(name, sample) {
 }
 
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null, near = false, usdc = null, merchant = null, network = null }) {
+  if (charged) { near = false; paymentNote = null; }
   const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const authored = authorCount(toolInfo);
   const cmds = connectCmds(publicBase);
   const cmd = cmds.claude;
-  const cardHtml = (t) => {
+  const cardHtml = (t, copy = null, quoteButton = false) => {
+    const choose = quoteButton ? `<button type="button" data-choose="${esc(t.name)}">Get a quote for this workflow ↗</button>` : "";
     const info = infoByName.get(t.name);
     // Built-ins have no graph file. Linking them would point at href="undefined"
     // and a 404 /graph/<tool>.json.
@@ -295,7 +305,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     // No structured pieces (a bare toolInfo entry) → the one-line description stands in.
     if (!card || !card.intent && !card.steps.length) {
       return `<li class="tool" id="${esc(t.name)}"><code>${esc(t.name)}</code><p class="muted">${esc(t.description)}</p>` +
-        `${links ? `<div class="tfoot">${links}</div>` : ""}${workflowExampleHtml(t.name)}${author}</li>`;
+        `${links ? `<div class="tfoot">${links}</div>` : ""}${choose}${workflowExampleHtml(t.name)}${author}</li>`;
     }
     /*
      * The card lays the description's pieces out as layers instead of one blob:
@@ -308,16 +318,17 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     ).join(`<span class="arr">→</span>`);
     const cost = renderCost(costs[t.name]);
     return `<li class="tool" id="${esc(t.name)}">` +
-      `<div class="thead"><span class="tname">${esc(toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
-      `<p class="intent">${esc(card.intent || t.description)}</p>` +
+      `<div class="thead"><span class="tname">${esc(copy?.title || toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
+      `<p class="intent">${esc(copy?.intent || card.intent || t.description)}</p>` +
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
-      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${workflowSampleHtml(t.name, card.sample)}${workflowExampleHtml(t.name)}${author}</li>`;
+      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${choose}${workflowSampleHtml(t.name, card.sample)}${workflowExampleHtml(t.name)}${author}</li>`;
   };
   const cards = tools.map(cardHtml).join("");
   if (near && !charged) {
     const templates = tools.filter(t => !["run_noodle", "price_noodle", "noodle_guide"].includes(t.name));
     const page = nearSitePage({ version, publicBase, merchant, network, tools: templates, usdc,
-      cards: templates.map(t => cardHtml(t).replace(/<\/li>$/, `<button type="button" data-choose="${esc(t.name)}">Try this workflow ↗</button></li>`)).join("") });
+      cards: templates.map(t => cardHtml(t, nearWorkflowCopy[t.name], true).replace(/last run \$/g, "last model cost $")).join(""),
+      notes: receiptsHtml({ toolNames: templates.map(t => t.name), compact: true }) });
     return htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head);
   }
   const tagline = near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}` : charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
@@ -327,6 +338,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     ? "AI workflows paid in Nano over x402 — image, video, audio, and text pipelines behind one MCP endpoint. No account, no API key."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
   const ogHead =
+    `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">` +
     `<meta name="theme-color" content="#0b0d12">` +
     `<link rel="preload" href="/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
     `<meta name="description" content="${esc(desc)}">` +
@@ -436,7 +448,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
     </div>
     <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a>
-      <div class="labs"><span class="ff" aria-hidden="true">FF</span><span class="lname">255labs</span><span class="ltag">Full signal. Zero noise. · 0xFF</span></div>
+      <div class="labs"><a href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" height="36" alt="255labs"></a><span class="ltag">Full signal. Zero noise. · 0xFF</span></div>
     </footer>
     <script>
       const CMDS = ${JSON.stringify(cmds)};
@@ -462,6 +474,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
 
 /** The landing page's story as plain text — the version an agent should read. */
 function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null, near = false }) {
+  if (charged) { near = false; paymentNote = null; }
   const authored = authorCount(toolInfo);
   const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
@@ -558,7 +571,7 @@ function nearPayPageHtml(q) {
   const asset = q.asset === "USDC" ? "USDC" : "NEAR";
   const amount = q.amount ?? q.amountNear;
   return htmlPage(`Pay in ${asset} · nanoodle on NEAR`, `
-    <a href="/">nanoodle <span class="muted">on NEAR</span></a>
+    <a class="pay-brand" href="/">nanoodle <span class="muted">on NEAR</span></a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
       <h1>Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · NEAR ${esc(q.network)}</p>
       <div class="card">
@@ -580,7 +593,7 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted">Keep this page open. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="/near-wallet.js"></script>
-  `, PAGE_CSS + `:root{--bg:#101311;--fg:#eff4ee;--card:#191e1a;--edge:#303b32;--muted:#aab8ad;--ok:#99f4ac}body{background:var(--bg);color:var(--fg)}a{color:#b7fac4}#near-payment h1{font-size:2rem;margin-top:1.5rem}.card h2{font-size:1.6rem}button{background:#99f4ac;color:#101711;font-weight:600}button:disabled{opacity:.5}input{background:#101711;color:#eff4ee;border:1px solid #3a483d;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}`);
+  `, PAGE_CSS + `@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--brand-font-sans),system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--brand-font-mono),monospace;margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;background:linear-gradient(105deg,#99a5ff,#e7a4d3);color:#0b0d12;font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:2px solid #d7ff3f;outline-offset:3px}`, `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">`);
 }
 
 function payPageHtml(q) {
@@ -707,6 +720,11 @@ export async function serveHttp({
   log = (...a) => console.error(...a),
 }) {
   const sha = commit === undefined ? gitShortSha() : (commit || null);
+  // Each public page describes its own payment experience. Routing and stored
+  // payments still share the original backend, including compatibility calls.
+  const publicTools = () => gate ? listTools().filter(t => !["run_noodle", "price_noodle", "noodle_guide"].includes(t.name)).map(t => ({
+    ...t, description: toolInfo.find(info => info.name === t.name)?.description || t.description?.split(" It can also be paid in NEAR:")[0],
+  })) : listTools();
   const publicOrigin = new URL(publicBase || `http://${host}:${port}`).origin;
   const trustedOrigins = new Set([publicOrigin, ...allowedOrigins.map((value) => {
     const url = new URL(value);
@@ -873,11 +891,11 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (url.pathname === "/") {
-        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote, near: !!nearGate, usdc, merchant: nearHealth?.merchant, network: nearHealth?.network }), "text/html; charset=utf-8");
+        return send(200, landingHtml({ name, version, listTools: publicTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote, near: !!nearGate, usdc, merchant: nearHealth?.merchant, network: nearHealth?.network }), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/llms.txt") {
-        return send(200, llmsTxt({ name, version, listTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate }), "text/plain; charset=utf-8");
+        return send(200, llmsTxt({ name, version, listTools: publicTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate }), "text/plain; charset=utf-8");
       }
 
       if (url.pathname === "/rates" && rates) {
@@ -895,7 +913,7 @@ export async function serveHttp({
       }
 
       if (ASSETS[url.pathname]) {
-        const path = join(ASSET_DIR, basename(url.pathname));
+        const path = join(ASSET_DIR, url.pathname.slice(1)); // pathname is an exact static allowlist key
         if (!existsSync(path)) return send(404, JSON.stringify({ error: "not found" }));
         res.writeHead(200, {
           "Content-Type": ASSETS[url.pathname],

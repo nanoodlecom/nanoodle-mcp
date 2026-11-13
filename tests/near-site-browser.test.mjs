@@ -1,12 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startStudio, callMcp, savedInputs } from "../src/near-site-browser.mjs";
+import { startStudio, callMcp, savedInputs, resultText } from "../src/near-site-browser.mjs";
 
 const config = { merchant: "merchant.near", tools: [{ name: "poster" }] };
 const payment = { paymentId: "nq_test", status: "payment_required", payTo: "merchant.near", asset: "USDC", amount: "0.01", amountAtomic: "10000" };
 const receipt = { outcome: "succeeded", charged: { amount: "0.002" }, refund: { amount: "0.008", status: "sent" } };
 const complete = { content: [{ type: "text", text: "A finished result" }], structuredContent: { receipt } };
 const store = () => { const data = new Map(); return { setItem: (k, v) => data.set(k, v), getItem: k => data.get(k) || null }; };
+
+test("paid output stays visible while the current structured receipt replaces stale pending copy", () => {
+  const content = [{ type: "text", text: "Paid in moonlight, the fox sails home. ✓" },
+    { type: "text", text: "charged: $0.002; refund pending" }, { type: "text", text: "Paid 0.01 USDC on NEAR mainnet. Refund pending." }];
+  assert.equal(resultText({ content, structuredContent: { receipt } }), content[0].text);
+  assert.equal(content.length, 3, "rendering does not change the original MCP response");
+  assert.equal(resultText(complete), "A finished result", "an unexpected response never loses its paid text");
+  const failed = { content: [{ type: "text", text: "The run failed; refund pending." }], structuredContent: { receipt: { outcome: "run_failed" } } };
+  assert.equal(resultText(failed), failed.content[0].text);
+});
 
 for (const name of ["run_noodle", "poster"]) test(`browser studio ${name}: quoting does not run, then payment resumes the immutable request`, async () => {
   const calls = [], storage = store(); let checks = 0, finish;

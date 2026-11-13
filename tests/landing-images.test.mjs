@@ -43,7 +43,7 @@ test("landing page images are same-origin or on media.nanoodle.com", async () =>
   const { html, srcs, local } = await landingImgSrcs();
   // favicon + the receipts hero + six sample previews (sing has no preview;
   // neon-shrine-duel, storyboard-relay and tiny-world-film have no example)
-  assert.equal(srcs.length, 8, `expected 8 <img>, got ${JSON.stringify(srcs)}`);
+  assert.equal(srcs.length, 9, `expected favicon, seven previews and the official 255labs lockup, got ${JSON.stringify(srcs)}`);
   assert.ok(srcs.includes("https://media.nanoodle.com/subnano/2026-10-21-song-to-music-video/poster.webp"));
   for (const src of srcs) {
     const origin = new URL(src, PUBLIC_BASE + "/").origin;
