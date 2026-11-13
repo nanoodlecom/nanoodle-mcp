@@ -576,28 +576,32 @@ brief. A successful upload returns `/workflows/wf_…` and
 result components as the main service. `/workflows/wf_…/llms.txt` explains
 automatic payment continuation for that endpoint.
 
-Marketplace publication is an operator review step. On the host, run the
-following as the service user, with its private hosted-workflow directory:
+Hosting is immediate after automated graph, price and Nano-address checks.
+There is **no Nanoodle review or approval step**. Creators own their marketplace
+listings: create a listing on [market.near.ai](https://market.near.ai), and connect
+its agent to the uploaded workflow's `/workflows/wf_…/mcp` endpoint. Nanoodle
+does not create or adopt the listing, collect its marketplace proceeds, or need
+its credentials. The creator chooses the hire price and receives marketplace
+proceeds in their own account.
 
-```sh
-node scripts/hosted-workflows.mjs list /srv/nanoodle-mcp/out/hosted-workflows
-node scripts/hosted-workflows.mjs register /srv/nanoodle-mcp/out/hosted-workflows wf_ID
-node scripts/hosted-workflows.mjs adoption /srv/nanoodle-mcp/out/hosted-workflows wf_ID
-# Open the private, expiring adoption URL while signed into Nanoodle's owner account.
-# Set MARKET_HOSTED_OWNER_ACCOUNT_ID to that verified account UUID, then:
-node scripts/hosted-workflows.mjs publish /srv/nanoodle-mcp/out/hosted-workflows wf_ID
-```
+The hosted page supplies the MCP URL, client connection command and copyable
+instructions for the listing's agent. The agent maps the customer's brief to
+`run_workflow` inputs, pays Nanoodle's exact NEAR/USDC execution quote using its
+authorized wallet, resumes the same payment ID, and delivers the result through
+its own listing. A marketplace hire does **not** automatically pay the Nanoodle
+quote: these are separate payments. Nanoodle provides the model backend and
+returns unused execution funds in the same asset. Successful executions route
+the collected model-cost markup to the embedded Nano author address as above.
 
-Registration credentials and adoption links are private operator capabilities,
-never returned to creators. The publisher requires verified adoption into the
-configured Nanoodle owner account, reprices the graph, creates its per-call
-plan and emits the existing marketplace worker catalog. Until publication,
-the direct run page works and honestly shows marketplace publication pending.
-Published workers start in the same Nanoodle process without a restart and
-use the shared Nano payment queue. They accept the customer's text brief,
-never a replacement workflow. Shutdown drains these workers too.
+The storefront must have an agent/backend capable of calling remote MCP tools
+and paying quotes; a storefront URL by itself is not an MCP client. No Nanoodle
+owner-account connection, marketplace approval queue or adoption step is involved.
+The repository's existing Nanoodle marketplace workers continue to serve its
+own listings independently.
 
-For market hires, the creator payout becomes owed only after **acceptance**.
+For Nanoodle's existing marketplace workers, which execute their own hires
+directly rather than through a paid MCP call, the creator payout becomes owed
+only after **acceptance**.
 It is 20% of actual model cost, capped by accepted proceeds after model costs,
 converted at the XNO/USD rate locked before execution. Refunded hires and
 unknown model costs create no payout. The common durable Nano outbox retries
