@@ -36,6 +36,7 @@
  * clients without Origin still work; payment authorizes paid calls.
  */
 import http from "node:http";
+import { nearSitePage } from "./near-site.mjs";
 import { constants, createReadStream, existsSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
@@ -71,6 +72,7 @@ const ASSETS = {
   "/righteous-latin.woff2": "font/woff2",
   "/righteous-latin-ext.woff2": "font/woff2",
   "/near-wallet.js": "text/javascript; charset=utf-8",
+  "/near-site.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
 };
 const ICON_LINKS =
@@ -273,13 +275,13 @@ function workflowSampleHtml(name, sample) {
     `<pre>${esc(JSON.stringify(sampleCall(name), null, 2))}</pre></details>`;
 }
 
-function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null, near = false }) {
+function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null, near = false, usdc = null, merchant = null, network = null }) {
   const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
   const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
   const authored = authorCount(toolInfo);
   const cmds = connectCmds(publicBase);
   const cmd = cmds.claude;
-  const cards = tools.map((t) => {
+  const cardHtml = (t) => {
     const info = infoByName.get(t.name);
     // Built-ins have no graph file. Linking them would point at href="undefined"
     // and a 404 /graph/<tool>.json.
@@ -310,7 +312,14 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       `<p class="intent">${esc(card.intent || t.description)}</p>` +
       (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
       `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${workflowSampleHtml(t.name, card.sample)}${workflowExampleHtml(t.name)}${author}</li>`;
-  }).join("");
+  };
+  const cards = tools.map(cardHtml).join("");
+  if (near && !charged) {
+    const templates = tools.filter(t => !["run_noodle", "price_noodle", "noodle_guide"].includes(t.name));
+    const page = nearSitePage({ version, publicBase, merchant, network, tools: templates, usdc,
+      cards: templates.map(t => cardHtml(t).replace(/<\/li>$/, `<button type="button" data-choose="${esc(t.name)}">Try this workflow ↗</button></li>`)).join("") });
+    return htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head);
+  }
   const tagline = near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}` : charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
   const desc = near
     ? "AI workflows paid in native NEAR with automatic change — image, video, audio, and text pipelines. Connect your wallet, pay a deposit, and receive unused NEAR back on chain."
@@ -549,7 +558,7 @@ function nearPayPageHtml(q) {
   const asset = q.asset === "USDC" ? "USDC" : "NEAR";
   const amount = q.amount ?? q.amountNear;
   return htmlPage(`Pay in ${asset} · nanoodle on NEAR`, `
-    <a href="/">nanoodle-mcp</a>
+    <a href="/">nanoodle <span class="muted">on NEAR</span></a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
       <h1>Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · NEAR ${esc(q.network)}</p>
       <div class="card">
@@ -571,7 +580,7 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted">Keep this page open. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="/near-wallet.js"></script>
-  `);
+  `, PAGE_CSS + `:root{--bg:#101311;--fg:#eff4ee;--card:#191e1a;--edge:#303b32;--muted:#aab8ad;--ok:#99f4ac}body{background:var(--bg);color:var(--fg)}a{color:#b7fac4}#near-payment h1{font-size:2rem;margin-top:1.5rem}.card h2{font-size:1.6rem}button{background:#99f4ac;color:#101711;font-weight:600}button:disabled{opacity:.5}input{background:#101711;color:#eff4ee;border:1px solid #3a483d;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}`);
 }
 
 function payPageHtml(q) {
@@ -864,7 +873,7 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (url.pathname === "/") {
-        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote, near: !!nearGate }), "text/html; charset=utf-8");
+        return send(200, landingHtml({ name, version, listTools, publicBase, charged: !!gate, toolInfo, costs, paymentNote, near: !!nearGate, usdc, merchant: nearHealth?.merchant, network: nearHealth?.network }), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/llms.txt") {

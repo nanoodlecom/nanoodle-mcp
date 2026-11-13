@@ -1,7 +1,9 @@
-# Brand assets
+# Browser and brand assets
 
-`near-wallet.js` is the NEAR payment page's browser bundle. Rebuild it with
-`npm ci && npm run build:near-wallet`. Its source is `src/near-pay-browser.mjs`.
+`near-site.js` is the NEAR landing page and browser workflow studio, built from
+`src/near-site-browser.mjs`. `near-wallet.js` is the NEAR/USDC wallet payment
+page, built from `src/near-pay-browser.mjs`. Rebuild both with
+`npm ci && npm run build:near-wallet`.
 The payment bundle includes NEAR Connect 0.12.0
 (MIT, HOT Labs), pinned as a build dependency.
 The Node server keeps its existing two runtime dependencies. Wallet discovery

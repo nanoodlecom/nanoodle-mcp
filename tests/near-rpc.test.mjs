@@ -308,3 +308,18 @@ test("pool: when every endpoint fails, the last transport error surfaces", async
   // both resting: still tried, in order, rather than refusing outright
   await assert.rejects(rpc.status(), { code: "RPC_HTTP" });
 });
+
+test("pool: request pacing covers chain checks, failover and concurrent callers", async () => {
+  let clock = 1000;
+  const at = [];
+  const f = hostFetch({ "a.test": limited, "b.test": ok() });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", minIntervalMs: 100,
+    now: () => clock, pause: async ms => { clock += ms; },
+    fetch: (url, init) => { at.push(clock); return f.fetch(url, init); } });
+  await rpc.block({ finality: "final" });
+  assert.deepEqual(at, [1000, 1100, 1200], "network checks and failover consume the same request budget");
+  await Promise.all([rpc.block({ finality: "final" }), rpc.block({ finality: "final" })]);
+  assert.ok(at.slice(3).every(t => t >= 1300));
+  assert.equal(clock, 1400, "simultaneous requests reserve distinct slots");
+  assert.throws(() => createNearRpcPool({ urls: "https://a.test", minIntervalMs: -1 }), /minIntervalMs/);
+});
