@@ -1,5 +1,11 @@
 # Recorded workflow examples
 
+`nanoodle-editor.webp` is a screenshot of the public Nanoodle editor captured
+on 13 November 2026 at 1440 × 800, showing the gallery's “From scene to short
+clip” workflow. The comment node was removed and the canvas fitted through
+the editor controls. No sign-in, API key or generation was used. It links to
+`https://nanoodle.com` from the NEAR site's workflow-building section.
+
 `sing.mp3` is the original 208.3-second Mureka 9.5 output from the site owner's
 2026-11-13 Nanoodle demo run, preserved at their request for the public song
 player. The brief asked for a song about the singularity. It is served as a
