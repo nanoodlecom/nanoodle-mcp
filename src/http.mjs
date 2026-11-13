@@ -223,6 +223,7 @@ const LANDING_CSS = `
   .tool .cost{font:.75rem/1.4 ui-monospace,monospace;color:var(--muted);white-space:nowrap}
   .tool .example{border-top:1px solid var(--edge);margin-top:1rem;padding-top:.5rem;font-size:.85rem}
   .tool .example img{display:block;width:100%;height:auto;border-radius:8px;margin:.6rem 0}
+  .tool .example video{display:block;width:100%;max-width:100%;border-radius:8px;background:#0b0e16;margin:.7rem 0;aspect-ratio:832/480;object-fit:contain}
   .tool .sample{font-size:.85rem;border-top:1px solid var(--edge);margin:.7rem 0;padding-top:.7rem}
   .tool .sample summary{cursor:pointer;color:var(--accent-ink)}
   .tool .sample pre{white-space:pre-wrap;overflow-wrap:anywhere}
