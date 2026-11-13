@@ -209,9 +209,9 @@ function mount(root) {
   const command = () => node("connect-client").value === "url" ? `${config.publicBase}${config.mcpPath || "/mcp"}` : `${node("connect-client").value} mcp add --transport http nanoodle ${config.publicBase}${config.mcpPath || "/mcp"}`;
   node("connect-client").addEventListener("change", () => { node("connect-command").textContent = command(); });
   node("connect-copy").addEventListener("click", async () => { try { await navigator.clipboard.writeText(command()); node("connect-copy").textContent = "Copied"; } catch { node("connect-copy").textContent = "Select the command to copy"; } });
-  node("listing-copy")?.addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(node("listing-instructions").textContent); node("listing-copy").textContent = "Copied"; }
-    catch { node("listing-copy").textContent = "Select the instructions to copy"; }
+  node("agent-copy")?.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(node("agent-instructions").textContent); node("agent-copy").textContent = "Copied"; }
+    catch { node("agent-copy").textContent = "Select the instructions to copy"; }
   });
   setInterval(() => {
     const wf = selected?.workflow;

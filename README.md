@@ -577,27 +577,18 @@ result components as the main service. `/workflows/wf_…/llms.txt` explains
 automatic payment continuation for that endpoint.
 
 Hosting is immediate after automated graph, price and Nano-address checks.
-There is **no Nanoodle review or approval step**. Creators own their marketplace
-listings: create a listing on [market.near.ai](https://market.near.ai), and connect
-its agent to the uploaded workflow's `/workflows/wf_…/mcp` endpoint. Nanoodle
-does not create or adopt the listing, collect its marketplace proceeds, or need
-its credentials. The creator chooses the hire price and receives marketplace
-proceeds in their own account.
+There is **no Nanoodle review or approval step**. Share the run page with people,
+or connect an agent to the uploaded workflow's `/workflows/wf_…/mcp` endpoint.
+The page supplies the MCP URL, client connection command and copyable payment
+instructions. Users pay the execution quote in NEAR/USDC before the workflow
+runs; unused funds return in the same asset. Successful executions route the
+collected model-cost fee to the embedded Nano author address as above.
 
-The hosted page supplies the MCP URL, client connection command and copyable
-instructions for the listing's agent. The agent maps the customer's brief to
-`run_workflow` inputs, pays Nanoodle's exact NEAR/USDC execution quote using its
-authorized wallet, resumes the same payment ID, and delivers the result through
-its own listing. A marketplace hire does **not** automatically pay the Nanoodle
-quote: these are separate payments. Nanoodle provides the model backend and
-returns unused execution funds in the same asset. Successful executions route
-the collected model-cost markup to the embedded Nano author address as above.
-
-The storefront must have an agent/backend capable of calling remote MCP tools
-and paying quotes; a storefront URL by itself is not an MCP client. No Nanoodle
-owner-account connection, marketplace approval queue or adoption step is involved.
-The repository's existing Nanoodle marketplace workers continue to serve its
-own listings independently.
+Creator marketplace-listing setup is not currently offered. Market holds buyer
+funds in escrow and releases seller proceeds after delivery/acceptance; those
+proceeds cannot fund Nanoodle's upfront execution quote for that same job. Such
+an integration requires the creator to front the execution cost. The existing
+Nanoodle marketplace workers remain separate from this hosted creator flow.
 
 For Nanoodle's existing marketplace workers, which execute their own hires
 directly rather than through a paid MCP call, the creator payout becomes owed

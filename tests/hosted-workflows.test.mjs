@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { deriveAddress, derivePublicKey, deriveSecretKey } from "nanocurrency";
 import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { createHostedWorkflows } from "../src/hosted-workflows.mjs";
-import { creatorListingInstructions } from "../src/creator-instructions.mjs";
+import { creatorAgentInstructions } from "../src/creator-instructions.mjs";
 import { serveHttp } from "../src/http.mjs";
 
 const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 2)), { useNanoPrefix: true });
@@ -53,7 +53,7 @@ test("hosted calls bind graph and payout, map sanitized names, forward progress 
   assert.equal(calls.length, 1);
 });
 
-test("creator HTTP surfaces expose a bound MCP tool and keep recipes, tokens and adoption links private", async () => {
+test("creator HTTP surfaces expose a bound MCP tool without publishing the recipe", async () => {
   const creators = rig({ callTool: async () => ({ content: [{ type: "text", text: "same gate" }] }) });
   const server = await serveHttp({ host: "127.0.0.1", port: 0, name: "test", version: "test", publicBase: "https://near.example", listTools: () => [], callTool: async () => ({}), creators, nearHealth: { merchant: "merchant.near", network: "mainnet" }, usdc: { enabled: true }, log: () => {} });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -62,7 +62,7 @@ test("creator HTTP surfaces expose a bound MCP tool and keep recipes, tokens and
     assert.equal((await post("/creators/workflows", submission, { Origin: "https://evil.example" })).status, 403);
     const response = await post("/creators/workflows", submission); assert.equal(response.status, 201); const record = await response.json();
     const page = await (await fetch(`${base}/workflows/${record.id}`)).text();
-    assert.match(page, /Idea into a poster/); assert.match(page, /Your storefront\. Our workflow engine/); assert.doesNotMatch(page, /pending Nanoodle review|Nanoodle reviews|owner-account adoption/); assert.match(page, /\/workflows\/wf_.*?\/mcp/); assert.ok(!page.includes("Write one vivid image prompt"));
+    assert.match(page, /Idea into a poster/); assert.match(page, /Payment instructions for your agent/); assert.doesNotMatch(page, /market\.near\.ai|marketplace|storefront/i); assert.doesNotMatch(page, /pending Nanoodle review|Nanoodle reviews|owner-account adoption/); assert.match(page, /\/workflows\/wf_.*?\/mcp/); assert.ok(!page.includes("Write one vivid image prompt"));
     const tools = await (await post(`/workflows/${record.id}/mcp`, { jsonrpc: "2.0", id: 1, method: "tools/list" })).json();
     assert.deepEqual(tools.result.tools.map(t => t.name), ["run_workflow", "price_workflow"]);
     assert.equal((await post(`/workflows/${record.id}/mcp`, {}, { Origin: "null" })).status, 403);
@@ -73,10 +73,10 @@ test("creator HTTP surfaces expose a bound MCP tool and keep recipes, tokens and
   } finally { await new Promise(resolve => server.close(resolve)); }
 });
 
-test("creator listing instructions use the bound MCP endpoint and leave listing ownership and proceeds with the creator", async () => {
-  const creators = rig(), record = await creators.submit(submission), text = creatorListingInstructions(record);
-  assert.ok(text.includes(record.mcpUrl)); assert.match(text, /creator's own listing/);
-  assert.match(text, /receives marketplace proceeds in their own account/); assert.match(text, /execution payment are separate/);
+test("hosted agent instructions use the bound MCP endpoint, payment ID and result without promoting storefronts", async () => {
+  const creators = rig(), record = await creators.submit(submission), text = creatorAgentInstructions(record);
+  assert.ok(text.includes(record.mcpUrl)); assert.match(text, /authorized funded wallet/);
+  assert.match(text, /Show the final media or text to the user/); assert.doesNotMatch(text, /marketplace|storefront|listing/i);
   assert.match(text, /_payment_id/); assert.match(text, /price_workflow/); assert.doesNotMatch(text, /Write one vivid image prompt/);
   assert.match(creators.instructions(record.id), /Hosting requires no Nanoodle approval/);
 });

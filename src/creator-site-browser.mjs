@@ -25,11 +25,11 @@ async function submit(host) {
     const result = await response.json(); if (!response.ok) throw new Error(result.error || "Could not check this workflow. Try again.");
     const preview = node("creator-preview"); preview.replaceChildren(); preview.hidden = false;
     const title = document.createElement("h2"); title.textContent = host ? "Your workflow is hosted." : "Ready to host."; preview.append(title);
-    paragraph(preview, `Estimated model cost: $${Number(result.estimatedCostUsd).toFixed(6)}. You choose the price of your own storefront listing.`);
+    paragraph(preview, `Estimated model cost: $${Number(result.estimatedCostUsd).toFixed(6)}. Users get a quote before each run.`);
     paragraph(preview, `Creator payouts: ${result.author}`);
     if (host) {
       const link = document.createElement("a"); link.href = result.url; link.className = "primary-link"; link.textContent = "Open your workflow ↗"; preview.append(link);
-      paragraph(preview, "Your workflow is live. Share it directly, or connect its MCP endpoint to the agent behind your own marketplace listing. No Nanoodle approval is needed.");
+      paragraph(preview, "Your workflow is live. Share the run page with people, or connect an agent to its MCP endpoint. No Nanoodle approval is needed.");
     } else { paragraph(preview, "Checking never runs a model. Hosting creates your page immediately with the payout address shown above."); }
   } catch (error) { node("creator-error").textContent = error.message; }
   finally { busy = false; node("creator-check").disabled = node("creator-host").disabled = false; }

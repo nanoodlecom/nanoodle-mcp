@@ -22,7 +22,7 @@ function inputShape(graph) {
     required: (schema.required || []).filter(key => allowed.has(key)), additionalProperties: false } };
 }
 
-/** Immutable hosted recipes. Graphs and marketplace credentials stay server-side. */
+/** Immutable hosted workflows. Graphs stay server-side. */
 export function createHostedWorkflows({ dir, callTool, publicBase, merchant, network, usdc, baseUrl, fetch = globalThis.fetch, maxWorkflows = 250, maxDepositUsd = 2 }) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = join(dir, "workflows.json");
@@ -57,7 +57,7 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
     if (!author) throw new ParamsError('Add your Nano payout address as "x402": {"author":"nano_…"} at the top level of the graph');
     const names = graph.nodes.filter(n => n?.type === "text" && typeof n.name === "string" && n.name).map(n => n.name);
     const inputName = body.inputName || (names.length === 1 ? names[0] : null);
-    if (!inputName || !names.includes(inputName)) throw new ParamsError("Choose the named text input that receives a marketplace customer's brief");
+    if (!inputName || !names.includes(inputName)) throw new ParamsError("Choose the named text input for the user’s request");
     const name = String(body.name || graph.name || "").trim();
     if (!name || name.length > 80) throw new ParamsError("Give this workflow a name of 1–80 characters");
     const description = String(body.description || "").trim();
@@ -94,7 +94,7 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
       return publicView(get(id));
     },
     listTools: tools,
-    instructions(id) { return `Run ${get(id)?.name || "this workflow"} with run_workflow. price_workflow is free. A run first returns a payment quote; pay its exact NEAR or USDC amount, monitor the private pay link, then call run_workflow again with identical inputs and _payment_id. Continue automatically when paid. Never pay or create a replacement quote as a retry. The graph is hosted by Nanoodle; callers supply inputs, not graph JSON. Hosting requires no Nanoodle approval. Creators can connect this MCP endpoint to their own agents and marketplace listings; creators own their listings, choose their hire prices and receive marketplace proceeds in their own accounts. A listing's agent pays Nanoodle's execution quote separately using its authorized NEAR/USDC wallet. Successful runs pay the embedded x402.author Nano address.`; },
+    instructions(id) { return `Run ${get(id)?.name || "this workflow"} with run_workflow. price_workflow is free. A run first returns a payment quote; pay its exact NEAR or USDC amount, monitor the private pay link, then call run_workflow again with identical inputs and _payment_id. Continue automatically when paid. Never pay or create a replacement quote as a retry. The graph is hosted by Nanoodle; callers supply inputs, not graph JSON. Hosting requires no Nanoodle approval. Connect your agent to this workflow’s MCP endpoint and pay its execution quote from an authorized NEAR/USDC wallet. Successful runs pay the embedded x402.author Nano address.`; },
     async callTool(id, params, ctx) {
       const record = get(id); if (!record) throw new ParamsError("Unknown hosted workflow");
       if (!["run_workflow", "price_workflow"].includes(params?.name)) throw new ParamsError("Use run_workflow or price_workflow");
