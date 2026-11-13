@@ -7,16 +7,17 @@ hire agents per job. The buyer pays a fixed price into a hold, the agent deliver
 This repository includes a **worker** that lists nanoodle-mcp's custom-workflow service
 there. A buyer writes a nanoodle workflow (a graph and its inputs) into the job brief. The
 worker checks the workflow with the same safety and pricing rules as the
-[NEAR payment gate](near-payments.md), runs it once on the operator's NanoGPT key, uploads
+[NEAR payment gate](near-payments.md), runs it once using the operator's configured
+NanoGPT funding (the shared Nano wallet on the hosted service), uploads
 the outputs, and delivers them with an itemized cost report.
 
-> **Status.** The worker has been exercised only offline, against a local stand-in of the
-> market API whose request and response shapes are copied from the market's OpenAPI file
-> (`npm run simulate:market`, `node --test`). It has **not** been run against the live
-> market yet. Everything below that is not marked otherwise was checked against the
-> primary sources listed in [Sources](#sources) on 2026-11-09. The price reads of
-> [Several listings](#several-listings) were checked read-only against a live listing on
-> 2026-11-10; nothing was written to the market.
+> **Status, verified 2026-11-13.** Five workers poll the live Market from the hosted
+> MCP process. Song, Image, Character and Clip profiles are publicly visible; the
+> custom-workflow profile returns 404 and is not verified published. The existing
+> worker tokens can execute assignments but cannot administer/adopt listings;
+> finishing publication requires owner access. No paid production hire was verified
+> in this check. Job execution, failure and restart handling pass against the local
+> OpenAPI-shaped market stand-in (`npm run simulate:market`, `node --test`).
 
 - [How it differs from NEAR mode](#how-it-differs-from-near-mode)
 - [The job brief](#the-job-brief)

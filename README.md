@@ -63,12 +63,18 @@ transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md
   (30 checks).
 - Real testnet, read-only: the transaction checker and the server's own payment verifier
   read a real testnet transfer from public RPC and pass (step 4 below).
-- Not done yet: this code has **not moved real NEAR**. The first real testnet payment and
-  refund is the maintainer-run step 5 below. The market worker has not been run against
-  the live market. The hosted server at `mcp.nanoodle.com` defaults to Nano.
-  The NEAR-first listener and wallet payment page are implemented; hosting requires
-  a funded merchant and DNS for `mcp-near.nanoodle.com` (see
-  [deployment instructions](docs/near-payments.md#near-endpoint-and-wallet-payments)).
+- Live mainnet, verified 2026-11-13: connect to **https://mcp-near.nanoodle.com/mcp**.
+  Quotes pay `nanoodle.near`; the server detects the transfer, runs the workflow using
+  the shared Nano funding pool, and sends unused NEAR back to the payer. A real
+  [0.003192 NEAR payment](https://nearblocks.io/txns/qF4e5cGJDBqXdoqpmLnQrrtBi7XR2NSeF6orRHcR5LT)
+  was detected without submitting its hash, a text workflow succeeded, and
+  [0.00318950963855421686747 NEAR was refunded](https://nearblocks.io/txns/54CkAs3dK2Tf1u4LNX2Hn5qTCvKkW5ncPYmABMrjhQxs)
+  at FINAL finality. All 13 payment/receipt/refund checks passed. The primary endpoint
+  at `mcp.nanoodle.com` continues to default to Nano.
+- Market: workers poll the live marketplace for five configured listings. Song, Image,
+  Character and Clip are publicly visible; the custom-workflow profile is not verified
+  published. Owner access is needed to finish that listing. No paid production hire
+  has been verified in this check.
 - NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version` shows
   0.7.0 or later, run it from a clone as below.
 
@@ -794,10 +800,10 @@ model) is in [docs/near-payments.md](docs/near-payments.md).
 > from a clone (`node bin/nanoodle-mcp.mjs …`, as below). The scripts used below
 > (`scripts/…`) are not in the npm package at all; they need a clone.
 >
-> Status: the flow passes offline and the verifier passes read-only checks against a real
-> testnet transfer. This code has not yet moved real NEAR; the first real testnet run
-> is [Prove it on testnet](#prove-it-on-testnet-turnkey). For the NEAR-first hostname,
-> shared Nano pool and connected-wallet payment flow, see
+> Live mainnet: **https://mcp-near.nanoodle.com/mcp**, with payments to `nanoodle.near`.
+> A real payment, automatic detection, workflow execution and native refund were
+> verified on 2026-11-13; the transaction links are in [Status](#near-hackathon-entry).
+> For the shared Nano pool and connected-wallet payment flow, see
 > [NEAR endpoint and wallet payments](docs/near-payments.md#near-endpoint-and-wallet-payments).
 >
 > The same workflow runs can also be sold as jobs on NEAR Agent Market, paid by the

@@ -8,6 +8,10 @@ This document covers the design and how to operate it. It describes NEAR **testn
 default. Mainnet is a configuration change; read [Limitations](#limitations) before you
 switch.
 
+The hosted mainnet endpoint is **https://mcp-near.nanoodle.com/mcp**, with
+`nanoodle.near` as the merchant. A real payment, automatic detection, workflow
+run and refund were verified on 2026-11-13; see [Live mainnet verification](#live-mainnet-verification).
+
 - [The flow in one picture](#the-flow-in-one-picture)
 - [Pricing vocabulary](#pricing-vocabulary)
 - [Worked example](#worked-example)
@@ -160,6 +164,22 @@ The RPC must support `EXPERIMENTAL_changes` and `EXPERIMENTAL_receipt_to_tx`
 (including receipt-to-transaction tracking). Public FastNEAR RPC was checked
 read-only on mainnet on 2026-11-13. An RPC without those methods leaves automatic
 detection unavailable; the payment page's explicit confirmation remains usable.
+
+### Live mainnet verification
+
+On 2026-11-13 a temporary payer sent
+[0.003192 NEAR to nanoodle.near](https://nearblocks.io/txns/qF4e5cGJDBqXdoqpmLnQrrtBi7XR2NSeF6orRHcR5LT).
+The shared watcher accepted it without a payment POST or caller-supplied hash.
+The original `run_noodle` call resumed with only `_payment_id`, ran a small text
+workflow on NanoGPT using the existing Nano wallet, and returned a receipt.
+The model cost was $0.00000689; with the 20% service fee the charge was
+$0.000008268, or 0.00000249036144578313253 NEAR at the locked rate.
+[The remaining 0.00318950963855421686747 NEAR](https://nearblocks.io/txns/54CkAs3dK2Tf1u4LNX2Hn5qTCvKkW5ncPYmABMrjhQxs)
+returned to the actual payer at FINAL finality. All 13 checks in the real-payment
+verifier passed, including exact balance arithmetic and the refund recipient.
+The temporary payer's remaining balance was returned to the merchant and its
+account was closed. This verifies one real run; failure/restart scenarios remain
+covered by local chain/provider simulations.
 
 ### Authorize the merchant refund key
 
@@ -930,9 +950,9 @@ These are deliberate cuts for this version.
   `NEAR_SWAP_SPREAD_BPS` from the env file, not a pinned XNO/USD.
 - The background rate refresh asks NanoGPT for an x402 invoice (never paid) and CoinGecko
   once per interval while any rate is live.
-- Everything is exercised offline against a local chain stand-in that speaks the public RPC
-  wire format, plus read-only queries against public testnet RPC. Testnet is the intended
-  first live network; mainnet works by configuration only.
+- Failure and restart scenarios are exercised offline against a local chain stand-in
+  that speaks the public RPC wire format. Read-only testnet verification and one
+  mainnet payment/run/refund have also passed; this is not a production load test.
 - Unpaid quotes are pruned one hour after they expire. A payment for a quote that was
   pruned is answered "unknown payment id"; the NEAR stays in the merchant account and the
   operator must return it by hand.
