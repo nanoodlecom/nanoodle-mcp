@@ -22,9 +22,10 @@ button.addEventListener("click", async () => {
     await refresh();
     if (authorized) return;
     const connector = new NearConnector({ network: config.network, features: { signAndSendTransaction: true, signInWithoutAddKey: true } });
+    let selectedAccount = null;
+    connector.on("wallet:signIn", ({ accounts }) => { selectedAccount = accounts[0]?.accountId || null; });
     const wallet = await connector.connect({ walletId: "meteor-wallet" });
-    const accounts = await wallet.getAccounts({ network: config.network });
-    if (!accounts.some((a) => a.accountId === config.merchant)) {
+    if (selectedAccount !== config.merchant) {
       throw new Error(`Select ${config.merchant} in Meteor Wallet, then try again.`);
     }
     status.textContent = "Review and approve the Full Access key in Meteor Wallet.";

@@ -15,9 +15,11 @@ async function setupPage(accountId = "nanoodle.near") {
     document: { querySelector: (id) => nodes.get(id) }, setInterval: () => null,
     fetch: async () => ({ ok: true, json: async () => ({ authorized, active: false }) }),
     NearConnector: class {
+      on(name, callback) { this.onSignIn = callback; }
       async connect(options) {
         assert.equal(options.walletId, "meteor-wallet");
-        return { getAccounts: async () => [{ accountId }], signAndSendTransaction: async (tx) => {
+        this.onSignIn({ accounts: [{ accountId }] });
+        return { getAccounts: async () => [{ accountId }, { accountId: "nanoodle.near" }], signAndSendTransaction: async (tx) => {
           transactions.push(JSON.parse(JSON.stringify(tx))); authorized = true; return { status: { SuccessValue: "" } };
         } };
       }
