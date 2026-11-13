@@ -676,17 +676,11 @@ async function main() {
 
   // NEAR Agent Market worker, inside this server: it pays NanoGPT exactly as the server
   // does (API key, or the Nano wallet through x402) and shares the wallet's one send queue.
-  let hostedMarket = null;
-  if (creators) {
-    const { startHostedMarket } = await import("../src/market/hosted.mjs");
-    hostedMarket = startHostedMarket({ creators, payment: wallet?.payment, creatorPayments, apiKey,
-      log: line => console.error("nanoodle-mcp: " + line) });
-  }
   let marketService = null;
   if (process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
     marketService = await startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments });
   }
-  if (marketService || hostedMarket) {
+  if (marketService) {
     let stopping = false;
     const stop = async sig => {
       if (stopping) process.exit(1);
@@ -694,7 +688,7 @@ async function main() {
       console.error(`nanoodle-mcp: market worker: ${sig}: no new jobs; waiting up to 20 s for the jobs in hand`);
       marketService?.stop();
       const timer = setTimeout(() => process.exit(0), 20_000);
-      await Promise.all([marketService?.done, hostedMarket?.stop()]); clearTimeout(timer); process.exit(0);
+      await marketService.done; clearTimeout(timer); process.exit(0);
     };
     process.on("SIGTERM", () => void stop("SIGTERM"));
     process.on("SIGINT", () => void stop("SIGINT"));
