@@ -78,7 +78,7 @@ test("NEAR mode serves llms.txt and the landing page with the NEAR payment note"
     assert.match(llms, /## Payment\n\nEvery call is paid in native NEAR on testnet/);
     assert.doesNotMatch(llms, /Payment \(x402, Nano\/XNO\)/, "no Nano payment story on a NEAR server");
     const landing = await (await fetch(base + "/")).text();
-    assert.match(landing, /Nanoodle is NEAR/);
+    assert.match(landing, /Make images, clips and songs/);
     assert.match(landing, /id="near-studio"/);
     assert.doesNotMatch(landing, /option value="usdc"/, "USDC is offered only when enabled");
     const tools = await mcpClient(base).list();
@@ -227,7 +227,7 @@ test("NEAR hostname shares one process: wallet page, confirmation, monitor, auto
     assert.equal(page.headers.get("referrer-policy"), "no-referrer");
     assert.match(await page.text(), /Connect wallet &amp; pay/);
     assert.equal((await fetch(base + "/near-wallet.js")).status, 200);
-    assert.match(await (await fetch(base + "/")).text(), /Nanoodle is NEAR/);
+    assert.match(await (await fetch(base + "/")).text(), /Make images, clips and songs/);
     assert.match(await (await fetch(base + "/llms.txt")).text(), /No transaction hash needs to be copied/);
     const txHash = chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto));
     const submit = (body, headers = {}) => fetch(`${base}/near/pay/${p.paymentId}`, {
@@ -348,6 +348,10 @@ test("USDC over real HTTP: custom and saved workflows detect token payments, exe
   const base = `http://127.0.0.1:${nearPort}`, mcp = mcpClient(base);
   try {
     const health = await (await fetch(base + "/near/health")).json(); assert.equal(health.usdc.enabled, true);
+    const primaryLanding = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    assert.match(primaryLanding, /paid in Nano over x402/);
+    assert.doesNotMatch(primaryLanding, /\bNEAR\b|\bUSDC\b/, "the Nano page describes only Nano payments");
+    assert.doesNotMatch(await (await fetch(`http://127.0.0.1:${port}/llms.txt`)).text(), /\bNEAR\b|\bUSDC\b/);
     const landing = await (await fetch(base + "/")).text();
     assert.match(landing, /option value="usdc">USDC on NEAR/);
     assert.match(landing, /src="\/near-site.js"/);

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review desk — 255labs UI example</title><link rel="icon" href="./favicon.svg"><link rel="stylesheet" href="./255labs-tokens.css"><link rel="stylesheet" href="./255labs-ui.css"></head><body class="brand-ui" style="margin:0;padding:clamp(1rem,4vw,3rem)"><main style="max-width:1100px;margin:auto"><h1 style="font-size:1.5rem;margin:0 0 1rem">255labs UI / working example</h1><p style="margin-bottom:1.5rem">Sample data. A reference for your own product, with changes kept in this tab.</p><div class="brand-ui brand-demo" data-brand-demo data-brand-theme="dark">
+  <div class="brand-demo-header">
+    <div class="brand-demo-name"><strong>Review desk</strong><span class="brand-endorsement"><svg viewBox="0 0 168 112" aria-hidden="true"><path d="M12 12H80L68 32H34V48H62L50 68H34V100H12ZM88 12H156L144 32H110V48H138L126 68H110V100H88Z"/></svg> by 255labs</span></div>
+    <div class="brand-demo-controls">
+      <label class="brand-field">Theme<select class="brand-input" data-demo-theme aria-label="Theme"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+      <label class="brand-field">Example state<select class="brand-input" data-demo-state aria-label="Example state"><option value="ready">Ready</option><option value="empty">Empty</option><option value="loading">Loading</option><option value="error">Error</option></select></label>
+    </div>
+  </div>
+  <div class="brand-demo-body">
+    <div class="brand-demo-title"><div><span class="brand-label">Workspace / Overview</span><h2>A little clarity.<br>Then the next step.</h2><p>Review the work, resolve what’s blocked, and keep things moving.</p></div><span class="brand-badge info">Interactive example</span></div>
+    <label class="brand-field brand-demo-filter">Show items<select class="brand-input" data-demo-filter aria-label="Show items"><option value="all">All items</option><option value="review">Needs review</option><option value="ready">Ready</option><option value="blocked">Blocked</option></select></label>
+    <div class="brand-table-wrap" data-demo-table>
+      <table class="brand-table"><caption class="brand-muted" style="text-align:left;padding-bottom:.5rem">Example work queue</caption><thead><tr><th scope="col">Item</th><th scope="col">Project</th><th scope="col">Status</th><th scope="col">Action</th></tr></thead><tbody data-demo-rows></tbody></table>
+    </div>
+    <div class="brand-demo-state" data-demo-empty hidden><h3>Room for the next idea.</h3><p>No items match this view. Show all items or add one below.</p><button class="brand-button secondary" type="button" data-demo-show-all>Show all items</button></div>
+    <div class="brand-demo-state" data-demo-loading hidden role="status"><h3>Loading the example queue…</h3><p>This is a preview of the loading state.</p><button class="brand-button secondary" type="button" data-demo-retry>Show ready state</button></div>
+    <div class="brand-note error" data-demo-error hidden><h3>The queue couldn’t load.</h3><p>This is an example error. Your entries are still here.</p><button class="brand-button secondary" type="button" data-demo-retry>Try again</button></div>
+    <form class="brand-demo-form" data-demo-form novalidate>
+      <h3>Add something to review</h3>
+      <div class="brand-demo-form-fields"><label class="brand-field">Item name<input class="brand-input" data-demo-name name="name" placeholder="e.g. Review the onboarding copy" maxlength="80" required aria-describedby="demo-name-help demo-name-error"><span class="brand-muted" id="demo-name-help">Sample data only. Changes stay in this tab.</span><span class="brand-error" id="demo-name-error" hidden>Enter a name for this item.</span></label><button class="brand-button" type="submit">Add item →</button></div>
+    </form>
+    <p class="brand-demo-feedback" role="status" aria-live="polite" data-demo-feedback></p>
+    <div class="brand-demo-footer"><span>Sample workspace · no account or AI service</span><button class="brand-button secondary" type="button" data-demo-reset>Reset example</button></div>
+  </div>
+</div>
+</main><script defer src="./255labs-app-example.js"></script></body></html>

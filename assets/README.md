@@ -29,3 +29,13 @@ this server hosts:
 To regenerate, run the favicon graph with your own brand text and resize the
 result (e.g. `magick icon.jpg -resize 48x48 favicon.png`,
 `magick icon.jpg -define icon:auto-resize=48,32,16 favicon.ico`).
+
+The original **255labs Brand System v1.1.0** kit from
+[branding.255labs.xyz](https://branding.255labs.xyz/downloads/) is pinned under
+`brand/255labs-v1.1.0/`, including its manifest, original SVG lockups, Manrope and
+IBM Plex Mono WOFF2 fonts, CSS tokens and font licenses. All 37 file digests in
+the supplied manifest were verified. The NEAR site keeps Nanoodle’s Righteous
+identity, dark dot canvas and model-port colors while using the brand kit’s
+body type, labels, focus color and original 255labs endorsement. Essential
+controls are at least 44px high. The primary MCP page presents Nano; the NEAR
+page presents NEAR and enabled USDC.

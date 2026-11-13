@@ -1,0 +1,103 @@
+{
+  "name": "255labs",
+  "version": "1.1.0",
+  "color": {
+    "signal": "#D7FF3F",
+    "ink": "#101110",
+    "paper": "#F1F2EA",
+    "graphite": "#22251F",
+    "muted": "#A0A69A",
+    "line": "#35392F",
+    "blue": "#AACBFA",
+    "lilac": "#D7BDF6"
+  },
+  "font": {
+    "sans": "\"Manrope Variable\", \"Manrope\", sans-serif",
+    "mono": "\"IBM Plex Mono\", monospace"
+  },
+  "space": {
+    "1": "4px",
+    "2": "8px",
+    "3": "12px",
+    "4": "16px",
+    "6": "24px",
+    "8": "32px",
+    "12": "48px",
+    "16": "64px",
+    "24": "96px"
+  },
+  "radius": {
+    "small": "4px",
+    "medium": "8px",
+    "large": "12px"
+  },
+  "type": {
+    "body-size": "1rem",
+    "body-leading": "1.7",
+    "small-size": ".875rem",
+    "label-size": ".75rem",
+    "heading-size": "1.5rem",
+    "heading-leading": "1.2",
+    "display-size": "clamp(2.5rem, 5vw, 4.5rem)",
+    "display-leading": "1.08",
+    "weight-body": "400",
+    "weight-heading": "550",
+    "weight-strong": "650"
+  },
+  "control": {
+    "height": "2.75rem",
+    "border-width": "1px",
+    "focus-width": "2px",
+    "focus-offset": "3px"
+  },
+  "motion": {
+    "fast": "140ms",
+    "standard": "200ms"
+  },
+  "theme": {
+    "dark": {
+      "bg": "#101110",
+      "surface": "#171916",
+      "surface-raised": "#22251F",
+      "text": "#F1F2EA",
+      "text-muted": "#A0A69A",
+      "border": "#35392F",
+      "control-border": "#7B826F",
+      "action": "#D7FF3F",
+      "action-hover": "#E4FF7B",
+      "on-action": "#101110",
+      "focus": "#D7FF3F",
+      "accent": "#AACBFA",
+      "success": "#B9E4A0",
+      "success-bg": "#23351D",
+      "warning": "#F2D18B",
+      "warning-bg": "#362D19",
+      "error": "#FFB4A6",
+      "error-bg": "#3C211E",
+      "info": "#AACBFA",
+      "info-bg": "#1B2A3D"
+    },
+    "light": {
+      "bg": "#F1F2EA",
+      "surface": "#FFFFFF",
+      "surface-raised": "#E6E9DE",
+      "text": "#101110",
+      "text-muted": "#50564A",
+      "border": "#CDD1C5",
+      "control-border": "#707765",
+      "action": "#101110",
+      "action-hover": "#30362A",
+      "on-action": "#F1F2EA",
+      "focus": "#4C5E00",
+      "accent": "#234E91",
+      "success": "#285215",
+      "success-bg": "#E1F1D6",
+      "warning": "#715000",
+      "warning-bg": "#FFF0C7",
+      "error": "#9B2E20",
+      "error-bg": "#FCE4DD",
+      "info": "#234E91",
+      "info-bg": "#E2ECFC"
+    }
+  }
+}

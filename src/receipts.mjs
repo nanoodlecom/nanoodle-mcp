@@ -43,9 +43,19 @@ function ext(href, className, inner) {
   return `<a class="${className}" href="${esc(href)}" target="_blank" rel="noopener">${inner}</a>`;
 }
 
-export function receiptsHtml() {
-  const articles = orderedArticles();
+export function receiptsHtml({ toolNames = null, compact = false } = {}) {
+  const articles = orderedArticles().filter(a => !toolNames || toolNames.includes(a.ability));
   if (!articles.length) return "";
+  if (compact) {
+    const notes = articles.map(article => ext(article.url, "note",
+      `<span class="when">${esc(shortDate(article.date))}</span><span class="what"><span class="title">${esc(article.title)}</span></span><span class="chip">${esc(article.ability)}</span>`)).join("");
+    const guides = GUIDES.filter(g => !toolNames || toolNames.some(name => g.href.endsWith("/" + name))).map(guide => ext(guide.href, "guide",
+      `<span class="k">guide</span><span class="title">${esc(guide.title)}</span><span class="arr" aria-hidden="true">→</span>`)).join("");
+    return `<section class="receipts" id="real-runs" aria-labelledby="real-runs-title"><p class="eyebrow">FROM THE NANOODLE RUN NOTES</p>` +
+      `<h2 id="real-runs-title">${esc(HEADING)}</h2><p class="lead">Actual outputs, costs and the parts that didn’t work. These recorded examples use the same workflow library; get a fresh quote for current pricing.</p>` +
+      `<div class="cols"><div class="notes"><h3>Field notes <span class="muted">· Subnano</span></h3>${notes}</div>` +
+      `<div class="guides"><h3>See how the graph works</h3>${guides}</div></div></section>`;
+  }
   const [hero, ...rest] = articles;
   const thumb = pageThumb(hero);
   const shot = thumb

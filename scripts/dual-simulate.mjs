@@ -184,8 +184,8 @@ export async function runDualSimulation({ print = console.log } = {}) {
     step("9. Landing page and llms.txt");
     const landing = await (await fetch(base + "/")).text();
     const llms = await (await fetch(base + "/llms.txt")).text();
-    expect(/paid in Nano or NEAR/.test(landing) && /Or pay in NEAR/.test(landing) && landing.includes(`${base}/rates`), "the landing page says both rails are accepted and links the rates");
-    expect(/## Payment \(x402, Nano\/XNO\)/.test(llms) && /## Payment in NEAR/.test(llms), "llms.txt describes both rails");
+    expect(/paid in Nano over x402/.test(landing) && !/\bNEAR\b|\bUSDC\b/.test(landing), "the primary landing page presents Nano only while backend compatibility calls still work");
+    expect(/## Payment \(x402, Nano\/XNO\)/.test(llms) && !/\bNEAR\b|\bUSDC\b/.test(llms), "the primary page’s plain-text companion describes Nano only");
   } catch (e) {
     failures.push(`simulation aborted: ${(e && e.message) || e}`);
     print(`  ✗ simulation aborted: ${(e && e.stack) || e}\n${stderr}`);
