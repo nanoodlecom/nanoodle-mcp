@@ -119,6 +119,23 @@ function startServer({ graphs = FIXTURES, outDir, env = {} } = {}) {
 
 /* ================================ tests ================================ */
 
+test("stdio forwards the same workflow execution abstraction as HTTP when progress is requested", async () => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-progress-")), srv = startServer({ outDir });
+  try {
+    const graph = { v: 1, nodes: [{ id: "arbitrary", type: "text", name: "Brief", fields: { text: "private text" } }], links: [] };
+    const result = await srv.request("tools/call", { name: "run_noodle", arguments: { graph }, _meta: { progressToken: "stdio-run" } });
+    assert.equal(result.result.isError, undefined);
+    const updates = srv.messages.filter(m => m.method === "notifications/progress");
+    assert.ok(updates.length >= 3);
+    assert.ok(updates.every(m => m.params.progressToken === "stdio-run"));
+    const snapshots = updates.map(m => m.params._meta["com.nanoodle/workflow"]);
+    assert.equal(snapshots[0].nodes[0].status, "pending");
+    assert.equal(snapshots.at(-1).nodes[0].status, "done");
+    assert.equal(snapshots.at(-1).status, "succeeded");
+    assert.doesNotMatch(JSON.stringify(snapshots), /private text/);
+  } finally { await srv.close(); }
+});
+
 test("full handshake: initialize → initialized → tools/list → tools/call", async () => {
   const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-out-"));
   const srv = startServer({ outDir });

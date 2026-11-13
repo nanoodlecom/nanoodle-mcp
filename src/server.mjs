@@ -19,6 +19,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 
 export const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
@@ -139,7 +140,16 @@ export function serveMcp({
   const write = (msg) => output.write(JSON.stringify(msg) + "\n");
   const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
   const handle = async (msg) => {
-    const response = await dispatch(msg);
+    const token = msg?.params?._meta?.progressToken;
+    let progress = 0;
+    const announce = (message, workflow) => write({ jsonrpc: "2.0", method: "notifications/progress", params: {
+      progressToken: token, progress: ++progress, message, ...(workflow ? { _meta: { [WORKFLOW_META_KEY]: workflow } } : {}),
+    } });
+    const ctx = token === undefined ? null : {
+      report() {}, announce,
+      workflow: state => announce(workflowMessage(state), state),
+    };
+    const response = await dispatch(msg, ctx);
     if (response) write(response);
   };
 

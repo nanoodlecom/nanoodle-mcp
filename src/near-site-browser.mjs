@@ -1,7 +1,10 @@
+import { WORKFLOW_META_KEY } from "./workflow-progress.mjs";
+import { renderWorkflow, displayAmount } from "./workflow-view.mjs";
 let rpcId = 0;
-export async function callMcp(name, args, { onProgress = () => {}, fetch: request = globalThis.fetch } = {}) {
+export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch } = {}) {
+  const id = ++rpcId;
   const response = await request("/mcp", { method: "POST", headers: { "Content-Type": "application/json", Accept: args._payment_id ? "text/event-stream" : "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }) });
+    body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args, ...(args._payment_id ? { _meta: { progressToken: `studio:${id}` } } : {}) } }) });
   if (!response.ok) throw new Error(`The server could not complete this request (${response.status}).`);
   const unwrap = message => { if (message.error) throw new Error(message.error.message); return message.result; };
   if (!response.headers.get("content-type")?.includes("text/event-stream")) return unwrap(await response.json());
@@ -15,7 +18,11 @@ export async function callMcp(name, args, { onProgress = () => {}, fetch: reques
       if (!data) continue;
       const message = JSON.parse(data);
       if (message.id != null && ("result" in message || message.error)) { const result = unwrap(message); await reader.cancel(); return result; }
-      if (message.params?.message) onProgress(message.params.message);
+      if (message.method === "notifications/progress") {
+        if (message.params?.message) onProgress(message.params.message);
+        const workflow = message.params?._meta?.[WORKFLOW_META_KEY];
+        if (workflow?.v === 1 && Array.isArray(workflow.nodes) && Array.isArray(workflow.links)) onWorkflow(workflow);
+      }
     }
     if (done) break;
   }
@@ -57,10 +64,13 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
         try {
           const view = await status(session.payment);
           session.view = view;
-          if (["expired", "rejected", "failed"].includes(view.status)) { session.phase = "finished"; changed(session); break; }
-          if (["paid", "settled"].includes(view.status) && !session.result) {
+          if (view.workflow) session.workflow = view.workflow;
+          if (view.receipt) session.receipt = view.receipt;
+          if (view.status === "expired") { session.phase = "finished"; changed(session); break; }
+          if (["paid", "settled", "rejected", "failed"].includes(view.status) && !session.result) {
             session.phase = "running"; changed(session);
-            const result = await rpc(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); } });
+            const result = await rpc(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); },
+              onWorkflow: workflow => { session.workflow = workflow; changed(session); } });
             if (result.isError && !result.structuredContent?.receipt) throw new Error((result.content || []).map(c => c.text || "").join("\n"));
             session.result = result; session.message = "";
           }
@@ -87,11 +97,18 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
       try {
         const previous = JSON.parse(storage?.getItem("nanoodle-near-studio:v1") || "[]");
         if (!Array.isArray(previous)) return;
+        const restored = [];
         for (const session of previous.slice(-10)) {
           if (!session?.payment || session.payment.payTo !== config.merchant || !/^nq_[A-Za-z0-9_-]+$/.test(session.payment.paymentId)
             || !session.args || typeof session.args !== "object" || !["run_noodle", ...config.tools.map(t => t.name)].includes(session.name)) continue;
-          sessions.push(session); update(session, sessions); void monitor(session);
+          restored.push(session);
         }
+        sessions.push(...restored);
+        // Reconnect to the latest open run, rather than showing an older paid
+        // result while a newer workflow silently continues in the background.
+        const current = [...restored].reverse().find(s => s.phase !== "finished") || restored.at(-1);
+        if (current) update(current, sessions);
+        for (const session of restored) void monitor(session);
       } catch {}
     },
   };
@@ -108,7 +125,7 @@ function mount(root) {
     { id: "topic", type: "text", name: "Topic", fields: { text: "" } },
     { id: "writer", type: "llm", fields: { model: "meta-llama/llama-3.3-70b-instruct", system: "Reply with one vivid sentence about the topic.", maxTokens: 48 } },
   ], links: [{ id: "topic-writer", from: { node: "topic", port: "text" }, to: { node: "writer", port: "prompt" } }] };
-  let mode = "saved", selected = null, quoting = false, renderedResult = null;
+  let mode = "saved", selected = null, quoting = false, renderedResult = null, renderedWorkflow = null, workflowDisplayKey = null;
   const safeUrl = value => {
     const url = new URL(value, location.origin), canonical = new URL(config.publicBase).origin;
     if (![location.origin, canonical].includes(url.origin) || !["http:", "https:"].includes(url.protocol)) throw new Error("Unexpected payment URL.");
@@ -119,25 +136,57 @@ function mount(root) {
     node("studio-history").replaceChildren();
     for (const item of sessions) {
       const button = document.createElement("button"); button.type = "button";
+      button.setAttribute("aria-pressed", String(item === selected));
       button.textContent = `${item.name.replace(/[-_]/g, " ")} · ${item.payment.asset || "NEAR"} · ${item.phase}`;
       button.addEventListener("click", () => { selected = item; render(item, sessions); }); node("studio-history").append(button);
     }
     if (session !== selected) return;
     node("studio-empty").hidden = true; node("studio-payment").hidden = false;
     const p = session.payment, receipt = session.receipt || session.result?.structuredContent?.receipt;
-    node("studio-quoted-tool").textContent = session.name.replace(/[-_]/g, " ");
+    const title = session.name === "run_noodle" ? "Your workflow" : config.tools.find(t => t.name === session.name)?.title || session.name.replace(/[-_]/g, " ");
+    node("studio-quoted-tool").textContent = title;
+    const stage = receipt ? receipt.outcome === "succeeded" ? "Complete" : "Run failed" : session.phase === "waiting" ? "Awaiting payment" : session.phase === "running" ? "Running workflow" : "Quote expired";
+    node("studio-stage").textContent = stage;
+    node("studio-stage").dataset.phase = receipt ? receipt.outcome === "succeeded" ? "done" : "error" : session.phase;
     node("studio-amount").textContent = `${p.amount ?? p.amountNear} ${p.asset || "NEAR"}`;
-    node("studio-breakdown").textContent = `Estimated model cost $${session.pricing?.estimatedCost?.usd ?? "—"} + 20% service fee. You can never be charged more than this deposit. Unused ${p.asset || "NEAR"} returns to the paying account.`;
+    node("studio-deposit").hidden = session.phase !== "waiting";
+    node("studio-breakdown").textContent = `Estimated models $${session.pricing?.estimatedCost?.usd ?? "—"} + 20% service fee. Unused funds return automatically.`;
     node("studio-pay").href = safeUrl(p.payUrl); node("studio-pay").hidden = session.phase !== "waiting";
-    node("studio-status").textContent = session.message || (receipt
-      ? `${receipt.outcome === "succeeded" ? "Done." : "Run finished."} Charged ${receipt.charged.amount ?? receipt.charged.near} ${p.asset || "NEAR"}. Refund ${receipt.refund.amount ?? receipt.refund.near} ${p.asset || "NEAR"}: ${receipt.refund.status}.`
-      : session.phase === "waiting" ? "Waiting for your wallet payment. No model has run yet." : session.phase === "running" ? "Payment received. Working on your result—do not pay again." : `Quote ${session.view?.status || "finished"}. No new payment was requested.`);
+    const refundStatus = receipt?.refund?.status;
+    const refundMessage = refundStatus === "sent" ? "Change returned to your wallet." : refundStatus === "pending" ? "Returning your unused deposit…" : refundStatus === "skipped" ? "No change is due." : `Refund status: ${refundStatus}.`;
+    node("studio-status").textContent = receipt
+      ? `${receipt.outcome === "succeeded" ? "Your result is ready." : "This run did not complete."} ${refundMessage}`
+      : session.message || (session.phase === "waiting" ? "Pay the exact deposit in your wallet to start." : session.phase === "running" ? "Payment confirmed. Preparing your workflow…" : `Quote ${session.view?.status || "finished"}.`);
+    node("studio-payment-note").hidden = session.phase !== "waiting";
+    node("studio-totals").hidden = !receipt;
+    if (receipt) {
+      for (const [id, amount] of [["paid", receipt.deposit], ["charged", receipt.charged], ["returned", receipt.refund]]) {
+        const exact = amount?.amount ?? amount?.near ?? "0";
+        node(`studio-total-${id}`).textContent = `${displayAmount(exact)} ${p.asset || "NEAR"}`;
+        node(`studio-total-${id}`).title = `${exact} ${p.asset || "NEAR"} (exact)`;
+      }
+      node("studio-refund-state").textContent = receipt.refund.status === "sent" ? "Back in your wallet" : receipt.refund.status === "pending" ? "Returning to your wallet…" : receipt.refund.status === "skipped" ? "No change due" : `Refund ${receipt.refund.status}`;
+    }
+    node("studio-workflow").hidden = !session.workflow;
+    if (session.workflow) {
+      if (renderedWorkflow !== session.workflow) { renderWorkflow(node("studio-workflow-graph"), session.workflow); renderedWorkflow = session.workflow; }
+      const wf = session.workflow, finished = wf.nodes.filter(n => ["done", "skipped", "gated", "error"].includes(n.status)).length;
+      const displayKey = `${p.paymentId}:${!!wf.finishedAt}`;
+      if (workflowDisplayKey !== displayKey) { node("studio-workflow").open = !wf.finishedAt; workflowDisplayKey = displayKey; }
+      node("studio-workflow-count").textContent = `${finished} / ${wf.nodes.length} steps finished`;
+      const elapsed = Math.max(0, Math.floor(((wf.finishedAt || Date.now()) - wf.startedAt) / 1000));
+      node("studio-elapsed").textContent = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
+    }
     node("studio-result").hidden = !session.result;
     if (session.result) {
       const text = resultText(session.result);
       const newOutput = renderedResult !== session.result;
       if (newOutput) {
-        node("studio-output").textContent = text; node("studio-output").hidden = !text;
+        // Media already has a player/preview and download action. Keep its raw
+        // URL in details rather than repeating it in the main result.
+        const readable = text.split("\n").filter(line => !/^[^\n]*https?:\/\/[^\s]+\/out\/[^\s]+$/.test(line.trim())).join("\n").trim();
+        node("studio-output").textContent = readable; node("studio-output").hidden = !readable;
+        node("studio-raw-output").textContent = text;
         node("studio-media").replaceChildren(); renderedResult = session.result;
       }
       node("studio-receipt").textContent = JSON.stringify(receipt, null, 2);
@@ -155,14 +204,15 @@ function mount(root) {
           else { preview.controls = true; preview.preload = "metadata"; }
           node("studio-media").append(preview);
         }
-        a.href = resultUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = "Open result ↗";
+        a.href = resultUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = media ? "Download result ↗" : "Open result ↗";
         node("studio-output-links").append(a);
       }
+      node("studio-transactions").replaceChildren();
       for (const [label, leg] of [["Payment", receipt?.deposit], ["Refund", receipt?.refund]]) {
         if (!leg?.explorerUrl) continue;
         const url = new URL(leg.explorerUrl);
         if (!["https:", "http:"].includes(url.protocol)) continue;
-        const a = document.createElement("a"); a.href = url.href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = `${label} transaction ↗`; node("studio-output-links").append(a);
+        const a = document.createElement("a"); a.href = url.href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = `${label} transaction ↗`; node("studio-transactions").append(a);
       }
     }
   }
@@ -221,5 +271,11 @@ function mount(root) {
   const command = () => node("connect-client").value === "url" ? `${config.publicBase}/mcp` : `${node("connect-client").value} mcp add --transport http nanoodle ${config.publicBase}/mcp`;
   node("connect-client").addEventListener("change", () => { node("connect-command").textContent = command(); });
   node("connect-copy").addEventListener("click", async () => { try { await navigator.clipboard.writeText(command()); node("connect-copy").textContent = "Copied"; } catch { node("connect-copy").textContent = "Select the command to copy"; } });
+  setInterval(() => {
+    const wf = selected?.workflow;
+    if (!wf || selected.phase !== "running" || wf.finishedAt) return;
+    const seconds = Math.max(0, Math.floor((Date.now() - wf.startedAt) / 1000));
+    node("studio-elapsed").textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  }, 1000);
   studio.restore();
 }

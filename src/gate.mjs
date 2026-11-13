@@ -1237,7 +1237,7 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args });
+              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args }, ctx);
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.

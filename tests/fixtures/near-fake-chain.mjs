@@ -375,7 +375,7 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
-export function nanoGptMock() {
+export function nanoGptMock({ beforeChat = async () => {} } = {}) {
   let chatRuns = 0;
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
@@ -392,6 +392,7 @@ export function nanoGptMock() {
     if (method === "GET" && p === "/api/v1/image-models") return json(200, { data: WORKED_CATALOGS.image });
     if (method === "GET" && /^\/api\/v1\/(video|audio|3d)-models$/.test(p)) return json(200, { data: [] });
     if (method === "POST" && p === "/api/v1/chat/completions") {
+      await beforeChat();
       chatRuns++;
       chatBodies.push(body);
       const prompt = JSON.stringify(body && body.messages);
