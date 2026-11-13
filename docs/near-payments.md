@@ -311,6 +311,21 @@ The payment quote exposes `payment.authorPayout` before the customer pays.
 
 ## Browser studio
 
+The private `/pay/<paymentId>` page follows the complete run, using the same
+graph, receipt and result renderer as the studio. Its `?run=1` event subscription
+continues through payment, node execution and refund settlement. Reopening the
+page attaches to the current snapshot and reads the existing result; it never
+starts a workflow or requests another payment.
+
+`GET /near/result/<paymentId>` is a read-only result endpoint: 202 while the run
+is unfinished, 200 with the existing MCP result and receipt after settlement,
+404 for an unknown id. The unguessable private payment link grants read access
+to that run's output, so keep it private. Responses use `no-store`; pay pages
+send no referrer. Paid text remains in memory and is not recoverable after a
+server restart. Persisted media links remain recoverable while the files exist.
+The default agent payment watcher still closes on payment so agents can resume
+their bound MCP call immediately; the browser's optional run watcher is separate.
+
 **https://near.nanoodle.com** presents Nanoodle on NEAR and offers NEAR or USDC
 only when enabled. Ready-made workflows have editable named inputs; the custom
 tab accepts graph JSON and text inputs. Getting a quote never executes a model.

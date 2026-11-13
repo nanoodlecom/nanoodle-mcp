@@ -704,6 +704,11 @@ export function createNearGate({
 
   function waitForPayment(id, timeoutMs = 25_000, { signal } = {}) {
     if (signal?.aborted || paymentView(id)?.status !== "pending") return Promise.resolve();
+    return waitForUpdate(id, timeoutMs, { signal });
+  }
+
+  function waitForUpdate(id, timeoutMs = 25_000, { signal, previous } = {}) {
+    if (signal?.aborted || previous != null && JSON.stringify(paymentView(id)) !== previous) return Promise.resolve();
     return new Promise((resolve) => {
       const set = waiters.get(id) || new Set();
       waiters.set(id, set);
@@ -749,7 +754,7 @@ export function createNearGate({
       if (prepError) throw prepError;
       res = await registry.callTool(prepared.run, {
         ...ctx,
-        workflow(state) { workflows.set(q.id, state); ctx?.workflow?.(state); },
+        workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
       });
     } catch (e) {
       const msg = String((e && e.message) || e);
@@ -947,5 +952,9 @@ export function createNearGate({
       assets: new Set(["near", ...(usdcEnabled ? ["usdc"] : [])]) };
   }
 
-  return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment, pendingQuotes, observeTransfer };
+  return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment, waitForUpdate, pendingQuotes, observeTransfer,
+    // The private payment URL is also the capability to read this paid result.
+    // This getter never runs a workflow, accepts payment or changes settlement.
+    result(id) { const q = ledger.getQuote(id); return q && FINAL.has(q.status) ? replay(q) : null; },
+  };
 }

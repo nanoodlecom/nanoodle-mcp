@@ -41,6 +41,7 @@ import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { runViewHtml, RUN_VIEW_CSS } from "./run-view.mjs";
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
@@ -589,17 +590,18 @@ function nearPayPageHtml(q) {
   return htmlPage(`Pay in ${asset} · nanoodle on NEAR`, `
     <a class="pay-brand" href="/">nanoodle <span class="muted">on NEAR</span></a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
-      <h1>Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · NEAR ${esc(q.network)}</p>
-      <div class="card">
-        <h2>Deposit ${esc(amount)} ${asset}</h2>
+      <h1 id="near-title">Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · NEAR ${esc(q.network)}</p>
+      <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
+      <details class="card" id="near-deposit" open>
+        <summary>Maximum deposit <strong>${esc(amount)} ${asset}</strong></summary>
         <p>You pay the model cost + 20%. Unused ${asset} returns to the wallet that pays. A failed run refunds the whole deposit.</p>
         <p class="muted">Send on <strong>${esc(q.network)}</strong> to:</p><code>${esc(q.payTo)}</code>
         ${asset === "USDC" ? `<p class="muted">Circle-issued USDC on NEAR · six decimals. Network gas is paid separately in NEAR.</p>` : ""}
         <p><button id="near-pay" type="button">Connect wallet &amp; pay</button></p>
-        <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
         <p id="near-error" role="alert"></p>
-      </div>
-      <details><summary>Already paid with another wallet?</summary>
+      </details>
+      ${runViewHtml("pay")}
+      <details id="near-manual"><summary>Already paid with another wallet?</summary>
         <p>Send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The server detects the payment automatically. You can also confirm its transaction here.</p>
         <form id="near-confirm">
           <p><label>Your NEAR account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
@@ -607,9 +609,9 @@ function nearPayPageHtml(q) {
           <button type="submit">Confirm payment</button>
         </form>
       </details>
-      <p class="muted">Keep this page open. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
+      <p class="muted" id="near-note">Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="${scriptUrls["near-wallet.js"]}"></script>
-  `, PAGE_CSS + `@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--brand-font-sans),system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--brand-font-mono),monospace;margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;background:linear-gradient(105deg,#99a5ff,#e7a4d3);color:#0b0d12;font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:2px solid #d7ff3f;outline-offset:3px}`, `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">`);
+  `, PAGE_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--brand-font-sans),system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--brand-font-mono),monospace;margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;background:linear-gradient(105deg,#99a5ff,#e7a4d3);color:#0b0d12;font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:2px solid #d7ff3f;outline-offset:3px}`, `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">`);
 }
 
 function payPageHtml(q) {
@@ -977,10 +979,21 @@ export async function serveHttp({
         if (!q) return send(404, htmlPage("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
+        res.setHeader("X-Robots-Tag", "noindex, nofollow");
         return send(200, id.startsWith("nq_") ? nearPayPageHtml(q) : payPageHtml(q), "text/html; charset=utf-8");
       }
 
       const statusMatch = url.pathname.match(/^\/(x402|near)\/status\/([^/]+)$/);
+      const resultMatch = url.pathname.match(/^\/near\/result\/([^/]+)$/);
+      if (resultMatch && nearGate) {
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        res.setHeader("X-Robots-Tag", "noindex, nofollow");
+        const id = decodeURIComponent(resultMatch[1]), q = nearGate.quote(id);
+        if (!q) return send(404, JSON.stringify({ error: "Unknown or expired payment" }));
+        const result = nearGate.result(id);
+        return result ? send(200, JSON.stringify(result)) : send(202, JSON.stringify({ status: q.status }));
+      }
       const statusGate = statusMatch?.[1] === "near" ? nearGate : gate;
       if (statusMatch && statusGate) {
         const id = decodeURIComponent(statusMatch[2]);
@@ -1014,6 +1027,8 @@ export async function serveHttp({
       const watchMatch = url.pathname.match(/^\/(x402|near)\/watch\/([^/]+)$/);
       const watchGate = watchMatch?.[1] === "near" ? nearGate : gate;
       if (watchMatch && watchGate) {
+        const followRun = watchMatch[1] === "near" && url.searchParams.get("run") === "1";
+        const runDone = q => ["settled", "failed", "rejected", "expired", "unknown"].includes(q?.status) && q?.receipt?.refund?.status !== "pending";
         const id = decodeURIComponent(watchMatch[2]);
         if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: "too many open streams — poll /x402/status instead" }));
         res.writeHead(200, {
@@ -1029,7 +1044,7 @@ export async function serveHttp({
         // done + next so the agent knows how to access the result stream after close.
         const frame = (q) => {
           if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
-          if (watchMatch[1] === "near") return q;
+          if (watchMatch[1] === "near") return followRun ? { ...q, done: runDone(q) } : q;
           const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
           if (q.done) { f.done = true; if (q.next) f.next = q.next; }
           return f;
@@ -1052,9 +1067,10 @@ export async function serveHttp({
           // the client leaves. Each wait resolves on the shared watcher firing
           // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
           // dropped connection be noticed and cleaned up.
-          const deadline = watchMatch[1] === "near" ? Date.parse(q?.expiresAt) : Date.now() + 20 * 60 * 1000;
-          while (alive && q && q.status === "pending" && Date.now() < deadline) {
-            await watchGate.waitForPayment(id, 25_000, { signal: stop.signal });
+          const deadline = followRun ? Date.now() + 20 * 60 * 1000 : watchMatch[1] === "near" ? Date.parse(q?.expiresAt) : Date.now() + 20 * 60 * 1000;
+          while (alive && q && (followRun ? !runDone(q) : q.status === "pending") && Date.now() < deadline) {
+            if (followRun) await watchGate.waitForUpdate(id, q.receipt ? 2000 : 25_000, { signal: stop.signal, previous: JSON.stringify(q) });
+            else await watchGate.waitForPayment(id, 25_000, { signal: stop.signal });
             if (!alive) break;
             q = watchGate.quote(id);
             if (q) sse("status", frame(q));

@@ -4,14 +4,14 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
 const source = (await readFile(new URL("../src/near-pay-browser.mjs", import.meta.url), "utf8"))
-  .replace('import { NearConnector } from "@hot-labs/near-connect";', "");
+  .replace(/^import .*;$/gm, "");
 
 function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null, asset = {}, finalStatus = "paid" } = {}) {
   const payment = { paymentId: "nq_test", status: "pending", network: "testnet", payTo: "merchant.testnet", amountYocto: "12345678901234567890123", ...asset };
   const state = { ...payment };
   const events = new Map();
   const elements = new Map();
-  for (const id of ["#near-payment", "#near-pay", "#near-status", "#near-error", "#near-confirm"]) {
+  for (const id of ["#near-payment", "#near-pay", "#near-status", "#near-error", "#near-confirm", "#near-title", "#near-deposit", "#near-manual", "#near-note"]) {
     elements.set(id, { dataset: { payment: JSON.stringify(payment) }, textContent: "", elements: { senderId: { value: "" }, txHash: { value: "" } },
       addEventListener: (name, fn) => events.set(`${id}:${name}`, fn) });
   }
@@ -28,6 +28,9 @@ function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = n
       }
     },
     EventSource: class { addEventListener() {} close() {} },
+    createRunView: () => ({ render() {}, elapsed() {} }),
+    monitorPaymentRun: ({ initial, update }) => update(initial, null),
+    setInterval() {},
     fetch: async (url, args) => {
       if (args?.method === "POST") {
         confirmed.push(JSON.parse(args.body)); state.status = finalStatus;
