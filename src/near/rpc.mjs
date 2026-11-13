@@ -131,9 +131,9 @@ const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"])
 /**
  * The same client over several endpoints, tried in order with failover.
  *
- * There is no node to run: the server never listens to the chain. It looks up
- * the one transaction a caller names, so any RPC it trusts will do, and a
- * second one covers the first being down or rate limiting.
+ * Verification and the shared finalized-block payment watcher use this pool.
+ * No node or external indexer is required. An additional endpoint covers the
+ * first being down or rate limiting.
  *
  *  - A call moves to the next endpoint only on a transport failure (RPC_HTTP,
  *    including rate limits; RPC_TIMEOUT; RPC_BAD_RESPONSE). An answer, including

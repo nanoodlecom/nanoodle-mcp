@@ -603,6 +603,29 @@ export function createNearGate({
     });
   }
 
+  function pendingQuotes() {
+    const t = now();
+    return ledger.quotes().filter((q) => ["pending", "expired"].includes(q.status) && t <= q.expiresAt + expiredRetainMs);
+  }
+
+  /** Discovered receipts are only hints: verify FINAL, then match an exact quote. */
+  async function observeTransfer(txHash, senderId) {
+    if (ledger.consumedBy(txHash)) return;
+    let transfer;
+    try {
+      transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
+    } catch (e) {
+      if (["NOT_A_SINGLE_TRANSFER", "WRONG_RECEIVER", "TX_FAILED"].includes(e.code)) return;
+      throw e; // finality/RPC failures retry the same finalized block
+    }
+    const q = pendingQuotes().find((q) => q.amountYocto === transfer.amountYocto.toString()
+      && transfer.blockTimeMs >= q.createdAt);
+    if (q) {
+      const result = await confirmPayment(q.id, txHash, senderId);
+      if (result.error && result.status === "pending") throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
+    }
+  }
+
   function waitForPayment(id, timeoutMs = 25_000, { signal } = {}) {
     if (signal?.aborted || paymentView(id)?.status !== "pending") return Promise.resolve();
     return new Promise((resolve) => {
@@ -829,5 +852,5 @@ export function createNearGate({
     return { listTools, callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]) };
   }
 
-  return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment };
+  return { wrapRegistry, resume, quote: paymentView, confirmPayment, waitForPayment, pendingQuotes, observeTransfer };
 }

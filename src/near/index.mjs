@@ -15,4 +15,5 @@ export {
   COINGECKO_RATES_URL, MAX_SPREAD_BPS, createNearRates, parseSpreadBps, spreadPair, ratioDecimal, bpsPercent,
 } from "./rates.mjs";
 export { createRefunder } from "./refunds.mjs";
+export { createNearWatcher } from "./watch.mjs";
 export { NEAR_NETWORKS, explorerTxUrl, explorerAccountUrl } from "./explorer.mjs";

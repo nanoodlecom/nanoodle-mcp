@@ -69,6 +69,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     sendTxCount: 0,
   };
 
+  let lastBlockHash = rid();
   function newBlock(timeMs) {
     const hash = rid();
     const ns = BigInt(Math.round(timeMs)) * 1_000_000n;
@@ -77,7 +78,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
       header: {
         height: ++height,
         hash,
-        prev_hash: rid(),
+        prev_hash: lastBlockHash,
         timestamp: Number(ns), // the RPC sends this as an unsafe JSON number; clients must use timestamp_nanosec
         timestamp_nanosec: ns.toString(),
         chunks_included: 1,
@@ -85,6 +86,8 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
       chunks: [],
     };
     blocks.set(hash, block);
+    blocks.set(block.header.height, block);
+    lastBlockHash = hash;
     return block;
   }
   let head = newBlock(now());
@@ -179,6 +182,21 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
         return rpcError(id, "UNKNOWN_TRANSACTION", `Transaction ${params && params.tx_hash} doesn't exist`);
       }
       return ok(id, r);
+    }
+    if (method === "EXPERIMENTAL_changes") {
+      const block = blocks.get(params.block_id);
+      if (!block) return rpcError(id, "UNKNOWN_BLOCK", "unknown block");
+      const changes = [...txs.values()].filter((tx) => tx.transaction_outcome.block_hash === block.header.hash
+        && params.account_ids.includes(tx.transaction.receiver_id)).map((tx) => ({
+        cause: { type: "receipt_processing", receipt_hash: tx.receipts_outcome[0].id },
+        type: "account_update", change: { account_id: tx.transaction.receiver_id },
+      }));
+      return ok(id, { block_hash: block.header.hash, changes });
+    }
+    if (method === "EXPERIMENTAL_receipt_to_tx") {
+      const tx = [...txs.values()].find((tx) => tx.receipts_outcome.some((r) => r.id === params.receipt_id));
+      return tx ? ok(id, { transaction_hash: tx.transaction.hash, sender_account_id: tx.transaction.signer_id })
+        : rpcError(id, "UNKNOWN_RECEIPT", "unknown receipt");
     }
     if (method === "query") {
       const acct = accounts.get(params.account_id);

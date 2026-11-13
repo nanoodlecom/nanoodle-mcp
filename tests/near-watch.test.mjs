@@ -1,0 +1,71 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createNearWatcher, createNearRpc, openNearLedger, NearError } from "../src/near/index.mjs";
+import { createFakeChain } from "./fixtures/near-fake-chain.mjs";
+
+async function world() {
+  let time = Date.now() - 60_000;
+  const chain = createFakeChain({ now: () => time });
+  chain.addAccount("merchant.testnet", 10n ** 24n);
+  chain.addAccount("payer.testnet", 10n ** 24n);
+  const file = join(await mkdtemp(join(tmpdir(), "near-watch-")), "state.json");
+  const ledger = openNearLedger({ file, network: "testnet", merchant: "merchant.testnet" });
+  const rpc = createNearRpc({ url: "http://chain.fake", fetch: chain.fetch });
+  const observed = [];
+  let pending = [];
+  const opts = { rpc, ledger, merchantId: "merchant.testnet", pendingQuotes: () => pending,
+    observeTransfer: async (hash, sender) => { observed.push({ hash, sender }); }, schedule: () => null };
+  return { chain, ledger, rpc, observed, opts,
+    quote: () => { time += 1000; pending = [{ createdAt: time }]; },
+    pay: () => { time += 1000; return chain.transfer("payer.testnet", "merchant.testnet", 123n, { blockTimeMs: time }); },
+  };
+}
+
+test("native RPC watcher discovers transfers without a caller tx hash and checkpoints across restart", async () => {
+  const w = await world();
+  const watcher = createNearWatcher(w.opts); await watcher.start();
+  w.quote(); const tx = w.pay(); await watcher.tick();
+  assert.deepEqual(w.observed, [{ hash: tx, sender: "payer.testnet" }]);
+  assert.equal(watcher.status().listening, true);
+  watcher.stop();
+  const restarted = createNearWatcher(w.opts); await restarted.start();
+  assert.equal(w.observed.length, 1, "a persisted cursor does not redeliver a block");
+  const next = w.pay(); await restarted.tick();
+  assert.equal(w.observed.at(-1).hash, next); restarted.stop();
+});
+
+test("a failed receipt lookup or gate confirmation retries the same block, without losing a payment", async () => {
+  const w = await world(); let reject = true;
+  const watcher = createNearWatcher({ ...w.opts, observeTransfer: async (hash, sender) => {
+    if (reject) throw new NearError("RPC_UNAVAILABLE", "temporary failure");
+    w.observed.push({ hash, sender });
+  } });
+  await watcher.start(); const before = w.ledger.getMeta("paymentWatch").height;
+  w.quote(); const tx = w.pay(); await watcher.tick();
+  assert.equal(w.ledger.getMeta("paymentWatch").height, before);
+  assert.equal(watcher.status().listening, false);
+  reject = false; await watcher.tick();
+  assert.equal(watcher.status().listening, true);
+  assert.equal(w.observed[0].hash, tx); watcher.stop();
+});
+
+test("a first startup with old quotes backfills final receipts instead of missing a transfer", async () => {
+  const w = await world(); w.quote(); const tx = w.pay();
+  const watcher = createNearWatcher(w.opts); await watcher.start();
+  assert.deepEqual(w.observed, [{ hash: tx, sender: "payer.testnet" }]);
+  assert.equal(watcher.status().backfilling, false); watcher.stop();
+});
+
+test("unquoted top-ups are not interpreted as jobs", async () => {
+  const w = await world(); const watcher = createNearWatcher(w.opts); await watcher.start();
+  w.pay(); await watcher.tick();
+  assert.equal(w.observed.length, 0); watcher.stop();
+});
+
+test("malformed durable cursor fails closed", async () => {
+  const w = await world(); w.ledger.setMeta("paymentWatch", { height: "not a height" });
+  assert.throws(() => createNearWatcher(w.opts), (e) => e.code === "STATE_UNREADABLE");
+});

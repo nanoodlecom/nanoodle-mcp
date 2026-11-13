@@ -72,6 +72,7 @@ const ASSETS = {
   "/righteous-latin-ext.woff2": "font/woff2",
   "/near-wallet.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
+  "/near-setup.js": "text/javascript; charset=utf-8",
 };
 const ICON_LINKS =
   `<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">` +
@@ -559,7 +560,7 @@ function nearPayPageHtml(q) {
         <p id="near-error" role="alert"></p>
       </div>
       <details><summary>Already paid with another wallet?</summary>
-        <p>Send exactly <code>${esc(q.amountNear)}</code> NEAR in one native transfer, then confirm its transaction here.</p>
+        <p>Send exactly <code>${esc(q.amountNear)}</code> NEAR in one native transfer. The server detects the payment automatically. You can also confirm its transaction here.</p>
         <form id="near-confirm">
           <p><label>Your NEAR account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
           <p><label>Transaction hash <input name="txHash" required autocomplete="off"></label></p>
@@ -568,6 +569,23 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted">Keep this page open. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="/near-wallet.js"></script>
+  `);
+}
+
+function nearSetupPageHtml(setup) {
+  const config = { merchant: setup.merchant, network: setup.network, publicKey: setup.publicKey };
+  return htmlPage("Authorize NEAR refunds · nanoodle", `
+    <a href="/">nanoodle-mcp</a><h1>Enable NEAR payments and change</h1>
+    <div id="near-setup" data-setup="${esc(JSON.stringify(config))}">
+      <div class="card"><h2>Merchant: ${esc(setup.merchant)}</h2>
+        <p>Payments go to this account on ${esc(setup.network)}. The server needs a signing key to return unused NEAR automatically.</p>
+        <p>Authorize this server public key:</p><code>${esc(setup.publicKey)}</code>
+        <p><strong>Permission: Full Access.</strong> This gives the server control of this account, including transfers and key management. Use an account dedicated to Nanoodle. Your existing wallet key stays in place.</p>
+        <p><button id="near-authorize" type="button">Authorize refund key in Meteor Wallet</button></p>
+        <p id="near-setup-status" role="status" aria-live="polite">Checking authorization…</p>
+        <p id="near-setup-error" role="alert"></p>
+      </div>
+    </div><script type="module" src="/near-setup.js"></script>
   `);
 }
 
@@ -679,6 +697,8 @@ export async function serveHttp({
   instructions,
   gate = null,
   nearGate = null,
+  nearSetup = null,
+  nearWatcher = null,
   paymentNote = null,
   rates = null,
   toolInfo = [],
@@ -863,6 +883,20 @@ export async function serveHttp({
         const force = ["1", "true", "yes"].includes(url.searchParams.get("refresh") || "");
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
         return res.end(JSON.stringify(await rates.view({ refresh: force }), null, 2));
+      }
+      if (url.pathname === "/setup" && nearSetup) {
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        return send(200, nearSetupPageHtml(nearSetup), "text/html; charset=utf-8");
+      }
+      if (url.pathname === "/setup/status" && nearSetup) {
+        res.setHeader("Cache-Control", "no-store");
+        const authorized = await nearSetup.authorized();
+        return send(200, JSON.stringify({ merchant: nearSetup.merchant, network: nearSetup.network, authorized, active: !!nearGate }));
+      }
+      if (url.pathname === "/near/health" && nearSetup) {
+        res.setHeader("Cache-Control", "no-store");
+        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearSetup.merchant, network: nearSetup.network, active: !!nearGate, watcher: nearWatcher?.status() || null }));
       }
 
       if (url.pathname === "/version") {

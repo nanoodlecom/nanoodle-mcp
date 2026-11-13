@@ -147,6 +147,29 @@ test("NEAR mode refuses unsafe configurations at startup", { timeout: 60_000 }, 
   }
 });
 
+test("a native wallet transfer is discovered automatically and unblocks the MCP payment stream", { timeout: 30_000 }, async () => {
+  const { graphsDir, outDir } = await fixtureDirs();
+  const chain = createFakeChain(); const key = await throwawayNearKey();
+  chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
+  chain.addAccount("payer.testnet", parseNearToYocto("2"));
+  const nano = nanoGptMock(); await chain.listen(); await nano.listen();
+  const port = await freePort();
+  const srv = await startServer({ graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: key.secretKey, port });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const client = mcpClient(base); const args = { Idea: "a lighthouse at dawn" };
+    const q = await client.call("idea-poster", args); const p = q.structuredContent.payment;
+    const stream = await fetch(p.watchUrl); const frames = stream.text();
+    chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto), { blockTimeMs: Date.now() + 1 });
+    assert.match(await frames, /"status":"paid"/);
+    const result = await client.call("idea-poster", { ...args, _payment_id: p.paymentId });
+    assert.equal(result.structuredContent.receipt.refund.status, "sent");
+    const health = await (await fetch(base + "/near/health")).json();
+    assert.equal(health.watcher.listening, true);
+    assert.equal((await (await fetch(base + "/setup/status")).json()).authorized, true);
+  } finally { await srv.kill(); await chain.close(); await nano.close(); }
+});
+
 /** Start the bin with both rails and wait until it serves; resolves { stderr(), kill }. */
 async function startDual({ graphsDir, outDir, port, nearRpc, nanoRpc, nanoUrl, secretKey, nearPort }) {
   const child = spawn(process.execPath, [
@@ -291,6 +314,12 @@ test("both rails: a dead first NEAR RPC fails over; a broken NEAR setup leaves N
       const disabledNear = mcpClient(`http://127.0.0.1:${disabledNearPort}`);
       assert.deepEqual(await disabledNear.list(), [], "unavailable NEAR endpoint must expose no runnable workflows");
       assert.equal((await disabledNear.call("run_noodle", { graph: WORKED_GRAPH })).isError, true, "NEAR failure must not make workflow execution free");
+      const disabledBase = `http://127.0.0.1:${disabledNearPort}`;
+      const setupPage = await (await fetch(disabledBase + "/setup")).text();
+      assert.match(setupPage, /Permission: Full Access/);
+      assert.ok(setupPage.includes(other.publicKey));
+      assert.ok(!setupPage.includes(other.secretKey), "only the public refund key is exposed");
+      assert.equal((await (await fetch(disabledBase + "/setup/status")).json()).authorized, false);
     } finally { await srv.kill(); }
   } finally {
     await chain.close();

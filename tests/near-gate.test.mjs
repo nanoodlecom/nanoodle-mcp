@@ -107,6 +107,24 @@ test("wallet confirmation persists across restart and retains transaction reuse 
   assert.equal(result.structuredContent.receipt.outcome, "succeeded");
 });
 
+test("a discovered exact transfer is accepted automatically; top-ups and older transfers are not jobs", async () => {
+  const w = await world();
+  const q = await call(w, "idea-poster", INPUTS);
+  const p = q.structuredContent.payment;
+  const topup = w.chain.transfer(PAYER, MERCHANT, 10n ** 23n);
+  await w.gate.observeTransfer(topup, PAYER);
+  assert.equal(w.gate.quote(p.paymentId).status, "pending");
+  assert.equal(w.ledger.consumedBy(topup), null);
+  const old = w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto), { blockTimeMs: Date.now() - 1000 });
+  await w.gate.observeTransfer(old, PAYER);
+  assert.equal(w.gate.quote(p.paymentId).status, "pending");
+  const tx = w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto), { blockTimeMs: Date.now() + 1 });
+  await w.gate.observeTransfer(tx, PAYER);
+  assert.equal(w.gate.quote(p.paymentId).status, "paid");
+  const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(result.structuredContent.receipt.refund.status, "sent");
+});
+
 test("wallet confirmation refunds wrong and late transfers without running a model", async () => {
   for (const late of [false, true]) {
     const w = await world();

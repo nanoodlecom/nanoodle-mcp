@@ -995,7 +995,7 @@ should send from its key.
 |---|---|---|---|
 | `--near-merchant <account>` | `NEAR_MERCHANT` | off | Turns NEAR mode on. Needs `--serve`. With `--charge-usd` too, the server accepts either rail per call (below). |
 | `--near-network testnet\|mainnet` | `NEAR_NETWORK` | `testnet` | Network to verify payments and send refunds on. |
-| `--near-rpc <url[,url]>` | `NEAR_RPC_URL` | fastnear's public RPC, then near.org's | RPC endpoint(s) you trust to report finality, tried in order with failover. No node of your own is needed: the server looks up the one transaction each caller names. |
+| `--near-rpc <url[,url]>` | `NEAR_RPC_URL` | fastnear's public RPC, then near.org's | RPC endpoint(s) you trust to report finality, tried in order with failover. The shared watcher detects exact transfers through finalized account changes and receipt-to-transaction lookup; no node or indexer is needed. |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key: `ed25519:…` in the env, or a JSON key file with `account_id`, `public_key` and `private_key` (legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes). near-cli-rs key files have no `account_id`; use `NEAR_PRIVATE_KEY` for those. Never accepted on argv, never logged. |
 | `--near-usd <n>` | `NEAR_USD` (env or `--env-file`) | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
 | `--xno-usd <n>` | | live (NanoGPT x402 invoices, else CoinGecko) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet; informational with an API key. |
@@ -1143,8 +1143,8 @@ neither are the built-in tools.
   absorbs the rest.
 - Text results stay in memory only; a replay after a restart returns the receipt
   and says the text was not kept.
-- Wallet payments have a pay page and monitoring stream. A transfer sent outside
-  that page must be confirmed with its sender and hash.
+- Wallet payments have a pay page and monitoring stream. Exact transfers are
+  detected automatically through RPC; unmatched payments need explicit confirmation.
 - A transfer for a quote that expired more than an hour earlier is not refunded
   automatically (the quote is gone); the operator sees it in the merchant account.
 - The NEAR→XNO swap rate is derived from two USD rates and the server never swaps; the

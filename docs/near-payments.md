@@ -139,6 +139,43 @@ Agents with their own signing wallet can still pay directly with
 NEAR-to-Nano swap: NEAR is received and refunded natively; the existing Nano
 float pays model invoices.
 
+### Automatic transfer detection
+
+One shared watcher polls finalized NEAR blocks every two seconds. While quotes
+are outstanding it checks only the merchant's account changes, resolves receipt
+IDs with `EXPERIMENTAL_receipt_to_tx`, and runs the same FINAL payment verifier.
+An exact amount matching a quote is accepted automatically; the caller does not
+need to paste a transaction hash. A payment must be in a block created after
+its quote for automatic matching. A late exact payment for a retained quote is
+refunded in full. An unmatched top-up is not treated as a workflow purchase.
+Wrong-amount payments can still be confirmed explicitly for a full refund.
+
+The processed block cursor is durable. RPC failures leave it unchanged and
+retry with backoff; restarts catch up, and an existing quote is backfilled when
+the watcher is first introduced. Re-reading a receipt cannot spend twice: the
+payment gate keeps the consumed transaction hashes. `GET /near/health` reports
+the watcher cursor and status without exposing workflow inputs.
+
+The RPC must support `EXPERIMENTAL_changes` and `EXPERIMENTAL_receipt_to_tx`
+(including receipt-to-transaction tracking). Public FastNEAR RPC was checked
+read-only on mainnet on 2026-11-13. An RPC without those methods leaves automatic
+detection unavailable; the payment page's explicit confirmation remains usable.
+
+### Authorize the merchant refund key
+
+For an existing named merchant such as `nanoodle.near`, open `/setup` on the
+NEAR endpoint. The page displays the exact account, public server key, network
+and Full Access permission. The owner connects Meteor Wallet and approves one
+`AddKey` transaction on that account. It does not remove the existing wallet
+key or request its seed phrase/private key.
+
+Full Access controls the entire merchant account; it is necessary for plain
+native NEAR refund transfers, which function-call keys cannot sign. Use a
+dedicated merchant account. The server's private refund key remains in its
+existing protected environment file. `/setup/status` checks the public key on
+chain; restart the service once authorized. No paid workflows are offered on
+the NEAR listener until this verification succeeds.
+
 ## Pricing vocabulary
 
 Every price the server shows uses these terms, with the same meaning in
@@ -774,9 +811,10 @@ client parses integers exactly and uses `timestamp_nanosec`, which is a string.
 
 ### The RPC: no node of your own
 
-The server never listens to the chain. A caller names the one transaction that pays its
-quote, and the server looks that transaction up (`tx` with `wait_until: FINAL`, then its
-block). So it needs a JSON-RPC endpoint, not a node, an indexer or a websocket.
+The server watches finalized account changes over RPC and resolves incoming
+receipts to their original transactions. It verifies each candidate with `tx`
+at `FINAL` and its block before matching the exact quoted amount. A caller can
+also present a hash directly. No node, external indexer or websocket is needed.
 
 `--near-rpc` takes one or more endpoints, tried in order:
 
@@ -873,7 +911,8 @@ These are deliberate cuts for this version.
 - Built-in tools (`subnano_comment`, `sfw_check`, `humanize-comment`) are not sold in
   NEAR mode.
 - The NEAR pay page connects a wallet rather than using a universal payment QR code.
-  A transfer sent outside that page must be confirmed with its sender and hash.
+  Exact transfers sent outside that page are detected by the shared RPC watcher;
+  an unmatched amount needs explicit confirmation to associate it with a quote.
 - With both rails on one server, a NanoGPT max-cost refund to the shared Nano wallet is a
   receive like any caller payment; the Nano gate matches receives by amount, so such a
   refund can in rare cases match an open Nano quote's amount. This is the same exposure the

@@ -1,8 +1,9 @@
 # Brand assets
 
-`near-wallet.js` is the NEAR payment page's browser bundle. Rebuild it with
+`near-wallet.js` is the NEAR payment page's browser bundle; `near-setup.js`
+handles the merchant owner's explicit Meteor refund-key approval. Rebuild both with
 `npm ci && npm run build:near-wallet`. Its source is `src/near-pay-browser.mjs`;
-it includes NEAR Connect 0.12.0 (MIT, HOT Labs), pinned as a build dependency.
+they include NEAR Connect 0.12.0 (MIT, HOT Labs), pinned as a build dependency.
 The Node server keeps its existing two runtime dependencies. Wallet discovery
 and wallet executors come from NEAR Connect's upstream manifest; the payer's
 private keys stay in their wallet. Attribution is in `near-wallet.LICENSE.txt`.
