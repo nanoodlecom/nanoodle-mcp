@@ -25,7 +25,8 @@ async function landingImgSrcs() {
     const page = await fetch(base + "/");
     assert.equal(page.status, 200);
     const html = await page.text();
-    const srcs = [...html.matchAll(/<img\b[^>]*?\bsrc="([^"]*)"/g)].map(m => m[1].replace(/&amp;/g, "&"));
+    const srcs = [...html.matchAll(/<img\b[^>]*?\bsrc="([^"]*)"|<video\b[^>]*?\bposter="([^"]*)"/g)].map(m => (m[1] || m[2]).replace(/&amp;/g, "&"));
+    const videos = [...html.matchAll(/<source\b[^>]*?\bsrc="([^"]*)"/g)].map(m => m[1]);
     const local = [];
     for (const src of srcs.filter(s => new URL(s, PUBLIC_BASE + "/").origin === PUBLIC_BASE)) {
       const url = new URL(src, PUBLIC_BASE + "/");
@@ -33,17 +34,20 @@ async function landingImgSrcs() {
       local.push({ src, status: res.status, type: res.headers.get("content-type") });
       await res.arrayBuffer();
     }
-    return { html, srcs, local };
+    for (const src of videos) {
+      const res = await fetch(base + src, { method: "HEAD" });
+      assert.equal(res.status, 200); assert.equal(res.headers.get("content-type"), "video/mp4");
+    }
+    return { html, srcs, local, videos };
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
 }
 
 test("landing page images are same-origin or on media.nanoodle.com", async () => {
-  const { html, srcs, local } = await landingImgSrcs();
-  // favicon + the receipts hero + six sample previews (sing has no preview;
-  // neon-shrine-duel, storyboard-relay and tiny-world-film have no example)
-  assert.equal(srcs.length, 9, `expected favicon, seven previews and the official 255labs lockup, got ${JSON.stringify(srcs)}`);
+  const { html, srcs, local, videos } = await landingImgSrcs();
+  assert.equal(srcs.length, 10, `expected brand images and image/video posters, got ${JSON.stringify(srcs)}`);
+  assert.deepEqual(videos.sort(), ["/examples/idea-to-3d-model.mp4", "/examples/neon-shrine-duel.mp4"]);
   assert.ok(srcs.includes("https://media.nanoodle.com/subnano/2026-10-21-song-to-music-video/poster.webp"));
   for (const src of srcs) {
     const origin = new URL(src, PUBLIC_BASE + "/").origin;
@@ -59,7 +63,7 @@ test("landing page images are same-origin or on media.nanoodle.com", async () =>
 test("landing page media images return 200, an image type and no same-origin CORP", { skip: OFFLINE && "NANOODLE_OFFLINE=1" }, async () => {
   const { srcs } = await landingImgSrcs();
   const media = srcs.filter(src => new URL(src, PUBLIC_BASE + "/").origin === MEDIA_ORIGIN);
-  assert.equal(media.length, 7, `expected 7 media images, got ${JSON.stringify(media)}`);
+  assert.equal(media.length, 6, `expected 6 media images, got ${JSON.stringify(media)}`);
   for (const src of media) {
     const res = await fetch(src, { method: "HEAD", headers: { Origin: PUBLIC_BASE }, signal: AbortSignal.timeout(15000) });
     assert.equal(res.status, 200, `${src} -> ${res.status}`);

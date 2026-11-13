@@ -67,7 +67,7 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       assert.ok(html.includes(`id="${name}"`));
       if (["deslop", "sing"].includes(name)) assert.ok(!html.includes(`examples/gallery/${name}/preview`));
       else if (["image-model-arena", "photo-to-video", "talking-avatar"].includes(name)) assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
-      else if (name === "idea-to-3d-model") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
+      else if (name === "idea-to-3d-model") assert.ok(html.includes('poster="/examples/idea-to-3d-model.png"'));
       else if (name === "mix-the-references") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else assert.ok(html.includes(`https://nanoodle.com/examples/gallery/${name}/preview.webp`));
       if (name === "sing") {

@@ -24,6 +24,14 @@ const WORKFLOW_EXAMPLES = {
   "edit-a-photo": reviewedSample("edit-a-photo", "A bottle image edit with its source and instruction documented in the sample. The shape remains recognizable; compare any markings that must survive an edit of your own product.", "Reviewed bottle image edit result"),
   "combine-images": reviewedSample("combine-images", "A bottle and a mug-on-desk source image combined into one plausible scene. The sample includes both inputs; exact product fidelity needs a separate comparison.", "Bottle combined with a mug-on-desk source image"),
   "photo-to-video": reviewedSample("photo-to-video", "A short tea-on-a-desk animation. Sampled frames retained the mug while steam moved. This thumbnail is one frame; the example does not establish a seamless loop.", "Frame from a generated tea-on-a-desk video"),
+  "neon-shrine-duel": {
+    title: "Watch the 5-second result",
+    play: "https://nanoodle.com/examples/gallery/#neon-shrine-duel",
+    preview: "/examples/neon-shrine-duel.webp",
+    video: "/examples/neon-shrine-duel.mp4",
+    alt: "A fox-masked sword dancer and chrome-armored fighter clash beneath a neon shrine gate",
+    description: "One scene idea becomes an anime action shot: GLM writes the still and motion prompts, Anima makes the opening frame, and MiniMax H3 Max animates it. This recorded sample runs for five seconds.",
+  },
   "omni-flash-turntable": reviewedSample("omni-flash-turntable", "A 360p draft camera orbit around a generated bottle with coherent geometry in the reviewed clip. This thumbnail is one frame; open the sample to inspect the motion.", "Frame from a generated water-bottle product video"),
   "deslop": reviewedSample("deslop", "A repair-booking announcement rewritten in plain language while retaining the supplied facts. Compare the source and result in the sample; this is an editorial workflow, not an authorship detector."),
   "render-a-mockup": reviewedSample("render-a-mockup", "A repair-shop dashboard concept with the requested navigation, date, three appointment rows, names, statuses and totals. This is a rendered screen concept; implementation and interaction are separate work.", "Repair-shop dashboard concept with three appointment rows"),
@@ -37,7 +45,8 @@ const WORKFLOW_EXAMPLES = {
   },
   "idea-to-3d-model": {
     ...reviewedSample("idea-to-3d-model", "One line becomes a textured 3D model: a teal-and-cream wind-up toy submarine with a brass periscope, portholes, a wind-up key and a striped tail. GLM writes the concept, Muse paints it, and TRELLIS.2 turns that one picture into a GLB that holds up from every side. The viewer shades it flatter than the concept, and the thin key and propeller blades go soft at some angles.", "Concept render and 3D turntable of a teal wind-up toy submarine"),
-    preview: "https://media.nanoodle.com/mcp/examples/idea-to-3d-model.webp",
+    preview: "/examples/idea-to-3d-model.png",
+    video: "/examples/idea-to-3d-model.mp4",
     title: "3D sample",
   },
   "mix-the-references": {

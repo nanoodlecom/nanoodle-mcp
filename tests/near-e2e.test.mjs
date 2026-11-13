@@ -392,6 +392,14 @@ test("USDC over real HTTP: custom and saved workflows detect token payments, exe
   const base = `http://127.0.0.1:${nearPort}`, mcp = mcpClient(base);
   try {
     const health = await (await fetch(base + "/near/health")).json(); assert.equal(health.usdc.enabled, true);
+    const llms = await (await fetch(base + "/llms.txt")).text();
+    const init = await (await fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "initialize", params: {} }) })).json();
+    for (const text of [llms, init.result.instructions]) {
+      assert.match(text, /Agent quickstart: NEAR and USDC on NEAR/);
+      for (const field of ["amountYocto", "amountAtomic", "tokenContract", "ft_transfer", "_payment_id", "progressToken"]) assert.ok(text.includes(field));
+      assert.match(text, /do not wait for a follow-up/);
+    }
     const primaryLanding = await (await fetch(`http://127.0.0.1:${port}/`)).text();
     assert.match(primaryLanding, /paid in Nano over x402/);
     assert.doesNotMatch(primaryLanding, /\bNEAR\b|\bUSDC\b/, "the Nano page describes only Nano payments");

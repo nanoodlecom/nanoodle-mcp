@@ -37,6 +37,8 @@
  */
 import http from "node:http";
 import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
+import { nearShowcase } from "./near-showcase.mjs";
+import { nearAgentGuide } from "./near/agent-guide.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -73,6 +75,10 @@ const ASSETS = {
   "/apple-touch-icon.png": "image/png",
   "/icon-512.png": "image/png",
   "/og.jpg": "image/jpeg",
+  "/examples/neon-shrine-duel.webp": "image/webp",
+  "/examples/neon-shrine-duel.mp4": "video/mp4",
+  "/examples/idea-to-3d-model.png": "image/png",
+  "/examples/idea-to-3d-model.mp4": "video/mp4",
   "/righteous-latin.woff2": "font/woff2",
   "/righteous-latin-ext.woff2": "font/woff2",
   "/near-wallet.js": "text/javascript; charset=utf-8",
@@ -265,32 +271,33 @@ function authorCount(toolInfo) {
 }
 
 
-function workflowExampleHtml(name) {
+function workflowExampleHtml(name, description) {
   const example = workflowExample(name);
   if (!example) return "";
   return `<div class="example"><p><strong>${example.skill ? "Made with this skill: " : ""}${esc(example.title)}</strong></p>` +
-    (example.preview ? `<a href="${esc(example.play)}"><img src="${esc(example.preview)}" alt="${esc(example.alt || example.title)}" loading="lazy"></a>` : "") +
-    `<p class="muted">${esc(example.description)}</p>` +
+    (example.video ? `<video controls playsinline preload="none" poster="${esc(example.preview)}" aria-label="${esc(example.alt || example.title)}"><source src="${esc(example.video)}" type="video/mp4"></video>` : example.preview ? `<a href="${esc(example.play)}"><img src="${esc(example.preview)}" alt="${esc(example.alt || example.title)}" loading="lazy"></a>` : "") +
+    `<p class="muted">${esc(description || example.description)}</p>` +
     `<p><a href="${esc(example.play)}">See sample</a>` +
     (example.skill ? ` · <a href="${esc(example.skill)}">give your agent the skill</a>` : "") + `</p></div>`;
 }
 
-function sampleCall(name) {
-  return { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} } };
+function sampleCall(name, graph) {
+  return { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: graph ? "run_noodle" : name, arguments: graph ? { graph, inputs: {} } : {} } };
 }
 
-function workflowSampleHtml(name, sample) {
+function workflowSampleHtml(name, sample, graph) {
   if (!sample) return "";
   return `<details class="sample"><summary>Try the included sample</summary>` +
     `<p><strong>${esc(sample.label)}:</strong> ${esc(sample.text)}</p>` +
     `<p class="muted">Send this MCP call after connecting. It uses the saved inputs and requests a paid generation.</p>` +
-    `<pre>${esc(JSON.stringify(sampleCall(name), null, 2))}</pre></details>`;
+    `<pre>${esc(JSON.stringify(sampleCall(name, graph), null, 2))}</pre></details>`;
 }
 
 function landingHtml({ name, version, listTools, publicBase, charged, toolInfo = [], costs = {}, paymentNote = null, near = false, usdc = null, merchant = null, network = null }) {
   if (charged) { near = false; paymentNote = null; }
   const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
-  const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
+  const showcase = near && !charged ? nearShowcase(tools, toolInfo) : null;
+  const infoByName = new Map((showcase?.info || toolInfo).map((t) => [t.name, t]));
   const authored = authorCount(toolInfo);
   const cmds = connectCmds(publicBase);
   const cmd = cmds.claude;
@@ -301,7 +308,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     // and a 404 /graph/<tool>.json.
     const links = info && info.editorUrl && info.rawText
       ? `<span class="links"><a href="${esc(info.editorUrl)}">open in editor</a>` +
-        ` · <a href="/graph/${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>`
+        ` · <a href="${info.graph ? "/examples/" : "/graph/"}${esc(encodeURIComponent(t.name))}.json">graph JSON</a></span>`
       : "";
     const author = info && info.x402 && info.x402.author
       ? `<p class="muted">author payout: <code>${esc(info.x402.author)}</code></p>` : "";
@@ -317,19 +324,20 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
      * shared payment contract lives once above the grid, not on every card —
      * agents still get the full per-tool contract via tools/list and /llms.txt.
      */
-    const chips = card.steps.map((s) =>
+    const stages = copy?.steps || card.steps;
+    const chips = stages.map((s) =>
       `<span class="chip k-${esc(s.kind)}">${esc(s.n > 1 ? `${s.label}×${s.n}` : s.label)}</span>`
     ).join(`<span class="arr">→</span>`);
     const cost = renderCost(costs[t.name]);
     return `<li class="tool" id="${esc(t.name)}">` +
       `<div class="thead"><span class="tname">${esc(copy?.title || toolTitle(t.name))}</span><code class="tid">${esc(t.name)}</code></div>` +
       `<p class="intent">${esc(copy?.intent || card.intent || t.description)}</p>` +
-      (card.steps.length ? `<div class="chain">${chips}</div>` : "") +
-      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${choose}${workflowSampleHtml(t.name, card.sample)}${workflowExampleHtml(t.name)}${author}</li>`;
+      (stages.length ? `<div class="chain">${chips}</div>` : "") +
+      `<div class="tfoot"><span class="cost">${esc(cost)}</span>${links}</div>${choose}${workflowSampleHtml(t.name, card.sample, info.graph)}${workflowExampleHtml(t.name, copy?.sampleDescription)}${author}</li>`;
   };
   const cards = tools.map(cardHtml).join("");
   if (near && !charged) {
-    const templates = tools.filter(t => !["run_noodle", "price_noodle", "noodle_guide"].includes(t.name));
+    const templates = showcase.tools;
     const page = nearSitePage({ version, publicBase, merchant, network, tools: templates, usdc, scriptUrl: scriptUrls["near-site.js"],
       cards: templates.map(t => cardHtml(t, nearWorkflowCopy[t.name], true).replace(/last run \$/g, "last model cost $")).join(""),
       notes: receiptsHtml({ toolNames: templates.map(t => t.name), compact: true }) });
@@ -477,7 +485,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
 }
 
 /** The landing page's story as plain text — the version an agent should read. */
-function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null, near = false }) {
+function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null, near = false, usdc = null, network = "mainnet" }) {
   if (charged) { near = false; paymentNote = null; }
   const authored = authorCount(toolInfo);
   const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
@@ -486,7 +494,7 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
     `# ${name} v${version}`,
     ``,
     near && !charged
-      ? `Public MCP server: AI workflows paid per call in native NEAR, with automatic NEAR refunds — built with nanoodle (https://nanoodle.com).`
+      ? `Public MCP server: AI workflows paid per call in ${usdc?.enabled ? "NEAR or Circle-issued USDC on NEAR" : "native NEAR"}, with automatic same-asset refunds — built with nanoodle (https://nanoodle.com).`
       : charged
       ? `Public MCP server: AI workflows (image, video, audio, text) paid per call in Nano over x402 — built with nanoodle (https://nanoodle.com).`
       : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
@@ -496,13 +504,11 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
     `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
     ``,
   ];
-  if (near) lines.push(
-    `NEAR payment flow: show payment.payUrl to the user and immediately open payment.watchUrl (SSE), or poll payment.statusUrl?wait=1.`,
-    `The user connects a NEAR wallet and approves the exact deposit on the pay page. Once the monitor closes with status paid and done:true, call the original tool with the same arguments plus _payment_id. No transaction hash needs to be copied from the user.`,
-    `Agents with a wallet can also pay directly and supply _payment_id, _payment_tx and _payment_sender.`,
-    `Unused NEAR returns to the transaction signer automatically. A failed run refunds the whole deposit. The shared Nano wallet funds the model provider.`,
-    ``,
-  );
+  if (near) {
+    lines.push(nearAgentGuide({ publicBase, usdc: !!usdc?.enabled, network }));
+    const custom = nearShowcase(tools, toolInfo).tools.find(t => t.graph);
+    if (custom) lines.push(`Featured ready-made template: ${custom.name}. GET ${publicBase}/examples/${custom.name}.json, then pass that JSON as graph to price_noodle and run_noodle, with inputs and your selected _pay_with. The template uses priced provider defaults.`, ``);
+  }
   if (charged) {
     lines.push(
       `## Payment (x402, Nano/XNO)`,
@@ -901,7 +907,7 @@ export async function serveHttp({
       }
 
       if (url.pathname === "/llms.txt") {
-        return send(200, llmsTxt({ name, version, listTools: publicTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate }), "text/plain; charset=utf-8");
+        return send(200, llmsTxt({ name, version, listTools: publicTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate, usdc, network: nearHealth?.network }), "text/plain; charset=utf-8");
       }
 
       if (url.pathname === "/rates" && rates) {
@@ -916,6 +922,12 @@ export async function serveHttp({
 
       if (url.pathname === "/version") {
         return send(200, JSON.stringify({ name, version, commit: sha }));
+      }
+
+      if (nearGate && !gate && url.pathname === "/examples/idea-to-3d-model.json") {
+        const template = nearShowcase(publicTools(), toolInfo).tools.find(t => t.graph && t.name === "idea-to-3d-model");
+        if (!template) return send(404, JSON.stringify({ error: "workflow not mounted" }));
+        return send(200, JSON.stringify(template.graph));
       }
 
       if (ASSETS[url.pathname]) {
