@@ -67,6 +67,18 @@ export function createNearWatcher({
     if (!pendingQuotes().length) {
       if (state.height !== height || state.backfill) save({ height, hash: latest.header.hash, backfill: null });
     } else {
+      // After a long outage, keep new payments live while recovering older
+      // quotes newest-first. Rewalking a range is safe: the gate durably
+      // consumes each payment hash before execution.
+      if (height - state.height > maxBlocksPerTick) {
+        const cutoffMs = Math.min(...pendingQuotes().map(q => q.createdAt), state.backfill?.cutoffMs ?? Infinity);
+        await inspect(latest);
+        remaining--;
+        save({ height, hash: latest.header.hash, backfill: {
+          nextHash: latest.header.prev_hash,
+          cutoffMs,
+        } });
+      }
       let nextHeight = state.height + 1;
       while (nextHeight <= height && remaining-- > 0) {
         let block;
@@ -84,7 +96,7 @@ export function createNearWatcher({
         nextHeight++;
       }
       // Backfill runs newest-first without delaying live transfers at the tip.
-      let budget = maxBlocksPerTick;
+      let budget = Math.max(0, remaining);
       while (state.backfill && budget-- > 0) {
         const block = await rpc.block({ blockId: state.backfill.nextHash });
         if (block.header.hash !== state.backfill.nextHash) throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher backfill block mismatch");

@@ -189,6 +189,17 @@ The temporary payer's remaining balance was returned to the merchant and its
 account was closed. This verifies one real run; failure/restart scenarios remain
 covered by local chain/provider simulations.
 
+A real Circle USDC custom run was also verified on mainnet on 2026-11-13:
+[0.010358 USDC payment](https://nearblocks.io/txns/GQtma288xJxXafx7pM6E2Tm3CRTQLj8vqTB9iT22FN3b),
+automatic discovery without submitting a hash, one text workflow using the same
+Nano funding pool, a charge of 0.000015 USDC, and
+[0.010343 USDC returned to the payer](https://nearblocks.io/txns/DcX8qB65MPa9gCti3Qk1ucVbvKURPb9dcnZo9dvCzjhr)
+at FINAL. A repeated call returned the same refund receipt without another run
+or refund. The first discovery was delayed by public RPC rate limiting; the
+service recovered from its durable cursor after switching to verified dRPC with
+FASTNEAR fallback. Public requests are paced. A long outage prioritizes new
+finalized transfers while older pending quotes backfill within the same scan budget.
+
 ## USDC on NEAR
 
 The hosted endpoint accepts **Circle-issued USDC** alongside native NEAR. Operators

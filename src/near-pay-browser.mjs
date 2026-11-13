@@ -1,5 +1,5 @@
 // Built into assets/near-wallet.js by npm run build:near-wallet. Wallet keys
-// stay in the selected wallet; this page only requests one native transfer.
+// stay in the selected wallet; this page requests one NEAR or USDC transfer.
 import { NearConnector } from "@hot-labs/near-connect";
 
 const root = document.querySelector("#near-payment");
@@ -23,13 +23,14 @@ const remember = (value) => {
 
 function render(state) {
   current = state;
+  const asset = quote.asset === "USDC" ? "USDC" : "NEAR";
   const messages = {
     pending: "Ready to pay. Approve the deposit in your NEAR wallet.",
     paid: "Payment confirmed. Your agent is continuing — no further payment needed.",
     running: "Payment confirmed. Your workflow is running.",
-    settled: "Complete. Unused NEAR is returned to the wallet that paid.",
+    settled: `Complete. Unused ${asset} is returned to the wallet that paid.`,
     failed: "The run failed. Your deposit is being refunded to the wallet that paid.",
-    rejected: "This payment could not buy the run. Received NEAR is being refunded.",
+    rejected: `This payment could not buy the run. Received ${asset} is being refunded.`,
     expired: "This quote expired. Ask your agent for a fresh quote.",
     unknown: "Unknown payment. Ask your agent for a fresh quote.",
   };

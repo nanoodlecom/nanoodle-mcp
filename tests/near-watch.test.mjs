@@ -69,3 +69,40 @@ test("malformed durable cursor fails closed", async () => {
   const w = await world(); w.ledger.setMeta("paymentWatch", { height: "not a height" });
   assert.throws(() => createNearWatcher(w.opts), (e) => e.code === "STATE_UNREADABLE");
 });
+
+test("a long outage keeps new payments live while old payments backfill within one shared budget", async () => {
+  const w = await world();
+  let inspected = 0;
+  const rpc = { ...w.rpc, call: async (method, ...args) => {
+    if (method === "EXPERIMENTAL_changes") inspected++;
+    return w.rpc.call(method, ...args);
+  } };
+  const opts = { ...w.opts, rpc, maxBlocksPerTick: 3 };
+  const watcher = createNearWatcher(opts); await watcher.start(); w.quote();
+  const old = Array.from({ length: 12 }, () => w.pay());
+  await watcher.tick();
+  assert.equal(w.observed[0].hash, old.at(-1), "the newest finalized payment is checked first");
+  assert.equal(watcher.status().backfilling, true);
+  assert.ok(inspected <= 3, "live and recovery scans share the request budget");
+  const fresh = w.pay(); inspected = 0; await watcher.tick();
+  assert.ok(w.observed.some(o => o.hash === fresh), "a new payment does not wait behind the outage backlog");
+  assert.ok(inspected <= 3);
+  watcher.stop();
+  const restarted = createNearWatcher(opts); await restarted.start();
+  for (let i = 0; i < 20 && restarted.status().backfilling; i++) await restarted.tick();
+  assert.equal(restarted.status().backfilling, false);
+  for (const hash of [...old, fresh]) assert.ok(w.observed.some(o => o.hash === hash), "no payment is lost during recovery or restart");
+  restarted.stop();
+});
+
+test("accepting the last pending quote at the live tip leaves a readable recovery cursor", async () => {
+  const w = await world(); let accepted = false;
+  const watcher = createNearWatcher({ ...w.opts, maxBlocksPerTick: 1,
+    pendingQuotes: () => accepted ? [] : w.opts.pendingQuotes(),
+    observeTransfer: async () => { accepted = true; } });
+  await watcher.start(); w.quote(); w.pay(); w.pay(); await watcher.tick();
+  assert.equal(accepted, true);
+  assert.ok(Number.isFinite(w.ledger.getMeta("paymentWatch").backfill.cutoffMs));
+  watcher.stop();
+  const restarted = createNearWatcher(w.opts); await restarted.start(); restarted.stop();
+});
