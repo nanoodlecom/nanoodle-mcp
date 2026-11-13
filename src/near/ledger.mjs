@@ -58,7 +58,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
     if (e?.code !== "ENOENT") throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} could not be read`, { cause: e });
   }
   if (text === null) {
-    state = { v: 1, network, merchant, quotes: {}, consumedTx: {}, refunds: {}, meta: {} };
+    state = { v: 1, network, merchant, quotes: {}, consumedTx: {}, refunds: {}, payouts: {}, meta: {} };
   } else {
     try {
       state = JSON.parse(text);
@@ -67,10 +67,12 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
     }
     if (!isPlainObject(state) || state.v !== 1 || typeof state.network !== "string" || typeof state.merchant !== "string"
       || !isPlainObject(state.quotes) || !isPlainObject(state.consumedTx) || !isPlainObject(state.refunds)
+      || (state.payouts !== undefined && !isPlainObject(state.payouts))
       || (state.meta !== undefined && !isPlainObject(state.meta))) {
       throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} does not have the expected shape; refusing to start empty`);
     }
     state.meta ??= {};
+    state.payouts ??= {};
     if (state.network !== network || state.merchant !== merchant) {
       throw new NearError("STATE_MISMATCH",
         `NEAR state file ${file} belongs to ${state.merchant} on ${state.network}, not ${merchant} on ${network}`);
@@ -164,6 +166,27 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
     },
     refunds() {
       return Object.values(state.refunds).map(copy);
+    },
+
+    // Creator payouts are in Nano, independently of the customer's payment asset.
+    // Keep this outbox after quote pruning, like refunds and consumed hashes.
+    putPayout(payout) {
+      if (!isPlainObject(payout) || typeof payout.paymentId !== "string" || !payout.paymentId) throw new TypeError("a payout needs a paymentId");
+      assertJsonSafe(payout, "payout");
+      if (Object.hasOwn(state.payouts, payout.paymentId)) throw new NearError("DUPLICATE_ID", "a payout already exists for this payment");
+      mutate(() => { state.payouts[payout.paymentId] = copy(payout); });
+    },
+    getPayout(paymentId) {
+      return Object.hasOwn(state.payouts, paymentId) ? copy(state.payouts[paymentId]) : null;
+    },
+    updatePayout(paymentId, patch) {
+      if (!Object.hasOwn(state.payouts, paymentId)) throw new NearError("NOT_FOUND", "no payout for this payment");
+      assertJsonSafe(patch, "payout patch");
+      mutate(() => { state.payouts[paymentId] = { ...state.payouts[paymentId], ...copy(patch), paymentId }; });
+      return copy(state.payouts[paymentId]);
+    },
+    payouts() {
+      return Object.values(state.payouts).map(copy);
     },
 
     getMeta(key) {

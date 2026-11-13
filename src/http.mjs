@@ -40,7 +40,7 @@ import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
-import { constants, createReadStream, existsSync, readFileSync } from "node:fs";
+import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
@@ -79,6 +79,7 @@ const ASSETS = {
   "/examples/neon-shrine-duel.mp4": "video/mp4",
   "/examples/idea-to-3d-model.png": "image/png",
   "/examples/idea-to-3d-model.mp4": "video/mp4",
+  "/examples/sing.mp3": "audio/mpeg",
   "/righteous-latin.woff2": "font/woff2",
   "/righteous-latin-ext.woff2": "font/woff2",
   "/near-wallet.js": "text/javascript; charset=utf-8",
@@ -177,6 +178,7 @@ const LANDING_CSS = `
   .eyebrow{color:var(--accent-ink);font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;text-align:center;margin:1.5rem 0 .6rem}
   h1{font-family:"Righteous",ui-sans-serif,system-ui,sans-serif;font-weight:400;font-size:clamp(2.1rem,6vw,3.1rem);margin:0;text-align:center;letter-spacing:.01em}
   .sub{color:var(--muted);text-align:center;margin:.75rem auto 2rem;max-width:40rem}
+  .hero-links{display:flex;gap:.6rem;flex-wrap:wrap;justify-content:center;margin:-.5rem 0 1.7rem}.hero-links a{display:inline-flex;align-items:center;min-height:44px;padding:.5rem .8rem;border:1px solid #48516b;border-radius:7px;font-size:.82rem;text-decoration:none}.hero-links a:first-child{background:var(--accent);color:#0b0d12;border-color:var(--accent)}
   .connect-wrap{display:flex;flex-direction:column;gap:.65rem}
   .tabs{display:flex;justify-content:center;gap:.35rem}
   .tabs .tab{font:inherit;font-size:.82rem;padding:.5rem .95rem;border-radius:999px;border:1px solid var(--edge);
@@ -224,6 +226,7 @@ const LANDING_CSS = `
   .tool .example{border-top:1px solid var(--edge);margin-top:1rem;padding-top:.5rem;font-size:.85rem}
   .tool .example img{display:block;width:100%;height:auto;border-radius:8px;margin:.6rem 0}
   .tool .example video{display:block;width:100%;max-width:100%;border-radius:8px;background:#0b0e16;margin:.7rem 0;aspect-ratio:832/480;object-fit:contain}
+  .tool .example audio{display:block;width:100%;max-width:38rem;margin:1rem 0;border-radius:8px}
   .tool .sample{font-size:.85rem;border-top:1px solid var(--edge);margin:.7rem 0;padding-top:.7rem}
   .tool .sample summary{cursor:pointer;color:var(--accent-ink)}
   .tool .sample pre{white-space:pre-wrap;overflow-wrap:anywhere}
@@ -276,6 +279,7 @@ function workflowExampleHtml(name, description) {
   const example = workflowExample(name);
   if (!example) return "";
   return `<div class="example"><p><strong>${example.skill ? "Made with this skill: " : ""}${esc(example.title)}</strong></p>` +
+    (example.audio ? `<audio controls preload="none" aria-label="Play ${esc(example.title)}"><source src="${esc(example.audio)}" type="audio/mpeg"></audio>` : "") +
     (example.video ? `<video controls playsinline preload="none" poster="${esc(example.preview)}" aria-label="${esc(example.alt || example.title)}"><source src="${esc(example.video)}" type="video/mp4"></video>` : example.preview ? `<a href="${esc(example.play)}"><img src="${esc(example.preview)}" alt="${esc(example.alt || example.title)}" loading="lazy"></a>` : "") +
     `<p class="muted">${esc(description || example.description)}</p>` +
     `<p><a href="${esc(example.play)}">See sample</a>` +
@@ -348,7 +352,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
   const desc = near
     ? "AI workflows paid in native NEAR with automatic change — image, video, audio, and text pipelines. Connect your wallet, pay a deposit, and receive unused NEAR back on chain."
     : charged
-    ? "AI workflows paid in Nano over x402 — image, video, audio, and text pipelines behind one MCP endpoint. No account, no API key."
+    ? "Give your agents new abilities with x402. Run or build AI workflows over MCP, pay per call in Nano, and earn as a workflow author. Open source."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
   const ogHead =
     `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">` +
@@ -372,12 +376,13 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <a class="brand" href="/"><img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span></a><span class="v">v${esc(version)}</span>
       <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
     </header>
-    <p class="eyebrow">public MCP server</p>
-    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "AI workflows, paid in Nano over x402." : "AI media workflows over MCP."}</h1>
-    <p class="sub">Image, video, audio, and text pipelines behind one MCP endpoint.
+    <p class="eyebrow">${charged ? "Open source · MCP + x402 · Nano" : "public MCP server"}</p>
+    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents new abilities." : "AI media workflows over MCP."}</h1>
+    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect Nanoodle over MCP, then let your agent discover workflows and pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
       ${charged || near ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
-    <div class="connect-wrap">
+    ${charged ? `<p class="hero-links"><a href="#connect">Connect your agent ↓</a><a href="https://nanoodle.com">Build a workflow ↗</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">View source ↗</a></p>` : ""}
+    <div id="connect" class="connect-wrap">
       <div class="tabs" role="tablist" aria-label="MCP client">
         <button type="button" class="tab on" role="tab" aria-selected="true" data-client="claude" onclick="selectClient(this)">Claude</button>
         <button type="button" class="tab" role="tab" aria-selected="false" data-client="grok" onclick="selectClient(this)">Grok</button>
@@ -934,13 +939,28 @@ export async function serveHttp({
       if (ASSETS[url.pathname]) {
         const path = join(ASSET_DIR, url.pathname.slice(1)); // pathname is an exact static allowlist key
         if (!existsSync(path)) return send(404, JSON.stringify({ error: "not found" }));
-        res.writeHead(200, {
+        const size = statSync(path).size, media = /^(audio|video)\//.test(ASSETS[url.pathname]);
+        let start = 0, end = size - 1, partial = false;
+        if (media && req.method === "GET" && req.headers.range) {
+          const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
+          if (match && (match[1] || match[2])) {
+            start = match[1] ? Number(match[1]) : Math.max(0, size - Number(match[2]));
+            end = match[1] && match[2] ? Math.min(size - 1, Number(match[2])) : size - 1;
+            partial = Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && start <= end && start < size && (match[1] || Number(match[2]) > 0);
+          }
+          if (!partial) { res.writeHead(416, { "Content-Range": `bytes */${size}`, "Content-Length": "0" }); return res.end(); }
+        }
+        res.writeHead(partial ? 206 : 200, {
           "Content-Type": ASSETS[url.pathname],
+          "Content-Length": String(end - start + 1),
+          ...(media ? { "Accept-Ranges": "bytes" } : {}),
+          ...(partial ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
           "Access-Control-Allow-Origin": "*",
           "Cache-Control": url.pathname.endsWith(".js") && !url.searchParams.has("v") ? "no-cache" : "public, max-age=86400",
         });
         if (req.method === "HEAD") return res.end();
-        return createReadStream(path).on("error", () => res.destroy()).pipe(res);
+        pipeline(createReadStream(path, { start, end }), res, () => {});
+        return;
       }
 
       const graphMatch = url.pathname.match(/^\/graph\/([^/]+)\.json$/);

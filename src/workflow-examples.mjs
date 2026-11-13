@@ -36,8 +36,10 @@ const WORKFLOW_EXAMPLES = {
   "deslop": reviewedSample("deslop", "A repair-booking announcement rewritten in plain language while retaining the supplied facts. Compare the source and result in the sample; this is an editorial workflow, not an authorship detector."),
   "render-a-mockup": reviewedSample("render-a-mockup", "A repair-shop dashboard concept with the requested navigation, date, three appointment rows, names, statuses and totals. This is a rendered screen concept; implementation and interaction are separate work.", "Repair-shop dashboard concept with three appointment rows"),
   "sing": {
-    ...reviewedSample("sing", "A 170-second generated closing-credits song. Gemini 3.8 Flash reported clear gentle acoustic vocals and a chorus matching the supplied lyrics. This sample was recorded with MiniMax Music 3, before the tool moved to Mureka 9.5. This is model-assisted audio review, not human listening sign-off."),
-    title: "Audio sample",
+    title: "Audio sample · Singularity · 3:28",
+    play: "https://mcp.nanoodle.com/examples/sing.mp3",
+    audio: "/examples/sing.mp3",
+    description: "A song about the singularity, made with this workflow: lyrics and arrangement, then Mureka 9.5. Play the recorded result here for free; generating your own song is a separate paid run.",
   },
   "talking-avatar": {
     ...reviewedSample("talking-avatar", "A fictional presenter reads a short workshop introduction. Sampled frames preserve the presenter; check precise lip-sync timing in playback. Generation can take several minutes.", "Frame from a fictional presenter's workshop introduction"),

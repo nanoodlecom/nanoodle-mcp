@@ -11,7 +11,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock } from "nanocurrency";
+import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock } from "nanocurrency";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +28,70 @@ const FRONTIER = "B".repeat(64);
 const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
+
+test("durable Nano payouts journal before publishing and recover a lost response after other pool spending", async () => {
+  const blocks = new Map(); let unavailable = true, journal;
+  const mock = fakeRpc({
+    process(body, state, reply) {
+      const hash = hashBlock(body.block);
+      if (blocks.has(hash)) return reply({ error: "Old block" });
+      assert.ok(journal || body.block.link_as_account === ADDRESS, "payout must be journaled first");
+      assert.equal(body.block.previous, state.frontier);
+      blocks.set(hash, body.block); state.frontier = hash; state.balance = body.block.balance;
+      state.processed.push(body); return reply({ hash });
+    },
+    block_info(body, state, reply) {
+      if (unavailable) return { ok: false, status: 503, text: async () => "unavailable" };
+      return blocks.has(body.hash) ? reply({ confirmed: "true", contents: blocks.get(body.hash) }) : reply({ error: "Block not found" });
+    },
+  });
+  const make = () => createNanoWallet({ secretKey: SECRET, fetch: mock.fetch });
+  const wallet = make(), options = { onPrepared: p => { journal = structuredClone(p); } };
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options), /HTTP 503/);
+  assert.ok(journal); assert.equal(mock.state.processed.length, 1);
+  await wallet.ops.transfer(ADDRESS, "1", "provider payment");
+  assert.equal(mock.state.processed.length, 2);
+  unavailable = false;
+  const restarted = make();
+  const hash = await restarted.ops.transferOnce(PAY_TO, AMOUNT, { ...options, prepared: journal });
+  assert.equal(hash, journal.hash); assert.equal(mock.state.processed.length, 2);
+  assert.equal(BigInt(mock.state.balance), BigInt(BALANCE) - BigInt(AMOUNT) - 1n);
+});
+
+test("a durable Nano send is replaced only when a different successor is confirmed", async () => {
+  const competing = "D".repeat(64), blocks = new Map(); let confirmed = false, journal, signed = 0;
+  const mock = fakeRpc({
+    process(body, state, reply) {
+      if (body.block.previous === FRONTIER) {
+        state.frontier = competing; state.balance = (BigInt(BALANCE) - 1n).toString();
+        return reply({ error: "Fork" });
+      }
+      const hash = hashBlock(body.block);
+      blocks.set(hash, body.block); state.processed.push(body); state.frontier = hash; state.balance = body.block.balance;
+      return reply({ hash });
+    },
+    block_info(body, state, reply) {
+      if (body.hash === FRONTIER) return reply({ successor: competing });
+      if (body.hash === competing) return reply({ confirmed: String(confirmed) });
+      return blocks.has(body.hash) ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
+    },
+  });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch });
+  const options = () => ({ prepared: journal, onPrepared: p => { journal = structuredClone(p); signed++; } });
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /Fork/);
+  const first = journal.hash;
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /Fork/);
+  assert.equal(signed, 1); assert.equal(mock.state.processed.length, 0);
+  confirmed = true;
+  const hash = await wallet.ops.transferOnce(PAY_TO, AMOUNT, options());
+  assert.notEqual(hash, first); assert.equal(signed, 2); assert.equal(mock.state.processed.length, 1);
+});
+
+test("a failed durable-send journal write publishes nothing", async () => {
+  const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch });
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, { onPrepared() { throw new Error("disk full"); } }), /disk full/);
+  assert.equal(mock.state.processed.length, 0);
+});
 
 /** In-memory Nano RPC: account_info / work_generate / receivable / process, with a frontier that advances. */
 function fakeRpc(overrides = {}) {

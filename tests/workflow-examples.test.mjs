@@ -60,7 +60,7 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
     for (const structured of [true, false]) {
       const [html, text] = await pages(name, structured);
       for (const body of [html, text]) {
-        assert.ok(body.includes(`https://nanoodle.com/examples/gallery/#${name}`));
+        assert.ok(body.includes(name === "sing" ? "https://mcp.nanoodle.com/examples/sing.mp3" : `https://nanoodle.com/examples/gallery/#${name}`));
         assert.doesNotMatch(body, /undefined|agent skill:|give your agent the skill|Iron Verdict/);
       }
       assert.match(html, />See sample<\/a>/);
@@ -72,7 +72,9 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       else assert.ok(html.includes(`https://nanoodle.com/examples/gallery/${name}/preview.webp`));
       if (name === "sing") {
         assert.match(html, /Audio sample/);
-        assert.match(text, /model-assisted audio review, not human listening sign-off/);
+        assert.match(html, /<audio controls preload="none"/);
+        assert.match(html, /src="\/examples\/sing.mp3" type="audio\/mpeg"/);
+        assert.match(text, /Mureka 9.5/);
       }
       if (name === "talking-avatar") {
         assert.match(html, /Video sample/);

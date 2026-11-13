@@ -32,7 +32,7 @@ import { readFileSync } from "node:fs";
 import { writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
-import { rawToXno } from "./wallet.mjs";
+import { rawToXno, authorAddress } from "./wallet.mjs";
 import { knownUsd } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
@@ -1019,10 +1019,8 @@ export function createChargeGate({
       // markup of each successful call to its author — Nano has no fees, so
       // nothing is skimmed off it. No field → the wallet keeps the markup.
       const authorFor = (tool) => {
-        const a = tool.x402 && typeof tool.x402.author === "string" ? tool.x402.author.trim() : "";
-        if (!a) return null;
-        if (!checkAddress(a)) { log(`ignoring x402.author on ${tool.name}: not a valid Nano address`); return null; }
-        return a;
+        try { return authorAddress(tool.x402); }
+        catch { log(`ignoring x402.author on ${tool.name}: not a valid Nano address`); return null; }
       };
       const authors = new Map(registry.tools.map((t) => [t.name, authorFor(t)]));
 

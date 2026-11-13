@@ -120,7 +120,7 @@ test("NEAR mode serves llms.txt and the landing page with the NEAR payment note"
     assert.match(llms, /## Payment\n\nEvery call is paid in native NEAR on testnet/);
     assert.doesNotMatch(llms, /Payment \(x402, Nano\/XNO\)/, "no Nano payment story on a NEAR server");
     const landing = await (await fetch(base + "/")).text();
-    assert.match(landing, /Make images, clips and songs/);
+    assert.match(landing, /Give your agents/);
     assert.match(landing, /id="near-studio"/);
     assert.doesNotMatch(landing, /option value="usdc"/, "USDC is offered only when enabled");
     const tools = await mcpClient(base).list();
@@ -271,7 +271,7 @@ test("NEAR hostname shares one process: wallet page, confirmation, monitor, auto
     assert.match(walletHtml, /Connect wallet &amp; pay/);
     assert.match(walletHtml, /src="\/near-wallet\.js\?v=[a-f0-9]{12}"/);
     assert.equal((await fetch(base + "/near-wallet.js")).status, 200);
-    assert.match(await (await fetch(base + "/")).text(), /Make images, clips and songs/);
+    assert.match(await (await fetch(base + "/")).text(), /Give your agents/);
     assert.match(await (await fetch(base + "/llms.txt")).text(), /No transaction hash needs to be copied/);
     const txHash = chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto));
     const submit = (body, headers = {}) => fetch(`${base}/near/pay/${p.paymentId}`, {

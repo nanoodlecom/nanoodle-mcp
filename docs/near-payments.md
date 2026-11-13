@@ -271,6 +271,44 @@ or refund again. A quote is bound to its asset and exact original request;
 wrong amounts or late matched payments refund in the payment asset. Disabling
 new USDC quotes does not discard outstanding token refund obligations.
 
+## Workflow creator payouts
+
+A workflow can declare its creator's Nano address in top-level graph metadata:
+
+```json
+"x402": { "author": "nano_…" }
+```
+
+This works for saved tools and custom `run_noodle` graphs (objects, JSON strings,
+or full share links). The recipient is locked when quoting. Customers still pay
+NEAR or USDC and receive change in the same asset. On a successful run, the
+collected 20% markup is paid to the author **in Nano from the shared Nano pool**.
+There is no extra charge to the customer. Missing `author` leaves the fee with
+the operator; invalid addresses are refused before quoting.
+
+The payout uses the quote's locked XNO/USD rate. In integer arithmetic:
+
+```
+feeCollected = min(feeAtomic, max(chargedAtomic - costAtomic, 0))
+authorRaw = floor(feeCollected × rate.usdNano × 10^30 / (rate.yocto × xnoUsdNano))
+```
+
+`Atomic` means yoctoNEAR for native payments and six-decimal token units for USDC.
+The rate pair uses those same units. A deposit exhausted by model cost leaves
+no author payout. Failed, rejected and interrupted runs produce no payout.
+An authored workflow needs a current XNO/USD rate and a configured Nano wallet
+before payment can be quoted, even when an API key pays the model provider.
+
+The durable payout outbox is separate from customer refunds and is never pruned
+with quotes. It records the debt and signed Nano block before broadcasting.
+Retries and restarts republish the same block, so a lost response cannot create
+a second payout. A new block can be signed only when a different confirmed
+successor proves the original cannot land. All Nano operations use the existing
+wallet's single signing queue. Payouts retry independently; customer results and
+refunds do not wait for them. `receipt.authorPayout` exposes the recipient,
+`amountRaw`, display amount, status and Nano block hash; it is also receipt leg 4.
+The payment quote exposes `payment.authorPayout` before the customer pays.
+
 ## Browser studio
 
 **https://near.nanoodle.com** presents Nanoodle on NEAR and offers NEAR or USDC
