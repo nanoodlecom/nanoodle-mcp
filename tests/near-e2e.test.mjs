@@ -267,7 +267,9 @@ test("NEAR hostname shares one process: wallet page, confirmation, monitor, auto
     assert.equal(p.payUrl, `${base}/pay/${p.paymentId}`);
     const page = await fetch(p.payUrl);
     assert.equal(page.headers.get("referrer-policy"), "no-referrer");
-    assert.match(await page.text(), /Connect wallet &amp; pay/);
+    const walletHtml = await page.text();
+    assert.match(walletHtml, /Connect wallet &amp; pay/);
+    assert.match(walletHtml, /src="\/near-wallet\.js\?v=[a-f0-9]{12}"/);
     assert.equal((await fetch(base + "/near-wallet.js")).status, 200);
     assert.match(await (await fetch(base + "/")).text(), /Make images, clips and songs/);
     assert.match(await (await fetch(base + "/llms.txt")).text(), /No transaction hash needs to be copied/);
@@ -396,8 +398,13 @@ test("USDC over real HTTP: custom and saved workflows detect token payments, exe
     assert.doesNotMatch(await (await fetch(`http://127.0.0.1:${port}/llms.txt`)).text(), /\bNEAR\b|\bUSDC\b/);
     const landing = await (await fetch(base + "/")).text();
     assert.match(landing, /option value="usdc">USDC on NEAR/);
-    assert.match(landing, /src="\/near-site.js"/);
-    assert.equal((await fetch(base + "/near-site.js")).status, 200);
+    const script = landing.match(/src="(\/near-site\.js\?v=[a-f0-9]{12})"/)?.[1];
+    assert.ok(script, "each build gets a fresh script URL so a normal reload loads the matching UI");
+    const versioned = await fetch(base + script), unversioned = await fetch(base + "/near-site.js");
+    assert.equal(versioned.status, 200); assert.equal(unversioned.status, 200);
+    assert.equal(versioned.headers.get("cache-control"), "public, max-age=86400");
+    assert.equal(unversioned.headers.get("cache-control"), "no-cache");
+    assert.equal(await versioned.text(), await unversioned.text());
     const primary = mcpClient(`http://127.0.0.1:${port}`);
     const saved = (await primary.list()).find(t => t.name === "idea-poster");
     assert.deepEqual(saved.inputSchema.properties._pay_with.enum, ["nano", "near", "usdc"]);
