@@ -81,7 +81,7 @@ transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md
 - NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version` shows
   0.7.0 or later, run it from a clone as below.
 
-**Try it: do X, see Y.** Node 22.23.4+, 24.22.1+ or 26.12.1+. Steps 1–3 need no network
+**Try it: do X, see Y.** Node 22.23.5+, 24.22.3+ or 26.13.1+. Steps 1–3 need no network
 after `npm ci`, and no keys or funds.
 
 ```bash
@@ -163,14 +163,14 @@ For the published graph, the generation step is:
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"character-sprites","arguments":{"Character":"A compact furnace knight with an ivory helmet, amber visor, navy armor and brass gauntlets. Outlined 2D platformer art. No weapon or wings."}}}
 ```
 
-Install the skill for local extraction and animation (Node 22.23.4+, 24.22.1+, or 26.12.1+ and ffmpeg/ffprobe
+Install the skill for local extraction and animation (Node 22.23.5+, 24.22.3+, or 26.13.1+ and ffmpeg/ffprobe
 required). A useful agent request is: “Use character-sprites to make an animated
 fighter from my description, inspect the joints and alpha edges, then build a
 small playable arena with heavy gravity and impactful combat.”
 
 ## Install
 
-You need: **Node 22.23.4+, 24.22.1+, or 26.12.1+**, a folder of saved graphs (say `~/noodles` — see
+You need: **Node 22.23.5+, 24.22.3+, or 26.13.1+**, a folder of saved graphs (say `~/noodles` — see
 [Making graphs](#making-graphs)), and a [nano-gpt.com](https://nano-gpt.com)
 API key in `NANOGPT_API_KEY` (or passed via `--key` / `--env-file`) — or no
 key at all with a Nano wallet, see
