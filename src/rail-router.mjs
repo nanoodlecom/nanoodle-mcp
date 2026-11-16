@@ -40,7 +40,7 @@ export function createRailRouter({ nano, near }) {
     }
     const args = raw == null ? {} : raw;
     const { _pay_with: payWith, ...rest } = args;
-    if (payWith === "usdc" && !near.assets?.has("usdc")) return { refusal: "USDC payments are not enabled on this server. Request a NEAR quote instead." };
+    if (payWith === "usdc" && !near.assets?.has("usdc")) return { refusal: "USDC on NEAR is not enabled on this server. If you already have a payment quote, keep its original _payment_id and payment rail. For a new quote, choose an enabled rail from the tool schema. Nothing was charged." };
     if (payWith !== undefined && !PAY_WITH.has(payWith)) {
       return { refusal: `_pay_with must be ${near.assets?.has("usdc") ? '"nano", "near" or "usdc"' : '"nano" or "near"'}, got ${JSON.stringify(payWith).slice(0, 40)}. Nothing was charged.` };
     }
@@ -62,7 +62,7 @@ export function createRailRouter({ nano, near }) {
       }
       if (id.startsWith("pay_")) {
         if (payWith === "near" || payWith === "usdc" || hasNearFields) {
-          return { refusal: `payment id ${id} is a Nano (XNO) quote; it takes no "_pay_with": "near", _payment_tx or _payment_sender. Call again with the same arguments plus only "_payment_id". Nothing was consumed.` };
+          return { refusal: `payment id ${id} is a Nano (XNO) quote. Keep the same _payment_id and original workflow arguments; remove _pay_with, _payment_tx and _payment_sender, then retry. Nothing was consumed.` };
         }
         return { gate: "nano", params: stripped };
       }
@@ -76,7 +76,7 @@ export function createRailRouter({ nano, near }) {
       return { gate: "near", params: stripped };
     }
     if (hasNearFields) {
-      return { refusal: `_payment_tx and _payment_sender pay a NEAR quote: ask for one with "_pay_with": "near", send the transfer, then call again with _payment_id, _payment_tx and _payment_sender. Nothing was charged.` };
+      return { refusal: `Nano (XNO) requests do not use _payment_tx or _payment_sender. For Nano, remove _payment_tx and _payment_sender and retry with the same workflow arguments. If you already paid, include the original _payment_id and keep its payment rail. Nothing was charged.` };
     }
     return { gate: "nano", params: stripped };
   }

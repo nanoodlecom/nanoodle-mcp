@@ -286,7 +286,7 @@ test("router: every routing branch", async () => {
     ["idea-poster", { Idea: "x", _payment_id: "nq_a", _pay_with: "nano" }, /is a NEAR quote, but "_pay_with" says nano/],
     ["idea-poster", { Idea: "x", _payment_id: "pay_a", _pay_with: "near" }, /is a Nano \(XNO\) quote/],
     ["idea-poster", { Idea: "x", _payment_id: "pay_a", _payment_tx: "t" }, /is a Nano \(XNO\) quote/],
-    ["idea-poster", { Idea: "x", _payment_tx: "t", _payment_sender: "a.testnet" }, /ask for one with "_pay_with": "near"/],
+    ["idea-poster", { Idea: "x", _payment_tx: "t", _payment_sender: "a.testnet" }, /Nano \(XNO\) requests do not use _payment_tx or _payment_sender/],
     ["run_noodle", { graph: {}, _pay_with: "nano" }, /paid in NEAR only on this server/],
     ["sfw_check", { _pay_with: "near" }, /cannot be paid in NEAR on this server\. Pay in Nano \(XNO\) instead: call it again without "_pay_with"/],
   ]) {
