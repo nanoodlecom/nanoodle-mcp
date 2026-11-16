@@ -42,6 +42,7 @@ systemctl list-timers nanoodle-near-check.timer
 The timer runs at **09:00 UTC daily**, including one catch-up after downtime.
 No automatic service restart is configured. A failure leaves a failed systemd
 unit and a redacted `latest.json`; notification routing is deployment-specific.
+The supplied units record failures locally; they do not send push notifications.
 
 ```sh
 systemctl status nanoodle-near-check.service
@@ -73,3 +74,8 @@ is rejected, inspect the recorded hash and account on chain before archiving the
 state. Do not delete state to blindly retry. If recovery finds a completed run
 whose original progress stream was lost, missing live progress correctly fails
 the check rather than claiming that streaming was verified.
+The server also keeps paid text output in memory: a restart between execution
+and replay can preserve the receipt and refund while losing replayable text.
+This check reports that as a failure. Finish paid checks before restarting the
+app, and inspect the retained original result and on-chain receipt before
+archiving an interrupted manual check.

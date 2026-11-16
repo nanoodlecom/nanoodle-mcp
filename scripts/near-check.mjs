@@ -138,7 +138,8 @@ export async function runCheck(config, deps = {}) {
     require((await checkTransferOnChain({ rpc, txHash: receipt.refund.txHash, sender: merchant, receiver: payer, amountYocto: refunded })).ok, "Refund does not match the finalized on-chain transfer");
     stage = "replay_and_result";
     const replay = await call("run_noodle", paidArgs);
-    require(JSON.stringify(replay.structuredContent?.receipt) === JSON.stringify(receipt) && resultText(replay).includes(expected), "Replay changed the result or receipt");
+    require(JSON.stringify(replay.structuredContent?.receipt) === JSON.stringify(receipt), "Replay changed the receipt");
+    require(resultText(replay).includes(expected), "Paid output is unavailable on replay; text results are not retained across server restarts");
     const cached = await json(`/near/result/${q.paymentId}`);
     require(JSON.stringify(cached).includes(expected), "Payment page result cache is missing the output");
     const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: "z-ai/glm-5.3-flash", modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
