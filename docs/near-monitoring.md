@@ -41,8 +41,8 @@ systemctl list-timers nanoodle-near-check.timer
 
 The timer runs at **09:00 UTC daily**, including one catch-up after downtime.
 No automatic service restart is configured. A failure leaves a failed systemd
-unit and a redacted `latest.json`; notification routing is deployment-specific.
-The supplied units record failures locally; they do not send push notifications.
+unit and a redacted `latest.json`. The failure hook alerts Ember over Babel when
+the notification setup below is installed.
 
 ```sh
 systemctl status nanoodle-near-check.service
@@ -79,3 +79,49 @@ and replay can preserve the receipt and refund while losing replayable text.
 This check reports that as a failure. Finish paid checks before restarting the
 app, and inspect the retained original result and on-chain receipt before
 archiving an interrupted manual check.
+
+## Babel failure alerts
+
+The check's `OnFailure` starts `nanoodle-near-alert@<failed-unit>.service`.
+`scripts/near-alert.mjs` saves a selected-metadata message before attempting
+delivery. Each systemd invocation has a stable message ID; network failures and
+lost responses retry that ID. `nanoodle-near-alert-retry.timer` drains pending
+messages every five minutes. Babel then owns durable delivery and recipient wakes.
+Queue acceptance is distinct from Ember's authenticated receipt.
+
+Provision a dedicated persistent sender through the Babel operator's approved
+process, scoped to a conversation with Ember. Do not copy a native worker's
+expiring credential. Keep its token in `/etc/nanoodle-near-check/babel-token`
+(root:nanoodle-check, 0640), and write `babel.env` alongside it:
+
+```sh
+BABEL_URL=http://127.0.0.1:8403/mcp/v1
+BABEL_HOST=babel.255bits.com
+BABEL_TOKEN_FILE=/etc/nanoodle-near-check/babel-token
+BABEL_SENDER=<dedicated sender ID>
+BABEL_CONVERSATION=<dedicated alert conversation>
+```
+
+The supplied unit restricts network access to localhost. The Babel credential
+has no wallet access. Alert text contains the time, failed stage, service result
+and recovery instructions; it excludes prompts, quote capabilities and keys.
+Install `ops/nanoodle-near-alert@.service` and
+`ops/nanoodle-near-alert-retry.timer`, reload systemd, and enable the retry timer.
+Inspect delivery with:
+
+```sh
+systemctl status 'nanoodle-near-alert@nanoodle-near-check.service.service'
+cat /var/lib/nanoodle-near-check/alerts/latest-delivery.json
+```
+
+Test the exact failure path without paying for a workflow:
+
+```sh
+systemd-run --unit=nanoodle-near-check-alert-test \
+  --property='OnFailure=nanoodle-near-alert@%n.service' /usr/bin/false
+```
+
+This unit's failure is expected. Its alert is explicitly labeled TEST and asks
+Ember to claim and acknowledge it. Verify `message_status` for the resulting
+message using the sender's own credential. A queued message alone does not prove
+receipt. Never acknowledge on Ember's behalf.
