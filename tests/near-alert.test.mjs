@@ -76,6 +76,7 @@ test("the real loopback wire preserves the gateway Host header", async () => {
   writeFileSync(config.tokenFile, "synthetic_".repeat(8), { mode: 0o600 });
   const server = createServer(async (req, res) => {
     assert.equal(req.headers.host, config.host); assert.match(req.headers.authorization, /^Bearer synthetic_/);
+    assert.equal(req.headers["x-forwarded-proto"], "https", "the authenticated loopback caller must satisfy the gateway edge contract");
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const args = JSON.parse(Buffer.concat(chunks)).params.arguments;
     res.setHeader("content-type", "application/json");
