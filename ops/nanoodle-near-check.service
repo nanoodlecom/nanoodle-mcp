@@ -2,6 +2,7 @@
 Description=Paid NEAR MCP availability check
 Wants=network-online.target
 After=network-online.target
+OnFailure=nanoodle-near-alert@%n.service
 
 [Service]
 Type=oneshot
