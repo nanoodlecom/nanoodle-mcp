@@ -29,14 +29,14 @@ function render(state) {
   current = state;
   const asset = quote.asset === "USDC" ? "USDC" : "NEAR";
   const messages = {
-    pending: "Ready to pay. Approve the deposit in your NEAR wallet.",
+    pending: `Ready to pay. Approve the ${asset} deposit in your wallet.`,
     paid: "Payment confirmed. Your agent is continuing — no further payment needed.",
     running: "Payment confirmed. Your workflow is running.",
     settled: `Complete. Unused ${asset} is returned to the wallet that paid.`,
     failed: "The run failed. Your deposit is being refunded to the wallet that paid.",
     rejected: `This payment could not buy the run. Received ${asset} is being refunded.`,
-    expired: "This quote expired. Ask your agent for a fresh quote.",
-    unknown: "Unknown payment. Ask your agent for a fresh quote.",
+    expired: `This quote expired. Ask your agent for a fresh ${asset} quote.`,
+    unknown: `Unknown payment. Ask your agent for a fresh ${asset} quote.`,
   };
   status.textContent = messages[state.status] || state.status;
   const final = ["settled", "failed", "rejected"].includes(state.status);
@@ -59,7 +59,7 @@ function render(state) {
 async function confirm(txHash, senderId) {
   error.textContent = "";
   for (let attempt = 0; attempt < 10; attempt++) {
-    status.textContent = "Confirming your transfer on NEAR…";
+    status.textContent = "Confirming your transfer…";
     const response = await fetch(`/near/pay/${encodeURIComponent(quote.paymentId)}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ txHash, senderId }),
@@ -89,7 +89,7 @@ button.addEventListener("click", async () => {
     const wallet = await connector.connect();
     const accounts = await wallet.getAccounts({ network: quote.network });
     const senderId = accounts[0]?.accountId;
-    if (!senderId) throw new Error("The wallet did not return a NEAR account.");
+    if (!senderId) throw new Error("The wallet did not return an account.");
     // Persist before requesting a signature: a closed tab or uncertain wallet
     // result must not invite a second payment on reload.
     remember({ senderId });

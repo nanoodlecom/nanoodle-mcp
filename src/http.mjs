@@ -590,16 +590,16 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
 function nearPayPageHtml(q) {
   const asset = q.asset === "USDC" ? "USDC" : "NEAR";
   const amount = q.amount ?? q.amountNear;
-  return htmlPage(`Pay in ${asset} · nanoodle on NEAR`, `
-    <a class="pay-brand" href="/">nanoodle <span class="muted">on NEAR</span></a>
+  return htmlPage(`Pay in ${asset} · nanoodle`, `
+    <a class="pay-brand" href="/">nanoodle</a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
-      <h1 id="near-title">Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · NEAR ${esc(q.network)}</p>
+      <h1 id="near-title">Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
       <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
       <details class="card" id="near-deposit" open>
         <summary>Maximum deposit <strong>${esc(amount)} ${asset}</strong></summary>
         <p>You pay the model cost + 20%. Unused ${asset} returns to the wallet that pays. A failed run refunds the whole deposit.</p>
         <p class="muted">Send on <strong>${esc(q.network)}</strong> to:</p><code>${esc(q.payTo)}</code>
-        ${asset === "USDC" ? `<p class="muted">Circle-issued USDC on NEAR · six decimals. Network gas is paid separately in NEAR.</p>` : ""}
+        ${asset === "USDC" ? `<p class="muted">Circle-issued USDC · six decimals. Use the NEAR network. Network gas is paid separately.</p>` : ""}
         <p><button id="near-pay" type="button">Connect wallet &amp; pay</button></p>
         <p id="near-error" role="alert"></p>
       </details>
@@ -607,7 +607,7 @@ function nearPayPageHtml(q) {
       <details id="near-manual"><summary>Already paid with another wallet?</summary>
         <p>Send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The server detects the payment automatically. You can also confirm its transaction here.</p>
         <form id="near-confirm">
-          <p><label>Your NEAR account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
+          <p><label>Your paying account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
           <p><label>Transaction hash <input name="txHash" required autocomplete="off"></label></p>
           <button type="submit">Confirm payment</button>
         </form>

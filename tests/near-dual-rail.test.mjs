@@ -19,6 +19,8 @@ import {
 } from "../src/near/index.mjs";
 import { createFakeChain, throwawayNearKey, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
 
+import { USDC_CONTRACTS } from "../src/near/ft.mjs";
+
 const MERCHANT = "merchant.testnet";
 const PAYER = "payer.testnet";
 const INPUTS = { Idea: "a lighthouse at dawn" };
@@ -38,12 +40,14 @@ after(() => { globalThis.fetch = realFetch; });
 
 const staticRates = (o = {}) => createNearRates({ nearUsd: "3.64", xnoUsd: "0.95", refreshMs: 0, fetch: async () => { throw new Error("offline"); }, ...o });
 
-async function world({ rate = staticRates(), modelPayment = "api_key", quoteTtlMs, hosted = false } = {}) {
+async function world({ rate = staticRates(), modelPayment = "api_key", quoteTtlMs, hosted = false, usdc = false } = {}) {
   const out = await mkdtemp(join(tmpdir(), "dual-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
   chain.addAccount(MERCHANT, parseNearToYocto("10"), key.publicKey);
   chain.addAccount(PAYER, parseNearToYocto("5"));
+  const token = USDC_CONTRACTS.testnet;
+  if (usdc) chain.addFt(token, { [MERCHANT]: 0n, [PAYER]: 10_000_000n });
   const registry = await loadTools({ dirs: [graphsDir], apiKey: "test-key", outDir: out, publicBase: "http://127.0.0.1:1", log: () => {}, hosted, remote: true });
   const file = join(out, "near-state.json");
   const events = [];
@@ -51,9 +55,10 @@ async function world({ rate = staticRates(), modelPayment = "api_key", quoteTtlM
   const make = (r) => {
     const rpc = createNearRpc({ url: "https://rpc.fake", fetch: chain.fetch });
     const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT });
-    const refunder = createRefunder({ rpc, signer: parseNearSecretKey(key.secretKey), accountId: MERCHANT, ledger, schedule: () => null });
+    const refunder = createRefunder({ rpc, signer: parseNearSecretKey(key.secretKey), accountId: MERCHANT, ledger, ...(usdc ? { usdcToken: token } : {}), schedule: () => null });
     const gate = createNearGate({
-      merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder, rate: r, fetch: mock.fetch, randomInt: () => dust++,
+      merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder, rate: r,
+      ...(usdc ? { usdcEnabled: true, usdcToken: token } : {}), fetch: mock.fetch, randomInt: () => dust++,
       usage: (event, fields) => events.push({ event, ...fields }), modelPayment, ...(quoteTtlMs ? { quoteTtlMs } : {}),
     });
     return { gate, ledger, wrapped: gate.wrapRegistry(registry) };
@@ -83,7 +88,7 @@ test("swap margin: the quote, settlement and receipt use the locked spread pair,
   assert.equal(p.rate.spreadBps, 150);
   assert.equal(p.rate.effectiveNearUsd, "3.586206897");
   assert.equal(p.rate.xnoPerNear, "3.831578947");
-  assert.match(text(q), /Rate: 1 NEAR = \$3\.64 \(static, [^)]+\); 1 XNO = \$0\.95 \(static, [^)]+\), so 1 NEAR = 3\.831578947 XNO; swap margin 1\.5%: NEAR amounts use 1 NEAR = \$3\.586206897, locked for this quote; network testnet/);
+  assert.match(text(q), /Rate: 1 NEAR = \$3\.64 \(static, [^)]+\); swap margin 1\.5%: NEAR amounts use 1 NEAR = \$3\.586206897, locked for this quote; network testnet/);
   const stored = w.ledger.getQuote(p.paymentId);
   assert.equal(stored.rate.yocto, "1015000000000000000000000");
   const paid = await call();
@@ -92,7 +97,7 @@ test("swap margin: the quote, settlement and receipt use the locked spread pair,
   assert.equal(rc.charged.yocto, "3148730769230769230769");
   assert.equal(rc.refund.yocto, (8503000000000000000000n - 3148730769230769230769n).toString());
   assert.equal(rc.rate.spreadBps, 150);
-  assert.match(text(paid), /Rate 3\.64 USD\/NEAR \(static, [^)]+\); 1 XNO = \$0\.95 .*swap margin 1\.5%.*, locked when quoted\./);
+  assert.match(text(paid), /Rate 3\.64 USD\/NEAR \(static, [^)]+\); swap margin 1\.5%.*, locked when quoted\./);
 });
 
 test("with 0 bps the numbers are the worked example's, byte for byte", async () => {
@@ -122,7 +127,7 @@ test("three-leg receipt and operator accounting: wallet-funded runs derive the X
   assert.equal(rc.legs[2].yocto, rc.refund.yocto);
   const t = text(paid);
   assert.match(t, /Leg 1, caller payment: 0\.008379 NEAR, tx \w+, final\./);
-  assert.match(t, /Leg 2, model payment to NanoGPT: \$0\.00941 = 0\.009905263 XNO \(XNO derived from the reported cost at the locked XNO\/USD rate\)\./);
+  assert.match(t, /Leg 2, model payment to NanoGPT: \$0\.00941 \(paid from the operator's wallet\)\./);
   assert.match(t, /Leg 3, refund: ≈0\.005277 NEAR, sent \(tx \w+/);
   // every pre-existing receipt field is still there
   for (const k of ["rail", "network", "paymentId", "deposit", "actualCost", "serviceFee", "charged", "refund", "rate", "outcome"]) assert.ok(k in rc, k);
@@ -204,19 +209,19 @@ test("a quote persisted before the rates service (no XNO/swap fields) still load
   assert.equal(rc.legs.length, 3);
 });
 
-test("wallet-funded server with no XNO/USD: no NEAR quote, nothing stored; API-key server quotes and shows it unavailable", async () => {
+test("wallet-funded server with no XNO/USD: no NEAR quote, nothing stored; API-key server still quotes", async () => {
   const down = { fetch: async () => { throw new Error("offline"); } };
   const ww = await world({ rate: createNearRates({ nearUsd: "3.64", xnoRequired: true, refreshMs: 0, ...down }), modelPayment: "wallet" });
   const r = await ww.wrapped.callTool({ name: "run_noodle", arguments: { graph: WORKED_GRAPH, inputs: INPUTS } });
   assert.equal(r.isError, true);
-  assert.match(text(r), /no current XNO\/USD rate \(this server pays its model provider in XNO, so the NEAR to XNO swap rate is unknown\)/);
+  assert.match(text(r), /Cannot quote in NEAR right now: the operator's funding rate is unavailable/);
   assert.equal(ww.ledger.quotes().length, 0);
 
   const wk = await world({ rate: createNearRates({ nearUsd: "3.64", refreshMs: 0, ...down }) });
   const ok = await wk.wrapped.callTool({ name: "run_noodle", arguments: { graph: WORKED_GRAPH, inputs: INPUTS } });
   assert.ok(!ok.isError);
   assert.equal(ok.structuredContent.payment.rate.xnoUsd, null);
-  assert.match(text(ok), /; XNO\/USD unavailable, locked for this quote/);
+  assert.match(text(ok), /\), locked for this quote/);
 });
 
 /* ---------------- the dual-rail router ---------------- */
@@ -233,8 +238,8 @@ function nanoNode() {
   };
 }
 
-async function dual() {
-  const w = await world({ hosted: true });
+async function dual(opts = {}) {
+  const w = await world({ hosted: true, ...opts });
   const node = nanoNode();
   const nanoGate = createChargeGate({
     address: GATE_ADDR, ops: node.ops, usd: 0.05, xnoUsd: 1,
@@ -277,18 +282,19 @@ test("router: every routing branch", async () => {
   assert.equal(R("idea-poster", { Idea: "x", _payment_id: "other" }).gate, "nano");
   assert.equal(R("idea-poster", { Idea: "x", _payment_id: "other", _payment_tx: "t" }).gate, "near");
   assert.equal(d.router.route(null).gate, "nano");
-  // _pay_with never reaches a gate
-  assert.deepEqual(R("idea-poster", { Idea: "x", _pay_with: "near" }).params.arguments, { Idea: "x" });
-  assert.deepEqual(R("idea-poster", { Idea: "x", _payment_id: "nq_a", _pay_with: "near" }).params.arguments, { Idea: "x", _payment_id: "nq_a" });
+  // An explicit native or token selector reaches the shared gate for validation.
+  assert.deepEqual(R("idea-poster", { Idea: "x", _pay_with: "near" }).params.arguments, { Idea: "x", _pay_with: "near" });
+  assert.deepEqual(R("idea-poster", { Idea: "x", _payment_id: "nq_a", _pay_with: "near" }).params.arguments, { Idea: "x", _payment_id: "nq_a", _pay_with: "near" });
   // refusals
   for (const [name, args, re] of [
     ["idea-poster", { Idea: "x", _pay_with: "bitcoin" }, /_pay_with must be "nano" or "near"/],
-    ["idea-poster", { Idea: "x", _payment_id: "nq_a", _pay_with: "nano" }, /is a NEAR quote, but "_pay_with" says nano/],
+    ["idea-poster", { Idea: "x", _payment_id: "nq_a", _pay_with: "nano" }, /uses a different payment asset.*remove _pay_with/],
     ["idea-poster", { Idea: "x", _payment_id: "pay_a", _pay_with: "near" }, /is a Nano \(XNO\) quote/],
     ["idea-poster", { Idea: "x", _payment_id: "pay_a", _payment_tx: "t" }, /is a Nano \(XNO\) quote/],
     ["idea-poster", { Idea: "x", _payment_tx: "t", _payment_sender: "a.testnet" }, /Nano \(XNO\) requests do not use _payment_tx or _payment_sender/],
-    ["run_noodle", { graph: {}, _pay_with: "nano" }, /paid in NEAR only on this server/],
-    ["sfw_check", { _pay_with: "near" }, /cannot be paid in NEAR on this server\. Pay in Nano \(XNO\) instead: call it again without "_pay_with"/],
+    ["run_noodle", { graph: {}, _pay_with: "nano" }, /does not accept Nano \(XNO\) payments/],
+    ["run_noodle", { graph: {}, _payment_id: "pay_a" }, /does not accept Nano \(XNO\) payments/],
+    ["sfw_check", { _pay_with: "near" }, /does not accept NEAR payments/],
   ]) {
     const r = R(name, args);
     assert.match(r.refusal || "", re, JSON.stringify(args));
@@ -303,7 +309,6 @@ test("router: every routing branch", async () => {
 test("router: a saved tool paid in NEAR; the paying call hashes the same with or without _pay_with; replay through the router", async () => {
   const d = await dual();
   const args = { Idea: "a lighthouse at dawn" };
-  assert.equal(hashArgs("idea-poster", args), hashArgs("idea-poster", d.router.route({ name: "idea-poster", arguments: { ...args, _pay_with: "near" } }).params.arguments));
   for (const repeat of [true, false]) {
     const runs0 = mock.runs();
     const { p, call } = await nearPay(d.router.callTool, "idea-poster", { ...args, _pay_with: "near" }, d.chain, { extra: repeat ? {} : { _pay_with: undefined } });
@@ -337,4 +342,106 @@ test("router: the same saved tool paid in Nano; replay through the router; and a
   const { call } = await nearPay(d.router.callTool, "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }, d.chain);
   const custom = await call();
   assert.equal(custom.structuredContent.receipt.charged.yocto, "3102197802197802197803");
+});
+
+test("one saved workflow keeps Nano, NEAR and USDC quotes, retries, charges and refunds separate", async () => {
+  const d = await dual({ usdc: true, modelPayment: "wallet", rate: staticRates({ spreadBps: 150 }) });
+  const token = USDC_CONTRACTS.testnet;
+  const name = "idea-poster";
+  const call = (asset, extra = {}) => d.router.callTool({ name, arguments: { ...INPUTS, _pay_with: asset, ...extra } });
+  const unwanted = {
+    nano: /\b(?:USDC|NEAR)\b/i,
+    near: /\b(?:USDC|Nano|XNO)\b/i,
+    usdc: /\b(?:NEAR|Nano|XNO)\b/i,
+  };
+  // Strip only URLs (transport/explorer hostnames are still allowed to name the
+  // network), plus the explicit chain label. NanoGPT is a provider, not a currency.
+  function isolated(asset, msg, stage) {
+    const prose = msg.replace(/https?:\/\/\S+/g, "").replace(/\bNEAR network\b/g, "network");
+    assert.doesNotMatch(prose, unwanted[asset], `${asset}: ${stage}`);
+  }
+  const start = mock.runs();
+
+  const nanoQuote = await call("nano");
+  const nearQuote = await call("near");
+  const usdcQuote = await call("usdc");
+  const nano = nanoQuote.structuredContent.x402;
+  const near = nearQuote.structuredContent.payment;
+  const usdc = usdcQuote.structuredContent.payment;
+  assert.deepEqual(d.router.listTools().find(t => t.name === name).inputSchema.properties._pay_with.enum, ["nano", "near", "usdc"]);
+  assert.match(nano.paymentId, /^pay_/);
+  assert.match(nano.uri, /^nano:/);
+  assert.match(near.paymentId, /^nq_/);
+  assert.ok(!Object.hasOwn(near, "amountAtomic"));
+  assert.match(usdc.paymentId, /^nq_/);
+  assert.equal(usdc.asset, "USDC");
+  assert.equal(usdc.tokenContract, token);
+  assert.ok(!Object.hasOwn(usdc, "amountYocto"));
+  assert.equal(mock.runs(), start, "quotes do not execute work");
+  for (const [asset, response] of [["nano", nanoQuote], ["near", nearQuote], ["usdc", usdcQuote]]) {
+    const copy = text(response);
+    assert.match(copy, asset === "nano" ? /\b(?:Nano|XNO)\b/ : new RegExp(`\\b${asset}\\b`, "i"));
+    isolated(asset, copy, "quote");
+  }
+
+  // Conflicting selections cannot spend, switch a quote, or tell the payer to pay another currency.
+  const conflict = await call("usdc", { _payment_id: nano.paymentId });
+  assert.equal(conflict.isError, true);
+  assert.match(text(conflict), /same _payment_id.*retry/i);
+  isolated("nano", text(conflict), "conflict");
+  const nearNqConflict = await call("nano", { _payment_id: near.paymentId });
+  const usdcNqConflict = await call("nano", { _payment_id: usdc.paymentId });
+  for (const [asset, result] of [["near", nearNqConflict], ["usdc", usdcNqConflict]]) {
+    assert.equal(result.isError, true);
+    assert.match(text(result), /same _payment_id.*retry/i);
+    isolated(asset, text(result), "conflict");
+  }
+  const nearTx = d.chain.transfer(PAYER, MERCHANT, BigInt(near.amountYocto));
+  const usdcTx = d.chain.ftTransfer(token, PAYER, MERCHANT, BigInt(usdc.amountAtomic));
+  for (const [quoted, selected, p, paidTx] of [["near", "usdc", near, nearTx], ["usdc", "near", usdc, usdcTx]]) {
+    await assert.rejects(call(selected, { _payment_id: p.paymentId, _payment_tx: paidTx, _payment_sender: PAYER }), e => {
+      assert.match(e.message, /asset cannot change/);
+      isolated(quoted, e.message, "asset mismatch");
+      return true;
+    });
+    assert.equal(d.ledger.consumedBy(paidTx), null, "mismatch must not claim even a valid transfer before a correct retry");
+    const changed = await call(undefined, { _payment_id: p.paymentId, Idea: "a different poster" });
+    assert.equal(changed.isError, true);
+    assert.match(text(changed), new RegExp(`_pay_with: "${quoted}"`));
+    isolated(quoted, text(changed), "changed workflow arguments");
+  }
+  for (const [asset, p, wrongTx] of [["near", near, usdcTx], ["usdc", usdc, nearTx]]) {
+    const wrongProof = await call(asset, { _payment_id: p.paymentId, _payment_tx: wrongTx, _payment_sender: PAYER });
+    assert.equal(wrongProof.isError, true);
+    isolated(asset, text(wrongProof), "wrong-asset proof");
+    assert.equal(d.ledger.consumedBy(wrongTx), null);
+  }
+  assert.equal(mock.runs(), start, "rejected proofs do not execute work");
+
+  d.node.state.receivable["A".repeat(64)] = { amount: nano.amountRaw, source: NANO_PAYER };
+  const cases = [
+    ["nano", { _payment_id: nano.paymentId }, nano.paymentId],
+    ["near", { _payment_id: near.paymentId, _payment_tx: nearTx, _payment_sender: PAYER }, near.paymentId],
+    ["usdc", { _payment_id: usdc.paymentId, _payment_tx: usdcTx, _payment_sender: PAYER }, usdc.paymentId],
+  ];
+  for (const [asset, proof, id] of cases) {
+    const prev = mock.runs();
+    const paid = await call(asset, proof);
+    assert.ok(!paid.isError, text(paid));
+    const copy = text(paid);
+    assert.match(copy, /refund|change returned/i);
+    isolated(asset, copy, "receipt");
+    if (asset !== "nano") {
+      const r = paid.structuredContent.receipt;
+      assert.equal(r.paymentId, id);
+      assert.equal(r.outcome, "succeeded");
+      assert.equal(r.refund.status, "sent");
+      assert.equal(r.legs[0].asset, asset.toUpperCase());
+      assert.equal(r.legs[2].asset, asset.toUpperCase());
+    }
+    const retry = await call(undefined, proof); // original quote determines asset even when this selector is omitted
+    assert.deepEqual(retry, paid);
+    assert.equal(mock.runs(), prev + 1, "one run, no repeat charge");
+  }
+  assert.equal(d.node.state.transfers.filter(x => x.to === NANO_PAYER).length, 1);
 });
