@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer } from "node:http";
 import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT } from "../scripts/near-alert.mjs";
 
 const invocation = { MONITOR_UNIT: CHECK_UNIT, MONITOR_INVOCATION_ID: "a".repeat(32), MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" };
@@ -68,4 +69,20 @@ test("Babel transport uses the dedicated credential, explicit conversation and b
     return Response.json({ result: { content: [{ type: "text", text: JSON.stringify({ message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } }) }] } });
   });
   assert.equal((await deliverAlerts(config, { env: invocation, call })).ok, true);
+});
+
+test("the real loopback wire preserves the gateway Host header", async () => {
+  const config = setup(); config.tokenFile = join(config.stateDir, "token"); config.host = "babel.example.com";
+  writeFileSync(config.tokenFile, "synthetic_".repeat(8), { mode: 0o600 });
+  const server = createServer(async (req, res) => {
+    assert.equal(req.headers.host, config.host); assert.match(req.headers.authorization, /^Bearer synthetic_/);
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const args = JSON.parse(Buffer.concat(chunks)).params.arguments;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ result: { content: [{ type: "text", text: JSON.stringify({ message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } }) }] } }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  config.url = `http://127.0.0.1:${server.address().port}/mcp/v1`;
+  try { assert.equal((await deliverAlerts(config, { env: invocation })).ok, true); }
+  finally { await new Promise(resolve => server.close(resolve)); }
 });

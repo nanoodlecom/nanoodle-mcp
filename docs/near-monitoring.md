@@ -118,7 +118,8 @@ Test the exact failure path without paying for a workflow:
 
 ```sh
 systemd-run --unit=nanoodle-near-check-alert-test \
-  --property='OnFailure=nanoodle-near-alert@%n.service' /usr/bin/false
+  --property=OnFailure=nanoodle-near-alert@nanoodle-near-check-alert-test.service.service \
+  /usr/bin/false
 ```
 
 This unit's failure is expected. Its alert is explicitly labeled TEST and asks

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { request as httpRequest } from "node:http";
 import { atomicJson } from "./near-check.mjs";
 
 export const CHECK_UNIT = "nanoodle-near-check.service";
@@ -27,7 +28,23 @@ export function failureEvent(env, latest, now = Date.now()) {
     ].join("\n") };
 }
 
-export function babelClient(config, request = fetch) {
+// Node's fetch ignores a supplied Host header. Use HTTP for the loopback
+// gateway's explicit virtual host; credentials never leave the local machine.
+export function babelRequest(input, init) {
+  const url = new URL(input);
+  if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) return fetch(input, init);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(url, { method: init.method, headers: init.headers, signal: init.signal }, res => {
+      const chunks = []; let bytes = 0;
+      res.on("data", chunk => { bytes += chunk.length; if (bytes > 524288) { req.destroy(Error("Babel response too large")); return; } chunks.push(chunk); });
+      res.on("error", reject);
+      res.on("end", () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode, headers: { "content-type": res.headers["content-type"] || "application/json" } })));
+    });
+    req.on("error", reject); req.end(init.body);
+  });
+}
+
+export function babelClient(config, request = babelRequest) {
   let id = 0;
   return async (name, args) => {
     const token = readFileSync(config.tokenFile, "utf8").trim();
