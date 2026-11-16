@@ -53,8 +53,8 @@ test("disabled USDC never instructs an existing Nano payer to replace it with a 
   const r = router(false);
   const result = await r.value.callTool({ name: "poster", arguments: { _payment_id: originalId, _pay_with: "usdc" } });
   assert.equal(result.isError, true);
-  assert.match(text(result), /USDC on NEAR is not enabled/);
-  assert.match(text(result), /original _payment_id and payment rail/);
+  assert.match(text(result), /Nano \(XNO\).*keep the same _payment_id/i);
+  assert.doesNotMatch(text(result), /USDC|\bNEAR\b/);
   assert.doesNotMatch(text(result), /request a NEAR quote instead/i);
   assert.deepEqual(r.calls, []);
 });
@@ -74,17 +74,19 @@ test("valid Nano and NEAR USDC calls keep their existing routing and advertised 
   assert.deepEqual(schema.enum, ["nano", "near", "usdc"]);
 });
 
-test("Nano QR, waiting, expiry, paid, refund and polling copy stay on Nano while NEAR USDC stays on NEAR", async t => {
+test("Nano QR, waiting, expiry, paid, refund and polling copy stay on Nano while USDC names its own asset", async t => {
   const quote = {
     id: originalId, tool: "poster", status: "pending", amountRaw: "50000000000000000000000000000",
     amountXno: "0.05", usd: 0.05, address, expiresAt: new Date(Date.now() + 60000).toISOString(),
   };
   quote.uri = `nano:${address}?amount=${quote.amountRaw}`;
-  const nearQuote = { id: "nq_synthetic", tool: "poster", status: "pending", asset: "USDC", amount: "0.05",
+  const usdcQuote = { id: "nq_synthetic_usdc", tool: "poster", status: "pending", asset: "USDC", amount: "0.05",
     tokenContract: "circle-usdc.testnet", network: "testnet", expiresAt: quote.expiresAt };
+  const nearQuote = { id: "nq_synthetic_near", tool: "poster", status: "pending", amountNear: "0.05",
+    amountYocto: "50000000000000000000000", network: "testnet", expiresAt: quote.expiresAt };
   const server = await serveHttp({ host: "127.0.0.1", port: 0, name: "copy-fixture", version: "0",
     publicBase: "http://fixture.invalid", gate: { quote: id => id === originalId ? quote : null },
-    nearGate: { quote: id => id === nearQuote.id ? nearQuote : null }, usdc: { enabled: true },
+    nearGate: { quote: id => [nearQuote, usdcQuote].find(q => q.id === id) || null }, usdc: { enabled: true },
     listTools: () => [tool], callTool: async () => { throw Error("tools must not run"); }, log: () => {},
   });
   t.after(() => new Promise(resolve => server.close(resolve)));
@@ -95,9 +97,23 @@ test("Nano QR, waiting, expiry, paid, refund and polling copy stay on Nano while
   assert.doesNotMatch(html, /USDC|\bNEAR\b/);
   assert.equal(qrDecode(svgToMatrix(html.match(/<svg[\s\S]*?<\/svg>/)[0])), quote.uri);
   const nearHtml = await (await fetch(`${base}/pay/${nearQuote.id}`)).text();
-  assert.match(nearHtml, /Pay in USDC/);
-  assert.match(nearHtml, /Circle-issued USDC on NEAR/);
-  assert.match(nearHtml, /ft_transfer/);
+  assert.match(nearHtml, /Pay in NEAR/);
+  assert.match(nearHtml, /one native transfer/);
+  assert.doesNotMatch(nearHtml, /\b(?:USDC|XNO|Nano)\b/);
+  const usdcHtml = await (await fetch(`${base}/pay/${usdcQuote.id}`)).text();
+  assert.match(usdcHtml, /Pay in USDC/);
+  assert.match(usdcHtml, /Circle-issued USDC/);
+  assert.match(usdcHtml, /ft_transfer/);
+  assert.match(usdcHtml, /Use the NEAR network/);
+  assert.doesNotMatch(usdcHtml.replace("NEAR network", "network"), /\b(?:NEAR|XNO|Nano)\b/);
+  for (const [q, statusPath] of [[quote, "x402"], [nearQuote, "near"], [usdcQuote, "near"]]) {
+    const status = await fetch(`${base}/${statusPath}/status/${q.id}`);
+    assert.equal(status.status, 200);
+    const current = await status.json();
+    assert.equal(current.status, "pending");
+    if (q === nearQuote) assert.ok(!Object.hasOwn(current, "amountAtomic"));
+    if (q === usdcQuote) { assert.equal(current.asset, "USDC"); assert.ok(!Object.hasOwn(current, "amountYocto")); }
+  }
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
   function page() {
     const elements = new Map(["paybox", "status", "expiry"].map(id => [id, { textContent: "", innerHTML: "" }]));

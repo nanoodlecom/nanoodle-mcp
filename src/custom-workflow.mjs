@@ -904,17 +904,11 @@ const bpsPct = (bps) => {
 };
 
 /**
- * The XNO/USD, swap-rate and margin part of the one rate line, "" when the
- * rate carries none of them. Starts with "; ".
+ * Display the quote margin without exposing the operator's other funding rates.
  */
 export function rateExtrasText(x) {
   if (!x) return "";
   const parts = [];
-  if ("xnoUsd" in x) {
-    parts.push(x.xnoUsd != null
-      ? `1 XNO = $${x.xnoUsd} (${x.xnoSource}, ${x.xnoAt}), so 1 NEAR = ${x.xnoPerNear} XNO`
-      : "XNO/USD unavailable");
-  }
   if (x.spreadBps) parts.push(`swap margin ${bpsPct(x.spreadBps)}%: NEAR amounts use 1 NEAR = $${x.effectiveNearUsd}`);
   return parts.map((p) => `; ${p}`).join("");
 }
@@ -984,14 +978,14 @@ export function formatQuote({ pricing, payment, now = Date.now() }) {
     const voc = pricingVocabulary(pricing);
     const next = pay.payUrl
       ? `Show ${pay.payUrl} and monitor ${pay.watchUrl}. When status is paid, repeat the original call with _payment_id: "${pay.paymentId}". Continue automatically; do not pay again.`
-      : `Call ft_transfer on ${pay.tokenContract} with receiver_id ${pay.payTo}, amount "${pay.amountAtomic}" and exactly 1 yoctoNEAR attached. Then resume the original call with _payment_id, _payment_tx and _payment_sender.`;
+      : `Call ft_transfer on ${pay.tokenContract} with receiver_id ${pay.payTo}, amount "${pay.amountAtomic}" and an attached deposit of exactly one atomic network unit. Then resume the original call with _payment_id, _payment_tx and _payment_sender.`;
     return {
       text: [
-        `PAYMENT REQUIRED (USDC on NEAR ${pay.network}) — deposit ${pay.amount} USDC to ${pay.payTo}.`,
-        `The deposit is the most you can be charged. Pay actual model cost + 20% service fee; unused USDC returns to the paying NEAR account. A failed run refunds the whole deposit.`,
+        `PAYMENT REQUIRED (USDC, ${pay.network}) — deposit ${pay.amount} USDC to ${pay.payTo}.`,
+        `The deposit is the most you can be charged. Pay actual model cost + 20% service fee; unused USDC returns to the paying account. A failed run refunds the whole deposit.`,
         ...(pay.payUrl ? [`Pay in your wallet: ${pay.payUrl}`] : []), next,
-        `Token contract: ${pay.tokenContract}. Amount: ${pay.amountAtomic} integer units (${pay.amount} USDC, six decimals).`,
-        `Quoted in USDC at 1 USD per USDC. Includes ${pay.dustAmount} USDC of unique refundable dust. Network gas is paid separately in NEAR.`,
+        `Use the NEAR network. Token contract: ${pay.tokenContract}. Amount: ${pay.amountAtomic} integer units (${pay.amount} USDC, six decimals).`,
+        `Quoted in USDC at 1 USD per USDC. Includes ${pay.dustAmount} USDC of unique refundable dust. Network gas is paid separately.`,
         `Quote expires ${pay.expiresAt}. The payment id is a secret; do not share it.`,
         "", ...pricingLines(pricing),
       ].join("\n"),
@@ -1068,7 +1062,7 @@ export function formatReceipt(receipt) {
       : `Model cost $${cost.usd}; charged ${ch.amount} USDC including the 20% service fee, rounded to token precision${ch.capped ? " and capped at the deposit" : ""}.`;
     const outcome = r.outcome === "succeeded" ? charge : "The workflow did not run successfully. Nothing was charged; the whole received deposit is refunded.";
     return { text: [
-      `Paid ${dep.amount} USDC on NEAR ${r.network} (tx ${dep.txHash}${dep.explorerUrl ? ", " + dep.explorerUrl : ""}). ${outcome}`,
+      `Paid ${dep.amount} USDC on ${r.network} (tx ${dep.txHash}${dep.explorerUrl ? ", " + dep.explorerUrl : ""}). ${outcome}`,
       `Refund ${ref.amount} USDC to ${ref.to}: ${refundStatusText(ref, r.paymentId)}.`,
       `Token: ${r.tokenContract}. Quote denomination: 1 USD per USDC; network gas is separate.`,
       ...legLines(r.legs || [], r.paymentId),
@@ -1123,13 +1117,13 @@ function legLines(legs, paymentId) {
     let t;
     if (model.status === "none") t = "none (nothing ran)";
     else if (model.status === "unknown") t = `unknown (${model.basis})`;
-    else t = `$${model.usd}${model.xno != null ? ` = ${model.xno} XNO` : ""} (${model.basis})`;
+    else t = `$${model.usd} (${model.fundedBy === "wallet" ? "paid from the operator's wallet" : model.basis})`;
     out.push(`Leg 2, model payment to NanoGPT: ${t}.`);
   }
   if (refund) {
     out.push(`Leg 3, refund: ${shortNear(refund.amount)} ${refund.asset || "NEAR"}, ${refundStatusText(refund, paymentId)}.`);
   }
-  if (author) out.push(`Leg 4, workflow author: ${author.amount} XNO to ${author.to}, ${author.status}${author.txHash ? `, block ${author.txHash}` : ""}.`);
+  if (author) out.push(`Leg 4, workflow author: payout ${author.status} (see the structured receipt for payout details).`);
   return out;
 }
 

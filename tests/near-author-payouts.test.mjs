@@ -80,7 +80,9 @@ for (const asset of ["near", "usdc"]) for (const name of ["poster", "run_noodle"
     assert.ok(BigInt(w.sends[0].amountRaw) > 0n);
     assert.equal(receipt.refund.status, "sent"); assert.equal(receipt.refund.to, P);
     assert.equal(receipt.legs[3].leg, "author payout");
-    assert.match(result.content.map(c => c.text || "").join("\n"), /Leg 4, workflow author:/);
+    const copy = result.content.map(c => c.text || "").join("\n");
+    assert.match(copy, /Leg 4, workflow author: payout/);
+    assert.doesNotMatch(copy.replace(/https?:\/\/\S+/g, ""), /\b(?:Nano|XNO)\b/i);
     const modelRuns = mock.runs(), refundSends = w.chain.sendTxCount;
     const restarted = w.make(); await restarted.gate.resume();
     assert.equal((await restarted.call(name, { ...args, _payment_id: p.paymentId })).structuredContent.receipt.authorPayout.status, "sent");

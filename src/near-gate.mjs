@@ -434,9 +434,9 @@ export function createNearGate({
   }
 
   async function quote(registry, name, args, tool, asset = "near", resumeTool = null) {
-    if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server. Request a NEAR quote instead.");
+    if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server.");
     const { pricing, author } = await prepare(registry, name, args, tool);
-    if (author && !authorPayouts) return errResult("This workflow names a Nano author but the server has no Nano payout wallet configured. Nothing was quoted or charged.");
+    if (author && !authorPayouts) return errResult("This workflow requires a creator payout, but the server has no payout wallet configured. Nothing was quoted or charged.");
     maybePrune();
     if (openQuoteCount() >= maxOpenQuotes) {
       return errResult("This server is holding too many open quotes right now; try again in a few minutes. Nothing was charged.");
@@ -447,13 +447,13 @@ export function createNearGate({
       r = asset === "usdc" ? await rate.currentUsdc() : await rate.current();
     } catch (e) {
       if (e instanceof NearError && e.code === "RATE_UNAVAILABLE") {
-        const pair = (e.data && e.data.pair) || "NEAR/USD";
-        const why = pair === "XNO/USD" ? " (this server pays its model provider in XNO, so the NEAR to XNO swap rate is unknown)" : "";
-        return errResult(`Cannot quote in ${asset === "usdc" ? "USDC" : "NEAR"} right now: no current ${pair} rate${why}; try again shortly. Nothing was charged.`);
+        const quoteAsset = asset === "usdc" ? "USDC" : "NEAR";
+        const reason = e.data?.pair === "XNO/USD" ? "the operator's funding rate is unavailable" : `no current ${quoteAsset}/USD rate`;
+        return errResult(`Cannot quote in ${quoteAsset} right now: ${reason}; try again shortly. Nothing was charged.`);
       }
       throw e;
     }
-    if (author && !(r.xnoUsd != null && parseUsdNano(r.xnoUsd) > 0n)) return errResult("Cannot quote this authored workflow without a current XNO/USD rate for its Nano creator payout. Try again shortly. Nothing was charged.");
+    if (author && !(r.xnoUsd != null && parseUsdNano(r.xnoUsd) > 0n)) return errResult("Cannot quote this authored workflow without a current funding rate for its creator payout. Try again shortly. Nothing was charged.");
     const taken = openAmounts(asset);
     let amountYocto;
     try {
@@ -521,7 +521,7 @@ export function createNearGate({
     // computePrice also reports what stops a quote: live-priced or unpriced models, a deposit over the cap.
     const computed = await computePrice(priceArgs, { baseUrl, fetch, log, allowShortLinks: false, limits: L });
     if (_pay_with === "usdc") {
-      const result = priceNoodleResult(computed, { note: "Request a USDC quote with _pay_with: usdc. Amounts use six decimal places; unused USDC returns on NEAR." });
+      const result = priceNoodleResult(computed, { note: "Request a USDC quote with _pay_with: usdc. Amounts use six decimal places; unused USDC returns to the paying account." });
       result.structuredContent.usdc = { network, tokenContract: usdcToken, decimals: 6, usdcUsd: "1", pricingBasis: "USDC denomination" };
       return result;
     }
@@ -539,8 +539,8 @@ export function createNearGate({
         note = `This server is paid in NEAR on ${network}. Call run_noodle with the same arguments for a quote; nothing is charged until you send the transfer.`;
       } catch (e) {
         if (!(e instanceof NearError && e.code === "RATE_UNAVAILABLE")) throw e;
-        const pair = (e.data && e.data.pair) || "NEAR/USD";
-        note = `No current ${pair} rate is available, so the figures are in USD only; a quote needs a rate and will fail until one is available.`;
+        const rateName = e.data?.pair === "XNO/USD" ? "operator funding" : "NEAR/USD";
+        note = `The ${rateName} rate is unavailable, so the figures are in USD only; a quote needs a rate and will fail until one is available.`;
       }
     }
     return priceNoodleResult(computed, { near, note });
@@ -564,8 +564,8 @@ export function createNearGate({
       throw new GraphArgsError("the paying call needs _payment_tx (your transfer's transaction hash) and _payment_sender (the account you paid from) together with _payment_id");
     }
     const txHash = tx.trim(), senderId = sender.trim();
-    try { base58Decode(txHash, 32); } catch { throw new GraphArgsError("_payment_tx must be a NEAR transaction hash (base58, 32 bytes)"); }
-    if (!isNearAccountId(senderId)) throw new GraphArgsError("_payment_sender must be a NEAR account id, e.g. alice.testnet");
+    try { base58Decode(txHash, 32); } catch { throw new GraphArgsError("_payment_tx must be a network transaction hash (base58, 32 bytes)"); }
+    if (!isNearAccountId(senderId)) throw new GraphArgsError("_payment_sender must be a network account id, e.g. alice.testnet");
 
     const consumed = ledger.consumedBy(txHash);
     if (consumed && consumed !== q0.id) {
@@ -576,7 +576,7 @@ export function createNearGate({
       if (ctx && typeof ctx.announce === "function") ctx.announce(s);
       else if (ctx && typeof ctx.report === "function") ctx.report(s);
     };
-    note(`checking payment ${q0.id} on NEAR ${network}`);
+    note(`checking ${symbol(q0)} payment ${q0.id} on ${network}`);
     let t;
     try {
       t = await readPaymentTransfer({ rpc, txHash, senderId, merchantId,
@@ -590,8 +590,8 @@ export function createNearGate({
         NOT_A_SINGLE_TRANSFER: assetOf(q0) === "usdc" ? `Transaction ${txHash} must contain exactly one ft_transfer on the quoted USDC contract with the exact recipient and amount.`
           : `Transaction ${txHash} is not exactly one native NEAR transfer (one Transfer action, nothing else). Send a plain transfer of exactly the quoted amount.`,
         WRONG_RECEIVER: `Transaction ${txHash} does not pay ${merchantId}. Send exactly the quoted amount to ${merchantId}.`,
-        TX_MISMATCH: "The NEAR RPC returned a different transaction than the one asked for; try again.",
-        RPC_UNAVAILABLE: "The NEAR RPC could not be reached to check the payment; try again shortly. Nothing was consumed.",
+        TX_MISMATCH: "The network RPC returned a different transaction than the one asked for; try again.",
+        RPC_UNAVAILABLE: "The network RPC could not be reached to check the payment; try again shortly. Nothing was consumed.",
       }[e.code] || `The payment could not be checked (${e.code}); try again. Nothing was consumed.`;
       return errResult(why);
     }
@@ -728,10 +728,10 @@ export function createNearGate({
 
   async function pay(registry, { name, args, argsHash, paymentId, tx, sender, ctx, tool }) {
     const q0 = ledger.getQuote(paymentId);
-    if (!q0) return errResult(`Unknown or expired payment id "${paymentId}" — call again without _payment_id for a fresh quote.`);
+    if (!q0) return errResult(`Unknown or expired payment id "${paymentId}" — call again without _payment_id and explicitly select your intended payment asset for a fresh quote.`);
     if (q0.tool !== name || q0.argsHash !== argsHash) {
       return errResult(`payment ${q0.id} was issued for a different call (tool/arguments changed) — ` +
-        "call again without _payment_id to get a quote for these arguments.");
+        `call again without _payment_id and with _pay_with: "${assetOf(q0)}" to get a quote for these arguments.`);
     }
     if (FINAL.has(q0.status)) return replay(q0);
     if (q0.status === "running") {

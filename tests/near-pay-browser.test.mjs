@@ -40,7 +40,7 @@ function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = n
     setTimeout,
   };
   vm.runInNewContext(source, context);
-  return { elements, sent, confirmed, storage, options: () => options, click: () => events.get("#near-pay:click")() };
+  return { elements, sent, confirmed, storage, options: () => options, render: (status) => context.render({ status }), click: () => events.get("#near-pay:click")() };
 }
 
 test("wallet page requests exactly one native transfer, then confirms it without another payment", async () => {
@@ -76,4 +76,16 @@ test("USDC wallet payment signs one ft_transfer to the quoted token contract, wi
   assert.deepEqual(p.confirmed, [{ senderId: "payer.testnet", txHash: "transfer-hash" }]);
   assert.match(p.elements.get("#near-status").textContent, /Unused USDC is returned/);
   await p.click(); assert.equal(p.sent.length, 1);
+});
+
+test("wallet pending, error and refund copy names only the quoted asset", () => {
+  for (const [asset, forbidden, options] of [["NEAR", /\b(?:USDC|XNO|Nano)\b/i, {}], ["USDC", /\b(?:NEAR|XNO|Nano)\b/i, { asset: { asset: "USDC" } }]]) {
+    const p = page(options);
+    for (const state of ["pending", "settled", "rejected", "expired", "unknown"]) {
+      p.render(state);
+      const status = p.elements.get("#near-status").textContent;
+      assert.match(status, new RegExp(`\\b${asset}\\b`));
+      assert.doesNotMatch(status, forbidden);
+    }
+  }
 });
