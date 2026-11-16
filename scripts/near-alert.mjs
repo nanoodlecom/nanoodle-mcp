@@ -34,7 +34,9 @@ export function babelRequest(input, init) {
   const url = new URL(input);
   if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) return fetch(input, init);
   return new Promise((resolve, reject) => {
-    const req = httpRequest(url, { method: init.method, headers: init.headers, signal: init.signal }, res => {
+    // The gateway's local listener requires the trusted edge header as well as
+    // its Host. This is loopback-only; Bearer authentication remains mandatory.
+    const req = httpRequest(url, { method: init.method, headers: { ...init.headers, "x-forwarded-proto": "https" }, signal: init.signal }, res => {
       const chunks = []; let bytes = 0;
       res.on("data", chunk => { bytes += chunk.length; if (bytes > 524288) { req.destroy(Error("Babel response too large")); return; } chunks.push(chunk); });
       res.on("error", reject);
