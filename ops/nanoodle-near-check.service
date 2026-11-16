@@ -1,0 +1,23 @@
+[Unit]
+Description=Paid NEAR MCP availability check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=nanoodle-check
+Group=nanoodle-check
+WorkingDirectory=/srv/nanoodle-mcp/app
+EnvironmentFile=/etc/nanoodle-near-check/env
+EnvironmentFile=/etc/255labs/system-trust.env
+StateDirectory=nanoodle-near-check
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/flock -n /var/lib/nanoodle-near-check/check.lock /usr/local/bin/with-system-trust /opt/node-v22.23.4-linux-x64/bin/node /srv/nanoodle-mcp/app/scripts/near-check.mjs
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/nanoodle-near-check/payer.json
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

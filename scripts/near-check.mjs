@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// A paid production canary. Run under flock; see docs/near-monitoring.md.
+import { mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
+import { pathToFileURL } from "node:url";
+import { createNearRpcPool, loadNearSigner, NEAR_NETWORKS, signTransfer, parseNearToYocto, formatYoctoAsNear } from "../src/near/index.mjs";
+import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib.mjs";
+import { callMcp, resultText } from "../src/near-site-browser.mjs";
+
+export function checkGraph(marker, twoSteps = false) {
+  const fields = { model: "z-ai/glm-5.3-flash", reasoningEffort: "low", temperature: 0, maxTokens: 256 };
+  const nodes = [
+    { id: "input", type: "text", name: "Marker", fields: { text: "" } },
+    { id: "extract", type: "llm", name: "Read marker", fields: { ...fields, system: twoSteps
+      ? "Return only the marker value from the user's message. No prefix, punctuation or explanation."
+      : "Return NANOODLE_OK: followed immediately by the marker value in the user's message. Nothing else." } },
+  ];
+  const links = [{ id: "read", from: { node: "input", port: "text" }, to: { node: "extract", port: "prompt" } }];
+  if (twoSteps) {
+    nodes.push({ id: "format", type: "llm", name: "Format answer", fields: { ...fields, system: "The user message is a marker. Return NANOODLE_OK: followed immediately by that marker. Nothing else." } });
+    links.push({ id: "handoff", from: { node: "extract", port: "text" }, to: { node: "format", port: "prompt" } });
+  }
+  return { graph: { v: 1, nodes, links }, inputs: { Marker: `Marker: ${marker}` }, _pay_with: "near" };
+}
+
+// fsync before rename, including the directory: never broadcast an unrecorded tx.
+export function atomicJson(file, value) {
+  const tmp = file + ".tmp", fd = openSync(tmp, "w", 0o600);
+  try { writeFileSync(fd, JSON.stringify(value, null, 2) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, file);
+  const dir = openSync(resolve(file, ".."), "r");
+  try { fsyncSync(dir); } finally { closeSync(dir); }
+}
+
+/** Dependencies are injectable so crash recovery and payment limits run offline. */
+export async function runCheck(config, deps = {}) {
+  const { stateDir, payer, keyFile, merchant = "nanoodle.near", network = "mainnet", twoSteps = false,
+    maxNear = "0.01", maxUsd = 0.001, url = "https://near.nanoodle.com" } = config;
+  const base = url.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  const now = deps.now || Date.now, sleep = deps.sleep || (ms => new Promise(r => setTimeout(r, ms)));
+  const request = deps.fetch || ((input, init = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(240_000) }));
+  const rpc = deps.rpc || createNearRpcPool({ urls: config.rpc || NEAR_NETWORKS[network].rpcUrls, chainId: network, timeoutMs: 20_000 });
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const file = join(stateDir, "state.json"), latest = join(stateDir, "latest.json");
+  let state = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null, stage = "preflight";
+  const save = () => atomicJson(file, state);
+  const require = (condition, message) => { if (!condition) throw Object.assign(new Error(message), { checkFailure: true }); };
+  let id = 0;
+  const json = async path => { const response = await request(base + path); require(response.ok, "HTTP status check failed"); return response.json(); };
+  const mcp = async (method, params) => {
+    const response = await request(base + "/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }) });
+    require(response.ok, "MCP HTTP check failed"); const body = await response.json();
+    require(!body.error && body.result, "MCP returned an error"); return body.result;
+  };
+  const call = (name, args) => mcp("tools/call", { name, arguments: args });
+  try {
+    const day = new Date(now()).toISOString().slice(0, 10);
+    require(payer && payer !== merchant && keyFile, "A separate payer and key file are required");
+    require(Number.isFinite(Number(maxUsd)) && Number(maxUsd) > 0 && parseNearToYocto(maxNear) > 0n, "Invalid spending cap");
+    // Check configuration even on a cached day; never resume against another host/account.
+    if (state) require(state.base === base && state.payer === payer && state.merchant === merchant && state.network === network, "Stored run belongs to another configuration");
+    await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-daily-check", version: "1" } });
+    const tools = (await mcp("tools/list", {})).tools;
+    require(["run_noodle", "price_noodle", "noodle_guide"].every(name => tools?.some(t => t.name === name)), "Required MCP tools are missing");
+    require(!(await call("noodle_guide", {})).isError, "Agent guide failed");
+    if (state?.done && state.day === day) {
+      const report = { ...state.report, checkedAt: new Date(now()).toISOString(), reused: true };
+      atomicJson(latest, report); return report;
+    }
+    if (!state || state.done) {
+      const marker = randomBytes(8).toString("hex");
+      state = { v: 1, day, base, payer, merchant, network, marker, args: checkGraph(marker, twoSteps), progress: [], createdAt: new Date(now()).toISOString() };
+      save();
+    }
+    stage = "quote";
+    if (!state.quote) {
+      const priced = await call("price_noodle", { graph: state.args.graph, inputs: state.args.inputs });
+      const pricing = priced.structuredContent?.pricing;
+      require(!priced.isError && pricing?.safety?.ok && Number.isFinite(Number(pricing.estimatedCost?.usd)) && Number(pricing.estimatedCost.usd) <= Number(maxUsd), "Price exceeds the model-cost cap or cannot be estimated");
+      const quoted = await call("run_noodle", state.args);
+      require(!quoted.isError, "Workflow quote failed");
+      state.quote = quoted.structuredContent?.payment; save();
+    }
+    const q = state.quote;
+    require(q?.status === "payment_required" && /^nq_[A-Za-z0-9_-]+$/.test(q.paymentId) && /^\d+$/.test(q.amountYocto), "Invalid NEAR quote");
+    require(q.network === network && q.payTo === merchant && (!q.asset || q.asset === "NEAR"), "Unexpected network, asset or payment destination");
+    const deposit = BigInt(q.amountYocto);
+    require(deposit > 0n && deposit <= parseNearToYocto(maxNear) && Number(q.depositUsd) <= Number(maxUsd) * 10, "Deposit exceeds the spending cap");
+    stage = "payment";
+    let newlySigned = false;
+    if (!state.signed) {
+      require(Date.parse(q.expiresAt) > now() + 60_000, "Unpaid quote expired; operator must archive this state before trying a new run");
+      const signer = await (deps.loadSigner || loadNearSigner)({ accountId: payer, keyFile, env: {} });
+      const key = await rpc.viewAccessKey({ accountId: payer, publicKey: signer.publicKey });
+      state.signed = signTransfer({ signer, signerId: payer, receiverId: merchant, nonce: BigInt(key.nonce) + 1n, blockHash: key.block_hash, amountYocto: deposit });
+      save(); newlySigned = true;
+    }
+    if (!state.paymentFinal) {
+      // On recovery, query first; if unknown, only re-broadcast these SAME bytes.
+      let tx;
+      try { if (!newlySigned) tx = await rpc.txStatus({ txHash: state.signed.txHash, senderId: payer, waitUntil: "FINAL", timeoutMs: 15_000 }); } catch (e) {
+        if (!["UNKNOWN_TRANSACTION", "TIMEOUT_ERROR", "RPC_TIMEOUT", "RPC_HTTP", "RPC_BAD_RESPONSE"].includes(e.code)) throw e;
+      }
+      if (!tx || tx.final_execution_status !== "FINAL") tx = await rpc.sendTx(state.signed.signedTxBase64, "FINAL", { timeoutMs: 60_000 });
+      require(tx?.final_execution_status === "FINAL" && Object.hasOwn(tx.status || {}, "SuccessValue") && !(tx.receipts_outcome || []).some(r => r.outcome?.status?.Failure), "Payment did not succeed at FINAL");
+      state.paymentFinal = true; state.gasYocto = tokensBurnt(tx).toString(); save();
+    }
+    stage = "payment_detection";
+    // Deliberately no _payment_tx/_payment_sender hints: exercise the watcher.
+    let view;
+    for (let i = 0; i < 90; i++) {
+      view = await json(`/near/status/${q.paymentId}`);
+      if (["paid", "running", "settled"].includes(view.status)) break;
+      await sleep(1000);
+    }
+    require(["paid", "running", "settled"].includes(view?.status), "Payment watcher did not recognize the deposit");
+    stage = "execution";
+    const paidArgs = { ...state.args, _payment_id: q.paymentId };
+    if (!state.result) {
+      state.result = await callMcp("run_noodle", paidArgs, { fetch: request, endpoint: base + "/mcp", onWorkflow: workflow => {
+        state.progress.push({ status: workflow.status, nodes: workflow.nodes.map(n => ({ id: n.id, status: n.status })) }); save();
+      } }); save();
+    }
+    const expected = `NANOODLE_OK:${state.marker}`;
+    require(!state.result.isError && resultText(state.result).includes(expected), "Custom workflow returned an incorrect result");
+    require(state.progress.some(w => w.nodes.some(n => n.status === "running")), "No live running-node progress received");
+    stage = "refund";
+    let receipt = state.result.structuredContent?.receipt;
+    for (let i = 0; receipt?.refund?.status === "pending" && i < 90; i++) {
+      await sleep(1000); receipt = (await call("run_noodle", paidArgs)).structuredContent?.receipt || receipt;
+    }
+    require(receipt?.outcome === "succeeded", "Workflow receipt did not succeed");
+    const refunded = BigInt(receipt.refund?.yocto ?? -1), charged = BigInt(receipt.charged?.yocto ?? -1);
+    require(BigInt(receipt.deposit?.yocto ?? -1) === deposit && receipt.deposit.txHash === state.signed.txHash && deposit - refunded === charged && charged >= 0n, "Receipt arithmetic or deposit does not match");
+    require(Number.isFinite(Number(receipt.charged.usd)) && Number(receipt.charged.usd) <= Number(maxUsd) * 1.2, "Actual charge exceeds the cost cap");
+    require(refunded > 0n && receipt.refund.status === "sent" && receipt.refund.to === payer, "Refund was not sent to the payer");
+    require((await checkTransferOnChain({ rpc, txHash: receipt.refund.txHash, sender: merchant, receiver: payer, amountYocto: refunded })).ok, "Refund does not match the finalized on-chain transfer");
+    stage = "replay_and_result";
+    const replay = await call("run_noodle", paidArgs);
+    require(JSON.stringify(replay.structuredContent?.receipt) === JSON.stringify(receipt) && resultText(replay).includes(expected), "Replay changed the result or receipt");
+    const cached = await json(`/near/result/${q.paymentId}`);
+    require(JSON.stringify(cached).includes(expected), "Payment page result cache is missing the output");
+    const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: "z-ai/glm-5.3-flash", modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
+      output: expected, progressFrames: state.progress.length, chargedUsd: receipt.charged.usd, chargedNear: formatYoctoAsNear(charged), refundedNear: formatYoctoAsNear(refunded), payerGasNear: formatYoctoAsNear(BigInt(state.gasYocto)),
+      paymentTx: state.signed.txHash, refundTx: receipt.refund.txHash, watcher: true, replay: true, paymentPageResult: true };
+    state.done = true; state.receipt = receipt; state.report = report; save(); atomicJson(latest, report); return report;
+  } catch (error) {
+    // Raw RPC/MCP errors can include signed payloads and private checkout URLs.
+    const report = { ok: false, checkedAt: new Date(now()).toISOString(), stage, error: error.checkFailure ? error.message : "Check interrupted or dependency failed; resume the retained state. Inspect locally before replacing it." };
+    atomicJson(latest, report); throw Object.assign(new Error(report.error), { report });
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+  try {
+    const o = parseArgs(process.argv.slice(2), ["two-steps"]);
+    const report = await runCheck({ stateDir: o["state-dir"] || "/var/lib/nanoodle-near-check", payer: o.payer || process.env.CHECK_PAYER,
+      keyFile: o["key-file"] || process.env.CHECK_KEY_FILE, url: o.url || process.env.CHECK_URL, network: o.network || "mainnet", rpc: o.rpc,
+      merchant: o.merchant || "nanoodle.near", maxNear: o["max-near"] || "0.01", maxUsd: Number(o["max-usd"] || "0.001"), twoSteps: !!o["two-steps"] });
+    console.log(JSON.stringify(report));
+  } catch (error) { console.error(JSON.stringify(error.report || { ok: false, error: "Invalid configuration or unreadable state" })); process.exitCode = 1; }
+}
