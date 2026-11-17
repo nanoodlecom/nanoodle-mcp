@@ -130,6 +130,7 @@ export function createNearGate({
   authorPayouts = null,
   canQuote = () => true,
   fundRun = null,
+  maintenance = null,
   runTimeoutMs = undefined,
   refundFunding = null,
 }) {
@@ -138,6 +139,7 @@ export function createNearGate({
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
+  if (maintenance !== null && typeof maintenance.run !== "function") throw new TypeError("maintenance must provide operation admission and accounting");
   if (refundFunding !== null && ["quote", "run"].some(k => typeof refundFunding[k] !== "function")) throw new TypeError("refundFunding needs quote and run checks");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}) };
   if (usdcEnabled && !isNearAccountId(usdcToken)) throw new TypeError("USDC needs a verified token contract");
@@ -989,13 +991,16 @@ export function createNearGate({
     }
 
     // Which names this gate sells and which only it offers (the dual-rail router reads these).
-    return { listTools, callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]),
+    return { listTools, callTool: maintenance ? (params, ctx) => maintenance.run(() => callTool(params, ctx)) : callTool, sells: (n) => paidNames.has(n), nearOnly: new Set([RUN_NOODLE, PRICE_NOODLE_NAME, NOODLE_GUIDE_NAME]),
       assets: new Set(["near", ...(usdcEnabled ? ["usdc"] : [])]) };
   }
 
-  return { wrapRegistry, resume, authorPayouts,
+  return { wrapRegistry, resume: maintenance ? () => maintenance.run(resume, "background") : resume, authorPayouts,
     fundingLiabilitiesRaw: context => nearCreatorLiabilities({ quotes: ledger.quotes(), payouts: ledger.payouts() }, context),
-    quote: paymentView, confirmPayment, waitForPayment, waitForUpdate, pendingQuotes, observeTransfer,
+    quote: paymentView,
+    confirmPayment: maintenance ? (...args) => maintenance.run(() => confirmPayment(...args)) : confirmPayment,
+    observeTransfer: maintenance ? (...args) => maintenance.run(() => observeTransfer(...args), "background") : observeTransfer,
+    waitForPayment, waitForUpdate, pendingQuotes,
     // The private payment URL is also the capability to read this paid result.
     // This getter never runs a workflow, accepts payment or changes settlement.
     result(id) { const q = ledger.getQuote(id); return q && FINAL.has(q.status) ? replay(q) : null; },

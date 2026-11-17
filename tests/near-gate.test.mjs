@@ -8,10 +8,11 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
 import {
   createNearRpc, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
@@ -39,7 +40,7 @@ before(async () => {
 });
 after(() => { globalThis.fetch = realFetch; });
 
-async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false, merchantBalance = parseNearToYocto("10") } = {}) {
+async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false, merchantBalance = parseNearToYocto("10"), maintenance } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
@@ -54,12 +55,12 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
     const signer = parseNearSecretKey(key.secretKey);
     const refundFunding = guardRefunds ? createNearFunding({ rpc, ledger, accountId: MERCHANT, publicKey: signer.publicKey, network: "testnet" }) : null;
     const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null,
-      beforeSign: refundFunding?.beforeSign, beforeComplete: refundFunding?.beforeComplete });
+      beforeSign: refundFunding?.beforeSign, beforeComplete: refundFunding?.beforeComplete, maintenance });
     const gate = createNearGate({
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
       rate: rate || createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase, canQuote, fundRun, refundFunding,
+      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase, canQuote, fundRun, refundFunding, maintenance,
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -692,4 +693,27 @@ test("NEAR tool schemas describe what this server accepts (no media inputs, no s
   }
   const rn = w.listTools().find((x) => x.name === "run_noodle");
   assert.doesNotMatch(rn.description, /da\.gd|TinyURL|fragment-less short links trigger/);
+});
+
+for (const name of ["idea-poster", "run_noodle"]) test(`maintenance preserves the same paid NEAR quote for ${name} without inference or a refund`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "near-gate-maintenance-")), file = join(dir, "flag.json");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const maintenance = createMaintenanceBarrier({ file, ownerUid: process.getuid() }), w = await world({ maintenance });
+  const inputs = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: INPUTS } : INPUTS;
+  const payment = (await call(w, name, inputs)).structuredContent.payment;
+  const tx = w.chain.transfer(PAYER, MERCHANT, BigInt(payment.amountYocto));
+  await w.gate.confirmPayment(payment.paymentId, tx, PAYER);
+  assert.equal(w.ledger.getQuote(payment.paymentId).status, "paid");
+  const before = mock.runs();
+  await writeFile(file, JSON.stringify({ v: 1, token: "f".repeat(32), operation: "backup", revision: null }), { mode: 0o600 });
+  await assert.rejects(call(w, name, { ...inputs, _payment_id: payment.paymentId }), { code: "SERVICE_DRAINING", executionNotStarted: true });
+  assert.equal(w.ledger.getQuote(payment.paymentId).status, "paid");
+  assert.equal(w.ledger.refunds().length, 0); assert.equal(mock.runs(), before);
+  await rm(file);
+  const result = await call(w, name, { ...inputs, _payment_id: payment.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  const count = mock.runs(); assert.ok(count > before);
+  await call(w, name, { ...inputs, _payment_id: payment.paymentId });
+  assert.equal(mock.runs(), count);
+  maintenance.close(); await maintenance.waitForIdle();
 });

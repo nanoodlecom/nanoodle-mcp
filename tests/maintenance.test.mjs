@@ -133,3 +133,29 @@ test("synchronous admission checks grant no detached scope and allow an accepted
   assert.throws(() => w.barrier.assertAdmitted(), { code: "SERVICE_DRAINING" });
   assert.equal(w.barrier.snapshot().activeOperations, 0);
 });
+
+test("idle waits require closed admission and cannot resolve before accepted nested settlement finishes", async t => {
+  const w = world(t), entered = deferred(), finish = deferred(), settlement = deferred(); let drained = false;
+  await assert.rejects(w.barrier.waitForIdle(), { code: "SERVICE_NOT_DRAINING" });
+  const request = w.barrier.run(async () => {
+    entered.resolve(); await finish.promise;
+    await assert.rejects(w.barrier.waitForIdle(), { code: "SERVICE_OPERATION_ACTIVE" });
+    await w.barrier.run(() => settlement.promise, "wallet");
+  });
+  await entered.promise;
+  w.barrier.close();
+  const idle = w.barrier.waitForIdle().then(() => { drained = true; });
+  finish.resolve(); await new Promise(r => setImmediate(r));
+  assert.equal(drained, false);
+  settlement.resolve(); await Promise.all([request, idle]);
+  assert.equal(drained, true);
+  assert.equal(w.barrier.snapshot().stopping, true);
+  await assert.rejects(w.barrier.run(() => assert.fail("Shutdown cannot readmit work")), { code: "SERVICE_DRAINING" });
+});
+
+test("local shutdown closure is irreversible even when the operator removes its external flag", async t => {
+  const w = world(t); w.put(); w.barrier.close(); rmSync(w.file);
+  assert.equal(w.barrier.accepting(), false);
+  await w.barrier.waitForIdle();
+  assert.equal(w.barrier.snapshot().code, "service-stopping");
+});

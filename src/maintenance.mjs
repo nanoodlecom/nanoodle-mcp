@@ -20,7 +20,8 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
     || !Number.isSafeInteger(ownerUid) || ownerUid < 0 || typeof now !== "function") {
     throw new TypeError("Maintenance needs an absolute operator-owned path and a clock");
   }
-  const context = new AsyncLocalStorage(), active = new Set();
+  const context = new AsyncLocalStorage(), active = new Set(), idleWaiters = new Set();
+  let stopping = false;
 
   function control() {
     if (file === null) return absent();
@@ -57,11 +58,16 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
     finally { if (fd !== undefined) closeSync(fd); }
   }
 
+  function admission() {
+    const state = control();
+    return stopping ? { ...state, accepting: false, code: "service-stopping" } : state;
+  }
+
   // Synchronous ledger writes finish in the same event-loop turn. They need
   // an admission check, without turning a synchronous intent API into a promise.
   function assertAdmitted() {
     const parent = context.getStore();
-    if (!(parent && active.has(parent) && !parent.closed) && !control().accepting) {
+    if (!(parent && active.has(parent) && !parent.closed) && !admission().accepting) {
       throw new MaintenanceError("SERVICE_DRAINING", "New work is paused for maintenance; no work was started");
     }
   }
@@ -73,7 +79,10 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
     // task waiting in a queue is already in flight for drain purposes.
     const scope = { kind, startedAt: now(), started: false, closed: false };
     active.add(scope);
-    const close = () => { scope.closed = true; active.delete(scope); };
+    const close = () => {
+      scope.closed = true; active.delete(scope);
+      if (!active.size) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear(); }
+    };
     const scheduled = async () => {
       if (scope.closed || scope.started) throw new MaintenanceError("SERVICE_OPERATION_CLOSED", "Service operation cannot start again");
       scope.started = true;
@@ -88,14 +97,20 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
   }
 
   return {
-    accepting: () => control().accepting,
+    accepting: () => admission().accepting,
+    close() { stopping = true; },
+    async waitForIdle() {
+      if (admission().accepting) throw new MaintenanceError("SERVICE_NOT_DRAINING", "Close admission before waiting for a drain");
+      if (active.has(context.getStore())) throw new MaintenanceError("SERVICE_OPERATION_ACTIVE", "An active operation cannot await its own drain");
+      if (active.size) await new Promise(resolve => idleWaiters.add(resolve));
+    },
     capture,
     assertAdmitted,
     async run(execute, kind = "request") { return capture(execute, kind)(); },
     snapshot() {
       const counts = Object.fromEntries(KINDS.map(kind => [kind, 0]));
       for (const scope of active) counts[scope.kind]++;
-      return { v: 1, enforced: file !== null, ...control(), activeOperations: active.size,
+      return { v: 1, enforced: file !== null, ...admission(), stopping, activeOperations: active.size,
         oldestStartedAt: active.size ? Math.min(...[...active].map(scope => scope.startedAt)) : null, counts };
     },
   };

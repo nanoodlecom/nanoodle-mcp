@@ -212,6 +212,7 @@ export function createChargeGate({
   now = () => Date.now(),
   fundRun = null,
   canQuote = () => true,
+  maintenance = null,
   runTimeoutMs = undefined,
 }) {
   const executionLimit = hostedRunTimeout(runTimeoutMs);
@@ -220,6 +221,7 @@ export function createChargeGate({
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.accepting !== "function" || typeof maintenance.assertAdmitted !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
 
   /** @type {Map<string, object>} paymentId → quote */
   const quotes = new Map();
@@ -314,11 +316,16 @@ export function createChargeGate({
    */
   const owed = []; // { to, amountRaw, describe, event, fields, onOk, tries, at }
   const pendingTransfers = new Set();
-  function trackedTransfer(to, amountRaw, describe, event, fields) {
-    const record = { amountRaw: String(amountRaw), event, fields };
-    pendingTransfers.add(record);
-    return { promise: Promise.resolve().then(() => ops.transfer(to, amountRaw, describe, { liabilityRaw: amountRaw })),
-      release: () => pendingTransfers.delete(record) };
+  function trackedTransfer(to, amountRaw, describe, event, fields, complete) {
+    const execute = async () => {
+      const record = { amountRaw: String(amountRaw), event, fields };
+      pendingTransfers.add(record);
+      // The lifecycle includes success/failure persistence after publication,
+      // not just the wallet promise. Otherwise idle could precede the receipt.
+      try { return await complete(() => Promise.resolve().then(() => ops.transfer(to, amountRaw, describe, { liabilityRaw: amountRaw }))); }
+      finally { pendingTransfers.delete(record); }
+    };
+    return maintenance ? maintenance.run(execute, "wallet") : execute();
   }
   const OWED_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
   const OWED_MAX_TRIES = 100; // ≈16h at the 10-min cap — after that it needs a human
@@ -383,10 +390,9 @@ export function createChargeGate({
       usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: "payer account unknown", reason });
       return false;
     }
-    q.refunding = (async () => {
-      const transfer = trackedTransfer(q.source, q.amountRaw, "refunded", "refund", { paymentId: q.id });
+    q.refunding = trackedTransfer(q.source, q.amountRaw, "refunded", "refund", { paymentId: q.id }, async send => {
       try {
-        const hash = await transfer.promise;
+        const hash = await send();
         q.status = "refunded";
         usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: q.amountRaw, to: q.source, hash, reason });
         persist();
@@ -397,8 +403,8 @@ export function createChargeGate({
         owe(q.source, q.amountRaw, "refunded", "refund",
           { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; });
         return false;
-      } finally { transfer.release(); }
-    })();
+      }
+    });
     return q.refunding;
   }
 
@@ -414,11 +420,10 @@ export function createChargeGate({
    * model run merely because their content was deliberately not persisted.
    */
   let saveChain = Promise.resolve();
-  let saveQueued = false;
+  let saveQueued = false, pendingWrites = 0, persistenceFailed = false;
   function persist() {
     if (!stateFile || saveQueued) return;
-    saveQueued = true;
-    saveChain = saveChain.then(async () => {
+    const write = async () => {
       saveQueued = false; // snapshot at write time — later mutations queue another write
       const data = JSON.stringify({
         // v:2 is the content-stripping era — its results are provably media-only
@@ -461,7 +466,18 @@ export function createChargeGate({
       const tmp = stateFile + ".tmp";
       await writeFile(tmp, data);
       await rename(tmp, stateFile);
-    }).catch((e) => log(`cannot persist gate state to ${stateFile}: ${e.message}`));
+      persistenceFailed = false;
+    };
+    const complete = async () => {
+      try { await write(); }
+      catch (error) { persistenceFailed = true; log(`cannot persist gate state to ${stateFile}: ${error.message}`); }
+      finally { pendingWrites--; }
+    };
+    // Count the queued write before yielding. Completion of a refund or model
+    // result is insufficient while its retry debt/receipt is still in memory.
+    const scheduled = maintenance ? maintenance.capture(complete, "wallet") : complete;
+    saveQueued = true; pendingWrites++;
+    saveChain = saveChain.then(scheduled);
   }
 
   if (stateFile) {
@@ -553,6 +569,10 @@ export function createChargeGate({
   }
 
   function prune() {
+    if (maintenance) {
+      try { maintenance.assertAdmitted(); }
+      catch (error) { if (error.code === "SERVICE_DRAINING") return; throw error; }
+    }
     const t = now();
     let changed = false;
     for (const q of quotes.values()) {
@@ -699,7 +719,7 @@ export function createChargeGate({
    */
   const SCAN_BACKOFF_CAP_MS = 60 * 1000; // a quote only lives ~15min — never go quiet longer than this
   let scanFails = 0;
-  let scanning = false;
+  let scanning = null, stopped = false;
 
   function tick() {
     // tick() nulls `timer` and then awaits, so for the whole duration of a scan
@@ -707,12 +727,13 @@ export function createChargeGate({
     // of it. That is what let concurrent retryOwed() passes double-send (see the
     // o.sending guard). Belt and braces: never run two scans at once — the one
     // in flight schedules the next tick when it finishes.
-    if (scanning) return;
-    scanning = true;
+    if (scanning) return scanning;
+    if (stopped) return Promise.resolve();
     timer = null;
-    scan().then(
+    scanning = (maintenance ? maintenance.run(scan, "background") : scan()).then(
       () => { scanFails = 0; },
       (e) => {
+        if (e.code === "SERVICE_DRAINING") return;
         scanFails++;
         // Log the first few, then only every 12th — a stuck endpoint used to
         // write one line per poll (5,158 in 34h), burying everything else.
@@ -722,8 +743,8 @@ export function createChargeGate({
         }
       },
     ).then(() => {
-      scanning = false;
-      if (!anyWatchable()) return;
+      scanning = null;
+      if (stopped || !anyWatchable()) return;
       // With a live websocket the poll is only a safety net — relax it.
       let delay = wsConnected ? Math.max(pollMs, 5000) : pollMs;
       // Only back off the tick when a scan actually failed. Owed-only ticks keep
@@ -733,6 +754,7 @@ export function createChargeGate({
       timer = setTimeout(tick, delay);
       if (timer.unref) timer.unref();
     });
+    return scanning;
   }
 
   function ensureWatching() {
@@ -758,7 +780,7 @@ export function createChargeGate({
   let ws = null;
   let wsEverFailed = false;
   function connectWs() {
-    if (!wsUrl || ws) return;
+    if (stopped || (maintenance && !maintenance.accepting()) || !wsUrl || ws) return;
     if (typeof WebSocket === "undefined") {
       if (!wsEverFailed) { wsEverFailed = true; log("--nano-ws ignored: no global WebSocket (needs Node ≥ 21)"); }
       return;
@@ -776,7 +798,11 @@ export function createChargeGate({
       if (m && m.topic === "confirmation" && m.message) {
         const blk = m.message.block || {};
         if (blk.subtype === "send" && blk.link_as_account === address) {
-          matchAmount(m.message.amount, { source: blk.account, hash: m.message.hash, via: "websocket" });
+          const observe = () => matchAmount(m.message.amount, { source: blk.account, hash: m.message.hash, via: "websocket" });
+          if (maintenance) maintenance.run(observe, "background").catch(error => {
+            if (error.code !== "SERVICE_DRAINING") log("Websocket payment observation needs retry through polling");
+          });
+          else observe();
         }
       }
     };
@@ -883,6 +909,7 @@ export function createChargeGate({
   const gate = {
     address,
     fundingPair: ratePair,
+    persistenceStatus: () => ({ enabled: !!stateFile, ok: !persistenceFailed, pendingWrites }),
     fundingLiabilitiesRaw: () => nanoFundingLiabilities({ quotes: [...quotes.values()], owed, pending: [...pendingTransfers] }),
 
     /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
@@ -1088,23 +1115,27 @@ export function createChargeGate({
           log(`call ${q.id} (${name}) cost $${parsed} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
         if (author && take > 0n) {
-          const transfer = trackedTransfer(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id });
-          transfer.promise
-            .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? parsed : null, hash }))
-            .catch((e) => {
+          trackedTransfer(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id }, async send => {
+            try {
+              const hash = await send();
+              usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? parsed : null, hash });
+            } catch (e) {
               log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
               owe(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id, tool: name });
-            }).finally(transfer.release);
+            }
+          }).catch(() => log("Author payout completion needs operator reconciliation"));
         }
         if (change > 0n) {
           if (q.source) {
-            const transfer = trackedTransfer(q.source, change.toString(), "change:", "change", { paymentId: q.id });
-            transfer.promise
-              .then((hash) => usage("change", { paymentId: q.id, tool: name, ok: true, to: q.source, amountRaw: change.toString(), hash }))
-              .catch((e) => {
+            trackedTransfer(q.source, change.toString(), "change:", "change", { paymentId: q.id }, async send => {
+              try {
+                const hash = await send();
+                usage("change", { paymentId: q.id, tool: name, ok: true, to: q.source, amountRaw: change.toString(), hash });
+              } catch (e) {
                 log(`change for ${q.id} (→ ${q.source}) failed: ${e.message}`);
                 owe(q.source, change.toString(), "change:", "change", { paymentId: q.id, tool: name });
-              }).finally(transfer.release);
+              }
+            }).catch(() => log("Customer change completion needs operator reconciliation"));
           } else {
             log(`cannot return ${rawToXno(change)} XNO change for ${q.id}: payer account unknown`);
             usage("change", { paymentId: q.id, tool: name, ok: false, amountRaw: change.toString(), error: "payer account unknown" });
@@ -1344,11 +1375,18 @@ export function createChargeGate({
         return q.error ? errResult(q.error) : q.result;
       }
 
-      return { listTools, callTool };
+      return { listTools, callTool: maintenance ? (params, ctx) => maintenance.run(() => callTool(params, ctx)) : callTool };
     },
   };
   // Restored pending quotes / owed sends need the watcher running from boot,
   // not from the next quote — a payment may land while nobody is calling.
+  gate.stop = async () => {
+    stopped = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    ws?.close();
+    await scanning;
+    await saveChain;
+  };
   if (anyWatchable()) ensureWatching();
   return gate;
 }
