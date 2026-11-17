@@ -36,6 +36,7 @@ import { redactUrl } from "./redact.mjs";
 import { createRunFunding, FundingError } from "./run-funding.mjs";
 import { createNanoReadPool } from "./nano-read-pool.mjs";
 import { createDurableSender, createDurableReceiver, assertRecoveryObservation } from "./payments/durable-send.mjs";
+import { validateMigrationReceipt, receiptDigest } from "./payments/migration-receipt.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -557,8 +558,21 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   }
 
   const durableAuthorization = new Map();
+  let migrationSeen = null;
   function refreshRecoveryHead() {
     if (!recoveryStore || !readPool) return;
+    const migration = recoveryStore.load(`migration:${address}`).data;
+    if (!migration && migrationSeen !== null) throw Error("Invalid durable Nano migration checkpoint");
+    if (migration) {
+      const digest = receiptDigest(migration);
+      if (migrationSeen !== null && migrationSeen !== digest) throw Error("Invalid durable Nano migration checkpoint");
+      if (migrationSeen === null) validateMigrationReceipt(migration, { account: address });
+      migrationSeen = digest;
+      const anchor = migration.initialHead, blockCount = BigInt(anchor.blockCount);
+      readPool.observe({ frontier: anchor.hash, blockCount, balance: BigInt(anchor.balance), representative: anchor.representative });
+      if (chain && (chain.blockCount == null || chain.blockCount < blockCount
+        || chain.blockCount === blockCount && chain.frontier !== anchor.hash)) chain = null;
+    }
     const head = recoveryStore.load(`account-head:${address}`).data;
     if (!head) return;
     const operation = recoveryStore.getSend(head.operationId);

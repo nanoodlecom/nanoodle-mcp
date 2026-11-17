@@ -5,7 +5,26 @@ and the reviewed foundation in [draft #96](https://github.com/nanoodlecom/nanood
 (`5e47182`). Production still uses its existing JSON authorities. No canonical
 journal, production flag or schema migration has been activated. The current
 version-one production startup policy deliberately refuses journal activation;
-a qualified migration policy, monitoring, backups and rollback are still required.
+a qualified migration, monitoring, backups and rollback are still required.
+
+The draft now implements a version-two startup policy. It pins the existing
+private schema-3 database, Nano account, frozen legacy Nano bytes and immutable
+migration receipt digest. That receipt identifies every required Nano, NEAR and
+Market source by scope and SHA-256, plus a signed mainnet initial account head.
+Startup refuses missing/empty/replaced journals, wrong-wallet receipts, missing
+source scopes and a disabled recovery monitor. It cannot initialize new history
+over a missing database. Generic metadata writes cannot replace the migration
+receipt. Database availability and identity are rechecked before publication.
+
+The signed initial head seeds the read guard before the first RPC account read,
+including before the first outgoing operation. Two frozen peers below that
+floor cannot authorize a new block. The fixture reproduces the fork attempt on
+the preceding draft and verifies zero work generation or publication with this
+guard, then resumes the same operation when the real head becomes available.
+Receipt creation requires an empty outgoing journal and no outstanding Nano
+claims. A separate offline migration must still qualify every other rail,
+preserve the running wallet's high-water checkpoint and pin the complete frozen
+source set. No production version-two policy has been installed.
 
 ## Authority before effects
 
@@ -101,8 +120,8 @@ Before starting any worker/outbox, hosted funding registers existing canonical
 Nano obligations even when Nano checkout is disabled. After registration, a
 missing/malformed snapshot fails closed rather than reading stale JSON. An empty
 development journal can still import its legacy source. The future production
-policy must require the canonical scope after migration; that policy remains
-unimplemented and production activation remains refused.
+policy requires the canonical scope after migration in version two. Its
+production installation and activation remain refused pending qualification.
 
 The shared account now also fences fresh sends, provider payments and receives
 while any older creator payout lacks canonical proof. This includes historical
@@ -179,8 +198,9 @@ npm test
 
 Before production activation, finish and verify:
 
-1. A versioned production policy pinning the canonical existing DB, its account,
-   schema and legacy import. Qualify the actual current-state migration and a
+1. Qualify the implemented version-two policy pinning the canonical existing DB,
+   account, schema, legacy bytes, complete source set and initial signed head.
+   Implement/qualify the offline current-state migration and a
    schema-3-compatible rollback without modifying production authority. Include
    every NEAR/USDC/Market creator outbox: any legacy prepared Nano payout needs
    account-level reconciliation before fresh signing can be authorized.

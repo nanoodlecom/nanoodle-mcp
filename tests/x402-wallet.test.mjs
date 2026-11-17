@@ -11,12 +11,15 @@ import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock, createBlock } from "nanocurrency";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
 import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { USDC_CONTRACTS, parseNearToYocto } from "../src/near/index.mjs";
 import { mcpClient, freePort, stopServerChild } from "../scripts/near-simulate.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
+import { openRecoveryStore } from "../src/payments/recovery-store.mjs";
+import { receiptDigest } from "../src/payments/migration-receipt.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = join(here, "..", "bin", "nanoodle-mcp.mjs");
@@ -33,7 +36,7 @@ const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
 
-for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server${recovery ? " with the journal" : ""}`, { timeout: 60_000 }, async () => {
+for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server${recovery ? " with the V2 journal policy" : ""}`, { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-funding-"));
   const graphs = join(dir, "graphs"), out = join(dir, "out");
   await mkdir(graphs); await mkdir(out);
@@ -42,6 +45,9 @@ for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEA
   graph.x402 = { author: PAY_TO };
   await writeFile(join(graphs, "poster.json"), JSON.stringify(graph));
   const deposits = new Map(), providerBlocks = new Set();
+  const initial = createBlock(SECRET, { previous: "0".repeat(64), representative: ADDRESS, balance: BALANCE, link: "C".repeat(64), work: WORK });
+  initial.block.account = ADDRESS;
+  const initialFrontier = recovery ? initial.hash : FRONTIER;
   let frozenReads = 0, frozenPublishes = 0;
   const rpc = fakeRpc({
     account_info: (_b, state, reply) => {
@@ -64,11 +70,12 @@ for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEA
       return reply({ confirmed: "true", contents: p.block, amount: (delta < 0n ? -delta : delta).toString(), height: String(i + 2) });
     },
   });
+  rpc.state.frontier = initialFrontier;
   const rpcServer = http.createServer(async (req, res) => {
     const chunks = []; for await (const part of req) chunks.push(part);
     const rawBody = Buffer.concat(chunks).toString(), body = JSON.parse(rawBody);
     if (req.url === "/frozen") {
-      const answer = body.action === "account_info" ? nanoAccountInfo({ frontier: FRONTIER, balance: BALANCE, representative: ADDRESS, height: 1 })
+      const answer = body.action === "account_info" ? nanoAccountInfo({ frontier: initialFrontier, balance: BALANCE, representative: ADDRESS, height: 1 })
         : body.action === "receivable" ? { blocks: "" }
         : body.action === "account_history" ? { history: [] }
         : body.action === "work_generate" ? { work: WORK }
@@ -98,6 +105,23 @@ for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEA
   } });
   let child, stderr = "";
   try {
+    const policyFile = join(dir, "state-policy.json");
+    if (recovery) {
+      const legacy = Buffer.from(JSON.stringify({ v: 2, quotes: [], owed: [] }));
+      const nearState = Buffer.from(JSON.stringify({ v: 1, network: "testnet", merchant: "merchant.testnet", quotes: {}, consumedTx: {}, refunds: {}, payouts: {}, meta: {} }));
+      await writeFile(join(out, "gate-state.json"), legacy, { mode: 0o600 });
+      await writeFile(join(out, "near-state.json"), nearState, { mode: 0o600 });
+      const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+      const sources = [{ scope: "nano", sha256: digest(legacy) }, { scope: "near", sha256: digest(nearState) }];
+      const receipt = { v: 1, schema: 3, account: ADDRESS, networkGenesis: NANO_GENESIS_HASH, createdAt: Date.now(), legacySha256: digest(legacy), sources,
+        sourceSetSha256: digest(JSON.stringify(sources)), initialHead: { hash: initial.hash, blockCount: "1", balance: BALANCE, representative: ADDRESS, block: initial.block } };
+      const store = openRecoveryStore(join(dir, "journal.sqlite")); store.bindAccount(ADDRESS, { requireHeight: true });
+      store.save(`gate:${ADDRESS}`, 0, { v: 3, quotes: [], owed: [], historyCursor: { marker: null, head: null, newest: null } });
+      store.initializeMigration(receipt); store.close();
+      await writeFile(policyFile, JSON.stringify({ v: 2, outDir: out, nanoAddress: ADDRESS, chargeNano: true,
+        near: { merchant: "merchant.testnet", network: "testnet" }, marketRoot: null, marketHandles: [],
+        recovery: { path: join(dir, "journal.sqlite"), schema: 3, legacySha256: digest(legacy), receiptSha256: receiptDigest(receipt) } }), { mode: 0o600 });
+    }
     await new Promise(resolve => rpcServer.listen(0, "127.0.0.1", resolve));
     await near.listen(); await nano.listen();
     const port = await freePort(), base = `http://127.0.0.1:${port}`;
@@ -106,6 +130,7 @@ for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEA
       "--near-rpc", near.url, "--near-usd", "3.64"], { env: {
         PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANO_SEED: SEED, NANO_RPC_URL: ["frozen", "fresh-a", "fresh-b"].map(p => `http://127.0.0.1:${rpcServer.address().port}/${p}`).join(","),
         NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANOODLE_RUN_TIMEOUT_MS: "2000",
+        ...(recovery ? { NANOODLE_STATE_POLICY: policyFile, NANOODLE_REQUIRE_RECOVERY: "1" } : {}),
       }, stdio: ["ignore", "ignore", "pipe"] });
     child.stderr.setEncoding("utf8"); child.stderr.on("data", part => { stderr += part; });
     const started = Date.now();
@@ -118,6 +143,7 @@ for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEA
     assert.equal(health.funding.enforced, true); assert.equal(health.funding.ok, true);
     const funding = JSON.parse(await readFile(join(out, "funding-health.json"), "utf8"));
     if (recovery) {
+      assert.equal(funding.writerProtection.requiredState, true);
       assert.equal(funding.recovery.schema, 3); assert.equal(funding.recovery.heightProtected, true);
       assert.equal(funding.recovery.ready, true); assert.equal(funding.recovery.reconciler.enforced, true);
       assert.equal(funding.recovery.reconciler.ok, true);

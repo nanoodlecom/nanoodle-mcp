@@ -347,7 +347,7 @@ async function main() {
   const resolvedOut = resolve(outDir || "./nanoodle-out");
   const paidFunding = serveSpec !== null && (chargeUsd != null || nearMode);
   const marketEnabled = serveSpec !== null && !!(process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN);
-  const guardedFunding = paidFunding || marketEnabled;
+  const guardedFunding = paidFunding || marketEnabled || !!recoveryDbFlag;
   let fundingSources = null;
   let writerLocks = null;
   // The wallet exists for two independent jobs: paying NanoGPT x402 invoices when
@@ -387,6 +387,7 @@ async function main() {
         assertWriter: () => {
           if (!writerLocks) throw Error("Payment writer protection not acquired");
           writerLocks.assertHeld();
+          recoveryStore?.assertAvailable();
         },
         log: (line) => console.error("nanoodle-mcp: " + line),
       };
@@ -440,7 +441,9 @@ async function main() {
     }
     requiredState = verifyStartupState({ policyFile: process.env.NANOODLE_STATE_POLICY, outDir: resolvedOut,
       nanoAddress, chargeNano: chargeUsd != null,
-      nearMerchant, nearNetwork, marketRoot, marketHandles });
+      nearMerchant, nearNetwork, marketRoot, marketHandles,
+      recoveryDb: recoveryDbFlag ? resolve(recoveryDbFlag) : null,
+      requireRecoveryMonitoring: process.env.NANOODLE_REQUIRE_RECOVERY === "1" });
     fundingSources?.requireFiles(requiredState.files);
     console.error(`nanoodle-mcp: required payment state verified (${requiredState.files.length} files)`);
   }
@@ -449,15 +452,17 @@ async function main() {
     if (!walletOptions) throw Error("--recovery-db requires an active Nano wallet");
     // The existing v1 production policy pins JSON authority. Journal activation
     // needs a qualified migration/rollback policy; do not silently bypass it.
-    if (requiredState) throw Error("The current production state policy does not authorize journal migration");
+    if (requiredState && !requiredState.recovery) throw Error("The current production state policy does not authorize journal migration");
     writerLocks.assertHeld();
     const { openRecoveryStore } = await import("../src/payments/recovery-store.mjs");
-    recoveryStore = openRecoveryStore(resolve(recoveryDbFlag));
+    recoveryStore = openRecoveryStore(resolve(recoveryDbFlag), requiredState?.recovery ? {
+      requireExisting: true, migration: requiredState.recovery,
+    } : {});
   }
   if (walletOptions) wallet = walletFactory({ ...walletOptions, recoveryStore });
   if (recoveryStore && fundingSources) {
     const { registerCanonicalNanoFunding } = await import("../src/hosted-funding.mjs");
-    registerCanonicalNanoFunding(fundingSources, recoveryStore, wallet.address);
+    registerCanonicalNanoFunding(fundingSources, recoveryStore, wallet.address, { required: !!requiredState?.recovery });
   }
 
   const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");

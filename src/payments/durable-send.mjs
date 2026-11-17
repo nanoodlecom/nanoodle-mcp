@@ -125,6 +125,7 @@ function createDurableWriter(
     signed(r);
     if (!r.granted) return r.state === "completed" ? r.hash : reconcile(r);
     try {
+      store.assertAvailable?.();
       await publish(r.block);
     } catch {
       store.uncertain(id);

@@ -104,7 +104,7 @@ for (const index of [0, 1, 2]) test(`missing required ledger ${index} refuses an
 });
 
 for (const [label, change] of [
-  ['unknown policy version', p => { p.v = 2; }],
+  ['unknown policy version', p => { p.v = 999; }],
   ['policy typo', p => { p.ignoreMissing = true; }],
   ['different Nano identity', p => { p.nanoAddress = 'nano_changed'; }],
   ['different NEAR identity', p => { p.near.merchant = 'different.testnet'; }],

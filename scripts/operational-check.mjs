@@ -20,6 +20,7 @@ import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
 import { selectRecoveryHealth } from "../src/payments/recovery-health.mjs";
+import { readStartupPolicy } from "../src/startup-state.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -284,12 +285,13 @@ export async function runOperationalCheck(config, deps = {}) {
 
 async function productionConfig(env = process.env) {
   need(env.NANOODLE_REQUIRE_RECOVERY == null || ["0", "1"].includes(env.NANOODLE_REQUIRE_RECOVERY), "recovery-requirement-invalid");
+  const policy = readStartupPolicy(env.NANOODLE_STATE_POLICY || "/etc/nanoodle-mcp/state-policy.json");
   const secret = resolveWalletKey({ privateKey: env.NANO_PRIVATE_KEY, seed: env.NANO_SEED });
   need(secret, "nano-wallet-not-configured");
   const merchant = env.NEAR_MERCHANT;
   const signer = await loadNearSigner({ accountId: merchant, keyFile: env.NEAR_KEY_FILE || null, env });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", outDir: "/srv/nanoodle-mcp/out",
-    requireRecovery: env.NANOODLE_REQUIRE_RECOVERY === "1",
+    requireRecovery: policy.v === 2 || env.NANOODLE_REQUIRE_RECOVERY === "1",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
     nanoRpcUrls: env.NANO_RPC_URL.split(",").map(s => s.trim()), nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),

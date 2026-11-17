@@ -1,7 +1,9 @@
 /** Canonical Nano recovery metadata. No keys, prompts, outputs or provider error text. */
 import { DatabaseSync } from "node:sqlite";
-import { constants, openSync, closeSync, fstatSync, mkdirSync, fsyncSync } from "node:fs";
+import { constants, openSync, closeSync, fstatSync, lstatSync, mkdirSync, fsyncSync } from "node:fs";
 import { dirname } from "node:path";
+import { validateMigrationReceipt } from "./migration-receipt.mjs";
+import { nanoFundingLiabilities } from "../funding-liabilities.mjs";
 
 export class RecoveryError extends Error {
   constructor(code) {
@@ -17,14 +19,37 @@ const copy = (x) => JSON.parse(JSON.stringify(x));
 const uint = (x) => typeof x === "string" && /^(0|[1-9][0-9]*)$/.test(x);
 const hash = (x) => typeof x === "string" && /^[A-F0-9]{64}$/i.test(x);
 
-export function openRecoveryStore(path, { fault = () => {} } = {}) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+export function openRecoveryStore(path, { fault = () => {}, requireExisting = false, migration = null } = {}) {
+  check(typeof requireExisting === "boolean" && (!migration || requireExisting), "RECOVERY_MIGRATION_INVALID");
+  if (!requireExisting) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (requireExisting) {
+    const parent = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      const st = fstatSync(parent);
+      check(st.isDirectory() && st.uid === process.getuid() && !(st.mode & 0o077), "RECOVERY_FILE_UNSAFE");
+    } finally { closeSync(parent); }
+  }
+  const fd = openSync(path, constants.O_RDWR | (requireExisting ? 0 : constants.O_CREAT) | constants.O_NOFOLLOW, 0o600);
+  let identity;
   try {
     const st = fstatSync(fd);
     check(st.isFile() && st.nlink === 1 && st.uid === process.getuid() && !(st.mode & 0o077), "RECOVERY_FILE_UNSAFE");
+    check(!requireExisting || st.size > 0, "RECOVERY_SCHEMA_UNSUPPORTED");
+    identity = { dev: st.dev, ino: st.ino };
   } finally { closeSync(fd); }
+  function assertFile() {
+    try {
+      const st = lstatSync(path);
+      check(st.isFile() && st.dev === identity.dev && st.ino === identity.ino && st.nlink === 1
+        && st.uid === process.getuid() && !(st.mode & 0o077), "RECOVERY_FILE_UNSAFE");
+      if (requireExisting) {
+        const parent = lstatSync(dirname(path));
+        check(parent.isDirectory() && parent.uid === process.getuid() && !(parent.mode & 0o077), "RECOVERY_FILE_UNSAFE");
+      }
+    } catch { throw new RecoveryError("RECOVERY_FILE_UNSAFE"); }
+  }
   const db = new DatabaseSync(path);
+  try { assertFile(); } catch (error) { db.close(); throw error; }
   let closed = false,
     poisoned = false;
   const tables = db
@@ -39,6 +64,9 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
     "quote_amount",
     "wallet_identity",
   ];
+  if (requireExisting && !tables.length) {
+    db.close(); throw new RecoveryError("RECOVERY_SCHEMA_UNSUPPORTED");
+  }
   if (
     tables.length &&
     (tables.filter((t) => !t.name.startsWith("sqlite_")).length !==
@@ -58,6 +86,20 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
       db.close(); throw new RecoveryError("RECOVERY_SCHEMA_UNSUPPORTED");
     }
   }
+  function assertMigration() {
+    if (!migration) return;
+    try {
+      const owner = db.prepare("SELECT account,height_proofs FROM wallet_identity WHERE singleton=1").get();
+      if (owner?.account !== migration.account || owner.height_proofs !== 1) throw Error();
+      const row = db.prepare("SELECT data FROM metadata WHERE scope=?").get(`migration:${migration.account}`);
+      validateMigrationReceipt(row ? JSON.parse(row.data) : null, migration);
+      const gate = db.prepare("SELECT data FROM metadata WHERE scope=?").get(`gate:${migration.account}`);
+      const value = gate ? JSON.parse(gate.data) : null;
+      if (value?.v !== 3 || !Array.isArray(value.quotes) || !Array.isArray(value.owed)
+        || !value.historyCursor || typeof value.historyCursor !== "object" || Array.isArray(value.historyCursor)) throw Error();
+    } catch { throw new RecoveryError("RECOVERY_MIGRATION_INVALID"); }
+  }
+  try { assertMigration(); } catch (error) { db.close(); throw error; }
   try {
     db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       BEGIN IMMEDIATE;
@@ -104,12 +146,15 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
   }
   function available() {
     check(!closed && !poisoned, "RECOVERY_STORE_UNAVAILABLE");
+    assertFile();
   }
   function tx(fn, operation = "operation") {
     available();
     let committed = false;
     try {
       db.exec("BEGIN IMMEDIATE");
+      available();
+      assertMigration();
       const value = fn();
       fault("before_commit", operation);
       db.exec("COMMIT");
@@ -211,6 +256,7 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
     return { ...operation, epoch: r.epoch };
   }
   return Object.freeze({
+    assertAvailable() { available(); assertMigration(); },
     bindAccount(account, options) { return tx(() => bindAccount(account, options)); },
     load(scope) {
       available();
@@ -227,6 +273,7 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
       data,
       { intents = [], payment = null, payments = [] } = {},
     ) {
+      check(typeof scope === "string" && !scope.startsWith("migration:"), "RECOVERY_MIGRATION_IMMUTABLE");
       return tx(() => {
         for (const claim of [...payments, ...(payment ? [payment] : [])]) {
           check(
@@ -281,6 +328,7 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
     activeSend,
     status(account) {
       available();
+      assertMigration();
       const owner = db.prepare("SELECT account,height_proofs FROM wallet_identity WHERE singleton=1").get();
       check(owner?.account === account, "RECOVERY_ACCOUNT_MISMATCH");
       check(!db.prepare(`SELECT s.id FROM sends s LEFT JOIN active_send a ON a.account=s.account AND a.id=s.id
@@ -320,6 +368,24 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
         ).run(r.account, id, epoch);
         return { ...r, epoch };
       });
+    },
+    initializeMigration(receipt) {
+      receipt = copy(receipt);
+      validateMigrationReceipt(receipt, { account: receipt?.account });
+      return tx(() => {
+        const account = receipt.account, owner = db.prepare("SELECT account,height_proofs FROM wallet_identity WHERE singleton=1").get();
+        check(owner?.account === account && owner.height_proofs === 1, "RECOVERY_MIGRATION_INVALID");
+        check(!db.prepare("SELECT scope FROM metadata WHERE scope=?").get(`migration:${account}`)
+          && !db.prepare("SELECT id FROM sends LIMIT 1").get(), "RECOVERY_MIGRATION_ALREADY_STARTED");
+        const row = db.prepare("SELECT data FROM metadata WHERE scope=?").get(`gate:${account}`);
+        const gate = row ? JSON.parse(row.data) : null;
+        check(gate?.v === 3 && Array.isArray(gate.quotes) && Array.isArray(gate.owed) && gate.historyCursor
+          && typeof gate.historyCursor === "object" && !Array.isArray(gate.historyCursor), "RECOVERY_MIGRATION_INVALID");
+        let liabilities;
+        try { liabilities = nanoFundingLiabilities(gate); } catch { throw new RecoveryError("RECOVERY_MIGRATION_INVALID"); }
+        check(liabilities === 0n && gate.owed.length === 0, "RECOVERY_MIGRATION_NOT_QUIESCENT");
+        return writeState(`migration:${account}`, 0, receipt);
+      }, "initialize-migration");
     },
     submitted(id, { hash: h, block, previousBalance, epoch }) {
       return tx(() => {
@@ -370,8 +436,11 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
           const scope = `account-head:${r.account}`;
           const row = db.prepare("SELECT revision,data FROM metadata WHERE scope=?").get(scope);
           const old = row ? JSON.parse(row.data) : null;
-          check(!old || (BigInt(height) >= BigInt(old.blockCount)
-            && (height !== old.blockCount || old.hash === h)), "RECOVERY_HEAD_REGRESSION");
+          const migrationRow = db.prepare("SELECT data FROM metadata WHERE scope=?").get(`migration:${r.account}`);
+          const anchor = migrationRow ? validateMigrationReceipt(JSON.parse(migrationRow.data), { account: r.account }).initialHead : null;
+          const floor = old && (!anchor || BigInt(old.blockCount) >= BigInt(anchor.blockCount)) ? old : anchor;
+          check(!floor || (BigInt(height) >= BigInt(floor.blockCount)
+            && (height !== floor.blockCount || floor.hash === h)), "RECOVERY_HEAD_REGRESSION");
           writeState(scope, row?.revision ?? 0, { operationId: id, hash: h, blockCount: height,
             balance: r.block.balance, representative: r.block.representative });
         }

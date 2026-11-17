@@ -109,7 +109,7 @@ test("the BYOK startup path never statically imports the GPL dependency", () => 
   );
 });
 
-test("only the two x402 modules import nanocurrency", () => {
+test("only the optional x402 wallet, gate and migration verifier import nanocurrency", () => {
   // src/ is enumerated from disk: a new module that imports nanocurrency is caught
   // even when nothing else references it, and a rename gives this assertion, not ENOENT.
   const files = srcModules();
@@ -119,8 +119,8 @@ test("only the two x402 modules import nanocurrency", () => {
     .map((f) => relative(join(root, "src"), f));
   assert.deepEqual(
     gpl.sort(),
-    ["gate.mjs", "wallet.mjs"],
-    "nanocurrency (GPL-3.0) may only be imported by the two x402 modules. A new module that needs it " +
+    ["gate.mjs", "payments/migration-receipt.mjs", "wallet.mjs"],
+    "nanocurrency (GPL-3.0) may only be imported by the optional x402 modules and their keyless migration verifier. A new module that needs it " +
       "must stay off every static path from bin/nanoodle-mcp.mjs — reach it with await import() only.",
   );
 });
