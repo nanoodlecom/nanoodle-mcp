@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { nanoFundingLiabilities, nearCreatorLiabilities, marketCreatorLiabilities } from "./funding-liabilities.mjs";
 
 function read(file) {
@@ -13,7 +14,7 @@ function rows(value) {
 
 /** Register live ledger owners before they resume/start work. Disabled profiles
  * still contribute their recorded debts through read-only disk fallback. */
-export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
+export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now = () => performance.now() }) {
   let requiredFiles = new Set();
   function readState(file) {
     const value = read(file);
@@ -21,7 +22,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
     return value;
   }
   let nanoLive = null, nearLive = null, payoutsLive = null;
-  let quoteReady = false, storageReady = true;
+  let quoteReady = false, storageReady = true, readyAt = null;
   const marketLive = new Map();
   function nearDisk() {
     const s = readState(nearFile);
@@ -43,9 +44,18 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
   }
   return {
     requireFiles(files) { requiredFiles = new Set(files.map(file => resolve(file))); },
-    ready: () => quoteReady,
-    setReady(value) { quoteReady = value === true; },
-    setStorageReady(value) { storageReady = value === true; if (!storageReady) quoteReady = false; },
+    ready() {
+      if (!quoteReady || !storageReady) return false;
+      // Expire even when the refresh task is stuck on the wallet queue. Use a
+      // monotonic clock so wall-clock changes cannot extend a healthy lease.
+      const age = now() - readyAt;
+      if (!Number.isFinite(age) || age < 0 || age >= 60_000) {
+        quoteReady = false; readyAt = null;
+      }
+      return quoteReady;
+    },
+    setReady(value) { quoteReady = storageReady && value === true; readyAt = quoteReady ? now() : null; },
+    setStorageReady(value) { storageReady = value === true; if (!storageReady) { quoteReady = false; readyAt = null; } },
     registerNano(reader) { nanoLive = reader; },
     registerNear(reader, payouts) { nearLive = reader; payoutsLive = payouts; },
     registerMarket(file, reader) { marketLive.set(resolve(file), reader); },
