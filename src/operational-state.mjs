@@ -1,6 +1,7 @@
 // Read-only accounting for probes and admission checks. Never opens a ledger,
 // signs a transaction, retries an assignment, or returns customer content.
-import { parseUsdNano } from "./gate.mjs";
+import { parseUsdNano } from "./usd.mjs";
+import { nanoFundingLiabilities, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
 
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const U128_MAX = (1n << 128n) - 1n;
@@ -13,7 +14,7 @@ function values(value) { if (!object(value)) throw Error("invalid-state-shape");
 export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now(), stuckMs = 3_600_000, debtMs = 900_000 } = {}) {
   if (![1, 2].includes(nano?.v) || !Array.isArray(nano.quotes) || !Array.isArray(nano.owed)
     || near?.v !== 1 || !object(near.quotes) || !object(near.refunds) || !object(near.payouts ?? {})) throw Error("invalid-state-shape");
-  let nanoRaw = 0n, nearYocto = 0n, usdcAtomic = 0n, marketUsdNano = 0n;
+  let nanoRaw = nanoFundingLiabilities({ quotes: nano.quotes, owed: nano.owed }), nearYocto = 0n, usdcAtomic = 0n, marketUsdNano = 0n;
   let nativeRefunds = 0, tokenRefunds = 0;
   const issues = new Set();
   const old = (stamp, ms) => Number.isFinite(stamp) && now - stamp > ms;
@@ -23,19 +24,19 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     else if (asset == null || asset === "near") nearYocto += n;
     else throw Error("invalid-state-asset");
   };
+  const nanoRefundIds = new Set(nano.owed.filter(d => d.event === "refund").map(d => d.fields?.paymentId));
   for (const q of nano.quotes) {
     if (!["pending", "paid", "consumed", "expired", "refunded"].includes(q.status)) throw Error("invalid-nano-quote-status");
     // Text-only results can persist as paid + settled after restart. They are
     // completed financial settlements, not fresh refundable deposits.
     if (["paid", "consumed"].includes(q.status) && !q.settled && !q.result && !q.error) {
-      nanoRaw += amount(q.amountRaw);
       if (old(q.paidAt ?? q.createdAt, stuckMs)) issues.add("nano-paid-work-stuck");
     }
+    if (nanoQuoteClaim(q) > 0n && ((q.error && !nanoRefundIds.has(q.id)) || q.settled)) issues.add("nano-refund-unresolved");
   }
   for (const debt of nano.owed) {
-    nanoRaw += amount(debt.amountRaw);
     // Legacy debts have a next-attempt time, not an original creation time.
-    if (debt.tries >= 5 || old(debt.at, debtMs)) issues.add("nano-settlement-stuck");
+    if (debt.held || debt.tries >= 5 || old(debt.at, debtMs)) issues.add("nano-settlement-stuck");
   }
   const refunds = values(near.refunds), refundPayments = new Set(refunds.map(r => r.paymentId));
   for (const refund of refunds) {
@@ -74,6 +75,7 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
   }
   for (const state of market) {
     if (state?.v !== 1 || !object(state.assignments)) throw Error("invalid-market-state");
+    nanoRaw += marketCreatorLiabilities(values(state.assignments), { payouts });
     for (const rec of values(state.assignments)) {
       if (rec.phase === "stuck") issues.add("market-assignment-stuck");
       if (["new", "reworking", "running", "submitting", "delivering", "started", "starting", "pricing", "declining"].includes(rec.phase)

@@ -59,9 +59,9 @@ export async function runOperationalCheck(config, deps = {}) {
     const result = await http(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     need(!result.error, "nano-rpc-error"); return result;
   };
-  const mcp = async (method, params) => {
+  const mcp = async (method, params, site = config.site) => {
     need(["initialize", "tools/list"].includes(method) || (method === "tools/call" && params.name === "price_noodle"), "probe-action-forbidden");
-    const result = await http(config.site + "/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
+    const result = await http(site + "/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
     need(!result.error && result.result, "mcp-error"); return result.result;
   };
@@ -72,6 +72,18 @@ export async function runOperationalCheck(config, deps = {}) {
     const liabilities = paymentLiabilities({ nano, near, market }, { now: now() });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
+  });
+  await check("runtime-funding", async () => {
+    const value = read(join(config.outDir, "funding-health.json"));
+    need(value?.v === 1, "funding-report-missing");
+    const age = now() - Date.parse(value.checkedAt);
+    need(Number.isFinite(age) && age <= 60_000 && age >= -30_000, "funding-report-stale");
+    need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
+    need([value.balanceRaw, value.liabilitiesRaw, value.reservedRaw].every(v => typeof v === "string" && /^\d{1,39}$/.test(v)), "funding-report-invalid");
+    need(value.ok === true && BigInt(value.balanceRaw) >= BigInt(value.liabilitiesRaw) + BigInt(value.reservedRaw), "funding-underfunded");
+    need(Number.isSafeInteger(value.activeRuns) && value.activeRuns >= 0, "funding-report-invalid");
+    need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
+      && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= 45 * 60_000, "funding-run-stuck");
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -168,6 +180,13 @@ export async function runOperationalCheck(config, deps = {}) {
     const result = await mcp("tools/list", {});
     need(["price_noodle", "run_noodle", "noodle_guide"].every(name => result.tools?.some(t => t.name === name)), "mcp-tools-missing");
   });
+  await check("nano-mcp-discovery", async () => {
+    const target = config.nanoSite;
+    need(typeof target === "string" && target.length > 0, "nano-site-not-configured");
+    await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } }, target);
+    const result = await mcp("tools/list", {}, target);
+    need((config.nanoExpectedTools || ["sing"]).every(name => result.tools?.some(t => t.name === name)), "mcp-tools-missing");
+  }, ["nano"]);
   await check("custom-workflow-pricing", async () => {
     const sample = checkGraph("readonly-operational-probe", true);
     for (const asset of ["near", "usdc"]) {
@@ -251,7 +270,7 @@ async function productionConfig(env = process.env) {
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
     nanoRpcUrls: env.NANO_RPC_URL.split(",").map(s => s.trim()), nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
-    site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
+    site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
     nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 

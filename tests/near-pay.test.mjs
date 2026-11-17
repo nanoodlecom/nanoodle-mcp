@@ -35,7 +35,9 @@ async function setup() {
   const pFile = join(dir, `${PAYER}.json`);
   await writeFile(pFile, JSON.stringify({ account_id: PAYER, public_key: pk.publicKey, private_key: pk.secretKey }), { mode: 0o600 });
   const port = await freePort();
-  const srv = await startServer({ graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: mk.secretKey, port });
+  let srv;
+  try { srv = await startServer({ graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: mk.secretKey, port }); }
+  catch (error) { await chain.close(); await nano.close(); throw error; }
   const base = `http://127.0.0.1:${port}`;
   const close = async () => { await srv.kill(); await chain.close(); await nano.close(); };
   return { chain, nano, pk, pFile, base, close };

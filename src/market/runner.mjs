@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { MediaRef } from "nanoodle";
 import { computePrice, prepareRunNoodle, describeRunFailure, runNotices, extForMedia, ParamsError } from "../tools.mjs";
 import { DEFAULT_LIMITS, GraphArgsError, GraphRefusedError, exactUsd } from "../custom-workflow.mjs";
+import { runFundingBudget } from "../run-funding.mjs";
 
 /** The operator's margin on a market job, on top of the estimated model cost. */
 export const MARKET_MARGIN_RATE = 0.2;
@@ -66,11 +67,16 @@ export async function checkNanoGptKey({ apiKey, baseUrl = "https://nano-gpt.com"
  * @param {object} [o.limits]      custom-workflow caps (maxDepositUsd is replaced by budgetUsd)
  * @param {(line: string) => void} [o.log]
  */
-export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetch = globalThis.fetch, limits = DEFAULT_LIMITS, log = () => {} }) {
+export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetch = globalThis.fetch, limits = DEFAULT_LIMITS, log = () => {}, fundRun = null, fundingPair = null }) {
   const keyed = typeof apiKey === "string" && !!apiKey;
   if (!keyed && typeof payment !== "function") throw new TypeError("createWorkflowRunner needs the operator's NanoGPT API key or an x402 payment callback");
   // A key always wins, as everywhere else in this package.
-  const funding = keyed ? { apiKey } : { payment };
+  // Explicit wallet mode must not inherit a different account's environment
+  // key inside Workflow; that would silently bypass the funding controller.
+  const funding = keyed ? { apiKey } : { apiKey: null, payment };
+  if ((fundRun !== null || fundingPair !== null) && (keyed || typeof fundRun !== "function" || typeof fundingPair !== "function")) {
+    throw new TypeError("wallet run funding needs both fundRun and fundingPair, without an API key");
+  }
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createWorkflowRunner needs a positive budgetUsd");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}), maxDepositUsd: budgetUsd };
 
@@ -127,12 +133,14 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
      * @throws on a failed run (message from describeRunFailure; `buyerMessage` is set only
    *   when the message is the provider's per-step errors, safe to show the buyer)
      */
-    async run({ pricing, inputs, outDir }) {
+    async run({ pricing, inputs, outDir, fundingId, creator = false, onRunComplete = null }) {
+      if (onRunComplete !== null && typeof onRunComplete !== "function") throw new TypeError("onRunComplete must be a function or null");
       const { wf, inputs: resolved } = await prepareRunNoodle(
         { graph: pricing.boundGraph, inputs },
         { ...funding, baseUrl, fetch, log, allowShortLinks: false },
       );
       const { onProgress, notices } = runNotices(wf);
+      const execute = async () => {
       let result;
       try {
         result = await wf.run(resolved, { onProgress });
@@ -163,7 +171,12 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
         }
       }
       const costUsd = typeof result.costUsd === "number" && Number.isFinite(result.costUsd) ? result.costUsd : null;
-      return { costUsd, costExact: result.costExact !== false && costUsd != null, notices: [...notices], outputs };
+      const run = { costUsd, costExact: result.costExact !== false && costUsd != null, notices: [...notices], outputs };
+      if (onRunComplete) await onRunComplete(run);
+      return run;
+      };
+      return fundRun ? await fundRun(runFundingBudget({ id: fundingId, budgetUsd: pricing.depositUsd,
+        pair: await fundingPair(), creator }), execute) : await execute();
     },
   };
 }

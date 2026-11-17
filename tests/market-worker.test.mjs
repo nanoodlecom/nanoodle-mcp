@@ -31,7 +31,7 @@ before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
 /** A market, a state dir and a worker wired together. */
-async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true } = {}) {
+async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null } = {}) {
   const m = market || createMarketMock();
   if (!market) await m.listen();
   const stateDir = dir || mkdtempSync(join(tmpdir(), "market-worker-"));
@@ -39,7 +39,7 @@ async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, 
   const store = openMarketState({ dir: stateDir });
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
   const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nano.url });
-  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, log: (l) => logs.push(l) });
+  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, checkFee, log: (l) => logs.push(l) });
   const once = async () => { await worker.tick(); await worker.drain(); };
   return { m, store, worker, once, logs, stateDir };
 }
@@ -49,6 +49,24 @@ const noSecrets = (logs) => {
   assert.ok(!all.includes(MOCK_TOKEN), "the agent token appears in the log");
   assert.ok(!all.includes(NANO_KEY), "the NanoGPT key appears in the log");
 };
+
+test("a changed Market fee prevents both starting a hire and inference after a start", async () => {
+  for (const boundary of [1, 2]) {
+    let checks = 0;
+    const r = await rig({ checkFee: async () => {
+      if (++checks === boundary) { const error = Error("fee changed"); error.code = "MARKET_FEE_CHANGED"; throw error; }
+      return 500;
+    } });
+    try {
+      const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+      await r.once();
+      assert.equal(r.store.get(id).phase, "declined");
+      assert.equal(r.store.get(id).decline.code, "MARKET_FEE_CHANGED");
+      assert.equal(nano.runs(), before);
+      assert.equal(checks, boundary);
+    } finally { r.store.close(); await r.m.close(); }
+  }
+});
 
 test("accepted market hires pay the embedded Nano author once, at the locked rate, including after restart", async () => {
   const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });

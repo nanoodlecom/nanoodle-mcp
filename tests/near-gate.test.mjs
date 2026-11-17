@@ -14,8 +14,9 @@ import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
 import {
-  createNearRpc, openNearLedger, createNearUsdRate, createRefunder, parseNearSecretKey, parseNearToYocto,
+  createNearRpc, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
 } from "../src/near/index.mjs";
+import { createRunFunding } from "../src/run-funding.mjs";
 import { createFakeChain, throwawayNearKey, GAS_YOCTO, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
 
 const MERCHANT = "merchant.testnet";
@@ -37,7 +38,7 @@ before(async () => {
 });
 after(() => { globalThis.fetch = realFetch; });
 
-async function world({ limits, dust = 137, publicBase, canQuote } = {}) {
+async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
@@ -53,9 +54,9 @@ async function world({ limits, dust = 137, publicBase, canQuote } = {}) {
     const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null });
     const gate = createNearGate({
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
-      rate: createNearUsdRate({ staticUsd: "3.64" }),
+      rate: rate || createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase, canQuote,
+      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase, canQuote, fundRun,
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -67,6 +68,43 @@ async function world({ limits, dust = 137, publicBase, canQuote } = {}) {
 
 const call = (w, name, args) => w.callTool({ name, arguments: args });
 const text = (r) => r.content.map((c) => c.text || "").join("\n");
+
+test("saved and custom NEAR workflows inherit one funding reservation from their paid quote", async () => {
+  for (const [name, inputs] of [["idea-poster", INPUTS], ["run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }]]) {
+    let tail = Promise.resolve();
+    const pool = createRunFunding({ serial: fn => { const p = tail.then(fn); tail = p.catch(() => {}); return p; },
+      balance: async () => 100n * 10n ** 30n });
+    const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+    const policies = [];
+    const w = await world({ rate, fundRun: (terms, execute) => { policies.push(terms); return pool.run(terms, execute); } });
+    const original = w.registry.callTool;
+    w.registry.callTool = (...args) => {
+      assert.equal(pool.snapshot().activeRuns, 1);
+      return original(...args);
+    };
+    const { p, tx } = await quoteAndPay(w, name, inputs);
+    const result = await call(w, name, { ...inputs, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+    assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+    assert.equal(policies.length, 1);
+    assert.equal(policies[0].id, `near:${p.paymentId}`);
+    assert.ok(policies[0].maxRaw > 0n);
+    assert.equal(pool.snapshot().activeRuns, 0);
+    await call(w, name, { ...inputs, _payment_id: p.paymentId });
+    assert.equal(policies.length, 1, "receipt replay cannot grant a new budget");
+  }
+});
+
+test("funding refusal refunds a NEAR deposit without starting a model", async () => {
+  const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+  const pool = createRunFunding({ serial: fn => fn(), balance: async () => 0n });
+  const w = await world({ rate, fundRun: pool.run });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  const before = mock.runs();
+  const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+  assert.equal(result.structuredContent.receipt.outcome, "run_failed");
+  assert.equal(result.structuredContent.receipt.refund.status, "sent");
+  assert.equal(mock.runs(), before);
+});
 
 test("watcher outage pauses new payments while paid runs and receipts remain accessible", async () => {
   let ready = true;

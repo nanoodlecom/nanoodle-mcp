@@ -30,6 +30,8 @@ export function createAuthorPayouts({ ledger, ops, now = Date.now, log = () => {
   async function drive(rec) {
     try {
       const hash = await ops.transferOnce(rec.to, rec.amountRaw, {
+        liabilityRaw: rec.amountRaw,
+        fundingRunId: rec.paymentId.startsWith("market_") ? `market:${rec.paymentId.slice(7)}` : `near:${rec.paymentId}`,
         prepared: rec.prepared,
         onPrepared(prepared) { ledger.updatePayout(rec.paymentId, { status: "signed", prepared }); },
       });
@@ -52,5 +54,5 @@ export function createAuthorPayouts({ ledger, ops, now = Date.now, log = () => {
     })().finally(() => { running = null; });
     return running;
   }
-  return { enqueue, tick, resume: () => tick({ force: true }) };
+  return { enqueue, tick, resume: () => tick({ force: true }), records: () => ledger.payouts() };
 }

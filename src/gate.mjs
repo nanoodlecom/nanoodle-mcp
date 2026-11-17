@@ -36,6 +36,8 @@ import { rawToXno, authorAddress } from "./wallet.mjs";
 import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
+import { runFundingBudget } from "./run-funding.mjs";
+import { nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 /**
@@ -146,6 +148,22 @@ const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\
 /** Exact deposit figure (up to 8 decimals, trailing zeros trimmed) so the quote text matches the amount collected. */
 const exactUsd = (n) => "$" + Number(n).toFixed(8).replace(/(\.\d*?)0+$/, "$1");
 
+function settlementReceipt(q) {
+  const r = q.settleReceipt;
+  if (!r) return `paid ${rawToXno(q.amountRaw)} XNO deposit; this payment was already settled`;
+  const take = BigInt(r.take), change = BigInt(r.change);
+  const settledLine = !r.known
+    ? " — the model reported no cost, so the whole deposit is being returned to your wallet"
+    : r.clamped && r.providerUsd != null && r.billedUsd != null
+      ? ` — provider cost $${formatCostUsd(r.providerUsd)} (${r.providerExact ? "exact" : "a lower bound — some calls did not report a price"}); billed $${formatCostUsd(r.billedUsd)} (capped at the deposit)`
+      : r.exact === false
+        ? ` — settled at estimated cost $${formatCostUsd(r.costUsd)} (a lower bound: some calls did not report a price) + 20%`
+        : ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%`;
+  return `paid ${rawToXno(q.amountRaw)} XNO deposit` + (q.payHash ? ` (block ${q.payHash})` : "") + settledLine +
+    (r.known ? (r.author && take > 0n ? " (markup goes to this noodle's author)" : "") +
+      (change > 0n ? `; ${rawToXno(change, 30)} XNO change returned to your wallet` : "") : "");
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.address           Nano address payments arrive at (the wallet account)
@@ -190,9 +208,13 @@ export function createChargeGate({
   log = () => {},
   usage = () => {},
   now = () => Date.now(),
+  fundRun = null,
+  canQuote = () => true,
 }) {
   if (!address || !ops) throw new Error("charge gate needs a funded Nano wallet (address + ops)");
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
+  if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
+  if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
 
   /** @type {Map<string, object>} paymentId → quote */
   const quotes = new Map();
@@ -286,6 +308,13 @@ export function createChargeGate({
    * that's the difference between "the RPC blipped" and "the operator kept it".
    */
   const owed = []; // { to, amountRaw, describe, event, fields, onOk, tries, at }
+  const pendingTransfers = new Set();
+  function trackedTransfer(to, amountRaw, describe, event, fields) {
+    const record = { amountRaw: String(amountRaw), event, fields };
+    pendingTransfers.add(record);
+    return { promise: Promise.resolve().then(() => ops.transfer(to, amountRaw, describe, { liabilityRaw: amountRaw })),
+      release: () => pendingTransfers.delete(record) };
+  }
   const OWED_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
   const OWED_MAX_TRIES = 100; // ≈16h at the 10-min cap — after that it needs a human
   function owe(to, amountRaw, describe, event, fields, onOk) {
@@ -297,7 +326,7 @@ export function createChargeGate({
   async function retryOwed() {
     const t = now();
     for (const o of [...owed]) {
-      if (t < o.at) continue;
+      if (o.held || t < o.at) continue;
       // An entry is only removed from `owed` AFTER its send resolves, so any
       // second retryOwed() running during that await sees it as still owed and
       // sends it again. That is money out the door, once per concurrent pass.
@@ -311,16 +340,17 @@ export function createChargeGate({
       o.sending = true;
       o.tries++;
       try {
-        const hash = await ops.transfer(o.to, o.amountRaw, o.describe);
+        const hash = await ops.transfer(o.to, o.amountRaw, o.describe, { liabilityRaw: o.amountRaw });
         owed.splice(owed.indexOf(o), 1);
         usage(o.event, { ...o.fields, ok: true, to: o.to, amountRaw: o.amountRaw, hash, retries: o.tries });
         persist();
         if (o.onOk) o.onOk(hash);
       } catch (e) {
         if (o.tries >= OWED_MAX_TRIES) {
-          owed.splice(owed.indexOf(o), 1);
-          log(`GIVING UP on ${o.describe} ${rawToXno(o.amountRaw)} XNO to ${o.to} after ${o.tries} tries (${e.message}) — refund manually`);
-          usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw, error: e.message, retries: o.tries, gaveUp: true });
+          o.held = true;
+          o.at = Infinity;
+          log(`Manual reconciliation required for ${o.describe} ${rawToXno(o.amountRaw)} XNO to ${o.to} after ${o.tries} tries; the debt remains reserved`);
+          usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw, error: e.message, retries: o.tries, gaveUp: true, held: true });
           persist();
           continue;
         }
@@ -349,8 +379,9 @@ export function createChargeGate({
       return false;
     }
     q.refunding = (async () => {
+      const transfer = trackedTransfer(q.source, q.amountRaw, "refunded", "refund", { paymentId: q.id });
       try {
-        const hash = await ops.transfer(q.source, q.amountRaw, "refunded");
+        const hash = await transfer.promise;
         q.status = "refunded";
         usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: q.amountRaw, to: q.source, hash, reason });
         persist();
@@ -361,7 +392,7 @@ export function createChargeGate({
         owe(q.source, q.amountRaw, "refunded", "refund",
           { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; });
         return false;
-      }
+      } finally { transfer.release(); }
     })();
     return q.refunding;
   }
@@ -374,7 +405,8 @@ export function createChargeGate({
    * live-only bits: waiters/refunding always, inline image blocks from cached
    * results (the media files themselves persist on disk and keep their /out/
    * URLs), and a consumed-but-unfinished run demotes back to "paid" so the
-   * retry after restart runs it — charged once, delivered once.
+   * retry after restart can resume it. Settled text receipts never buy another
+   * model run merely because their content was deliberately not persisted.
    */
   let saveChain = Promise.resolve();
   let saveQueued = false;
@@ -395,12 +427,9 @@ export function createChargeGate({
           //     the files live on disk and keep their /out/ URLs). Their text is
           //     pointers + a cost line + a gate-authored receipt — no user content.
           //   - Text-output results (LLM/text nodes) hold the customer's paid
-          //     content, so they NEVER hit disk: persist null. With the status
-          //     rule below that demotes the quote back to "paid", so a retry after
-          //     a restart RE-RUNS instead of replaying content from disk. Charged
-          //     once / delivered once still holds; the only cost is one duplicate
-          //     model call in the rare restart-between-run-and-retry window — the
-          //     operator eats it, and privacy wins the trade.
+          //     content, so they NEVER hit disk: persist null. The settled flag
+          //     retains the financial outcome; replay reports lost result text
+          //     without paying for another inference or moving settlement twice.
           //   - Errors persist in their redacted q.errorPersist form (upstream
           //     text swapped for a placeholder, refund status kept). Its presence
           //     keeps status "consumed" so the redacted error replays after restart.
@@ -415,13 +444,13 @@ export function createChargeGate({
             status: q.status === "consumed" && !result && !error ? "paid" : q.status,
             source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
             completedAt: q.completedAt ?? null,
-            settled: q.settled === true, // don't re-pay change/author if this quote re-runs after restart
-            settleReceipt: q.settleReceipt ?? null, // FIRST run's money figures — a re-run's receipt is built from these, not its own cost
+            settled: q.settled === true,
+            settleReceipt: q.settleReceipt ?? null, // money figures only; no user content
             result,
             error,
           };
         }),
-        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries })),
+        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries, held: o.held === true })),
       });
       await mkdir(dirname(stateFile), { recursive: true });
       const tmp = stateFile + ".tmp";
@@ -453,10 +482,8 @@ export function createChargeGate({
         if (legacy) {
           // Legacy result: drop it. Old code only cached a result AFTER settling,
           // so a consumed quote that carried one was already settled — mark it so
-          // the forced re-run (result now null → demoted to "paid") recomputes the
-          // receipt WITHOUT paying change/author a second time. Money-safe; the
-          // operator eats at most one duplicate model call, and no output text
-          // survives to be written into the new v2 file.
+          // the replay must neither run inference nor pay change/author again.
+          // No legacy output text survives to be written into the new v2 file.
           if (q.result) { q.settled = q.settled === true || q.status === "consumed"; q.result = null; }
           // Legacy error: it inlines the upstream message. Replace it wholesale
           // with a gate-authored placeholder and keep the quote a REPLAY (below)
@@ -474,13 +501,15 @@ export function createChargeGate({
         // A finished run replays its cached outcome; without this, a retry
         // after restart would run (and settle) the same payment twice. A quote
         // whose result we just dropped has neither result nor error, so it is
-        // NOT marked a replay here — it re-runs on retry (guarded by q.settled).
+        // handled separately by the settled-receipt guard below.
         if (q.status === "consumed" && (q.result || q.error)) q.running = Promise.resolve();
         quotes.set(q.id, q);
       }
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
         if (!s || !checkAddress(s.to) || !/^\d+$/.test(s.amountRaw) || BigInt(s.amountRaw) <= 0n ||
-            !["refund", "change", "author_payout"].includes(s.event)) {
+            !["refund", "change", "author_payout"].includes(s.event) ||
+            (s.tries != null && (!Number.isSafeInteger(s.tries) || s.tries < 0)) ||
+            (s.held != null && typeof s.held !== "boolean")) {
           throw new Error("invalid owed send in gate state");
         }
         // Legacy state files predate the payments-ledger policy: their queued
@@ -492,7 +521,8 @@ export function createChargeGate({
         const fields = s.fields && typeof s.fields === "object" ? { ...s.fields } : s.fields;
         if (fields && "reason" in fields && !REFUND_REASONS.has(fields.reason)) fields.reason = "run_failed";
         owed.push({
-          ...s, fields, at: now() + OWED_BACKOFF_MS[0],
+          ...s, fields, tries: s.tries ?? 0, held: s.held === true || s.tries >= OWED_MAX_TRIES,
+          at: s.held === true || s.tries >= OWED_MAX_TRIES ? Infinity : now() + OWED_BACKOFF_MS[0],
           onOk: s.event === "refund" && s.fields && s.fields.paymentId
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
             : null,
@@ -528,7 +558,7 @@ export function createChargeGate({
       }
       // Retention may remove completed outcomes, never an unclaimed payment
       // or a run still in flight. Those records are outstanding obligations.
-      const unfinished = q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
+      const unfinished = nanoQuoteClaim(q) > 0n || q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
       if (!unfinished && t - (q.completedAt ?? q.createdAt) > RETAIN_MS) { quotes.delete(q.id); changed = true; }
     }
     if (changed) persist();
@@ -551,6 +581,9 @@ export function createChargeGate({
       if (q.status === "expired" && !q.refunding) {
         log(`late payment for expired quote ${q.id} — refunding`);
         q.source = q.source || meta.source || null;
+        q.payHash = q.payHash || meta.hash || null;
+        q.paidAt = q.paidAt ?? now();
+        persist();
         return void refund(q, "late_payment");
       }
       return; // paid/consumed already — a re-scan of the same block, not a new payment
@@ -823,6 +856,9 @@ export function createChargeGate({
    * with _payment_id) rather than sitting on a bare "paid" with no next step.
    */
   function nextFor(q) {
+    if (q.settled === true && !q.result && !q.error) {
+      return "Payment already settled before restart. Result text was not retained and this payment will not run the workflow again. Request a new quote to generate another result.";
+    }
     if (!q || q.status === "pending") return undefined;
     if (q.status === "paid" || q.status === "consumed") {
       return `Payment received — this watch stream is done; hang it up. ` +
@@ -841,6 +877,8 @@ export function createChargeGate({
 
   const gate = {
     address,
+    fundingPair: ratePair,
+    fundingLiabilitiesRaw: () => nanoFundingLiabilities({ quotes: [...quotes.values()], owed, pending: [...pendingTransfers] }),
 
     /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
@@ -1021,13 +1059,9 @@ export function createChargeGate({
        * queued and never block the caller's result. Returns the numbers for
        * the receipt.
        *
-       * `alreadySettled` is set only on the re-run that follows a restart of a
-       * text-output quote (see the persist() note): that quote's change and
-       * author payout went out on the FIRST run, so the re-run recomputes the
-       * receipt numbers but must NOT move money again. Without this the caller
-       * would be paid change twice and the author twice — the demote-and-re-run
-       * trade-off is meant to cost the operator exactly one duplicate model
-       * call, nothing more.
+       * `alreadySettled` defensively prevents any second money movement. Normal
+       * settled text replay is handled before execution; lost result text is
+       * not authority to buy another model call.
        */
       function settle(q, name, costUsd, alreadySettled = false) {
         const author = authors.get(name);
@@ -1042,28 +1076,30 @@ export function createChargeGate({
         const take = markup < remaining ? markup : remaining;
         const change = remaining - take;
 
-        // Recompute-only replay after a restart: the money already moved.
+        // A settled payment's original money movements remain authoritative.
         if (alreadySettled) return { known, costRaw, take, change, author: !!author, costUsd: known ? parsed : null };
 
         if (costRaw0 > deposit) {
           log(`call ${q.id} (${name}) cost $${parsed} — more than its ${rawToXno(deposit)} XNO deposit; keeping the deposit, no payouts`);
         }
         if (author && take > 0n) {
-          ops.transfer(author, take.toString(), "author payout:")
+          const transfer = trackedTransfer(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id });
+          transfer.promise
             .then((hash) => usage("author_payout", { paymentId: q.id, tool: name, ok: true, to: author, amountRaw: take.toString(), costUsd: known ? parsed : null, hash }))
             .catch((e) => {
               log(`author payout for ${q.id} (${name} → ${author}) failed: ${e.message}`);
               owe(author, take.toString(), "author payout:", "author_payout", { paymentId: q.id, tool: name });
-            });
+            }).finally(transfer.release);
         }
         if (change > 0n) {
           if (q.source) {
-            ops.transfer(q.source, change.toString(), "change:")
+            const transfer = trackedTransfer(q.source, change.toString(), "change:", "change", { paymentId: q.id });
+            transfer.promise
               .then((hash) => usage("change", { paymentId: q.id, tool: name, ok: true, to: q.source, amountRaw: change.toString(), hash }))
               .catch((e) => {
                 log(`change for ${q.id} (→ ${q.source}) failed: ${e.message}`);
                 owe(q.source, change.toString(), "change:", "change", { paymentId: q.id, tool: name });
-              });
+              }).finally(transfer.release);
           } else {
             log(`cannot return ${rawToXno(change)} XNO change for ${q.id}: payer account unknown`);
             usage("change", { paymentId: q.id, tool: name, ok: false, amountRaw: change.toString(), error: "payer account unknown" });
@@ -1140,6 +1176,7 @@ export function createChargeGate({
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
           if (validate) await validate({ name, arguments: args });
+          if (await canQuote() !== true) return errResult("Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
           const price = priceFor(name, args);
@@ -1179,6 +1216,11 @@ export function createChargeGate({
           if (q.status === "expired") {
             return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
           }
+          if (q.settled === true && !q.result && !q.error) {
+            return errResult("This workflow finished and its payment was already settled before the server restarted. " +
+              "The result text was not retained. This payment will not run the workflow again. " +
+              "Request a new quote if you want to generate another result.\n\n" + settlementReceipt(q));
+          }
         }
 
         // Prefer announce (immediate progress event) over report (next heartbeat).
@@ -1214,25 +1256,25 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args }, ctx);
+              const execute = () => registry.callTool({ name, arguments: args }, fundRun ? { ...ctx, paidFunding: true } : ctx);
+              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = fundRun
+                ? await fundRun(runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(name) }), execute)
+                : await execute();
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.
               q.textOutput = !!textOutput;
-              // q.settled is only ever true here on the re-run of a text-output
-              // quote that was demoted to "paid" across a restart — its money
-              // already moved, so settle() recomputes the numbers without paying
-              // change/author twice.
+              // Preserve any completed settlement if a caller reaches this
+              // point during a later result-formatting or delivery failure.
               const s = settle(q, name, costUsd, q.settled === true);
               // The receipt must describe the money that ACTUALLY moved, which is
-              // the FIRST run's settlement — a post-restart re-run may report a
-              // different cost (or none), and the change/payout already went out at
+              // the FIRST run's settlement. Change/payout already went out at
               // the first run's figures. So on the first settle we stash those
               // figures (money integers + the display cost only — no content, safe
               // at rest) and every receipt, first run or replay, is built from them.
               // Keyed on settleReceipt (not settled) so a legacy quote — marked
-              // settled on restore but carrying no stored figures — falls back to
-              // this recompute-only run's numbers rather than reading undefined.
+              // settled on restore but carrying no stored figures — has a legacy
+              // receipt rather than reading undefined.
               const clamped = typeof providerUsd === "number" && typeof costUsd === "number" && providerUsd - costUsd > 1e-9;
               if (!q.settleReceipt) {
                 q.settleReceipt = { known: s.known, costUsd: s.known ? s.costUsd : null, exact: costExact !== false,
@@ -1243,28 +1285,13 @@ export function createChargeGate({
                   take: s.take.toString(), change: s.change.toString(), author: s.author };
               }
               q.settled = true;
-              const r = q.settleReceipt;
-              const rTake = BigInt(r.take), rChange = BigInt(r.change);
               // Settled cost uses the cost line's precision (formatCostUsd), not the
               // deposit's cent rounding — $0.0656 must not print as $0.07. Change is
               // the exact raw remainder (30 decimals); the 8-decimal grain is only
               // how wallets display a quote, and it clips a sub-grain refund.
               // A clamped provider cost is not the billed amount. The gate still
               // settles min(metered × 1.2, deposit) from costUsd.
-              const settledLine = !r.known
-                ? " — the model reported no cost, so the whole deposit is being returned to your wallet"
-                : r.clamped && r.providerUsd != null && r.billedUsd != null
-                  ? ` — provider cost $${formatCostUsd(r.providerUsd)} (${r.providerExact ? "exact" : "a lower bound — some calls did not report a price"}); billed $${formatCostUsd(r.billedUsd)} (capped at the deposit)`
-                  : r.exact === false
-                    ? ` — settled at estimated cost $${formatCostUsd(r.costUsd)} (a lower bound: some calls did not report a price) + 20%`
-                    : ` — settled at actual cost $${formatCostUsd(r.costUsd)} + 20%`;
-              const receipt = `paid ${rawToXno(q.amountRaw)} XNO deposit` +
-                (q.payHash ? ` (block ${q.payHash})` : "") +
-                settledLine +
-                (r.known
-                  ? (r.author && rTake > 0n ? " (markup goes to this noodle's author)" : "") +
-                    (rChange > 0n ? `; ${rawToXno(rChange, 30)} XNO change returned to your wallet` : "")
-                  : "");
+              const receipt = settlementReceipt(q);
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               q.completedAt = now();
               // usage.jsonl is a PAYMENTS LEDGER — money lifecycle events only
@@ -1279,9 +1306,8 @@ export function createChargeGate({
               // Only the CALLER (q.error) and the operator's stderr (via log,
               // inside refund) see the upstream error text; the ledger records
               // the failure as the fixed category "run_failed".
-              // A text result is regenerated after restart without settling
-              // again. If that recovery fails, the original change/author
-              // payout still stands; refunding the whole deposit would pay twice.
+              // If settlement completed before a later result-formatting error,
+              // its change/author payout stands; a full refund would pay twice.
               const refunded = q.settled === true ? false : await refund(q, "run_failed");
               // The refund-status sentence is gate-authored (no user content), so
               // it's safe on disk; the upstream `msg` can quote prompt content, so
@@ -1296,7 +1322,7 @@ export function createChargeGate({
               // A throttled-RPC failure (all nodes 429) lands here too, so the
               // caller should read "try again," never "payment failed."
               const payer = q.settled === true
-                ? "The result could not be regenerated after restart. Your original payment was already settled; no additional refund was sent. Contact the operator for result recovery."
+                ? "The result could not be delivered. Your original payment was already settled; no additional refund was sent. Contact the operator for result recovery."
                 : refunded
                 ? `The run didn't complete, so your hosted payment of ${rawToXno(q.amountRaw)} XNO was refunded to ${q.source}. Provider costs already incurred by the service remain separate from this refund. You can try again in a moment.`
                 : q.source

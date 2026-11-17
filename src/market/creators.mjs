@@ -6,6 +6,7 @@ import { authorPayoutRaw } from "../author-payouts.mjs";
 
 export function createMarketCreatorPayments({ rates, payouts, log = () => {} }) {
   return {
+    payoutRecords: () => typeof payouts.records === "function" ? payouts.records() : [],
     async prepare(metadata) {
       const author = authorAddress(metadata);
       if (!author) return null;

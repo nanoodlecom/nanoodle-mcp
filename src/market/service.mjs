@@ -19,6 +19,8 @@ import { createWorkflowRunner, checkNanoGptKey } from "./runner.mjs";
 import { createMarketWorker, logSafe } from "./worker.mjs";
 import { createWebhookHandler, secretFileReader } from "./webhook.mjs";
 import { createBidder, openBidState } from "./bidder.mjs";
+import { marketCreatorLiabilities } from "../funding-liabilities.mjs";
+import { createMarketFeeGuard } from "./fee-guard.mjs";
 import {
   readCatalog, fetchListingPrice, patchListingPrice, budgetFromPrice, recommendPrice, fmtUsd, usdMicros,
   PRICE_REFRESH_SECONDS, PROBE_BRIEF,
@@ -303,19 +305,22 @@ export function createNotifier({ url, fetch = globalThis.fetch, log = () => {}, 
  * @param {(line: string) => void} o.log
  * @returns {Promise<{ done: Promise<number>, stop: () => void, store: object }>}
  */
-export async function startMarketService(cfg, { payment = null, creatorPayments = null, log: baseLog, fetch = globalThis.fetch }) {
+export async function startMarketService(cfg, { payment = null, creatorPayments = null, fundRun = null, fundingPair = null, registerFundingSource = () => {}, log: baseLog, fetch = globalThis.fetch }) {
   const notify = cfg.notifyUrl ? createNotifier({ url: cfg.notifyUrl, log: baseLog }) : null;
   const log = notify ? (line) => { baseLog(line); if (NOTIFY_LINES.test(line)) notify(line); } : baseLog;
+  const checkFee = createMarketFeeGuard({ baseUrl: cfg.baseUrl, fetch }).check;
   if (!cfg.apiKey && typeof payment !== "function") die("no NanoGPT funding source: an API key or a wallet payment callback is needed");
-  if (cfg.catalog) return startCatalogService(cfg, { payment, creatorPayments, log, baseLog, notify, fetch });
+  if (cfg.catalog) return startCatalogService(cfg, { payment, creatorPayments, fundRun, fundingPair, registerFundingSource, checkFee, log, baseLog, notify, fetch });
   let store;
   try { store = openMarketState({ dir: cfg.stateDir }); } catch (e) { die(e.message); }
+  registerFundingSource(store.file, () => store.all());
   const fail = (msg) => { try { store.close(); } catch { /* closed */ } die(msg); };
   const client = createMarketClient({ baseUrl: cfg.baseUrl, token: cfg.token });
-  const runner = createWorkflowRunner({ apiKey: cfg.apiKey || undefined, payment: cfg.apiKey ? undefined : payment, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
+  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment, fundRun, fundingPair };
+  const runner = createWorkflowRunner({ ...funding, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
   const worker = createMarketWorker({
     client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd, defaultWorkflow: cfg.defaultWorkflow,
-    concurrency: cfg.concurrency, retainMs: cfg.retainMs, log, creatorPayments,
+    concurrency: cfg.concurrency, retainMs: cfg.retainMs, log, creatorPayments, checkFee,
   });
   if (cfg.apiKey) {
     // A rejected key would fail every hire after the buyer has paid; stop here instead.
@@ -340,7 +345,8 @@ export async function startMarketService(cfg, { payment = null, creatorPayments 
   if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s; per-job budget $${cfg.budgetUsd}${cfg.listingPriceUsd != null ? `, listing price $${cfg.listingPriceUsd}` : ""}; state in ${cfg.stateDir}`);
   const loop = runLoop(worker, store, { pollMs: cfg.pollMs, once: cfg.once, log });
-  return { done: loop.done, stop: loop.stop, store };
+  return { done: loop.done, stop: loop.stop, store,
+    fundingLiabilitiesRaw: context => marketCreatorLiabilities(store.all(), { ...context, payouts: creatorPayments?.payoutRecords?.() ?? [] }) };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -367,7 +373,7 @@ function tokenFileExists(path) {
  * follows on the market. The worker is created at the first price that can
  * be determined; until then the listing takes no jobs (`gate.tick` is a no-op).
  */
-function createListing({ agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments }) {
+function createListing({ agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments, checkFee }) {
   const L = (line) => log(`[${agent.handle}] ${line}`);
   const client = createMarketClient({ baseUrl: cfg.baseUrl, token });
   // Every price() call from the worker and the probe passes its own budget; this one is only the default.
@@ -461,7 +467,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
           client, store, runner, budgetUsd, listingPriceUsd: price.priceUsd,
           defaultWorkflow: agent.defaultWorkflow, customWorkflows: agent.custom, customHandle: agent.custom ? null : customHandle,
           bidTerms: agent.bids ? bidTerms : null,
-          concurrency: cfg.concurrency, retainMs: cfg.retainMs, log: L, creatorPayments,
+          concurrency: cfg.concurrency, retainMs: cfg.retainMs, log: L, creatorPayments, checkFee,
         });
       } else {
         worker.setBudget({ budgetUsd, listingPriceUsd: price.priceUsd });
@@ -502,6 +508,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
   async function bidTick() {
     if (!agent.bids || !worker) return;
     try {
+      await checkFee();
       if (!bidder) {
         bidder = createBidder({
           client, runner, state: openBidState(join(cfg.stateDir, agent.handle, "bids.json")),
@@ -523,8 +530,8 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
   return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
 }
 
-async function startCatalogService(cfg, { payment, creatorPayments, log, baseLog, notify, fetch }) {
-  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment };
+async function startCatalogService(cfg, { payment, creatorPayments, fundRun, fundingPair, registerFundingSource, checkFee, log, baseLog, notify, fetch }) {
+  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment, fundRun, fundingPair };
   if (cfg.ignored && cfg.ignored.length) log(`the agents file replaces ${cfg.ignored.join(", ")}; ${cfg.ignored.length === 1 ? "it is" : "they are"} ignored`);
   await checkFunding(cfg, log);
   const custom = cfg.catalog.agents.find((a) => a.custom);
@@ -538,7 +545,8 @@ async function startCatalogService(cfg, { payment, creatorPayments, log, baseLog
     try { token = readSecretFile(agent.tokenFile, "token"); } catch (e) { L(`NEEDS OPERATOR — skipped: ${e.message}`); continue; }
     if (!/^aat_/.test(token)) L("warning: the agent token does not start with aat_");
     try { store = openMarketState({ dir: join(cfg.stateDir, agent.handle) }); } catch (e) { L(`NEEDS OPERATOR — skipped: ${e.message}`); continue; }
-    listings.push(createListing({ agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments }));
+    registerFundingSource(store.file, () => store.all());
+    listings.push(createListing({ agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments, checkFee }));
   }
   if (!listings.length) die(`no listing in ${cfg.catalog.file} can run (see the lines above); add a token file and restart`);
   await Promise.all(listings.map((l) => l.refresh()));
@@ -583,5 +591,7 @@ async function startCatalogService(cfg, { payment, creatorPayments, log, baseLog
   });
   const webhook = hooked.size && !cfg.once ? createWebhookHandler({ listings: hooked }) : null;
   if (webhook) log(`webhooks: ${[...hooked.keys()].join(", ")} also poll at once on a signed event at /market/webhook/<handle>`);
-  return { done, stop, store: { close: closeAll }, listings, webhook };
+  return { done, stop, store: { close: closeAll }, listings, webhook,
+    fundingLiabilitiesRaw: context => marketCreatorLiabilities(listings.flatMap(l => l.store.all()),
+      { ...context, payouts: creatorPayments?.payoutRecords?.() ?? [] }) };
 }

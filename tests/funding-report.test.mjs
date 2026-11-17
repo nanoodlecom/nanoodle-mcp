@@ -1,0 +1,63 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, stat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { startFundingReport } from "../src/funding-report.mjs";
+import { createHostedFundingSources } from "../src/hosted-funding.mjs";
+
+const value = { balanceRaw: "100", liabilitiesRaw: "20", reservedRaw: "80", activeRuns: 1,
+  oldestStartedAt: 1000, enforced: true, protectTransfers: true, privateExtra: "SECRET" };
+async function setup(t) {
+  const dir = await mkdtemp(join(tmpdir(), "funding-report-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sources = createHostedFundingSources({ nanoFile: join(dir, "nano.json"), nearFile: join(dir, "near.json") });
+  return { dir, sources, file: join(dir, "funding-health.json") };
+}
+
+test("funding health is private aggregate telemetry and insufficient funds pause new quotes", async t => {
+  const w = await setup(t); let balanceRaw = "100";
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000,
+    snapshot: async () => ({ ...value, balanceRaw }) });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  assert.equal((await stat(w.file)).mode & 0o777, 0o600);
+  const saved = await readFile(w.file, "utf8");
+  assert.doesNotMatch(saved, /SECRET|privateExtra/);
+  assert.equal(JSON.parse(saved).checkedAt, new Date(2000).toISOString());
+  balanceRaw = "99"; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
+});
+
+test("unreadable financial state fails closed and later recovery can resume quote readiness", async t => {
+  const w = await setup(t); let fail = true;
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
+    snapshot: async () => { if (fail) throw Error("PRIVATE_PROVIDER_ERROR"); return value; } });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), false);
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "v"]);
+  fail = false; await report.refresh(); assert.equal(w.sources.ready(), true);
+});
+
+test("a write failure pauses sending; read-only recovery does not need to enable sends first", async t => {
+  const w = await setup(t);
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
+    snapshot: async () => ({ ...value, liabilitiesRaw: w.sources.liabilitiesRaw({ readOnly: true }).toString() }) });
+  t.after(report.stop);
+  await mkdir(w.file + ".tmp");
+  await assert.rejects(report.refresh());
+  assert.equal(w.sources.ready(), false);
+  assert.throws(() => w.sources.liabilitiesRaw(), /funding-state-unwritable/);
+  await rm(w.file + ".tmp", { recursive: true });
+  await report.refresh();
+  assert.equal(w.sources.ready(), true); assert.equal(w.sources.liabilitiesRaw(), 0n);
+});
+
+test("the report writer refuses a staging symlink and does not overwrite its target", async t => {
+  const w = await setup(t), target = join(w.dir, "private.txt");
+  await writeFile(target, "KEEP"); await symlink(target, w.file + ".tmp");
+  await assert.rejects(startFundingReport({ outDir: w.dir, sources: w.sources, snapshot: async () => value }));
+  assert.equal(await readFile(target, "utf8"), "KEEP");
+  assert.equal(w.sources.ready(), false);
+});

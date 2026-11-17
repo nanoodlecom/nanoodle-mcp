@@ -17,7 +17,7 @@ before(async () => {
   await writeFile(join(graphs, "poster.json"), JSON.stringify(WORKED_GRAPH));
 });
 after(() => { globalThis.fetch = originalFetch; });
-async function world() {
+async function world({ fundRun } = {}) {
   const out = await mkdtemp(join(tmpdir(), "usdc-state-"));
   const chain = createFakeChain(); chain.addAccount(M, parseNearToYocto("10"), key.publicKey); chain.addAccount(P, parseNearToYocto("5"));
   chain.addFt(TOKEN, { [M]: 0n, [P]: 10_000_000n });
@@ -27,9 +27,10 @@ async function world() {
     const ledger = openNearLedger({ file: join(out, "state.json"), network: "testnet", merchant: M });
     const refunder = createRefunder({ rpc, signer: parseNearSecretKey(key.secretKey), accountId: M, ledger, usdcToken: TOKEN, schedule: () => null });
     let dust = 10;
-    const gate = createNearGate({ merchantId: M, network: "testnet", rpc, ledger, refunder, usdcToken: token, usdcEnabled: true,
+    const gate = createNearGate({ merchantId: M, network: "testnet", rpc, ledger, refunder, usdcToken: token, usdcEnabled: true, fundRun,
       rate: { current: async () => ({ usdNano: 3_000_000_000n, yocto: 10n ** 24n, nearUsd: "3", source: "test", at: new Date().toISOString() }),
-        currentUsdc: async () => ({ ...USDC_RATE, usdcUsd: "1", source: "USDC denomination", at: new Date().toISOString() }) },
+        currentUsdc: async () => ({ ...USDC_RATE, usdcUsd: "1", source: "USDC denomination", at: new Date().toISOString(),
+          ...(fundRun ? { xnoUsd: "0.5" } : {}) }) },
       fetch: mock.fetch, randomInt: () => dust++, publicBase: "https://near.nanoodle.com" });
     const wrapped = gate.wrapRegistry(registry);
     return { ledger, refunder, gate, call: (name, args) => wrapped.callTool({ name, arguments: args }) };
@@ -37,6 +38,18 @@ async function world() {
   return { chain, rpc, ...make(), make };
 }
 const argsFor = (name) => name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } } : { Idea: "a lighthouse" };
+
+test("USDC funding uses the locked Nano exchange rate rather than token atomic units", async () => {
+  const policies = [], w = await world({ fundRun: async (terms, execute) => { policies.push(terms); return execute(); } });
+  const args = argsFor("run_noodle");
+  const p = (await w.call("run_noodle", { ...args, _pay_with: "usdc" })).structuredContent.payment;
+  const tx = w.chain.ftTransfer(TOKEN, P, M, BigInt(p.amountAtomic), { blockTimeMs: Date.now() + 1 });
+  const result = await w.call("run_noodle", { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: P });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(policies.length, 1);
+  assert.equal(policies[0].id, `near:${p.paymentId}`);
+  assert.equal(policies[0].maxRaw, 6n * 10n ** 28n, "a $0.03 cap at $0.50/XNO is 0.06 XNO");
+});
 
 for (const name of ["run_noodle", "poster"]) test(`USDC: ${name} quotes, detects, executes once, refunds and replays`, async () => {
   const w = await world(), args = argsFor(name), start = mock.runs();

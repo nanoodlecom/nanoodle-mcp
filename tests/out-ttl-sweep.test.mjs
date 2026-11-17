@@ -50,6 +50,8 @@ test("bookkeeping and .tmp staging survive regardless of age", async () => {
     await writeAged(dir, "usage.jsonl", 1000 * HOUR);
     await writeAged(dir, "costs.json.7.tmp", 1000 * HOUR);
     await writeAged(dir, "gate-state.json.2.tmp", 1000 * HOUR);
+    await writeAged(dir, "funding-health.json", 1000 * HOUR);
+    await writeAged(dir, "funding-health.json.tmp", 1000 * HOUR);
     // A stale media file alongside them proves the sweep did run.
     await writeAged(dir, "poster-image-old.webp", 1000 * HOUR);
 
@@ -58,7 +60,7 @@ test("bookkeeping and .tmp staging survive regardless of age", async () => {
 
     const left = (await readdir(dir)).sort();
     assert.deepEqual(left, [
-      "costs.json", "costs.json.7.tmp", "gate-state.json", "gate-state.json.2.tmp", "usage.jsonl",
+      "costs.json", "costs.json.7.tmp", "funding-health.json", "funding-health.json.tmp", "gate-state.json", "gate-state.json.2.tmp", "usage.jsonl",
     ]);
   } finally {
     await rm(dir, { recursive: true, force: true });
