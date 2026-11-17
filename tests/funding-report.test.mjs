@@ -107,6 +107,21 @@ test("the private handoff retains only validated public-chain facts and never tr
   rpc.checkpoint = checkpoint; await report.refresh(); assert.equal(w.sources.ready(), true);
 });
 
+test("private RPC cooldown telemetry selects safe fields and malformed state pauses admission", async t => {
+  const w = await setup(t), head = { hash: "A".repeat(64), blockCount: "10" };
+  const rpc = { enforced: true, configuredPeers: 3, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: 2000,
+    checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: NANO_GENESIS_REPLY.contents.account, head, confirmed: head },
+    configuration: "a".repeat(64), cooldowns: [{ peer: 0, until: 32_000, endpoint: "PRIVATE_CREDENTIAL_URL" }] };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000, snapshot: async () => ({ ...value, nanoRpc: rpc }) });
+  t.after(report.stop);
+  let text = await readFile(w.file, "utf8");
+  assert.deepEqual(JSON.parse(text).nanoRpc.cooldowns, [{ peer: 0, until: 32_000 }]);
+  assert.doesNotMatch(text, /PRIVATE|endpoint/); assert.equal(w.sources.ready(), true);
+  rpc.cooldowns = [{ peer: 3, until: 32_000 }]; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  text = await readFile(w.file, "utf8"); assert.equal(JSON.parse(text).ok, false);
+});
+
 test("a pending refresh cannot keep stale checkout admission alive or discard protected debts", async t => {
   let clock = 1000, finish, snapshots = 0;
   const w = await setup(t, { now: () => clock });

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fundingRaw } from "./run-funding.mjs";
 import { hostedRunTimeout } from "./hosted-run.mjs";
 import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
+import { selectRpcCooldowns } from "./rpc-backoff.mjs";
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
@@ -32,6 +33,11 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           report.nanoRpc = { enforced: n.enforced === true, configuredPeers: n.configuredPeers, minimumPeers: n.minimumPeers,
             readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt,
             checkpoint: selectNanoCheckpoint(n.checkpoint) };
+          if (n.cooldowns !== undefined || n.configuration !== undefined) {
+            if (typeof n.configuration !== "string" || !/^[a-f0-9]{64}$/.test(n.configuration)) throw Error("invalid RPC configuration observation");
+            report.nanoRpc.configuration = n.configuration;
+            report.nanoRpc.cooldowns = selectRpcCooldowns(n.cooldowns, n.configuredPeers, now());
+          }
           const age = now() - n.lastReadAt;
           report.ok &&= report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
             && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers

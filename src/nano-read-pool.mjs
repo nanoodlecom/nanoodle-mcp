@@ -1,3 +1,5 @@
+import { MAX_RPC_RETRY_MS, rpcPeerSetId } from "./rpc-backoff.mjs";
+
 export const NANO_GENESIS = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948";
 const GENESIS_KEY = "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65093BA";
 const GENESIS_ACCOUNT = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
@@ -70,19 +72,30 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   if (!Array.isArray(bases) || !bases.length || bases.length > 8 || bases.some(b => typeof b !== "string" || !b)) throw new TypeError("Nano read pool needs between one and eight endpoint identifiers");
   if (new Set(bases).size !== bases.length) throw new TypeError("Duplicate Nano RPC endpoints are not independent peers");
   if (typeof checkAddress !== "function" || typeof hashBlock !== "function") throw new TypeError("Nano read pool needs wallet-owned address and hash validators");
-  const minimum = Math.min(2, bases.length), networks = new Map();
+  const minimum = Math.min(2, bases.length), networks = new Map(), cooldowns = new Map();
+  const configuration = rpcPeerSetId(bases);
   let high = null, final = null, blocked = false, lastReadAt = null, readPeers = 0, preferred = [], inflightNetwork = null;
   const expired = (at, ttl) => now() < at || now() - at >= ttl;
+  const cooling = base => (cooldowns.get(base)?.until ?? 0) > now();
+  function rateLimit(base, error) {
+    if (error?.rateLimited !== true) return;
+    const failures = Math.min((cooldowns.get(base)?.failures || 0) + 1, 5);
+    const fallback = Math.min(300_000, 30_000 * 2 ** (failures - 1));
+    const hint = Number.isSafeInteger(error.retryAfterMs) && error.retryAfterMs >= 0 ? Math.min(MAX_RPC_RETRY_MS, error.retryAfterMs) : 0;
+    cooldowns.set(base, { until: now() + Math.max(fallback, hint), failures });
+    networks.set(base, { ok: false, at: now() });
+  }
   async function networkBases() {
     if (inflightNetwork) return inflightNetwork;
     inflightNetwork = (async () => {
       await Promise.all(bases.map(async base => {
+        if (cooling(base)) return;
         const prior = networks.get(base);
         if (prior && !expired(prior.at, prior.ok ? networkTtlMs : 5_000)) return;
         try { checkNanoGenesis(await rpc({ action: "block_info", hash: NANO_GENESIS, json_block: "true" }, base)); networks.set(base, { ok: true, at: now() }); }
-        catch { networks.set(base, { ok: false, at: now() }); }
+        catch (error) { rateLimit(base, error); networks.set(base, { ok: false, at: now() }); }
       }));
-      return bases.filter(base => networks.get(base)?.ok && !expired(networks.get(base).at, networkTtlMs));
+      return bases.filter(base => !cooling(base) && networks.get(base)?.ok && !expired(networks.get(base).at, networkTtlMs));
     })().finally(() => { inflightNetwork = null; });
     return inflightNetwork;
   }
@@ -121,16 +134,20 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     const eligible = await networkBases(), rows = [], errors = [];
     if (eligible.length < minimum) { readPeers = 0; throw fail("NANO_RPC_NETWORK_QUORUM"); }
     await Promise.all(eligible.map(async base => {
+      if (cooling(base)) return;
+      const priorCooldown = cooldowns.get(base);
       try {
         let data = body.action === "account_info" ? null : await rpc({ ...body, ...(body.action === "receivable" ? { include_only_confirmed: "true" } : {}) }, base);
         const info = await rpc(infoRequest(), base), view = nanoAccountView(info, checkAddress);
         if (body.action === "receivable") data = checkedReceivable(data, body, view, checkAddress);
         if (body.action === "account_history") data = checkedHistory(data, checkAddress);
         rows.push({ base, info, view, data });
-      } catch (error) { errors.push(error); }
+        // An older in-flight success cannot erase a newer concurrent refusal.
+        if (cooldowns.get(base) === priorCooldown) cooldowns.delete(base);
+      } catch (error) { rateLimit(base, error); errors.push(error); }
     }));
     if (rows.length === 0 && errors.length === eligible.length && errors.every(e => e.authoritative && /Account not found/i.test(e.message))) { readPeers = 0; throw errors[0]; }
-    const best = select(rows);
+    const best = select(rows.filter(row => !cooling(row.base)));
     return body.action === "account_info" ? best.info : best.data;
   }
   function observe({ frontier, balance, blockCount, representative }) {
@@ -144,11 +161,14 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   }
   return {
     read,
+    isCooling: base => bases.includes(base) && cooling(base),
     async block(body) {
       if (body.action !== "block_info" || !hash(body.hash)) throw fail("NANO_RPC_READ_ACTION");
       const eligible = await networkBases(), found = [], missing = [];
       if (eligible.length < minimum) throw fail("NANO_RPC_NETWORK_QUORUM");
       await Promise.all(eligible.map(async base => {
+        if (cooling(base)) return;
+        const priorCooldown = cooldowns.get(base);
         try {
           const data = await rpc({ ...body, json_block: "true" }, base);
           if (![true, false, "true", "false"].includes(data.confirmed)) throw fail("NANO_RPC_BAD_BLOCK");
@@ -158,7 +178,8 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
           if (block.type === "state" && hashBlock(block).toUpperCase() !== body.hash.toUpperCase()) throw fail("NANO_RPC_BAD_BLOCK");
           if (yes(data.confirmed) && block.type === "state" && canonical(block.account) === account && raw(data.height) < 1n) throw fail("NANO_RPC_BAD_BLOCK");
           found.push({ data, block });
-        } catch (e) { if (e.authoritative && /block not found|unknown block/i.test(e.message)) missing.push(e); }
+          if (cooldowns.get(base) === priorCooldown) cooldowns.delete(base);
+        } catch (e) { rateLimit(base, e); if (e.authoritative && /block not found|unknown block/i.test(e.message)) missing.push(e); }
       }));
       const confirmed = found.find(d => yes(d.data.confirmed));
       if (confirmed) {
@@ -183,7 +204,8 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     },
     observe,
     status: () => ({ enforced: true, configuredPeers: bases.length, minimumPeers: minimum, readablePeers: readPeers,
-      networkPeers: bases.filter(b => networks.get(b)?.ok && !expired(networks.get(b).at, networkTtlMs)).length, lastReadAt,
+      networkPeers: bases.filter(b => !cooling(b) && networks.get(b)?.ok && !expired(networks.get(b).at, networkTtlMs)).length, lastReadAt,
+      configuration, cooldowns: bases.flatMap((base, peer) => cooling(base) ? [{ peer, until: cooldowns.get(base).until }] : []),
       checkpoint: high && final && !blocked ? { v: 1, networkGenesis: NANO_GENESIS, account,
         head: { hash: high.frontier, blockCount: high.height.toString() },
         confirmed: { hash: final.confirmedFrontier, blockCount: final.confirmedHeight.toString() } } : null }),

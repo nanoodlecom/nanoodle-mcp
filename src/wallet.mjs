@@ -34,6 +34,7 @@ import {
 import { redactUrl } from "./redact.mjs";
 import { createRunFunding } from "./run-funding.mjs";
 import { createNanoReadPool } from "./nano-read-pool.mjs";
+import { rpcRetryAfterMs } from "./rpc-backoff.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -173,7 +174,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     try { json = JSON.parse(text); } catch { /* handled below */ }
     if (!r.ok || json == null || typeof json !== "object" || Array.isArray(json)) {
       const e = new Error(`Nano RPC ${body.action} failed at ${redactUrl(base)} (HTTP ${r.status}): ${text.slice(0, 200)}`);
-      if (r.status === 429) e.rejected = true; // throttled: request never reached the node
+      if (r.status === 429) {
+        e.rejected = e.rateLimited = true; // throttled: request never reached the node
+        e.retryAfterMs = rpcRetryAfterMs({ body: json?.retry_after, header: r.headers?.get?.("retry-after"), now: now() });
+      }
       else if (r.status >= 500 || r.ok) e.ambiguous = true;
       throw e;
     }
@@ -188,7 +192,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       // payment, while three other endpoints sat unused. A refusal is a refusal
       // — classify it like the 429 status it is, including for publishes: the
       // proxy declined to forward, so the block provably did not land.
-      if (isThrottleError(json.error)) e.rejected = true;
+      if (isThrottleError(json.error)) {
+        e.rejected = e.rateLimited = true;
+        e.retryAfterMs = rpcRetryAfterMs({ body: json.retry_after, header: r.headers?.get?.("retry-after"), now: now() });
+      }
       else e.authoritative = true;
       throw e;
     }
@@ -291,6 +298,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     ];
     for (const [label, base] of workSources) {
       const withKey = workKey && workBases.includes(base);
+      // Public RPC fallback shares the unauthenticated endpoint's cooldown.
+      // A separately keyed work service has its own quota/authorization.
+      if (!withKey && readPool?.isCooling(base)) continue;
       try {
         return (await rpc(
           { action: "work_generate", hash: frontier, difficulty: threshold, ...(withKey ? { key: workKey } : {}) },
