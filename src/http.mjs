@@ -831,11 +831,11 @@ export async function serveHttp({
           const args = JSON.parse(body);
           if (url.pathname.endsWith("/check")) {
             const result = await creators.check(args);
-            return send(200, JSON.stringify({ name: result.name, author: result.author, estimatedCostUsd: result.estimatedCostUsd, recommendedPriceUsd: result.recommendedPriceUsd }));
+            return send(200, JSON.stringify({ name: result.name, author: result.author, schema: result.schema, estimatedCostUsd: result.estimatedCostUsd, recommendedPriceUsd: result.recommendedPriceUsd }));
           }
           return send(201, JSON.stringify(await creators.submit(args)));
         } catch (e) {
-          if (e instanceof SyntaxError || e.code === -32602 || e.name === "ParamsError" || e instanceof TypeError) return send(400, JSON.stringify({ error: e instanceof SyntaxError ? "Invalid JSON" : e.message }));
+          if (e instanceof SyntaxError || e.code === -32602 || e.mcpCode === -32602 || e.name === "ParamsError" || e instanceof TypeError) return send(400, JSON.stringify({ error: e instanceof SyntaxError ? "Invalid JSON" : e.message }));
           log("Hosted workflow validation is temporarily unavailable");
           return send(503, JSON.stringify({ error: "Workflow checking is temporarily unavailable. Please try again." }));
         }

@@ -561,16 +561,29 @@ and a dedicated MCP endpoint. The creator supplies the workflow, not a server,
 provider key or marketplace token. Customers pay NEAR or USDC; successful runs
 pay the creator in Nano using the rules above.
 
-Named text and choice nodes become customer inputs. Model configuration stays
-in the stored recipe; callers cannot replace the graph or payout address.
+Connected, named Text and Choice nodes become customer inputs automatically.
+Multiple inputs are mapped independently; no primary input selection is needed.
+Locked nodes, unnamed defaults, and saved optional prompts stay in the recipe.
+A saved text feeding only an optional field port (such as Image→Video's motion
+prompt) also stays in the recipe. The Day to Night example exposes its Day
+keyframe prompt and Night keyframe instruction while preserving its motion
+default. Names do not turn text into image inputs: upload nodes remain
+unsupported by the paid hosted runner. Model configuration stays in the stored
+recipe; callers cannot replace the graph or payout address.
 Uploads are immutable and deduplicated: a revision gets a new link. Public
 pages and MCP discovery do not distribute the graph. Hosting the platform
 yourself remains supported by this open-source repository.
 
 `POST /creators/check` validates and prices without executing; `POST
-/creators/workflows` hosts it. Both accept `{graph, name, description,
-inputName}`; `inputName` selects the named text node that receives a marketplace
-brief. A successful upload returns `/workflows/wf_…` and
+/creators/workflows` hosts it. Both accept `{graph, name, description}`;
+the check response includes the same customer `schema` as the hosted endpoint.
+Explicit legacy `inputName` submissions still select a named Text node for the
+single-input pricing probe and publish their former full input schema. The
+automatic form omits `inputName`; existing hosted records keep their published
+schemas. ComfyUI/OpenArt exports receive a format error before
+pricing or hosting: rebuild or open a supported native graph in the Nanoodle
+editor and use Save to export `noodle-graph.json`. Renaming a foreign JSON file
+does not convert it. A successful upload returns `/workflows/wf_…` and
 `/workflows/wf_…/mcp`. The endpoint offers `run_workflow` and free
 `price_workflow`, using the same NEAR/USDC gate, execution graph, receipt and
 result components as the main service. `/workflows/wf_…/llms.txt` explains
