@@ -6,6 +6,7 @@ import { hostedRunTimeout } from "./hosted-run.mjs";
 import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 import { selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { maintenanceProcessIdentity } from "./maintenance-report.mjs";
+import { readOperatorJson } from "./operator-file.mjs";
 
 const readFailureCodes = new Map([
   ["NANO_RPC_NETWORK_QUORUM", "nano-rpc-network-quorum"],
@@ -14,8 +15,21 @@ const readFailureCodes = new Map([
   ["NANO_RPC_REGRESSION", "nano-rpc-frontier-regressed"],
   ["NANO_RPC_UNCONFIRMED_FRONTIER", "nano-rpc-unconfirmed-frontier"],
 ]);
-const reportFailureCodes = new Set(["funding-state-unavailable", ...readFailureCodes.values()]);
+const reportFailureCodes = new Set([
+  "funding-state-unavailable", "funding-underfunded", "funding-durable-state-unavailable",
+  "funding-storage-unavailable", "funding-report-stale", "nano-read-guard-unhealthy",
+  ...readFailureCodes.values(),
+]);
 export const fundingReportFailure = code => reportFailureCodes.has(code) ? code : "funding-state-unavailable";
+
+export function selectFundingPause(pause, now) {
+  const { lastFailedAt, recoveredAt, code } = pause ?? {};
+  const end = recoveredAt ?? lastFailedAt;
+  if (!Number.isSafeInteger(lastFailedAt) || lastFailedAt <= 0
+      || (recoveredAt !== null && !Number.isSafeInteger(recoveredAt))
+      || !Number.isFinite(now) || end < lastFailedAt || end > now || now - end > 15 * 60_000) return null;
+  return { lastFailedAt, recoveredAt, code: fundingReportFailure(code) };
+}
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
@@ -23,6 +37,10 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
   const runTimeoutMs = hostedRunTimeout();
   const identity = maintenanceProcessIdentity();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
+  const { value: previous } = readOperatorJson(file, identity.uid, 16_384);
+  let pause = previous?.v === 1
+    ? selectFundingPause(previous.pause, Math.min(now(), Date.parse(previous.checkedAt))) : null;
+  let lastWriteHealthy = false;
   let pending = null;
   function refresh() {
     if (pending) return pending;
@@ -39,6 +57,7 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           activeRuns: value.activeRuns, oldestStartedAt: value.oldestStartedAt,
           enforced: value.enforced === true, protectTransfers: value.protectTransfers === true,
           ok: balance >= liabilities + reserved };
+        if (!report.ok) report.code = "funding-underfunded";
         if (value.nanoRpc) {
           const n = value.nanoRpc;
           if (![n.configuredPeers, n.minimumPeers, n.readablePeers, n.networkPeers, n.lastReadAt].every(x => Number.isSafeInteger(x) && x >= 0)) throw Error("invalid RPC snapshot");
@@ -51,15 +70,17 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
             report.nanoRpc.cooldowns = selectRpcCooldowns(n.cooldowns, n.configuredPeers, now());
           }
           const age = now() - n.lastReadAt;
-          report.ok &&= report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
+          const rpcHealthy = report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
             && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
             && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers && age <= 60_000 && age >= -30_000;
+          if (!rpcHealthy) { report.ok = false; report.code = "nano-read-guard-unhealthy"; }
         }
         if (durableState) {
           const state = durableState();
           if (typeof state?.ok !== "boolean" || !Number.isSafeInteger(state.pendingWrites) || state.pendingWrites < 0) throw Error("durable write health unavailable");
           report.durableState = { ok: state.ok, pendingWrites: state.pendingWrites };
-          report.ok &&= state.ok; // Normal queued writes do not indicate a failed snapshot.
+          // Normal queued writes do not indicate a failed snapshot.
+          if (!state.ok) { report.ok = false; report.code = "funding-durable-state-unavailable"; }
         }
         if (writerProtection) {
           const proof = writerProtection();
@@ -69,14 +90,23 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
       } catch (error) {
         report = { ok: false, code: fundingReportFailure(readFailureCodes.get(error?.code)) };
       }
-      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };
+      const checkedAt = now();
+      pause = selectFundingPause(pause, checkedAt);
+      if (!report.ok) pause = { lastFailedAt: checkedAt, recoveredAt: null, code: report.code };
+      else if (lastWriteHealthy && !sources.ready()) {
+        pause = { lastFailedAt: checkedAt, recoveredAt: checkedAt, code: "funding-report-stale" };
+      } else if (pause?.recoveredAt === null) pause = { ...pause, recoveredAt: checkedAt };
+      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(checkedAt).toISOString(), ...(pause && { pause }) };
       try {
         const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }
         finally { await handle.close(); }
         await rename(temporary, file);
         sources.setStorageReady(true); sources.setReady(report.ok);
+        lastWriteHealthy = report.ok;
       } catch (error) {
+        lastWriteHealthy = false;
+        pause = { lastFailedAt: now(), recoveredAt: null, code: "funding-storage-unavailable" };
         sources.setStorageReady(false); throw error;
       }
     })().finally(() => { pending = null; });

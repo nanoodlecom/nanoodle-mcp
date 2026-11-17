@@ -21,7 +21,7 @@ import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
-import { fundingReportFailure } from "../src/funding-report.mjs";
+import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
@@ -31,7 +31,7 @@ const need = (condition, code) => { if (!condition) throw new CheckError(code); 
 const readJson = file => JSON.parse(readFileSync(file, "utf8"));
 const safeCode = e => e instanceof CheckError ? e.message : /^[A-Z_]{2,60}$/.test(e?.code || "") ? e.code : /Timeout|Abort/.test(e?.name || "") ? "request-timeout" : "probe-failed";
 
-export function finishOperationalReport(stateDir, checks, now = Date.now()) {
+export function finishOperationalReport(stateDir, checks, now = Date.now(), fundingPause = null) {
   const latest = join(stateDir, "latest.json");
   let previous; try { previous = readJson(latest); } catch { /* first probe */ }
   const failed = checks.filter(c => !c.ok);
@@ -41,7 +41,7 @@ export function finishOperationalReport(stateDir, checks, now = Date.now()) {
   const incidentId = createHash("sha256").update(`${fingerprint}:${firstSeenAt}:${reminder}`).digest("hex").slice(0, 32);
   const admission = Object.fromEntries(ALL.map(asset => [asset, !failed.some(c => c.domains?.includes(asset))]));
   const report = { v: 1, ok: failed.length === 0, checkedAt: new Date(now).toISOString(), stage: failed[0]?.stage || "complete",
-    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}) };
+    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
   // The separate alert user needs to read it, without access to app secrets.
@@ -85,10 +85,10 @@ export async function runOperationalCheck(config, deps = {}) {
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
   });
-  await check("runtime-funding", async () => {
+  const fundingPause = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
-    const age = now() - Date.parse(value.checkedAt);
+    const checkedAt = Date.parse(value.checkedAt), age = now() - checkedAt;
     need(Number.isFinite(age) && age <= 60_000 && age >= -30_000, "funding-report-stale");
     if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
     need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
@@ -114,6 +114,8 @@ export async function runOperationalCheck(config, deps = {}) {
       try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, config.nanoRpcUrls.length, now()); }
       catch { need(false, "nano-cooldown-observation-invalid"); }
     }
+    const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
+    return pause?.recoveredAt != null ? pause : null;
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -290,7 +292,7 @@ export async function runOperationalCheck(config, deps = {}) {
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
     }, ["market"]);
   }));
-  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now());
+  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(), fundingPause);
 }
 
 async function productionConfig(env = process.env) {

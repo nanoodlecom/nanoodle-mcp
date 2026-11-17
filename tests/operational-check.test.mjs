@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
+import { deliverAlerts, EMBER } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
@@ -146,6 +147,58 @@ test("the no-inference check distinguishes wallet read refusal from missing fund
     assert.deepEqual(report.admission, { nano: false, near: false, usdc: false, market: false });
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PROVIDER_DETAILS/);
   }
+});
+
+test("a funding pause that recovers between probes leaves readiness open and reaches the existing durable alert queue", async () => {
+  const f = fixture();
+  const runtime = f.states["/state/funding-health.json"];
+  const pause = { lastFailedAt: NOW - 10_000, recoveredAt: NOW - 5000, code: "nano-rpc-read-quorum" };
+  runtime.pause = { ...pause, secret: "PRIVATE_RPC_URL" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.deepEqual(report.fundingPause, pause);
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_RPC_URL/);
+
+  const requests = [];
+  const config = { stateDir: f.config.stateDir, operationalReportFile: join(f.config.stateDir, "latest.json"), conversation: "near_check_alerts" };
+  const alert = { env: {}, now: () => NOW, call: async (_tool, args) => {
+    requests.push(args);
+    assert.equal(JSON.parse(readFileSync(join(config.stateDir, "alerts", args.message_id + ".json"), "utf8")).status, "pending");
+    if (requests.length === 1) throw Error("lost response");
+    return { message: { id: args.message_id, recipient: EMBER, status: "queued" } };
+  } };
+  assert.equal((await deliverAlerts(config, { ...alert, enqueueOnly: true })).messageId, undefined);
+  assert.equal((await deliverAlerts(config, alert)).ok, false);
+  assert.equal((await deliverAlerts(config, alert)).queued, 1);
+  assert.equal((await deliverAlerts(config, alert)).queued, 0);
+  assert.deepEqual(requests[0], requests[1]);
+  assert.match(requests[0].text, /wallet funding paused and recovered/);
+  assert.match(requests[0].text, /reported nano-rpc-read-quorum/);
+  assert.doesNotMatch(requests[0].text, /PRIVATE_RPC_URL|FAILED/);
+
+  runtime.pause = { ...pause, lastFailedAt: NOW - 4000, recoveredAt: NOW - 3000 };
+  await runOperationalCheck(f.config, f.deps);
+  assert.equal((await deliverAlerts(config, alert)).queued, 1);
+  assert.notEqual(requests[2].message_id, requests[0].message_id);
+});
+
+test("ongoing, expired, or invalid pause history cannot announce a funding recovery", async () => {
+  const f = fixture(), runtime = f.states["/state/funding-health.json"];
+  for (const pause of [
+    { lastFailedAt: NOW - 5000, recoveredAt: null },
+    { lastFailedAt: NOW - 5000, recoveredAt: NOW + 5 },
+    { lastFailedAt: NOW - 16 * 60_000, recoveredAt: NOW - 15 * 60_000 - 1 },
+    { lastFailedAt: NOW - 5000, recoveredAt: NOW - 6000 },
+  ]) {
+    runtime.pause = pause;
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, true); assert.equal(report.fundingPause, undefined);
+  }
+  runtime.pause = { lastFailedAt: NOW - 10_000, recoveredAt: NOW - 5000, code: "nano-rpc-read-quorum" };
+  runtime.ok = false; runtime.code = "funding-state-unavailable";
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.fundingPause, undefined); assert.equal(report.admission.near, false);
 });
 
 test("stale, disabled, underfunded or stuck live reservations fail independently of the public site", async () => {

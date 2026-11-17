@@ -253,6 +253,13 @@ user can read this selected report without gaining access to the app's keys.
 The report's `admission` fields are readiness observations; this monitor does
 not itself enforce per-run reservations or alter the payment gates.
 
+The app retains its most recent shared-wallet funding pause for 15 minutes
+after recovery. The readiness probe includes the last failed sample, the
+recovery time, and an allowlisted reason when it confirms funding is healthy.
+This catches pauses between probes while preserving the current admission
+status. The existing alert retry timer queues one recovery notice per observed
+pause for Ember, even when the readiness probe succeeds.
+
 Failures use the existing sender/outbox/Ember route. An unchanged incident has
 one message ID across timer invocations, with a new reminder after six hours;
 recovery followed by another failure is a new incident. Hook delivery retries

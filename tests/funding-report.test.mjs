@@ -42,7 +42,7 @@ test("unreadable financial state fails closed and later recovery can resume quot
     snapshot: async () => { if (fail) throw Error("PRIVATE_PROVIDER_ERROR"); return value; } });
   t.after(report.stop);
   assert.equal(w.sources.ready(), false);
-  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "process", "runTimeoutMs", "v"]);
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "pause", "process", "runTimeoutMs", "v"]);
   fail = false; await report.refresh(); assert.equal(w.sources.ready(), true);
 });
 
@@ -62,6 +62,34 @@ test("runtime funding reports a known read guard refusal without copying RPC dia
   assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
 });
 
+test("a funding pause keeps the last failed sample and first recovery across a reporter restart", async t => {
+  const w = await setup(t);
+  let clock = 1000, fail = false;
+  const options = { outDir: w.dir, sources: w.sources, now: () => clock, intervalMs: 1_000_000,
+    snapshot: async () => {
+      if (fail) throw Object.assign(Error("PRIVATE_RPC_URL"), { code: "NANO_RPC_READ_QUORUM" });
+      return value;
+    } };
+  const saved = async () => JSON.parse(await readFile(w.file, "utf8"));
+  const before = await startFundingReport(options);
+  t.after(before.stop);
+  assert.equal((await saved()).pause, undefined);
+  fail = true; clock = 6000; await before.refresh();
+  clock = 11_000; await before.refresh();
+  assert.deepEqual((await saved()).pause, { lastFailedAt: 11_000, recoveredAt: null, code: "nano-rpc-read-quorum" });
+  before.stop();
+  fail = false; clock = 16_000;
+  const after = await startFundingReport(options);
+  t.after(after.stop);
+  const pause = { lastFailedAt: 11_000, recoveredAt: 16_000, code: "nano-rpc-read-quorum" };
+  assert.deepEqual((await saved()).pause, pause);
+  assert.equal(w.sources.ready(), true);
+  clock += 300_000; await after.refresh();
+  assert.deepEqual((await saved()).pause, pause, "the next scheduled probe can still see the failure");
+  clock += 15 * 60_000; await after.refresh();
+  assert.equal((await saved()).pause, undefined);
+});
+
 test("a write failure pauses sending; read-only recovery does not need to enable sends first", async t => {
   const w = await setup(t);
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
@@ -74,6 +102,7 @@ test("a write failure pauses sending; read-only recovery does not need to enable
   await rm(w.file + ".tmp", { recursive: true });
   await report.refresh();
   assert.equal(w.sources.ready(), true); assert.equal(w.sources.liabilitiesRaw(), 0n);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).pause.code, "funding-storage-unavailable");
 });
 
 test("the report writer refuses a staging symlink and does not overwrite its target", async t => {
@@ -148,6 +177,7 @@ test("a pending refresh cannot keep stale checkout admission alive or discard pr
   const w = await setup(t, { now: () => clock });
   w.sources.registerNano(() => 20n);
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, intervalMs: 1_000_000,
+    now: () => clock,
     snapshot: async () => { snapshots++; if (snapshots > 1) await new Promise(resolve => { finish = resolve; }); return value; } });
   t.after(report.stop);
   assert.equal(w.sources.ready(), true);
@@ -160,6 +190,7 @@ test("a pending refresh cannot keep stale checkout admission alive or discard pr
   assert.equal(w.sources.liabilitiesRaw(), 20n, "settlement still sees the existing obligations");
   finish(); await pending;
   assert.equal(w.sources.ready(), true, "a fresh successful observation restores admission");
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).pause.code, "funding-report-stale");
   assert.equal(snapshots, 2);
 });
 
