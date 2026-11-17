@@ -169,3 +169,71 @@ systemd-run --unit=nanoodle-market-check-alert-test \
 
 The resulting alert explicitly says TEST. As above, verify Ember's authenticated
 receipt separately from queue admission.
+
+## Financial and workflow readiness every five minutes
+
+`scripts/operational-check.mjs` runs as `nanoodle-mcp` with its existing config
+and filesystem access. It reads public chain data and authenticated read-only
+Market assignments, checks free MCP discovery/pricing, and reads local ledgers.
+It does not execute models, generate PoW, pay invoices, sign/broadcast transfers,
+start/retry jobs, submit bids or change listings. A small unique temporary file
+is written, fsynced and removed in the output directory to verify persistence.
+
+Coverage:
+
+- Confirmed Nano wallet height/frontier agreement across configured nodes.
+- NEAR network, syncing, finalized head age and cross-node consistency;
+  payment-watcher age/lag and the merchant's current refund-key permission.
+- Current gas/storage costs, native NEAR reserve and USDC registration/balance.
+- Balances after customer/creator liabilities and accepted Market work; Market
+  revenue is not treated as spendable before settlement. A $2 provider-funding
+  buffer and 0.05 NEAR native reserve are checked in addition to recorded debts.
+- Stuck paid runs, missing refund/payout intents, pending/permanently failed
+  refunds, creator payouts and Market work requiring an operator.
+- Live exchange-rate freshness; platform fee still matching the worker's 5%
+  assumption; authenticated Market token validity and actual worker lock/process.
+- Catalog pricing and Market net-price coverage for all four predefined graphs,
+  plus free MCP pricing of a custom two-step graph in NEAR and USDC.
+- Disk/inode headroom and a write/fsync probe; disabled/overdue check timers and
+  failed scheduled services, including the paid canary and alert-queue retry.
+
+Install `ops/nanoodle-operational-check.{service,timer}`, reload systemd, start
+the service once, inspect its report, then enable the timer. It runs at every
+five-minute UTC boundary with a catch-up after downtime. Its four-minute unit
+deadline bounds the entire probe. The app needs to be running before the check
+can succeed. The unit grants write access only to its report directory and the
+output directory needed by the unique persistence probe.
+
+```sh
+systemctl start nanoodle-operational-check.service
+cat /var/lib/nanoodle-operational-check/latest.json
+systemctl enable --now nanoodle-operational-check.timer
+TZ=UTC systemctl list-timers nanoodle-operational-check.timer
+```
+
+The report contains fixed stage/error codes, timestamps and readiness booleans;
+no prompts, assignment bodies, account secrets, raw upstream errors or private
+URLs. Its directory is 0755 and `latest.json` is 0644 so the separate Babel alert
+user can read this selected report without gaining access to the app's keys.
+The report's `admission` fields are readiness observations; this monitor does
+not itself enforce per-run reservations or alter the payment gates.
+
+Failures use the existing sender/outbox/Ember route. An unchanged incident has
+one message ID across timer invocations, with a new reminder after six hours;
+recovery followed by another failure is a new incident. Hook delivery retries
+remain separate from probe execution. Test the real hook without an outage:
+
+```sh
+systemd-run --unit=nanoodle-operational-check-alert-test \
+  --property=OnFailure=nanoodle-near-alert@nanoodle-operational-check-alert-test.service.service \
+  /usr/bin/false
+```
+
+Read the broader [reliability audit](operational-reliability.md) for remaining
+runtime prevention and full-host recovery requirements. These probes still run
+on the app's VPS; an independent missing-heartbeat observer and an alert path
+available during a Babel/host outage remain necessary.
+
+Protocol references: [Nano confirmed account fields](https://docs.nano.org/commands/rpc-protocol/#account_info),
+[NEAR gas prices](https://docs.near.org/api/rpc/gas) and
+[NEAR storage/transaction configuration](https://docs.near.org/api/rpc/protocol).

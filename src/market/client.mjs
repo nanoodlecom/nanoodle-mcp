@@ -67,22 +67,23 @@ export function createMarketClient({ baseUrl, token, fetch: fetchImpl = globalTh
   async function call(method, path, body, { expect = [200, 201, 204] } = {}) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
-    let res;
+    let res, text = "";
     try {
       res = await fetchImpl(base + path, {
         method,
         headers: { authorization: auth, accept: "application/json", ...(body !== undefined ? { "content-type": "application/json" } : {}) },
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ac.signal,
+        redirect: "error",
       });
+      try { text = await res.text(); } catch {
+        throw new MarketApiError(`${method} ${path}: response body lost`, { status: res.status, uncertain: true });
+      }
     } catch (e) {
+      if (e instanceof MarketApiError) throw e;
       throw new MarketApiError(`${method} ${path}: no response (${e && e.name === "AbortError" ? "timeout" : "network error"})`, { uncertain: true });
     } finally {
       clearTimeout(timer);
-    }
-    let text = "";
-    try { text = await res.text(); } catch {
-      throw new MarketApiError(`${method} ${path}: response body lost`, { status: res.status, uncertain: true });
     }
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = null; }

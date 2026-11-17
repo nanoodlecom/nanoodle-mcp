@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
-import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT } from "../scripts/near-alert.mjs";
+import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT, OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT } from "../scripts/near-alert.mjs";
 
 const invocation = { MONITOR_UNIT: CHECK_UNIT, MONITOR_INVOCATION_ID: "a".repeat(32), MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" };
 const setup = () => ({ stateDir: mkdtempSync(join(tmpdir(), "near-alert-")), conversation: "near_check_alerts", sender: "bits255.codex.near_monitor" });
@@ -65,6 +65,21 @@ test("Market failures use their own report and reach Ember through the existing 
   const drill = failureEvent({ ...invocation, MONITOR_UNIT: MARKET_TEST_UNIT }, {});
   assert.match(drill.text, /TEST ALERT.*Market/); assert.match(drill.text, /not a production outage/);
   assert.notEqual(result.messageId, failureEvent(invocation, {}).messageId, "the two monitors cannot collide");
+});
+
+test("operational incidents deduplicate across timer invocations and disclose only selected safe issue codes", async () => {
+  const config = setup(), requests = [];
+  config.operationalReportFile = join(config.stateDir, "operational.json");
+  writeFileSync(config.operationalReportFile, JSON.stringify({ ok: false, checkedAt: new Date().toISOString(), stage: "nano-liquidity", incidentId: "c".repeat(32),
+    checks: [{ stage: "nano-liquidity", ok: false, code: "insufficient", token: "PRIVATE_CREDENTIAL", message: "PRIVATE_CUSTOMER_TEXT" }] }));
+  const call = async (name, args) => { requests.push(args); return { message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } }; };
+  const first = await deliverAlerts(config, { env: { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT }, call });
+  const second = await deliverAlerts(config, { env: { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT, MONITOR_INVOCATION_ID: "d".repeat(32) }, call });
+  assert.equal(first.messageId, second.messageId); assert.equal(requests.length, 1);
+  assert.match(requests[0].text, /every five minutes/); assert.match(requests[0].text, /nano-liquidity=insufficient/);
+  assert.doesNotMatch(requests[0].text, /PRIVATE_|token|CUSTOMER/);
+  const drill = failureEvent({ ...invocation, MONITOR_UNIT: OPERATIONAL_TEST_UNIT }, { checks: "malformed" });
+  assert.match(drill.text, /TEST ALERT.*operational readiness/); assert.match(drill.text, /not a production outage/);
 });
 
 test("drafts and incorrect recipient responses remain pending, without bypassing bridge approval", async () => {
