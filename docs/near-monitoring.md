@@ -52,6 +52,13 @@ cat /var/lib/nanoodle-near-check/latest.json
 
 ## Recovery and manual checks
 
+New canaries use the non-reasoning `openai/gpt-4.1-nano` model with a 256-token
+limit. The fixed marker checks payment, execution and result delivery without
+depending on a thinking model finishing inside a tiny budget. Strict marker,
+progress, receipt, refund and replay checks still apply. Retained work keeps its
+original graph and signed payment when the script changes; an incorrect result
+stays failed and is not automatically rerun or replaced.
+
 State and signed transaction bytes are saved atomically before broadcasting.
 Reruns resume the same payment and graph. They never re-sign an ambiguous or
 expired transaction or replace an unfinished quote. A completed day performs
