@@ -39,6 +39,21 @@ export const freePort = () => new Promise((resolve, reject) => {
 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Cleanup is idempotent even if a test server exited before the caller. */
+export function stopServerChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const done = () => { clearTimeout(timer); child.removeListener("exit", done); child.removeListener("error", fail); resolve(); };
+    const fail = error => { clearTimeout(timer); child.removeListener("exit", done); child.removeListener("error", fail); reject(error); };
+    const timer = setTimeout(() => fail(new Error("test server did not exit after SIGKILL")), 5_000);
+    child.once("exit", done); child.once("error", fail);
+    try {
+      child.kill("SIGKILL");
+      if (child.exitCode !== null || child.signalCode !== null) done();
+    } catch (error) { fail(error); }
+  });
+}
+
 /** Start bin/nanoodle-mcp.mjs in NEAR mode; resolves once it serves. */
 export async function startServer({ graphsDir, outDir, chainUrl, nanoUrl, secretKey, port, log = () => {} }) {
   const env = {
@@ -56,16 +71,20 @@ export async function startServer({ graphsDir, outDir, chainUrl, nanoUrl, secret
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (c) => { stderr += c; });
   const t0 = Date.now();
-  while (!/MCP over HTTP on/.test(stderr)) {
-    if (child.exitCode !== null) throw new Error("server exited during startup:\n" + stderr);
-    if (Date.now() - t0 > 20_000) { child.kill("SIGKILL"); throw new Error("server did not start:\n" + stderr); }
-    await sleep(25);
+  try {
+    while (!/MCP over HTTP on/.test(stderr)) {
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error("server exited during startup:\n" + stderr);
+      if (Date.now() - t0 > 20_000) throw new Error("server did not start:\n" + stderr);
+      await sleep(25);
+    }
+  } catch (error) {
+    await stopServerChild(child); throw error;
   }
   log(stderr.split("\n").filter((l) => /NEAR|run_noodle|MCP over HTTP|interrupted|settled after/.test(l)).map((l) => "  [server] " + l.replace(/^nanoodle-mcp:\s*/, "")).join("\n"));
   return {
     child,
     get stderr() { return stderr; },
-    kill: () => new Promise((r) => { child.once("exit", r); child.kill("SIGKILL"); }),
+    kill: () => stopServerChild(child),
   };
 }
 
