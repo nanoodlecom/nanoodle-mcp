@@ -30,22 +30,22 @@ material remaining limits rather than treating a green public GET as proof.
 
 ## Next runtime safety work
 
-The monitor's balance reservations are observations, not enforced runtime leases.
+The monitor observes the reservations enforced by the running app.
 The [run funding controller](run-funding.md), PR #127, now binds hosted Nano
 checkout, NEAR/USDC saved/custom workflows and Market runners to one wallet queue.
 Live obligation readers, in-flight transfer/debt handoffs, disabled-profile
 obligations and fresh Market fee guards are implemented. The private runtime
 snapshot and separate Nano discovery probe extend the operational check from
-40 to 42 checks. The source passed 985 offline tests; deployment verification
-is still required before calling these guards live.
+40 to 42 checks. PR #127 deployed `bb40a2e` after 985 branch/main CI tests passed.
+The manual 04:46 and automatic 04:50 UTC readiness checks passed all 42 probes,
+and a bounded two-step native NEAR canary passed payment detection, progress,
+result, finalized refund and replay at 04:47 UTC. Inventory PR #30 and deploy
+PR #123 record the verified deployment and remaining recovery gaps.
 
-The wallet serializes spends and refuses an individual transfer above its balance,
-but several concurrent workflows can still consume funds another run or refund
-needs. Bind a per-run funding limit to the approved graph/quote and reserve shared
-working capital atomically before inference. Preserve customer and creator debts;
-release remaining capacity only after in-flight payments resolve. Provider maximum
-prepayments and their eventual refunds must not be confused with final model cost.
-Verify that omitted token limits are bounded consistently in pricing and execution.
+The wallet now preserves shared working capital and customer/creator debts on
+its serial queue. Provider maximum prepayments and their eventual refunds remain
+distinct from final model cost. Bound token defaults and creator fee handoffs
+are tested across saved/custom workflows and deferred Market settlement.
 
 Read-only upstream quotes on 2026-11-17 returned 402 (unpaid) for GLM 5.3 Flash:
 256 output tokens quoted $0.00008657; 4096 quoted $0.00135377. These are evidence
@@ -71,7 +71,7 @@ The watcher does not advance or refresh its cursor on a stale head. Its cached
 health also expires, and new NEAR/USDC quotes pause while monitoring is unhealthy;
 existing payment verification, outcomes and refunds remain accessible. Fault tests
 cover frozen/syncing/wrong-chain nodes, cached-head expiry and outage recovery.
-Deployment verification is required before treating these changes as live.
+PR #125 deployed this behavior before the subsequent funding-guard release.
 
 The separate public Nano MCP ingress now has a free discovery probe in addition
 to the canonical NEAR listener. It performs initialization and tool discovery,
@@ -87,7 +87,11 @@ Mureka 9.5 and both five-second H3 video models. No payment/complete request or
 inference was made. Check actual unpaid-quote/status behavior before changing
 their availability, and add safe probes
 where they can detect breakage without running a model. The library's video polling
-default is unbounded; qualify explicit hosted run deadlines and cancellation.
+default is unbounded. The shared [hosted execution deadline](hosted-execution.md)
+now covers saved/custom tools, nested built-ins, humanizer transports, Market
+runs and output downloads in source. Fault tests include in-flight payment
+reconciliation and full-refund/no-repay behavior through the actual server on
+Nano, NEAR and USDC. Deployment qualification is still required for this change.
 
 Independent whole-host/Babel outage notification and encrypted off-server recovery
 with a restore rehearsal are still open. Do not call the overall reliability goal

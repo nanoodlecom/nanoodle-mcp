@@ -84,7 +84,7 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
       "--charge-usd", "0.05", "--xno-usd", "0.5", "--no-local-work", "--near-merchant", "merchant.testnet", "--near-network", "testnet",
       "--near-rpc", near.url, "--near-usd", "3.64"], { env: {
         PATH: process.env.PATH, HOME: dir, NANO_SEED: SEED, NANO_RPC_URL: `http://127.0.0.1:${rpcServer.address().port}`,
-        NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1",
+        NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANOODLE_RUN_TIMEOUT_MS: "2000",
       }, stdio: ["ignore", "ignore", "pipe"] });
     child.stderr.setEncoding("utf8"); child.stderr.on("data", part => { stderr += part; });
     const started = Date.now();
@@ -113,6 +113,36 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
     }
     assert.equal(providerBlocks.size, 8, "four workflows each pay exactly two provider invoices");
     assert.ok(nano.chatBodies().every(body => body.max_tokens > 0), "funded saved and custom graphs send their priced token limits");
+    for (const asset of ["nano", "near", "usdc"]) {
+      const name = asset === "nano" ? "poster" : "run_noodle";
+      const args = asset === "nano" ? { Idea: "HOLD" } : { graph, inputs: { Idea: "HOLD" }, _pay_with: asset };
+      const quote = await client.call(name, args);
+      assert.ok(!quote.isError, JSON.stringify(quote));
+      let paidArgs;
+      if (asset === "nano") {
+        const p = quote.structuredContent.x402;
+        deposits.set("D".repeat(64), { amount: p.amountRaw, source: PAY_TO });
+        paidArgs = { ...args, _payment_id: p.paymentId };
+      } else {
+        const p = quote.structuredContent.payment;
+        const tx = asset === "usdc" ? near.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(p.amountAtomic))
+          : near.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto));
+        paidArgs = { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: "payer.testnet" };
+      }
+      const result = await client.call(name, paidArgs);
+      assert.equal(result.isError, true, JSON.stringify(result));
+      assert.match(JSON.stringify(result), /hosted execution limit/);
+      if (asset !== "nano") {
+        const r = result.structuredContent.receipt;
+        assert.equal(r.outcome, "run_failed"); assert.equal(r.refund.status, "sent");
+        assert.equal(r.charged.usd, "0");
+        assert.equal(r.refund.amountAtomic ?? r.refund.yocto, r.deposit.amountAtomic ?? r.deposit.yocto);
+      } else assert.match(JSON.stringify(result), /was refunded/);
+      const count = providerBlocks.size;
+      assert.equal((await client.call(name, paidArgs)).isError, true);
+      assert.equal(providerBlocks.size, count, "replaying a timed-out payment cannot pay another invoice");
+    }
+    assert.equal(providerBlocks.size, 11, "each failed run pays at most its one started invoice and no downstream image");
     assert.doesNotMatch(stderr, /unhandled|FUNDING_INVALID|cannot persist gate state/i);
   } finally {
     if (child) await stopServerChild(child);

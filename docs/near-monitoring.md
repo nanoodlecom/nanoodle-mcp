@@ -190,6 +190,9 @@ Coverage:
   buffer and 0.05 NEAR native reserve are checked in addition to recorded debts.
 - Stuck paid runs, missing refund/payout intents, pending/permanently failed
   refunds, creator payouts and Market work requiring an operator.
+- Fresh private runtime funding telemetry, enforced spend/transfer protection,
+  and active scopes older than the configured execution limit plus 15 minutes
+  for payment reconciliation. See [hosted deadlines](hosted-execution.md).
 - Live exchange-rate freshness; platform fee still matching the worker's 5%
   assumption; authenticated Market token validity and actual worker lock/process.
 - Catalog pricing and Market net-price coverage for all four predefined graphs,

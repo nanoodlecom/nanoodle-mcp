@@ -2,10 +2,12 @@ import { open, rename } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
 import { fundingRaw } from "./run-funding.mjs";
+import { hostedRunTimeout } from "./hosted-run.mjs";
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
 export async function startFundingReport({ outDir, snapshot, sources, intervalMs = 5_000, now = Date.now, log = () => {} }) {
+  const runTimeoutMs = hostedRunTimeout();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
   let pending = null;
   function refresh() {
@@ -24,7 +26,7 @@ export async function startFundingReport({ outDir, snapshot, sources, intervalMs
           enforced: value.enforced === true, protectTransfers: value.protectTransfers === true,
           ok: balance >= liabilities + reserved };
       } catch { report = { ok: false, code: "funding-state-unavailable" }; }
-      report = { ...report, v: 1, checkedAt: new Date(now()).toISOString() };
+      report = { ...report, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };
       try {
         const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }

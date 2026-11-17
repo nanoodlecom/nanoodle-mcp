@@ -16,6 +16,7 @@ import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
+import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -82,8 +83,10 @@ export async function runOperationalCheck(config, deps = {}) {
     need([value.balanceRaw, value.liabilitiesRaw, value.reservedRaw].every(v => typeof v === "string" && /^\d{1,39}$/.test(v)), "funding-report-invalid");
     need(value.ok === true && BigInt(value.balanceRaw) >= BigInt(value.liabilitiesRaw) + BigInt(value.reservedRaw), "funding-underfunded");
     need(Number.isSafeInteger(value.activeRuns) && value.activeRuns >= 0, "funding-report-invalid");
+    const limit = Object.hasOwn(value, "runTimeoutMs") ? value.runTimeoutMs : DEFAULT_HOSTED_RUN_MS;
+    need(Number.isSafeInteger(limit) && limit > 0 && limit <= 24 * 3_600_000, "funding-report-invalid");
     need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
-      && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= 45 * 60_000, "funding-run-stuck");
+      && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= limit + 15 * 60_000, "funding-run-stuck");
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
