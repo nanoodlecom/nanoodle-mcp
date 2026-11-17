@@ -64,6 +64,7 @@ test("daily canary resumes an ambiguous broadcast, verifies the refund, and pays
   const retained = JSON.parse(readFileSync(join(f.config.stateDir, "state.json")));
   const report = await runCheck(f.config, f.deps);
   assert.equal(report.ok, true); assert.equal(report.modelSteps, 2); assert.equal(f.quotes(), 1); assert.equal(f.runs(), 1);
+  assert.equal(report.model, "openai/gpt-4.1-nano");
   assert.equal(f.chain.sendTxCount, 2, "one deposit and one refund; no replacement deposit");
   assert.equal(report.paymentTx, retained.signed.txHash);
   assert.equal(statSync(join(f.config.stateDir, "state.json")).mode & 0o777, 0o600);
@@ -72,6 +73,21 @@ test("daily canary resumes an ambiguous broadcast, verifies the refund, and pays
   assert.equal(f.chain.sendTxCount, 2); assert.equal(f.runs(), 1);
   f.nextDay(); assert.equal((await runCheck(f.config, f.deps)).ok, true);
   assert.equal(f.chain.sendTxCount, 4); assert.equal(f.runs(), 2);
+});
+
+test("an unfinished retained graph keeps its original model and payment after a canary update", async () => {
+  const f = await fixture();
+  await runCheck(f.config, f.deps);
+  const file = join(f.config.stateDir, "state.json"), state = JSON.parse(readFileSync(file));
+  // Simulate resuming a completed result before the final canary checkpoint.
+  state.done = false;
+  for (const node of state.args.graph.nodes) if (node.type === "llm") node.fields.model = "z-ai/glm-5.3-flash";
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(file, JSON.stringify(state));
+  const report = await runCheck(f.config, f.deps);
+  assert.equal(report.model, "z-ai/glm-5.3-flash");
+  assert.equal(report.paymentTx, state.signed.txHash);
+  assert.equal(f.chain.sendTxCount, 2); assert.equal(f.runs(), 1); assert.equal(f.quotes(), 1);
 });
 
 test("price, deposit, network and destination guards stop before any payment", async t => {

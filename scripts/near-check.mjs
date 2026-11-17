@@ -9,7 +9,10 @@ import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib
 import { callMcp, resultText } from "../src/near-site-browser.mjs";
 
 export function checkGraph(marker, twoSteps = false) {
-  const fields = { model: "z-ai/glm-5.3-flash", reasoningEffort: "low", temperature: 0, maxTokens: 256 };
+  // This checks the payment/runtime path, not reasoning. A thinking model can
+  // spend this small output budget before emitting the marker, producing a
+  // billed empty answer. Keep strict output validation and a bounded budget.
+  const fields = { model: "openai/gpt-4.1-nano", temperature: 0, maxTokens: 256 };
   const nodes = [
     { id: "input", type: "text", name: "Marker", fields: { text: "" } },
     { id: "extract", type: "llm", name: "Read marker", fields: { ...fields, system: twoSteps
@@ -142,7 +145,7 @@ export async function runCheck(config, deps = {}) {
     require(resultText(replay).includes(expected), "Paid output is unavailable on replay; text results are not retained across server restarts");
     const cached = await json(`/near/result/${q.paymentId}`);
     require(JSON.stringify(cached).includes(expected), "Payment page result cache is missing the output");
-    const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: "z-ai/glm-5.3-flash", modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
+    const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: state.args.graph.nodes.find(n => n.type === "llm").fields.model, modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
       output: expected, progressFrames: state.progress.length, chargedUsd: receipt.charged.usd, chargedNear: formatYoctoAsNear(charged), refundedNear: formatYoctoAsNear(refunded), payerGasNear: formatYoctoAsNear(BigInt(state.gasYocto)),
       paymentTx: state.signed.txHash, refundTx: receipt.refund.txHash, watcher: true, replay: true, paymentPageResult: true };
     state.done = true; state.receipt = receipt; state.report = report; save(); atomicJson(latest, report); return report;
