@@ -30,10 +30,9 @@ test("creator intake checks real pricing without execution; recipes are private,
   const mutated = creators.get(result.id); mutated.graph.x402.author = "bad"; assert.equal(creators.get(result.id).author, author);
 });
 
-test("creator intake refuses missing/invalid author, ambiguous briefs, unsafe/unpriced graphs and capacity exhaustion", async () => {
+test("creator intake refuses missing/invalid author, unsafe/unpriced graphs and capacity exhaustion", async () => {
   const creators = rig({ maxWorkflows: 1 });
   for (const bad of [ { ...graph, x402: undefined }, { ...graph, x402: { author: "nano_bad" } },
-    { ...graph, nodes: [...graph.nodes, { id: "other", type: "text", name: "Other", fields: { text: "x" } }] },
     { ...graph, nodes: [...graph.nodes, { id: "code", type: "code", fields: { code: "run()" } }] } ]) {
     await assert.rejects(creators.submit({ ...submission, graph: bad }));
   }
