@@ -13,28 +13,34 @@ export const MARKET_UNIT = "nanoodle-market-check.service";
 export const MARKET_TEST_UNIT = "nanoodle-market-check-alert-test.service";
 export const OPERATIONAL_UNIT = "nanoodle-operational-check.service";
 export const OPERATIONAL_TEST_UNIT = "nanoodle-operational-check-alert-test.service";
+export const BACKUP_UNIT = "nanoodle-backup.service";
+export const BACKUP_TEST_UNIT = "nanoodle-backup-alert-test.service";
 export const EMBER = "bits255.dots.ada_20261002";
 const safe = value => /^[a-zA-Z0-9_.:-]{1,100}$/.test(value || "") ? value : "unknown";
 
 export function failureEvent(env, latest, now = Date.now()) {
   if (!env.MONITOR_UNIT) return null; // A retry timer never invents another incident.
-  if (![CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT, OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT) || !/^[a-f0-9]{32}$/.test(env.MONITOR_INVOCATION_ID || "")) throw Error("Unrecognized failure invocation");
+  if (![CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT, OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT, BACKUP_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT) || !/^[a-f0-9]{32}$/.test(env.MONITOR_INVOCATION_ID || "")) throw Error("Unrecognized failure invocation");
   const market = [MARKET_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT);
   const operational = [OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT);
-  const test = [TEST_UNIT, MARKET_TEST_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT);
-  const freshFailure = !test && latest?.ok === false && Math.abs(now - Date.parse(latest.checkedAt)) < 3_600_000;
-  const stage = freshFailure ? safe(latest.stage) : "service";
+  const backup = [BACKUP_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT);
+  const test = [TEST_UNIT, MARKET_TEST_UNIT, OPERATIONAL_TEST_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT);
+  const freshFailure = !backup && !test && latest?.ok === false && Math.abs(now - Date.parse(latest.checkedAt)) < 3_600_000;
+  const stage = backup ? "backup" : freshFailure ? safe(latest.stage) : "service";
   const issues = Array.isArray(latest?.checks) ? latest.checks : [];
   const eventId = operational && freshFailure && /^[a-f0-9]{32}$/.test(latest.incidentId || "") ? latest.incidentId : env.MONITOR_INVOCATION_ID;
   return { messageId: "near_check_" + createHash("sha256").update(env.MONITOR_UNIT + ":" + eventId).digest("hex").slice(0, 40), test,
-    text: [test ? `TEST ALERT — Nanoodle ${operational ? "operational readiness" : market ? "Market" : "NEAR"} check notification drill. This is not a production outage.`
+    text: [test ? `TEST ALERT — Nanoodle ${backup ? "backup" : operational ? "operational readiness" : market ? "Market" : "NEAR"} check notification drill. This is not a production outage.`
+        : backup ? "Nanoodle encrypted recovery backup FAILED (no inference)."
         : operational ? "Nanoodle operational readiness check FAILED (every five minutes, no inference)."
         : market ? "Nanoodle NEAR AI Market availability check FAILED (every 15 minutes)." : "Nanoodle NEAR MCP daily check FAILED.",
       `Site: https://${market ? "market.near.ai" : "near.nanoodle.com"}. Time: ${new Date(now).toISOString()}.`,
       `Stage: ${stage}. systemd result: ${safe(env.MONITOR_SERVICE_RESULT)}; exit: ${safe(env.MONITOR_EXIT_CODE)}/${safe(env.MONITOR_EXIT_STATUS)}.`,
-      operational ? "Inspect /var/lib/nanoodle-operational-check/latest.json and journalctl -u nanoodle-operational-check.service on 159.195.17.119."
+      backup ? "Inspect journalctl -u nanoodle-backup.service and /run/nanoodle-recovery/resume.json on 159.195.17.119."
+        : operational ? "Inspect /var/lib/nanoodle-operational-check/latest.json and journalctl -u nanoodle-operational-check.service on 159.195.17.119."
         : `Inspect /var/lib/nanoodle-near-check/${market ? "market-latest.json" : "latest.json"} and journalctl -u ${market ? MARKET_UNIT : CHECK_UNIT} on 159.195.17.119.`,
-      operational ? `Issues: ${freshFailure ? issues.filter(c => !c.ok).slice(0, 12).map(c => `${safe(c.stage)}=${safe(c.code)}`).join(", ") || "service" : "service"}. No payment or workflow is executed by this probe. Preserve money state; do not blindly retry transfers or paid jobs.`
+      backup ? "Confirm the app and its original timers resumed. Preserve payment state and keep the private recovery key off the VPS. This capture executes no models or transfers."
+        : operational ? `Issues: ${freshFailure ? issues.filter(c => !c.ok).slice(0, 12).map(c => `${safe(c.stage)}=${safe(c.code)}`).join(", ") || "service" : "service"}. No payment or workflow is executed by this probe. Preserve money state; do not blindly retry transfers or paid jobs.`
         : market ? "Read-only probes cover the Market site, API and four published Nanoodle listings with live pricing. This check does not hire agents or run inference."
         : "Payment state is durable: resume the same run; do not send a replacement deposit blindly.",
       ...(test ? ["Mikkel requested this test. Please claim and acknowledge this message in Babel, then reply to it confirming receipt. No repair or paid workflow is requested."] : []),
@@ -78,10 +84,10 @@ export function babelClient(config, request = babelRequest) {
 export async function deliverAlerts(config, { env = process.env, now = Date.now, call = babelClient(config), enqueueOnly = false } = {}) {
   const dir = join(config.stateDir, "alerts"); mkdirSync(dir, { recursive: true, mode: 0o700 });
   let latest;
-  const reportFile = [OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT)
+  const reportFile = [BACKUP_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT) ? null : [OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT)
     ? config.operationalReportFile || "/var/lib/nanoodle-operational-check/latest.json"
     : join(config.stateDir, [MARKET_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT) ? "market-latest.json" : "latest.json");
-  try { latest = JSON.parse(readFileSync(reportFile)); } catch { /* early exit or timeout */ }
+  if (reportFile) try { latest = JSON.parse(readFileSync(reportFile)); } catch { /* early exit or timeout */ }
   const event = failureEvent(env, latest, now());
   if (event) {
     const file = join(dir, event.messageId + ".json");
