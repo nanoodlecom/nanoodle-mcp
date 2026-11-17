@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
-import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync, realpathSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -30,6 +30,22 @@ class CheckError extends Error {}
 const need = (condition, code) => { if (!condition) throw new CheckError(code); };
 const readJson = file => JSON.parse(readFileSync(file, "utf8"));
 const safeCode = e => e instanceof CheckError ? e.message : /^[A-Z_]{2,60}$/.test(e?.code || "") ? e.code : /Timeout|Abort/.test(e?.name || "") ? "request-timeout" : "probe-failed";
+
+export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("../", import.meta.url))) {
+  if (!Number.isSafeInteger(lock?.pid) || lock.pid <= 0) return false;
+  need(lock.host === hostname() && lock.boot === readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), "market-worker-lock-is-foreign");
+  const processDir = `/proc/${lock.pid}`, releaseDir = realpathSync(appDirectory);
+  try {
+    const [, entrypoint] = readFileSync(join(processDir, "cmdline"), "utf8").split("\0");
+    // A former worker can still have "/current" in argv after that symlink
+    // moves. Its kernel working directory stays in the release it started in.
+    return isAbsolute(entrypoint || "") && realpathSync(join(processDir, "cwd")) === releaseDir
+      && realpathSync(entrypoint) === join(releaseDir, "bin/nanoodle-mcp.mjs");
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ESRCH") return false;
+    throw error;
+  }
+}
 
 export function finishOperationalReport(stateDir, checks, now = Date.now(), fundingPause = null) {
   const latest = join(stateDir, "latest.json");
@@ -266,12 +282,7 @@ export async function runOperationalCheck(config, deps = {}) {
   await Promise.all(config.agents.map(async agent => {
     await check(`market-process-${agent.handle}`, async () => {
       const lock = read(join(config.marketStateDir, agent.handle, "worker.lock"));
-      const alive = deps.isWorkerAlive || (value => {
-        need(value.host === hostname() && value.boot === readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), "market-worker-lock-is-foreign");
-        process.kill(value.pid, 0);
-        const command = readFileSync(`/proc/${value.pid}/cmdline`, "utf8").split("\0");
-        return command.includes("/srv/nanoodle-mcp/app/bin/nanoodle-mcp.mjs");
-      });
+      const alive = deps.isWorkerAlive || isMarketWorkerAlive;
       need(Number.isSafeInteger(lock?.pid) && lock.pid > 0 && alive(lock), "market-worker-process-missing");
     }, ["market"]);
     await check(`market-auth-${agent.handle}`, async () => {

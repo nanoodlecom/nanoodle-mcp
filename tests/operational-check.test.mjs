@@ -1,15 +1,52 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
 import { deliverAlerts, EMBER } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
+
+test("Market liveness follows the selected release and rejects a worker left behind by a switched symlink", async t => {
+  const root = mkdtempSync(join(tmpdir(), "operational-market-release-")), children = [];
+  t.after(async () => {
+    await Promise.all(children.map(async child => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    }));
+    rmSync(root, { recursive: true, force: true });
+  });
+  const old = join(root, "old"), next = join(root, "next"), current = join(root, "current");
+  for (const dir of [old, next]) {
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    writeFileSync(join(dir, "bin/nanoodle-mcp.mjs"), 'console.log("ready"); setInterval(() => {}, 1000);');
+  }
+  const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), host = hostname();
+  const start = async directory => {
+    const child = spawn(process.execPath, [join(directory, "bin/nanoodle-mcp.mjs")],
+      { cwd: directory, env: {}, stdio: ["ignore", "pipe", "ignore"] });
+    children.push(child);
+    await Promise.race([once(child.stdout, "data"), once(child, "exit").then(() => assert.fail("Worker fixture exited early"))]);
+    return { pid: child.pid, boot, host };
+  };
+  assert.equal(isMarketWorkerAlive(await start(old), old), true, "the legacy layout still works");
+  symlinkSync(old, current);
+  const original = await start(current);
+  assert.equal(isMarketWorkerAlive(original, old), true);
+  symlinkSync(next, current + ".new"); renameSync(current + ".new", current);
+  assert.equal(isMarketWorkerAlive(original, next), false, "resolving argv alone would mistake the original worker for its replacement");
+  assert.equal(isMarketWorkerAlive(await start(current), next), true);
+  assert.throws(() => isMarketWorkerAlive({ ...original, boot: "foreign" }, next), /market-worker-lock-is-foreign/);
+});
+
 function fixture(override = () => null) {
   const calls = [], stateDir = mkdtempSync(join(tmpdir(), "operational-check-"));
   const config = { stateDir, outDir: "/state", marketStateDir: "/jobs", network: "mainnet", merchant: "nanoodle.near", nearPublicKey: "ed25519:public",
