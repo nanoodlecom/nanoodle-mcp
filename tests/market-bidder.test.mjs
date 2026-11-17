@@ -183,7 +183,7 @@ test("inside the server: a posted workflow is quoted, awarded and delivered", { 
   const port = await freePort();
   const child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", join(dir, "out"), "--serve", `127.0.0.1:${port}`], {
     env: {
-      PATH: process.env.PATH, HOME: dir, NANOGPT_API_KEY: NANO_KEY, MARKET_STATE_DIR: join(dir, "market-state"),
+      PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_API_KEY: NANO_KEY, MARKET_STATE_DIR: join(dir, "market-state"),
       NANOGPT_BASE_URL: nano.url, MARKET_BASE_URL: m.url, MARKET_AGENTS_FILE: catalog, MARKET_POLL_SECONDS: "1", MARKET_BID_POLL_SECONDS: "1",
     },
     stdio: ["ignore", "ignore", "pipe"],

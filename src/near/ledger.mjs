@@ -45,7 +45,8 @@ function fsyncDir(dir) {
   }
 }
 
-export function openNearLedger({ file, network, merchant, now = Date.now }) {
+export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false }) {
+  if (typeof requireExisting !== "boolean") throw TypeError("requireExisting must be a boolean");
   if (typeof file !== "string" || !file) throw new TypeError("openNearLedger needs a file path");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof merchant !== "string" || !merchant) throw new TypeError("openNearLedger needs a merchant account");
@@ -55,7 +56,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
   try {
     text = readFileSync(file, "utf8");
   } catch (e) {
-    if (e?.code !== "ENOENT") throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} could not be read`, { cause: e });
+    if (e?.code !== "ENOENT" || requireExisting) throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} could not be read; refusing to start empty`, { cause: e });
   }
   if (text === null) {
     state = { v: 1, network, merchant, quotes: {}, consumedTx: {}, refunds: {}, payouts: {}, meta: {} };

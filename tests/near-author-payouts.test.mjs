@@ -181,7 +181,7 @@ test("the real server pays saved and custom creators from one Nano queue when an
     child = spawn(process.execPath, ["bin/nanoodle-mcp.mjs", "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`,
       "--public-url", base, "--near-merchant", M, "--near-network", "testnet", "--near-rpc", chain.url,
       "--near-usd", "3", "--xno-usd", "0.5", "--nano-rpc", `http://127.0.0.1:${node.address().port}`, "--no-local-work"],
-    { env: { PATH: process.env.PATH, HOME: out, NANOGPT_API_KEY: "test-only", NANOGPT_BASE_URL: provider.url,
+    { env: { PATH: process.env.PATH, HOME: out, NANOODLE_WRITER_LOCK_DIR: join(out, "writer-locks"), NANOGPT_API_KEY: "test-only", NANOGPT_BASE_URL: provider.url,
       NANO_SEED: "0".repeat(64), NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1" }, stdio: ["ignore", "ignore", "pipe"] });
     child.stderr.on("data", c => { stderr += c; });
     for (let i = 0; i < 300 && !stderr.includes("MCP over HTTP on"); i++) {

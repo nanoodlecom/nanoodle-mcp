@@ -82,6 +82,8 @@ export async function runOperationalCheck(config, deps = {}) {
     const age = now() - Date.parse(value.checkedAt);
     need(Number.isFinite(age) && age <= 60_000 && age >= -30_000, "funding-report-stale");
     need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
+    need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
+    need(value.writerProtection.requiredState === true, "required-state-policy-not-enforced");
     need([value.balanceRaw, value.liabilitiesRaw, value.reservedRaw].every(v => typeof v === "string" && /^\d{1,39}$/.test(v)), "funding-report-invalid");
     need(value.ok === true && BigInt(value.balanceRaw) >= BigInt(value.liabilitiesRaw) + BigInt(value.reservedRaw), "funding-underfunded");
     need(Number.isSafeInteger(value.activeRuns) && value.activeRuns >= 0, "funding-report-invalid");

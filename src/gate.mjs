@@ -205,6 +205,7 @@ export function createChargeGate({
   pollMs = 1000,
   waitMs = 20_000,
   stateFile = null,
+  requireExistingState = false,
   fetch = globalThis.fetch,
   log = () => {},
   usage = () => {},
@@ -214,6 +215,7 @@ export function createChargeGate({
   runTimeoutMs = undefined,
 }) {
   const executionLimit = hostedRunTimeout(runTimeoutMs);
+  if (typeof requireExistingState !== "boolean" || (requireExistingState && !stateFile)) throw TypeError("required Nano state needs a state file");
   if (!address || !ops) throw new Error("charge gate needs a funded Nano wallet (address + ops)");
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
@@ -546,7 +548,7 @@ export function createChargeGate({
       // Starting fresh could forget a paid run or an outstanding refund, then
       // overwrite the only recovery record. A missing first-run file is fine;
       // unreadable or corrupt money state requires operator recovery.
-      if (e.code !== "ENOENT") throw new Error(`cannot restore gate state ${stateFile} — refusing to accept payments; recover the state file before restarting`, { cause: e });
+      if (e.code !== "ENOENT" || requireExistingState) throw new Error(`cannot restore gate state ${stateFile} — refusing to accept payments; recover the state file before restarting`, { cause: e });
     }
   }
 
