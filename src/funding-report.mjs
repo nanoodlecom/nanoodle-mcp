@@ -5,11 +5,13 @@ import { fundingRaw } from "./run-funding.mjs";
 import { hostedRunTimeout } from "./hosted-run.mjs";
 import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 import { selectRpcCooldowns } from "./rpc-backoff.mjs";
+import { maintenanceProcessIdentity } from "./maintenance-report.mjs";
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
 export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, durableState = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
+  const identity = maintenanceProcessIdentity();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
   let pending = null;
   function refresh() {
@@ -55,7 +57,7 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           report.writerProtection = { enforced: true, requiredState: proof.requiredState };
         }
       } catch { report = { ok: false, code: "funding-state-unavailable" }; }
-      report = { ...report, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };
+      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };
       try {
         const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }

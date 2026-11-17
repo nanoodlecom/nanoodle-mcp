@@ -41,8 +41,9 @@ export function createServiceLifecycle({ maintenance, startup = Promise.resolve(
 }
 
 /** Aggregate private write health without copying paths, events or credentials. */
-export function moneyStateStatus(states) {
+export function moneyStateStatus(states, { requireAll = false } = {}) {
   let ok = true, pendingWrites = 0;
+  if (requireAll && states.some(value => value == null)) return { ok: false, pendingWrites: 0 };
   for (const state of states.filter(value => value != null)) {
     if (typeof state.ok !== "boolean" || !Number.isSafeInteger(state.pendingWrites) || state.pendingWrites < 0) return { ok: false, pendingWrites: null };
     ok &&= state.ok;

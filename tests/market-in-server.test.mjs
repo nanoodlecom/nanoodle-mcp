@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function serve(env) {
   const dir = mkdtempSync(join(tmpdir(), "market-in-server-"));
   const graphs = join(dir, "noodles"); mkdirSync(graphs);
+  mkdirSync(join(dir, "out"), { mode: 0o700 });
   writeFileSync(join(graphs, "idea-poster.json"), JSON.stringify(WORKED_GRAPH));
   const def = join(dir, "default.json"); writeFileSync(def, JSON.stringify({ ...WORKED_GRAPH, name: "Idea to image" }));
   const port = await freePort();
@@ -41,7 +42,7 @@ async function serve(env) {
   };
   await until(/MCP over HTTP on/);
   const exited = new Promise((r) => child.once("exit", (code, sig) => r({ code, sig })));
-  return { port, until, stderr: () => stderr, child, exited, kill: () => { child.kill("SIGKILL"); return exited; } };
+  return { outDir: join(dir, "out"), port, until, stderr: () => stderr, child, exited, kill: () => { child.kill("SIGKILL"); return exited; } };
 }
 
 test("the worker runs inside the server: a plain-language hire is delivered; SIGTERM drains and exits 0", { timeout: 90_000 }, async () => {
@@ -118,15 +119,22 @@ test("several listings inside the server (MARKET_AGENTS_FILE): each hire runs on
   } finally { if (srv.child.exitCode === null) await srv.kill(); await m.close(); await nano.close(); hook.closeAllConnections?.(); await new Promise((r) => hook.close(r)); }
 });
 
-test("a broken market setting leaves the MCP server serving with the worker off", { timeout: 60_000 }, async () => {
+test("a broken market setting leaves the MCP server serving but cannot qualify a maintenance handoff", { timeout: 60_000 }, async () => {
   const nano = nanoGptMock(); await nano.listen();
   // budget above what a $0.10 hire pays after the fee
-  const srv = await serve({ NANOGPT_BASE_URL: nano.url, MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.5", MARKET_LISTING_PRICE_USD: "0.10" });
+  const operator = mkdtempSync(join(tmpdir(), "market-off-maintenance-"));
+  const srv = await serve({ NANOGPT_BASE_URL: nano.url, MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.5", MARKET_LISTING_PRICE_USD: "0.10",
+    NANOODLE_MAINTENANCE_FILE: join(operator, "control.json"), NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) });
   try {
     await srv.until(/market worker: OFF — --budget-usd 0\.5 is above what a \$0\.1 hire pays you/);
     await srv.until(/the MCP server is serving normally/);
+    const proof = join(srv.outDir, "maintenance-health.json"), deadline = Date.now() + 5000;
+    while (!existsSync(proof)) { assert.ok(Date.now() < deadline, srv.stderr()); await sleep(10); }
+    const frame = JSON.parse(readFileSync(proof));
+    assert.equal(frame.moneyState.ok, false, "a configured but absent Market writer must refuse maintenance qualification");
+    assert.equal(frame.readyToStop, false);
     assert.equal((await fetch(`http://127.0.0.1:${srv.port}/`)).status, 200);
-  } finally { await srv.kill(); await nano.close(); }
+  } finally { await srv.kill(); await nano.close(); rmSync(operator, { recursive: true, force: true }); }
 });
 
 test("configuration: a wallet-funded host needs no NanoGPT key; a runner takes a key or a payment callback", () => {

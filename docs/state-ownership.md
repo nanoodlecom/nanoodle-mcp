@@ -80,8 +80,10 @@ retain their deliberate first-run behavior.
 
 The private `funding-health.json` includes only `writerProtection.enforced` and
 `writerProtection.requiredState` booleans, checked within the existing five-minute
-runtime-funding probe. Missing/disabled protection fails readiness; schedules
-and healthy probe count are unchanged. These checks run no inference, signing,
+runtime-funding probe. Funding telemetry also binds its Linux PID, UID, boot ID
+and process start ticks; a resume controller must reject an earlier process's
+report even when its timestamp is recent. Missing/disabled protection fails
+readiness; schedules and healthy probe count are unchanged. These checks run no inference, signing,
 publication or PoW. Local startup errors remain visible in systemd/readiness;
 an independent observer is still needed during a whole-server/Babel outage.
 
@@ -109,6 +111,12 @@ and the root-owned, read-only `.nanoodle-release.json` attestation. The root
 controller must independently verify the complete immutable tree and intended
 service command before issuing permission; a reported Git SHA or an app-written
 health frame is insufficient. Graphs and MCP arguments cannot configure this.
+
+The maintenance handoff also requires every configured checkout rail and Market
+service to have initialized its financial writer. A missing configured component
+cannot disappear from the aggregate and leave a healthy-looking stop proof.
+Active rails retain their existing runtime funding behavior when another rail
+is unavailable.
 
 Authorized initialization is counted as accepted work while request entry and
 routine background passes still check closed admission. Only explicit startup

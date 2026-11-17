@@ -62,3 +62,11 @@ test("money write health selects only aggregate status and treats malformed coun
   assert.deepEqual(moneyStateStatus([null, { ok: true, pendingWrites: 2, key: "PRIVATE" }, { ok: false, pendingWrites: 1 }]), { ok: false, pendingWrites: 3 });
   for (const pendingWrites of [-1, 0.5, "0", Number.MAX_SAFE_INTEGER + 1]) assert.deepEqual(moneyStateStatus([{ ok: true, pendingWrites }]), { ok: false, pendingWrites: null });
 });
+
+test("maintenance qualification cannot silently omit a configured financial writer", () => {
+  const healthy = { ok: true, pendingWrites: 0 };
+  assert.deepEqual(moneyStateStatus([healthy, undefined], { requireAll: true }), { ok: false, pendingWrites: 0 });
+  assert.deepEqual(moneyStateStatus([healthy, null], { requireAll: true }), { ok: false, pendingWrites: 0 });
+  assert.deepEqual(moneyStateStatus([healthy], { requireAll: true }), healthy);
+  assert.deepEqual(moneyStateStatus([healthy, null]), healthy, "optional runtime profiles retain their existing behavior");
+});

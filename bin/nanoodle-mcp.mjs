@@ -368,6 +368,13 @@ async function main() {
     }
     const paidFunding = serveSpec !== null && (chargeUsd != null || nearMode);
     const marketEnabled = serveSpec !== null && !!(process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN);
+    // A configured rail/worker that failed initialization cannot qualify a
+    // maintenance handoff. Runtime funding still observes the active writers.
+    const maintenanceMoneyState = () => moneyStateStatus([
+      ...(chargeUsd != null ? [gate?.persistenceStatus(), usageWriter?.status()] : []),
+      ...(nearMode ? [near?.persistenceStatus(), near?.usageStatus()] : []),
+      ...(marketEnabled ? [marketService?.persistenceStatus()] : []),
+    ], { requireAll: true });
     const guardedFunding = paidFunding || marketEnabled;
     let fundingSources = null;
     let writerLocks = null;
@@ -784,7 +791,7 @@ async function main() {
 
     if (maintenance.snapshot().enforced && !serviceLifecycle.isStopping()) {
       const { startMaintenanceReport } = await import("../src/maintenance-report.mjs");
-      await startMaintenanceReport({ outDir: resolvedOut, maintenance, moneyState,
+      await startMaintenanceReport({ outDir: resolvedOut, maintenance, moneyState: maintenanceMoneyState,
         writerProtection: () => {
           writerLocks?.assertHeld();
           return { enforced: !!writerLocks, requiredState: requiredState?.requireExisting === true, scopes: writerLocks?.count || 0 };
