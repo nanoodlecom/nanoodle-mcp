@@ -1,5 +1,22 @@
+import { hostedWorkflowCopy } from "./hosted-workflow-copy.mjs";
+
+/** Shared public contract for the workflow's copy panel and MCP discovery. */
+export function conciseHostedInstructions() {
+  return [
+    `price_workflow is free; it never runs models. Quote with run_workflow and _pay_with: "near" or "usdc". Pay the exact quote from an authorized wallet, or show the payment link for approval.`,
+    `Watch payment.watchUrl (SSE) or payment.statusUrl?wait=1. When paid, automatically repeat run_workflow with identical arguments plus _payment_id: payment.paymentId. Reuse that ID on retries/reconnects; never pay again or create a replacement quote as a retry.`,
+    `Use SSE with a progressToken for steps. Show final media/text. Unused funds return to the paying wallet in the same asset.`,
+  ].join("\n\n");
+}
+
 /** Payment and execution instructions for any agent using a hosted workflow. */
 export function creatorAgentInstructions(record) {
+  if (!hostedWorkflowCopy(record).showCreatorInfo) return [
+    `MCP: ${record.mcpUrl}`,
+    `Inputs: Day_keyframe_prompt (day scene), Night_keyframe_instruction (night edit). Both are optional strings with saved defaults. Keep scene and framing consistent; the graph and motion prompt stay hosted.`,
+    conciseHostedInstructions(),
+    `Schema: ${record.url}/llms.txt`,
+  ].join("\n\n");
   const inputs = Object.fromEntries(Object.entries(record.schema.properties).map(([key, field]) => [key, field.enum?.[0] || `User's ${key.replace(/_/g, " ")}`]));
   return [
     `Run the Nanoodle workflow ${JSON.stringify(record.name)}.`,

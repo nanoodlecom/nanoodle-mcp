@@ -7,6 +7,8 @@ import { buildInputSchema, keyedInputs, ParamsError } from "./tools.mjs";
 import { createWorkflowRunner } from "./market/runner.mjs";
 import { assertCreatorGraph, creatorPayoutAddress } from "./creator-format.mjs";
 import { recommendPrice, PROBE_BRIEF } from "./market/catalog.mjs";
+import { hostedWorkflowCopy } from "./hosted-workflow-copy.mjs";
+import { conciseHostedInstructions } from "./creator-instructions.mjs";
 
 export const WORKFLOW_ID = /^wf_[a-f0-9]{24}$/;
 const paymentKeys = new Set(["_pay_with", "_payment_id", "_payment_tx", "_payment_sender"]);
@@ -61,7 +63,7 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
   function publicView(record) {
     if (!record) return null;
     const { schema } = inputShape(record.graph, record.inputNodeIds);
-    return { id: record.id, status: "live", name: record.name, description: record.description, author: record.author, inputName: record.inputName,
+    return { id: record.id, status: "live", name: record.name, description: hostedWorkflowCopy(record).description, author: record.author, inputName: record.inputName,
       schema, url: `${publicBase}/workflows/${record.id}`, mcpUrl: `${publicBase}/workflows/${record.id}/mcp`,
       estimatedCostUsd: record.estimatedCostUsd, recommendedPriceUsd: record.recommendedPriceUsd };
   }
@@ -97,9 +99,10 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
   function tools(id) {
     const record = get(id); if (!record) return [];
     const { schema } = inputShape(record.graph, record.inputNodeIds);
+    const copy = hostedWorkflowCopy(record);
     return ["run_workflow", "price_workflow"].map(name => ({ name,
       description: name === "price_workflow" ? "Check the cost of this hosted workflow for free; no models run."
-        : `${record.description || record.name} Hosted by Nanoodle. Quote first; pay NEAR or USDC; unused funds return automatically. ${record.author ? "Creator earnings go to the graph's embedded Nano address." : "No creator payout is configured for this workflow."}`,
+        : `${copy.description || record.name} Hosted by Nanoodle. Quote first; pay NEAR or USDC; unused funds return automatically.${copy.showCreatorInfo ? ` ${record.author ? "Creator earnings go to the graph's embedded Nano address." : "No creator payout is configured for this workflow."}` : ""}`,
       inputSchema: { ...schema, properties: { ...schema.properties,
         _pay_with: { type: "string", enum: ["near", ...(usdc?.enabled ? ["usdc"] : [])] },
         ...(name === "run_workflow" ? Object.fromEntries(["_payment_id", "_payment_tx", "_payment_sender"].map(key => [key, { type: "string" }])) : {}) } } }));
@@ -116,7 +119,11 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
       return publicView(get(id));
     },
     listTools: tools,
-    instructions(id) { const record = get(id); return `Run ${record?.name || "this workflow"} with run_workflow. price_workflow is free. A run first returns a payment quote; pay its exact NEAR or USDC amount, monitor the private pay link, then call run_workflow again with identical inputs and _payment_id. Continue automatically when paid. Never pay or create a replacement quote as a retry. The graph is hosted by Nanoodle; callers supply inputs, not graph JSON. Hosting requires no Nanoodle approval. Connect your agent to this workflow’s MCP endpoint and pay its execution quote from an authorized NEAR/USDC wallet. ${record?.author ? "Successful runs pay the embedded x402.author Nano address." : "No creator payout is configured for this workflow; execution still requires payment."}`; },
+    instructions(id) {
+      const record = get(id);
+      if (record && !hostedWorkflowCopy(record).showCreatorInfo) return conciseHostedInstructions();
+      return `Run ${record?.name || "this workflow"} with run_workflow. price_workflow is free. A run first returns a payment quote; pay its exact NEAR or USDC amount, monitor the private pay link, then call run_workflow again with identical inputs and _payment_id. Continue automatically when paid. Never pay or create a replacement quote as a retry. The graph is hosted by Nanoodle; callers supply inputs, not graph JSON. Hosting requires no Nanoodle approval. Connect your agent to this workflow’s MCP endpoint and pay its execution quote from an authorized NEAR/USDC wallet. ${record?.author ? "Successful runs pay the embedded x402.author Nano address." : "No creator payout is configured for this workflow; execution still requires payment."}`;
+    },
     async callTool(id, params, ctx) {
       const record = get(id); if (!record) throw new ParamsError("Unknown hosted workflow");
       if (!["run_workflow", "price_workflow"].includes(params?.name)) throw new ParamsError("Use run_workflow or price_workflow");

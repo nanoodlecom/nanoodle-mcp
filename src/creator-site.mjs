@@ -1,5 +1,6 @@
 import { nearSitePage, studioHtml, BRAND_BASE } from "./near-site.mjs";
 import { creatorAgentInstructions } from "./creator-instructions.mjs";
+import { hostedWorkflowCopy } from "./hosted-workflow-copy.mjs";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const header = `<header class="top"><a class="brand" href="/"><img src="/favicon.png" alt=""><span class="bname">nanoodle</span></a><nav><a href="/creators">Creators</a><a href="https://nanoodle.com">Editor ↗</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source ↗</a></nav></header>`;
 const footer = `<footer class="near-footer"><a href="/">Nanoodle on NEAR</a> · <a href="/llms.txt">Agent instructions</a><a class="labs-brand" href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" alt="255labs"></a></footer>`;
@@ -18,10 +19,11 @@ export function creatorPage(opts) {
 
 export function hostedWorkflowPage(record, opts) {
   const theme = base(opts), tool = { name: "run_workflow", title: record.name, inputSchema: record.schema };
+  const copy = hostedWorkflowCopy(record);
   const config = { publicBase: opts.publicBase, merchant: opts.merchant, usdc: opts.usdc, hosted: record.id,
     mcpPath: `/workflows/${record.id}/mcp`, tools: [{ name: tool.name, title: tool.title, schema: tool.inputSchema }] };
-  return { title: `${record.name} · nanoodle`, head: `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css"><meta name="description" content="${esc(record.description)}"><link rel="canonical" href="${esc(record.url)}">`, css: theme.css + css,
-    body: `${header}<section class="creator-intro"><p class="eyebrow">A CREATOR WORKFLOW · HOSTED BY NANOODLE</p><h1>${esc(record.name)}</h1><p class="hosted-description">${esc(record.description)}</p><p>Pay per run in NEAR or USDC. Quote first, watch the steps run, then get your result and change.</p>${record.author ? `<details><summary>Creator payout</summary><p class="payout-address">Nano earnings go to ${esc(record.author)}</p></details>` : `<p>No creator payout is configured for this workflow. Runs still require payment.</p>`}</section>
+  return { title: `${record.name} · nanoodle`, head: `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css"><meta name="description" content="${esc(copy.description)}"><link rel="canonical" href="${esc(record.url)}">`, css: theme.css + css,
+    body: `${header}<section class="creator-intro"><p class="eyebrow">${copy.showCreatorInfo ? "A CREATOR WORKFLOW · HOSTED BY NANOODLE" : "HOSTED BY NANOODLE"}</p><h1>${esc(record.name)}</h1><p class="hosted-description">${esc(copy.description)}</p><p>Pay per run in NEAR or USDC. Quote first, watch the steps run, then get your result and change.</p>${copy.showCreatorInfo ? (record.author ? `<details><summary>Creator payout</summary><p class="payout-address">Nano earnings go to ${esc(record.author)}</p></details>` : `<p>No creator payout is configured for this workflow. Runs still require payment.</p>`) : ""}</section>
     <section id="connect" class="connect-section"><div class="connect-heading"><b>Give your agent this ability.</b><select id="connect-client" aria-label="MCP client"><option value="claude">Claude Code</option><option value="grok">Grok</option><option value="url">Any MCP client · URL</option></select></div><div class="connect"><pre id="connect-command">${esc(`claude mcp add --transport http nanoodle ${record.mcpUrl}`)}</pre><button type="button" id="connect-copy">Copy</button></div></section>
     <details class="agent-help"><summary>Payment instructions for your agent</summary><pre id="agent-instructions" class="agent-instructions">${esc(creatorAgentInstructions(record))}</pre><button type="button" id="agent-copy" class="secondary-link">Copy agent instructions</button></details>
     ${studioHtml({ config, tools: [tool], usdc: opts.usdc })}${footer}<script type="module" src="${esc(opts.scriptUrl)}"></script>` };
