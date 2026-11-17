@@ -92,6 +92,14 @@ archiving an interrupted manual check.
 
 ## Babel failure alerts
 
+The same durable outbox also recognizes the manual `nanoodle-backup.service`
+and labeled `nanoodle-backup-alert-test.service` drill. Backup messages select
+only the systemd invocation/result and a fixed backup stage; they never read
+payment reports, archive contents or recovery keys. They ask the operator to
+confirm that the app and original timers resumed. This does not install or
+schedule a backup, provide an off-server destination, or keep Babel reachable
+during loss of the shared VPS.
+
 The check's `OnFailure` starts `nanoodle-near-alert@<failed-unit>.service`.
 `scripts/near-alert.mjs` saves a selected-metadata message before attempting
 delivery. Each systemd invocation has a stable message ID; network failures and
