@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
+import { NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 function fixture(override = () => null) {
@@ -15,7 +16,8 @@ function fixture(override = () => null) {
   const states = {
     "/state/gate-state.json": { v: 2, quotes: [], owed: [] },
     "/state/funding-health.json": { v: 1, checkedAt: new Date(NOW).toISOString(), ok: true, enforced: true, protectTransfers: true,
-      balanceRaw: "1000", liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null },
+      balanceRaw: "1000", liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
+      nanoRpc: { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: NOW } },
     "/state/near-state.json": { v: 1, network: "mainnet", merchant: "nanoodle.near", quotes: {}, refunds: {}, payouts: {} },
     "/jobs/nanoodle-image/market-state.json": { v: 1, assignments: {} },
     "/jobs/nanoodle-image/worker.lock": { pid: 1 },
@@ -34,8 +36,9 @@ function fixture(override = () => null) {
       const replaced = override(call, config, states); if (replaced) return replaced;
       const json = result => Response.json(body?.jsonrpc ? { jsonrpc: "2.0", id: body.id, result } : result);
       if (/^nano-\d/.test(url.hostname)) {
+        if (body.action === "block_info") return json(NANO_GENESIS_REPLY);
         assert.equal(body.action, "account_info");
-        return json({ confirmed_balance: "10000000000000000000000000000000", confirmed_height: "10", confirmed_frontier: "A".repeat(64) });
+        return json(nanoAccountInfo({ frontier: "A".repeat(64), balance: "10000000000000000000000000000000" }));
       }
       if (url.hostname.startsWith("near-")) {
         if (body.method === "status") return json({ chain_id: "mainnet", sync_info: { syncing: false } });
@@ -117,6 +120,15 @@ test("stuck scope observations use the operator's execution limit plus reconcili
   assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "funding-run-stuck"));
 });
 
+test("disabled, stale or insufficient Nano read enforcement cannot be hidden by fresh funding telemetry", async () => {
+  for (const change of [{ enforced: false }, { networkPeers: 1 }, { readablePeers: 1 }, { configuredPeers: 1 }, { lastReadAt: NOW - 61_000 }]) {
+    const f = fixture(); Object.assign(f.states["/state/funding-health.json"].nanoRpc, change);
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
+    assert.ok(report.checks.some(c => c.stage === "runtime-funding" && !c.ok));
+  }
+});
+
 test("loss of the separate Nano ingress is visible without executing tools or disabling the NEAR rail", async () => {
   const f = fixture(({ url }) => url.hostname === "nano-site.example" ? new Response("PRIVATE_ERROR", { status: 503 }) : null);
   const report = await runOperationalCheck(f.config, f.deps);
@@ -141,13 +153,21 @@ test("a stale node is reported while a fresh fallback remains usable; loss of al
 test("disagreeing Nano frontiers, an underfunded pool and stale exchange rates cannot produce healthy admission", async () => {
   for (const kind of ["frontier", "funds", "rates"]) {
     const f = fixture(({ url, body }) => {
-      if (url.hostname.startsWith("nano-") && kind === "funds") return Response.json({ confirmed_balance: "0", confirmed_height: "10", confirmed_frontier: "A".repeat(64) });
-      if (url.hostname === "nano-0.example" && kind === "frontier") return Response.json({ confirmed_balance: "100", confirmed_height: "10", confirmed_frontier: "B".repeat(64) });
+      if (url.hostname.startsWith("nano-") && body?.action === "account_info" && kind === "funds") return Response.json(nanoAccountInfo({ balance: "0", frontier: "A".repeat(64) }));
+      if (url.hostname === "nano-0.example" && body?.action === "account_info" && kind === "frontier") return Response.json(nanoAccountInfo({ balance: "100", frontier: "B".repeat(64) }));
       if (url.pathname === "/rates" && kind === "rates") return Response.json({ quoting: false, nearUsd: "3", xnoUsd: "1" });
     });
     const report = await runOperationalCheck(f.config, f.deps);
     assert.equal(report.ok, false); assert.equal(report.admission.nano, false); assert.equal(report.admission.market, false);
   }
+});
+
+test("a readable endpoint on the wrong Nano network cannot satisfy operational readiness", async () => {
+  const f = fixture(({ url, body }) => url.hostname === "nano-0.example" && body?.action === "block_info"
+    ? Response.json({ confirmed: "true", contents: { ...NANO_GENESIS_REPLY.contents, source: "0".repeat(64) } }) : null);
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
+  assert.ok(report.checks.some(c => c.stage === "nano-node-0" && c.code === "NANO_RPC_WRONG_NETWORK"));
 });
 
 test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {

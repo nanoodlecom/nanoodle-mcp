@@ -16,6 +16,7 @@ import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wal
 import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { USDC_CONTRACTS, parseNearToYocto } from "../src/near/index.mjs";
 import { mcpClient, freePort, stopServerChild } from "../scripts/near-simulate.mjs";
+import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = join(here, "..", "bin", "nanoodle-mcp.mjs");
@@ -41,22 +42,39 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
   graph.x402 = { author: PAY_TO };
   await writeFile(join(graphs, "poster.json"), JSON.stringify(graph));
   const deposits = new Map(), providerBlocks = new Set();
+  let frozenReads = 0, frozenPublishes = 0;
   const rpc = fakeRpc({
+    account_info: (_b, state, reply) => {
+      const received = new Set(state.processed.filter(p => p.subtype === "receive").map(p => p.block.link.toUpperCase()));
+      const pending = [...deposits].filter(([h]) => !received.has(h)).reduce((n, [, value]) => n + BigInt(value.amount), 0n);
+      return reply(nanoAccountInfo({ frontier: state.frontier, balance: state.balance, representative: ADDRESS, height: state.processed.length + 1, pending: pending.toString() }));
+    },
     receivable: (_b, state, reply) => {
       const received = new Set(state.processed.filter(p => p.subtype === "receive").map(p => p.block.link.toUpperCase()));
       return reply({ blocks: Object.fromEntries([...deposits].filter(([hash]) => !received.has(hash))) });
     },
     account_history: (_b, state, reply) => reply({ history: state.processed.filter(p => p.subtype === "receive").map(p => ({
-      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount,
+      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount, confirmed: "true",
     })) }),
     block_info: (body, state, reply) => {
       const p = state.processed.find(p => hashBlock(p.block) === body.hash);
-      return p ? reply({ confirmed: "true", contents: p.block }) : reply({ error: "Block not found" });
+      return p ? reply({ confirmed: "true", contents: p.block, height: String(state.processed.indexOf(p) + 2) }) : reply({ error: "Block not found" });
     },
   });
   const rpcServer = http.createServer(async (req, res) => {
     const chunks = []; for await (const part of req) chunks.push(part);
-    const reply = await rpc.fetch("http://fixture.rpc", { body: Buffer.concat(chunks).toString() });
+    const rawBody = Buffer.concat(chunks).toString(), body = JSON.parse(rawBody);
+    if (req.url === "/frozen") {
+      const answer = body.action === "account_info" ? nanoAccountInfo({ frontier: FRONTIER, balance: BALANCE, representative: ADDRESS, height: 1 })
+        : body.action === "receivable" ? { blocks: "" }
+        : body.action === "account_history" ? { history: [] }
+        : body.action === "work_generate" ? { work: WORK }
+        : body.action === "block_info" && body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY
+        : { error: "Block not found" };
+      if (body.action === "process") frozenPublishes++; else frozenReads++;
+      res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(answer)); return;
+    }
+    const reply = await rpc.fetch("http://fixture.rpc", { body: rawBody });
     res.writeHead(reply.status, { "content-type": "application/json" }); res.end(await reply.text());
   });
   const near = createFakeChain(), key = await throwawayNearKey();
@@ -83,7 +101,7 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
     child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`, "--public-url", base,
       "--charge-usd", "0.05", "--xno-usd", "0.5", "--no-local-work", "--near-merchant", "merchant.testnet", "--near-network", "testnet",
       "--near-rpc", near.url, "--near-usd", "3.64"], { env: {
-        PATH: process.env.PATH, HOME: dir, NANO_SEED: SEED, NANO_RPC_URL: `http://127.0.0.1:${rpcServer.address().port}`,
+        PATH: process.env.PATH, HOME: dir, NANO_SEED: SEED, NANO_RPC_URL: ["frozen", "fresh-a", "fresh-b"].map(p => `http://127.0.0.1:${rpcServer.address().port}/${p}`).join(","),
         NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANOODLE_RUN_TIMEOUT_MS: "2000",
       }, stdio: ["ignore", "ignore", "pipe"] });
     child.stderr.setEncoding("utf8"); child.stderr.on("data", part => { stderr += part; });
@@ -143,6 +161,8 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
       assert.equal(providerBlocks.size, count, "replaying a timed-out payment cannot pay another invoice");
     }
     assert.equal(providerBlocks.size, 11, "each failed run pays at most its one started invoice and no downstream image");
+    assert.ok(frozenReads > 0, "the preferred stale peer really answered the scanner and reconciliation reads");
+    assert.equal(frozenPublishes, 0, "new sends use the current observed peers rather than the frozen first entry");
     assert.doesNotMatch(stderr, /unhandled|FUNDING_INVALID|cannot persist gate state/i);
   } finally {
     if (child) await stopServerChild(child);
@@ -163,6 +183,34 @@ test("one wallet enforces a cumulative budget across parallel provider invoices"
   assert.equal(BigInt(mock.state.balance), BigInt(BALANCE) - BigInt(AMOUNT) * 2n);
   assert.deepEqual(wallet.ops.fundingStatus(), { activeRuns: 0, reservedRaw: "0" });
   await assert.rejects(wallet.payment({ payTo: PAY_TO, amountRaw: AMOUNT }), { code: "FUNDING_REQUIRED" });
+});
+
+test("hosted funding observations refresh the read pool without signing, work or inference", async () => {
+  let at = 1_000, height = 1, reads = 0;
+  const mock = fakeRpc({ account_info: (_body, state, reply) => {
+    reads++; return reply(nanoAccountInfo({ frontier: state.frontier, balance: state.balance, representative: ADDRESS, height }));
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "https://peer-a,https://peer-b", fetch: mock.fetch,
+    verifyRpcReads: true, protectTransfers: true, requireFunding: true, now: () => at });
+  const first = await wallet.ops.fundingReport();
+  assert.equal(first.nanoRpc.readablePeers, 2); assert.equal(first.nanoRpc.networkPeers, 2);
+  assert.equal(reads, 2);
+  await wallet.ops.fundingReport(); assert.equal(reads, 2, "bounded cache avoids hammering the peers");
+  height++; mock.state.frontier = "C".repeat(64); mock.state.balance = String(BigInt(BALANCE) - 1n); at += 30_001;
+  const refreshed = await wallet.ops.fundingReport();
+  assert.equal(refreshed.balanceRaw, mock.state.balance); assert.equal(reads, 4);
+  assert.equal(refreshed.nanoRpc.lastReadAt, at);
+  assert.equal(mock.state.processed.length, 0); assert.equal(mock.state.workHashes.length, 0);
+});
+
+test("insufficient mainnet read peers refuses the hosted run before execution or publication", async () => {
+  const mock = fakeRpc(); let executed = false;
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "https://wrong,https://good", verifyRpcReads: true,
+    fetch: (url, init) => url.includes("wrong") && JSON.parse(init.body).hash === NANO_GENESIS_HASH
+      ? Promise.resolve({ ok: true, status: 200, text: async () => JSON.stringify({ error: "Block not found" }) }) : mock.fetch(url, init),
+  });
+  await assert.rejects(wallet.ops.withFunding({ id: "no-mainnet-quorum", maxUsd: 1, maxRaw: 1n }, () => { executed = true; }), { code: "NANO_RPC_NETWORK_QUORUM" });
+  assert.equal(executed, false); assert.equal(mock.state.processed.length, 0);
 });
 
 test("the wallet captures each queued caller's budget rather than the queue drainer's context", async () => {
@@ -286,10 +334,12 @@ function fakeRpc(overrides = {}) {
   const fetch = async (url, init) => {
     const body = JSON.parse(init.body);
     const reply = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
+    if (body.action === "block_info" && body.hash === NANO_GENESIS_HASH) return reply(NANO_GENESIS_REPLY);
     if (overrides[body.action]) return overrides[body.action](body, state, reply);
     if (body.action === "account_info") {
       state.infoCalls++;
-      return reply({ frontier: state.frontier, balance: state.balance, representative: ADDRESS });
+      return reply(body.include_confirmed === "true" ? nanoAccountInfo({ frontier: state.frontier, balance: state.balance, representative: ADDRESS, height: state.processed.length + 1 })
+        : { frontier: state.frontier, balance: state.balance, representative: ADDRESS });
     }
     if (body.action === "work_generate") {
       state.workDifficulties.push(body.difficulty);

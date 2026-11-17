@@ -312,6 +312,13 @@ the result. The seed/private key never leaves the process: only the *signed
 block* goes to the RPC node, and neither secret is ever logged. An API key,
 if present, always wins — the wallet is only used keyless.
 
+Hosted paid tools and Market workers compare account reads across configured
+Nano RPCs, validate mainnet identity and pause new spending on stale or
+inconsistent views. Configure independent peers with a comma-separated
+`NANO_RPC_URL`; multiple configured peers require at least two readable nodes.
+See [Nano RPC freshness](docs/nano-rpc-freshness.md) for protocol requirements,
+monitoring and the remaining restart-recovery limits.
+
 **Proof-of-work reliability.** Every send block needs Nano proof-of-work. The
 server asks the RPC node's `work_generate` first, but public nodes routinely
 refuse or throttle it (no GPU, key required); the fallback is local

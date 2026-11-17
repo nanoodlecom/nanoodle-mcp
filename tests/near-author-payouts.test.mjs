@@ -14,6 +14,7 @@ import { parseUsdNano } from "../src/gate.mjs";
 import { createNearRpc, openNearLedger, createRefunder, parseNearSecretKey, parseNearToYocto } from "../src/near/index.mjs";
 import { USDC_CONTRACTS, USDC_RATE } from "../src/near/ft.mjs";
 import { createFakeChain, throwawayNearKey, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
+import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
 const AUTHOR = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
 const OTHER = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 2)), { useNanoPrefix: true });
@@ -160,7 +161,7 @@ test("the real server pays saved and custom creators from one Nano queue when an
   const node = createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks)); let answer;
-    if (body.action === "account_info") answer = { frontier, balance: String(balance), representative: AUTHOR };
+    if (body.action === "account_info") answer = nanoAccountInfo({ frontier, balance: String(balance), representative: AUTHOR, height: blocks.size + 1 });
     else if (body.action === "receivable") answer = { blocks: "" };
     else if (body.action === "work_generate") answer = { work: "bbbbbbbbbbbbbbbb" };
     else if (body.action === "process") {
@@ -168,7 +169,8 @@ test("the real server pays saved and custom creators from one Nano queue when an
       if (blocks.has(hash)) answer = { error: "Old block" };
       else if (body.block.previous !== frontier) answer = { error: "Fork" };
       else { frontier = hash; balance = BigInt(body.block.balance); blocks.set(hash, body.block); answer = { hash }; }
-    } else if (body.action === "block_info") answer = blocks.has(body.hash) ? { confirmed: "true" } : { error: "Block not found" };
+    } else if (body.action === "block_info") answer = body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY
+      : blocks.has(body.hash) ? { confirmed: "true", contents: blocks.get(body.hash), height: String([...blocks.keys()].indexOf(body.hash) + 2) } : { error: "Block not found" };
     else answer = { error: "Unsupported stand-in request" };
     res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(answer));
   });

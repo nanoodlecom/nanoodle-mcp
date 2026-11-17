@@ -33,6 +33,7 @@ import {
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
 import { createRunFunding } from "./run-funding.mjs";
+import { createNanoReadPool } from "./nano-read-pool.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -118,11 +119,12 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, verifyRpcReads = false, now = Date.now, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
   if (typeof protectTransfers !== "boolean") throw new TypeError("protectTransfers must be a boolean");
+  if (typeof verifyRpcReads !== "boolean") throw new TypeError("verifyRpcReads must be a boolean");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
@@ -194,6 +196,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     return json;
   }
 
+  const readPool = verifyRpcReads ? createNanoReadPool({ bases: rpcBases, account: address, checkAddress, hashBlock, now,
+    rpc: (body, base) => rpcOnce(body, base, { signal: AbortSignal.timeout(Math.min(rpcTimeoutMs, 2500)) }),
+  }) : null;
+
   // Read/publish RPC with failover across the endpoint chain. `base` defaults to
   // the whole list; the work path passes a single explicit base so it keeps
   // driving its own source order (workBases → public RPC). A read fails over on
@@ -202,8 +208,12 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   // transport failure stops here so settleAfterTransportError (which re-checks
   // the frontier) can decide whether to republish, avoiding a double-submit.
   async function rpc(body, base = rpcBases, opts = {}) {
-    const bases = Array.isArray(base) ? base : [base];
     const isPublish = body.action === "process";
+    if (readPool && base === rpcBases) {
+      if (["account_info", "receivable", "account_history"].includes(body.action)) return readPool.read(body);
+      if (body.action === "block_info") return readPool.block(body);
+    }
+    const bases = readPool && isPublish && base === rpcBases ? await readPool.publishBases() : Array.isArray(base) ? base : [base];
     let lastErr;
     for (let i = 0; i < bases.length; i++) {
       try {
@@ -232,7 +242,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     if (!/^[a-f0-9]{64}$/i.test(info.frontier || "") || !/^\d{1,39}$/.test(String(info.balance)) || !checkAddress(info.representative)) {
       throw new Error("Nano RPC account_info returned invalid wallet state");
     }
-    return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative };
+    return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative,
+      ...(readPool ? { blockCount: BigInt(info.block_count) } : {}) };
   }
 
   /*
@@ -244,11 +255,21 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
    * uncertain (lost response, failed receive) and refetched on demand.
    */
   let chain = null;
+  let checkedAt = null;
   async function currentState(fresh = false) {
-    if (!fresh && chain) return chain;
+    const health = readPool?.status();
+    if (!fresh && chain && (!readPool || (checkedAt != null && now() >= checkedAt && now() - checkedAt < 30_000
+        && health.networkPeers >= health.minimumPeers && health.readablePeers >= health.minimumPeers))) return chain;
     chain = null; // a failed refetch must not leave the suspect cache behind
     chain = await accountState();
+    checkedAt = now();
     return chain;
+  }
+
+  function advanced(state, hash, balance) {
+    const next = { ...state, frontier: hash, balance, ...(state.blockCount != null ? { blockCount: state.blockCount + 1n } : {}) };
+    chain = readPool?.observe(next) === false ? null : next;
+    return next;
   }
 
   // Work: dedicated work server first (--work-rpc, e.g. a local nano-work-server
@@ -350,7 +371,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     let state = await currentState(fresh);
     let blocks;
     try {
-      const r = await rpc({ action: "receivable", account: address, count: "50", threshold: "1" });
+      const r = await rpc({ action: "receivable", account: address, count: "50", threshold: "1", include_only_confirmed: "true" });
       blocks = r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     } catch {
       return state;
@@ -376,7 +397,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         // between receives, send-grade for the frontier a send might grow next
         precomputeWork(hash, i < blocks.length - 1 ? RECEIVE_WORK_THRESHOLD : SEND_WORK_THRESHOLD);
         await rpc({ action: "process", json_block: "true", subtype: "receive", block });
-        chain = state = { ...state, frontier: hash, balance: state.balance + BigInt(amountRaw) };
+        state = advanced(state, hash, state.balance + BigInt(amountRaw));
         pocketed++;
         log(`x402: received ${rawToXno(amountRaw)} XNO (refund/deposit ${sendHash.slice(0, 8)}…, block ${hash})`);
       } catch (e) {
@@ -465,7 +486,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         // cache so the next send rebuilds from the node's own frontier.
         else { chain = null; throw e; }
       }
-      chain = { frontier: hash, balance: state.balance - amount, representative: state.representative };
+      advanced(state, hash, state.balance - amount);
       log(`x402: ${describe} ${rawToXno(amount)} XNO${extra} to ${to} (block ${hash})`);
       return hash;
     }
@@ -612,7 +633,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       fundingStatus: funding.snapshot,
       fundingReport: () => enqueue(async () => {
         const state = await currentState();
-        return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers };
+        return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers,
+          ...(readPool ? { nanoRpc: readPool.status() } : {}) };
       }),
       // The journal callback MUST persist the signed block before returning.
       // Retrying after a lost response or a restart uses the same block hash.

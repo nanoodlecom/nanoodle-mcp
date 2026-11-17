@@ -61,3 +61,12 @@ test("the report writer refuses a staging symlink and does not overwrite its tar
   assert.equal(await readFile(target, "utf8"), "KEEP");
   assert.equal(w.sources.ready(), false);
 });
+
+test("funding telemetry cannot call degraded read coverage healthy", async t => {
+  const w = await setup(t);
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000,
+    snapshot: async () => ({ ...value, nanoRpc: { enforced: true, configuredPeers: 4, minimumPeers: 2, networkPeers: 1, readablePeers: 1, lastReadAt: 2000 } }) });
+  t.after(report.stop);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
+  assert.equal(w.sources.ready(), false);
+});

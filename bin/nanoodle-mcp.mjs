@@ -365,6 +365,7 @@ async function main() {
         fundingLiabilities: context => fundingSources ? fundingSources.liabilitiesRaw(context) : 0n,
         requireFunding: paidFunding && !apiKey,
         protectTransfers: guardedFunding,
+        verifyRpcReads: guardedFunding,
         log: (line) => console.error("nanoodle-mcp: " + line),
       });
     } catch (e) { console.error("nanoodle-mcp: " + e.message); process.exit(1); }
