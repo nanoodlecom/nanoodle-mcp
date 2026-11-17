@@ -43,6 +43,7 @@ import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { nearCreatorLiabilities, nearRunFundingBudget } from "./funding-liabilities.mjs";
+import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const RUN_NOODLE = "run_noodle";
 const FINAL = new Set(["settled", "failed", "rejected"]);
@@ -129,7 +130,9 @@ export function createNearGate({
   authorPayouts = null,
   canQuote = () => true,
   fundRun = null,
+  runTimeoutMs = undefined,
 }) {
+  const executionLimit = hostedRunTimeout(runTimeoutMs);
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
@@ -770,7 +773,7 @@ export function createNearGate({
         if (fundRun) q = ledger.updateQuote(q.id, { fundingOutcomeReady: true });
         return result;
       };
-      res = fundRun ? await fundRun(nearRunFundingBudget(q), execute) : await execute();
+      res = await withHostedRun(() => fundRun ? fundRun(nearRunFundingBudget(q), execute) : execute(), executionLimit);
     } catch (e) {
       const msg = String((e && e.message) || e);
       const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";

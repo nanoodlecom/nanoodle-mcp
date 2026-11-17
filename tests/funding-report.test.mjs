@@ -36,7 +36,7 @@ test("unreadable financial state fails closed and later recovery can resume quot
     snapshot: async () => { if (fail) throw Error("PRIVATE_PROVIDER_ERROR"); return value; } });
   t.after(report.stop);
   assert.equal(w.sources.ready(), false);
-  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "v"]);
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "runTimeoutMs", "v"]);
   fail = false; await report.refresh(); assert.equal(w.sources.ready(), true);
 });
 

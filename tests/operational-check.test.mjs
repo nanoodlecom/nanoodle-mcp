@@ -97,7 +97,7 @@ test("operational probes cover live readiness with no inference, signing or Mark
 test("stale, disabled, underfunded or stuck live reservations fail independently of the public site", async () => {
   for (const change of [
     { checkedAt: new Date(NOW - 61_000).toISOString() }, { enforced: false }, { protectTransfers: false },
-    { balanceRaw: "299" }, { reservedRaw: "NaN" }, { ok: false }, { activeRuns: 1, oldestStartedAt: NOW - 46 * 60_000 },
+    { balanceRaw: "299" }, { reservedRaw: "NaN" }, { ok: false }, { activeRuns: 1, oldestStartedAt: NOW - 46 * 60_000 }, { runTimeoutMs: null },
   ]) {
     const f = fixture();
     Object.assign(f.states["/state/funding-health.json"], change);
@@ -106,6 +106,15 @@ test("stale, disabled, underfunded or stuck live reservations fail independently
     assert.ok(report.checks.some(c => c.stage === "runtime-funding" && !c.ok));
     assert.ok(report.checks.some(c => c.stage === "mcp-discovery" && c.ok));
   }
+});
+
+test("stuck scope observations use the operator's execution limit plus reconciliation grace", async () => {
+  const f = fixture(), state = f.states["/state/funding-health.json"];
+  Object.assign(state, { runTimeoutMs: 2 * 3_600_000, activeRuns: 1, oldestStartedAt: NOW - 60 * 60_000 });
+  assert.equal((await runOperationalCheck(f.config, f.deps)).ok, true);
+  state.oldestStartedAt = NOW - 136 * 60_000;
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "funding-run-stuck"));
 });
 
 test("loss of the separate Nano ingress is visible without executing tools or disabling the NEAR rail", async () => {

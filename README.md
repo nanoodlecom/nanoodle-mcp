@@ -363,6 +363,12 @@ service *anyone's* agent can connect to:
 nanoodle-mcp --graphs ~/noodles --serve 8402
 ```
 
+Hosted execution has a 30-minute deadline across each workflow and its output
+downloads. Operators can set `NANOODLE_RUN_TIMEOUT_MS` (positive milliseconds,
+at most 24 hours). Saved/custom workflows and Market jobs use the same rule;
+nested tools share their parent's deadline. See [execution and payment
+cancellation](docs/hosted-execution.md).
+
 Callers connect with one command — no key, no signup:
 
 ```bash
