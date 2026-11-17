@@ -7,11 +7,12 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock, createBlock } from "nanocurrency";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
 import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { USDC_CONTRACTS, parseNearToYocto } from "../src/near/index.mjs";
@@ -1137,4 +1138,82 @@ test("a real node error still never fails over", async () => {
   const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "http://a,http://b,http://c", fetch });
   await assert.rejects(() => wallet.ops.rpc({ action: "account_info", account: ADDRESS }), /Fork/);
   assert.equal(tried, 1, "an authoritative error must stop at the first node");
+});
+
+async function maintenanceWorld(t) {
+  const dir = await mkdtemp(join(tmpdir(), "wallet-maintenance-")), file = join(dir, "flag.json");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const maintenance = createMaintenanceBarrier({ file, ownerUid: process.getuid() });
+  return { maintenance, pause: () => writeFile(file, JSON.stringify({ v: 1, token: "a".repeat(32), operation: "backup", revision: null }), { mode: 0o600 }) };
+}
+
+test("wallet drain counts queued transfers until publication and rejects new work during pause", async t => {
+  const w = await maintenanceWorld(t), rpc = fakeRpc();
+  let release, reached, blocked = false;
+  const hold = new Promise(r => { release = r; }), entered = new Promise(r => { reached = r; });
+  const wallet = createNanoWallet({ secretKey: SECRET, maintenance: w.maintenance, fetch: async (url, init) => {
+    if (JSON.parse(init.body).action === "work_generate" && !blocked) { blocked = true; reached(); await hold; }
+    return rpc.fetch(url, init);
+  } });
+  const first = wallet.ops.transfer(PAY_TO, AMOUNT);
+  const queued = wallet.ops.transfer(PAY_TO, AMOUNT);
+  await entered;
+  assert.equal(w.maintenance.snapshot().counts.wallet, 2);
+  await w.pause();
+  await assert.rejects(wallet.ops.transfer(PAY_TO, AMOUNT), { code: "SERVICE_DRAINING" });
+  assert.equal(rpc.state.processed.length, 0);
+  release(); await Promise.all([first, queued]);
+  assert.equal(rpc.state.processed.length, 2);
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+  const report = await wallet.ops.fundingReport();
+  assert.equal(report.balanceRaw, rpc.state.balance);
+  assert.equal(w.maintenance.snapshot().activeOperations, 0, "read-only telemetry does not self-block the drain");
+});
+
+test("accepted requests can queue their refunds after pause even after releasing funding", async t => {
+  const w = await maintenanceWorld(t), rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: SECRET, maintenance: w.maintenance, fetch: rpc.fetch });
+  await w.maintenance.run(async () => {
+    await wallet.ops.withFunding({ id: "settlement-after-run", maxRaw: 1n, maxUsd: 0.01 }, async () => {});
+    assert.equal(wallet.ops.fundingStatus().activeRuns, 0);
+    await w.pause();
+    await wallet.ops.transfer(PAY_TO, AMOUNT, "customer change");
+  });
+  assert.equal(rpc.state.processed.length, 1);
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+  await assert.rejects(wallet.payment(invoice()), { code: "SERVICE_DRAINING" });
+});
+
+test("writer failures release tracked wallet work without wedging the queue", async t => {
+  const w = await maintenanceWorld(t), rpc = fakeRpc(); let validWriter = false;
+  const wallet = createNanoWallet({ secretKey: SECRET, maintenance: w.maintenance, fetch: rpc.fetch,
+    assertWriter: () => { if (!validWriter) throw Error("writer lost"); } });
+  await assert.rejects(wallet.ops.transfer(PAY_TO, AMOUNT), /writer lost/);
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+  assert.equal(rpc.state.processed.length, 0);
+  validWriter = true;
+  await wallet.ops.transfer(PAY_TO, AMOUNT);
+  assert.equal(rpc.state.processed.length, 1);
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+});
+
+test("a funded run remains admitted through pause and always releases its reservation", async t => {
+  const w = await maintenanceWorld(t), rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: SECRET, maintenance: w.maintenance, fetch: rpc.fetch, requireFunding: true });
+  let entered, release;
+  const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+  const run = wallet.ops.withFunding({ id: "accepted-before-pause", maxRaw: BigInt(AMOUNT), maxUsd: 0.01 }, async () => {
+    entered(); await hold;
+    await wallet.payment(invoice());
+  });
+  await reached; await w.pause();
+  assert.equal(wallet.ops.fundingStatus().activeRuns, 1);
+  assert.ok(w.maintenance.snapshot().activeOperations > 0);
+  await assert.rejects(wallet.ops.withFunding({ id: "late-run", maxRaw: 1n, maxUsd: 0.01 }, () => assert.fail("No late inference")), { code: "SERVICE_DRAINING", executionNotStarted: true });
+  release(); await run;
+  // Read-only report also waits behind any already-queued post-payment sweep.
+  await wallet.ops.fundingReport();
+  assert.equal(rpc.state.processed.length, 1);
+  assert.deepEqual(wallet.ops.fundingStatus(), { activeRuns: 0, reservedRaw: "0" });
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
 });

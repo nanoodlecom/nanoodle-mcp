@@ -36,6 +36,7 @@
  * clients without Origin still work; payment authorizes paid calls.
  */
 import http from "node:http";
+import { MaintenanceError } from "./maintenance.mjs";
 import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
@@ -737,10 +738,12 @@ export async function serveHttp({
   publicBase,
   marketWebhook = null,
   creators = null,
+  maintenance = null,
   progressMs = 10_000,
   maxStreams = 4096,
   log = (...a) => console.error(...a),
 }) {
+  if (maintenance !== null && typeof maintenance.run !== "function") throw new TypeError("maintenance must provide request admission and accounting");
   const sha = commit === undefined ? gitShortSha() : (commit || null);
   // Each public page describes its own payment experience. Routing and stored
   // payments still share the original backend, including compatibility calls.
@@ -762,7 +765,7 @@ export async function serveHttp({
   // nothing that scales with the chain. This counter is only a socket backstop.
   let activeStreams = 0;
 
-  const server = http.createServer(async (req, res) => {
+  const handleRequest = async (req, res) => {
     // Routing needs only the path. An untrusted Host header must not throw
     // before the request's error boundary (or influence URL parsing).
     const send = (code, body, type = "application/json") => {
@@ -1163,6 +1166,26 @@ export async function serveHttp({
       if (!res.headersSent) send(500, JSON.stringify({ error: "internal error" }));
       else res.destroy();
     }
+  };
+
+  const server = http.createServer((req, res) => {
+    // Keep a POST registered until its async handler finishes, even if the
+    // caller disconnects. Losing an SSE socket does not finish paid model work.
+    // Read-only GETs, including payment status streams, remain available.
+    const result = maintenance && req.method === "POST"
+      ? maintenance.run(() => handleRequest(req, res)) : handleRequest(req, res);
+    result.catch(error => {
+      if (res.headersSent) { res.destroy(); return; }
+      if (error instanceof MaintenanceError && error.code === "SERVICE_DRAINING") {
+        res.writeHead(503, { "Content-Type": "application/json", "Cache-Control": "no-store", "Retry-After": "5", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: { code: "SERVICE_DRAINING", executionNotStarted: true,
+          message: "Maintenance is in progress. No work started. Retry with the same payment ID; do not pay again." } }));
+      } else {
+        log("HTTP request accounting failed");
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "internal error" }));
+      }
+    });
   });
 
   await new Promise((resolve, reject) => {
