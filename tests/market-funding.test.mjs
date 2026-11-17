@@ -7,19 +7,36 @@ import { createWorkflowRunner } from "../src/market/runner.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 
-let nano;
-before(async () => { nano = nanoGptMock(); await nano.listen(); });
-after(async () => { await nano.close(); });
+let nano, previousEnvironmentKey;
+before(async () => {
+  previousEnvironmentKey = process.env.NANOGPT_API_KEY;
+  process.env.NANOGPT_API_KEY = "test-environment-key-must-not-be-used";
+  nano = nanoGptMock({ walletPayments: true }); await nano.listen();
+});
+after(async () => {
+  await nano.close();
+  if (previousEnvironmentKey === undefined) delete process.env.NANOGPT_API_KEY;
+  else process.env.NANOGPT_API_KEY = previousEnvironmentKey;
+});
 const pair = { usdNano: 500_000_000n, raw: 10n ** 30n };
 async function setup(balance = 10n ** 30n) {
-  const pool = createRunFunding({ serial: fn => fn(), balance: async () => balance });
-  const policies = [];
-  const runner = createWorkflowRunner({ payment: async () => assert.fail("fixture must not request real payments"),
+  let funds = balance, tail = Promise.resolve();
+  const serial = fn => { const p = tail.then(fn); tail = p.catch(() => {}); return p; };
+  const pool = createRunFunding({ serial, balance: async () => funds });
+  const policies = [], payments = [];
+  const runner = createWorkflowRunner({ payment: invoice => {
+      const scope = pool.capture();
+      return serial(() => {
+        pool.authorize(scope, invoice, funds);
+        funds -= BigInt(invoice.amountRaw); payments.push(invoice.paymentId);
+        nano.settleWalletInvoice(invoice.paymentId);
+      });
+    },
     budgetUsd: 1, baseUrl: nano.url, fundingPair: async () => pair,
     fundRun: (terms, execute) => { policies.push(terms); return pool.run(terms, execute); } });
   const priced = await runner.price({ graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } });
   assert.equal(priced.ok, true);
-  return { pool, policies, runner, args: { pricing: priced.pricing, inputs: priced.inputs,
+  return { pool, policies, payments, runner, args: { pricing: priced.pricing, inputs: priced.inputs,
     outDir: await mkdtemp(join(tmpdir(), "market-funding-")), fundingId: "market:test-assignment" } };
 }
 
@@ -28,6 +45,7 @@ test("Market execution inherits one capped reservation derived from its accepted
   const before = nano.runs();
   const result = await w.runner.run(w.args);
   assert.ok(result.outputs.length > 0); assert.ok(nano.runs() > before);
+  assert.equal(w.payments.length, 2, "both models use scoped x402 payments even when an environment key exists");
   assert.equal(w.policies[0].id, w.args.fundingId);
   assert.ok(w.policies[0].maxRaw > 0n);
   assert.deepEqual(w.pool.snapshot(), { activeRuns: 0, reservedRaw: "0" });

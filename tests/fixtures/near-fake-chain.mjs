@@ -376,15 +376,35 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
-export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CATALOGS } = {}) {
+export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CATALOGS, walletPayments = false } = {}) {
   let chatRuns = 0;
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
   const json = (status, obj) => ({ status, body: JSON.stringify(obj) });
   let probes = 0;
   let probe = XNO_PROBE;
+  const invoices = new Map();
+  let invoiceSequence = 0;
   async function handle(method, path, body, headers = {}) {
     const p = path.replace(/^https?:\/\/[^/]+/, "");
+    if (walletPayments && method === "POST" && p.startsWith("/api/x402/complete/")) {
+      const invoice = invoices.get(p.split("/").at(-1));
+      if (!invoice?.paid) return json(402, { error: "fixture payment not settled" });
+      invoice.response ||= handle(invoice.method, invoice.path, invoice.body, {});
+      return invoice.response;
+    }
+    if (walletPayments && method === "POST" && ["/api/v1/chat/completions", "/v1/images/generations"].includes(p)) {
+      if (headers.authorization || headers["x-api-key"]) throw new Error("wallet fixture received an unexpected API key");
+      if (String(headers["x-x402"] || "") === "true") {
+        const paymentId = `fixture-invoice-${++invoiceSequence}`;
+        invoices.set(paymentId, { method, path, body, paid: false, response: null });
+        const chat = p.includes("chat/completions");
+        return json(402, { accepts: [{ scheme: "nano", paymentId,
+          payTo: "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet",
+          maxAmountRequired: chat ? "820000000000000000000000000" : "18000000000000000000000000000",
+          maxAmountRequiredUSD: chat ? "0.00041" : "0.009" }] });
+      }
+    }
     if (method === "POST" && p === "/api/v1/chat/completions" && String(headers["x-x402"] || "") === "true") {
       probes++;
       return json(402, { accepts: [{ scheme: "nano", maxAmountRequired: probe.raw, maxAmountRequiredUSD: probe.usd }] });
@@ -407,6 +427,11 @@ export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CAT
   }
   return {
     REPLY,
+    settleWalletInvoice(id) {
+      const invoice = invoices.get(id);
+      if (!invoice || invoice.paid) throw new Error("fixture invoice missing or already settled");
+      invoice.paid = true;
+    },
     runs: () => chatRuns,
     /** XNO/USD rate probes answered (never runs). */
     probes: () => probes,

@@ -71,7 +71,9 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
   const keyed = typeof apiKey === "string" && !!apiKey;
   if (!keyed && typeof payment !== "function") throw new TypeError("createWorkflowRunner needs the operator's NanoGPT API key or an x402 payment callback");
   // A key always wins, as everywhere else in this package.
-  const funding = keyed ? { apiKey } : { payment };
+  // Explicit wallet mode must not inherit a different account's environment
+  // key inside Workflow; that would silently bypass the funding controller.
+  const funding = keyed ? { apiKey } : { apiKey: null, payment };
   if ((fundRun !== null || fundingPair !== null) && (keyed || typeof fundRun !== "function" || typeof fundingPair !== "function")) {
     throw new TypeError("wallet run funding needs both fundRun and fundingPair, without an API key");
   }
