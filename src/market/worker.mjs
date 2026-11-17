@@ -89,6 +89,7 @@ export function createMarketWorker({
   customWorkflows = true, customHandle = null, bidTerms = null, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
   log: rawLog = () => {}, now = Date.now,
   creatorPayments = null,
+  checkFee = null,
 }) {
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createMarketWorker needs a positive budgetUsd");
   if (!customWorkflows && !defaultWorkflow) throw new TypeError("createMarketWorker: a listing without custom workflows needs a default workflow");
@@ -120,6 +121,21 @@ export function createMarketWorker({
   const ok = (fields) => ({ attempts: 0, nextAttemptAt: 0, lastError: null, ...fields });
   /** The budget a job was accepted under (records from before this field existed: the current one). */
   const budgetOf = (rec) => (Number.isFinite(rec.budgetUsd) && rec.budgetUsd > 0 ? rec.budgetUsd : budgetNow);
+  const creatorProceedsOf = rec => {
+    const cap = rec.creator?.proceedsCapUsd;
+    if (cap == null) return budgetOf(rec); // Honor already-accepted legacy terms.
+    if (!Number.isFinite(cap) || cap <= 0 || cap > budgetOf(rec)) throw Error("Invalid accepted creator budget");
+    return cap;
+  };
+  async function feeRefusal(rec, reason) {
+    if (!checkFee) return null;
+    try { await checkFee(); return null; }
+    catch (error) {
+      if (error.code !== "MARKET_FEE_CHANGED") return backoff(rec, error);
+      return set(rec.id, ok({ phase: "declining", decline: { reason, code: error.code,
+        detail: "The marketplace fee changed beyond this listing's pricing allowance. No model was run; your payment is refunded in full." } }));
+    }
+  }
 
   async function progress(id, message, percent) {
     const t = now();
@@ -201,7 +217,10 @@ export function createMarketWorker({
     let creator = null;
     if (r.x402?.author != null && r.x402.author !== "") {
       if (!creatorPayments) return set(rec.id, ok({ phase: "declining", decline: { reason: "rejected", code: "CREATOR_PAYOUT_UNAVAILABLE", detail: "This workflow names a creator, but Nano creator payouts are not configured. Nothing was run; your payment is refunded in full." } }));
-      try { creator = await creatorPayments.prepare(r.x402); }
+      try {
+        const terms = await creatorPayments.prepare(r.x402);
+        creator = terms ? { ...terms, proceedsCapUsd: Math.min(jobBudget, r.pricing.depositUsd) } : null;
+      }
       catch (e) {
         if (e instanceof TypeError) return set(rec.id, ok({ phase: "declining", decline: { reason: "rejected", code: "BAD_AUTHOR", detail: "The workflow's x402.author must be a valid Nano address. Nothing was run; your payment is refunded in full." } }));
         return backoff(rec, new Error("Creator exchange rate is unavailable"));
@@ -236,6 +255,7 @@ export function createMarketWorker({
   }
 
   async function phaseStarting(rec) {
+    const refused = await feeRefusal(rec, "rejected"); if (refused) return refused;
     try {
       const r = await client.start(rec.id);
       return set(rec.id, ok({ phase: "started", startedAt: (r && r.startedAt) || new Date(now()).toISOString() }));
@@ -252,6 +272,7 @@ export function createMarketWorker({
   }
 
   async function phaseStarted(rec, row) {
+    const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
     const jobBudget = budgetOf(rec);
     let prep = prepared.get(rec.id);
     if (!prep) {
@@ -271,7 +292,14 @@ export function createMarketWorker({
     let run;
     try {
       run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
-        fundingId: `market:${rec.id}`, creator: !!rec.creator });
+        fundingId: `market:${rec.id}`, creator: !!rec.creator,
+        onRunComplete(result) {
+          if (!rec.creator || !creatorPayments) return;
+          const empty = result.outputs.length > 0 && result.outputs.every(o => o.kind === "text" && !String(o.text || "").trim());
+          const reserveRaw = empty ? "0" : creatorPayments.amount(rec.creator, { costUsd: result.costUsd, proceedsUsd: creatorProceedsOf(rec) });
+          rec = set(rec.id, { creator: { ...rec.creator, reserveRaw } });
+        },
+      });
     } catch (e) {
       log(`assignment ${short(rec.id)}: run failed (${errText(e)}); handing it back`);
       // Only the provider's own per-step message (runner.mjs marks it buyerMessage) goes to the
@@ -471,7 +499,7 @@ export function createMarketWorker({
       const row = await lookup(rec.id);
       if (row?.assignment?.status === "cancelled") { set(rec.id, { creator: { ...rec.creator, status: "cancelled" } }); return; }
       if (row?.assignment?.status !== "accepted") return;
-      const amountRaw = creatorPayments.amount(rec.creator, { costUsd: rec.run?.costUsd, proceedsUsd: budgetOf(rec) });
+      const amountRaw = creatorPayments.amount(rec.creator, { costUsd: rec.run?.costUsd, proceedsUsd: creatorProceedsOf(rec) });
       rec = set(rec.id, { creator: { ...rec.creator, amountRaw, status: amountRaw === "0" ? "none" : "owed" } });
     }
     if (rec.creator.status === "owed") {

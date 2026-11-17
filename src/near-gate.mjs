@@ -42,7 +42,7 @@ import { knownUsd } from "./usd.mjs";
 import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { rawToXno, authorAddress } from "./wallet.mjs";
-import { runFundingBudget } from "./run-funding.mjs";
+import { nearCreatorLiabilities, nearRunFundingBudget } from "./funding-liabilities.mjs";
 
 const RUN_NOODLE = "run_noodle";
 const FINAL = new Set(["settled", "failed", "rejected"]);
@@ -760,14 +760,17 @@ export function createNearGate({
     let res;
     try {
       if (prepError) throw prepError;
-      const execute = () => registry.callTool(prepared.run, {
+      const execute = async () => {
+        const result = await registry.callTool(prepared.run, {
         ...ctx,
         workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
-      });
-      res = fundRun ? await fundRun(runFundingBudget({
-        id: `near:${q.id}`, budgetUsd: q.depositUsd,
-        pair: { usdNano: parseUsdNano(q.rate.xnoUsd), raw: 10n ** 30n }, creator: !!q.author,
-      }), execute) : await execute();
+        });
+        // Money-only checkpoint before the funding scope releases creator
+        // overhead. No result text is persisted by this handoff.
+        if (fundRun) q = ledger.updateQuote(q.id, { fundingOutcomeReady: true });
+        return result;
+      };
+      res = fundRun ? await fundRun(nearRunFundingBudget(q), execute) : await execute();
     } catch (e) {
       const msg = String((e && e.message) || e);
       const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
@@ -964,7 +967,9 @@ export function createNearGate({
       assets: new Set(["near", ...(usdcEnabled ? ["usdc"] : [])]) };
   }
 
-  return { wrapRegistry, resume, authorPayouts, quote: paymentView, confirmPayment, waitForPayment, waitForUpdate, pendingQuotes, observeTransfer,
+  return { wrapRegistry, resume, authorPayouts,
+    fundingLiabilitiesRaw: context => nearCreatorLiabilities({ quotes: ledger.quotes(), payouts: ledger.payouts() }, context),
+    quote: paymentView, confirmPayment, waitForPayment, waitForUpdate, pendingQuotes, observeTransfer,
     // The private payment URL is also the capability to read this paid result.
     // This getter never runs a workflow, accepts payment or changes settlement.
     result(id) { const q = ledger.getQuote(id); return q && FINAL.has(q.status) ? replay(q) : null; },

@@ -376,7 +376,7 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
-export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CATALOGS, walletPayments = false } = {}) {
+export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CATALOGS, walletPayments = false, walletPaymentSeen = null } = {}) {
   let chatRuns = 0;
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
@@ -389,6 +389,7 @@ export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CAT
     const p = path.replace(/^https?:\/\/[^/]+/, "");
     if (walletPayments && method === "POST" && p.startsWith("/api/x402/complete/")) {
       const invoice = invoices.get(p.split("/").at(-1));
+      if (invoice && !invoice.paid && walletPaymentSeen) invoice.paid = !!await walletPaymentSeen(invoice);
       if (!invoice?.paid) return json(402, { error: "fixture payment not settled" });
       invoice.response ||= handle(invoice.method, invoice.path, invoice.body, {});
       return invoice.response;
@@ -397,11 +398,12 @@ export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CAT
       if (headers.authorization || headers["x-api-key"]) throw new Error("wallet fixture received an unexpected API key");
       if (String(headers["x-x402"] || "") === "true") {
         const paymentId = `fixture-invoice-${++invoiceSequence}`;
-        invoices.set(paymentId, { method, path, body, paid: false, response: null });
         const chat = p.includes("chat/completions");
+        const amountRaw = chat ? "820000000000000000000000000" : "18000000000000000000000000000";
+        invoices.set(paymentId, { paymentId, amountRaw, method, path, body, paid: false, response: null });
         return json(402, { accepts: [{ scheme: "nano", paymentId,
           payTo: "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet",
-          maxAmountRequired: chat ? "820000000000000000000000000" : "18000000000000000000000000000",
+          maxAmountRequired: amountRaw,
           maxAmountRequiredUSD: chat ? "0.00041" : "0.009" }] });
       }
     }

@@ -1,63 +1,68 @@
-# Run funding controller — integration in progress
+# Shared Nano run funding
 
-The controller is implemented and fault-tested; production gates do not yet pass
-funding scopes to it. Do not describe this as enforced production reservations.
-The existing five-minute operational check observes financial readiness but does
-not grant or enforce a run's spending authority.
+Hosted wallet-funded Nano checkout, NEAR/USDC saved and custom workflows, and
+Market workers use one controller on the wallet's block queue. A run reserves
+working capital before inference. Each provider invoice must fit both its
+cumulative USD maximum and its exact raw Nano maximum. Terms come from the paid
+quote or accepted job; caller arguments cannot grant spending authority.
 
 `createNanoWallet` exposes `ops.withFunding(terms, execute)` and
-`ops.fundingStatus()`. Terms are server-created: a stable run id, a maximum USD
-provider prepayment, an exact raw Nano limit, and optional creator overhead.
-`runFundingBudget` derives those limits from the quote's locked oracle pair.
-For authored workflows it keeps the 20% creator markup outside model authority.
-This is a limit on cumulative maximum invoice prepayments, distinct from the
-final model cost used in a customer receipt. Provider refunds fund future runs;
-they never reset the current run's spend limit.
+`ops.fundingStatus()`. Server-created terms contain a stable run identity, a
+maximum USD prepayment, an exact raw Nano limit and optional creator overhead.
+The quote's locked exchange pair determines these limits. Creator markup stays
+outside model authority. Provider maximum prepayments differ from final model
+cost: a provider refund increases future spendable capital and never resets the
+current run's cap. Failed or ambiguous payments still consume authority.
 
-Admission and invoice authorizations use the wallet's existing block queue.
-Concurrent paid nodes inherit one opaque async scope. The wallet captures the
+Concurrent nodes inherit one opaque async scope. The wallet captures the
 enqueuer's scope before entering the queue, so another caller's queue drainer
-cannot substitute its own budget. USD and raw limits are independently enforced;
-invoice prices round up against a budget rounded down. Duplicate invoice ids in
-one run are refused. Failed or ambiguous payments consume authority. Nested runs
-cannot reset a budget, and detached work cannot spend after its scope closes.
-Earlier queued payment attempts finish resolving before unused capital releases.
+cannot substitute its budget. Duplicate invoice identities, nested runs and
+detached work after scope closure are refused. Earlier queued payment attempts
+finish resolving before unused capital releases. Omitted saved-workflow token
+limits are bound consistently with pricing.
 
-`fundingLiabilities` must synchronously return live customer and creator debts in
-raw Nano. Admission rechecks it after waiting on chain reads. All active runs'
-unused capital and creator overhead are also held. Legacy unscoped invoices may
-not consume these reservations; `requireFunding` can reject them entirely once
-every production entry point supplies an approved scope.
+Live ledger owners supply customer refunds, in-flight Nano sends and creator
+debts. Completed work hands its earned creator claim to the ledger before its
+funding scope closes. Disabled Market profiles still contribute their recorded
+debts through read-only disk fallback. Exhausted refund retries remain held
+liabilities requiring reconciliation. Malformed state cannot become zero debt.
+All Nano transfers, including refunds and payouts, preserve other runs' reserved
+capital. A trusted ledger owner may consume its own recorded claim; graph JSON
+cannot provide that authority.
 
-Nano checkout and the NEAR/USDC gate have injectable `fundRun` handoffs. The
-latter covers both saved and custom workflows. Authority comes from the paid
-quote's locked exchange pair, not new caller arguments or a refreshed estimate.
-A denied reservation starts no model and uses the existing full-refund path.
-Replaying a NEAR/USDC receipt creates no new reservation.
+Market revenue is deferred and never counted as cash. New creator terms stay
+within the accepted workflow's priced budget. Workers verify the current public
+platform fee before accepting/starting inference, and bidders verify it before
+bidding. A fee above the pricing allowance refuses new work; an unavailable fee
+check backs off. A completed answer is not reused for a later execution phase.
 
-Market services can pass the same `fundRun` plus a current `fundingPair` reader
-to every listing runner. Workers supply a stable assignment identity and creator
-presence; runners derive authority from that assignment's accepted pricing.
-Creator overhead stays within that budget. No future Market revenue is counted
-by the funding controller. The host startup configuration does not wire these
-handoffs yet.
+The private `out/funding-health.json` snapshot selects aggregate counts and raw
+amounts, is mode 0600, and is excluded from public artifact delivery and sweeping.
+It is telemetry, never financial authority. New quotes pause when it reports an
+unfunded pool or unavailable state. A failed snapshot write also pauses Nano
+authorizations; read-only recovery can resume after storage recovers. The
+five-minute operational check requires fresh enforcement telemetry, tests its
+own atomic balance against liabilities plus reservations, and flags old scopes.
+It also checks both public MCP listeners without executing a workflow.
 
-## Activation requirements still open
+## Verification and remaining recovery limits
 
-- Bind hosted startup's Nano, NEAR/USDC and Market handoffs to the same controller and supply
-  live obligation readers. Preserve queued/in-flight settlement amounts, failed
-  debts and creator payouts across every handoff. A JSON file read alone is
-  insufficient: the Nano gate currently writes snapshots asynchronously.
-- Test actual provider maximum quotes for the supported bounded graph payloads,
-  including audio/video and humanizer fallback calls. A final cost estimate is
-  not proof that upstream maximum prepayments fit a cap.
-- Hold Market creator fees inside the net accepted budget; validate the actual
-  platform fee before starting work. Deferred Market revenue is not spendable.
-- Qualify the durable payment journal and single-writer recovery. This in-memory
-  controller is not a replacement for signed transaction intents, fencing,
-  ambiguous-send reconciliation or recovery backups. An unresolved publish must
-  not become permission to construct another transfer after restart.
-- Extend no-inference observations with the active funding reservations and
-  qualify the complete default and custom workflow matrix before activation.
+Offline tests exercise actual hosted Nano, NEAR and USDC saved/custom calls
+through provider 402 invoices and wallet block publication fixtures. Other fault
+tests cover concurrent budgets, oversize/malformed invoices, debt handoffs,
+creator fees, exhausted refunds, changed/unavailable Market fees, storage
+failure/recovery and private telemetry. These fixtures spend no real money and
+run no inference. Read-only upstream sample quotes also cover the current five
+NEAR demos' text, image, music and video models. Sample prompts are not a proof
+of every possible user input or permanent provider prices.
 
-The audit remains in [operational-reliability.md](operational-reliability.md).
+This controller holds reservations in memory. It does not replace a durable
+signed-intent journal, a fenced single writer, ambiguous-send reconciliation,
+encrypted off-server backups or a restore rehearsal. Completed Nano text
+payments cannot regenerate inference after restart just because result text was
+not retained; their financial receipt remains available. Interrupted unsettled
+work and ambiguous legacy sends still require the recovery audit. Never start a
+second writer or discard state to bypass an unresolved payment.
+
+Track deployment evidence and the remaining service-wide requirements in
+[operational-reliability.md](operational-reliability.md).

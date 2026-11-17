@@ -9,7 +9,7 @@ const balances = liabilities => ({ liabilities, nanoBalanceRaw: (10n ** 31n).toS
 
 test("all unsettled currencies and creator payouts are reserved without double-counting settlement intents", () => {
   const s = snapshots();
-  s.nano.quotes.push({ status: "paid", amountRaw: "10" }, { status: "paid", settled: true, amountRaw: "999" });
+  s.nano.quotes.push({ id: "nano1", status: "paid", amountRaw: "10" }, { id: "nano2", status: "paid", settled: true, amountRaw: "999" });
   s.nano.owed.push({ amountRaw: "20", tries: 0 });
   s.near.quotes.q1 = { id: "q1", status: "settled", settlement: { refundYocto: "100", authorPayout: { amountRaw: "200" } } };
   s.near.refunds.r1 = { paymentId: "q1", amountYocto: "100", status: "signed" };
@@ -35,7 +35,7 @@ test("a crash before refund/payout intent creation cannot erase those liabilitie
 
 test("stuck work, permanently failed refunds and long-pending creator payouts remain visible and reserved", () => {
   const s = snapshots();
-  s.nano.quotes.push({ status: "paid", amountRaw: "10", paidAt: 1 });
+  s.nano.quotes.push({ id: "nano1", status: "paid", amountRaw: "10", paidAt: 1 });
   s.nano.owed.push({ amountRaw: "20", tries: 5, at: NOW + 60_000 });
   s.near.quotes.q = { status: "running", paidYocto: "30", paidAtBlockMs: 1 };
   s.near.refunds.r = { amountYocto: "40", status: "failed_permanent" };

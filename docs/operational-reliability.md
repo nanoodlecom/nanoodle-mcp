@@ -31,12 +31,13 @@ material remaining limits rather than treating a green public GET as proof.
 ## Next runtime safety work
 
 The monitor's balance reservations are observations, not enforced runtime leases.
-An initial [run funding controller](run-funding.md), draft PR #127, now has
-wallet-queue fault tests and injectable Nano checkout, NEAR/USDC saved/custom
-workflow and Market service/runner handoffs. It is not activated by hosted
-startup; live obligation readers, startup binding and the activation matrix are
-still required. Do not claim deployment
-of this source work enforces service-wide reservations.
+The [run funding controller](run-funding.md), PR #127, now binds hosted Nano
+checkout, NEAR/USDC saved/custom workflows and Market runners to one wallet queue.
+Live obligation readers, in-flight transfer/debt handoffs, disabled-profile
+obligations and fresh Market fee guards are implemented. The private runtime
+snapshot and separate Nano discovery probe extend the operational check from
+40 to 42 checks. The source passed 985 offline tests; deployment verification
+is still required before calling these guards live.
 
 The wallet serializes spends and refuses an individual transfer above its balance,
 but several concurrent workflows can still consume funds another run or refund
@@ -72,14 +73,19 @@ existing payment verification, outcomes and refunds remain accessible. Fault tes
 cover frozen/syncing/wrong-chain nodes, cached-head expiry and outage recovery.
 Deployment verification is required before treating these changes as live.
 
-The public Nano MCP ingress also needs its own free discovery probe; current discovery
-probes target the canonical NEAR listener.
+The separate public Nano MCP ingress now has a free discovery probe in addition
+to the canonical NEAR listener. It performs initialization and tool discovery,
+never a quote requiring payment or an inference call.
 
 The upstream [x402 endpoint manifest](https://nano-gpt.com/api/v1/x402/endpoints)
 lists text/image/data contracts. [Its public x402 page](https://nano-gpt.com/x402)
 does not promise stable long-running video support. Our audio/video adapters use
-legacy paths; absence from the manifest is not proof they are broken. Check actual
-unpaid-quote/status behavior before changing their availability, and add safe probes
+legacy paths; absence from the manifest is not proof they are broken. Thirteen
+unpaid quote samples on 2026-11-17 returned valid 402 invoices for the current
+NEAR demos: GLM 5.3 Flash at 96/256/1536/4096 tokens, six image request shapes,
+Mureka 9.5 and both five-second H3 video models. No payment/complete request or
+inference was made. Check actual unpaid-quote/status behavior before changing
+their availability, and add safe probes
 where they can detect breakage without running a model. The library's video polling
 default is unbounded; qualify explicit hosted run deadlines and cancellation.
 

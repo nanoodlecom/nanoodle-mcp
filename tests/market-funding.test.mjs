@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
+import { marketCreatorLiabilities } from "../src/funding-liabilities.mjs";
+import { parseUsdNano } from "../src/usd.mjs";
 import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 
 let nano, previousEnvironmentKey;
@@ -19,10 +21,10 @@ after(async () => {
   else process.env.NANOGPT_API_KEY = previousEnvironmentKey;
 });
 const pair = { usdNano: 500_000_000n, raw: 10n ** 30n };
-async function setup(balance = 10n ** 30n) {
+async function setup(balance = 10n ** 30n, liabilitiesRaw = () => 0n) {
   let funds = balance, tail = Promise.resolve();
   const serial = fn => { const p = tail.then(fn); tail = p.catch(() => {}); return p; };
-  const pool = createRunFunding({ serial, balance: async () => funds });
+  const pool = createRunFunding({ serial, balance: async () => funds, liabilitiesRaw });
   const policies = [], payments = [];
   const runner = createWorkflowRunner({ payment: invoice => {
       const scope = pool.capture();
@@ -59,6 +61,20 @@ test("Market creator markup is held inside the accepted net budget", async () =>
   assert.ok(Number(policy.maxUsd) < w.args.pricing.depositUsd);
   const capRaw = BigInt(Math.round(w.args.pricing.depositUsd * 1e9)) * pair.raw / pair.usdNano;
   assert.ok(policy.maxRaw + policy.overheadRaw <= capRaw + 1n);
+});
+
+test("a completed Market run checkpoints its fee before returning unused model capital", async () => {
+  const record = { id: "test-assignment", phase: "running", creator: { status: "awaiting_acceptance", xnoUsd: "0.5" } };
+  const w = await setup(4n * 10n ** 28n, context => marketCreatorLiabilities([record], context));
+  await w.runner.run({ ...w.args, creator: true, onRunComplete(run) {
+    assert.equal(w.pool.snapshot().activeRuns, 1);
+    const feeUsd = parseUsdNano(run.costUsd) / 5n;
+    record.creator.reserveRaw = (feeUsd * pair.raw / pair.usdNano).toString();
+  } });
+  assert.ok(marketCreatorLiabilities([record]) > 0n);
+  const remaining = 4n * 10n ** 28n - 820000000000000000000000000n - 18000000000000000000000000000n;
+  await assert.rejects(w.pool.run({ id: "new-job", maxUsd: 1, maxRaw: remaining }, () => assert.fail("must not spend creator money")),
+    { code: "FUNDING_INSUFFICIENT" });
 });
 
 test("insufficient pool funds or missing assignment identity never starts Market inference", async () => {

@@ -133,17 +133,17 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
      * @throws on a failed run (message from describeRunFailure; `buyerMessage` is set only
    *   when the message is the provider's per-step errors, safe to show the buyer)
      */
-    async run({ pricing, inputs, outDir, fundingId, creator = false }) {
+    async run({ pricing, inputs, outDir, fundingId, creator = false, onRunComplete = null }) {
+      if (onRunComplete !== null && typeof onRunComplete !== "function") throw new TypeError("onRunComplete must be a function or null");
       const { wf, inputs: resolved } = await prepareRunNoodle(
         { graph: pricing.boundGraph, inputs },
         { ...funding, baseUrl, fetch, log, allowShortLinks: false },
       );
       const { onProgress, notices } = runNotices(wf);
+      const execute = async () => {
       let result;
       try {
-        const execute = () => wf.run(resolved, { onProgress });
-        result = fundRun ? await fundRun(runFundingBudget({ id: fundingId, budgetUsd: pricing.depositUsd,
-          pair: await fundingPair(), creator }), execute) : await execute();
+        result = await wf.run(resolved, { onProgress });
       } catch (e) {
         const d = describeRunFailure(e);
         // describeRunFailure returns a new error only when the engine reported per-step
@@ -171,7 +171,12 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
         }
       }
       const costUsd = typeof result.costUsd === "number" && Number.isFinite(result.costUsd) ? result.costUsd : null;
-      return { costUsd, costExact: result.costExact !== false && costUsd != null, notices: [...notices], outputs };
+      const run = { costUsd, costExact: result.costExact !== false && costUsd != null, notices: [...notices], outputs };
+      if (onRunComplete) await onRunComplete(run);
+      return run;
+      };
+      return fundRun ? await fundRun(runFundingBudget({ id: fundingId, budgetUsd: pricing.depositUsd,
+        pair: await fundingPair(), creator }), execute) : await execute();
     },
   };
 }

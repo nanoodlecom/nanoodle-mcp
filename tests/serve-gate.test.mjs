@@ -117,6 +117,42 @@ const GRAIN = 10n ** 22n; // 1e-8 XNO, the wallet-typeable resolution — mirror
 
 const argOf = (result) => result.structuredContent.x402;
 
+test("live liabilities retain change while a settlement transfer is still in flight", async () => {
+  const chain = fakeChain(); let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const original = chain.ops.transfer;
+  chain.ops.transfer = async (...args) => { await waiting; return original(...args); };
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "done" }], costUsd: 0.01 }) });
+  const gate = makeGate(chain, { registry }), { callTool } = gate.wrapRegistry(registry);
+  const p = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
+  chain.state.receivable["E".repeat(64)] = { amount: p.amountRaw, source: PAYER };
+  await callTool({ name: "poster", arguments: { Text: "a", _payment_id: p.paymentId } });
+  assert.equal(gate.fundingLiabilitiesRaw(), BigInt(p.amountRaw) - 12n * 10n ** 27n);
+  release();
+  await until("the change transfer to settle", () => gate.fundingLiabilitiesRaw() === 0n);
+});
+
+test("an exhausted Nano refund remains held across restart and is not retried or erased", async () => {
+  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-held-debt-")), "state.json");
+  await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [], owed: [{ to: PAYER, amountRaw: "100", describe: "refunded",
+    event: "refund", fields: { paymentId: "old-payment" }, tries: 99 }] }));
+  let t = 1_000_000, attempts = 0;
+  const chain = fakeChain(), registry = fakeRegistry();
+  chain.ops.transfer = async () => { attempts++; throw Error("RPC unavailable"); };
+  const gate = makeGate(chain, { registry, stateFile, now: () => t, pollMs: 5 });
+  const wrapped = gate.wrapRegistry(registry);
+  const p = argOf(await wrapped.callTool({ name: "poster", arguments: { Text: "wake" } }));
+  t += 60_000; await gate.waitForPayment(p.paymentId, 20);
+  const held = await untilState(stateFile, "the exhausted debt to be retained", s => s.owed[0]?.held === true);
+  assert.equal(held.owed[0].tries, 100);
+  assert.equal(gate.fundingLiabilitiesRaw(), 100n);
+  const restarted = makeGate(chain, { registry, stateFile, now: () => t, pollMs: 5 });
+  const next = argOf(await restarted.wrapRegistry(registry).callTool({ name: "poster", arguments: { Text: "another" } }));
+  t += 100_000; await restarted.waitForPayment(next.paymentId, 20);
+  assert.equal(restarted.fundingLiabilitiesRaw(), 100n);
+  assert.equal(attempts, 1);
+});
+
 test("Nano funding handoff uses the paid quote's locked pair and refuses before inference", async () => {
   for (const allowed of [true, false]) {
     const chain = fakeChain(), policies = [];
@@ -955,7 +991,7 @@ test("restore scrubs legacy free-text refund reasons: no upstream error text rea
     "not one byte of the legacy free-text reason may reach the new ledger line");
 });
 
-test("a text output never touches disk: state file holds no output text, restart re-runs (charged once)", async () => {
+test("a text output never touches disk and a settled payment cannot rerun inference after restart", async () => {
   const { mkdtemp, readFile } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -983,18 +1019,20 @@ test("a text output never touches disk: state file holds no output text, restart
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /CROWN-JEWELS/, "no tool output text may be written to disk");
 
-  // Restart: the quote demotes to paid and RE-RUNS on retry — delivered, not charged twice.
+  // A restart retains the financial outcome, not authority for fresh inference.
   const chain2 = fakeChain();
   const registry2 = fakeRegistry({ onCall: async () => textOut });
   const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
   const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
-  assert.ok(!replay.isError && replay.content.some((c) => c.text === SECRET), "retry after restart re-runs and delivers");
-  assert.equal(registry2.callCount(), 1, "the tool re-runs once after a restart (the operator eats the duplicate call)");
+  assert.equal(replay.isError, true);
+  assert.match(replay.content[0].text, /result text was not retained/);
+  assert.doesNotMatch(replay.content[0].text, /CROWN-JEWELS/);
+  assert.equal(registry2.callCount(), 0, "settled history is never permission to buy another model call");
   await new Promise((r) => setTimeout(r, 60));
   // Not charged twice: no fresh payment was demanded, and change/author are NOT paid a second time.
   assert.ok(!replay.structuredContent, "no new payment-required response — the original deposit still counts");
   assert.equal(chain2.state.transfers.filter((t) => t.describe === "change:").length, 0,
-    "the re-run must not pay change a second time");
+    "the lost result must not pay change a second time");
 });
 
 test("a media-URL result persists and replays after a restart (pointers are safe at rest)", async () => {
@@ -1153,7 +1191,7 @@ test("a redacted error survives a SECOND restart: the refund-status sentence is 
   assert.doesNotMatch(replay.content[0].text, /PROMPT-LEAK/);
 });
 
-test("a re-run after restart reports the FIRST run's settled cost and change, not the second run's", async () => {
+test("a lost text result reports the original settled cost and change without running again", async () => {
   const { mkdtemp } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -1172,14 +1210,12 @@ test("a re-run after restart reports the FIRST run's settled cost and change, no
   await untilState(stateFile, "the first run's settlement to persist",
     (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt; });
 
-  // Restart: the SECOND run reports NO cost. Money doesn't move again, and the
-  // receipt must still describe the first run's settlement — not claim "whole
-  // deposit returned" off the second run's missing cost.
+  // The attempted replacement would report no cost; it must never execute.
   const chain2 = fakeChain();
   const registry2 = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: SECRET }], textOutput: true }) }); // no costUsd
   const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
   const replay = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
-  assert.equal(registry2.callCount(), 1, "the text quote re-runs after restart");
+  assert.equal(registry2.callCount(), 0, "completed text work is not regenerated");
   const receipt = replay.content.at(-1).text;
   assert.match(receipt, /actual cost \$0\.02/, "receipt reports the FIRST run's cost");
   assert.match(receipt, /change returned to your wallet/, "receipt reports the FIRST run's change");

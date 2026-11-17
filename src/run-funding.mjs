@@ -12,6 +12,7 @@ function raw(value, positive = false) {
   }
   return BigInt(value);
 }
+export { raw as fundingRaw };
 function usd(value, roundUp = false) {
   if ((typeof value !== "number" && typeof value !== "string") || String(value).length > 128
     || !(knownUsd(value) > 0)) throw new FundingError("FUNDING_INVALID", "Funding requires a positive finite USD amount");
@@ -47,8 +48,12 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     || typeof requireScope !== "boolean") throw new TypeError("run funding needs a serial wallet queue, balance and liability readers");
   const context = new AsyncLocalStorage();
   const active = new Map();
-  const held = () => [...active.values()].reduce((n, s) => n + s.maxRaw - s.drawnRaw + s.overheadRaw, 0n);
-  const obligations = () => raw(liabilitiesRaw());
+  const held = () => [...active.values()].reduce((n, s) => n + s.maxRaw - s.drawnRaw + s.overheadRaw - s.overheadDrawnRaw, 0n);
+  const obligations = (candidate, readOnly = false) => {
+    const overheadRawByRun = new Map([...active.values()].map(s => [s.id, s.overheadRaw - s.overheadDrawnRaw]));
+    if (candidate) overheadRawByRun.set(candidate.id, candidate.overheadRaw);
+    return raw(liabilitiesRaw({ overheadRawByRun, readOnly }));
+  };
   const open = scope => {
     if (!scope || active.get(scope.id) !== scope || scope.closed) {
       throw new FundingError("FUNDING_CLOSED", "Provider payment has no open approved run budget");
@@ -61,14 +66,14 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     }
     if (context.getStore()) throw new FundingError("FUNDING_NESTED", "A nested run cannot reset an existing funding budget");
     const scope = { id, maxUsd: usd(maxUsd), maxRaw: raw(maxRaw, true), overheadRaw: raw(overheadRaw),
-      drawnUsd: 0n, drawnRaw: 0n, invoices: new Set(), closed: false };
+      drawnUsd: 0n, drawnRaw: 0n, overheadDrawnRaw: 0n, invoices: new Set(), closed: false, startedAt: Date.now() };
     await serial(async () => {
       if (active.has(id)) throw new FundingError("FUNDING_DUPLICATE", "This run already has a funding reservation");
-      const required = obligations() + held() + scope.maxRaw + scope.overheadRaw;
+      const required = obligations(scope) + held() + scope.maxRaw + scope.overheadRaw;
       const available = raw(await balance(required));
       // Obligations can increase during an RPC/work await. Re-read them before
       // admitting any model work; no other reservation mutates outside `serial`.
-      if (available < obligations() + held() + scope.maxRaw + scope.overheadRaw) {
+      if (available < obligations(scope) + held() + scope.maxRaw + scope.overheadRaw) {
         throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot cover this run after reservations and obligations");
       }
       active.set(id, scope);
@@ -108,8 +113,35 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     scope.drawnRaw += amount;
   }
 
+  function requiredForPayment(scope, amountRaw) {
+    if (scope) open(scope);
+    else if (requireScope) throw new FundingError("FUNDING_REQUIRED", "Provider payment requires an approved run budget");
+    return obligations() + held() + (scope ? 0n : raw(amountRaw, true));
+  }
+  function requiredForTransfer({ amountRaw, liabilityRaw = 0n }) {
+    const amount = raw(amountRaw, true), ownClaim = raw(liabilityRaw);
+    const reserved = obligations() + held();
+    if (ownClaim > amount || ownClaim > reserved) throw new FundingError("FUNDING_INVALID", "Transfer exceeds its recorded liability");
+    return reserved + amount - ownClaim;
+  }
+  // `liabilityRaw` is supplied by the trusted ledger owners only, never by
+  // workflow JSON. Refund/payout callers record that debt before calling us.
+  function authorizeTransfer(terms, balanceRaw) {
+    if (raw(balanceRaw) < requiredForTransfer(terms)) {
+      throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot send after reservations and obligations");
+    }
+    const scope = active.get(terms.fundingRunId);
+    if (scope) {
+      const claim = raw(terms.liabilityRaw ?? 0n);
+      const remaining = scope.overheadRaw - scope.overheadDrawnRaw;
+      scope.overheadDrawnRaw += claim < remaining ? claim : remaining;
+    }
+  }
+
   return {
-    run, capture: () => context.getStore() || null, authorize,
+    run, capture: () => context.getStore() || null, authorize, requiredForPayment, requiredForTransfer, authorizeTransfer,
     snapshot: () => ({ activeRuns: active.size, reservedRaw: held().toString() }),
+    report: () => ({ activeRuns: active.size, reservedRaw: held().toString(), liabilitiesRaw: obligations(null, true).toString(),
+      oldestStartedAt: active.size ? Math.min(...[...active.values()].map(s => s.startedAt)) : null, enforced: requireScope }),
   };
 }

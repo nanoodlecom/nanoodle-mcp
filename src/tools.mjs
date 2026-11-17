@@ -23,7 +23,7 @@ import { knownUsd } from "./usd.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
-import { readGraphArgs, checkGraphSafety, priceGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
+import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
 
 /**
  * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
@@ -1276,6 +1276,10 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
       // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
       let runWf = tool.wf, hf = null;
+      if (ctx?.paidFunding === true && !tool.humanize) {
+        const bound = bindPaidGraph(tool.wf.graph, registry.catalogs || tool.wf.catalog);
+        runWf = new Workflow(bound.graph, { apiKey: apiKey ?? null, payment, baseUrl, quiet: true, catalog: tool.wf.catalog });
+      }
       if (tool.humanize) {
         const args = params.arguments || {};
         const opts = humanizeCallOpts(args);
