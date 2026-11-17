@@ -95,6 +95,19 @@ test("a newer confirmed head must prove ancestry back to the captured live floor
   assert.equal(read(join(w.options.destination, "migration-receipt.json")).initialHead.hash, next.hash);
 });
 
+test("RPC display/provider fields never enter receipts, while a changed signed field still fails", async t => {
+  const good = fixture(t), record = good.blocks.get(good.anchor.hash);
+  record.contents = { ...record.contents, balance_nano: "0", apiKey: "PRIVATE_RPC_FIELD", prompt: "PRIVATE_RPC_FIELD" };
+  assert.equal((await preparePaymentMigration(good.options)).ok, true);
+  const receipt = read(join(good.options.destination, "migration-receipt.json"));
+  assert.equal(receipt.initialHead.balance, "1000");
+  assert.doesNotMatch(JSON.stringify(receipt), /balance_nano|apiKey|PRIVATE_RPC_FIELD|prompt/);
+  const bad = fixture(t), altered = bad.blocks.get(bad.anchor.hash);
+  altered.contents = { ...altered.contents, balance: "999", balance_nano: "1000" };
+  await assert.rejects(preparePaymentMigration(bad.options));
+  assert.equal(existsSync(bad.options.destination), false);
+});
+
 test("a higher signed head on a different branch cannot replace the captured history", async t => {
   const w = fixture(t), fork = block("D".repeat(64)), next = block(fork.hash, "900");
   w.current = next; w.height = 11;

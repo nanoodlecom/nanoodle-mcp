@@ -84,6 +84,8 @@ test("the immutable receipt cannot store prompts, keys or arbitrary provider fie
     { ...receipt(), secretKey: "NEVER_STORE_THIS" },
     { ...receipt(), initialHead: { ...receipt().initialHead, prompt: "NEVER_STORE_THIS" } },
     { ...receipt(), initialHead: { ...receipt().initialHead, block: { ...initial.block, apiKey: "NEVER_STORE_THIS" } } },
+    { ...receipt(), initialHead: { ...receipt().initialHead, block: { ...initial.block, work: "NEVER_STORE_THIS" } } },
+    { ...receipt(), initialHead: { ...receipt().initialHead, block: { ...initial.block, link_as_account: "NEVER_STORE_THIS" } } },
   ]) assert.throws(() => store.initializeMigration(value), { code: "RECOVERY_MIGRATION_INVALID" });
   assert.equal(store.load(`migration:${account}`).data, null);
   store.initializeMigration(receipt()); store.close();

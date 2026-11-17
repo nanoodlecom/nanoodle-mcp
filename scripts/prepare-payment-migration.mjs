@@ -16,7 +16,7 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { createChargeGate } from "../src/gate.mjs";
 import { paymentLiabilities } from "../src/operational-state.mjs";
 import { openRecoveryStore } from "../src/payments/recovery-store.mjs";
-import { receiptDigest, validateInitialHead, validateMigrationReceipt } from "../src/payments/migration-receipt.mjs";
+import { receiptDigest, initialHeadFromRpc, validateMigrationReceipt } from "../src/payments/migration-receipt.mjs";
 import { inspectRecoverySet } from "./inspect-payment-migration.mjs";
 
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -139,16 +139,14 @@ export async function preparePaymentMigration({ policyFile, destination, rpcUrls
     for (let walked = 0n; walked <= distance; walked++) {
       const info = await pool.block({ action: "block_info", hash: id }); live();
       need([true, "true"].includes(info.confirmed) && info.height === height.toString(), "MIGRATION_ANCESTRY_INVALID");
-      let block = info.contents; if (typeof block === "string") block = JSON.parse(block);
-      const head = { hash: id, blockCount: height.toString(), balance: block?.balance, representative: block?.representative, block };
-      validateInitialHead(p.nanoAddress, head);
+      const head = initialHeadFromRpc(p.nanoAddress, { hash: id, blockCount: height.toString(), block: info.contents });
       if (!initialHead) {
         need(head.balance === view.confirmed_balance && head.representative === view.confirmed_representative,
           "MIGRATION_ANCESTRY_INVALID"); initialHead = head;
       }
       if (height === BigInt(floor.head.blockCount)) need(id === floor.head.hash, "MIGRATION_ANCESTRY_INVALID");
       if (height === BigInt(floor.confirmed.blockCount)) need(id === floor.confirmed.hash, "MIGRATION_ANCESTRY_INVALID");
-      id = block.previous; height--;
+      id = head.block.previous; height--;
     }
     const fingerprints = sources.map(({ scope, sha256 }) => ({ scope, sha256 }));
     const receipt = { v: 1, schema: 3, account: p.nanoAddress, networkGenesis: NANO_GENESIS, createdAt: now(),

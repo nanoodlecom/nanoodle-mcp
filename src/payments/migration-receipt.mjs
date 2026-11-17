@@ -19,8 +19,22 @@ export function validateInitialHead(account, head) {
     const b = head.block;
     if (!keys(b, ["type", "account", "previous", "representative", "balance", "link", "signature", "work"], ["link_as_account"])
       || b.type !== "state" || b.account !== account || b.balance !== head.balance || b.representative !== head.representative
+      || !hash(b.previous) || !hash(b.link) || typeof b.work !== "string" || !/^[A-Fa-f0-9]{16}$/.test(b.work)
+      || typeof b.signature !== "string" || !/^[A-Fa-f0-9]{128}$/.test(b.signature)
+      || Object.hasOwn(b, "link_as_account") && !checkAddress(b.link_as_account)
       || hashBlock(b) !== head.hash || !verifyBlock({ hash: head.hash, signature: b.signature, publicKey: derivePublicKey(account) })) fail();
     return head;
+  } catch { fail(); }
+}
+
+/** RPCs may attach unsigned display/provider fields. Retain only the state
+ * block's signed core and work; verify that core before storing any receipt. */
+export function initialHeadFromRpc(account, { hash, blockCount, block }) {
+  try {
+    if (typeof block === "string") block = JSON.parse(block);
+    const selected = Object.fromEntries(["type", "account", "previous", "representative", "balance", "link", "signature", "work"]
+      .map(key => [key, block?.[key]]));
+    return validateInitialHead(account, { hash, blockCount, balance: selected.balance, representative: selected.representative, block: selected });
   } catch { fail(); }
 }
 
