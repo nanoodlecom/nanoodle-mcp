@@ -33,7 +33,7 @@ import { writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno, authorAddress } from "./wallet.mjs";
-import { knownUsd } from "./usd.mjs";
+import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
 
@@ -77,28 +77,7 @@ const GRAIN = 10n ** 22n;
  * (R raw costs U nano-dollars), and conversions are BigInt ratio arithmetic
  * with an explicit floor/ceil.
  */
-export function parseUsdNano(v) {
-  let s;
-  if (typeof v === "number") {
-    if (!Number.isFinite(v) || v < 0) throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
-    s = String(v);
-  } else if (typeof v === "string") {
-    s = v.trim();
-  } else {
-    throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
-  }
-  // Same numeric text knownUsd accepts: optional sign, a leading dot, a
-  // trailing dot. The digits stay in the string so the nano conversion is exact.
-  s = s.replace(/^([+-])?\./, (_, sign) => (sign === "-" ? "-0." : "0."));
-  if (/^\d+\.$/.test(s)) s = s.slice(0, -1);
-  if (s.startsWith("+")) s = s.slice(1);
-  const m = s.match(/^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
-  if (!m || m[1] === "-") throw new Error(`unusable USD amount: ${JSON.stringify(v)}`);
-  const digits = m[2] + (m[3] || "");
-  const exp = (m[4] ? parseInt(m[4], 10) : 0) - (m[3] ? m[3].length : 0) + 9; // scale to nano-USD
-  if (exp >= 0) return BigInt(digits) * 10n ** BigInt(exp);
-  return BigInt(digits.slice(0, digits.length + exp) || "0"); // truncate below 1e-9 USD
-}
+export { parseUsdNano } from "./usd.mjs";
 
 /** USD → raw via the exact oracle pair {usdNano, raw}: raw = usd·R/U, floor or ceil. */
 function usdToRaw(usdValue, pair, mode = "floor") {

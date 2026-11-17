@@ -661,6 +661,14 @@ test("parseUsdNano is string-exact, handles exponents, truncates below 1e-9 USD"
   assert.equal(parseUsdNano("1."), parseUsdNano(1));
   assert.throws(() => parseUsdNano("-.5"));
   assert.equal(parseUsdNano("0.0000000001"), 0n); // 1e-10 USD truncates
+  // A negative slice end used to wrap back through the significand and turn
+  // a sub-nanodollar scientific price into a material customer charge.
+  assert.equal(parseUsdNano("1234567890e-20"), 0n);
+  assert.equal(parseUsdNano(1.23456789e-11), 0n);
+  assert.equal(parseUsdNano("1.234567890123456789e-20"), 0n);
+  assert.equal(parseUsdNano("0.0000000001", { roundUp: true }), 1n);
+  assert.equal(parseUsdNano("0", { roundUp: true }), 0n);
+  assert.equal(parseUsdNano("1.0000000001", { roundUp: true }), 1_000_000_001n);
   assert.throws(() => parseUsdNano("-1"));
   assert.throws(() => parseUsdNano("abc"));
   assert.throws(() => parseUsdNano(""));
