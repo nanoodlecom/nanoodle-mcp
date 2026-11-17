@@ -18,7 +18,7 @@
  */
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -261,8 +261,12 @@ export async function runSimulation({ print = console.log } = {}) {
     const q4 = (await mcp.call("run_noodle", args4)).structuredContent.payment;
     // Advance both clocks past expiry. A future-dated chain head against an
     // unchanged server clock is an unhealthy node, not a healthy late payment.
-    clockOffset = Date.parse(q4.expiresAt) + 60_000 - Date.now();
-    await writeFile(clockOffsetFile, String(clockOffset));
+    const nextClockOffset = Date.parse(q4.expiresAt) + 60_000 - Date.now();
+    // The child reads this on every Date.now(), including background callbacks.
+    // Never expose writeFile's truncate/write window as an empty JSON clock.
+    await writeFile(clockOffsetFile + ".next", String(nextClockOffset));
+    await rename(clockOffsetFile + ".next", clockOffsetFile);
+    clockOffset = nextClockOffset;
     const tx4 = chain.transfer(PAYER, MERCHANT, BigInt(q4.amountYocto), { blockTimeMs: Date.parse(q4.expiresAt) + 60_000 });
     ledger.push({ kind: "deposit", yocto: BigInt(q4.amountYocto) });
     const late = await mcp.call("run_noodle", { ...args4, _payment_id: q4.paymentId, _payment_tx: tx4, _payment_sender: PAYER });
