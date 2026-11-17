@@ -11,7 +11,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock } from "nanocurrency";
+import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock, createBlock } from "nanocurrency";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -116,7 +116,7 @@ function fakeRpc(overrides = {}) {
     }
     if (body.action === "process") {
       state.processed.push(body);
-      state.frontier = "C".repeat(63) + state.processed.length; // advance the chain
+      state.frontier = hashBlock(body.block);
       state.balance = body.block.balance;
       return reply({ hash: state.frontier });
     }
@@ -128,6 +128,55 @@ function fakeRpc(overrides = {}) {
 const invoice = (extra = {}) => ({
   scheme: "nano", paymentId: "pay_1", payTo: PAY_TO,
   amountRaw: AMOUNT, amountUsd: 0.0012, ...extra,
+});
+
+test("wallet rejects malformed invoices and cap bypasses before touching funds", async () => {
+  const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, maxUsd: 1 });
+  for (const extra of [{ amountRaw: "0" }, { amountRaw: "-1" }, { amountRaw: "9".repeat(40) },
+    { amountUsd: NaN }, { amountUsd: Infinity }, { amountUsd: -1 }, { amountUsd: "0.01" }, { amountUsd: undefined }, { amountUsd: 0 }]) {
+    await assert.rejects(wallet.payment(invoice(extra)));
+  }
+  assert.equal(mock.state.infoCalls, 0); assert.equal(mock.state.processed.length, 0);
+  await wallet.payment(invoice({ paymentId: "valid-after-rejections" }));
+  assert.equal(mock.state.processed.length, 1, "refusals do not poison the wallet queue");
+  for (const maxUsd of [NaN, Infinity, 0, -1]) assert.throws(() => createNanoWallet({ secretKey: SECRET, maxUsd }));
+});
+
+test("a stalled Nano read times out and uses the next node", async () => {
+  const mock = fakeRpc(); let stalled = 0;
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "https://stalled.example,https://healthy.example", rpcTimeoutMs: 30,
+    fetch: async (url, init) => {
+      if (url.includes("stalled") && JSON.parse(init.body).action === "account_info") {
+        stalled++;
+        return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+      }
+      return mock.fetch(url, init);
+    },
+  });
+  await wallet.payment(invoice());
+  assert.equal(stalled, 1); assert.equal(mock.state.processed.length, 1);
+});
+
+test("a Nano response with a stalled body also has a deadline", async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.write("{"); });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: `http://127.0.0.1:${server.address().port}`, rpcTimeoutMs: 50 });
+    await assert.rejects(wallet.ops.rpc({ action: "account_info", account: ADDRESS }), /unreachable/);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test("a publish response must identify the exact block; invalid account state cannot fund a payment", async () => {
+  const prepared = createBlock(SECRET, { work: WORK, previous: FRONTIER, representative: ADDRESS, balance: "1", link: PAY_TO });
+  prepared.block.account = ADDRESS;
+  for (const response of [{}, { hash: "F".repeat(64) }]) {
+    const mock = fakeRpc({ process: (_body, _state, reply) => reply(response) });
+    const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch });
+    await assert.rejects(wallet.ops.rpc({ action: "process", block: prepared.block }), /matching block hash/);
+  }
+  const mock = fakeRpc({ account_info: (_body, _state, reply) => reply({ frontier: "not-a-hash", balance: "123", representative: ADDRESS }) });
+  await assert.rejects(createNanoWallet({ secretKey: SECRET, fetch: mock.fetch }).payment(invoice()), /invalid wallet state/);
+  assert.equal(mock.state.processed.length, 0);
 });
 
 test("resolveWalletKey: private key wins, seed derives account 0, junk is refused", () => {
@@ -504,7 +553,7 @@ test("paySend: a refund can cover an invoice the bare balance cannot", async () 
   const rpc = fakeRpc({
     account_info: (_b, state, reply) => { state.infoCalls++; return reply({ frontier: state.frontier, balance: "1", representative: ADDRESS }); },
     receivable: (_b, state, reply) => reply({ blocks: state.processed.length ? "" : { ["E".repeat(64)]: BALANCE } }),
-    process: (body, state, reply) => { state.processed.push(body); state.frontier = "C".repeat(63) + state.processed.length; return reply({ hash: state.frontier }); },
+    process: (body, state, reply) => { state.processed.push(body); state.frontier = hashBlock(body.block); return reply({ hash: state.frontier }); },
   });
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
   await wallet.payment(invoice());
@@ -518,7 +567,7 @@ test("paySend: an ambiguous publish failure drops the cache — the next send re
       // first publish dies with a definite-looking but ambiguous node error
       if (++processCalls === 1) return reply({ error: "Gap source block" });
       state.processed.push(body);
-      state.frontier = "C".repeat(63) + state.processed.length;
+      state.frontier = hashBlock(body.block);
       return reply({ hash: state.frontier });
     },
   });
@@ -536,7 +585,7 @@ test("paySend: an HTTP-5xx from the RPC proxy verifies and republishes instead o
       processCalls++;
       if (processCalls === 1) return { ok: false, status: 502, text: async () => "bad gateway" }; // proxy died; node never saw it
       state.processed.push(body);
-      return reply({ hash: "C".repeat(64) });
+      return reply({ hash: hashBlock(body.block) });
     },
   });
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
@@ -566,7 +615,7 @@ test("paySend: a bounced send refetches the frontier and retries exactly once", 
       processCalls++;
       if (processCalls === 1) return reply({ error: "Fork" });
       state.processed.push(body);
-      return reply({ hash: "C".repeat(64) });
+      return reply({ hash: hashBlock(body.block) });
     },
   });
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
@@ -589,7 +638,7 @@ test("paySend: a lost process response republishes the identical block", async (
     process: (body, state, reply) => {
       if (dropped++ === 0) throw new Error("fetch failed"); // transport dies, node never saw it
       state.processed.push(body);
-      return reply({ hash: "C".repeat(64) });
+      return reply({ hash: hashBlock(body.block) });
     },
   });
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: rpc.fetch });
@@ -605,7 +654,7 @@ test("paySend: a lost response for a block that DID land is not republished", as
     process: (body, state, reply) => {
       if (!sent) { sent = body.block; throw new Error("fetch failed"); } // accepted, response lost
       state.processed.push(body); // a second publish would land here
-      return reply({ hash: "C".repeat(64) });
+      return reply({ hash: hashBlock(body.block) });
     },
     account_info: (_b, _s, reply) => reply({
       frontier: sent
@@ -651,7 +700,7 @@ test("failover: an ambiguous 5xx on publish is verified, never cross-node republ
     process: (body, state, reply) => {
       if (!sent) { sent = body.block; return { ok: false, status: 502, text: async () => "bad gateway" }; }
       state.processed.push(body);
-      return reply({ hash: "C".repeat(64) });
+      return reply({ hash: hashBlock(body.block) });
     },
     account_info: (_b, _s, reply) => reply({
       frontier: sent
@@ -691,7 +740,7 @@ before(async () => {
     const send = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
     if (body.action === "account_info") return send({ frontier: FRONTIER, balance: BALANCE, representative: ADDRESS });
     if (body.action === "work_generate") return send({ work: WORK });
-    if (body.action === "process") { processed.push(body.block); return send({ hash: "D".repeat(64) }); }
+    if (body.action === "process") { processed.push(body.block); return send({ hash: hashBlock(body.block) }); }
     send({ error: "unknown action" });
   });
   await new Promise((r) => nanoRpc.listen(0, "127.0.0.1", r));
