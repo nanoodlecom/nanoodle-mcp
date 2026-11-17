@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
@@ -9,6 +9,7 @@ import { deriveAddress, derivePublicKey, deriveSecretKey, hashBlock } from "nano
 import { freePort, mcpClient } from "../scripts/near-simulate.mjs";
 import { loadTools, editorShareUrl } from "../src/tools.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createAuthorPayouts, authorPayoutRaw } from "../src/author-payouts.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { createNearRpc, openNearLedger, createRefunder, parseNearSecretKey, parseNearToYocto } from "../src/near/index.mjs";
@@ -214,4 +215,68 @@ test("the real server pays saved and custom creators from one Nano queue when an
     if (child && child.exitCode === null) { child.kill("SIGKILL"); await new Promise(r => child.once("exit", r)); }
     node.closeAllConnections?.(); await new Promise(r => node.close(r)); await chain.close(); await provider.close();
   }
+});
+
+async function maintenancePayoutWorld(t, transferOnce) {
+  const dir = await mkdtemp(join(tmpdir(), "creator-maintenance-")), control = join(dir, "maintenance.json");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ledger = openNearLedger({ file: join(dir, "ledger.json"), network: "testnet", merchant: M });
+  const maintenance = createMaintenanceBarrier({ file: control, ownerUid: process.getuid() });
+  const payouts = createAuthorPayouts({ ledger, maintenance, ops: { transferOnce }, schedule: () => null });
+  return { ledger, maintenance, payouts,
+    pause: () => writeFile(control, JSON.stringify({ v: 1, token: "d".repeat(32), operation: "backup", revision: null }), { mode: 0o600 }),
+    unpause: () => rm(control) };
+}
+
+test("creator payout publication and queued passes remain counted through pause and durable completion", { timeout: 5000 }, async t => {
+  let entered, release, sends = 0;
+  const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+  t.after(() => release());
+  const w = await maintenancePayoutWorld(t, async (_to, _amount, { onPrepared }) => {
+    const hash = "a".repeat(64); onPrepared({ hash }); entered(); await hold; sends++; return hash;
+  });
+  w.payouts.enqueue({ paymentId: "creator-drain", to: AUTHOR, amountRaw: "100" });
+  const first = w.payouts.tick(), queued = w.payouts.tick();
+  await reached; await w.pause();
+  assert.equal(w.maintenance.snapshot().counts.wallet, 2);
+  await assert.rejects(w.payouts.tick({ force: true }), { code: "SERVICE_DRAINING" });
+  assert.throws(() => w.payouts.enqueue({ paymentId: "creator-late", to: AUTHOR, amountRaw: "100" }), { code: "SERVICE_DRAINING" });
+  assert.equal(w.ledger.getPayout("creator-late"), null);
+  assert.equal(w.ledger.getPayout("creator-drain").status, "signed");
+  release(); await Promise.all([first, queued]);
+  assert.equal(sends, 1);
+  assert.equal(w.ledger.getPayout("creator-drain").status, "sent");
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+});
+
+test("paused creator retries retain the signed intent and attempt count across lost publication responses", async t => {
+  let calls = 0; const hashes = [], preparedHash = "b".repeat(64);
+  const w = await maintenancePayoutWorld(t, async (_to, _amount, { prepared, onPrepared }) => {
+    if (!prepared) { prepared = { hash: preparedHash }; onPrepared(prepared); }
+    hashes.push(prepared.hash); if (++calls === 1) throw Error("publish response was lost");
+    return prepared.hash;
+  });
+  w.payouts.enqueue({ paymentId: "creator-retry", to: AUTHOR, amountRaw: "100" });
+  await w.payouts.tick();
+  const before = w.ledger.getPayout("creator-retry");
+  assert.equal(before.status, "signed"); assert.equal(before.attempts, 1);
+  await w.pause(); await assert.rejects(w.payouts.tick({ force: true }), { code: "SERVICE_DRAINING" });
+  assert.deepEqual(w.ledger.getPayout("creator-retry"), before);
+  assert.equal(calls, 1);
+  await w.unpause(); await w.payouts.tick({ force: true });
+  assert.deepEqual(hashes, [preparedHash, preparedHash]);
+  assert.equal(w.ledger.getPayout("creator-retry").status, "sent");
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+});
+
+test("an accepted request may persist and send its creator payout after closing admission", async t => {
+  let calls = 0;
+  const w = await maintenancePayoutWorld(t, async (_to, _amount, { onPrepared }) => { calls++; const hash = "c".repeat(64); onPrepared({ hash }); return hash; });
+  await w.maintenance.run(async () => {
+    await w.pause();
+    w.payouts.enqueue({ paymentId: "accepted-creator", to: AUTHOR, amountRaw: "100" });
+    await w.payouts.tick();
+  });
+  assert.equal(calls, 1); assert.equal(w.ledger.getPayout("accepted-creator").status, "sent");
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
 });

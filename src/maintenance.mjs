@@ -57,12 +57,18 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
     finally { if (fd !== undefined) closeSync(fd); }
   }
 
-  function capture(execute, kind = "request") {
-    if (typeof execute !== "function" || !KINDS.includes(kind)) throw new TypeError("Invalid service operation");
+  // Synchronous ledger writes finish in the same event-loop turn. They need
+  // an admission check, without turning a synchronous intent API into a promise.
+  function assertAdmitted() {
     const parent = context.getStore();
     if (!(parent && active.has(parent) && !parent.closed) && !control().accepting) {
       throw new MaintenanceError("SERVICE_DRAINING", "New work is paused for maintenance; no work was started");
     }
+  }
+
+  function capture(execute, kind = "request") {
+    if (typeof execute !== "function" || !KINDS.includes(kind)) throw new TypeError("Invalid service operation");
+    assertAdmitted();
     // Register synchronously, before returning a callback or yielding. A wallet
     // task waiting in a queue is already in flight for drain purposes.
     const scope = { kind, startedAt: now(), started: false, closed: false };
@@ -84,6 +90,7 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
   return {
     accepting: () => control().accepting,
     capture,
+    assertAdmitted,
     async run(execute, kind = "request") { return capture(execute, kind)(); },
     snapshot() {
       const counts = Object.fromEntries(KINDS.map(kind => [kind, 0]));

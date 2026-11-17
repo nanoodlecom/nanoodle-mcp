@@ -124,3 +124,12 @@ test("a symlinked ancestor never grants maintenance admission", t => {
   assert.equal(redirected.accepting(), false);
   assert.throws(() => createMaintenanceBarrier({ file: w.dir + "/child/../flag.json" }), TypeError);
 });
+
+test("synchronous admission checks grant no detached scope and allow an accepted parent's ledger writes", async t => {
+  const w = world(t);
+  w.barrier.assertAdmitted();
+  assert.equal(w.barrier.snapshot().activeOperations, 0);
+  await w.barrier.run(async () => { w.put(); w.barrier.assertAdmitted(); });
+  assert.throws(() => w.barrier.assertAdmitted(), { code: "SERVICE_DRAINING" });
+  assert.equal(w.barrier.snapshot().activeOperations, 0);
+});

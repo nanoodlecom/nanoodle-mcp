@@ -5,13 +5,14 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { createHash, createPublicKey, verify } from "node:crypto";
 import { createNearRpc } from "../src/near/rpc.mjs";
 import { openNearLedger } from "../src/near/ledger.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createRefunder } from "../src/near/refunds.mjs";
 import { parseNearSecretKey } from "../src/near/keys.mjs";
 import { base58Encode, base58Decode } from "../src/near/base58.mjs";
@@ -483,5 +484,74 @@ test("an already signed refund still reconciles with identical bytes when fresh 
     assert.equal(debt.status, "pending"); advance(31_000); await refunder.tick();
     assert.equal(ledger.getRefund(debt.refundId).status, "sent"); assert.equal(checks, 1);
     assert.deepEqual(log.sends, [log.sends[0], log.sends[0]]);
+  });
+});
+
+async function maintenanceControl(file) {
+  const control = join(dirname(file), "maintenance.json");
+  return { maintenance: createMaintenanceBarrier({ file: control, ownerUid: process.getuid() }),
+    pause: () => writeFile(control, JSON.stringify({ v: 1, token: "c".repeat(32), operation: "backup", revision: null }), { mode: 0o600 }),
+    unpause: () => rm(control) };
+}
+
+test("maintenance counts queued NEAR refunds until FINAL and durable completion without consuming new nonces", { timeout: 5000 }, async t => {
+  await withLedger(async ({ file, open }) => {
+    const w = await maintenanceControl(file), ledger = open(); let entered, release;
+    const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+    t.after(() => release());
+    const chain = mockChain({ onSend: async (_tx, n) => { if (n === 1) { entered(); await hold; } return { result: DONE }; } });
+    const { refunder } = make(chain.rpc, ledger, { maintenance: w.maintenance });
+    const first = refunder.refund({ paymentId: "drain-first", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    const second = refunder.refund({ paymentId: "drain-queued", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    await reached; await w.pause();
+    assert.equal(w.maintenance.snapshot().counts.wallet, 2);
+    await assert.rejects(refunder.refund({ paymentId: "drain-late", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" }), { code: "SERVICE_DRAINING" });
+    assert.equal(ledger.refundForPayment("drain-late"), null);
+    assert.equal(chain.log.keys, 1);
+    release(); const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map(r => r.status), ["sent", "sent"]);
+    assert.equal(chain.log.sends.length, 2);
+    assert.equal(w.maintenance.snapshot().activeOperations, 0);
+    const before = ledger.refunds();
+    await assert.rejects(refunder.tick(), { code: "SERVICE_DRAINING" });
+    assert.deepEqual(ledger.refunds(), before);
+  });
+});
+
+test("an accepted request can refund after maintenance closes and keeps final ledger checkpointing counted", { timeout: 5000 }, async t => {
+  await withLedger(async ({ file, open }) => {
+    const w = await maintenanceControl(file), ledger = open(); let entered, release;
+    const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+    t.after(() => release());
+    const chain = mockChain({ onSend: () => ({ result: DONE }) });
+    const { refunder } = make(chain.rpc, ledger, { maintenance: w.maintenance, beforeComplete: async () => { entered(); await hold; } });
+    const request = w.maintenance.run(async () => {
+      await w.pause();
+      return refunder.refund({ paymentId: "after-model", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    });
+    await reached;
+    assert.equal(ledger.refundForPayment("after-model").status, "signed");
+    assert.equal(w.maintenance.snapshot().activeOperations, 2);
+    release(); assert.equal((await request).status, "sent");
+    assert.equal(w.maintenance.snapshot().activeOperations, 0);
+  });
+});
+
+test("paused NEAR refund retries preserve signed bytes and attempt budget until explicit resume", async () => {
+  await withLedger(async ({ file, open }) => {
+    const w = await maintenanceControl(file), ledger = open();
+    const chain = mockChain({ onSend: (_tx, n) => n === 1 ? { http: 503 } : { result: DONE } });
+    const { refunder, advance } = make(chain.rpc, ledger, { maintenance: w.maintenance });
+    const result = await refunder.refund({ paymentId: "signed-before-pause", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    assert.equal(result.status, "pending");
+    const before = ledger.getRefund(result.refundId); advance(60_000); await w.pause();
+    await assert.rejects(refunder.tick(), { code: "SERVICE_DRAINING" });
+    assert.deepEqual(ledger.getRefund(result.refundId), before);
+    assert.equal(chain.log.sends.length, 1);
+    await w.unpause(); await refunder.tick();
+    assert.equal(ledger.getRefund(result.refundId).status, "sent");
+    assert.equal(chain.log.keys, 1);
+    assert.equal(new Set(chain.log.sends).size, 1, "resuming a retry cannot sign or broadcast a different payment");
+    assert.equal(w.maintenance.snapshot().activeOperations, 0);
   });
 });
