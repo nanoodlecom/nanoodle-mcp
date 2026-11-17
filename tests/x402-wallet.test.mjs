@@ -29,6 +29,33 @@ const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
 
+test("one wallet enforces a cumulative budget across parallel provider invoices", async () => {
+  const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true });
+  await wallet.ops.withFunding({ id: "paid-run", maxRaw: BigInt(AMOUNT) * 2n, maxUsd: 0.2 }, async () => {
+    const results = await Promise.allSettled([1, 2, 3].map(n => wallet.payment({ paymentId: `invoice-${n}`, payTo: PAY_TO, amountRaw: AMOUNT, amountUsd: 0.1 })));
+    assert.equal(results.filter(r => r.status === "fulfilled").length, 2);
+    assert.equal(results.find(r => r.status === "rejected").reason.code, "FUNDING_OVER_BUDGET");
+  });
+  assert.equal(mock.state.processed.length, 2);
+  assert.equal(BigInt(mock.state.balance), BigInt(BALANCE) - BigInt(AMOUNT) * 2n);
+  assert.deepEqual(wallet.ops.fundingStatus(), { activeRuns: 0, reservedRaw: "0" });
+  await assert.rejects(wallet.payment({ payTo: PAY_TO, amountRaw: AMOUNT }), { code: "FUNDING_REQUIRED" });
+});
+
+test("the wallet captures each queued caller's budget rather than the queue drainer's context", async () => {
+  const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true });
+  await Promise.all(["first", "second"].map((id, n) => wallet.ops.withFunding({ id, maxRaw: BigInt(AMOUNT), maxUsd: (n + 1) * 0.1 },
+    () => wallet.payment({ paymentId: `invoice-${id}`, payTo: PAY_TO, amountRaw: AMOUNT, amountUsd: (n + 1) * 0.1 }))));
+  assert.equal(mock.state.processed.length, 2, "different runs retain their own distinct caps under one queue drainer");
+});
+
+test("live liabilities refuse a funded-looking run before work or a block is published", async () => {
+  const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, fundingLiabilities: () => BigInt(BALANCE) });
+  let ran = false;
+  await assert.rejects(wallet.ops.withFunding({ id: "blocked", maxRaw: 1n, maxUsd: 0.01 }, () => { ran = true; }), { code: "FUNDING_INSUFFICIENT" });
+  assert.equal(ran, false); assert.equal(mock.state.processed.length, 0);
+});
+
 test("durable Nano payouts journal before publishing and recover a lost response after other pool spending", async () => {
   const blocks = new Map(); let unavailable = true, journal;
   const mock = fakeRpc({

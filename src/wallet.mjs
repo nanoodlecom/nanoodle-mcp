@@ -32,6 +32,7 @@ import {
   hashBlock,
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
+import { createRunFunding } from "./run-funding.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -117,7 +118,7 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
@@ -497,7 +498,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     }
   }
 
-  async function paySend(invoice) {
+  async function paySend(invoice, scope) {
     if (!/^\d{1,39}$/.test(String(invoice.amountRaw || "")) || BigInt(invoice.amountRaw) <= 0n) {
       throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
     }
@@ -528,6 +529,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
         ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
     }
+    funding.authorize(scope, invoice, state.balance);
     await sendFrom(state, invoice.payTo, amount, "paid",
       invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "");
   }
@@ -571,8 +573,21 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     sweepQueued = true;
     enqueue(() => { sweepQueued = false; return pocketReceivables(false, urgentWaiting); }).catch(() => {});
   }
+  const funding = createRunFunding({
+    serial: fn => enqueue(fn, URGENT),
+    liabilitiesRaw: fundingLiabilities,
+    requireScope: requireFunding,
+    balance: async required => {
+      let state = await currentState();
+      if (state.balance < required) state = await pocketReceivables(true, s => s.balance >= required);
+      return state.balance;
+    },
+  });
   const payment = (invoice) => {
-    const p = enqueue(() => paySend(invoice), URGENT);
+    // The queue may drain in another caller's async context. Capture HERE,
+    // rather than reading AsyncLocalStorage inside a later queued callback.
+    const scope = funding.capture();
+    const p = enqueue(() => paySend(invoice, scope), URGENT);
     p.then(queueSweep, () => {});
     return p;
   };
@@ -590,6 +605,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
      */
     ops: {
       rpc,
+      withFunding: funding.run,
+      fundingStatus: funding.snapshot,
       // The journal callback MUST persist the signed block before returning.
       // Retrying after a lost response or a restart uses the same block hash.
       transferOnce: (to, amountRaw, { prepared = null, onPrepared } = {}) => enqueue(async () => {

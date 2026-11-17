@@ -42,6 +42,7 @@ import { knownUsd } from "./usd.mjs";
 import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { rawToXno, authorAddress } from "./wallet.mjs";
+import { runFundingBudget } from "./run-funding.mjs";
 
 const RUN_NOODLE = "run_noodle";
 const FINAL = new Set(["settled", "failed", "rejected"]);
@@ -127,10 +128,12 @@ export function createNearGate({
   usdcEnabled = false,
   authorPayouts = null,
   canQuote = () => true,
+  fundRun = null,
 }) {
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}) };
   if (usdcEnabled && !isNearAccountId(usdcToken)) throw new TypeError("USDC needs a verified token contract");
   const assetOf = (q) => q.asset === "usdc" ? "usdc" : "near";
@@ -757,10 +760,14 @@ export function createNearGate({
     let res;
     try {
       if (prepError) throw prepError;
-      res = await registry.callTool(prepared.run, {
+      const execute = () => registry.callTool(prepared.run, {
         ...ctx,
         workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
       });
+      res = fundRun ? await fundRun(runFundingBudget({
+        id: `near:${q.id}`, budgetUsd: q.depositUsd,
+        pair: { usdNano: parseUsdNano(q.rate.xnoUsd), raw: 10n ** 30n }, creator: !!q.author,
+      }), execute) : await execute();
     } catch (e) {
       const msg = String((e && e.message) || e);
       const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
