@@ -53,3 +53,38 @@ test("a closed or unpublished Market profile does not make its earned creator fe
   } });
   assert.equal(w.sources.liabilitiesRaw(), 2n * 10n ** 29n);
 });
+
+test("quote readiness expires without discarding debts or preventing their settlement", async () => {
+  const w = await setup(); let clock = 1000;
+  const sources = createHostedFundingSources({ ...w.options, now: () => clock });
+  sources.registerNano(() => 123n);
+  assert.equal(sources.ready(), false);
+  sources.setReady(true);
+  clock += 59_999;
+  assert.equal(sources.ready(), true);
+  clock += 1;
+  assert.equal(sources.ready(), false, "a stalled report cannot keep admitting deposits");
+  assert.equal(sources.liabilitiesRaw(), 123n, "expiry leaves existing debt accounting available");
+  sources.setReady(true);
+  assert.equal(sources.ready(), true, "a new healthy observation can resume admission");
+  sources.setReady(false);
+  assert.equal(sources.ready(), false);
+});
+
+test("invalid clock movement and storage failure require a new healthy observation", async () => {
+  const w = await setup(); let clock = 1000;
+  const sources = createHostedFundingSources({ ...w.options, now: () => clock });
+  sources.setReady(true);
+  clock -= 1;
+  assert.equal(sources.ready(), false);
+  clock += 1;
+  assert.equal(sources.ready(), false, "clock recovery alone cannot revive an invalid observation");
+  sources.setReady(true);
+  sources.setStorageReady(false);
+  sources.setStorageReady(true);
+  assert.equal(sources.ready(), false, "storage recovery alone cannot revive an observation");
+  sources.setReady(true);
+  assert.equal(sources.ready(), true);
+  clock = NaN;
+  assert.equal(sources.ready(), false);
+});

@@ -39,7 +39,11 @@ check backs off. A completed answer is not reused for a later execution phase.
 The private `out/funding-health.json` snapshot selects aggregate counts and raw
 amounts, is mode 0600, and is excluded from public artifact delivery and sweeping.
 It is telemetry, never financial authority. New quotes pause when it reports an
-unfunded pool or unavailable state. A failed snapshot write also pauses Nano
+unfunded pool or unavailable state. Quote admission also expires 60 seconds
+after the last healthy refresh, using a monotonic clock. A refresh stuck on the
+wallet queue cannot leave checkout enabled indefinitely; a new healthy refresh
+is required to resume. Expiry preserves existing debt accounting and settlement.
+A failed snapshot write also pauses Nano
 authorizations; read-only recovery can resume after storage recovers. The
 five-minute operational check requires fresh enforcement telemetry, tests its
 own atomic balance against liabilities plus reservations, and flags old scopes.
