@@ -80,9 +80,9 @@ never a quote requiring payment or an inference call.
 The upstream [x402 endpoint manifest](https://nano-gpt.com/api/v1/x402/endpoints)
 lists text/image/data contracts. [Its public x402 page](https://nano-gpt.com/x402)
 does not promise stable long-running video support. Our audio/video adapters use
-legacy paths; absence from the manifest is not proof they are broken. Thirteen
+legacy paths; absence from the manifest is not proof they are broken. Fifteen
 unpaid quote samples on 2026-11-17 returned valid 402 invoices for the current
-NEAR demos: GLM 5.3 Flash at 96/256/1536/4096 tokens, six image request shapes,
+NEAR demos: GLM 5.3 Flash at 96/256/1536/2000/2048/4096 tokens, six image request shapes,
 Mureka 9.5 and both five-second H3 video models. No payment/complete request or
 inference was made. Check actual unpaid-quote/status behavior before changing
 their availability, and add safe probes
