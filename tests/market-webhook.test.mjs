@@ -3,13 +3,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
 import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { freePort } from "../scripts/near-simulate.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { runLoop } from "../src/market/service.mjs";
 import { readCatalog } from "../src/market/catalog.mjs";
 import { createWebhookHandler, secretFileReader, verifyMarketSignature } from "../src/market/webhook.mjs";
@@ -271,4 +272,19 @@ test("inside the server: a signed hire.created is picked up at once, long before
     assert.deepEqual(await exited, { code: 0, sig: null });
     assert.deepEqual(m.violations, []);
   } finally { if (child.exitCode === null) { child.kill("SIGKILL"); await exited; } await m.close(); await nano.close(); }
+});
+
+test("a maintenance pause keeps the Market poll loop open and resumes without closing its state", { timeout: 5000 }, async t => {
+  const dir = mkdtempSync(join(tmpdir(), "market-loop-maintenance-")), file = join(dir, "flag.json");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const maintenance = createMaintenanceBarrier({ file, ownerUid: process.getuid() });
+  let polls = 0, closed = 0;
+  const loop = runLoop({ tick: () => maintenance.run(async () => { polls++; }, "background"), drain: async () => {} },
+    { close() { closed++; } }, { pollMs: 60_000, log: () => {} });
+  t.after(async () => { loop.stop(); await loop.done; });
+  await loop.poke(); const before = polls;
+  writeFileSync(file, JSON.stringify({ v: 1, token: "b".repeat(32), operation: "backup", revision: null }), { mode: 0o600 });
+  await loop.poke(); assert.equal(polls, before); assert.equal(closed, 0);
+  rmSync(file); await loop.poke(); assert.equal(polls, before + 1);
+  loop.stop(); assert.equal(await loop.done, 0); assert.equal(closed, 1);
 });

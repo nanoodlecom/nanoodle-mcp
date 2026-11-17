@@ -1,7 +1,7 @@
 # Maintenance admission and draining (preparation)
 
 `src/maintenance.mjs` provides process-local accounting for planned maintenance.
-Optional HTTP, wallet and NEAR watcher hooks use this accounting. The barrier is not
+Optional HTTP, wallet, payment-gate, settlement and Market hooks use this accounting. The barrier is not
 connected to the production CLI, deployment hook or backup service yet.
 Do not use its presence as evidence that a server can be stopped safely.
 
@@ -37,9 +37,35 @@ available during maintenance and does not count itself as financial work. The
 NEAR watcher pauses new scans and its `stop()` waits for an in-flight scan and
 payment observation to finish. Explicit ticks do not restart a stopped watcher.
 
-Before operational use, integration must connect every listener and execution
-route, Nano payment polling, NEAR refund queues, Market work, and retries through
-actual settlement. No production flag is enabled by these optional hooks.
-Maintenance must receive a private acknowledgement of the same token and zero
-tracked work before stopping the service. Build releases away from the live
+Nano gate scans and websocket observations are admitted through the same
+barrier. Its settlement callbacks and queued state writes remain registered
+until the receipt or retry debt reaches the state file. `persistenceStatus()`
+reports write failures separately from an idle count; an idle writer with a
+failed last snapshot is unsafe to stop. A later successful complete snapshot
+clears that error. Read-only quote lookups do not prune state while paused.
+
+NEAR refunds and Nano creator payouts capture their nonce/publication queue
+entries before waiting. A pause does not consume retry attempts, sign new
+transactions or alter an existing signed intent. Accepted settlement continues
+through FINAL verification and ledger updates. A new unadmitted payout intent
+is refused synchronously.
+
+Market polls retain assignment scopes through waiting for a concurrency slot,
+model work, uploads, submission and their final durable state. Paused polls keep
+the loop open for resume. Catalog refresh and bid passes are tracked, and shared
+stores stay locked until those passes and assignment loops finish.
+
+`close()` irreversibly closes process-local admission for shutdown, including
+when the external flag is later removed. `waitForIdle()` requires closed
+admission and cannot be called from an operation that would await itself. It
+never cancels accepted work. With only an external pause, the operator must keep
+the flag and maintenance lock held while qualifying and acting on a drain.
+
+Before operational use, integration must connect every CLI listener, wallet,
+gate, retry loop and Market service to the same barrier, then retain their
+handles for graceful process shutdown. No production flag is enabled by these
+optional hooks. The existing CLI shutdown has not been replaced yet.
+Maintenance must receive a fresh private acknowledgement from the same live
+process, for the same token, zero tracked work and healthy fully flushed state
+before stopping the service. Build releases away from the live
 checkout. A zero funding-reservation count alone is insufficient.

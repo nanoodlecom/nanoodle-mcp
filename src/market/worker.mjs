@@ -90,9 +90,12 @@ export function createMarketWorker({
   log: rawLog = () => {}, now = Date.now,
   creatorPayments = null,
   checkFee = null,
+  maintenance = null,
 }) {
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createMarketWorker needs a positive budgetUsd");
   if (!customWorkflows && !defaultWorkflow) throw new TypeError("createMarketWorker: a listing without custom workflows needs a default workflow");
+  if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.capture !== "function" || typeof maintenance.assertAdmitted !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
+  maintenance?.assertAdmitted();
   // The current budget and price. They can change while the worker runs (the listing's price
   // on the market changed); a job keeps the budget it was accepted under (stored on its record).
   let budgetNow = budgetUsd;
@@ -477,7 +480,7 @@ export function createMarketWorker({
 
   function launch(id, row) {
     if (inflight.has(id)) return;
-    const p = (async () => {
+    const execute = async () => {
       await acquire();
       try { await advance(id, row); } catch (e) {
         const rec = store.get(id);
@@ -487,7 +490,11 @@ export function createMarketWorker({
         release();
         inflight.delete(id);
       }
-    })();
+    };
+    // Include waiting for a concurrency slot and all delivery/submission work,
+    // not only the runner's funding reservation.
+    const scheduled = maintenance ? maintenance.capture(execute) : execute;
+    const p = scheduled();
     inflight.set(id, p);
   }
 
@@ -588,5 +595,5 @@ export function createMarketWorker({
     priceNow = p;
   }
 
-  return { tick, drain, setBudget, budget: () => ({ budgetUsd: budgetNow, listingPriceUsd: priceNow }), inflight: () => inflight.size };
+  return { tick: maintenance ? () => maintenance.run(tick, "background") : tick, drain, setBudget, budget: () => ({ budgetUsd: budgetNow, listingPriceUsd: priceNow }), inflight: () => inflight.size };
 }

@@ -15,6 +15,7 @@ import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner, checkNanoGptKey, isOperatorSideFailure } from "../src/market/runner.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
 import { createMarketCreatorPayments } from "../src/market/creators.mjs";
@@ -31,7 +32,7 @@ before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
 /** A market, a state dir and a worker wired together. */
-async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null } = {}) {
+async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null, maintenance = null, concurrency = 2 } = {}) {
   const m = market || createMarketMock();
   if (!market) await m.listen();
   const stateDir = dir || mkdtempSync(join(tmpdir(), "market-worker-"));
@@ -39,9 +40,9 @@ async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, 
   const store = openMarketState({ dir: stateDir });
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
   const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nano.url });
-  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, checkFee, log: (l) => logs.push(l) });
+  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, checkFee, maintenance, concurrency, log: (l) => logs.push(l) });
   const once = async () => { await worker.tick(); await worker.drain(); };
-  return { m, store, worker, once, logs, stateDir };
+  return { m, store, worker, once, logs, stateDir, client, runner };
 }
 
 const noSecrets = (logs) => {
@@ -584,4 +585,43 @@ test("a typed Duration field: the buyer's length is used, none given picks one f
   assert.match(md, new RegExp(`with your brief as the input \\(1 output\\)\\. Duration: none given, so it aims for about ${n} seconds \\(picked between 120 and 240\\)\\. Files`));
   assert.deepEqual(market.violations, []);
   store.close(); await market.close();
+});
+
+test("Market drain includes delivery and submission after the workflow has completed", { timeout: 10000 }, async t => {
+  const maintenance = createMaintenanceBarrier(), r = await rig({ maintenance }); let entered, release;
+  const reached = new Promise(resolve => { entered = resolve; }), hold = new Promise(resolve => { release = resolve; });
+  t.after(async () => { release(); await r.worker.drain(); r.store.close(); await r.m.close(); });
+  const submit = r.client.submit;
+  r.client.submit = async (...args) => { entered(); await hold; return submit(...args); };
+  const id = r.m.hire({ description: WORKED("finish this accepted job") });
+  await r.worker.tick(); await reached;
+  assert.equal(r.store.get(id).phase, "submitting");
+  maintenance.close();
+  const later = r.m.hire({ description: WORKED("wait until after maintenance") });
+  await assert.rejects(r.worker.tick(), { code: "SERVICE_DRAINING" });
+  assert.equal(r.store.get(later), null);
+  let idle = false; const drained = maintenance.waitForIdle().then(() => { idle = true; });
+  await Promise.resolve(); assert.equal(idle, false);
+  assert.equal(maintenance.snapshot().counts.request, 1);
+  release(); await drained; await r.worker.drain();
+  assert.equal(r.store.get(id).phase, "submitted");
+  assert.equal(r.m.rows.get(id).versions.length, 1);
+  assert.equal(maintenance.snapshot().activeOperations, 0);
+});
+
+test("Market assignments waiting for a concurrency slot retain admission and finish through pause", { timeout: 10000 }, async t => {
+  const maintenance = createMaintenanceBarrier(), r = await rig({ maintenance, concurrency: 1 }); let entered, release, runs = 0;
+  const reached = new Promise(resolve => { entered = resolve; }), hold = new Promise(resolve => { release = resolve; });
+  t.after(async () => { release(); await r.worker.drain(); r.store.close(); await r.m.close(); });
+  const execute = r.runner.run;
+  r.runner.run = async (...args) => { if (++runs === 1) { entered(); await hold; } return execute(...args); };
+  const ids = [r.m.hire({ description: WORKED("first accepted job") }), r.m.hire({ description: WORKED("queued accepted job") })];
+  await r.worker.tick(); await reached;
+  assert.equal(maintenance.snapshot().counts.request, 2);
+  maintenance.close();
+  release(); await maintenance.waitForIdle(); await r.worker.drain();
+  assert.equal(runs, 2);
+  assert.deepEqual(ids.map(id => r.store.get(id).phase), ["submitted", "submitted"]);
+  assert.ok(ids.every(id => r.m.rows.get(id).versions.length === 1));
+  assert.equal(maintenance.snapshot().activeOperations, 0);
 });

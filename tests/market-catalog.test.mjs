@@ -18,6 +18,7 @@ import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { readConfig, startMarketService, MarketConfigError, NOTIFY_LINES, createNotifier } from "../src/market/service.mjs";
 import {
   recommendPrice, budgetFromPrice, priceVerdict, usdMicros, fmtUsd, readCatalog, fetchListingPrice, patchListingPrice,
@@ -667,4 +668,28 @@ test("marketNeedUsd: estimated cost + 20%, rounded up to the cent, at least $0.0
   assert.equal(under.ok, false);
   assert.deepEqual(under.refusals.map((r) => r.code), ["OVER_BUDGET"]);
   assert.match(under.refusals[0].message, /estimated cost plus 20% is \$[\d.]+; this listing covers at most \$[\d.]+/);
+});
+
+test("catalog stop retains state locks until an in-flight price refresh is complete", { timeout: 10000 }, async t => {
+  const market = createMarketMock({ handle: "drain-image", priceAmount: "0.50" }); await market.listen();
+  let entered, release, profiles = 0;
+  const reached = new Promise(resolve => { entered = resolve; }), hold = new Promise(resolve => { release = resolve; });
+  const files = catalogFiles([{ handle: "drain-image", token: MOCK_TOKEN, graph: "default" }]);
+  const cfg = readConfig(files.args(market), { NANOGPT_API_KEY: NANO_KEY, MARKET_PRICE_REFRESH_SECONDS: "0.05" });
+  const maintenance = createMaintenanceBarrier();
+  const service = await startMarketService(cfg, { maintenance, log: () => {}, fetch: async (url, options) => {
+    if (new URL(url).pathname === "/v1/agents/drain-image" && ++profiles === 2) { entered(); await hold; }
+    return fetch(url, options);
+  } });
+  t.after(async () => { release(); service.stop(); await service.done; await market.close(); });
+  await reached; service.stop(); maintenance.close();
+  let stopped = false; const done = service.done.then(() => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  const lock = join(files.stateDir, "drain-image", "worker.lock");
+  assert.equal(stopped, false);
+  assert.equal(existsSync(lock), true, "a price pass still owns this store");
+  assert.ok(maintenance.snapshot().counts.background >= 1);
+  release(); await done; await maintenance.waitForIdle();
+  assert.equal(existsSync(lock), false);
+  assert.equal(maintenance.snapshot().activeOperations, 0);
 });
