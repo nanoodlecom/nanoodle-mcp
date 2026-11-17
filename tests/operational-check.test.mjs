@@ -1,0 +1,165 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
+
+const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
+function fixture(override = () => null) {
+  const calls = [], stateDir = mkdtempSync(join(tmpdir(), "operational-check-"));
+  const config = { stateDir, outDir: "/state", marketStateDir: "/jobs", network: "mainnet", merchant: "nanoodle.near", nearPublicKey: "ed25519:public",
+    nanoAddress: "nano_public", nanoRpcUrls: ["https://nano-0.example", "https://nano-1.example"], nearRpcUrls: ["https://near-0.example", "https://near-1.example"],
+    site: "https://site.example", marketUrl: "https://market.example", nanoGptBase: "https://models.example",
+    agents: [{ handle: "nanoodle-image", tokenFile: "/private-token", defaultWorkflow: { graph: { v: 1, nodes: [], links: [] }, inputName: "Idea" } }] };
+  const states = {
+    "/state/gate-state.json": { v: 2, quotes: [], owed: [] },
+    "/state/near-state.json": { v: 1, network: "mainnet", merchant: "nanoodle.near", quotes: {}, refunds: {}, payouts: {} },
+    "/jobs/nanoodle-image/market-state.json": { v: 1, assignments: {} },
+    "/jobs/nanoodle-image/worker.lock": { pid: 1 },
+  };
+  const deps = {
+    now: () => NOW, readJson: path => states[path], readText: () => "SYNTHETIC_PRIVATE_TOKEN",
+    statfs: () => ({ bavail: 1e6, blocks: 2e6, bsize: 4096, ffree: 1e6 }),
+    isWorkerAlive: () => true,
+    probeStateWrite: () => {},
+    unitState: unit => unit.endsWith(".timer") ? { ActiveState: "active", UnitFileState: "enabled", LastTriggerUSec: "@" + String(NOW / 1000) } : { ActiveState: "inactive", Result: "success" },
+    computePrice: async () => ({ safety: { ok: true }, pricing: { estimatedCostUsd: 0.01 } }),
+    fetch: async (input, init = {}) => {
+      const url = new URL(input), body = init.body ? JSON.parse(init.body) : null;
+      const call = { url, init, body }; calls.push(call);
+      assert.equal(init.redirect, "error"); assert.ok(init.signal);
+      const replaced = override(call, config, states); if (replaced) return replaced;
+      const json = result => Response.json(body?.jsonrpc ? { jsonrpc: "2.0", id: body.id, result } : result);
+      if (url.hostname.startsWith("nano-")) {
+        assert.equal(body.action, "account_info");
+        return json({ confirmed_balance: "10000000000000000000000000000000", confirmed_height: "10", confirmed_frontier: "A".repeat(64) });
+      }
+      if (url.hostname.startsWith("near-")) {
+        if (body.method === "status") return json({ chain_id: "mainnet", sync_info: { syncing: false } });
+        if (body.method === "block") return json({ header: { height: 100, hash: "same-block", timestamp_nanosec: String(BigInt(NOW) * 1_000_000n) } });
+        if (body.method === "gas_price") return json({ gas_price: "100000000" });
+        if (body.method === "EXPERIMENTAL_protocol_config") {
+          const cost = { send_sir: "300000000000", send_not_sir: "300000000000", execution: "300000000000" };
+          return json({ chain_id: "mainnet", runtime_config: { storage_amount_per_byte: "10000000000000000000", transaction_costs: {
+            action_receipt_creation_config: cost, action_creation_config: { transfer_cost: cost } } } });
+        }
+        if (body.method === "query") {
+          if (body.params.request_type === "view_access_key") return json({ permission: "FullAccess" });
+          if (body.params.request_type === "view_account") return json({ amount: "1000000000000000000000000", storage_usage: 500 });
+          if (body.params.request_type === "call_function") {
+            const results = { ft_metadata: { spec: "ft-1.0.0", symbol: "USDC", decimals: 6 }, storage_balance_of: { total: "1" }, ft_balance_of: "1000000" };
+            assert.ok(body.params.method_name in results);
+            return json({ result: [...Buffer.from(JSON.stringify(results[body.params.method_name]))] });
+          }
+        }
+        assert.fail("Unexpected NEAR RPC: " + body.method);
+      }
+      if (url.hostname === "site.example") {
+        if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
+        if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near", watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 } });
+        if (body.method === "initialize") return json({ serverInfo: { name: "nanoodle" } });
+        if (body.method === "tools/list") return json({ tools: ["price_noodle", "run_noodle", "noodle_guide"].map(name => ({ name })) });
+        assert.equal(body.method, "tools/call"); assert.equal(body.params.name, "price_noodle", "never execute a paid tool or request a deposit");
+        return json({ structuredContent: { pricing: { safety: { ok: true } } } });
+      }
+      if (url.hostname === "market.example") {
+        assert.equal(init.method || "GET", "GET", "Market probes never mutate jobs/listings");
+        if (url.pathname === "/v1/platform/config") return json({ platform_fee_bps: 500 });
+        if (url.pathname === "/v1/agents/me/assignments") {
+          assert.equal(init.headers.authorization, "Bearer SYNTHETIC_PRIVATE_TOKEN");
+          return json({ assignments: [], ignored_private_content: "PRIVATE_BUYER_TEXT" });
+        }
+        if (url.pathname === "/v1/agents/nanoodle-image") return json({ agent_id: ID, handle: "nanoodle-image" });
+        if (url.pathname === `/v1/agents/${ID}/pricing-plans`) return json([{ is_default: true, price_amount: "1.00", listing_status: "live" }]);
+      }
+      assert.fail(`Unexpected request ${url.hostname}${url.pathname}`);
+    },
+  };
+  return { config, deps, calls, states };
+}
+
+test("operational probes cover live readiness with no inference, signing or Market mutation and a redacted report", async () => {
+  const f = fixture(), before = JSON.stringify(f.states);
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, true); assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.ok(report.checks.some(c => c.stage === "nano-liquidity")); assert.ok(report.checks.some(c => c.stage === "usdc-liquidity"));
+  assert.ok(report.checks.some(c => c.stage === "workflow-price-nanoodle-image"));
+  const file = join(f.config.stateDir, "latest.json"), text = readFileSync(file, "utf8");
+  assert.doesNotMatch(text, /SYNTHETIC|PRIVATE_BUYER|public|ed25519|assignment|account_id/);
+  assert.equal(statSync(file).mode & 0o777, 0o644); assert.equal(JSON.stringify(f.states), before);
+});
+
+test("a stale node is reported while a fresh fallback remains usable; loss of all fresh NEAR nodes blocks that rail", async () => {
+  for (const both of [false, true]) {
+    const f = fixture(({ url, body }) => {
+      if ((both ? url.hostname.startsWith("near-") : url.hostname === "near-0.example") && body.method === "block") {
+        return Response.json({ id: body.id, result: { header: { height: 100, hash: "old", timestamp_nanosec: String(BigInt(NOW - 180_000) * 1_000_000n) } } });
+      }
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false); assert.equal(report.admission.near, !both); assert.equal(report.admission.nano, true);
+    assert.ok(report.checks.some(c => c.code === "near-finalized-head-stale"));
+  }
+});
+
+test("disagreeing Nano frontiers, an underfunded pool and stale exchange rates cannot produce healthy admission", async () => {
+  for (const kind of ["frontier", "funds", "rates"]) {
+    const f = fixture(({ url, body }) => {
+      if (url.hostname.startsWith("nano-") && kind === "funds") return Response.json({ confirmed_balance: "0", confirmed_height: "10", confirmed_frontier: "A".repeat(64) });
+      if (url.hostname === "nano-0.example" && kind === "frontier") return Response.json({ confirmed_balance: "100", confirmed_height: "10", confirmed_frontier: "B".repeat(64) });
+      if (url.pathname === "/rates" && kind === "rates") return Response.json({ quoting: false, nearUsd: "3", xnoUsd: "1" });
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false); assert.equal(report.admission.nano, false); assert.equal(report.admission.market, false);
+  }
+});
+
+test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {
+  for (const kind of ["fee", "token"]) {
+    const f = fixture(({ url }) => {
+      if (url.pathname === "/v1/platform/config" && kind === "fee") return Response.json({ platform_fee_bps: 1000 });
+      if (url.pathname === "/v1/agents/me/assignments" && kind === "token") return new Response("PRIVATE_ERROR_PAYLOAD", { status: 401 });
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false); assert.equal(report.admission.market, false); assert.equal(report.admission.nano, true);
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_ERROR|SYNTHETIC_PRIVATE/);
+  }
+});
+
+test("dead workers, a stale payment watcher and low disk space are reported independently of public availability", async () => {
+  const f = fixture(({ url }) => {
+    if (url.pathname === "/near/health") return Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near", watcher: { listening: true, height: 100, lastScanAt: new Date(NOW - 300_000).toISOString() } });
+  });
+  f.deps.isWorkerAlive = () => false;
+  f.deps.statfs = () => ({ bavail: 1, blocks: 1e6, bsize: 4096, ffree: 100 });
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, false);
+  for (const stage of ["market-process-nanoodle-image", "near-payment-watcher", "state-disk-space"]) assert.ok(report.checks.some(c => c.stage === stage && !c.ok));
+});
+
+test("disabled and overdue timers are detected, while a newly enabled daily timer has time for its first run", async () => {
+  for (const disabled of [true, false]) {
+    const f = fixture();
+    f.deps.unitState = unit => {
+      if (!unit.endsWith(".timer")) return { ActiveState: "inactive", Result: "success" };
+      if (unit === "nanoodle-near-check.timer") return { ActiveState: "active", UnitFileState: "enabled", LastTriggerUSec: "n/a", ActiveEnterTimestamp: "@" + String(NOW / 1000) };
+      return { ActiveState: "active", UnitFileState: disabled ? "disabled" : "enabled", LastTriggerUSec: "Tue 2026-11-17 00:00:00 UTC" };
+    };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false);
+    assert.ok(report.checks.some(c => c.stage === "timer-nanoodle-near-check" && c.ok));
+    assert.ok(report.checks.some(c => c.code === (disabled ? "check-timer-not-enabled" : "check-timer-missed")));
+  }
+});
+
+test("unchanged incidents retain one identity; six-hour reminders, recovery and new incidents remain distinct", () => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-incident-"));
+  const issues = [{ stage: "nano-liquidity", ok: false, code: "insufficient", domains: ["nano"] }];
+  const first = finishOperationalReport(dir, issues, NOW);
+  assert.equal(finishOperationalReport(dir, issues, NOW + 300_000).incidentId, first.incidentId);
+  const reminder = finishOperationalReport(dir, issues, NOW + 6 * 3_600_000);
+  assert.notEqual(reminder.incidentId, first.incidentId);
+  assert.equal(finishOperationalReport(dir, [], NOW + 7 * 3_600_000).ok, true);
+  assert.notEqual(finishOperationalReport(dir, issues, NOW + 8 * 3_600_000).incidentId, reminder.incidentId);
+});
