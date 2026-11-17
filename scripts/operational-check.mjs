@@ -18,6 +18,7 @@ import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
+import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
 import { selectRecoveryHealth } from "../src/payments/recovery-health.mjs";
 import { readStartupPolicy } from "../src/startup-state.mjs";
@@ -105,6 +106,8 @@ export async function runOperationalCheck(config, deps = {}) {
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= config.nanoRpcUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
+    try { selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
+    catch { need(false, "nano-checkpoint-unavailable"); }
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);

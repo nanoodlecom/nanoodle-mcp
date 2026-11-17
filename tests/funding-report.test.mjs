@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFundingReport } from "../src/funding-report.mjs";
 import { createHostedFundingSources } from "../src/hosted-funding.mjs";
+import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY } from "./fixtures/nano-protocol.mjs";
 
 const value = { balanceRaw: "100", liabilitiesRaw: "20", reservedRaw: "80", activeRuns: 1,
   oldestStartedAt: 1000, enforced: true, protectTransfers: true, privateExtra: "SECRET" };
@@ -82,6 +83,28 @@ test("lost writer protection pauses quotes and its private error is not publishe
   lost = true; await report.refresh(); saved = JSON.parse(await readFile(w.file, "utf8"));
   assert.equal(saved.ok, false); assert.equal(w.sources.ready(), false);
   assert.doesNotMatch(JSON.stringify(saved), /PRIVATE/);
+});
+
+test("the private handoff retains only validated public-chain facts and never treats a missing floor as healthy", async t => {
+  const w = await setup(t);
+  const head = { hash: "A".repeat(64), blockCount: "10" };
+  const checkpoint = { v: 1, networkGenesis: NANO_GENESIS_HASH, account: NANO_GENESIS_REPLY.contents.account,
+    head, confirmed: head, secret: "PRIVATE_KEY", provider: { token: "PRIVATE_TOKEN" } };
+  const rpc = { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2,
+    lastReadAt: 2000, checkpoint };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000,
+    snapshot: async () => ({ ...value, nanoRpc: rpc }) });
+  t.after(report.stop);
+  const saved = await readFile(w.file, "utf8"), selected = JSON.parse(saved).nanoRpc.checkpoint;
+  assert.equal(w.sources.ready(), true); assert.doesNotMatch(saved, /PRIVATE|secret|provider/);
+  assert.deepEqual(selected.head, head); assert.equal(selected.networkGenesis, NANO_GENESIS_HASH);
+  assert.equal((await stat(w.file)).mode & 0o777, 0o600);
+  for (const bad of [null, { ...checkpoint, account: "invalid" }, { ...checkpoint, networkGenesis: "F".repeat(64) },
+    { ...checkpoint, head: { ...head, blockCount: "9" } }, { ...checkpoint, confirmed: { ...head, hash: "B".repeat(64) } }]) {
+    rpc.checkpoint = bad; await report.refresh();
+    assert.equal(w.sources.ready(), false); assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
+  }
+  rpc.checkpoint = checkpoint; await report.refresh(); assert.equal(w.sources.ready(), true);
 });
 
 test("a pending refresh cannot keep stale checkout admission alive or discard protected debts", async t => {

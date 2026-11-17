@@ -4,14 +4,14 @@ import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
-import { NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
+import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 function fixture(override = () => null) {
   const calls = [], stateDir = mkdtempSync(join(tmpdir(), "operational-check-"));
   const config = { stateDir, outDir: "/state", marketStateDir: "/jobs", network: "mainnet", merchant: "nanoodle.near", nearPublicKey: "ed25519:public",
-    nanoAddress: "nano_public", nanoRpcUrls: ["https://nano-0.example", "https://nano-1.example"], nearRpcUrls: ["https://near-0.example", "https://near-1.example"],
+    nanoAddress: NANO_GENESIS_REPLY.contents.account, nanoRpcUrls: ["https://nano-0.example", "https://nano-1.example"], nearRpcUrls: ["https://near-0.example", "https://near-1.example"],
     site: "https://site.example", nanoSite: "https://nano-site.example", marketUrl: "https://market.example", nanoGptBase: "https://models.example",
     agents: [{ handle: "nanoodle-image", tokenFile: "/private-token", defaultWorkflow: { graph: { v: 1, nodes: [], links: [] }, inputName: "Idea" } }] };
   const states = {
@@ -19,7 +19,9 @@ function fixture(override = () => null) {
     "/state/funding-health.json": { v: 1, checkedAt: new Date(NOW).toISOString(), ok: true, enforced: true, protectTransfers: true,
       writerProtection: { enforced: true, requiredState: true },
       balanceRaw: "1000", liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
-      nanoRpc: { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: NOW } },
+      nanoRpc: { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: NOW,
+        checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: config.nanoAddress,
+          head: { hash: "A".repeat(64), blockCount: "10" }, confirmed: { hash: "A".repeat(64), blockCount: "10" } } } },
     "/state/near-state.json": { v: 1, network: "mainnet", merchant: "nanoodle.near", quotes: {}, refunds: {}, payouts: {} },
     "/jobs/nanoodle-image/market-state.json": { v: 1, assignments: {} },
     "/jobs/nanoodle-image/worker.lock": { pid: 1 },
@@ -128,6 +130,17 @@ test("disabled, stale or insufficient Nano read enforcement cannot be hidden by 
     const report = await runOperationalCheck(f.config, f.deps);
     assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
     assert.ok(report.checks.some(c => c.stage === "runtime-funding" && !c.ok));
+  }
+});
+
+test("monitoring rejects a missing or wrong-wallet checkpoint without copying it to the public report", async () => {
+  for (const change of [null, { account: "invalid" }, { networkGenesis: "F".repeat(64) }, { head: { hash: "A".repeat(64), blockCount: "9" } }]) {
+    const f = fixture(), rpc = f.states["/state/funding-health.json"].nanoRpc;
+    rpc.checkpoint = change === null ? null : { ...rpc.checkpoint, ...change };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
+    assert.ok(report.checks.some(c => c.code === "nano-checkpoint-unavailable"));
+    assert.doesNotMatch(JSON.stringify(report), /networkGenesis|blockCount|nano_3/);
   }
 });
 
