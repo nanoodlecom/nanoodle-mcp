@@ -117,8 +117,10 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
+  if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
+  if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
@@ -148,23 +150,25 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   //     safely retry; a publish must NOT (the node may have accepted it and only
   //     the response died), so that case is left to settleAfterTransportError.
   async function rpcOnce(body, base, { headers = {}, signal } = {}) {
-    let r;
+    let r, text;
     try {
       r = await fetch(base, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify(body),
-        signal,
+        signal: signal || AbortSignal.timeout(rpcTimeoutMs),
+        redirect: "error",
       });
+      text = await r.text(); // The same deadline covers a body that never finishes.
     } catch (e) {
-      throw new Error(`Nano RPC ${redactUrl(base)} unreachable (action ${body.action}): ${e.message}`);
+      throw Object.assign(new Error(`Nano RPC ${redactUrl(base)} unreachable (action ${body.action})`), { ambiguous: true });
     }
-    const text = await r.text();
     let json = null;
     try { json = JSON.parse(text); } catch { /* handled below */ }
-    if (!r.ok || json == null) {
+    if (!r.ok || json == null || typeof json !== "object" || Array.isArray(json)) {
       const e = new Error(`Nano RPC ${body.action} failed at ${redactUrl(base)} (HTTP ${r.status}): ${text.slice(0, 200)}`);
       if (r.status === 429) e.rejected = true; // throttled: request never reached the node
+      else if (r.status >= 500 || r.ok) e.ambiguous = true;
       throw e;
     }
     if (json.error) {
@@ -181,6 +185,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       if (isThrottleError(json.error)) e.rejected = true;
       else e.authoritative = true;
       throw e;
+    }
+    if (body.action === "process" && String(json.hash || "").toUpperCase() !== hashBlock(body.block).toUpperCase()) {
+      throw Object.assign(new Error("Nano RPC process returned no matching block hash"), { ambiguous: true });
     }
     return json;
   }
@@ -220,6 +227,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       }
       throw e;
     });
+    if (!/^[a-f0-9]{64}$/i.test(info.frontier || "") || !/^\d{1,39}$/.test(String(info.balance)) || !checkAddress(info.representative)) {
+      throw new Error("Nano RPC account_info returned invalid wallet state");
+    }
     return { frontier: info.frontier, balance: BigInt(info.balance), representative: info.representative };
   }
 
@@ -407,6 +417,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
    * block hash. `describe` labels the log line ("paid", "refunded", …).
    */
   async function prepareSend(state, to, amount) {
+    if (typeof amount !== "bigint" || amount <= 0n) throw new Error("Nano transfer amount must be positive");
     if (amount > state.balance) throw new Error("insufficient Nano wallet balance for transfer");
     const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
     const prepared = createBlock(secretKey, {
@@ -432,7 +443,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         // Lost response mid-publish — dead transport or a fronting proxy's
         // HTTP-5xx: the node may already have the block. Verify, republish
         // the identical block if not, and only then give up.
-        if (/unreachable|failed(?: at \S+)? \(HTTP 5\d\d\)/.test(e.message)) {
+        if (e.ambiguous) {
           chain = null; // until settled, the frontier is uncertain
           log(`process transport failure (${e.message}) — verifying and republishing`);
           if (await settleAfterTransportError(hash, block)) { /* landed */ }
@@ -487,13 +498,17 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   }
 
   async function paySend(invoice) {
-    if (!/^\d+$/.test(String(invoice.amountRaw || ""))) {
+    if (!/^\d{1,39}$/.test(String(invoice.amountRaw || "")) || BigInt(invoice.amountRaw) <= 0n) {
       throw new Error("x402 invoice has no usable Nano amount — refusing to pay");
     }
     if (!checkAddress(String(invoice.payTo || ""))) {
       throw new Error(`x402 invoice payTo is not a valid Nano address: ${invoice.payTo}`);
     }
-    if (maxUsd != null && invoice.amountUsd != null && invoice.amountUsd > maxUsd) {
+    if (invoice.amountUsd != null && !(typeof invoice.amountUsd === "number" && Number.isFinite(invoice.amountUsd) && invoice.amountUsd >= 0)) {
+      throw new Error("x402 invoice has an invalid USD amount — refusing to pay");
+    }
+    if (maxUsd != null && !(invoice.amountUsd > 0)) throw new Error("x402 invoice needs a positive USD amount to enforce the --max-usd cap");
+    if (maxUsd != null && invoice.amountUsd > maxUsd) {
       throw new Error(
         `x402 invoice is $${invoice.amountUsd.toFixed(4)}, over the --max-usd cap of $${maxUsd} — ` +
         "raise the cap to allow calls this expensive (invoices are priced at the call's maximum; " +
