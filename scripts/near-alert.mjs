@@ -9,21 +9,26 @@ import { atomicJson } from "./near-check.mjs";
 
 export const CHECK_UNIT = "nanoodle-near-check.service";
 export const TEST_UNIT = "nanoodle-near-check-alert-test.service";
+export const MARKET_UNIT = "nanoodle-market-check.service";
+export const MARKET_TEST_UNIT = "nanoodle-market-check-alert-test.service";
 export const EMBER = "bits255.dots.ada_20261002";
 const safe = value => /^[a-zA-Z0-9_.:-]{1,100}$/.test(value || "") ? value : "unknown";
 
 export function failureEvent(env, latest, now = Date.now()) {
   if (!env.MONITOR_UNIT) return null; // A retry timer never invents another incident.
-  if (![CHECK_UNIT, TEST_UNIT].includes(env.MONITOR_UNIT) || !/^[a-f0-9]{32}$/.test(env.MONITOR_INVOCATION_ID || "")) throw Error("Unrecognized failure invocation");
-  const test = env.MONITOR_UNIT === TEST_UNIT;
+  if (![CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT) || !/^[a-f0-9]{32}$/.test(env.MONITOR_INVOCATION_ID || "")) throw Error("Unrecognized failure invocation");
+  const market = [MARKET_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT);
+  const test = [TEST_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT);
   const freshFailure = !test && latest?.ok === false && Math.abs(now - Date.parse(latest.checkedAt)) < 3_600_000;
   const stage = freshFailure ? safe(latest.stage) : "service";
   return { messageId: "near_check_" + createHash("sha256").update(env.MONITOR_UNIT + ":" + env.MONITOR_INVOCATION_ID).digest("hex").slice(0, 40), test,
-    text: [test ? "TEST ALERT — Nanoodle NEAR check notification drill. This is not a production outage." : "Nanoodle NEAR MCP daily check FAILED.",
-      `Site: https://near.nanoodle.com. Time: ${new Date(now).toISOString()}.`,
+    text: [test ? `TEST ALERT — Nanoodle ${market ? "Market" : "NEAR"} check notification drill. This is not a production outage.`
+        : market ? "Nanoodle NEAR AI Market availability check FAILED (every 15 minutes)." : "Nanoodle NEAR MCP daily check FAILED.",
+      `Site: https://${market ? "market.near.ai" : "near.nanoodle.com"}. Time: ${new Date(now).toISOString()}.`,
       `Stage: ${stage}. systemd result: ${safe(env.MONITOR_SERVICE_RESULT)}; exit: ${safe(env.MONITOR_EXIT_CODE)}/${safe(env.MONITOR_EXIT_STATUS)}.`,
-      "Inspect /var/lib/nanoodle-near-check/latest.json and journalctl -u nanoodle-near-check.service on 159.195.17.119.",
-      "Payment state is durable: resume the same run; do not send a replacement deposit blindly.",
+      `Inspect /var/lib/nanoodle-near-check/${market ? "market-latest.json" : "latest.json"} and journalctl -u ${market ? MARKET_UNIT : CHECK_UNIT} on 159.195.17.119.`,
+      market ? "Read-only probes cover the Market site, API and four published Nanoodle listings with live pricing. This check does not hire agents or run inference."
+        : "Payment state is durable: resume the same run; do not send a replacement deposit blindly.",
       ...(test ? ["Mikkel requested this test. Please claim and acknowledge this message in Babel, then reply to it confirming receipt. No repair or paid workflow is requested."] : []),
     ].join("\n") };
 }
@@ -65,7 +70,8 @@ export function babelClient(config, request = babelRequest) {
 export async function deliverAlerts(config, { env = process.env, now = Date.now, call = babelClient(config), enqueueOnly = false } = {}) {
   const dir = join(config.stateDir, "alerts"); mkdirSync(dir, { recursive: true, mode: 0o700 });
   let latest;
-  try { latest = JSON.parse(readFileSync(join(config.stateDir, "latest.json"))); } catch { /* early exit or timeout */ }
+  const reportFile = [MARKET_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT) ? "market-latest.json" : "latest.json";
+  try { latest = JSON.parse(readFileSync(join(config.stateDir, reportFile))); } catch { /* early exit or timeout */ }
   const event = failureEvent(env, latest, now());
   if (event) {
     const file = join(dir, event.messageId + ".json");

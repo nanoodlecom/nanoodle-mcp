@@ -1,0 +1,10 @@
+[Unit]
+Description=Check NEAR AI Market every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 UTC
+Persistent=true
+Unit=nanoodle-market-check.service
+
+[Install]
+WantedBy=timers.target
