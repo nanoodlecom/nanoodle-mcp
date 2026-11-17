@@ -7,11 +7,12 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock, createBlock } from "nanocurrency";
+import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
 import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
@@ -1216,4 +1217,139 @@ test("a funded run remains admitted through pause and always releases its reserv
   assert.equal(rpc.state.processed.length, 1);
   assert.deepEqual(wallet.ops.fundingStatus(), { activeRuns: 0, reservedRaw: "0" });
   assert.equal(w.maintenance.snapshot().activeOperations, 0);
+});
+
+async function hostedShutdownWorld(t, withMarket, { operatorControl = false } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "hosted-shutdown-")), graphs = join(dir, "graphs"), out = join(dir, "out");
+  await mkdir(graphs); await mkdir(out);
+  const graph = structuredClone(WORKED_GRAPH);
+  delete graph.nodes.find(node => node.type === "llm").fields.maxTokens;
+  graph.x402 = { author: PAY_TO };
+  await writeFile(join(graphs, "poster.json"), JSON.stringify(graph));
+  const deposits = new Map(), providerBlocks = new Set();
+  const pending = state => {
+    const received = new Set(state.processed.filter(p => p.subtype === "receive").map(p => p.block.link.toUpperCase()));
+    return [...deposits].filter(([hash]) => !received.has(hash));
+  };
+  const rpc = fakeRpc({
+    account_info: (_body, state, reply) => reply(nanoAccountInfo({ frontier: state.frontier, balance: state.balance, representative: ADDRESS,
+      height: state.processed.length + 1, pending: pending(state).reduce((sum, [, value]) => sum + BigInt(value.amount), 0n).toString() })),
+    receivable: (_body, state, reply) => reply({ blocks: Object.fromEntries(pending(state)) }),
+    account_history: (_body, state, reply) => reply({ history: state.processed.filter(p => p.subtype === "receive").map(p => ({
+      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount, confirmed: "true" })) }),
+    block_info: (body, state, reply) => {
+      const index = state.processed.findIndex(p => hashBlock(p.block) === body.hash);
+      return reply(index < 0 ? { error: "Block not found" } : { confirmed: "true", contents: state.processed[index].block, height: String(index + 2) });
+    },
+  });
+  const rpcServer = http.createServer(async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const response = await rpc.fetch("http://fixture.rpc", { body: Buffer.concat(chunks).toString() });
+    res.writeHead(response.status, { "Content-Type": "application/json" }); res.end(await response.text());
+  });
+  let reached, release;
+  const running = new Promise(resolve => { reached = resolve; }), held = new Promise(resolve => { release = resolve; });
+  const provider = nanoGptMock({ walletPayments: true, beforeChat: async () => { reached(); await held; }, walletPaymentSeen(invoice) {
+    let previous = BigInt(BALANCE);
+    for (const operation of rpc.state.processed) {
+      const amount = previous - BigInt(operation.block.balance); previous = BigInt(operation.block.balance);
+      const hash = hashBlock(operation.block);
+      if (operation.subtype === "send" && operation.block.link_as_account === "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet"
+        && amount === BigInt(invoice.amountRaw) && !providerBlocks.has(hash)) { providerBlocks.add(hash); return true; }
+    }
+    return false;
+  } });
+  const chain = createFakeChain(), key = await throwawayNearKey();
+  chain.addAccount("merchant.testnet", parseNearToYocto("10"), key.publicKey); chain.addAccount("payer.testnet", parseNearToYocto("5"));
+  chain.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 1_000_000n });
+  const market = withMarket ? createMarketMock() : null;
+  let child, stderr = "";
+  t.after(async () => {
+    release(); if (child) await stopServerChild(child);
+    await chain.close(); await provider.close(); await market?.close();
+    rpcServer.closeAllConnections(); if (rpcServer.listening) await new Promise(resolve => rpcServer.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  });
+  await new Promise(resolve => rpcServer.listen(0, "127.0.0.1", resolve)); await chain.listen(); await provider.listen(); await market?.listen();
+  const port = await freePort(), secondaryPort = await freePort(), base = `http://127.0.0.1:${port}`, secondary = `http://127.0.0.1:${secondaryPort}`;
+  child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`, "--public-url", base,
+    "--charge-usd", "0.05", "--xno-usd", "0.5", "--no-local-work", "--near-merchant", "merchant.testnet", "--near-network", "testnet",
+    "--near-rpc", chain.url, "--near-usd", "3.64", "--near-serve", `127.0.0.1:${secondaryPort}`, "--near-public-url", secondary], {
+    env: { PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANO_SEED: SEED,
+      NANO_RPC_URL: `http://127.0.0.1:${rpcServer.address().port}`, NANOGPT_BASE_URL: provider.url, NEAR_PRIVATE_KEY: key.secretKey,
+      NEAR_USDC: "1", NANOODLE_RUN_TIMEOUT_MS: "10000", MARKET_STATE_DIR: join(dir, "market"),
+      ...(operatorControl ? { NANOODLE_MAINTENANCE_FILE: join(dir, "maintenance.json"), NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) } : {}),
+      ...(market ? { MARKET_BASE_URL: market.url, MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.1", MARKET_LISTING_PRICE_USD: "1", MARKET_POLL_SECONDS: "1" } : {}) },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  for (let attempt = 0; !stderr.includes(market ? "market worker: polling" : "MCP over HTTP on"); attempt++) {
+    assert.equal(child.exitCode, null, stderr); assert.ok(attempt < 500, stderr); await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  return { child, graph, out, chain, deposits, providerBlocks, provider, base, secondary, running, release, controlFile: join(dir, "maintenance.json"), stderr: () => stderr };
+}
+
+for (const [asset, name, secondary, withMarket] of [["nano", "poster", false, false], ["near", "poster", true, true], ["near", "run_noodle", false, false], ["usdc", "run_noodle", true, false]]) {
+  test(`SIGTERM drains ${asset} ${name} through provider payments, creator payout and customer change`, { timeout: 20000 }, async t => {
+    const w = await hostedShutdownWorld(t, withMarket), client = mcpClient(secondary ? w.secondary : w.base);
+    const args = name === "run_noodle" ? { graph: w.graph, inputs: { Idea: "finish this paid idea" }, _pay_with: asset }
+      : { Idea: "finish this paid idea", _pay_with: asset };
+    const quote = await client.call(name, args), payment = asset === "nano" ? quote.structuredContent.x402 : quote.structuredContent.payment;
+    assert.ok(payment, JSON.stringify(quote));
+    let proof = {};
+    if (asset === "nano") w.deposits.set("C".repeat(64), { amount: payment.amountRaw, source: PAY_TO });
+    else proof = { _payment_tx: asset === "usdc" ? w.chain.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(payment.amountAtomic))
+      : w.chain.transfer("payer.testnet", "merchant.testnet", BigInt(payment.amountYocto)), _payment_sender: "payer.testnet" };
+    const result = client.call(name, { ...args, ...proof, _payment_id: payment.paymentId });
+    await w.running;
+    const exited = new Promise(resolve => w.child.once("exit", (code, signal) => resolve({ code, signal })));
+    w.child.kill("SIGTERM");
+    for (let attempt = 0; !w.stderr().includes("SIGTERM: no new work"); attempt++) {
+      assert.equal(w.child.exitCode, null, w.stderr()); assert.ok(attempt < 100, w.stderr()); await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    w.child.kill("SIGINT"); await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(w.child.exitCode, null, "a repeated signal must not abandon the accepted workflow");
+    assert.equal(w.child.signalCode, null);
+    w.release(); const done = await result;
+    assert.ok(!done.isError, JSON.stringify(done));
+    assert.deepEqual(await exited, { code: 0, signal: null }, w.stderr());
+    assert.equal(w.providerBlocks.size, 2, "both provider invoices finish after admission closes");
+    assert.equal(w.provider.runs(), 1);
+    const usage = (await readFile(join(w.out, asset === "nano" ? "usage.jsonl" : "near-usage.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    assert.ok(usage.some(event => event.event === "author_payout" && event.ok), "creator payout is durable before exit");
+    if (asset === "nano") {
+      const state = JSON.parse(await readFile(join(w.out, "gate-state.json"), "utf8"));
+      assert.equal(state.quotes.find(q => q.id === payment.paymentId).settled, true); assert.equal(state.owed.length, 0);
+      assert.ok(usage.some(event => event.event === "change" && event.ok));
+    } else {
+      assert.equal(done.structuredContent.receipt.refund.status, "sent");
+      const state = JSON.parse(await readFile(join(w.out, "near-state.json"), "utf8"));
+      assert.equal(Object.values(state.refunds).length, 1); assert.equal(Object.values(state.refunds)[0].status, "sent");
+      assert.equal(Object.values(state.payouts)[0].status, "sent");
+    }
+    assert.doesNotMatch(w.stderr(), /unhandled|shutdown could not be qualified|operator reconciliation is required/);
+  });
+}
+
+test("operator pause covers both actual listeners and preserves an already-paid custom USDC deposit", { timeout: 20000 }, async t => {
+  const w = await hostedShutdownWorld(t, false, { operatorControl: true }), client = mcpClient(w.secondary);
+  const args = { graph: w.graph, inputs: { Idea: "resume this existing deposit" }, _pay_with: "usdc" };
+  const payment = (await client.call("run_noodle", args)).structuredContent.payment;
+  const tx = w.chain.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(payment.amountAtomic));
+  const confirmed = await fetch(`${w.secondary}/near/pay/${payment.paymentId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ txHash: tx, senderId: "payer.testnet" }) });
+  assert.equal(confirmed.status, 200); assert.equal((await confirmed.json()).status, "paid");
+  await writeFile(w.controlFile, JSON.stringify({ v: 1, token: "a".repeat(32), operation: "backup", revision: null }), { mode: 0o600 });
+  for (const origin of [w.base, w.secondary]) {
+    const refused = await fetch(origin + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) });
+    assert.equal(refused.status, 503); assert.equal((await refused.json()).error.executionNotStarted, true);
+  }
+  assert.equal((await (await fetch(payment.statusUrl)).json()).status, "paid");
+  assert.equal(w.providerBlocks.size, 0); assert.equal(w.provider.runs(), 0);
+  await rm(w.controlFile);
+  const result = client.call("run_noodle", { ...args, _payment_id: payment.paymentId });
+  await w.running; w.release();
+  assert.equal((await result).structuredContent.receipt.outcome, "succeeded");
+  const count = w.providerBlocks.size;
+  await client.call("run_noodle", { ...args, _payment_id: payment.paymentId });
+  assert.equal(w.providerBlocks.size, count); assert.equal(w.provider.runs(), 1);
 });

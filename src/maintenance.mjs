@@ -115,3 +115,16 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
     },
   };
 }
+
+/** Operator environment only; graph/tool arguments cannot configure admission. */
+export function maintenanceConfig(env = process.env) {
+  const file = env.NANOODLE_MAINTENANCE_FILE, uid = env.NANOODLE_MAINTENANCE_OWNER_UID;
+  if (file === undefined) {
+    if (uid !== undefined) throw TypeError("Maintenance owner UID requires a control file");
+    return { file: null, ownerUid: 0 };
+  }
+  if (typeof file !== "string" || !isAbsolute(file) || normalize(file) !== file) throw TypeError("Maintenance control file must be an absolute canonical path");
+  const text = uid ?? "0";
+  if (!/^(0|[1-9][0-9]{0,9})$/.test(text) || Number(text) >= 4_294_967_295) throw TypeError("Maintenance owner UID must be an exact operating-system UID");
+  return { file, ownerUid: Number(text) };
+}

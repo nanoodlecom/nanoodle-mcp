@@ -28,8 +28,8 @@
  * payment (observed live 2026-07-22).
  */
 import { randomBytes, createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { writeFile, rename, mkdir } from "node:fs/promises";
+import { readFileSync, constants } from "node:fs";
+import { open, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkAddress } from "nanocurrency";
 import { rawToXno, authorAddress } from "./wallet.mjs";
@@ -464,8 +464,18 @@ export function createChargeGate({
       });
       await mkdir(dirname(stateFile), { recursive: true });
       const tmp = stateFile + ".tmp";
-      await writeFile(tmp, data);
+      const handle = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+      try {
+        const state = await handle.stat();
+        if (!state.isFile() || state.nlink !== 1 || state.uid !== process.getuid()) throw Error("unsafe payment-state staging file");
+        await handle.chmod(0o600);
+        await handle.truncate(0);
+        await handle.writeFile(data);
+        await handle.sync();
+      } finally { await handle.close(); }
       await rename(tmp, stateFile);
+      const directory = await open(dirname(stateFile), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { await directory.sync(); } finally { await directory.close(); }
       persistenceFailed = false;
     };
     const complete = async () => {

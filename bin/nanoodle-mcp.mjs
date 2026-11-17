@@ -36,7 +36,7 @@
  * --max-usd refuses any single invoice above $n.
  */
 import { nearAgentGuide } from "../src/near/agent-guide.mjs";
-import { readFile, appendFile, mkdir } from "node:fs/promises";
+import { readFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import process from "node:process";
 import { loadTools, attachEstimates, attachCatalogs } from "../src/tools.mjs";
@@ -47,6 +47,9 @@ import { serveHttp } from "../src/http.mjs";
 import { redactUrl } from "../src/redact.mjs";
 import { startSweeper } from "../src/sweep.mjs";
 import { acquireWriterLocks, canonicalStatePath } from "../src/process-lock.mjs";
+import { createMaintenanceBarrier, maintenanceConfig } from "../src/maintenance.mjs";
+import { createServiceLifecycle, moneyStateStatus } from "../src/service-lifecycle.mjs";
+import { createMoneyLog } from "../src/money-log.mjs";
 import { verifyStartupState } from "../src/startup-state.mjs";
 /*
  * src/wallet.mjs and src/gate.mjs are the ONLY modules that reach `nanocurrency`,
@@ -158,6 +161,8 @@ Without --serve the server speaks MCP over stdio — wire it into an MCP client.
 Every tools/call spends real money (your NanoGPT balance, or your Nano wallet).`);
   process.exit(code);
 }
+
+let serviceLifecycle = null, finishStartup = () => {};
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -339,6 +344,26 @@ async function main() {
   }
 
   const resolvedOut = resolve(outDir || "./nanoodle-out");
+  const maintenance = serveSpec === null ? null : createMaintenanceBarrier(maintenanceConfig());
+  const httpServers = [];
+  let gate = null, near = null, marketService = null, usageWriter = null;
+  const moneyState = () => moneyStateStatus([gate?.persistenceStatus(), usageWriter?.status(), near?.usageStatus()]);
+  if (maintenance) {
+    maintenance.assertAdmitted(); // A retained/unsafe operator flag must fail before recovery or signing.
+    const startup = new Promise(resolve => { finishStartup = resolve; });
+    // Track startup without lending its async context to listener/poll callbacks.
+    const startupLifetime = maintenance.run(() => startup, "background");
+    serviceLifecycle = createServiceLifecycle({ maintenance, startup: startupLifetime, servers: () => httpServers,
+      market: () => marketService,
+      stopPayments: async () => { await Promise.all([gate?.stop(), near?.watcher.stop()]); },
+      storageHealthy: () => { const state = moneyState(); return state.ok && state.pendingWrites === 0; },
+      log: line => console.error("nanoodle-mcp: " + line) });
+    for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
+      serviceLifecycle.stop(signal).then(({ exitCode }) => process.exit(exitCode), () => {
+        console.error("nanoodle-mcp: shutdown could not be qualified"); process.exit(1);
+      });
+    });
+  }
   const paidFunding = serveSpec !== null && (chargeUsd != null || nearMode);
   const marketEnabled = serveSpec !== null && !!(process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN);
   const guardedFunding = paidFunding || marketEnabled;
@@ -366,6 +391,7 @@ async function main() {
         workKey,
         localWork: !noLocalWork,
         maxUsd,
+        maintenance,
         fundingLiabilities: context => fundingSources ? fundingSources.liabilitiesRaw(context) : 0n,
         requireFunding: paidFunding && !apiKey,
         protectTransfers: guardedFunding,
@@ -549,11 +575,9 @@ async function main() {
 
   let listTools = () => registry.listTools();
   let callTool;
-  let gate = null;
   let instructions;
   let paymentNote = null;
   let nearInfo = null;
-  let near = null;
   const nearHealth = nearMode ? { merchant: nearMerchant, network: nearNetwork } : null;
   if (nearMode) {
     try {
@@ -563,7 +587,7 @@ async function main() {
         xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
         modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
         nanoOps: wallet?.ops,
-        fundingSources,
+        fundingSources, maintenance,
         requireExistingState: requiredState?.requireExisting === true,
         assertWriter: () => writerLocks.assertHeld(),
         maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
@@ -582,14 +606,9 @@ async function main() {
   }
   if (chargeUsd != null) {
     usagePath = join(resolvedOut, "usage.jsonl");
-    let usageChain = Promise.resolve();
-    usageLog = (event, fields) => {
-      const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
-      usageChain = usageChain
-        .then(() => mkdir(resolvedOut, { recursive: true }))
-        .then(() => appendFile(usagePath, line))
-        .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
-    };
+    usageWriter = createMoneyLog({ file: usagePath, maintenance,
+      log: line => console.error("nanoodle-mcp: " + line) });
+    usageLog = usageWriter.write;
     // Forecast each graph's per-run cost from the public catalog so the FIRST quote
     // for a never-run tool already deposits enough to cover it (change returns the
     // slack). Best-effort — a catalog that won't load just leaves the flat opening
@@ -623,7 +642,7 @@ async function main() {
       fundRun: !apiKey ? wallet.ops.withFunding : null,
       canQuote: () => !fundingSources || fundingSources.ready(),
       log: (line) => console.error("nanoodle-mcp: " + line),
-      usage: usageLog,
+      usage: usageLog, maintenance,
     });
     fundingSources?.registerNano(gate.fundingLiabilitiesRaw);
     const nanoWrapped = gate.wrapRegistry(registry);
@@ -670,7 +689,7 @@ async function main() {
   let creators = null, creatorPayments = null;
   if (fundingSources) {
     const { startFundingReport } = await import("../src/funding-report.mjs");
-    await startFundingReport({ outDir: resolvedOut, snapshot: wallet.ops.fundingReport, sources: fundingSources,
+    await startFundingReport({ outDir: resolvedOut, snapshot: wallet.ops.fundingReport, sources: fundingSources, durableState: moneyState,
       writerProtection: () => {
         writerLocks.assertHeld();
         return { enforced: true, requiredState: requiredState?.requireExisting === true };
@@ -686,7 +705,8 @@ async function main() {
       publicBase: (nearServePort ? nearPublicUrl : publicBase).replace(/\/+$/, ""), merchant: nearInfo.merchant,
       network: nearInfo.network, usdc: near.usdc, maxDepositUsd: nearMaxDeposit ?? 2, baseUrl: process.env.NANOGPT_BASE_URL });
   }
-  await serveHttp({
+  if (serviceLifecycle.isStopping()) return;
+  httpServers.push(await serveHttp({
     host: serveHost,
     port: servePort,
     name: "nanoodle-mcp",
@@ -704,15 +724,15 @@ async function main() {
     outDir: resolvedOut,
     publicBase,
     marketWebhook,
-    creators: !gate ? creators : null,
+    creators: !gate ? creators : null, maintenance,
     log: (...a) => console.error(...a),
-  });
+  }));
   if (nearServePort) {
     // Advertise no runnable tools if merchant verification fails; the Nano
     // endpoint continues serving while the NEAR account awaits funding.
     const unavailable = () => ({ content: [{ type: "text", text: "NEAR payments are unavailable. The merchant account must be funded and its refund key verified before any workflows can run." }], isError: true });
     try {
-      await serveHttp({
+      httpServers.push(await serveHttp({
         host: nearServeHost, port: nearServePort, name: "nanoodle-mcp", version: pkg.version,
         listTools: near ? near.wrapped.listTools : () => [],
         callTool: near ? near.wrapped.callTool : unavailable,
@@ -723,9 +743,9 @@ async function main() {
         allowedOrigins: (process.env.NEAR_PUBLIC_ALIASES || "").split(",").map((s) => s.trim()).filter(Boolean),
         toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
         publicBase: nearPublicUrl.replace(/\/+$/, ""),
-        creators,
+        creators, maintenance,
         log: (...a) => console.error(...a),
-      });
+      }));
       console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl}/mcp on ${nearServeHost}:${nearServePort} — shared Nano funding pool${near ? "" : "; NEAR payments unavailable"}`);
     } catch (e) {
       console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl} could not listen on ${nearServeHost}:${nearServePort}: ${e.message}`);
@@ -749,9 +769,9 @@ async function main() {
 
   // NEAR Agent Market worker, inside this server: it pays NanoGPT exactly as the server
   // does (API key, or the Nano wallet through x402) and shares the wallet's one send queue.
-  let marketService = null;
+  if (serviceLifecycle.isStopping()) return;
   if (process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
-    marketService = await startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources,
+    marketService = await startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources, maintenance,
       requireExistingState: requiredState?.requireExisting === true,
       fundingPair: gate?.fundingPair || (near ? async () => {
         const r = await near.rates.currentUsdc();
@@ -759,19 +779,7 @@ async function main() {
         return { usdNano: parseUsdNano(r.xnoUsd), raw: 10n ** 30n };
       } : null) });
   }
-  if (marketService) {
-    let stopping = false;
-    const stop = async sig => {
-      if (stopping) process.exit(1);
-      stopping = true;
-      console.error(`nanoodle-mcp: market worker: ${sig}: no new jobs; waiting up to 20 s for the jobs in hand`);
-      marketService?.stop();
-      const timer = setTimeout(() => process.exit(0), 20_000);
-      await marketService.done; clearTimeout(timer); process.exit(0);
-    };
-    process.on("SIGTERM", () => void stop("SIGTERM"));
-    process.on("SIGINT", () => void stop("SIGINT"));
-  }
+
 }
 
 /**
@@ -782,7 +790,7 @@ async function main() {
  * (MARKET_AGENTS_FILE, MARKET_PRICE_REFRESH_SECONDS, MARKET_AUTO_PRICE); and MARKET_STATE_DIR.
  * With a catalog, log lines name the listing ("[handle] …") and SIGTERM drains every listing.
  */
-async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources, fundingPair, requireExistingState }) {
+async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources, fundingPair, requireExistingState, maintenance }) {
   const say = (line) => console.error("nanoodle-mcp: market worker: " + line);
   try {
     const [{ readConfig, startMarketService }, { logSafe }] = await Promise.all([
@@ -792,7 +800,7 @@ async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creato
     const cfg = readConfig([], env, { needKey: !wallet });
     const funded = !cfg.apiKey && wallet && fundingSources;
     const svc = await startMarketService(cfg, { payment: !cfg.apiKey && wallet ? wallet.payment : null, creatorPayments,
-      requireExistingState,
+      requireExistingState, maintenance,
       fundRun: funded ? wallet.ops.withFunding : null, fundingPair: funded ? fundingPair : null,
       registerFundingSource: (file, reader) => fundingSources?.registerMarket(file, reader), log: (l) => say(logSafe(l)) });
     // The HTTP server is already listening; from here it passes the market's events on.
@@ -814,7 +822,7 @@ async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creato
 async function startNearMode({
   registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
   quoteTtlMin, refreshS, modelPayment, nanoOps, fundingSources, maxDepositUsd, outDir, publicBase, dual,
-  requireExistingState = false,
+  requireExistingState = false, maintenance = null,
   assertWriter = () => {},
 }) {
   // With both rails on one server a NEAR problem must never stop the Nano rail:
@@ -865,14 +873,9 @@ async function startNearMode({
 
   // With both rails on one server, each gate keeps its own payments ledger.
   const usagePath = join(outDir, dual ? "near-usage.jsonl" : "usage.jsonl");
-  let usageChain = Promise.resolve();
-  const usage = (event, fields) => {
-    const line = JSON.stringify({ ts: new Date().toISOString(), event, ...fields }) + "\n";
-    usageChain = usageChain
-      .then(() => mkdir(outDir, { recursive: true }))
-      .then(() => appendFile(usagePath, line))
-      .catch((e) => console.error(`nanoodle-mcp: cannot write ${usagePath}: ${e.message}`));
-  };
+  const usageWriter = createMoneyLog({ file: usagePath, maintenance,
+    log: line => console.error("nanoodle-mcp: " + line) });
+  const usage = usageWriter.write;
   const log = (line) => console.error("nanoodle-mcp: " + line);
 
   // Catalogs clamp payloads and price every quote; refreshed hourly as in charge mode
@@ -936,16 +939,16 @@ async function startNearMode({
   const fundingTimer = setInterval(() => { refundFunding.refresh().catch(() => {}); }, 30_000);
   fundingTimer.unref();
   const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken,
-    beforeSign: refundFunding.beforeSign, beforeComplete: refundFunding.beforeComplete });
+    beforeSign: refundFunding.beforeSign, beforeComplete: refundFunding.beforeComplete, maintenance });
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
-  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage }) : null;
+  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance }) : null;
   let watcher = null;
   const gate = createNearGate({
     merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled, authorPayouts,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
     canQuote: () => watcher?.status().listening === true && (!fundingSources || fundingSources.ready()),
-    fundRun: modelPayment === "wallet" ? nanoOps.withFunding : null, refundFunding,
+    fundRun: modelPayment === "wallet" ? nanoOps.withFunding : null, refundFunding, maintenance,
   });
   fundingSources?.registerNear(gate.fundingLiabilitiesRaw, () => authorPayouts?.records() ?? []);
   const wrapped = gate.wrapRegistry(registry);
@@ -953,7 +956,7 @@ async function startNearMode({
   await gate.resume(); // before serving: a run a previous process left in flight is refunded, never re-run
   watcher = near.createNearWatcher({
     rpc, ledger, merchantId: merchant, pendingQuotes: gate.pendingQuotes,
-    observeTransfer: gate.observeTransfer, log, tokenContracts: [usdcToken],
+    observeTransfer: gate.observeTransfer, log, tokenContracts: [usdcToken], maintenance,
   });
   await watcher.start();
 
@@ -997,8 +1000,14 @@ async function startNearMode({
     "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." +
     (usdcEnabled ? ` Choose _pay_with: "usdc" for Circle-issued USDC on NEAR, including USDC change and refunds; otherwise the quote is in native NEAR.` : "") + ratesLine;
   return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions: dual ? instructions : nearInstructions,
-    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant, funding: refundFunding.status }, usagePath };
+    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant, funding: refundFunding.status }, usagePath, usageStatus: usageWriter.status };
 }
 
-main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
+main().then(() => finishStartup(), error => {
+  finishStartup();
+  if (serviceLifecycle?.isStopping()) return; // The signal handler awaits this startup lifetime.
+  console.error("nanoodle-mcp: " + (error?.message || error));
+  if (!serviceLifecycle) process.exit(1);
+  else serviceLifecycle.stop("startup failed").then(() => process.exit(1), () => process.exit(1));
+});
 

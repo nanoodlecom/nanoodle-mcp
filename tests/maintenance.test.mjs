@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, renameSync, rmSync, chmodSync, symlinkSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { createMaintenanceBarrier } from "../src/maintenance.mjs";
+import { createMaintenanceBarrier, maintenanceConfig } from "../src/maintenance.mjs";
 
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const token = "a".repeat(32), revision = "b".repeat(40);
@@ -158,4 +158,13 @@ test("local shutdown closure is irreversible even when the operator removes its 
   assert.equal(w.barrier.accepting(), false);
   await w.barrier.waitForIdle();
   assert.equal(w.barrier.snapshot().code, "service-stopping");
+});
+
+test("operator maintenance configuration defaults to root ownership and rejects ambiguous settings", () => {
+  assert.deepEqual(maintenanceConfig({}), { file: null, ownerUid: 0 });
+  assert.deepEqual(maintenanceConfig({ NANOODLE_MAINTENANCE_FILE: "/etc/nanoodle-mcp/maintenance.json" }), { file: "/etc/nanoodle-mcp/maintenance.json", ownerUid: 0 });
+  assert.deepEqual(maintenanceConfig({ NANOODLE_MAINTENANCE_FILE: "/tmp/flag", NANOODLE_MAINTENANCE_OWNER_UID: "1000" }), { file: "/tmp/flag", ownerUid: 1000 });
+  for (const file of ["", "relative", "/tmp/../flag"]) assert.throws(() => maintenanceConfig({ NANOODLE_MAINTENANCE_FILE: file }), TypeError);
+  for (const uid of ["-1", "00", "1.5", "4294967295", "Infinity"]) assert.throws(() => maintenanceConfig({ NANOODLE_MAINTENANCE_FILE: "/tmp/flag", NANOODLE_MAINTENANCE_OWNER_UID: uid }), TypeError);
+  assert.throws(() => maintenanceConfig({ NANOODLE_MAINTENANCE_OWNER_UID: "1000" }), TypeError);
 });

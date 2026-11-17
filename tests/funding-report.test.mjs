@@ -126,3 +126,19 @@ test("a pending refresh cannot keep stale checkout admission alive or discard pr
   assert.equal(w.sources.ready(), true, "a fresh successful observation restores admission");
   assert.equal(snapshots, 2);
 });
+
+test("failed money-state persistence pauses checkout admission without inference and normal queued writes do not", async t => {
+  const w = await setup(t); let state = { ok: true, pendingWrites: 2, privateExtra: "PRIVATE_MONEY_EVENT" };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, snapshot: async () => value, durableState: () => state });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  assert.deepEqual(JSON.parse(await readFile(w.file, "utf8")).durableState, { ok: true, pendingWrites: 2 });
+  state.ok = false; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
+  state = { ok: true, pendingWrites: "unknown" }; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).code, "funding-state-unavailable");
+  state = { ok: true, pendingWrites: 0 }; await report.refresh();
+  assert.equal(w.sources.ready(), true);
+});

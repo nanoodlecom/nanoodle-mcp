@@ -1168,13 +1168,14 @@ export async function serveHttp({
     }
   };
 
+  const readOnlyResponses = new Set();
   const server = http.createServer((req, res) => {
-    // Keep a POST registered until its async handler finishes, even if the
-    // caller disconnects. Losing an SSE socket does not finish paid model work.
-    // Read-only GETs, including payment status streams, remain available.
-    const result = maintenance && req.method === "POST"
-      ? maintenance.run(() => handleRequest(req, res)) : handleRequest(req, res);
-    result.catch(error => {
+    if (["GET", "HEAD"].includes(req.method)) {
+      readOnlyResponses.add(res);
+      const release = () => { readOnlyResponses.delete(res); };
+      res.once("finish", release); res.once("close", release);
+    }
+    const fail = error => {
       if (res.headersSent) { res.destroy(); return; }
       if (error instanceof MaintenanceError && error.code === "SERVICE_DRAINING") {
         res.writeHead(503, { "Content-Type": "application/json", "Cache-Control": "no-store", "Retry-After": "5", "Access-Control-Allow-Origin": "*" });
@@ -1185,9 +1186,28 @@ export async function serveHttp({
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "internal error" }));
       }
-    });
+    };
+    let result;
+    if (maintenance && req.method === "POST") {
+      const flushed = new Promise(resolve => {
+        const finish = () => { res.off("finish", finish); res.off("close", finish); resolve(); };
+        res.once("finish", finish); res.once("close", finish);
+      });
+      result = maintenance.run(async () => {
+        // A disconnected caller does not finish paid work; an ended response
+        // may still be backpressured. Wait for both the handler and socket flush.
+        try { await handleRequest(req, res); } catch (error) { fail(error); }
+        await flushed;
+      });
+    } else result = handleRequest(req, res);
+    result.catch(fail);
   });
 
+  // Closing unpaid watches must not destroy a paid POST response still being
+  // flushed to its caller. server.close() retains those sockets until finish.
+  server.closeReadOnlyStreams = () => {
+    for (const response of readOnlyResponses) if (!response.writableEnded && !response.destroyed) response.end();
+  };
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);

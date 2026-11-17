@@ -7,7 +7,7 @@ import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
-export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
+export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, durableState = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
   let pending = null;
@@ -36,6 +36,12 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           report.ok &&= report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
             && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
             && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers && age <= 60_000 && age >= -30_000;
+        }
+        if (durableState) {
+          const state = durableState();
+          if (typeof state?.ok !== "boolean" || !Number.isSafeInteger(state.pendingWrites) || state.pendingWrites < 0) throw Error("durable write health unavailable");
+          report.durableState = { ok: state.ok, pendingWrites: state.pendingWrites };
+          report.ok &&= state.ok; // Normal queued writes do not indicate a failed snapshot.
         }
         if (writerProtection) {
           const proof = writerProtection();

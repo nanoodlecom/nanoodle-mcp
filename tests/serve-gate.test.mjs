@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile, readFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, mkdir, link, symlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2463,6 +2463,7 @@ test("Nano result completion cannot hide an unfinished change send or its durabl
   chain.state.failTransfer = true; release(); await idle;
   const state = JSON.parse(await readFile(stateFile, "utf8"));
   assert.equal(state.owed.length, 1, "the retry debt must exist before the drain acknowledgement");
+  assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
   assert.equal(state.owed[0].fields.paymentId, payment.paymentId);
   assert.equal(w.maintenance.snapshot().activeOperations, 0);
 });
@@ -2484,4 +2485,16 @@ test("a failed Nano state flush remains unhealthy after drain until a later snap
   await w.pause(); await w.maintenance.waitForIdle();
   assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: true, pendingWrites: 0 });
   assert.equal(JSON.parse(await readFile(stateFile, "utf8")).quotes.length, 2);
+});
+
+for (const [kind, makeLink] of [["symlink", symlink], ["hardlink", link]]) test(`Nano state snapshots reject a ${kind} staging file without modifying its target`, async t => {
+  const w = await gateMaintenance(t), chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-staging-link-")), file = join(dir, "state.json"), target = join(dir, "private-target");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(target, "KEEP PRIVATE STATE"); await makeLink(target, file + ".tmp");
+  const gate = makeGate(chain, { registry, stateFile: file, maintenance: w.maintenance }); t.after(() => gate.stop());
+  await gate.wrapRegistry(registry).callTool({ name: "poster", arguments: { Text: "refuse unsafe storage" } });
+  await w.pause(); await w.maintenance.waitForIdle();
+  assert.equal(await readFile(target, "utf8"), "KEEP PRIVATE STATE");
+  assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: false, pendingWrites: 0 });
 });

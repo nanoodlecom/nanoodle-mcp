@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServiceLifecycle } from "../src/service-lifecycle.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 
@@ -63,4 +64,24 @@ test("invalid requests and tool failures release HTTP operation registrations", 
   assert.equal(w.maintenance.snapshot().activeOperations, 0);
   const response = await w.post(); await response.text();
   assert.equal(w.maintenance.snapshot().activeOperations, 0);
+});
+
+test("shutdown closes read-only payment watches while a large paid POST response finishes intact", { timeout: 10000 }, async t => {
+  const maintenance = createMaintenanceBarrier(), output = "result ".repeat(1_000_000);
+  const gate = { quote: () => ({ status: "pending", amountRaw: "123", expiresAt: "2099-01-01" }),
+    waitForPayment: (_id, _ms, { signal }) => new Promise(resolve => signal.addEventListener("abort", resolve, { once: true })) };
+  const server = await serveHttp({ host: "127.0.0.1", port: 0, publicBase: "http://example.test", name: "test", version: "0", maintenance, gate,
+    listTools: () => [{ name: "work", inputSchema: { type: "object" } }], callTool: async () => ({ content: [{ type: "text", text: output }] }), log: () => {} });
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const watch = await fetch(base + "/x402/watch/payment"), readingWatch = watch.text().catch(error => error);
+  const response = await fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(call) });
+  const lifecycle = createServiceLifecycle({ maintenance, servers: () => [server], stopPayments: async () => {}, market: () => null });
+  const stopped = lifecycle.stop("SIGTERM");
+  // Begin draining while the client has not read its large POST body yet.
+  await new Promise(resolve => setImmediate(resolve));
+  const result = await response.json(); assert.equal(result.result.content[0].text, output);
+  assert.deepEqual(await stopped, { exitCode: 0 });
+  const endedWatch = await readingWatch;
+  assert.ok(typeof endedWatch === "string" ? endedWatch.includes("pending") : endedWatch instanceof TypeError, "a read-only watch may close when its server stops");
 });
