@@ -19,6 +19,7 @@
 import http from "node:http";
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { base58Encode, base58Decode } from "../../src/near/base58.mjs";
+import { nearProtocol } from "./near-fees.mjs";
 
 export const GAS_YOCTO = 44_627_500_000_000_000_000n; // ~0.0000446 NEAR, a plain transfer's burn
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -60,6 +61,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
   const blocks = new Map();   // hash -> block
   const txs = new Map();      // hash -> FINAL tx result
   const tokens = new Map();
+  const snapshots = new Map();
   let height = 230_000_000;
   const log = [];             // every RPC call: { method, params }
   const chain = {
@@ -72,6 +74,8 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     /** tx lookups answer "unknown" this many more times (not final yet). */
     hideTx: 0,
     sendTxCount: 0,
+    gasPrice: "100000000",
+    minGasPurchasePrice: "1000000000",
   };
 
   let lastBlockHash = rid();
@@ -96,6 +100,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     return block;
   }
   let head = newBlock(now());
+  const snapshot = () => snapshots.set(head.header.hash, { accounts: structuredClone(accounts), tokens: structuredClone(tokens) });
 
   chain.addAccount = (id, balanceYocto = 0n, publicKey = null, nonce = 275_735_371_000_000n) => {
     const a = { balance: BigInt(balanceYocto), keys: new Map() };
@@ -121,6 +126,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
   function record({ hash, signerId, publicKey, nonce, receiverId, actions, signature, blockTimeMs, success = true, logs = [] }) {
     const block = newBlock(blockTimeMs ?? now());
     head = block;
+    snapshot();
     const receiptId = rid();
     const meta = { version: 1, gas_profile: null };
     const result = {
@@ -165,6 +171,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
 
   /** A wallet-side transfer: records a FINAL tx and returns its hash. */
   chain.transfer = (from, to, yocto, { blockTimeMs, actions } = {}) => {
+    snapshot();
     const acts = actions || [{ Transfer: { deposit: BigInt(yocto).toString() } }];
     const total = acts.reduce((s, x) => s + BigInt((x.Transfer && x.Transfer.deposit) || 0), 0n);
     move(from, to, total);
@@ -173,6 +180,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     return hash;
   };
   chain.ftTransfer = (contract, from, to, amount, { blockTimeMs } = {}) => {
+    snapshot();
     const event = moveFt(contract, from, to, amount);
     move(from, contract, 1n);
     const hash = rid();
@@ -200,6 +208,8 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
       const b = blocks.get(params && params.block_id);
       return b ? ok(id, b) : rpcError(id, "UNKNOWN_BLOCK", "DB Not Found Error: BLOCK HEIGHT");
     }
+    if (method === "gas_price") return ok(id, { gas_price: chain.gasPrice });
+    if (method === "EXPERIMENTAL_protocol_config") return ok(id, nearProtocol({ chainId, floor: chain.minGasPurchasePrice }));
     if (method === "tx") {
       // Like public testnet RPC (checked on rpc.testnet.near.org and rpc.testnet.fastnear.com,
       // 2026-11), the lookup finds the transaction even when sender_account_id is wrong.
@@ -226,9 +236,14 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
         : rpcError(id, "UNKNOWN_RECEIPT", "unknown receipt");
     }
     if (method === "query") {
-      const acct = accounts.get(params.account_id);
+      const at = params.block_id == null ? head : blocks.get(params.block_id);
+      if (!at) return rpcError(id, "UNKNOWN_BLOCK", "unknown query block");
+      const state = at === head ? { accounts, tokens } : snapshots.get(at.header.hash);
+      if (!state) return rpcError(id, "UNKNOWN_BLOCK", "missing historical state");
+      const metadata = { block_hash: at.header.hash, block_height: at.header.height };
+      const acct = state.accounts.get(params.account_id);
       if (params.request_type === "call_function") {
-        const balances = tokens.get(params.account_id);
+        const balances = state.tokens.get(params.account_id);
         if (!balances) return rpcError(id, "UNKNOWN_ACCOUNT", "unknown token");
         const args = JSON.parse(Buffer.from(params.args_base64, "base64").toString());
         let value;
@@ -236,18 +251,18 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
         else if (params.method_name === "ft_balance_of") value = String(balances.get(args.account_id) ?? 0n);
         else if (params.method_name === "storage_balance_of") value = balances.has(args.account_id) ? { total: "1250000000000000000000", available: "0" } : null;
         else return rpcError(id, "UNSUPPORTED", "unknown FT view");
-        return ok(id, { result: [...Buffer.from(JSON.stringify(value))], logs: [], block_hash: head.header.hash, block_height: head.header.height });
+        return ok(id, { result: [...Buffer.from(JSON.stringify(value))], logs: [], ...metadata });
       }
       if (params.request_type === "view_account") {
         if (!acct) return rpcError(id, "UNKNOWN_ACCOUNT", `account ${params.account_id} does not exist while viewing`);
-        return ok(id, { amount: acct.balance.toString(), locked: "0", code_hash: "11111111111111111111111111111111", storage_usage: 182, block_height: head.header.height, block_hash: head.header.hash });
+        return ok(id, { amount: acct.balance.toString(), locked: "0", code_hash: "11111111111111111111111111111111", storage_usage: 182, ...metadata });
       }
       if (params.request_type === "view_access_key") {
         const k = acct && acct.keys.get(params.public_key);
         if (!k) {
-          return ok(id, { error: `access key ${params.public_key} does not exist while viewing`, logs: [], block_height: head.header.height, block_hash: head.header.hash });
+          return ok(id, { error: `access key ${params.public_key} does not exist while viewing`, logs: [], ...metadata });
         }
-        return ok(id, { nonce: Number(k.nonce), permission: "FullAccess", block_height: head.header.height, block_hash: head.header.hash });
+        return ok(id, { nonce: Number(k.nonce), permission: "FullAccess", ...metadata });
       }
       return rpcError(id, "UNSUPPORTED", "fake chain: unsupported query");
     }
@@ -277,6 +292,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
       if (!blocks.has(base58Encode(t.blockHash))) {
         return rpcError(id, "INVALID_TRANSACTION", { TxExecutionError: { InvalidTxError: "Expired" } });
       }
+      snapshot();
       key.nonce = t.nonce;
       let logs = [];
       if (t.actions[0].Transfer) move(t.signerId, t.receiverId, t.actions[0].Transfer.deposit);

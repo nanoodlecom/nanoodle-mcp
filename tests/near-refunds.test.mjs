@@ -427,6 +427,15 @@ test("send_tx that returns before the receipt executed is confirmed with tx at F
   });
 });
 
+test("executed receipts without FINAL still require a finalized transaction lookup", async () => {
+  await withLedger(async ({ open }) => {
+    const { rpc, log } = mockChain({ onSend: () => ({ result: { ...DONE, final_execution_status: "EXECUTED" } }), onTx: () => ({ result: DONE }) });
+    const { refunder } = make(rpc, open());
+    assert.equal((await refunder.refund({ paymentId: "not-final", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" })).status, "sent");
+    assert.equal(log.txs.length, 1);
+  });
+});
+
 test("an old refund whose hash the RPC no longer knows is not re-signed (no double refund after RPC garbage collection)", async () => {
   await withLedger(async ({ open }) => {
     const ledger = open();
@@ -446,5 +455,33 @@ test("an old refund whose hash the RPC no longer knows is not re-signed (no doub
     assert.equal(rec.lastError, "UNPROVABLE");
     assert.equal(log.sends.length, 2, "no third (re-signed) broadcast");
     assert.match(lines.join("\n"), /could not be confirmed/);
+  });
+});
+
+test("insufficient refund funding retains an unsigned debt and does not consume a nonce", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), { rpc, log } = mockChain({ onSend: () => ({ result: DONE }) });
+    let ready = false;
+    const { refunder, advance } = make(rpc, ledger, { beforeSign: () => {
+      if (!ready) throw Object.assign(Error("funding unavailable"), { code: "NEAR_FUNDING_INSUFFICIENT" });
+    } });
+    const debt = await refunder.refund({ paymentId: "funding", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    assert.equal(debt.status, "pending"); assert.equal(log.sends.length, 0);
+    assert.equal(ledger.getRefund(debt.refundId).status, "queued");
+    assert.equal(ledger.getRefund(debt.refundId).signedTxBase64, null); assert.equal(ledger.getMeta("lastNonce"), undefined);
+    ready = true; advance(31_000); await refunder.tick();
+    assert.equal(ledger.getRefund(debt.refundId).status, "sent"); assert.equal(log.sends.length, 1);
+  });
+});
+
+test("an already signed refund still reconciles with identical bytes when fresh signing is paused", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), { rpc, log } = mockChain({ onSend: (_bytes, n) => n === 1 ? { http: 503 } : { result: DONE } });
+    let checks = 0;
+    const { refunder, advance } = make(rpc, ledger, { beforeSign: () => { if (++checks > 1) throw Error("no new signing"); } });
+    const debt = await refunder.refund({ paymentId: "already-signed", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    assert.equal(debt.status, "pending"); advance(31_000); await refunder.tick();
+    assert.equal(ledger.getRefund(debt.refundId).status, "sent"); assert.equal(checks, 1);
+    assert.deepEqual(log.sends, [log.sends[0], log.sends[0]]);
   });
 });

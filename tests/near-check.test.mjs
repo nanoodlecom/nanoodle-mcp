@@ -37,6 +37,8 @@ async function fixture() {
         amountYocto: parseNearToYocto(change.deposit || "0.004").toString(), depositUsd: "0.01", expiresAt: new Date(day + 600_000).toISOString() } } });
     }
     assert.equal(args._payment_tx, undefined, "the canary must exercise discovery without hints");
+    if (change.paused) return ok({ isError: true, content: [{ type: "text", text: "refund funding unavailable" }],
+      structuredContent: { payment: { paymentId: args._payment_id, status: "paid", retryable: true } } });
     if (!result) {
       runs++;
       const state = JSON.parse(readFileSync(join(stateDir, "state.json")));
@@ -101,6 +103,17 @@ test("version-one canary checkpoints retain their original expected output and g
   assert.equal(f.quotes(), 1); assert.equal(f.runs(), 1);
   assert.equal((await runCheck(f.config, f.deps)).reused, true);
   assert.equal(f.chain.sendTxCount, 2);
+});
+
+test("a funding pause resumes the retained payment without caching a temporary error or paying again", async () => {
+  const f = await fixture(); f.change.paused = true;
+  await assert.rejects(runCheck(f.config, f.deps), /execution is temporarily paused/);
+  const state = JSON.parse(readFileSync(join(f.config.stateDir, "state.json")));
+  assert.equal(state.result, undefined); assert.equal(f.chain.sendTxCount, 1); assert.equal(f.runs(), 0);
+  f.change.paused = false;
+  const report = await runCheck(f.config, f.deps);
+  assert.equal(report.ok, true); assert.equal(report.paymentTx, state.signed.txHash);
+  assert.equal(f.chain.sendTxCount, 2); assert.equal(f.quotes(), 1); assert.equal(f.runs(), 1);
 });
 
 test("price, deposit, network and destination guards stop before any payment", async t => {

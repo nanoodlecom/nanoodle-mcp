@@ -131,12 +131,14 @@ export function createNearGate({
   canQuote = () => true,
   fundRun = null,
   runTimeoutMs = undefined,
+  refundFunding = null,
 }) {
   const executionLimit = hostedRunTimeout(runTimeoutMs);
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
+  if (refundFunding !== null && ["quote", "run"].some(k => typeof refundFunding[k] !== "function")) throw new TypeError("refundFunding needs quote and run checks");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}) };
   if (usdcEnabled && !isNearAccountId(usdcToken)) throw new TypeError("USDC needs a verified token contract");
   const assetOf = (q) => q.asset === "usdc" ? "usdc" : "near";
@@ -465,62 +467,78 @@ export function createNearGate({
       throw e;
     }
     if (author && !(r.xnoUsd != null && parseUsdNano(r.xnoUsd) > 0n)) return errResult("Cannot quote this authored workflow without a current funding rate for its creator payout. Try again shortly. Nothing was charged.");
-    const taken = openAmounts(asset);
-    let amountYocto;
-    try {
-      const makeDeposit = asset === "usdc" ? usdcDeposit : depositYocto;
-      amountYocto = asset === "usdc"
-        ? makeDeposit(pricing.depositUsd, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []))
-        : makeDeposit(pricing.depositUsd, r, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []));
-    } catch (e) {
-      if (e instanceof NearError && e.code === "NO_UNIQUE_AMOUNT") {
-        return errResult("This server is holding too many open quotes at this price right now; try again in a few minutes. Nothing was charged.");
+    const issue = () => {
+      if (openQuoteCount() >= maxOpenQuotes) return errResult("This server is holding too many open quotes right now; try again in a few minutes. Nothing was charged.");
+      const taken = openAmounts(asset);
+      let amountYocto;
+      try {
+        const makeDeposit = asset === "usdc" ? usdcDeposit : depositYocto;
+        amountYocto = asset === "usdc"
+          ? makeDeposit(pricing.depositUsd, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []))
+          : makeDeposit(pricing.depositUsd, r, (y) => taken.has(y.toString()), ...(randomInt ? [randomInt] : []));
+      } catch (e) {
+        if (e instanceof NearError && e.code === "NO_UNIQUE_AMOUNT") {
+          return errResult("This server is holding too many open quotes at this price right now; try again in a few minutes. Nothing was charged.");
+        }
+        throw e;
       }
-      throw e;
-    }
-    const id = "nq_" + randomBytes(9).toString("base64url");
-    const createdAt = now();
-    const expiresAt = createdAt + quoteTtlMs;
-    // Only what payment and settlement need is stored; the itemized pricing is in the answer.
-    const record = {
-      id, tool: name, ...(resumeTool ? { resumeTool } : {}), argsHash: hashArgs(name, args), status: "pending", author,
-      ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
-      amountYocto: amountYocto.toString(),
-      depositUsd: exactUsd(pricing.depositUsd),
-      estimatedCostUsd: exactUsd(pricing.estimatedCostUsd),
-      rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(),
-        ...(asset === "usdc" ? { usdcUsd: "1" } : { nearUsd: r.nearUsd }), source: r.source, at: r.at, ...rateExtras(r) },
-      createdAt, expiresAt,
-      payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
-      settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
+      const id = "nq_" + randomBytes(9).toString("base64url");
+      const createdAt = now();
+      const expiresAt = createdAt + quoteTtlMs;
+      // Only what payment and settlement need is stored; the itemized pricing is in the answer.
+      const record = {
+        id, tool: name, ...(resumeTool ? { resumeTool } : {}), argsHash: hashArgs(name, args), status: "pending", author,
+        ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
+        amountYocto: amountYocto.toString(),
+        depositUsd: exactUsd(pricing.depositUsd),
+        estimatedCostUsd: exactUsd(pricing.estimatedCostUsd),
+        rate: { usdNano: r.usdNano.toString(), yocto: r.yocto.toString(),
+          ...(asset === "usdc" ? { usdcUsd: "1" } : { nearUsd: r.nearUsd }), source: r.source, at: r.at, ...rateExtras(r) },
+        createdAt, expiresAt,
+        payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
+        settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
+      };
+      ledger.putQuote(record);
+      ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source, ...rateExtras(r) });
+      const likelyCharge = usdToYocto(pricing.likelyChargeUsd, r, "ceil");
+      const baseYocto = asset === "usdc" ? usdToYocto(pricing.depositUsd, r, "ceil") : stepUp(usdToYocto(pricing.depositUsd, r, "ceil"));
+      const q = formatQuote({
+        pricing,
+        now: createdAt,
+        payment: {
+          network, paymentId: id, payTo: merchantId,
+          ...(asset === "usdc"
+            ? { asset: "USDC", amountAtomic: record.amountYocto, amount: formatUsdc(amountYocto), tokenContract: usdcToken, decimals: 6,
+                dustAmount: formatUsdc(amountYocto - baseYocto), likelyCharge: formatUsdc(likelyCharge) }
+            : { amountYocto: record.amountYocto, amountNear: formatYoctoAsNear(amountYocto), dustNear: formatYoctoAsNear(amountYocto - baseYocto),
+                likelyChargeNear: formatYoctoAsNear(likelyCharge, { maxDecimals: 6 }) }),
+          depositUsd: record.depositUsd,
+          ...(author ? { authorPayout: { asset: "XNO", to: author, basis: "the collected 20% markup, paid in Nano at the locked XNO/USD rate" } } : {}),
+          depositUsdSent: estUsd(Number(yoctoToUsd(amountYocto, r.usdNano, r.yocto))),
+          rate: rateView(record),
+          expiresAt: new Date(expiresAt).toISOString(),
+          ...(publicBase ? {
+            payUrl: `${publicBase}/pay/${id}`,
+            watchUrl: `${publicBase}/near/watch/${id}`,
+            statusUrl: `${publicBase}/near/status/${id}`,
+          } : {}),
+        },
+      });
+      return { content: [{ type: "text", text: q.text }], structuredContent: q.structured };
     };
-    ledger.putQuote(record);
-    ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source, ...rateExtras(r) });
-    const likelyCharge = usdToYocto(pricing.likelyChargeUsd, r, "ceil");
-    const baseYocto = asset === "usdc" ? usdToYocto(pricing.depositUsd, r, "ceil") : stepUp(usdToYocto(pricing.depositUsd, r, "ceil"));
-    const q = formatQuote({
-      pricing,
-      now: createdAt,
-      payment: {
-        network, paymentId: id, payTo: merchantId,
-        ...(asset === "usdc"
-          ? { asset: "USDC", amountAtomic: record.amountYocto, amount: formatUsdc(amountYocto), tokenContract: usdcToken, decimals: 6,
-              dustAmount: formatUsdc(amountYocto - baseYocto), likelyCharge: formatUsdc(likelyCharge) }
-          : { amountYocto: record.amountYocto, amountNear: formatYoctoAsNear(amountYocto), dustNear: formatYoctoAsNear(amountYocto - baseYocto),
-              likelyChargeNear: formatYoctoAsNear(likelyCharge, { maxDecimals: 6 }) }),
-        depositUsd: record.depositUsd,
-        ...(author ? { authorPayout: { asset: "XNO", to: author, basis: "the collected 20% markup, paid in Nano at the locked XNO/USD rate" } } : {}),
-        depositUsdSent: estUsd(Number(yoctoToUsd(amountYocto, r.usdNano, r.yocto))),
-        rate: rateView(record),
-        expiresAt: new Date(expiresAt).toISOString(),
-        ...(publicBase ? {
-          payUrl: `${publicBase}/pay/${id}`,
-          watchUrl: `${publicBase}/near/watch/${id}`,
-          statusUrl: `${publicBase}/near/status/${id}`,
-        } : {}),
-      },
-    });
-    return { content: [{ type: "text", text: q.text }], structuredContent: q.structured };
+    if (!refundFunding) return issue();
+    try {
+      return await refundFunding.quote(asset, issue, async () => {
+        if (await canQuote() !== true) throw new NearError("NEAR_FUNDING_UNAVAILABLE", "Payment monitoring is unavailable");
+        r = asset === "usdc" ? await rate.currentUsdc() : await rate.current();
+        if (author && !(r.xnoUsd != null && parseUsdNano(r.xnoUsd) > 0n)) throw new NearError("NEAR_FUNDING_UNAVAILABLE", "Creator funding rate is unavailable");
+      });
+    }
+    catch (e) {
+      if (!e?.code?.startsWith("NEAR_FUNDING_")) throw e;
+      if (e.code === "NEAR_FUNDING_BUSY") return errResult("This server is handling too many quote requests right now. Try again shortly. Nothing was quoted or charged.");
+      return errResult("Cannot quote right now: the operator's NEAR refund funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
+    }
   }
 
   /* ---------------- price_noodle with NEAR figures ---------------- */
@@ -757,6 +775,11 @@ export function createNearGate({
     // The bound MCP call is still checked before any model work can begin.
     let prepared = null, prepError = null;
     try { prepared = await prepare(registry, name, args, tool); } catch (e) { prepError = e; }
+    if (!prepError && refundFunding) {
+      try { await refundFunding.run(assetOf(q)); }
+      catch { return errResult("Your payment is verified. The run is paused while the operator restores NEAR refund funding. Retry this same payment id; no model work was started and no new payment is needed.",
+        { payment: { paymentId: q.id, status: "paid", retryable: true, code: "NEAR_FUNDING_UNAVAILABLE" } }); }
+    }
     q = ledger.updateQuote(q.id, { status: "running" });
     if (ctx?.announce) ctx.announce(`payment verified — running ${name}`);
 

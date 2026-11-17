@@ -526,6 +526,7 @@ async function main() {
       });
       ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
       nearHealth.usdc = near.usdc;
+      nearHealth.funding = nearInfo.funding;
     } catch (e) {
       // Only reachable with both rails configured (NEAR alone exits inside startNearMode).
       // The Nano rail is the production default; it keeps serving and NEAR stays off until a restart.
@@ -876,7 +877,12 @@ async function startNearMode({
     catch (e) { log(`USDC payments are off (${e.code || "unavailable"}): ${e.message}. Native NEAR continues.`); }
   }
   const usdc = { enabled: usdcEnabled, tokenContract: usdcToken, decimals: 6 };
-  const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken });
+  const refundFunding = near.createNearFunding({ rpc, ledger, network, accountId: merchant, publicKey: signer.publicKey, usdcToken });
+  await refundFunding.refresh();
+  const fundingTimer = setInterval(() => { refundFunding.refresh().catch(() => {}); }, 30_000);
+  fundingTimer.unref();
+  const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken,
+    beforeSign: refundFunding.beforeSign, beforeComplete: refundFunding.beforeComplete });
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
   const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage }) : null;
   let watcher = null;
@@ -885,7 +891,7 @@ async function startNearMode({
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
     canQuote: () => watcher?.status().listening === true && (!fundingSources || fundingSources.ready()),
-    fundRun: modelPayment === "wallet" ? nanoOps.withFunding : null,
+    fundRun: modelPayment === "wallet" ? nanoOps.withFunding : null, refundFunding,
   });
   fundingSources?.registerNear(gate.fundingLiabilitiesRaw, () => authorPayouts?.records() ?? []);
   const wrapped = gate.wrapRegistry(registry);
@@ -937,7 +943,7 @@ async function startNearMode({
     "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." +
     (usdcEnabled ? ` Choose _pay_with: "usdc" for Circle-issued USDC on NEAR, including USDC change and refunds; otherwise the quote is in native NEAR.` : "") + ratesLine;
   return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions: dual ? instructions : nearInstructions,
-    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant }, usagePath };
+    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant, funding: refundFunding.status }, usagePath };
 }
 
 main().catch((e) => { console.error("nanoodle-mcp: " + ((e && e.message) || e)); process.exit(1); });
