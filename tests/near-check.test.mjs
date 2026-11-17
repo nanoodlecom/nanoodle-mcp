@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runCheck } from "../scripts/near-check.mjs";
+import { runCheck, checkGraph } from "../scripts/near-check.mjs";
 import { createNearRpcPool, loadNearSigner, parseNearToYocto } from "../src/near/index.mjs";
 import { generateNearKey, writeKeyFile, sendTransfer } from "../scripts/near-testnet-lib.mjs";
 import { createFakeChain } from "./fixtures/near-fake-chain.mjs";
@@ -42,7 +42,8 @@ async function fixture() {
       const state = JSON.parse(readFileSync(join(stateDir, "state.json")));
       const deposit = BigInt(state.quote.amountYocto), charged = parseNearToYocto("0.0001"), refunded = deposit - charged;
       const refund = await sendTransfer({ rpc, signer, signerId: merchant, receiverId: payer, amountYocto: refunded });
-      result = { content: [{ type: "text", text: change.wrongOutput ? "wrong" : `Answer: NANOODLE_OK:${state.marker}` }], structuredContent: { receipt: {
+      result = { content: [{ type: "text", text: change.wrongOutput ? "wrong" : change.markerOnlyInBilling ? "" : state.v < 2 ? `Answer: NANOODLE_OK:${state.marker}` : state.marker },
+        ...(change.markerOnlyInBilling ? [{ type: "text", text: `billing note: ${state.marker}` }] : [])], structuredContent: { receipt: {
         outcome: "succeeded", deposit: { yocto: deposit.toString(), txHash: state.signed.txHash }, charged: { yocto: charged.toString(), usd: "0.0003" },
         refund: { yocto: refunded.toString(), txHash: refund.txHash, to: change.wrongRefund ? merchant : payer, status: "sent" },
       } } };
@@ -82,12 +83,24 @@ test("an unfinished retained graph keeps its original model and payment after a 
   // Simulate resuming a completed result before the final canary checkpoint.
   state.done = false;
   for (const node of state.args.graph.nodes) if (node.type === "llm") node.fields.model = "z-ai/glm-5.3-flash";
-  const { writeFileSync } = await import("node:fs");
   writeFileSync(file, JSON.stringify(state));
   const report = await runCheck(f.config, f.deps);
   assert.equal(report.model, "z-ai/glm-5.3-flash");
   assert.equal(report.paymentTx, state.signed.txHash);
   assert.equal(f.chain.sendTxCount, 2); assert.equal(f.runs(), 1); assert.equal(f.quotes(), 1);
+});
+
+test("version-one canary checkpoints retain their original expected output and graph", async () => {
+  const f = await fixture(), marker = "0123456789abcdef", args = checkGraph(marker, true);
+  for (const node of args.graph.nodes) if (node.type === "llm") node.fields.model = "z-ai/glm-5.3-flash";
+  const state = { v: 1, day: new Date(f.deps.now()).toISOString().slice(0, 10), base: f.config.url,
+    payer: f.config.payer, merchant: f.config.merchant, network: f.config.network, marker, args, progress: [] };
+  writeFileSync(join(f.config.stateDir, "state.json"), JSON.stringify(state));
+  const report = await runCheck(f.config, f.deps);
+  assert.equal(report.output, `NANOODLE_OK:${marker}`); assert.equal(report.model, "z-ai/glm-5.3-flash");
+  assert.equal(f.quotes(), 1); assert.equal(f.runs(), 1);
+  assert.equal((await runCheck(f.config, f.deps)).reused, true);
+  assert.equal(f.chain.sendTxCount, 2);
 });
 
 test("price, deposit, network and destination guards stop before any payment", async t => {
@@ -99,7 +112,7 @@ test("price, deposit, network and destination guards stop before any payment", a
 });
 
 test("incorrect model output, missing live progress, and wrong refund recipient fail without repaying", async t => {
-  for (const change of [{ wrongOutput: true }, { noProgress: true }, { wrongRefund: true }]) await t.test(JSON.stringify(change), async () => {
+  for (const change of [{ wrongOutput: true }, { markerOnlyInBilling: true }, { noProgress: true }, { wrongRefund: true }]) await t.test(JSON.stringify(change), async () => {
     const f = await fixture(); Object.assign(f.change, change);
     await assert.rejects(runCheck(f.config, f.deps));
     await assert.rejects(runCheck(f.config, f.deps));

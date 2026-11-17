@@ -15,16 +15,22 @@ export function checkGraph(marker, twoSteps = false) {
   const fields = { model: "openai/gpt-4.1-nano", temperature: 0, maxTokens: 256 };
   const nodes = [
     { id: "input", type: "text", name: "Marker", fields: { text: "" } },
-    { id: "extract", type: "llm", name: "Read marker", fields: { ...fields, system: twoSteps
-      ? "Return only the marker value from the user's message. No prefix, punctuation or explanation."
-      : "Return NANOODLE_OK: followed immediately by the marker value in the user's message. Nothing else." } },
+    { id: "extract", type: "llm", name: "Read marker", fields: { ...fields,
+      system: "Return only the 16 lowercase hexadecimal characters after Marker: in the user's message. Copy them exactly. No prefix, punctuation, spaces or explanation." } },
   ];
   const links = [{ id: "read", from: { node: "input", port: "text" }, to: { node: "extract", port: "prompt" } }];
   if (twoSteps) {
-    nodes.push({ id: "format", type: "llm", name: "Format answer", fields: { ...fields, system: "The user message is a marker. Return NANOODLE_OK: followed immediately by that marker. Nothing else." } });
+    nodes.push({ id: "format", type: "llm", name: "Copy marker", fields: { ...fields, system: "Return the user's 16 lowercase hexadecimal characters exactly. No prefix, punctuation, spaces or explanation." } });
     links.push({ id: "handoff", from: { node: "extract", port: "text" }, to: { node: "format", port: "prompt" } });
   }
   return { graph: { v: 1, nodes, links }, inputs: { Marker: `Marker: ${marker}` }, _pay_with: "near" };
+}
+
+function correctOutput(result, state) {
+  if (state.v < 2) return resultText(result).includes(`NANOODLE_OK:${state.marker}`);
+  // Validate the model output itself, not marker text in billing or metadata.
+  const text = result?.content?.find(c => c.type === "text")?.text;
+  return /^[a-f0-9]{16}$/.test(state.marker) && typeof text === "string" && text.trim() === state.marker;
 }
 
 // fsync before rename, including the directory: never broadcast an unrecorded tx.
@@ -73,7 +79,7 @@ export async function runCheck(config, deps = {}) {
     }
     if (!state || state.done) {
       const marker = randomBytes(8).toString("hex");
-      state = { v: 1, day, base, payer, merchant, network, marker, args: checkGraph(marker, twoSteps), progress: [], createdAt: new Date(now()).toISOString() };
+      state = { v: 2, day, base, payer, merchant, network, marker, args: checkGraph(marker, twoSteps), progress: [], createdAt: new Date(now()).toISOString() };
       save();
     }
     stage = "quote";
@@ -125,8 +131,8 @@ export async function runCheck(config, deps = {}) {
         state.progress.push({ status: workflow.status, nodes: workflow.nodes.map(n => ({ id: n.id, status: n.status })) }); save();
       } }); save();
     }
-    const expected = `NANOODLE_OK:${state.marker}`;
-    require(!state.result.isError && resultText(state.result).includes(expected), "Custom workflow returned an incorrect result");
+    const expected = state.v < 2 ? `NANOODLE_OK:${state.marker}` : state.marker;
+    require(!state.result.isError && correctOutput(state.result, state), "Custom workflow returned an incorrect result");
     require(state.progress.some(w => w.nodes.some(n => n.status === "running")), "No live running-node progress received");
     stage = "refund";
     let receipt = state.result.structuredContent?.receipt;
@@ -142,7 +148,7 @@ export async function runCheck(config, deps = {}) {
     stage = "replay_and_result";
     const replay = await call("run_noodle", paidArgs);
     require(JSON.stringify(replay.structuredContent?.receipt) === JSON.stringify(receipt), "Replay changed the receipt");
-    require(resultText(replay).includes(expected), "Paid output is unavailable on replay; text results are not retained across server restarts");
+    require(correctOutput(replay, state), "Paid output is unavailable on replay; text results are not retained across server restarts");
     const cached = await json(`/near/result/${q.paymentId}`);
     require(JSON.stringify(cached).includes(expected), "Payment page result cache is missing the output");
     const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: state.args.graph.nodes.find(n => n.type === "llm").fields.model, modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
