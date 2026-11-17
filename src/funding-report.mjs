@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { join } from "node:path";
 import { fundingRaw } from "./run-funding.mjs";
 import { hostedRunTimeout } from "./hosted-run.mjs";
+import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
@@ -19,8 +20,8 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         const balance = fundingRaw(value.balanceRaw), liabilities = fundingRaw(value.liabilitiesRaw), reserved = fundingRaw(value.reservedRaw);
         if (!Number.isSafeInteger(value.activeRuns) || value.activeRuns < 0 ||
             !(value.oldestStartedAt === null || (Number.isSafeInteger(value.oldestStartedAt) && value.oldestStartedAt > 0))) throw Error("invalid snapshot");
-        // Select aggregate fields explicitly: no future wallet metadata belongs
-        // in this file, or in the separate monitor's public report.
+        // Select aggregate fields and the public-chain handoff checkpoint
+        // explicitly. Private wallet/provider fields must never be copied.
         report = { balanceRaw: balance.toString(), liabilitiesRaw: liabilities.toString(), reservedRaw: reserved.toString(),
           activeRuns: value.activeRuns, oldestStartedAt: value.oldestStartedAt,
           enforced: value.enforced === true, protectTransfers: value.protectTransfers === true,
@@ -29,7 +30,8 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           const n = value.nanoRpc;
           if (![n.configuredPeers, n.minimumPeers, n.readablePeers, n.networkPeers, n.lastReadAt].every(x => Number.isSafeInteger(x) && x >= 0)) throw Error("invalid RPC snapshot");
           report.nanoRpc = { enforced: n.enforced === true, configuredPeers: n.configuredPeers, minimumPeers: n.minimumPeers,
-            readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt };
+            readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt,
+            checkpoint: selectNanoCheckpoint(n.checkpoint) };
           const age = now() - n.lastReadAt;
           report.ok &&= report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
             && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers

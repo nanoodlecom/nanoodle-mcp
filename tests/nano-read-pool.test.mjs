@@ -92,10 +92,20 @@ test("network identity expires, is rechecked, and can recover without restart", 
 
 test("locally published blocks cannot be replaced by an older cached account state", async () => {
   const w = world(); await w.pool.read(info);
+  assert.equal(w.pool.status().checkpoint.head.blockCount, "10");
   w.pool.observe({ frontier: OTHER, balance: 93n, blockCount: 11n, representative: ACCOUNT });
+  const captured = w.pool.status().checkpoint;
+  assert.deepEqual(captured, { v: 1, networkGenesis: NANO_GENESIS_HASH, account: ACCOUNT,
+    head: { hash: OTHER, blockCount: "11" }, confirmed: { hash: "B".repeat(64), blockCount: "10" } });
   await assert.rejects(w.pool.read(info), { code: "NANO_RPC_REGRESSION" });
+  assert.deepEqual(w.pool.status().checkpoint, captured, "a lagging peer cannot lower the operator handoff floor");
   for (const p of w.peers) p.info = nanoAccountInfo({ height: 11, frontier: OTHER, balance: "93" });
   assert.equal((await w.pool.read(info)).balance, "93");
+  assert.deepEqual(w.pool.status().checkpoint.confirmed, captured.head);
+  captured.head.hash = SEND;
+  assert.equal(w.pool.status().checkpoint.head.hash, OTHER, "returned telemetry cannot mutate the live guard");
+  w.pool.observe({ frontier: SEND, balance: 93n, blockCount: 11n, representative: ACCOUNT });
+  assert.equal(w.pool.status().checkpoint, null, "conflicting local history cannot supply a healthy handoff");
 });
 
 test("an unknown unconfirmed head cannot authorize spending, while our own queued chain is retained", async () => {
