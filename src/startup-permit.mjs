@@ -4,6 +4,7 @@ import { lstatSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { maintenanceProcessIdentity } from "./maintenance-report.mjs";
+import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 import { readOperatorJson } from "./operator-file.mjs";
 
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -16,7 +17,8 @@ export function qualifyStartupPermit({ file, ownerUid, request, releaseRoot = PA
   if (read.status !== "valid") return read;
   try {
     const value = read.value, identity = maintenanceProcessIdentity(), root = realpathSync(releaseRoot), stat = lstatSync(root);
-    if (!exact(value, ["v", "request", "process", "release"]) || value.v !== 1
+    const newPermit = value?.v === 2;
+    if (!exact(value, ["v", "request", "process", "release", ...(newPermit ? ["nanoCheckpoint"] : [])]) || (!newPermit && value.v !== 1)
       || !exact(value.request, ["v", "token", "operation", "revision"])
       || !Object.keys(value.request).every(key => value.request[key] === request[key])
       || !exact(value.process, ["pid", "uid", "bootId", "startTicks"])
@@ -41,6 +43,7 @@ export function qualifyStartupPermit({ file, ownerUid, request, releaseRoot = PA
       || m.installScripts !== false || m.devDependencies !== false) return { status: "unavailable" };
     // Root independently verifies the complete tree before issuing this grant;
     // the app checks this root-owned attestation, not an app-supplied Git SHA.
-    return { status: "valid", fingerprint: read.fingerprint };
+    return { status: "valid", fingerprint: read.fingerprint,
+      ...(newPermit && { nanoCheckpoint: selectNanoCheckpoint(value.nanoCheckpoint) }) };
   } catch { return { status: "unavailable" }; }
 }

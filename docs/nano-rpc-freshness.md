@@ -14,6 +14,17 @@ wrong-wallet, conflicting or behind-floor view must stop the handoff. This
 telemetry is an input to an operator handoff; it is not a durable journal,
 an automatic restore mechanism or permission to run two wallet writers.
 
+A guarded app records its final wallet checkpoint in private
+`out/nano-handoff.json` after a clean operator-requested drain. It binds the
+record to the paused operation and the outgoing kernel process. A version 2
+startup permit can carry that checkpoint into the replacement. Before any
+payment recovery, two independent mainnet peers must agree on the newest
+confirmed account head and confirm the old observed head. If the new head is
+higher, each peer must confirm the checkpoint block on the same account at the
+recorded height. A previously pending head must have confirmed before it can
+qualify the handoff. These checks use wallet reads and seed the replacement
+process's existing monotonic read guard.
+
 Hosted paid tools and Market workers enable the shared wallet's read guard.
 `NANO_RPC_URL` / `--nano-rpc` accepts one to eight distinct, comma-separated
 endpoints. Configure independently operated mainnet nodes: with multiple endpoints,

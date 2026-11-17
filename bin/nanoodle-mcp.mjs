@@ -48,6 +48,9 @@ import { redactUrl } from "../src/redact.mjs";
 import { startSweeper } from "../src/sweep.mjs";
 import { acquireWriterLocks, canonicalStatePath } from "../src/process-lock.mjs";
 import { createMaintenanceBarrier, maintenanceConfig } from "../src/maintenance.mjs";
+import { maintenanceProcessIdentity } from "../src/maintenance-report.mjs";
+import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
+import { writePrivateStateSync } from "../src/private-state.mjs";
 import { createServiceLifecycle, moneyStateStatus } from "../src/service-lifecycle.mjs";
 import { createMoneyLog } from "../src/money-log.mjs";
 import { verifyStartupState } from "../src/startup-state.mjs";
@@ -347,9 +350,10 @@ async function main() {
   const maintenance = serveSpec === null ? null : createMaintenanceBarrier(maintenanceConfig());
   return maintenance ? maintenance.start(initialize, { onWait: () => console.error("nanoodle-mcp: startup paused; waiting for a process-bound operator permit") }) : initialize();
 
-  async function initialize() {
+  async function initialize(nanoCheckpoint = null) {
     const httpServers = [];
     let gate = null, near = null, marketService = null, usageWriter = null;
+    let recordNanoHandoff = null;
     const moneyState = () => moneyStateStatus([gate?.persistenceStatus(), near?.persistenceStatus(), marketService?.persistenceStatus(), usageWriter?.status(), near?.usageStatus()]);
     if (maintenance) {
       const startup = new Promise(resolve => { finishStartup = resolve; });
@@ -359,6 +363,7 @@ async function main() {
         market: () => marketService,
         stopPayments: async () => { await Promise.all([gate?.stop(), near?.watcher.stop()]); },
         storageHealthy: () => { const state = moneyState(); return state.ok && state.pendingWrites === 0; },
+        recordDrain: () => recordNanoHandoff?.(),
         log: line => console.error("nanoodle-mcp: " + line) });
       for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
         serviceLifecycle.stop(signal).then(({ exitCode }) => process.exit(exitCode), () => {
@@ -462,6 +467,21 @@ async function main() {
         nearMerchant, nearNetwork, marketRoot, marketHandles });
       fundingSources?.requireFiles(requiredState.files);
       console.error(`nanoodle-mcp: required payment state verified (${requiredState.files.length} files)`);
+    }
+    if (nanoCheckpoint) {
+      if (!wallet || !guardedFunding) throw Error("Startup permit requires an active guarded Nano wallet");
+      await wallet.ops.verifyCheckpoint(nanoCheckpoint);
+    }
+    if (maintenance && guardedFunding && wallet) {
+      recordNanoHandoff = () => {
+        const { token, operation, revision } = maintenance.snapshot();
+        if (!token) return; // A normal SIGTERM has no operator handoff request.
+        writerLocks.assertHeld();
+        const checkpoint = selectNanoCheckpoint(wallet.ops.checkpoint(), wallet.address);
+        const request = { v: 1, token, operation, revision };
+        writePrivateStateSync(join(resolvedOut, "nano-handoff.json"),
+          JSON.stringify({ v: 1, request, process: maintenanceProcessIdentity(), checkpoint }) + "\n");
+      };
     }
 
     const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");

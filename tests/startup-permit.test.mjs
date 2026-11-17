@@ -7,11 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { deriveAddress, derivePublicKey, deriveSecretKey } from 'nanocurrency';
 import { createMaintenanceBarrier, maintenanceConfig } from '../src/maintenance.mjs';
 import { maintenanceProcessIdentity } from '../src/maintenance-report.mjs';
 import { qualifyStartupPermit } from '../src/startup-permit.mjs';
 import { openNearLedger } from '../src/near/ledger.mjs';
 import { createFakeChain, throwawayNearKey, nanoGptMock } from './fixtures/near-fake-chain.mjs';
+import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from './fixtures/nano-protocol.mjs';
 
 const revision = 'b'.repeat(40), tree = 'c'.repeat(64), request = { v: 1, token: 'a'.repeat(32), operation: 'deploy', revision };
 const json = (file, value, mode = 0o600) => writeFileSync(file, JSON.stringify(value), { mode });
@@ -173,10 +175,27 @@ test('real CLI waits before any provider request, initializes while paused and a
 });
 
 
-test('real paused NEAR startup recovers a recorded refund once while watcher and workflow admission stay closed', { timeout: 20000 }, async t => {
+test('real paused NEAR startup proves the Nano checkpoint before recovering a recorded refund once', { timeout: 20000 }, async t => {
   const w = fixture(t), packageRoot = copyRelease(w), key = await throwawayNearKey();
   const chain = createFakeChain(), nano = nanoGptMock();
   const merchant = 'startup-shop.testnet', payer = 'startup-payer.testnet', deposit = 10n ** 22n;
+  const seed = '0'.repeat(64), account = deriveAddress(derivePublicKey(deriveSecretKey(seed, 0)), { useNanoPrefix: true });
+  const oldHead = { hash: 'B'.repeat(64), blockCount: '10' };
+  const nanoCalls = [];
+  const nanoRpc = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks));
+    nanoCalls.push({ peer: req.url, action: body.action });
+    const result = body.action === 'block_info' && body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY
+      : body.action === 'account_info' ? nanoAccountInfo({ representative: account, balance: String(10n ** 31n) })
+      : { error: 'Unexpected mock RPC action' };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+  });
+  nanoRpc.listen(0, '127.0.0.1'); await once(nanoRpc, 'listening');
+  w.cleanup.push(() => { nanoRpc.closeAllConnections(); return new Promise(resolve => nanoRpc.close(resolve)); });
+  const rpcBase = `http://127.0.0.1:${nanoRpc.address().port}`;
   chain.addAccount(merchant, 10n ** 25n, key.publicKey); chain.addAccount(payer, 10n ** 25n);
   await chain.listen(); await nano.listen();
   w.cleanup.push(() => chain.close(), () => nano.close());
@@ -187,9 +206,9 @@ test('real paused NEAR startup recovers a recorded refund once while watcher and
   ledger.putQuote({ id: 'nq_startup', status: 'running', asset: 'near', tool: 'hello', amountYocto: String(deposit), paidYocto: String(deposit),
     payer, payTx: 'synthetic-prior-paid-transfer', paidAtBlockMs: Date.now(), createdAt: Date.now(), expiresAt: Date.now() + 3600000 });
   const policy = join(w.root, 'state-policy.json');
-  json(policy, { v: 1, outDir: out, nanoAddress: null, chargeNano: false, near: { network: 'testnet', merchant }, marketRoot: null, marketHandles: [] });
+  json(policy, { v: 1, outDir: out, nanoAddress: account, chargeNano: false, near: { network: 'testnet', merchant }, marketRoot: null, marketHandles: [] });
   const initialBalance = chain.balance(payer);
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     rmSync(w.startupFile, { force: true });
     const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
     const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
@@ -198,6 +217,7 @@ test('real paused NEAR startup recovers a recorded refund once while watcher and
       '--serve', `127.0.0.1:${port}`, '--public-url', base, '--key', 'synthetic-no-account-key', '--near-merchant', merchant,
       '--near-network', 'testnet', '--near-rpc', chain.url, '--near-usd', '3.64'],
       { env: { PATH: process.env.PATH, NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NANOODLE_STATE_POLICY: policy,
+        NANO_SEED: seed, NANO_RPC_URL: `${rpcBase}/a,${rpcBase}/b`,
         NANOODLE_WRITER_LOCK_DIR: join(w.root, 'locks'), NANOODLE_MAINTENANCE_FILE: w.file,
         NANOODLE_MAINTENANCE_STARTUP_FILE: w.startupFile, NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) }, stdio: ['ignore', 'ignore', 'pipe'] });
     let log = ''; child.stderr.on('data', chunk => { log += chunk; });
@@ -206,8 +226,22 @@ test('real paused NEAR startup recovers a recorded refund once while watcher and
       assert.equal(child.exitCode, null, log); assert.ok(Date.now() < deadline, log); await delay(10);
     } };
     await wait(() => log.includes('waiting for a process-bound operator permit'));
-    assert.equal(chain.sendTxCount, attempt ? 1 : 0);
-    const grant = w.grant(); grant.process = processIdentity(child.pid); w.put(grant);
+    assert.equal(chain.sendTxCount, attempt === 2 ? 1 : 0);
+    const exit = once(child, 'exit');
+    const head = attempt === 0 ? { hash: 'C'.repeat(64), blockCount: '11' } : oldHead;
+    const identity = processIdentity(child.pid);
+    w.put({ ...w.grant(), v: 2, process: identity,
+      nanoCheckpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account, head, confirmed: oldHead } });
+    if (attempt === 0) {
+      const [code] = await exit; assert.equal(code, 1, log);
+      assert.match(log, /Nano startup checkpoint lacks two confirmed peer views/);
+      assert.equal(chain.sendTxCount, 0);
+      assert.equal(JSON.parse(readFileSync(file)).quotes.nq_startup.status, 'running');
+      assert.throws(() => readFileSync(join(out, 'nano-handoff.json')), { code: 'ENOENT' });
+      assert.deepEqual(new Set(nanoCalls.filter(call => call.action === 'account_info').map(call => call.peer)), new Set(['/a', '/b']));
+      assert.ok(nanoCalls.every(call => ['account_info', 'block_info'].includes(call.action)));
+      continue;
+    }
     await wait(() => log.includes('NEAR mode on testnet'));
     await wait(() => log.includes('MCP over HTTP'));
     const q = JSON.parse(readFileSync(file)).quotes.nq_startup;
@@ -221,6 +255,11 @@ test('real paused NEAR startup recovers a recorded refund once while watcher and
     const response = await fetch(base + '/mcp', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'run_noodle', arguments: {} } }) });
     assert.equal(response.status, 503);
-    const exit = once(child, 'exit'); child.kill('SIGTERM'); const [code] = await exit; assert.equal(code, 0, log);
+    assert.equal((await fetch(base + '/out/nano-handoff.json')).status, 404);
+    child.kill('SIGTERM'); const [code] = await exit; assert.equal(code, 0, log);
+    const handoff = join(out, 'nano-handoff.json');
+    assert.equal(lstatSync(handoff).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(handoff)), { v: 1, request, process: identity,
+      checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account, head: oldHead, confirmed: oldHead } });
   }
 });

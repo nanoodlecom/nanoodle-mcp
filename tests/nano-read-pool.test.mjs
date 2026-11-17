@@ -8,7 +8,7 @@ const ACCOUNT = NANO_GENESIS_REPLY.contents.account, PAYER = "nano_3i1aq1cchnmbn
 const SEND = "A".repeat(64), OTHER = "C".repeat(64);
 const absent = () => Object.assign(Error("Block not found"), { authoritative: true });
 const pending = amount => ({ blocks: { [SEND]: { amount: String(amount), source: PAYER } } });
-function world(count = 3, requestsPerMinute = 0) {
+function world(count = 3, requestsPerMinute = 0, account = ACCOUNT) {
   let at = 1_000, elapsed = 0;
   const peers = Array.from({ length: count + Number(requestsPerMinute > 0) }, (_, index) => ({
     base: requestsPerMinute ? `https://peer-${index}.example` : String(index),
@@ -16,7 +16,7 @@ function world(count = 3, requestsPerMinute = 0) {
   }));
   const calls = [];
   const standby = requestsPerMinute ? { url: peers[count].base, requestsPerMinute } : undefined;
-  const pool = createNanoReadPool({ bases: peers.slice(0, count).map(p => p.base), account: ACCOUNT, checkAddress, hashBlock, standby,
+  const pool = createNanoReadPool({ bases: peers.slice(0, count).map(p => p.base), account, checkAddress, hashBlock, standby,
     now: () => at, monotonicNow: () => elapsed,
     rpc: async (body, base) => {
       calls.push({ action: body.action, base });
@@ -270,6 +270,45 @@ test("locally published blocks cannot be replaced by an older cached account sta
   assert.equal(w.pool.status().checkpoint.head.hash, OTHER, "returned telemetry cannot mutate the live guard");
   w.pool.observe({ frontier: SEND, balance: 93n, blockCount: 11n, representative: ACCOUNT });
   assert.equal(w.pool.status().checkpoint, null, "conflicting local history cannot supply a healthy handoff");
+});
+
+test("a startup checkpoint refuses agreeing stale peers, then seeds the running read guard", async () => {
+  const w = world(2);
+  const old = { v: 1, account: ACCOUNT, networkGenesis: NANO_GENESIS_HASH,
+    confirmed: { hash: "B".repeat(64), blockCount: "10" }, head: { hash: OTHER, blockCount: "11" } };
+  await assert.rejects(w.pool.verifyCheckpoint({ ...old, account: PAYER }), { code: "NANO_CHECKPOINT_INVALID" });
+  assert.equal(w.calls.length, 0);
+  await assert.rejects(w.pool.verifyCheckpoint(old), { code: "NANO_RPC_CHECKPOINT_UNPROVEN" });
+  assert.equal(w.pool.status().checkpoint, null);
+  w.peers[0].info = nanoAccountInfo({ height: 11, frontier: OTHER });
+  await assert.rejects(w.pool.verifyCheckpoint(old), { code: "NANO_RPC_CHECKPOINT_UNPROVEN" });
+  w.peers[1].info = nanoAccountInfo({ height: 11, frontier: SEND });
+  await assert.rejects(w.pool.verifyCheckpoint(old), { code: "NANO_RPC_CHECKPOINT_CONFLICT" });
+  w.peers[1].info = nanoAccountInfo({ height: 11, frontier: OTHER });
+  await w.pool.verifyCheckpoint(old);
+  assert.deepEqual(w.pool.status().checkpoint.confirmed, old.head);
+  for (const peer of w.peers) peer.info = nanoAccountInfo();
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_REGRESSION" });
+});
+
+test("two newer peers each prove the original account block at its confirmed height", async () => {
+  const block = createBlock("0".repeat(64), { work: "0".repeat(16), previous: "B".repeat(64), representative: ACCOUNT, balance: "93", link: PAYER });
+  const account = block.block.account.replace(/^xrb_/, "nano_"), w = world(2, 0, account);
+  const head = { hash: block.hash.toUpperCase(), blockCount: "10" };
+  const old = { v: 1, account, networkGenesis: NANO_GENESIS_HASH, head, confirmed: head };
+  for (const peer of w.peers) {
+    peer.info = nanoAccountInfo({ height: 11, frontier: OTHER });
+    peer.blocks[head.hash] = { confirmed: "true", contents: block.block, height: "10" };
+  }
+  w.peers[0].blocks[head.hash].height = "9";
+  await assert.rejects(w.pool.verifyCheckpoint(old), { code: "NANO_RPC_CHECKPOINT_UNPROVEN" });
+  w.peers[0].blocks[head.hash].height = "10";
+  w.peers[0].blocks[head.hash].contents = { ...block.block, balance: "94" };
+  await assert.rejects(w.pool.verifyCheckpoint(old), { code: "NANO_RPC_CHECKPOINT_UNPROVEN" });
+  w.peers[0].blocks[head.hash].contents = JSON.stringify(block.block);
+  await w.pool.verifyCheckpoint(old);
+  assert.deepEqual(w.pool.status().checkpoint.confirmed, { hash: OTHER, blockCount: "11" });
+  assert.ok(w.calls.every(call => ["block_info", "account_info"].includes(call.action)));
 });
 
 test("an unknown unconfirmed head cannot authorize spending, while our own queued chain is retained", async () => {

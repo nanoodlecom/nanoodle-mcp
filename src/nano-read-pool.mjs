@@ -1,11 +1,14 @@
 import { performance } from "node:perf_hooks";
 import { MAX_RPC_RETRY_MS, rpcPeerSetId } from "./rpc-backoff.mjs";
+import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 
-export const NANO_GENESIS = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948";
+export { NANO_GENESIS } from "./nano-checkpoint.mjs";
 const GENESIS_KEY = "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65093BA";
 const GENESIS_ACCOUNT = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
 const HASH = /^[A-F0-9]{64}$/i, U128 = (1n << 128n) - 1n;
 const fail = (code, message = "Nano RPC peers cannot provide a consistent current account view") => Object.assign(Error(message), { code });
+const unprovenCheckpoint = () => fail("NANO_RPC_CHECKPOINT_UNPROVEN", "Nano startup checkpoint lacks two confirmed peer views");
+const conflictingCheckpoint = () => fail("NANO_RPC_CHECKPOINT_CONFLICT", "Nano peers disagree with the startup checkpoint or latest confirmed head");
 const hash = value => typeof value === "string" && HASH.test(value) && !/^0+$/.test(value);
 const raw = value => { if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128) throw fail("NANO_RPC_BAD_VIEW"); return BigInt(value); };
 const yes = value => value === true || value === "true";
@@ -175,7 +178,39 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     preferred = rows.filter(r => r.base !== standbyUrl && r.view.height === v.height && r.view.pending === v.pending).map(r => r.base);
     return best;
   }
-  async function read(body) {
+  async function anchoredRows(rows, anchor) {
+    if (rows.length < 2) throw unprovenCheckpoint();
+    const height = BigInt(anchor.blockCount);
+    const newest = rows.reduce((best, row) => row.view.confirmedHeight > best ? row.view.confirmedHeight : best, 0n);
+    if (newest < height) throw unprovenCheckpoint();
+    if (rows.some(({ view }) => view.confirmedHeight === height && view.confirmedFrontier !== anchor.hash)) {
+      throw conflictingCheckpoint();
+    }
+    const current = rows.filter(({ view }) => view.confirmedHeight === newest);
+    if (current.length < 2) throw unprovenCheckpoint();
+    if (!current.every(({ view }) => view.confirmedFrontier === current[0].view.confirmedFrontier
+        && view.confirmedBalance === current[0].view.confirmedBalance
+        && view.confirmedRepresentative === current[0].view.confirmedRepresentative)) {
+      throw conflictingCheckpoint();
+    }
+    if (newest === height) return current;
+    // At a greater height use each peer's own confirmed historical block.
+    // A trusted mainnet node only confirms one block per account height.
+    const witnesses = (await Promise.all(current.map(async row => {
+      try {
+        const historic = await readRpc({ action: "block_info", hash: anchor.hash, json_block: "true" }, row.base);
+        if (!yes(historic.confirmed) || raw(historic.height) !== height) return null;
+        const block = typeof historic.contents === "string" ? JSON.parse(historic.contents) : historic.contents;
+        if (canonical(block?.account) !== account) return null;
+        if (anchor.hash === NANO_GENESIS && height === 1n) checkNanoGenesis(historic);
+        else if (block.type !== "state" || hashBlock(block).toUpperCase() !== anchor.hash) return null;
+        return row;
+      } catch (error) { rateLimit(row.base, error); return null; }
+    }))).filter(row => row && hasProof(row.base));
+    if (witnesses.length < 2) throw unprovenCheckpoint();
+    return witnesses;
+  }
+  async function read(body, anchor = null) {
     if (!["account_info", "receivable", "account_history"].includes(body.action)) throw fail("NANO_RPC_READ_ACTION");
     if (body.account !== account) throw fail("NANO_RPC_ACCOUNT_SCOPE");
     const eligible = await networkBases(), errors = [], primaryViews = [];
@@ -220,7 +255,8 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         readPeers = 0; throw fail("NANO_RPC_STANDBY_BUDGET");
       }
     }
-    const best = select(rows.filter(row => hasProof(row.base)));
+    const valid = rows.filter(row => hasProof(row.base));
+    const best = select(anchor ? await anchoredRows(valid, anchor) : valid);
     return body.action === "account_info" ? best.info : best.data;
   }
   function observe({ frontier, balance, blockCount, representative }) {
@@ -234,6 +270,11 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   }
   return {
     read,
+    async verifyCheckpoint(value) {
+      const checkpoint = selectNanoCheckpoint(value, account);
+      if (minimum < 2) throw unprovenCheckpoint();
+      await read(infoRequest(), checkpoint.head);
+    },
     isCooling: base => bases.includes(base) && cooling(base),
     async block(body) {
       if (body.action !== "block_info" || !hash(body.hash)) throw fail("NANO_RPC_READ_ACTION");

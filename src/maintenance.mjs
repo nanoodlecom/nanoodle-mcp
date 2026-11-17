@@ -92,6 +92,7 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
         || !Number.isSafeInteger(timeoutMs) || timeoutMs < pollMs || timeoutMs > 300_000 || typeof onWait !== "function") throw TypeError("Invalid startup handoff");
       startupCalled = true;
       const initial = admission();
+      let nanoCheckpoint = null;
       if (initial.accepting) {
         if (startupFile !== null && readOperatorJson(startupFile, ownerUid).status !== "absent") throw new MaintenanceError("MAINTENANCE_STARTUP_UNAVAILABLE", "Startup needs operator reconciliation");
       } else {
@@ -110,6 +111,7 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
             if (readOperatorJson(file, ownerUid).fingerprint !== originalFlag
               || readOperatorJson(startupFile, ownerUid).fingerprint !== grant.fingerprint
               || after.code !== current.code || ["token", "operation", "revision"].some(key => after[key] !== current[key])) throw new MaintenanceError("MAINTENANCE_STARTUP_UNAVAILABLE", "Startup authorization changed; operator reconciliation is required");
+            nanoCheckpoint = grant.nanoCheckpoint ?? null;
             break;
           }
           if (grant.status !== "absent" || performance.now() >= deadline) throw new MaintenanceError("MAINTENANCE_STARTUP_UNAVAILABLE", "Startup needs a valid process-bound operator permit");
@@ -119,7 +121,7 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
       }
       // Initialization is accepted work, while callbacks created by it still
       // need separate admission for requests and routine background passes.
-      return register(execute, "background", true)();
+      return register(() => execute(nanoCheckpoint), "background", true)();
     },
     async recover(execute) {
       const parent = context.getStore();

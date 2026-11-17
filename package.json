@@ -1,7 +1,7 @@
 {
   "name": "nanoodle-mcp",
   "version": "0.7.0",
-  "nanoodleMaintenanceProtocol": 1,
+  "nanoodleMaintenanceProtocol": 2,
   "mcpName": "io.github.nanoodlecom/nanoodle-mcp",
   "description": "MCP server (stdio and HTTP) that runs nanoodle workflow graphs, saved or composed by the agent, as tools on the NanoGPT API: BYOK, pay per call in Nano (x402), or pay in native NEAR with automatic refunds",
   "type": "module",

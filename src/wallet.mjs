@@ -651,6 +651,11 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       rpc,
       withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
       fundingStatus: funding.snapshot,
+      checkpoint: () => readPool?.status().checkpoint ?? null,
+      verifyCheckpoint: checkpoint => enqueue(async () => {
+        if (!readPool) throw Error("Nano wallet checkpoint verification requires the read guard");
+        await readPool.verifyCheckpoint(checkpoint);
+      }, HOUSEKEEPING, false),
       fundingReport: () => enqueue(async () => {
         const state = await currentState();
         return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers,

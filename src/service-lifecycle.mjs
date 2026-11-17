@@ -1,6 +1,6 @@
 /** One process-wide shutdown, retaining all financial and startup lifetimes. */
 export function createServiceLifecycle({ maintenance, startup = Promise.resolve(), servers,
-  stopPayments, market, storageHealthy = () => true, log = () => {},
+  stopPayments, market, storageHealthy = () => true, recordDrain = () => {}, log = () => {},
 }) {
   let stopping = null;
   function stop(signal) {
@@ -33,7 +33,10 @@ export function createServiceLifecycle({ maintenance, startup = Promise.resolve(
       const failed = outcomes.some(result => result.status === "rejected"
         || (typeof result.value === "number" && result.value !== 0));
       if (!healthy) log("Shutdown drained, but persisted money state needs operator reconciliation");
-      return { exitCode: failed || !healthy ? 1 : 0 };
+      if (failed || !healthy) return { exitCode: 1 };
+      try { await recordDrain(); }
+      catch { log("Shutdown drained, but the wallet handoff could not be recorded"); return { exitCode: 1 }; }
+      return { exitCode: 0 };
     })();
     return stopping;
   }
