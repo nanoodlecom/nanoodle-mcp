@@ -106,3 +106,32 @@ test("accepting the last pending quote at the live tip leaves a readable recover
   watcher.stop();
   const restarted = createNearWatcher(w.opts); await restarted.start(); restarted.stop();
 });
+
+test("a frozen head stops listening without advancing or refreshing the durable cursor", async () => {
+  const w = await world(); let at = Date.now();
+  const watcher = createNearWatcher({ ...w.opts, now: () => at });
+  await watcher.start();
+  const before = w.ledger.getMeta("paymentWatch"), scan = watcher.status().lastScanAt;
+  at += 90_001;
+  assert.equal(watcher.status().listening, false, "even a stalled loop's cached status expires");
+  await watcher.tick();
+  assert.equal(watcher.status().error, "RPC_STALE");
+  assert.equal(watcher.status().lastScanAt, scan);
+  assert.deepEqual(w.ledger.getMeta("paymentWatch"), before);
+  at = Date.now(); w.pay(); await watcher.tick();
+  assert.equal(watcher.status().listening, true, "fresh-head recovery resumes the existing cursor");
+  watcher.stop();
+});
+
+test("a malformed or future finalized head is rejected before writing initial state", async () => {
+  const w = await world(), at = Date.now();
+  for (const timestamp of [undefined, "not-a-number", String(BigInt(at + 30_001) * 1_000_000n)]) {
+    const block = await w.rpc.block({ finality: "final" });
+    block.header.timestamp_nanosec = timestamp;
+    const watcher = createNearWatcher({ ...w.opts, now: () => at, rpc: { block: async () => block } });
+    await watcher.start();
+    assert.equal(watcher.status().listening, false);
+    assert.equal(w.ledger.getMeta("paymentWatch"), undefined);
+    watcher.stop();
+  }
+});

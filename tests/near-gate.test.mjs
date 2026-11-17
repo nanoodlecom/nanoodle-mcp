@@ -37,7 +37,7 @@ before(async () => {
 });
 after(() => { globalThis.fetch = realFetch; });
 
-async function world({ limits, dust = 137, publicBase } = {}) {
+async function world({ limits, dust = 137, publicBase, canQuote } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
@@ -55,7 +55,7 @@ async function world({ limits, dust = 137, publicBase } = {}) {
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
       rate: createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase,
+      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase, canQuote,
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -67,6 +67,23 @@ async function world({ limits, dust = 137, publicBase } = {}) {
 
 const call = (w, name, args) => w.callTool({ name, arguments: args });
 const text = (r) => r.content.map((c) => c.text || "").join("\n");
+
+test("watcher outage pauses new payments while paid runs and receipts remain accessible", async () => {
+  let ready = true;
+  const w = await world({ canQuote: () => ready });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  ready = false;
+  const refused = await call(w, "idea-poster", INPUTS);
+  assert.equal(refused.isError, true);
+  assert.match(text(refused), /finalized-payment monitoring is temporarily unavailable/);
+  assert.equal(refused.structuredContent?.payment, undefined);
+  const paid = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+  assert.equal(paid.structuredContent.receipt.outcome, "succeeded");
+  const replay = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.deepEqual(replay, paid);
+  ready = true;
+  assert.ok((await call(w, "idea-poster", INPUTS)).structuredContent.payment);
+});
 
 test("wallet page confirms payment without running; the original MCP call resumes with only its id", async () => {
   const w = await world({ publicBase: "https://mcp-near.nanoodle.com" });

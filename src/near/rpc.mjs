@@ -21,6 +21,7 @@
  * Those are mapped by their cause like any other JSON-RPC error.
  */
 import { NearError } from "./errors.mjs";
+import { assertFreshBlock, assertFreshStatus, assertFreshTime, MAX_CLOCK_SKEW_MS } from "./freshness.mjs";
 
 export function parseRpcJson(text) {
   return JSON.parse(text, (key, value, ctx) => {
@@ -126,7 +127,7 @@ export function parseRpcUrls(value) {
   return [...new Set(list)];
 }
 
-const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"]);
+const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE", "RPC_STALE", "RPC_SYNCING"]);
 
 /**
  * The same client over several endpoints, tried in order with failover.
@@ -135,27 +136,36 @@ const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"])
  * No node or external indexer is required. An additional endpoint covers the
  * first being down or rate limiting.
  *
- *  - A call moves to the next endpoint only on a transport failure (RPC_HTTP,
- *    including rate limits; RPC_TIMEOUT; RPC_BAD_RESPONSE). An answer, including
+ *  - A call moves to the next endpoint on transport or node-health failures
+ *    (RPC_HTTP, RPC_TIMEOUT, RPC_BAD_RESPONSE, RPC_STALE, RPC_SYNCING). An answer, including
  *    "unknown transaction", is final for that call.
- *  - `send_tx` moves on only for RPC_HTTP. The signed bytes are identical on
+ *  - Once attempted, `send_tx` moves on only for RPC_HTTP. Preflight health
+ *    failures may move on before any bytes are broadcast. Signed bytes are identical on
  *    every endpoint, so a second submission is the same transaction, never a
  *    second transfer; a timeout is left to the caller, which resolves it by hash.
  *  - An endpoint that failed rests for `cooldownMs`, then is tried again in its
  *    place, so a dead first entry does not slow every call.
- *  - With `chainId`, an endpoint is used only after its own `status` reports that
- *    chain. One on another network is dropped for good: a testnet node must
+ *  - With `chainId`, an endpoint's network is rechecked every `recheckMs`.
+ *    One on another network is dropped for good: a testnet node must
  *    never vouch for a mainnet payment.
+ *  - Hosted callers enable `maxHeadAgeMs`: syncing/stale status or latest blocks
+ *    fail over before authorizing work. Historical blocks remain readable.
  *
  * Every endpoint is equally trusted for finality; list only ones you trust.
  */
-export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, minIntervalMs = 0, now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), log = () => {} } = {}) {
+export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, minIntervalMs = 0, recheckMs = 30_000, maxHeadAgeMs = null, maxClockSkewMs = MAX_CLOCK_SKEW_MS, now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), log = () => {} } = {}) {
   const list = parseRpcUrls(urls);
   if (!list.length) throw new TypeError("createNearRpcPool needs at least one url");
   if (!Number.isFinite(minIntervalMs) || minIntervalMs < 0 || minIntervalMs > 60_000) throw new TypeError("minIntervalMs must be between 0 and 60000");
-  const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checked: !chainId, wrongChain: false, downUntil: 0 }));
+  if (!Number.isSafeInteger(recheckMs) || recheckMs < 0 || recheckMs > 60_000) throw new TypeError("recheckMs must be between 0 and 60000");
+  if (maxHeadAgeMs !== null && (!Number.isSafeInteger(maxHeadAgeMs) || maxHeadAgeMs <= 0)) throw new TypeError("maxHeadAgeMs must be a positive integer or null");
+  if (!Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs < 0) throw new TypeError("maxClockSkewMs must be a nonnegative integer");
+  const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checkedAt: null, headAt: null, checking: null, wrongChain: false, downUntil: 0 }));
   const host = (url) => { try { return new URL(url).host; } catch { return "rpc"; } };
   let nextStart = 0;
+  let latestFinalHeight = 0;
+  let latestFinalHash = null;
+  const freshness = () => ({ now: now(), maxHeadAgeMs, maxClockSkewMs });
   async function request(ep, method, params, opts) {
     if (minIntervalMs) {
       const at = Math.max(now(), nextStart), delay = at - now();
@@ -170,6 +180,27 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
     ep.wrongChain = true;
   }
 
+  function checkStatus(ep, status) {
+    if (chainId && status.chain_id !== chainId) {
+      markWrong(ep, status.chain_id);
+      throw new NearError("RPC_WRONG_NETWORK", "NEAR RPC changed network");
+    }
+    if (maxHeadAgeMs !== null) ep.headAt = assertFreshStatus(status, freshness());
+    ep.checkedAt = now();
+  }
+
+  async function ensureChecked(ep) {
+    if (!chainId && maxHeadAgeMs === null) return;
+    if (ep.checkedAt !== null && now() >= ep.checkedAt && now() - ep.checkedAt < recheckMs) {
+      try {
+        if (maxHeadAgeMs !== null) assertFreshTime(ep.headAt, freshness());
+        return;
+      } catch { /* a cached status can expire sooner than the recheck interval */ }
+    }
+    if (!ep.checking) ep.checking = request(ep, "status", []).then(st => checkStatus(ep, st)).finally(() => { ep.checking = null; });
+    await ep.checking;
+  }
+
   async function call(method, params, opts) {
     const usable = eps.filter((ep) => !ep.wrongChain);
     if (!usable.length) throw new NearError("RPC_WRONG_NETWORK", `no NEAR RPC endpoint is on ${chainId}`);
@@ -178,23 +209,34 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
     const order = rested.length ? [...rested, ...usable.filter((ep) => ep.downUntil > t)] : usable;
     let lastErr = null;
     for (const ep of order) {
+      if (ep.wrongChain) continue;
+      let attempted = false;
       try {
-        if (!ep.checked && method !== "status") {
-          const st = await request(ep, "status", []);
-          if (st.chain_id !== chainId) { markWrong(ep, st.chain_id); continue; }
-          ep.checked = true;
-        }
+        if (method !== "status") await ensureChecked(ep);
+        attempted = true;
         const result = await request(ep, method, params, opts);
-        if (method === "status" && chainId) {
-          if (result.chain_id !== chainId) { markWrong(ep, result.chain_id); continue; }
-          ep.checked = true;
+        if (method === "status") checkStatus(ep, result);
+        if (maxHeadAgeMs !== null && method === "block" && params?.finality) {
+          assertFreshBlock(result, freshness());
+          if (params.finality === "final") {
+            const height = Number(result.header.height);
+            if (height < latestFinalHeight) throw new NearError("RPC_STALE", "NEAR finalized head regressed");
+            if (height === latestFinalHeight && result.header.hash !== latestFinalHash) {
+              throw new NearError("RPC_BAD_RESPONSE", "NEAR finalized head changed hash at the same height");
+            }
+            latestFinalHeight = height;
+            latestFinalHash = result.header.hash;
+          }
         }
         ep.downUntil = 0;
         return result;
       } catch (e) {
+        if (e?.code === "RPC_WRONG_NETWORK" && ep.wrongChain) continue;
         const transport = TRANSPORT_CODES.has(e?.code);
-        if (!transport || (method === "send_tx" && e.code !== "RPC_HTTP")) throw e;
+        if (!transport || (method === "send_tx" && attempted && e.code !== "RPC_HTTP")) throw e;
         lastErr = e;
+        ep.checkedAt = null;
+        ep.headAt = null;
         if (ep.downUntil <= now() && eps.length > 1) log(`NEAR RPC ${host(ep.url)} failed (${e.code}${e?.data?.status ? " " + e.data.status : ""}); trying the next endpoint`);
         ep.downUntil = now() + cooldownMs;
       }

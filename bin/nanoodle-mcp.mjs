@@ -751,11 +751,11 @@ async function startNearMode({
   let rpc;
   try {
     const localRpc = rpcUrls.every(url => ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname));
-    rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, minIntervalMs: localRpc ? 0 : 100,
+    rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, maxHeadAgeMs: 90_000, minIntervalMs: localRpc ? 0 : 100,
       log: (line) => console.error("nanoodle-mcp: " + line) });
   } catch (e) { fail(`--near-rpc: ${e.message}`); }
   // A public RPC can be briefly unreachable or rate limiting at boot; give it a few tries.
-  const transient = (e) => ["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"].includes(e?.code);
+  const transient = (e) => ["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE", "RPC_STALE", "RPC_SYNCING"].includes(e?.code);
   const patiently = async (fn) => {
     for (let i = 0; ; i++) {
       try { return await fn(); } catch (e) {
@@ -848,15 +848,17 @@ async function startNearMode({
   const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken });
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
   const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage }) : null;
+  let watcher = null;
   const gate = createNearGate({
     merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled, authorPayouts,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
+    canQuote: () => watcher?.status().listening === true,
   });
   const wrapped = gate.wrapRegistry(registry);
   const { listTools, callTool } = wrapped;
   await gate.resume(); // before serving: a run a previous process left in flight is refunded, never re-run
-  const watcher = near.createNearWatcher({
+  watcher = near.createNearWatcher({
     rpc, ledger, merchantId: merchant, pendingQuotes: gate.pendingQuotes,
     observeTransfer: gate.observeTransfer, log, tokenContracts: [usdcToken],
   });

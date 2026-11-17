@@ -19,7 +19,7 @@ or worker readiness. Source/production baseline: `8357d57`, 2026-11-17.
 | Prices and upstream fee assumptions stay current | Validate exchange-rate freshness, public model catalogs, all saved/custom workflow pricing and Market's actual platform fee; stale assumptions must not silently authorize losses. |
 | Paid work/refunds/payouts cannot duplicate after ambiguous failures | Verify restart, receipt finality, nonce/frontier conflicts, persisted intents, stale snapshots and competing writers. No blind replacement transactions. |
 | Stuck work is visible | Observe old running payments/assignments, pending/failed refunds and creator payouts, polling errors, worker authorization and heartbeat age. Do not execute jobs from a health check. |
-| No-inference monitoring is installed and actually runs | New operational check covers 40 conditions on the live VPS in isolated read-only probes (all passed), plus timer and financial-state fault tests. Five-minute units and deduplicated Babel alerts are prepared; deployment, schedule and authenticated drill receipt still need verification. See near-monitoring.md. |
+| No-inference monitoring is installed and actually runs | Deployed PR #124 (`a9191d1`), 913 CI tests passed. Five-minute timer enabled; automatic 01:55 and 02:00 UTC runs passed all 40 checks. Actual systemd test alert `near_check_161a96f8d6df2e22d31e08c99018ea15df7fca3b` acknowledged by Ember with mcp-recipient receipt. Inventory #28 and deploy #121 record/mirror it. See near-monitoring.md. |
 | Monitoring failure is itself detectable | Check stopped/missed timers, disk capacity/state writability, and independent observation of a whole-host/Babel outage. Existing same-host alarms cannot report while the VPS is unavailable. |
 | Recovery preserves money state | Follow the inventory/deploy recovery audit: encrypted off-server backups and an isolated restore rehearsal remain unverified. Never start a second wallet writer or an empty ledger to bypass recovery. |
 
@@ -27,3 +27,55 @@ Completion needs targeted failure tests, full regression tests, merged/deployed
 changes, live read-only observations, enabled schedules and authenticated alert
 receipt. Paid inference is not part of the recurring readiness probes. Record
 material remaining limits rather than treating a green public GET as proof.
+
+## Next runtime safety work
+
+The monitor's balance reservations are observations, not enforced runtime leases.
+The wallet serializes spends and refuses an individual transfer above its balance,
+but several concurrent workflows can still consume funds another run or refund
+needs. Bind a per-run funding limit to the approved graph/quote and reserve shared
+working capital atomically before inference. Preserve customer and creator debts;
+release remaining capacity only after in-flight payments resolve. Provider maximum
+prepayments and their eventual refunds must not be confused with final model cost.
+Verify that omitted token limits are bounded consistently in pricing and execution.
+
+Read-only upstream quotes on 2026-11-17 returned 402 (unpaid) for GLM 5.3 Flash:
+256 output tokens quoted $0.00008657; 4096 quoted $0.00135377. These are evidence
+of that request shape only, not permanent prices or a general reserve policy.
+Check the actual bound graph/model options before choosing a cap.
+
+Draft [durable Nano recovery PR #96](https://github.com/nanoodlecom/nanoodle-mcp/pull/96)
+qualifies a schema-2 journal against an older base. It is unmerged/unactivated and
+has an operational hold for ownership coordination, backups and compatible rollback.
+Do not blindly enable it. Review/rebase against current Nano + NEAR/USDC + Market
+paths, preserve the current timeout fixes, qualify current-state migration read-only,
+and verify backups/restore/fencing before any cutover. Existing JSON sends can have
+ambiguous restart outcomes; monitoring does not correct that. Audit ownership locks
+before startup money effects and behavior after an unclean reboot.
+
+The hosted NEAR pool now revalidates network identity every 30 seconds and rejects
+syncing nodes, heads older than 90 seconds or more than 30 seconds in the future,
+malformed head metadata, and regressing latest finalized heights. Unhealthy reads
+fail over; semantic negative transaction answers remain authoritative. Historical
+payment blocks retain their original verification rules. A timed-out broadcast
+still resolves by its existing transaction hash, without constructing a replacement.
+The watcher does not advance or refresh its cursor on a stale head. Its cached
+health also expires, and new NEAR/USDC quotes pause while monitoring is unhealthy;
+existing payment verification, outcomes and refunds remain accessible. Fault tests
+cover frozen/syncing/wrong-chain nodes, cached-head expiry and outage recovery.
+Deployment verification is required before treating these changes as live.
+
+The public Nano MCP ingress also needs its own free discovery probe; current discovery
+probes target the canonical NEAR listener.
+
+The upstream [x402 endpoint manifest](https://nano-gpt.com/api/v1/x402/endpoints)
+lists text/image/data contracts. [Its public x402 page](https://nano-gpt.com/x402)
+does not promise stable long-running video support. Our audio/video adapters use
+legacy paths; absence from the manifest is not proof they are broken. Check actual
+unpaid-quote/status behavior before changing their availability, and add safe probes
+where they can detect breakage without running a model. The library's video polling
+default is unbounded; qualify explicit hosted run deadlines and cancellation.
+
+Independent whole-host/Babel outage notification and encrypted off-server recovery
+with a restore rehearsal are still open. Do not call the overall reliability goal
+complete based on the deployed monitoring milestone alone.

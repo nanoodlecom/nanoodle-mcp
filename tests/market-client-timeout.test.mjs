@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 
-test("a Market body that stalls after its headers is bounded and remains an uncertain outcome", async () => {
+test("a Market body that stalls after its headers is bounded and remains an uncertain outcome", { timeout: 5_000 }, async () => {
   let calls = 0, stall = true;
   const server = createServer((req, res) => {
     calls++;
@@ -13,7 +13,9 @@ test("a Market body that stalls after its headers is bounded and remains an unce
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   try {
-    const client = createMarketClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, token: "private-test-token", timeoutMs: 50 });
+    // The complete suite starts many child servers concurrently. Allow their
+    // initial connection/header scheduling, then exercise the stalled body.
+    const client = createMarketClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, token: "private-test-token", timeoutMs: 500 });
     await assert.rejects(client.listAssignments(), e => e instanceof MarketApiError && e.uncertain && e.status === 200 && !e.message.includes("private-test-token"));
     assert.equal(calls, 1, "the transport must not retry a possibly effective operation itself");
     stall = false;

@@ -126,9 +126,11 @@ export function createNearGate({
   usdcToken = null,
   usdcEnabled = false,
   authorPayouts = null,
+  canQuote = () => true,
 }) {
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
+  if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}) };
   if (usdcEnabled && !isNearAccountId(usdcToken)) throw new TypeError("USDC needs a verified token contract");
   const assetOf = (q) => q.asset === "usdc" ? "usdc" : "near";
@@ -436,6 +438,9 @@ export function createNearGate({
   async function quote(registry, name, args, tool, asset = "near", resumeTool = null) {
     if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server.");
     const { pricing, author } = await prepare(registry, name, args, tool);
+    if (await canQuote() !== true) {
+      return errResult("Cannot accept a new payment right now: finalized-payment monitoring is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
+    }
     if (author && !authorPayouts) return errResult("This workflow requires a creator payout, but the server has no payout wallet configured. Nothing was quoted or charged.");
     maybePrune();
     if (openQuoteCount() >= maxOpenQuotes) {
