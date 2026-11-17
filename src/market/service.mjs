@@ -572,7 +572,9 @@ async function startCatalogService(cfg, { maintenance, payment, creatorPayments,
     listings.push(createListing({ maintenance, agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments, checkFee }));
   }
   if (!listings.length) die(`no listing in ${cfg.catalog.file} can run (see the lines above); add a token file and restart`);
-  await Promise.all(listings.map((l) => perform(() => l.refresh())));
+  const initializeListings = () => Promise.all(listings.map((l) => perform(() => l.refresh())));
+  if (maintenance?.initializing?.()) await maintenance.recover(initializeListings);
+  else await initializeListings();
   if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s for ${listings.length} listing${listings.length === 1 ? "" : "s"} (${listings.map((l) => l.handle + (l.active() ? "" : " (off: no price)")).join(", ")}); prices read again every ${cfg.priceRefreshMs / 1000} s; state in ${cfg.stateDir}/<handle>`);
 
