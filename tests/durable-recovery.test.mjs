@@ -86,6 +86,120 @@ const confirmed = (c) => ({
   contents: c.block,
 });
 
+test("runtime recovery confirms the original signed operation without preparing or publishing", async t => {
+  for (const direction of ["send", "receive"]) {
+    const f = await fixture(t), store = f.open(), calls = [], sourceHash = "B".repeat(64);
+    const c = direction === "send" ? candidate() : {
+      ...createBlock(secret, { previous: frontier, representative: account, balance: (balance + 100n).toString(), link: sourceHash, work: "0".repeat(16) }),
+      previousBalance: balance.toString(),
+    };
+    c.block.account = account;
+    const id = direction === "send" ? "recover-original" : `receive:${account}:${sourceHash}`;
+    const terms = direction === "send" ? binding : { ...binding, to: sourceHash };
+    const lease = store.beginSend(id, terms);
+    store.submitted(id, { ...c, epoch: lease.epoch }); store.uncertain(id);
+    const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false,
+      rpcUrl: "https://fixture.invalid", fetch: async (_url, init) => {
+        const body = JSON.parse(init.body); calls.push(body.action);
+        assert.equal(body.action, "block_info"); assert.equal(body.hash, c.hash);
+        return Response.json(confirmed(c));
+      } });
+    assert.deepEqual(await wallet.ops.reconcileActive(), { state: "confirmed" });
+    assert.equal(store.getSend(id).hash, c.hash);
+    assert.equal(store.getSend(id).state, "completed");
+    assert.equal(store.activeSend(account), null);
+    assert.deepEqual(await wallet.ops.reconcileActive(), { state: "idle" });
+    assert.deepEqual(calls, ["block_info"]);
+  }
+});
+
+test("runtime recovery releases only an unsigned slot and fences its old preparation", async t => {
+  const f = await fixture(t), store = f.open(); let rpcCalls = 0;
+  const lease = store.beginSend("never-signed", binding);
+  const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false,
+    fetch: async () => { rpcCalls++; throw Error("unexpected effect"); } });
+  assert.deepEqual(await wallet.ops.reconcileActive(), { state: "unsigned-released" });
+  assert.equal(store.getSend("never-signed").state, "intent");
+  assert.equal(store.activeSend(account), null);
+  store.beginSend("next-operation", binding);
+  assert.throws(() => store.submitted("never-signed", { ...candidate(), epoch: lease.epoch }), /ACCOUNT_WRITER_FENCED/);
+  const abort = new AbortController(); abort.abort();
+  await assert.rejects(wallet.ops.reconcileActive({ signal: abort.signal }), /SEND_RECONCILIATION_ABORTED/);
+  assert.equal(store.activeSend(account).id, "next-operation");
+  assert.equal(rpcCalls, 0);
+});
+
+test("an aborted recovery lookup cannot later clear the account slot", async t => {
+  const f = await fixture(t), store = f.open(), c = candidate(); let finish;
+  const lease = store.beginSend("late-proof", binding);
+  store.submitted("late-proof", { ...c, epoch: lease.epoch });
+  const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false,
+    rpcUrl: "https://fixture.invalid", fetch: async (_url, init) => {
+      assert.equal(JSON.parse(init.body).action, "block_info");
+      await new Promise(resolve => { finish = resolve; });
+      return Response.json(confirmed(c));
+    } });
+  const abort = new AbortController(), pending = wallet.ops.reconcileActive({ signal: abort.signal });
+  await until(() => finish); abort.abort(); finish();
+  await assert.rejects(pending, /SEND_RECONCILIATION_ABORTED/);
+  assert.equal(store.activeSend(account).id, "late-proof");
+  assert.equal(store.getSend("late-proof").state, "submitted");
+});
+
+test("an elapsed recovery deadline stays fenced even before the event loop delivers its abort timer", async t => {
+  const { performance } = await import("node:perf_hooks");
+  const f = await fixture(t), store = f.open(), c = candidate(), abort = new AbortController();
+  const lease = store.beginSend("deadline-proof", binding);
+  store.submitted("deadline-proof", { ...c, epoch: lease.epoch });
+  const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false,
+    rpcUrl: "https://fixture.invalid", fetch: async (_url, init) => {
+      assert.equal(JSON.parse(init.body).action, "block_info");
+      const end = performance.now() + 25;
+      while (performance.now() < end) { /* Delayed event loop, before any timer callback. */ }
+      return Response.json(confirmed(c));
+    } });
+  await assert.rejects(wallet.ops.reconcileActive({ signal: abort.signal, deadlineAt: performance.now() + 10 }), /SEND_RECONCILIATION_ABORTED/);
+  assert.equal(abort.signal.aborted, false, "the absolute deadline must work independently of timer delivery");
+  assert.equal(store.activeSend(account).id, "deadline-proof");
+});
+
+test("malformed operation state cannot masquerade as an unsigned releasable slot", async t => {
+  const { DatabaseSync } = await import("node:sqlite");
+  for (const mutation of [
+    { state: "unknown" }, { hash: "A".repeat(64) }, { block: "{}" }, { previous_balance: "1" },
+    { binding: JSON.stringify({ ...binding, account: payer }) }, { binding: "broken JSON" },
+  ]) {
+    const f = await fixture(t), store = f.open(), lease = store.beginSend("malformed", binding);
+    const db = new DatabaseSync(f.path), [[column, value]] = Object.entries(mutation);
+    db.prepare(`UPDATE sends SET ${column}=? WHERE id='malformed'`).run(value);
+    assert.throws(() => store.releaseUnsigned("malformed", lease.epoch), /RECOVERY_OPERATION_INVALID/);
+    assert.equal(db.prepare("SELECT id FROM active_send WHERE account=?").get(account).id, "malformed");
+    db.close();
+  }
+});
+
+test("recovery readiness is aggregate and read-only, and ignores only settled historical runs", async t => {
+  const f = await fixture(t), store = f.open();
+  store.bindAccount(account, { requireHeight: true });
+  const empty = { enforced: true, schema: 3, heightProtected: true, activeOperations: 0,
+    heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, ready: true };
+  assert.deepEqual(store.status(account), empty);
+  let revision = store.save(`gate:${account}`, 0, { v: 3, quotes: [
+    { id: "PRIVATE_OLD_RUN", recoveryRequired: true, settled: true },
+  ], owed: [] });
+  const before = store.load(`gate:${account}`);
+  assert.deepEqual(store.status(account), empty);
+  assert.deepEqual(store.load(`gate:${account}`), before);
+  revision = store.save(`gate:${account}`, revision, { v: 3, quotes: [
+    { id: "PRIVATE_HELD_RUN", recoveryRequired: true, settled: false },
+  ], owed: [{ id: "PRIVATE_PAYOUT", legacy: true }] });
+  assert.deepEqual(store.status(account), { ...empty, heldRuns: 1, heldPayouts: 1, queuedPayouts: 1, ready: false });
+  assert.doesNotMatch(JSON.stringify(store.status(account)), /PRIVATE|nano_|hash|signature/);
+  store.save(`gate:${account}`, revision, { v: 3, quotes: [], owed: [] });
+  store.beginSend("PRIVATE_OPERATION", binding);
+  assert.deepEqual(store.status(account), { ...empty, activeOperations: 1, ready: false });
+});
+
 test("operation binding and signed block persist before publish, completed restart never republishes", async (t) => {
   const f = await fixture(t);
   let store = f.open(),
@@ -419,6 +533,32 @@ function gateFixture(
   };
   return { gate, wrapped: gate.wrapRegistry(registry), wallet };
 }
+
+test("a Nano payment paused before admission survives restart and resumes without another deposit", async t => {
+  const f = await fixture(t), store = f.open(), rpc = fakeRpc(); let ready = false, calls = 0;
+  const fundRun = async (_terms, execute) => {
+    if (!ready) throw Object.assign(Error("recovery pending"), { code: "FUNDING_RECOVERY_REQUIRED" });
+    return execute();
+  };
+  const execute = async () => { calls++; return { content: [{ type: "text", text: "finished" }], costUsd: 0.02 }; };
+  const first = gateFixture(store, rpc, execute, { fundRun });
+  const p = (await first.wrapped.callTool({ name: "poster", arguments: {} })).structuredContent.x402;
+  rpc.state.receivable["D".repeat(64)] = { amount: p.amountRaw, source: payer };
+  const retry = { name: "poster", arguments: { _payment_id: p.paymentId } };
+  const paused = await first.wrapped.callTool(retry);
+  assert.equal(paused.structuredContent.payment.retryable, true);
+  assert.equal(first.gate.quote(p.paymentId).status, "paid");
+  assert.equal(store.load(`gate:${account}`).data.quotes[0].execution, null);
+  assert.equal(calls, 0); assert.equal(rpc.state.publishes, 0);
+  await first.gate.stopWatching();
+  const restarted = gateFixture(store, rpc, execute, { fundRun });
+  t.after(() => restarted.gate.stopWatching());
+  ready = true;
+  const result = await restarted.wrapped.callTool(retry);
+  assert.equal(result.isError, undefined); assert.equal(calls, 1);
+  assert.deepEqual(await restarted.wrapped.callTool(retry), result);
+  assert.equal(calls, 1);
+});
 test("actual wallet payment retries use the same durable invoice operation", async (t) => {
   const f = await fixture(t),
     store = f.open(),

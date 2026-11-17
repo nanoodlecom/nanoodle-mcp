@@ -7,7 +7,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -116,6 +116,13 @@ for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEA
     const client = mcpClient(base); await client.initialize();
     const health = await (await fetch(base + "/near/health")).json();
     assert.equal(health.funding.enforced, true); assert.equal(health.funding.ok, true);
+    const funding = JSON.parse(await readFile(join(out, "funding-health.json"), "utf8"));
+    if (recovery) {
+      assert.equal(funding.recovery.schema, 3); assert.equal(funding.recovery.heightProtected, true);
+      assert.equal(funding.recovery.ready, true); assert.equal(funding.recovery.reconciler.enforced, true);
+      assert.equal(funding.recovery.reconciler.ok, true);
+    } else assert.equal(funding.recovery, undefined);
+    assert.equal((await fetch(base + "/out/funding-health.json")).status, 404, "private recovery telemetry is never an artifact");
     near.accounts.get("merchant.testnet").balance = 0n;
     for (const asset of ["near", "usdc"]) {
       const refused = await client.call("run_noodle", { graph, inputs: { Idea: "no refund gas" }, _pay_with: asset });

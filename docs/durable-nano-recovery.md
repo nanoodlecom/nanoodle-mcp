@@ -1,6 +1,6 @@
 # Durable Nano recovery: current-source integration
 
-This is an **inactive integration candidate**, based on production `246ef51`
+This is an **inactive integration candidate**, based on production `3d25758`
 and the reviewed foundation in [draft #96](https://github.com/nanoodlecom/nanoodle-mcp/pull/96)
 (`5e47182`). Production still uses its existing JSON authorities. No canonical
 journal, production flag or schema migration has been activated. The current
@@ -59,6 +59,47 @@ journal proof may supply its transaction hash; absence of proof must not be
 presented as returned change. Stopping a gate's watcher now awaits its in-flight
 scan, pending direct transfers and queued persistence.
 
+## Runtime reconciliation and admission
+
+The journal-mode HTTP process starts one recovery worker before serving. It
+checks the account queue every 15 seconds, with a ten-second observation limit.
+It either releases a proven unsigned slot or looks up the original signed send
+or receive hash. Confirmation verifies the stored signature, binding, amount
+and required height before committing the checkpoint. It never signs, publishes,
+sweeps receivables, generates PoW or executes a workflow.
+
+An observation timeout aborts its authority to complete that attempt, but retains
+the actual queued task until terminal. Further ticks do not enqueue duplicates.
+A late lookup cannot clear the slot after cancellation. A new attempt may read
+the same original hash after the old task really ends. Malformed operation
+bindings/states and partial signed data cannot masquerade as unsigned slots.
+Monotonic deadline checks also reject late results before the event loop delivers
+the abort timer; an overdue callback cannot call itself fresh just because its
+timer has not run yet.
+
+Private funding telemetry includes only schema/enforcement, aggregate active
+operations, held runs/payouts, queued payout counts and selected worker health.
+The worker's last success expires after 60 seconds. The no-inference probe
+validates those fields whenever advertised. A qualified production cutover must
+also set `NANOODLE_REQUIRE_RECOVERY=1` for the operational-check unit, so a missing
+recovery section cannot silently pass. That flag is not enabled in production.
+Unknown, stale or held recovery state pauses new quotes and new run reservations.
+The shared admission guard checks again after a balance await. Existing debts
+remain accounted for and settlement can continue through its own authorization.
+
+A recovery refusal before execution leaves an already verified Nano, NEAR or
+USDC deposit paid and retryable. It clears the unstarted Nano execution intent;
+the customer retries the same payment ID without paying again. Offline tests
+include a restart during this pause. Once execution has started, its existing
+failure/refund and ambiguous-execution rules apply instead.
+
+Before starting any worker/outbox, hosted funding registers existing canonical
+Nano obligations even when Nano checkout is disabled. After registration, a
+missing/malformed snapshot fails closed rather than reading stale JSON. An empty
+development journal can still import its legacy source. The future production
+policy must require the canonical scope after migration; that policy remains
+unimplemented and production activation remains refused.
+
 ## Legacy state and recovery
 
 `scripts/inspect-payment-migration.mjs` is a read-only aggregate planner. It opens
@@ -104,13 +145,15 @@ Before production activation, finish and verify:
 
 1. A versioned production policy pinning the canonical existing DB, its account,
    schema and legacy import. Qualify the actual current-state migration and a
-   schema-3-compatible rollback without modifying production authority.
-2. A bounded runtime reconciler for signed operations and private recovery
-   telemetry observed by the no-inference monitor. An unresolved account must
-   pause new work while existing debt remains recoverable; readiness must never
-   sign or infer.
-3. Canonical gate obligations during startup/disabled rails, before any worker
-   or creator outbox can spend. Preserve all current NEAR funding protections.
+   schema-3-compatible rollback without modifying production authority. Include
+   every NEAR/USDC/Market creator outbox: any legacy prepared Nano payout needs
+   account-level reconciliation before fresh signing can be authorized.
+2. Qualify the implemented bounded reconciler/admission/private telemetry with
+   the canonical production policy and require recovery monitoring independently
+   of the app's advertised fields. Keep probes free of signing/inference.
+3. Bind the implemented startup/disabled-rail canonical obligation reader to
+   the production policy, so a missing migrated scope cannot become a fresh
+   import. Preserve all current NEAR funding protections.
 4. Consistent encrypted DB/WAL backup, isolated restore, full-host fencing/boot
    rehearsal and independent backup freshness/outage notification.
 5. Current-source independent review and owner/interface coordination through

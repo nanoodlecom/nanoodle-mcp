@@ -3,10 +3,11 @@ import { constants } from "node:fs";
 import { join } from "node:path";
 import { fundingRaw } from "./run-funding.mjs";
 import { hostedRunTimeout } from "./hosted-run.mjs";
+import { selectRecoveryHealth } from "./payments/recovery-health.mjs";
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
-export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
+export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, recovery = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
   let pending = null;
@@ -39,6 +40,10 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           const proof = writerProtection();
           if (proof?.enforced !== true || typeof proof.requiredState !== "boolean") throw Error("writer protection unavailable");
           report.writerProtection = { enforced: true, requiredState: proof.requiredState };
+        }
+        if (recovery) {
+          report.recovery = selectRecoveryHealth(recovery(), now());
+          report.ok &&= report.recovery.ready;
         }
       } catch { report = { ok: false, code: "funding-state-unavailable" }; }
       report = { ...report, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };

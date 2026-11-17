@@ -103,3 +103,26 @@ test("a pending refresh cannot keep stale checkout admission alive or discard pr
   assert.equal(w.sources.ready(), true, "a fresh successful observation restores admission");
   assert.equal(snapshots, 2);
 });
+
+test("journal recovery readiness and reconciler freshness gate quotes without leaking operation data", async t => {
+  const w = await setup(t); let clock = 2000;
+  const recovery = { enforced: true, schema: 3, heightProtected: true, activeOperations: 0,
+    heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, ready: true, operationId: "PRIVATE_OPERATION",
+    reconciler: { enforced: true, ok: true, checkedAt: clock, pending: false, code: "ok", url: "PRIVATE_RPC" } };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => clock,
+    snapshot: async () => value, recovery: () => recovery });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  recovery.activeOperations = 1; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  let saved = await readFile(w.file, "utf8");
+  assert.equal(JSON.parse(saved).recovery.activeOperations, 1);
+  assert.doesNotMatch(saved, /PRIVATE|operationId|url/);
+  recovery.activeOperations = 0; clock += 60_000;
+  await report.refresh(); assert.equal(w.sources.ready(), false, "fresh funding cannot hide a stalled recovery worker");
+  recovery.reconciler.checkedAt = clock;
+  await report.refresh(); assert.equal(w.sources.ready(), true);
+  recovery.reconciler.code = "PRIVATE_FAILURE";
+  await report.refresh(); saved = await readFile(w.file, "utf8");
+  assert.equal(w.sources.ready(), false); assert.doesNotMatch(saved, /PRIVATE/);
+});

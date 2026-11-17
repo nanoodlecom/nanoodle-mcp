@@ -24,6 +24,24 @@ function world({ initial = 1000n, requireScope = true } = {}) {
 }
 const budget = (id, maxRaw = 100n, maxUsd = 1) => ({ id, maxRaw, maxUsd });
 
+test("unresolved recovery pauses admission before and after a balance await without opening a run", async () => {
+  let ready = false, reads = 0, executes = 0, hold = false;
+  const waiting = deferred();
+  const pool = createRunFunding({ serial: fn => fn(), canAdmit: () => ready,
+    balance: async () => { reads++; if (hold) await waiting.promise; return 1000n; } });
+  const execute = async () => { executes++; };
+  await assert.rejects(pool.run(budget("before"), execute), { code: "FUNDING_RECOVERY_REQUIRED" });
+  assert.equal(reads, 0); assert.equal(executes, 0);
+  ready = true; hold = true;
+  const pending = pool.run(budget("during"), execute);
+  ready = false; waiting.resolve();
+  await assert.rejects(pending, { code: "FUNDING_RECOVERY_REQUIRED" });
+  assert.equal(executes, 0); assert.deepEqual(pool.snapshot(), { activeRuns: 0, reservedRaw: "0" });
+  ready = true; hold = false;
+  await pool.run(budget("after"), execute);
+  assert.equal(executes, 1);
+});
+
 test("locked quote terms reserve creator markup without authorizing models to spend it", () => {
   const options = { id: "quote", budgetUsd: "1.20", pair: { usdNano: 500_000_000n, raw: 10n ** 30n } };
   assert.deepEqual(runFundingBudget(options), { id: "quote", maxUsd: "1.200000000", maxRaw: 24n * 10n ** 29n, overheadRaw: 0n });

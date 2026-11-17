@@ -43,9 +43,9 @@ export function runFundingBudget({ id, budgetUsd, pair, creator = false }) {
  * The engine and nested/late work inherit the opaque scope through async context;
  * no prompt, graph field or tools/call argument can grant itself another budget.
  */
-export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, requireScope = false } = {}) {
+export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, requireScope = false, canAdmit = () => true } = {}) {
   if (typeof serial !== "function" || typeof balance !== "function" || typeof liabilitiesRaw !== "function"
-    || typeof requireScope !== "boolean") throw new TypeError("run funding needs a serial wallet queue, balance and liability readers");
+    || typeof requireScope !== "boolean" || typeof canAdmit !== "function") throw new TypeError("run funding needs a serial wallet queue, balance and liability readers");
   const context = new AsyncLocalStorage();
   const active = new Map();
   const held = () => [...active.values()].reduce((n, s) => n + s.maxRaw - s.drawnRaw + s.overheadRaw - s.overheadDrawnRaw, 0n);
@@ -59,6 +59,11 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
       throw new FundingError("FUNDING_CLOSED", "Provider payment has no open approved run budget");
     }
   };
+  function admit() {
+    let ready = false;
+    try { ready = canAdmit() === true; } catch { /* Unknown recovery state grants no work. */ }
+    if (!ready) throw new FundingError("FUNDING_RECOVERY_REQUIRED", "Shared Nano payment recovery is pending; no model work was started");
+  }
 
   async function run({ id, maxUsd, maxRaw, overheadRaw = 0n }, execute) {
     if (typeof id !== "string" || !/^[A-Za-z0-9_.:-]{1,160}$/.test(id) || typeof execute !== "function") {
@@ -68,9 +73,11 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     const scope = { id, maxUsd: usd(maxUsd), maxRaw: raw(maxRaw, true), overheadRaw: raw(overheadRaw),
       drawnUsd: 0n, drawnRaw: 0n, overheadDrawnRaw: 0n, invoices: new Set(), closed: false, startedAt: Date.now() };
     await serial(async () => {
+      admit();
       if (active.has(id)) throw new FundingError("FUNDING_DUPLICATE", "This run already has a funding reservation");
       const required = obligations(scope) + held() + scope.maxRaw + scope.overheadRaw;
       const available = raw(await balance(required));
+      admit();
       // Obligations can increase during an RPC/work await. Re-read them before
       // admitting any model work; no other reservation mutates outside `serial`.
       if (available < obligations(scope) + held() + scope.maxRaw + scope.overheadRaw) {

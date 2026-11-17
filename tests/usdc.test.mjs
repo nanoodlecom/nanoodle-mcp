@@ -39,6 +39,26 @@ async function world({ fundRun } = {}) {
 }
 const argsFor = (name) => name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } } : { Idea: "a lighthouse" };
 
+test("a verified USDC payment waits for shared Nano recovery and resumes without a second transfer", async () => {
+  let ready = false;
+  const w = await world({ fundRun: async (_terms, execute) => {
+    if (!ready) throw Object.assign(Error("recovery pending"), { code: "FUNDING_RECOVERY_REQUIRED" });
+    return execute();
+  } }), args = argsFor("run_noodle");
+  const p = (await w.call("run_noodle", { ...args, _pay_with: "usdc" })).structuredContent.payment;
+  const tx = w.chain.ftTransfer(TOKEN, P, M, BigInt(p.amountAtomic)), before = mock.runs();
+  const paused = await w.call("run_noodle", { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: P });
+  assert.equal(paused.structuredContent.payment.code, "FUNDING_RECOVERY_REQUIRED");
+  assert.equal(w.ledger.getQuote(p.paymentId).status, "paid");
+  assert.equal(w.chain.sendTxCount, 0); assert.equal(mock.runs(), before);
+  const restarted = w.make(); await restarted.gate.resume(); ready = true;
+  const result = await restarted.call("run_noodle", { ...args, _payment_id: p.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  const runs = mock.runs(), sends = w.chain.sendTxCount;
+  assert.deepEqual(await restarted.call("run_noodle", { ...args, _payment_id: p.paymentId }), result);
+  assert.equal(mock.runs(), runs); assert.equal(w.chain.sendTxCount, sends);
+});
+
 test("USDC funding uses the locked Nano exchange rate rather than token atomic units", async () => {
   const policies = [], w = await world({ fundRun: async (terms, execute) => { policies.push(terms); return execute(); } });
   const args = argsFor("run_noodle");

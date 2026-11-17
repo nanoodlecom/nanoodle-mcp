@@ -783,10 +783,11 @@ export function createNearGate({
     q = ledger.updateQuote(q.id, { status: "running" });
     if (ctx?.announce) ctx.announce(`payment verified — running ${name}`);
 
-    let res;
+    let res, executionStarted = false;
     try {
       if (prepError) throw prepError;
       const execute = async () => {
+        executionStarted = true;
         const result = await registry.callTool(prepared.run, {
         ...ctx,
         workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
@@ -798,6 +799,11 @@ export function createNearGate({
       };
       res = await withHostedRun(() => fundRun ? fundRun(nearRunFundingBudget(q), execute) : execute(), executionLimit);
     } catch (e) {
+      if (!executionStarted && e?.code === "FUNDING_RECOVERY_REQUIRED") {
+        q = ledger.updateQuote(q.id, { status: "paid" });
+        return errResult("Your payment is verified. The run is paused while the operator reconciles shared Nano funding. Retry this same payment id; no model work was started and no new payment is needed.",
+          { payment: { paymentId: q.id, status: "paid", retryable: true, code: "FUNDING_RECOVERY_REQUIRED" } });
+      }
       const msg = String((e && e.message) || e);
       const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
       // Persist the failure before the refund goes out, so a restart never re-runs it.

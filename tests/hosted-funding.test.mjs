@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHostedFundingSources } from "../src/hosted-funding.mjs";
+import { createHostedFundingSources, registerCanonicalNanoFunding } from "../src/hosted-funding.mjs";
 
 async function setup() {
   const dir = await mkdtemp(join(tmpdir(), "hosted-funding-"));
@@ -87,4 +87,27 @@ test("invalid clock movement and storage failure require a new healthy observati
   assert.equal(sources.ready(), true);
   clock = NaN;
   assert.equal(sources.ready(), false);
+});
+
+test("canonical Nano obligations precede disabled-rail workers and cannot fall back after journal loss", async () => {
+  const w = await setup();
+  await w.write(w.options.nanoFile, { v: 2, quotes: [], owed: [] });
+  let data = { v: 3, quotes: [{ id: "canonical-debt", status: "paid", amountRaw: "100" }], owed: [] };
+  const store = { load: scope => { assert.equal(scope, "gate:account"); return { revision: 1, data }; } };
+  assert.equal(registerCanonicalNanoFunding(w.sources, store, "account"), true);
+  assert.equal(w.sources.liabilitiesRaw(), 100n, "no live Nano gate needs to be running");
+  data.quotes[0].amountRaw = "200";
+  assert.equal(w.sources.liabilitiesRaw(), 200n);
+  data = null;
+  assert.throws(() => w.sources.liabilitiesRaw(), /canonical-funding-state-unavailable/);
+  data = { v: 2, quotes: [], owed: [] };
+  assert.throws(() => w.sources.liabilitiesRaw(), /canonical-funding-state-unavailable/);
+});
+
+test("a new journal may use its legacy import source, but required canonical state cannot be initialized empty", async () => {
+  const w = await setup(), store = { load: () => ({ data: null }) };
+  await w.write(w.options.nanoFile, { v: 2, quotes: [{ id: "legacy-debt", status: "paid", amountRaw: "50" }], owed: [] });
+  assert.equal(registerCanonicalNanoFunding(w.sources, store, "account"), false);
+  assert.equal(w.sources.liabilitiesRaw(), 50n);
+  assert.throws(() => registerCanonicalNanoFunding(w.sources, store, "account", { required: true }), /canonical-funding-state-unavailable/);
 });

@@ -1628,8 +1628,12 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             if(recoveryStore) { q.execution="intent";persist(); }
+            let executionStarted = false;
             try {
-              const execute = () => registry.callTool({ name, arguments: args }, fundRun ? { ...ctx, paidFunding: true } : ctx);
+              const execute = () => {
+                executionStarted = true;
+                return registry.callTool({ name, arguments: args }, fundRun ? { ...ctx, paidFunding: true } : ctx);
+              };
               const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await withHostedRun(() => fundRun
                 ? fundRun(runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(name) }), execute)
                 : execute(), executionLimit);
@@ -1686,6 +1690,14 @@ export function createChargeGate({
               if(recoveryStore && owed.length) ensureWatching();
             } catch (e) {
               if(recoveryError) throw recoveryError;
+              if (!executionStarted && e?.code === "FUNDING_RECOVERY_REQUIRED") {
+                q.status = "paid"; q.execution = null; q.running = null;
+                persist();
+                return { fundingPaused: true, result: {
+                  ...errResult("Your payment is verified. The run is paused while shared Nano funding is reconciled. Retry this same payment id; no model work was started and no new payment is needed."),
+                  structuredContent: { payment: { paymentId: q.id, status: "paid", retryable: true, code: "FUNDING_RECOVERY_REQUIRED" } },
+                } };
+              }
               const msg = String((e && e.message) || e);
               if(recoveryStore) {
                 q.execution="failed";
@@ -1725,7 +1737,8 @@ export function createChargeGate({
             }
           })();
         }
-        await q.running;
+        const paused = await q.running;
+        if (paused?.fundingPaused) return paused.result;
         return q.error ? errResult(q.error) : q.result;
       }
 

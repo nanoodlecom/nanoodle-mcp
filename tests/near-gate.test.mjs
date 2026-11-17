@@ -109,6 +109,26 @@ test("funding refusal refunds a NEAR deposit without starting a model", async ()
   assert.equal(mock.runs(), before);
 });
 
+test("a verified NEAR payment waits for shared-pool recovery and resumes the same deposit after restart", async () => {
+  let ready = false;
+  const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+  const pool = createRunFunding({ serial: fn => fn(), balance: async () => 100n * 10n ** 30n, canAdmit: () => ready });
+  const w = await world({ rate, fundRun: pool.run });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS), before = mock.runs();
+  const args = { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER };
+  const paused = await call(w, "idea-poster", args);
+  assert.equal(paused.structuredContent.payment.code, "FUNDING_RECOVERY_REQUIRED");
+  assert.equal(paused.structuredContent.payment.retryable, true);
+  assert.equal(w.ledger.getQuote(p.paymentId).status, "paid");
+  assert.equal(w.chain.sendTxCount, 0); assert.equal(mock.runs(), before);
+  const restarted = await w.restart(); ready = true;
+  const result = await call(restarted, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  const runs = mock.runs();
+  assert.deepEqual(await call(restarted, "idea-poster", { ...INPUTS, _payment_id: p.paymentId }), result);
+  assert.equal(mock.runs(), runs);
+});
+
 test("refund gas is checked before quoting and inference; a paid call resumes without another payment", async () => {
   const w = await world({ guardRefunds: true, merchantBalance: parseNearToYocto("0.0001") });
   const before = mock.runs();

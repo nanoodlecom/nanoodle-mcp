@@ -12,6 +12,21 @@ function rows(value) {
   return Object.values(value);
 }
 
+/** Install before any worker/outbox starts, even with Nano checkout disabled.
+ * Once canonical state exists, a later loss must never revive stale JSON. */
+export function registerCanonicalNanoFunding(sources, store, account, { required = false } = {}) {
+  const scope = `gate:${account}`;
+  if (store.load(scope).data === null && !required) return false;
+  const reader = () => {
+    const data = store.load(scope).data;
+    if (!data || data.v !== 3) throw Error("canonical-funding-state-unavailable");
+    return nanoFundingLiabilities(data);
+  };
+  reader();
+  sources.registerNano(reader);
+  return true;
+}
+
 /** Register live ledger owners before they resume/start work. Disabled profiles
  * still contribute their recorded debts through read-only disk fallback. */
 export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now = () => performance.now() }) {

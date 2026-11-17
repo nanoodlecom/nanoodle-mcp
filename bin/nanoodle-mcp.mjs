@@ -354,7 +354,7 @@ async function main() {
   // there's no API key (a key always wins for runs, matching the library), and — in
   // --charge-usd mode — receiving callers' payments and sending refunds/payouts.
   // NEAR creator payouts share that wallet too, including API-key-funded runs.
-  let recoveryStore = null;
+  let recoveryStore = null, recoveryReconciler = null;
   let wallet = null;
   let walletOptions = null, walletFactory = null, nanoAddress = null;
   if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null || nearMode)) {
@@ -378,6 +378,7 @@ async function main() {
         localWork: !noLocalWork,
         maxUsd,
         fundingLiabilities: context => fundingSources ? fundingSources.liabilitiesRaw(context) : 0n,
+        fundingReady: () => !fundingSources || fundingSources.ready(),
         requireFunding: paidFunding && !apiKey,
         protectTransfers: guardedFunding,
         verifyRpcReads: guardedFunding || !!recoveryDbFlag,
@@ -421,7 +422,10 @@ async function main() {
   ];
   if (writerResources.length) {
     writerLocks = acquireWriterLocks({ resources: writerResources });
-    process.once("exit", () => { try { recoveryStore?.close(); } finally { writerLocks.close(); } });
+    process.once("exit", () => {
+      recoveryReconciler?.stop();
+      try { recoveryStore?.close(); } finally { writerLocks.close(); }
+    });
   }
   let requiredState = null;
   if (process.env.NANOODLE_STATE_POLICY) {
@@ -449,6 +453,10 @@ async function main() {
     recoveryStore = openRecoveryStore(resolve(recoveryDbFlag));
   }
   if (walletOptions) wallet = walletFactory({ ...walletOptions, recoveryStore });
+  if (recoveryStore && fundingSources) {
+    const { registerCanonicalNanoFunding } = await import("../src/hosted-funding.mjs");
+    registerCanonicalNanoFunding(fundingSources, recoveryStore, wallet.address);
+  }
 
   const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");
   if (chargeUsd != null && serveHost === "0.0.0.0" && !publicUrlFlag) {
@@ -556,6 +564,11 @@ async function main() {
   }
 
   /* ---- --serve: MCP over streamable HTTP, optionally charging per call ---- */
+
+  if (recoveryStore) {
+    const { startRecoveryReconciler } = await import("../src/payments/recovery-reconciler.mjs");
+    recoveryReconciler = await startRecoveryReconciler({ reconcile: wallet.ops.reconcileActive });
+  }
 
   // Long-lived server: have send work ready before the first payment arrives.
   // (Not done in stdio mode — a session that never pays would waste one work per boot.)
@@ -695,6 +708,7 @@ async function main() {
   if (fundingSources) {
     const { startFundingReport } = await import("../src/funding-report.mjs");
     await startFundingReport({ outDir: resolvedOut, snapshot: wallet.ops.fundingReport, sources: fundingSources,
+      recovery: recoveryReconciler ? () => ({ ...wallet.ops.recoveryStatus(), reconciler: recoveryReconciler.status() }) : null,
       writerProtection: () => {
         writerLocks.assertHeld();
         return { enforced: true, requiredState: requiredState?.requireExisting === true };

@@ -1,4 +1,5 @@
 /** Fenced account-block coordinator. Retry only reconciles an existing signed block. */
+import { performance } from "node:perf_hooks";
 const sameAddress = (a, b) =>
   typeof a === "string" &&
   typeof b === "string" &&
@@ -13,6 +14,9 @@ function error(code) {
 const check = (ok, code) => {
   if (!ok) throw error(code);
 };
+export function assertRecoveryObservation({ signal, deadlineAt } = {}) {
+  check(!signal?.aborted && (deadlineAt === undefined || Number.isFinite(deadlineAt) && performance.now() < deadlineAt), "SEND_RECONCILIATION_ABORTED");
+}
 function createDurableWriter(
   { store, account, publicKey, prepare, publish, lookup, crypto, requireHeight = false, onConfirmed = () => {} },
   direction,
@@ -57,7 +61,8 @@ function createDurableWriter(
     );
     return r;
   }
-  async function reconcile(r) {
+  async function reconcile(r, options = {}) {
+    assertRecoveryObservation(options);
     signed(r);
     let info;
     try {
@@ -65,6 +70,9 @@ function createDurableWriter(
     } catch {
       throw error("SEND_RECONCILIATION_UNAVAILABLE");
     }
+    // A timed-out observer cannot later release the account slot. A later
+    // attempt may re-read this same hash; it never constructs a replacement.
+    assertRecoveryObservation(options);
     check(
       info &&
         (info.confirmed === true || info.confirmed === "true") &&
@@ -79,6 +87,7 @@ function createDurableWriter(
     );
     const height = typeof info.height === "string" && /^[1-9]\d{0,38}$/.test(info.height) ? info.height : null;
     check(!requireHeight || height !== null, "SEND_CONFIRMATION_HEIGHT_REQUIRED");
+    assertRecoveryObservation(options);
     store.complete(r.id, r.hash, { height });
     onConfirmed();
     return r.hash;
@@ -144,11 +153,12 @@ function createDurableWriter(
       active.set(id, { key, promise });
       return promise;
     },
-    async reconcile(id) {
+    async reconcile(id, options = {}) {
+      assertRecoveryObservation(options);
       const r = store.getSend(id);
       check(r && r.state !== "intent", "SEND_NOT_SUBMITTED");
       signed(r);
-      return r.state === "completed" ? r.hash : reconcile(r);
+      return r.state === "completed" ? r.hash : reconcile(r, options);
     },
   });
 }

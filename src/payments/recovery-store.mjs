@@ -130,16 +130,20 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
   }
   const readSend = (id) => {
     const r = db.prepare("SELECT * FROM sends WHERE id=?").get(id);
-    return r
-      ? {
-          id: r.id,
-          ...JSON.parse(r.binding),
-          state: r.state,
-          hash: r.hash,
-          block: r.block ? JSON.parse(r.block) : null,
-          previousBalance: r.previous_balance,
-        }
-      : null;
+    if (!r) return null;
+    let binding, block;
+    try { binding = JSON.parse(r.binding); block = r.block === null ? null : JSON.parse(r.block); }
+    catch { throw new RecoveryError("RECOVERY_OPERATION_INVALID"); }
+    check(binding && typeof binding === "object" && !Array.isArray(binding)
+      && JSON.stringify(Object.keys(binding).sort()) === JSON.stringify(["account", "amountRaw", "to"])
+      && binding.account === r.account && typeof binding.to === "string" && binding.to.length > 0
+      && uint(binding.amountRaw) && BigInt(binding.amountRaw) > 0n
+      && ["intent", "submitted", "uncertain", "completed"].includes(r.state), "RECOVERY_OPERATION_INVALID");
+    check(r.state === "intent"
+      ? r.hash === null && r.block === null && r.previous_balance === null
+      : hash(r.hash) && r.hash === r.hash.toUpperCase() && uint(r.previous_balance)
+        && block && typeof block === "object" && !Array.isArray(block), "RECOVERY_OPERATION_INVALID");
+    return { id: r.id, ...binding, state: r.state, hash: r.hash, block, previousBalance: r.previous_balance };
   };
   function intent(id, binding) {
     check(
@@ -196,6 +200,15 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
       "INSERT INTO metadata VALUES(?,?,?) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,data=excluded.data",
     ).run(scope, next, JSON.stringify(data));
     return next;
+  }
+  function activeSend(account) {
+    available();
+    const r = db.prepare("SELECT id,epoch FROM active_send WHERE account=?").get(account);
+    if (!r?.id) return null;
+    const operation = readSend(r.id);
+    check(operation && operation.account === account && Number.isSafeInteger(r.epoch) && r.epoch > 0
+      && ["intent", "submitted", "uncertain"].includes(operation.state), "RECOVERY_ACCOUNT_STATE_INVALID");
+    return { ...operation, epoch: r.epoch };
   }
   return Object.freeze({
     bindAccount(account, options) { return tx(() => bindAccount(account, options)); },
@@ -265,15 +278,28 @@ export function openRecoveryStore(path, { fault = () => {} } = {}) {
       available();
       return readSend(id);
     },
-    activeSend(account) {
+    activeSend,
+    status(account) {
       available();
-      const r = db
-        .prepare("SELECT id,epoch FROM active_send WHERE account=?")
-        .get(account);
-      if (!r?.id) return null;
-      const operation = readSend(r.id);
-      check(operation, "ACTIVE_OPERATION_MISSING");
-      return { ...operation, epoch: r.epoch };
+      const owner = db.prepare("SELECT account,height_proofs FROM wallet_identity WHERE singleton=1").get();
+      check(owner?.account === account, "RECOVERY_ACCOUNT_MISMATCH");
+      check(!db.prepare(`SELECT s.id FROM sends s LEFT JOIN active_send a ON a.account=s.account AND a.id=s.id
+        WHERE s.account!=? OR s.state NOT IN ('intent','submitted','uncertain','completed')
+          OR (s.state IN ('submitted','uncertain') AND a.id IS NULL) LIMIT 1`).get(account), "RECOVERY_ACCOUNT_STATE_INVALID");
+      const operation = activeSend(account);
+      const row = db.prepare("SELECT data FROM metadata WHERE scope=?").get(`gate:${account}`);
+      let data = null;
+      try { if (row) data = JSON.parse(row.data); }
+      catch { throw new RecoveryError("RECOVERY_GATE_INVALID"); }
+      check(!row || data?.v === 3 && Array.isArray(data.quotes) && Array.isArray(data.owed), "RECOVERY_GATE_INVALID");
+      const heldRuns = data?.quotes.filter(q => q.recoveryRequired && q.settled !== true).length ?? 0;
+      const heldPayouts = data?.owed.filter(o => o.legacy || o.held || ["review_required", "legacy_uncertain"].includes(o.state)).length ?? 0;
+      const activeOperations = operation ? 1 : 0;
+      // Pure aggregate observation: no IDs, signed bytes, financial writes or
+      // RPC calls. Fresh signing remains the wallet/ledger owners' authority.
+      return { enforced: true, schema: 3, heightProtected: owner.height_proofs === 1,
+        activeOperations, heldRuns, heldPayouts, queuedPayouts: data?.owed.length ?? 0,
+        ready: activeOperations + heldRuns + heldPayouts === 0 };
     },
     beginSend(id, binding) {
       return tx(() => {
