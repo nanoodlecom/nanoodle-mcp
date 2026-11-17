@@ -11,6 +11,7 @@ import { readOperatorJson } from "./operator-file.mjs";
 const readFailureCodes = new Map([
   ["NANO_RPC_NETWORK_QUORUM", "nano-rpc-network-quorum"],
   ["NANO_RPC_READ_QUORUM", "nano-rpc-read-quorum"],
+  ["NANO_RPC_LAGGING_PEERS", "nano-rpc-lagging-peers"],
   ["NANO_RPC_CONFLICT", "nano-rpc-frontier-conflict"],
   ["NANO_RPC_REGRESSION", "nano-rpc-frontier-regressed"],
   ["NANO_RPC_UNCONFIRMED_FRONTIER", "nano-rpc-unconfirmed-frontier"],

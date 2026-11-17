@@ -413,6 +413,24 @@ test("a readable endpoint on the wrong Nano network cannot satisfy operational r
   assert.ok(report.checks.some(c => c.stage === "nano-node-0" && c.code === "NANO_RPC_WRONG_NETWORK"));
 });
 
+test("the monitor reports a lagging peer and requires two current views for payment readiness", async t => {
+  for (const third of [true, false]) {
+    const f = fixture(({ url, body }) => url.hostname === "nano-0.example" && body?.action === "account_info"
+      ? Response.json(nanoAccountInfo({ height: 7, frontier: "B".repeat(64) })) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    if (third) {
+      f.config.nanoRpcUrls.push("https://nano-2.example");
+      f.states["/state/funding-health.json"].nanoRpc.configuredPeers = 3;
+    }
+    const result = await runOperationalCheck(f.config, f.deps);
+    assert.equal(result.ok, false);
+    assert.ok(Object.values(result.admission).every(value => value === third));
+    assert.ok(result.checks.some(c => c.stage === "nano-node-0-lag" && c.code === "nano-rpc-peer-lagging"));
+    assert.ok(result.checks.some(c => c.stage === "nano-frontier-agreement" && c.ok === third
+      && (third || c.code === "nano-rpc-lagging-peers")));
+  }
+});
+
 test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {
   for (const kind of ["fee", "token"]) {
     const f = fixture(({ url }) => {

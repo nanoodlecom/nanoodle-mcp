@@ -50,7 +50,10 @@ serving, and the required independent-peer minimum stays the same.
 
 Reads fan out to qualified peers. The wallet selects the newest consistent
 account height; at the same head, the greater confirmed pending total wins over
-a stale empty view. It rejects malformed amounts, conflicting heads/balances,
+a stale empty view. A peer more than two blocks behind the newest confirmed
+account height cannot count toward quorum or receive a new publication. The
+five-minute check reports that peer and checks quorum using the same rule.
+The wallet rejects malformed amounts, conflicting heads/balances,
 regression below an observed or locally published head, and unknown unconfirmed
 heads. A local published chain can continue while its confirmations arrive.
 An unavailable quorum pauses new spending rather than treating an outage as an

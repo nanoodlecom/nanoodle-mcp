@@ -19,7 +19,7 @@ import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig } from "../src/nano-read-pool.mjs";
+import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
@@ -189,21 +189,17 @@ export async function runOperationalCheck(config, deps = {}) {
     need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
     checkNanoGenesis(await nanoRpc(url, { action: "block_info", hash: NANO_GENESIS, json_block: "true" }));
     const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true", receivable: "true" });
-    nanoAccountView(info, checkAddress);
-    return info;
+    return { info, peer: index, view: nanoAccountView(info, checkAddress) };
   }, [])))).filter(Boolean);
   const nano = await check("nano-frontier-agreement", async () => {
-    if (nanoNodes.length < Math.min(2, config.nanoRpcUrls.length)) {
-      need(nanoNodes.length === 1 && standbyCheckpoint, "nano-read-quorum-unavailable");
-      const primary = nanoNodes[0];
-      need(BigInt(primary.confirmed_height) === BigInt(standbyCheckpoint.blockCount)
-        && primary.confirmed_frontier.toUpperCase() === standbyCheckpoint.hash, "nano-standby-checkpoint-disagrees");
+    const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(nanoNodes);
+    for (const { peer } of lagging) checks.push({ stage: `nano-node-${peer}-lag`, ok: false, code: "nano-rpc-peer-lagging", domains: [] });
+    if (current.length < Math.min(2, config.nanoRpcUrls.length)) {
+      need(current.length === 1 && standbyCheckpoint, lagging.length ? "nano-rpc-lagging-peers" : "nano-read-quorum-unavailable");
+      need(latestConfirmed.confirmedHeight === BigInt(standbyCheckpoint.blockCount)
+        && latestConfirmed.confirmedFrontier === standbyCheckpoint.hash, "nano-standby-checkpoint-disagrees");
     }
-    const highest = nanoNodes.reduce((a, b) => BigInt(a.confirmed_height) >= BigInt(b.confirmed_height) ? a : b);
-    const consistent = nanoNodes.every(n => BigInt(highest.confirmed_height) - BigInt(n.confirmed_height) <= 2n
-      && (n.confirmed_height !== highest.confirmed_height || n.confirmed_frontier === highest.confirmed_frontier));
-    need(consistent, "nano-wallet-nodes-disagree");
-    return highest;
+    return current.find(row => row.view === latestConfirmed).info;
   });
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
   const nearNodes = (await Promise.all(config.nearRpcUrls.map((url, index) => check(`near-node-${index}`, async () => {

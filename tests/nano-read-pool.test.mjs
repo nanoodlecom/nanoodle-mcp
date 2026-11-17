@@ -229,6 +229,32 @@ test("a newer account head wins over an old peer's already-pocketed receivable",
   assert.equal((await w.pool.read(info)).frontier, OTHER);
 });
 
+test("a lagging peer cannot form quorum or receive a publication until its account view catches up", async () => {
+  const w = world(), [old, primary, other] = w.peers;
+  primary.info = other.info = nanoAccountInfo({ height: 13, frontier: OTHER, balance: "107" });
+  assert.equal((await w.pool.read(info)).frontier, OTHER);
+  assert.equal(w.pool.status().readablePeers, 2);
+  assert.deepEqual(await w.pool.publishBases(), [primary.base, other.base]);
+  other.down = true;
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_LAGGING_PEERS" });
+  assert.equal(w.pool.status().readablePeers, 0);
+  old.info = nanoAccountInfo({ height: 11, frontier: SEND, balance: "102" });
+  assert.equal((await w.pool.read(info)).frontier, OTHER);
+  assert.deepEqual(await w.pool.publishBases(), [primary.base, old.base, other.base]);
+});
+
+test("the metered standby can replace a lagging primary without masking a same-height conflict", async () => {
+  const w = world(2, 10), [old, primary, standby] = w.peers;
+  primary.info = standby.info = nanoAccountInfo({ height: 13, frontier: OTHER });
+  assert.equal((await w.pool.read(info)).frontier, OTHER);
+  assert.equal(w.pool.status().standby.inUse, true);
+  assert.deepEqual(await w.pool.publishBases(), [primary.base]);
+  old.info = nanoAccountInfo({ height: 13, frontier: SEND });
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_CONFLICT" });
+  assert.equal(w.pool.status().readablePeers, 0);
+  assert.equal(w.calls.filter(call => call.base === standby.base).length, 2);
+});
+
 test("conflicting heads or balances at the same height refuse new spending", async () => {
   for (const patch of [{ frontier: OTHER, confirmed_frontier: OTHER }, { balance: "101", confirmed_balance: "101" }]) {
     const w = world(); Object.assign(w.peers[0].info, patch);
