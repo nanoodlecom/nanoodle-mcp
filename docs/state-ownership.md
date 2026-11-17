@@ -90,6 +90,10 @@ an independent observer is still needed during a whole-server/Babel outage.
 
 ## Starting a verified release while admission remains paused
 
+The package declares `nanoodleMaintenanceProtocol: 1` for the paused startup,
+writer proof and process-bound funding telemetry contract. The root release
+store must refuse older artifacts without that contract before starting them.
+
 Draft source supports a process-bound startup handoff; it is not deployed and
 has no installed root controller yet. With only `NANOODLE_MAINTENANCE_FILE`
 configured, a retained or unsafe pause still refuses startup before wallet
