@@ -9,7 +9,7 @@ export function creatorAgentInstructions(record) {
     `Call run_workflow for a quote. Pay its exact NEAR or USDC amount from an authorized funded wallet, or show the wallet payment link for the user to approve. Never execute a second payment as a retry.`,
     `Monitor payment.watchUrl (SSE) or payment.statusUrl?wait=1. Once paid, immediately call run_workflow again with identical inputs plus _payment_id: payment.paymentId. Do not ask the user to pay again or create another quote as a retry.`,
     `Request an SSE result stream with a progressToken to follow workflow steps. Reconnect using the same paymentId if disconnected. Show the final media or text to the user.`,
-    `Nanoodle returns unused execution funds to the paying wallet in the same asset. Successful runs send the collected 20% fee on actual model cost to the workflow's embedded Nano author address.`,
+    `Nanoodle returns unused execution funds to the paying wallet in the same asset. ${record.author ? "Successful runs send the collected 20% fee on actual model cost to the workflow's embedded Nano author address." : "No creator payout is configured for this workflow; execution still requires payment."}`,
     `Full input schema and payment instructions: ${record.url}/llms.txt`,
   ].join("\n\n");
 }

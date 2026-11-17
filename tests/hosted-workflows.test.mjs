@@ -30,9 +30,9 @@ test("creator intake checks real pricing without execution; recipes are private,
   const mutated = creators.get(result.id); mutated.graph.x402.author = "bad"; assert.equal(creators.get(result.id).author, author);
 });
 
-test("creator intake refuses missing/invalid author, unsafe/unpriced graphs and capacity exhaustion", async () => {
+test("creator intake refuses invalid author, unsafe/unpriced graphs and capacity exhaustion", async () => {
   const creators = rig({ maxWorkflows: 1 });
-  for (const bad of [ { ...graph, x402: undefined }, { ...graph, x402: { author: "nano_bad" } },
+  for (const bad of [ { ...graph, x402: { author: "nano_bad" } },
     { ...graph, nodes: [...graph.nodes, { id: "code", type: "code", fields: { code: "run()" } }] } ]) {
     await assert.rejects(creators.submit({ ...submission, graph: bad }));
   }
@@ -87,4 +87,45 @@ test("existing uploads with legacy pending-market metadata remain live without a
   const restored = rig({ dir: creators.dir, callTool: async () => { called = true; return { content: [] }; } });
   assert.equal(restored.publicView(record.id).status, "live"); assert.equal(restored.publicView(record.id).market, undefined);
   await restored.callTool(record.id, { name: "run_workflow", arguments: { Idea: "A lighthouse" } }); assert.ok(called);
+});
+
+test("optional creator payout checks, hosts and restores sanitized graphs without inventing an author", async () => {
+  const creators = rig(), plain = { ...WORKED_GRAPH, providerKey: "SYNTHETIC-NEVER-PERSIST", x402: undefined };
+  const before = nano.runs(), checked = await creators.check({ ...submission, graph: plain });
+  assert.equal(checked.author, null); assert.equal(Object.hasOwn(checked.graph, "x402"), false);
+  assert.equal(Object.hasOwn(checked.graph, "providerKey"), false); assert.equal(nano.runs(), before);
+  const hosted = await creators.submit({ ...submission, graph: plain });
+  assert.equal(hosted.author, null); assert.ok(hosted.estimatedCostUsd > 0); assert.equal(creators.get(hosted.id).graph.x402, undefined);
+  const restored = rig({ dir: creators.dir }); assert.deepEqual(restored.publicView(hosted.id), hosted);
+  assert.match(restored.instructions(hosted.id), /execution still requires payment/);
+  assert.doesNotMatch(restored.listTools(hosted.id)[0].description, /earnings go/);
+  assert.match(creatorAgentInstructions(hosted), /No creator payout/);
+  assert.doesNotMatch(creatorAgentInstructions(hosted), /Successful runs send/);
+  for (const x402 of [undefined, null, {}, { author: "" }, { author: "  " }, { author: null }]) {
+    assert.equal((await creators.submit({ ...submission, graph: { ...WORKED_GRAPH, x402 } })).id, hosted.id);
+  }
+  // Recorded from main a9191d1 before this fix; opting in retains the old identity.
+  assert.equal((await creators.submit({ graph, name: "Idea into a poster", description: "Make a poster from an idea" })).id, "wf_69f23750674d4599bdd14c69");
+});
+
+test("both HTTP intake routes allow missing payout but reject malformed explicit metadata", async () => {
+  const creators = rig();
+  const server = await serveHttp({ host: "127.0.0.1", port: 0, name: "test", version: "test", publicBase: "https://near.example", listTools: () => [], callTool: async () => ({}), creators, log: () => {} });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (path, graph) => fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...submission, graph }) });
+  try {
+    for (const path of ["/creators/check", "/creators/workflows"]) {
+      const response = await post(path, WORKED_GRAPH); assert.equal(response.status, path.endsWith("/check") ? 200 : 201);
+      const result = await response.json(); assert.equal(result.author, null); assert.ok(result.estimatedCostUsd > 0);
+      for (const x402 of ["bad", [], 1, { author: 1 }, { author: {} }, { author: "nano_bad" }]) {
+        const invalid = await post(path, { ...WORKED_GRAPH, x402 }); assert.equal(invalid.status, 400); assert.match((await invalid.json()).error, /x402|Nano/);
+      }
+      const unsafe = await post(path, { ...WORKED_GRAPH, nodes: [...WORKED_GRAPH.nodes, { id: "code", type: "code", fields: { code: "no()" } }] }); assert.equal(unsafe.status, 400);
+      if (result.id) {
+        const page = await (await fetch(base + `/workflows/${result.id}`)).text();
+        assert.match(page, /No creator payout is configured/); assert.match(page, /Pay per run in NEAR or USDC/);
+        assert.doesNotMatch(page, /earnings go to null|Creator payouts: null|Successful runs send the collected/);
+      }
+    }
+  } finally { await new Promise(resolve => server.close(resolve)); }
 });
