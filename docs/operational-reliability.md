@@ -31,10 +31,11 @@ material remaining limits rather than treating a green public GET as proof.
 ## Next runtime safety work
 
 The monitor's balance reservations are observations, not enforced runtime leases.
-An initial [run funding controller](run-funding.md) now has wallet-queue fault
-tests and an injectable NEAR saved/custom-workflow handoff. It is not activated
-by the hosted startup configuration; Nano/Market integration, live obligation
-readers and the activation matrix are still required. Do not claim deployment
+An initial [run funding controller](run-funding.md), draft PR #127, now has
+wallet-queue fault tests and injectable Nano checkout, NEAR/USDC saved/custom
+workflow and Market service/runner handoffs. It is not activated by hosted
+startup; live obligation readers, startup binding and the activation matrix are
+still required. Do not claim deployment
 of this source work enforces service-wide reservations.
 
 The wallet serializes spends and refuses an individual transfer above its balance,

@@ -303,16 +303,17 @@ export function createNotifier({ url, fetch = globalThis.fetch, log = () => {}, 
  * @param {(line: string) => void} o.log
  * @returns {Promise<{ done: Promise<number>, stop: () => void, store: object }>}
  */
-export async function startMarketService(cfg, { payment = null, creatorPayments = null, log: baseLog, fetch = globalThis.fetch }) {
+export async function startMarketService(cfg, { payment = null, creatorPayments = null, fundRun = null, fundingPair = null, log: baseLog, fetch = globalThis.fetch }) {
   const notify = cfg.notifyUrl ? createNotifier({ url: cfg.notifyUrl, log: baseLog }) : null;
   const log = notify ? (line) => { baseLog(line); if (NOTIFY_LINES.test(line)) notify(line); } : baseLog;
   if (!cfg.apiKey && typeof payment !== "function") die("no NanoGPT funding source: an API key or a wallet payment callback is needed");
-  if (cfg.catalog) return startCatalogService(cfg, { payment, creatorPayments, log, baseLog, notify, fetch });
+  if (cfg.catalog) return startCatalogService(cfg, { payment, creatorPayments, fundRun, fundingPair, log, baseLog, notify, fetch });
   let store;
   try { store = openMarketState({ dir: cfg.stateDir }); } catch (e) { die(e.message); }
   const fail = (msg) => { try { store.close(); } catch { /* closed */ } die(msg); };
   const client = createMarketClient({ baseUrl: cfg.baseUrl, token: cfg.token });
-  const runner = createWorkflowRunner({ apiKey: cfg.apiKey || undefined, payment: cfg.apiKey ? undefined : payment, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
+  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment, fundRun, fundingPair };
+  const runner = createWorkflowRunner({ ...funding, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
   const worker = createMarketWorker({
     client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd, defaultWorkflow: cfg.defaultWorkflow,
     concurrency: cfg.concurrency, retainMs: cfg.retainMs, log, creatorPayments,
@@ -523,8 +524,8 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
   return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
 }
 
-async function startCatalogService(cfg, { payment, creatorPayments, log, baseLog, notify, fetch }) {
-  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment };
+async function startCatalogService(cfg, { payment, creatorPayments, fundRun, fundingPair, log, baseLog, notify, fetch }) {
+  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment, fundRun, fundingPair };
   if (cfg.ignored && cfg.ignored.length) log(`the agents file replaces ${cfg.ignored.join(", ")}; ${cfg.ignored.length === 1 ? "it is" : "they are"} ignored`);
   await checkFunding(cfg, log);
   const custom = cfg.catalog.agents.find((a) => a.custom);

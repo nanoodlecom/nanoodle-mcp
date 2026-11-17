@@ -36,6 +36,7 @@ import { rawToXno, authorAddress } from "./wallet.mjs";
 import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
+import { runFundingBudget } from "./run-funding.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 /**
@@ -190,9 +191,11 @@ export function createChargeGate({
   log = () => {},
   usage = () => {},
   now = () => Date.now(),
+  fundRun = null,
 }) {
   if (!address || !ops) throw new Error("charge gate needs a funded Nano wallet (address + ops)");
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
+  if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
 
   /** @type {Map<string, object>} paymentId → quote */
   const quotes = new Map();
@@ -1214,7 +1217,10 @@ export function createChargeGate({
           const t0 = now();
           q.running = (async () => {
             try {
-              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await registry.callTool({ name, arguments: args }, ctx);
+              const execute = () => registry.callTool({ name, arguments: args }, ctx);
+              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = fundRun
+                ? await fundRun(runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(name) }), execute)
+                : await execute();
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
               // persist() knows this result must not be written to disk.

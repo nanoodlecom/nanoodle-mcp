@@ -29,15 +29,22 @@ unused capital and creator overhead are also held. Legacy unscoped invoices may
 not consume these reservations; `requireFunding` can reject them entirely once
 every production entry point supplies an approved scope.
 
-The NEAR gate has an injectable `fundRun` handoff for both saved and custom
-workflows. It derives authority from the persisted paid quote, not new caller
-arguments or a refreshed graph estimate. A denied reservation starts no model
-and uses the gate's existing full-refund path. Replaying a receipt creates no
-new reservation.
+Nano checkout and the NEAR/USDC gate have injectable `fundRun` handoffs. The
+latter covers both saved and custom workflows. Authority comes from the paid
+quote's locked exchange pair, not new caller arguments or a refreshed estimate.
+A denied reservation starts no model and uses the existing full-refund path.
+Replaying a NEAR/USDC receipt creates no new reservation.
+
+Market services can pass the same `fundRun` plus a current `fundingPair` reader
+to every listing runner. Workers supply a stable assignment identity and creator
+presence; runners derive authority from that assignment's accepted pricing.
+Creator overhead stays within that budget. No future Market revenue is counted
+by the funding controller. The host startup configuration does not wire these
+handoffs yet.
 
 ## Activation requirements still open
 
-- Bind Nano, NEAR/USDC and Market entry points to the same controller and supply
+- Bind hosted startup's Nano, NEAR/USDC and Market handoffs to the same controller and supply
   live obligation readers. Preserve queued/in-flight settlement amounts, failed
   debts and creator payouts across every handoff. A JSON file read alone is
   insufficient: the Nano gate currently writes snapshots asynchronously.

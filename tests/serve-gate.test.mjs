@@ -14,6 +14,7 @@ import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
+import { createRunFunding } from "../src/run-funding.mjs";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 import { qrModules } from "nanoodle";
@@ -93,7 +94,7 @@ function fakeRegistry({ author = null, onCall } = {}) {
   return registry;
 }
 
-function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch, stateFile } = {}) {
+function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch, stateFile, fundRun } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
@@ -107,6 +108,7 @@ function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10,
     now,
     fetch,
     stateFile,
+    fundRun,
   });
   return gate;
 }
@@ -114,6 +116,30 @@ function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10,
 const GRAIN = 10n ** 22n; // 1e-8 XNO, the wallet-typeable resolution — mirrors the gate's constant
 
 const argOf = (result) => result.structuredContent.x402;
+
+test("Nano funding handoff uses the paid quote's locked pair and refuses before inference", async () => {
+  for (const allowed of [true, false]) {
+    const chain = fakeChain(), policies = [];
+    const pool = createRunFunding({ serial: fn => fn(), balance: async () => allowed ? 10n ** 30n : 0n });
+    const registry = fakeRegistry({ onCall: async () => {
+      assert.equal(pool.snapshot().activeRuns, 1);
+      return { content: [{ type: "text", text: "done" }], costUsd: 0.01 };
+    } });
+    const gate = makeGate(chain, { registry, fundRun: (terms, execute) => { policies.push(terms); return pool.run(terms, execute); } });
+    const { callTool } = gate.wrapRegistry(registry);
+    const p = argOf(await callTool({ name: "poster", arguments: { Text: "funded" } }));
+    chain.state.receivable["C".repeat(64)] = { amount: p.amountRaw, source: PAYER };
+    const result = await callTool({ name: "poster", arguments: { Text: "funded", _payment_id: p.paymentId } });
+    assert.equal(policies[0].id, `nano:${p.paymentId}`);
+    assert.equal(policies[0].maxRaw, 5n * 10n ** 28n, "the $0.05/$1 pair excludes identifying dust");
+    assert.equal(registry.callCount(), allowed ? 1 : 0);
+    assert.equal(pool.snapshot().activeRuns, 0);
+    if (!allowed) {
+      assert.equal(result.isError, true);
+      assert.equal(chain.state.transfers[0].amountRaw, p.amountRaw);
+    }
+  }
+});
 
 /**
  * Wait for a CONDITION, never for the clock.

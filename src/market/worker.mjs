@@ -270,7 +270,8 @@ export function createMarketWorker({
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
     try {
-      run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id) });
+      run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
+        fundingId: `market:${rec.id}`, creator: !!rec.creator });
     } catch (e) {
       log(`assignment ${short(rec.id)}: run failed (${errText(e)}); handing it back`);
       // Only the provider's own per-step message (runner.mjs marks it buyerMessage) goes to the
