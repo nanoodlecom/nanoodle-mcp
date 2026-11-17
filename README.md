@@ -555,11 +555,15 @@ wallet or current XNO/USD rate is available. API-key-funded servers can configur
 #### Hosted creator workflows
 
 On [near.nanoodle.com/creators](https://near.nanoodle.com/creators), upload a
-Nanoodle graph with your embedded `x402.author` Nano address. Nanoodle stores
+native Nanoodle graph. An embedded `x402.author` Nano address is optional. Nanoodle stores
 the recipe, funds the model calls from its shared pool, and supplies a run page
 and a dedicated MCP endpoint. The creator supplies the workflow, not a server,
-provider key or marketplace token. Customers pay NEAR or USDC; successful runs
-pay the creator in Nano using the rules above.
+provider key or marketplace token. Customers still pay NEAR or USDC before execution. With a valid address, successful
+runs pay the creator in Nano using the rules above; without one, no creator payout
+is made. The form warns on the first Host click and requires a second Host click
+for the same graph, name and description to host without creator payouts. Editing
+the form or choosing another file resets that acknowledgment. Free checking never
+requires a payout address; malformed explicit metadata is still rejected.
 
 Connected, named Text and Choice nodes become customer inputs automatically.
 Multiple inputs are mapped independently; no primary input selection is needed.

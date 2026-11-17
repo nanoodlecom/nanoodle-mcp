@@ -1,4 +1,13 @@
 /** Format checks shared by creator upload UI and intake. No graph leaves the browser here. */
+export function creatorPayoutAddress(graph) {
+  const metadata = graph?.x402;
+  if (metadata == null) return null;
+  if (typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("Optional x402 payout metadata must be an object");
+  if (metadata.author == null) return null;
+  if (typeof metadata.author !== "string") throw new Error("The embedded x402.author must be a valid Nano payout address");
+  return metadata.author.trim() || null;
+}
+
 export function assertCreatorGraph(graph) {
   const object = value => value && typeof value === "object" && !Array.isArray(value);
   if (object(graph) && ("last_node_id" in graph || "last_link_id" in graph ||
