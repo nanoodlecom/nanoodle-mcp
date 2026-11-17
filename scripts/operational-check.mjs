@@ -9,6 +9,7 @@ import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
+import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/index.mjs";
 import { resolveWalletKey } from "../src/wallet.mjs";
@@ -293,7 +294,11 @@ async function productionConfig(env = process.env) {
 
 if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
   let report;
-  try { report = await runOperationalCheck(await productionConfig()); }
+  try {
+    const config = await productionConfig();
+    await waitForRecentAppStart(config);
+    report = await runOperationalCheck(config);
+  }
   catch { report = finishOperationalReport(process.env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", [{ stage: "preflight", ok: false, code: "check-could-not-finish", domains: ALL }]); }
   console.log(JSON.stringify(report)); if (!report.ok) process.exitCode = 1;
 }
