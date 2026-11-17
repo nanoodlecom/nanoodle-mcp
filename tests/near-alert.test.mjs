@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
-import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT } from "../scripts/near-alert.mjs";
+import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT } from "../scripts/near-alert.mjs";
 
 const invocation = { MONITOR_UNIT: CHECK_UNIT, MONITOR_INVOCATION_ID: "a".repeat(32), MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" };
 const setup = () => ({ stateDir: mkdtempSync(join(tmpdir(), "near-alert-")), conversation: "near_check_alerts", sender: "bits255.codex.near_monitor" });
@@ -48,6 +48,23 @@ test("test alerts are labeled, ignore stale status, and cannot mistake another u
   assert.equal(failureEvent({}, latest), null);
   assert.throws(() => failureEvent({ ...invocation, MONITOR_UNIT: "other.service" }, latest));
   assert.match(failureEvent(invocation, { ...latest, checkedAt: "2020-01-01T00:00:00Z" }).text, /Stage: service/);
+});
+
+test("Market failures use their own report and reach Ember through the existing durable queue", async () => {
+  const config = setup(), requests = [];
+  writeFileSync(join(config.stateDir, "latest.json"), JSON.stringify({ ok: false, checkedAt: new Date().toISOString(), stage: "refund" }));
+  writeFileSync(join(config.stateDir, "market-latest.json"), JSON.stringify({ ok: false, checkedAt: new Date().toISOString(), stage: "listing-nanoodle-song" }));
+  const call = async (name, args) => { requests.push(args); return { message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } }; };
+  const result = await deliverAlerts(config, { env: { ...invocation, MONITOR_UNIT: MARKET_UNIT }, call, enqueueOnly: true });
+  assert.equal(result.persisted, true); assert.equal(requests.length, 0);
+  assert.equal((await deliverAlerts(config, { env: {}, call })).queued, 1);
+  assert.equal(requests[0].recipient, EMBER); assert.equal(requests[0].conversation_id, config.conversation);
+  assert.match(requests[0].text, /every 15 minutes/); assert.match(requests[0].text, /https:\/\/market.near.ai/);
+  assert.match(requests[0].text, /Stage: listing-nanoodle-song/); assert.match(requests[0].text, /market-latest.json/);
+  assert.doesNotMatch(requests[0].text, /refund|deposit|daily/);
+  const drill = failureEvent({ ...invocation, MONITOR_UNIT: MARKET_TEST_UNIT }, {});
+  assert.match(drill.text, /TEST ALERT.*Market/); assert.match(drill.text, /not a production outage/);
+  assert.notEqual(result.messageId, failureEvent(invocation, {}).messageId, "the two monitors cannot collide");
 });
 
 test("drafts and incorrect recipient responses remain pending, without bypassing bridge approval", async () => {

@@ -126,3 +126,46 @@ This unit's failure is expected. Its alert is explicitly labeled TEST and asks
 Ember to claim and acknowledge it. Verify `message_status` for the resulting
 message using the sender's own credential. A queued message alone does not prove
 receipt. Never acknowledge on Ember's behalf.
+
+## NEAR AI Market availability every 15 minutes
+
+`scripts/market-check.mjs` makes public GET requests to `market.near.ai`: the
+website, platform API, and the four published Nanoodle profiles (song, image,
+character, clip) with their default live pricing plans. It checks that profiles
+are live, available and not funding-paused. Occupied job slots alone do not
+fail a check. The custom-workflow profile is not published yet and is excluded;
+add it to `MARKET_HANDLES` after publication.
+
+This is an availability check, not a paid execution test. It uses no credentials,
+creates no jobs, runs no inference, and makes no payments. It does not prove an
+authenticated worker can complete an assignment. Each failed probe gets up to
+three attempts with a two-second pause; each request, including its response
+body, has a 12-second deadline. Reports contain selected public status only.
+
+Install `ops/nanoodle-market-check.{service,timer}` alongside the existing check
+and alert units, then:
+
+```sh
+systemctl daemon-reload
+systemctl start nanoodle-market-check.service
+systemctl enable --now nanoodle-market-check.timer
+TZ=UTC systemctl list-timers nanoodle-market-check.timer
+cat /var/lib/nanoodle-near-check/market-latest.json
+```
+
+The timer runs at **:00, :15, :30 and :45 UTC** with a catch-up after downtime.
+It runs on the same production VPS, `159.195.17.119`, as user `nanoodle-check`;
+the unit hides the payer key and Babel token. Failures use the existing Babel
+sender, conversation with Ember, private outbox and five-minute alert retry
+timer. No additional Babel enrollment or grant is required.
+
+Test the Market failure route without interrupting the actual service:
+
+```sh
+systemd-run --unit=nanoodle-market-check-alert-test \
+  --property=OnFailure=nanoodle-near-alert@nanoodle-market-check-alert-test.service.service \
+  /usr/bin/false
+```
+
+The resulting alert explicitly says TEST. As above, verify Ember's authenticated
+receipt separately from queue admission.

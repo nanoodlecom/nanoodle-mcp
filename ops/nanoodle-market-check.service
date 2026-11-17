@@ -1,0 +1,23 @@
+[Unit]
+Description=Read-only NEAR AI Market availability check
+Wants=network-online.target
+After=network-online.target
+OnFailure=nanoodle-near-alert@%n.service
+
+[Service]
+Type=oneshot
+User=nanoodle-check
+Group=nanoodle-check
+WorkingDirectory=/srv/nanoodle-mcp/app
+EnvironmentFile=/etc/255labs/system-trust.env
+StateDirectory=nanoodle-near-check
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/flock -n /var/lib/nanoodle-near-check/market-check.lock /usr/local/bin/with-system-trust /opt/node-v22.23.4-linux-x64/bin/node /srv/nanoodle-mcp/app/scripts/market-check.mjs
+TimeoutStartSec=3min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=/etc/nanoodle-near-check/payer.json /etc/nanoodle-near-check/babel-token
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
