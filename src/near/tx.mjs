@@ -22,6 +22,7 @@ import { NearError } from "./errors.mjs";
 
 const U64_MAX = (1n << 64n) - 1n;
 const U128_MAX = (1n << 128n) - 1n;
+export const DEFAULT_FUNCTION_CALL_GAS = 30_000_000_000_000n;
 
 function u32(n) {
   const b = Buffer.alloc(4);
@@ -83,7 +84,7 @@ export function signTransfer({ signer, signerId, receiverId, nonce, blockHash, a
 }
 
 /** One NEAR FunctionCall, used for NEP-141 transfers and storage registration. */
-export function signFunctionCall({ signer, signerId, receiverId, nonce, blockHash, methodName, args, gas = 30_000_000_000_000n, depositYocto = 1n }) {
+export function signFunctionCall({ signer, signerId, receiverId, nonce, blockHash, methodName, args, gas = DEFAULT_FUNCTION_CALL_GAS, depositYocto = 1n }) {
   assertNearAccountId(signerId);
   assertNearAccountId(receiverId);
   if (typeof methodName !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(methodName)) throw new TypeError("invalid FunctionCall method");

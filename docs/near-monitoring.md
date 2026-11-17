@@ -197,6 +197,10 @@ Coverage:
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
+- Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
+  separate NEAR/USDC quote capacity. Fee calculations include the protocol's
+  gas purchase floor and complete action costs; paid/running work retains fees
+  before its refund outbox entry exists. These add two per-asset probes.
 - Balances after customer/creator liabilities and accepted Market work; Market
   revenue is not treated as spendable before settlement. A $2 provider-funding
   buffer and 0.05 NEAR native reserve are checked in addition to recorded debts.

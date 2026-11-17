@@ -57,6 +57,8 @@ export function createRefunder({
   log = () => {},
   minRefundYocto = MIN_REFUND_YOCTO,
   usdcToken = null,
+  beforeSign = async () => {},
+  beforeComplete = async () => {},
   backoffMs = [30_000, 60_000, 120_000, 300_000, 600_000],
   maxAttempts = 100,
   resignWindowMs = 36 * 3_600_000,
@@ -68,6 +70,8 @@ export function createRefunder({
 }) {
   assertNearAccountId(accountId);
   if (!signer || typeof signer.sign !== "function" || typeof signer.publicKey !== "string") throw new TypeError("createRefunder needs a signer");
+  if (typeof beforeSign !== "function") throw new TypeError("beforeSign must be a function");
+  if (typeof beforeComplete !== "function") throw new TypeError("beforeComplete must be a function");
 
   let chain = Promise.resolve();
   function serialized(task) {
@@ -79,11 +83,15 @@ export function createRefunder({
   /** Sign a fresh transfer for `rec` and persist it before returning. */
   async function signFor(rec) {
     if (rec.asset != null && !["near", "usdc"].includes(rec.asset)) throw new Error("Unknown refund asset in ledger");
-    const key = await rpc.viewAccessKey({ accountId, publicKey: signer.publicKey });
+    if (rec.asset === "usdc" && (!usdcToken || rec.tokenContract !== usdcToken)) throw new Error("USDC refund contract does not match this server");
+    // The debt is already durable. Refuse a fresh signature without consuming
+    // nonce/state when gas, storage or another customer's principal is short.
+    // Existing signed bytes still reconcile through drive/confirm unchanged.
+    const admission = await beforeSign(rec);
+    const key = admission?.accessKey ?? await rpc.viewAccessKey({ accountId, publicKey: signer.publicKey });
     const chainNonce = BigInt(key.nonce);
     const lastNonce = BigInt(ledger.getMeta("lastNonce") ?? 0);
     const nonce = (chainNonce > lastNonce ? chainNonce : lastNonce) + 1n;
-    if (rec.asset === "usdc" && (!usdcToken || rec.tokenContract !== usdcToken)) throw new Error("USDC refund contract does not match this server");
     const signed = rec.asset === "usdc" ? signFtTransfer({ signer, signerId: accountId, tokenContract: usdcToken,
       to: rec.to, amount: BigInt(rec.amountYocto), nonce, blockHash: key.block_hash }) : signTransfer({
       signer,
@@ -122,7 +130,7 @@ export function createRefunder({
 
   /** Has the transfer's outcome (incl. its receipt) executed? Only then is "sent" or "failed" known. */
   function executed(result) {
-    return !!(result && typeof result === "object" && result.status && typeof result.status === "object"
+    return !!(result && typeof result === "object" && result.final_execution_status === "FINAL" && result.status && typeof result.status === "object"
       && (Object.hasOwn(result.status, "SuccessValue") || Object.hasOwn(result.status, "Failure"))
       && Array.isArray(result.receipts_outcome) && result.receipts_outcome.length > 0);
   }
@@ -132,7 +140,11 @@ export function createRefunder({
     return result.receipts_outcome.some((ro) => ro && ro.outcome && ro.outcome.status && typeof ro.outcome.status === "object" && Object.hasOwn(ro.outcome.status, "Failure"));
   }
 
-  function markSent(rec, result) {
+  async function markSent(rec, result) {
+    // Keep the debt until the funding reader has checkpointed the finalized
+    // outgoing effects. An older account view must not reuse the spent funds.
+    try { await beforeComplete(rec, result); }
+    catch (e) { return retryLater(rec, e); }
     const failed = failedOutcome(result) || rec.asset === "usdc" && !hasFtTransfer(result, {
       tokenContract: usdcToken, from: accountId, to: rec.to, amount: rec.amountYocto,
     });

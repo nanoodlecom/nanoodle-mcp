@@ -962,7 +962,8 @@ export async function serveHttp({
       }
       if (url.pathname === "/near/health" && nearHealth) {
         res.setHeader("Cache-Control", "no-store");
-        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearHealth.merchant, network: nearHealth.network, active: !!nearGate, watcher: nearWatcher?.status() || null, ...(usdc ? { usdc } : {}) }));
+        return send(nearGate ? 200 : 503, JSON.stringify({ merchant: nearHealth.merchant, network: nearHealth.network, active: !!nearGate, watcher: nearWatcher?.status() || null,
+          ...(nearHealth.funding ? { funding: nearHealth.funding() } : {}), ...(usdc ? { usdc } : {}) }));
       }
 
       if (url.pathname === "/version") {

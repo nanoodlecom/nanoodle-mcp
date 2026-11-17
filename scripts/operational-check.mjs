@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
-import { createNearRpc, loadNearSigner, ftView, checkUsdcMerchant } from "../src/near/index.mjs";
+import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/index.mjs";
 import { resolveWalletKey } from "../src/wallet.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
@@ -18,6 +18,7 @@ import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
+import { readNearFunding } from "../src/near/funding.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -164,9 +165,17 @@ export async function runOperationalCheck(config, deps = {}) {
     need(health.active && health.merchant === config.merchant && health.network === config.network, "near-listener-not-active");
     const age = now() - Date.parse(health.watcher?.lastScanAt);
     need(health.watcher?.listening && Number.isFinite(age) && age < 120_000 && age >= -30_000, "near-watcher-stale");
+    need(health.funding?.enforced === true, "near-refund-funding-not-enforced");
+    need(health.funding.ok === true && Number.isSafeInteger(health.funding.checkedAt)
+      && now() - health.funding.checkedAt <= 60_000 && now() - health.funding.checkedAt >= -30_000, "near-refund-funding-unhealthy");
     if (near) need(Number(near.block.header.height) - Number(health.watcher.height) <= 120, "near-watcher-behind");
     return health;
   }, ["near", "usdc"]);
+  if (site) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
+    await check(`${asset}-refund-admission`, async () => {
+      need(site.funding[key] === true, "near-refund-capacity-exhausted");
+    }, [asset]);
+  }
   const rates = await check("exchange-rates", async () => {
     const result = await http(config.site + "/rates");
     need(result.quoting && parseUsdNano(result.nearUsd) > 0n && parseUsdNano(result.xnoUsd) > 0n, "exchange-rate-not-usable");
@@ -211,23 +220,16 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["near", "usdc"]);
     const token = await check("usdc-receive-registration", () => checkUsdcMerchant({ rpc: near.rpc, network: config.network, merchantId: config.merchant }), ["usdc"]);
     const funding = await check("near-fee-and-balance-reads", async () => {
-      let gas;
-      // Some providers answer UNKNOWN_BLOCK for gas_price [null] while other
-      // reads work. Try an explicit finalized height, then another fresh node.
+      let last;
       for (const node of [near, ...nearNodes.filter(n => n !== near)]) {
-        try { gas = await node.rpc.call("gas_price", [Number(node.block.header.height)]); break; } catch { /* read-only failover */ }
+        try {
+          const frame = await readNearFunding({ rpc: node.rpc, network: config.network, accountId: config.merchant,
+            publicKey: config.nearPublicKey, tokenContract: token?.tokenContract, now });
+          return { nearBalanceYocto: frame.balanceYocto.toString(), storageUsage: frame.storageUsage, costs: frame.costs,
+            usdcBalanceAtomic: frame.usdcAtomic?.toString() ?? null };
+        } catch (e) { last = e; }
       }
-      need(gas?.gas_price, "near-gas-price-unavailable");
-      const [account, protocol, usdc] = await Promise.all([
-        near.rpc.call("query", { request_type: "view_account", finality: "final", account_id: config.merchant }),
-        near.rpc.call("EXPERIMENTAL_protocol_config", { finality: "final" }),
-        token ? ftView(near.rpc, token.tokenContract, "ft_balance_of", { account_id: config.merchant }) : null,
-      ]);
-      const costs = protocol.runtime_config.transaction_costs;
-      need(protocol.chain_id === config.network, "near-protocol-network-mismatch");
-      const feeGas = cost => BigInt(cost.send_sir) > BigInt(cost.send_not_sir) ? BigInt(cost.send_sir) + BigInt(cost.execution) : BigInt(cost.send_not_sir) + BigInt(cost.execution);
-      return { nearBalanceYocto: account.amount, storageUsage: Number(account.storage_usage), storagePriceYocto: protocol.runtime_config.storage_amount_per_byte,
-        gasPriceYocto: gas.gas_price, transferGas: feeGas(costs.action_receipt_creation_config) + feeGas(costs.action_creation_config.transfer_cost), usdcBalanceAtomic: usdc };
+      throw last;
     }, ["near", "usdc"]);
     if (funding && state && rates) await check("refund-liquidity-accounting", async () => {
       const results = liquidityChecks({ ...funding, usdcBalanceAtomic: funding.usdcBalanceAtomic ?? "0", liabilities: state.liabilities, nanoBalanceRaw: nano?.confirmed_balance || "0",

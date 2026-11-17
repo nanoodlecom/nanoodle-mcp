@@ -197,7 +197,7 @@ test("the real server pays saved and custom creators from one Nano queue when an
       assert.equal(p.authorPayout.to, AUTHOR);
       const tx = asset === "usdc" ? chain.ftTransfer(TOKEN, P, M, BigInt(p.amountAtomic)) : chain.transfer(P, M, BigInt(p.amountYocto));
       const result = await mcp.call(name, { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: P });
-      assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+      assert.equal(result.structuredContent?.receipt?.outcome, "succeeded", JSON.stringify(result));
       let receipt;
       for (let i = 0; i < 100; i++) {
         receipt = (await (await fetch(`${base}/near/status/${p.paymentId}`)).json()).receipt;

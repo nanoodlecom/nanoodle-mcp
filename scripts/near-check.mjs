@@ -127,9 +127,13 @@ export async function runCheck(config, deps = {}) {
     stage = "execution";
     const paidArgs = { ...state.args, _payment_id: q.paymentId };
     if (!state.result) {
-      state.result = await callMcp("run_noodle", paidArgs, { fetch: request, endpoint: base + "/mcp", onWorkflow: workflow => {
+      const result = await callMcp("run_noodle", paidArgs, { fetch: request, endpoint: base + "/mcp", onWorkflow: workflow => {
         state.progress.push({ status: workflow.status, nodes: workflow.nodes.map(n => ({ id: n.id, status: n.status })) }); save();
-      } }); save();
+      } });
+      const pause = result.structuredContent?.payment;
+      require(!(result.isError && pause?.retryable === true && pause.status === "paid" && pause.paymentId === q.paymentId),
+        "Payment verified but execution is temporarily paused; resume this retained payment after funding recovers");
+      state.result = result; save();
     }
     const expected = state.v < 2 ? `NANOODLE_OK:${state.marker}` : state.marker;
     require(!state.result.isError && correctOutput(state.result, state), "Custom workflow returned an incorrect result");

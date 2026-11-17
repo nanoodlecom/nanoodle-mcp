@@ -111,6 +111,15 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     const client = mcpClient(base); await client.initialize();
+    const health = await (await fetch(base + "/near/health")).json();
+    assert.equal(health.funding.enforced, true); assert.equal(health.funding.ok, true);
+    near.accounts.get("merchant.testnet").balance = 0n;
+    for (const asset of ["near", "usdc"]) {
+      const refused = await client.call("run_noodle", { graph, inputs: { Idea: "no refund gas" }, _pay_with: asset });
+      assert.equal(refused.isError, true); assert.equal(refused.structuredContent?.payment, undefined);
+      assert.equal(providerBlocks.size, 0, "gas refusal must not pay a model invoice");
+    }
+    near.accounts.get("merchant.testnet").balance = parseNearToYocto("10");
     for (const [asset, name] of [["nano", "poster"], ["near", "poster"], ["near", "run_noodle"], ["usdc", "run_noodle"]]) {
       const args = name === "run_noodle" ? { graph, inputs: { Idea: "a lighthouse" }, _pay_with: asset }
         : { Idea: "a lighthouse", ...(asset === "nano" ? {} : { _pay_with: asset }) };
@@ -125,6 +134,14 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
         const p = quote.structuredContent.payment;
         const tx = asset === "usdc" ? near.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(p.amountAtomic))
           : near.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto));
+        if (asset === "usdc") {
+          const held = near.accounts.get("merchant.testnet").balance, invoices = providerBlocks.size;
+          near.accounts.get("merchant.testnet").balance = 0n;
+          const paused = await client.call(name, { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: "payer.testnet" });
+          assert.equal(paused.isError, true); assert.match(JSON.stringify(paused), /same payment id/);
+          assert.equal(providerBlocks.size, invoices, "a verified USDC deposit cannot start inference without native refund gas");
+          near.accounts.get("merchant.testnet").balance = held;
+        }
         const result = await client.call(name, { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: "payer.testnet" });
         assert.equal(result.structuredContent?.receipt?.outcome, "succeeded", JSON.stringify(result));
       }

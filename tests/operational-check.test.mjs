@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
 import { NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
+import { nearProtocol } from "./fixtures/near-fees.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 function fixture(override = () => null) {
@@ -45,24 +46,24 @@ function fixture(override = () => null) {
         if (body.method === "block") return json({ header: { height: 100, hash: "same-block", timestamp_nanosec: String(BigInt(NOW) * 1_000_000n) } });
         if (body.method === "gas_price") return json({ gas_price: "100000000" });
         if (body.method === "EXPERIMENTAL_protocol_config") {
-          const cost = { send_sir: "300000000000", send_not_sir: "300000000000", execution: "300000000000" };
-          return json({ chain_id: "mainnet", runtime_config: { storage_amount_per_byte: "10000000000000000000", transaction_costs: {
-            action_receipt_creation_config: cost, action_creation_config: { transfer_cost: cost } } } });
+          return json(nearProtocol({ chainId: "mainnet" }));
         }
         if (body.method === "query") {
-          if (body.params.request_type === "view_access_key") return json({ permission: "FullAccess" });
-          if (body.params.request_type === "view_account") return json({ amount: "1000000000000000000000000", storage_usage: 500 });
+          const at = { block_height: 100, block_hash: "same-block" };
+          if (body.params.request_type === "view_access_key") return json({ permission: "FullAccess", nonce: 100, ...at });
+          if (body.params.request_type === "view_account") return json({ amount: "1000000000000000000000000", storage_usage: 500, ...at });
           if (body.params.request_type === "call_function") {
             const results = { ft_metadata: { spec: "ft-1.0.0", symbol: "USDC", decimals: 6 }, storage_balance_of: { total: "1" }, ft_balance_of: "1000000" };
             assert.ok(body.params.method_name in results);
-            return json({ result: [...Buffer.from(JSON.stringify(results[body.params.method_name]))] });
+            return json({ result: [...Buffer.from(JSON.stringify(results[body.params.method_name]))], ...at });
           }
         }
         assert.fail("Unexpected NEAR RPC: " + body.method);
       }
       if (url.hostname === "site.example" || url.hostname === "nano-site.example") {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
-        if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near", watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 } });
+        if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
+          funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 } });
         if (body.method === "initialize") return json({ serverInfo: { name: "nanoodle" } });
         if (body.method === "tools/list") return json({ tools: ["sing", "price_noodle", "run_noodle", "noodle_guide"].map(name => ({ name })) });
         assert.equal(body.method, "tools/call"); assert.equal(body.params.name, "price_noodle", "never execute a paid tool or request a deposit");
@@ -135,6 +136,18 @@ test("loss of the separate Nano ingress is visible without executing tools or di
   assert.equal(report.admission.nano, false); assert.equal(report.admission.near, true);
   assert.ok(report.checks.some(c => c.stage === "nano-mcp-discovery" && !c.ok));
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_ERROR/);
+});
+
+test("periodic readiness verifies fresh enforced refund funding and each asset's admission capacity", async () => {
+  for (const change of [{ enforced: false }, { checkedAt: NOW - 60_001 }, { ok: false }, { canQuoteUsdc: false }]) {
+    const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
+      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 },
+      funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true, ...change } }) : null);
+    const result = await runOperationalCheck(f.config, f.deps);
+    assert.equal(result.ok, false); assert.equal(result.admission.usdc, false);
+    if (change.canQuoteUsdc === false) assert.equal(result.admission.near, true);
+    else assert.equal(result.admission.near, false);
+  }
 });
 
 test("a stale node is reported while a fresh fallback remains usable; loss of all fresh NEAR nodes blocks that rail", async () => {

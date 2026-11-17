@@ -5,7 +5,8 @@ import { paymentLiabilities, liquidityChecks } from "../src/operational-state.mj
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
 const balances = liabilities => ({ liabilities, nanoBalanceRaw: (10n ** 31n).toString(), nearBalanceYocto: (10n ** 24n).toString(),
-  storageUsage: 500, storagePriceYocto: "10000000000000000000", usdcBalanceAtomic: "1000000000", gasPriceYocto: "100000000", transferGas: 1_000_000_000_000n, xnoUsd: "1", providerReserveUsd: "2" });
+  storageUsage: 500, usdcBalanceAtomic: "1000000000", xnoUsd: "1", providerReserveUsd: "2",
+  costs: { storagePriceYocto: 10_000_000_000_000_000_000n, nativeRefundFeeYocto: 200_000_000_000_000_000_000n, tokenRefundFeeYocto: 6_000_000_000_000_000_000_001n } });
 
 test("all unsettled currencies and creator payouts are reserved without double-counting settlement intents", () => {
   const s = snapshots();
@@ -18,7 +19,7 @@ test("all unsettled currencies and creator payouts are reserved without double-c
   s.near.quotes.q3 = { id: "q3", status: "paid", paidYocto: "400" };
   const before = JSON.stringify(s), l = paymentLiabilities(s, { now: NOW });
   assert.equal(l.nanoRaw, 230n); assert.equal(l.nearYocto, 500n); assert.equal(l.usdcAtomic, 300n);
-  assert.equal(l.nativeRefunds, 1); assert.deepEqual(l.issues, []);
+  assert.equal(l.nativeRefunds, 2); assert.equal(l.tokenRefunds, 1); assert.deepEqual(l.issues, []);
   assert.equal(JSON.stringify(s), before, "accounting must never mutate or retry money state");
 });
 
@@ -71,7 +72,7 @@ test("USDC funds do not cover NEAR gas or storage, and gas price increases are i
   assert.equal(checks.find(c => c.stage === "usdc-liquidity").ok, true);
   config.nearBalanceYocto = "62000000000000000000000";
   assert.equal(liquidityChecks(config).find(c => c.stage === "near-liquidity").ok, true);
-  config.gasPriceYocto = "200000000";
+  config.costs.tokenRefundFeeYocto *= 2n;
   assert.equal(liquidityChecks(config).find(c => c.stage === "near-liquidity").ok, false);
 });
 
