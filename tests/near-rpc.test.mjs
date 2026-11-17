@@ -323,3 +323,113 @@ test("pool: request pacing covers chain checks, failover and concurrent callers"
   assert.equal(clock, 1400, "simultaneous requests reserve distinct slots");
   assert.throws(() => createNearRpcPool({ urls: "https://a.test", minIntervalMs: -1 }), /minIntervalMs/);
 });
+
+function healthyHead(at, height = 100) {
+  return { header: { height, hash: `block-${height}`, timestamp_nanosec: (BigInt(at) * 1_000_000n).toString() } };
+}
+function healthyStatus(at, chain = "mainnet", syncing = false) {
+  return { chain_id: chain, sync_info: { syncing, latest_block_time: new Date(at).toISOString() } };
+}
+
+test("pool: stale, syncing and malformed status cannot authorize a payment read", async () => {
+  const at = 1_800_000_000_000;
+  for (const status of [healthyStatus(at - 90_001), healthyStatus(at + 30_001), healthyStatus(at, "mainnet", true),
+    { chain_id: "mainnet" }, healthyStatus(at, "mainnet", null)]) {
+    const { fetch, calls } = hostFetch({
+      "a.test": () => ({ body: { result: status } }),
+      "b.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at) : { good: true } } }),
+    });
+    const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch });
+    assert.deepEqual(await rpc.txStatus({ txHash: "h", senderId: "s.near" }), { good: true });
+    assert.deepEqual(calls, ["a.test status", "b.test status", "b.test tx"]);
+  }
+});
+
+test("pool: a frozen finalized head fails over even while cached status remains fresh", async () => {
+  const at = 1_800_000_000_000;
+  const { fetch, calls } = hostFetch({
+    "a.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at) : healthyHead(at - 90_001) } }),
+    "b.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at) : healthyHead(at) } }),
+  });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch });
+  assert.deepEqual(await rpc.block({ finality: "final" }), healthyHead(at));
+  assert.deepEqual(calls, ["a.test status", "a.test block", "b.test status", "b.test block"]);
+});
+
+test("pool: an almost-expired cached status is refreshed before the normal recheck interval", async () => {
+  let at = 1_800_000_000_000;
+  const headAt = at - 89_000;
+  const f = hostFetch({ "a.test": req => ({ body: { result: req.method === "status" ? healthyStatus(headAt) : { good: true } } }) });
+  const rpc = createNearRpcPool({ urls: "https://a.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await rpc.viewAccessKey({}); at += 1001; f.calls.length = 0;
+  await assert.rejects(rpc.viewAccessKey({}), { code: "RPC_STALE" });
+  assert.deepEqual(f.calls, ["a.test status"], "no state query reaches the expired endpoint");
+});
+
+test("pool: rechecks network identity after startup and shares concurrent health reads", async () => {
+  let at = 1_800_000_000_000, chain = "mainnet";
+  const f = hostFetch({
+    "a.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at, chain) : { from: "a" } } }),
+    "b.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at) : { from: "b" } } }),
+  });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await Promise.all([rpc.viewAccessKey({}), rpc.viewAccessKey({})]);
+  assert.equal(f.calls.filter(c => c === "a.test status").length, 1);
+  chain = "testnet"; at += 30_000; f.calls.length = 0;
+  assert.deepEqual(await rpc.viewAccessKey({}), { from: "b" });
+  assert.deepEqual(f.calls, ["a.test status", "b.test status", "b.test query"]);
+  f.calls.length = 0; at += 30_000;
+  await rpc.viewAccessKey({});
+  assert.ok(f.calls.every(c => !c.startsWith("a.test")), "changed network remains quarantined");
+});
+
+test("pool: stale-node preflight can fail over before sending; signed bytes stay identical", async () => {
+  const at = 1_800_000_000_000, sent = [];
+  const f = hostFetch({
+    "a.test": () => ({ body: { result: healthyStatus(at - 90_001) } }),
+    "b.test": req => {
+      if (req.method === "send_tx") sent.push(req.params.signed_tx_base64);
+      return { body: { result: req.method === "status" ? healthyStatus(at) : { accepted: true } } };
+    },
+  });
+  const rpc = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await rpc.sendTx("IDENTICAL_SIGNED_BYTES");
+  assert.deepEqual(sent, ["IDENTICAL_SIGNED_BYTES"]);
+  assert.ok(!f.calls.includes("a.test send_tx"));
+});
+
+test("pool: fresh status does not make a regressed latest head safe; historical blocks still work", async () => {
+  const at = 1_800_000_000_000;
+  let height = 100;
+  const f = hostFetch({ "a.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at)
+    : req.params.block_id ? healthyHead(at - 86_400_000, 5) : healthyHead(at, height) } }) });
+  const rpc = createNearRpcPool({ urls: "https://a.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await rpc.block({ finality: "final" }); height = 99;
+  await assert.rejects(rpc.block({ finality: "final" }), { code: "RPC_STALE" });
+  assert.deepEqual(await rpc.block({ blockId: "old-payment-block" }), healthyHead(at - 86_400_000, 5));
+});
+
+test("pool: all frozen nodes fail closed and a healthy node's negative answer is still authoritative", async () => {
+  const at = 1_800_000_000_000;
+  const stale = hostFetch({ "a.test": () => ({ body: { result: healthyStatus(at - 90_001) } }) });
+  const rpc = createNearRpcPool({ urls: "https://a.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: stale.fetch });
+  await assert.rejects(rpc.txStatus({ txHash: "h", senderId: "s.near" }), { code: "RPC_STALE" });
+  const f = hostFetch({
+    "a.test": req => req.method === "status" ? { body: { result: healthyStatus(at) } }
+      : { body: { error: { cause: { name: "UNKNOWN_TRANSACTION" } } } },
+    "b.test": () => { throw new Error("must not shop for a different answer"); },
+  });
+  const healthy = createNearRpcPool({ urls: "https://a.test,https://b.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await assert.rejects(healthy.txStatus({ txHash: "h", senderId: "s.near" }), { code: "UNKNOWN_TRANSACTION" });
+  assert.deepEqual(f.calls, ["a.test status", "a.test tx"]);
+});
+
+test("pool: the same finalized height cannot silently change its block hash", async () => {
+  const at = 1_800_000_000_000;
+  let changed = false;
+  const f = hostFetch({ "a.test": req => ({ body: { result: req.method === "status" ? healthyStatus(at)
+    : { header: { ...healthyHead(at).header, hash: changed ? "different-finalized-hash" : "block-100" } } } }) });
+  const rpc = createNearRpcPool({ urls: "https://a.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await rpc.block({ finality: "final" }); changed = true;
+  await assert.rejects(rpc.block({ finality: "final" }), { code: "RPC_BAD_RESPONSE" });
+});

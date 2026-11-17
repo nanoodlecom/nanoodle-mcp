@@ -53,9 +53,18 @@ and verify backups/restore/fencing before any cutover. Existing JSON sends can h
 ambiguous restart outcomes; monitoring does not correct that. Audit ownership locks
 before startup money effects and behavior after an unclean reboot.
 
-The NEAR pool verifies network identity at startup and the monitor checks head
-freshness. Runtime failover still needs freshness/identity revalidation so a frozen
-but HTTP-responsive primary does not keep answering while a healthy fallback exists.
+The hosted NEAR pool now revalidates network identity every 30 seconds and rejects
+syncing nodes, heads older than 90 seconds or more than 30 seconds in the future,
+malformed head metadata, and regressing latest finalized heights. Unhealthy reads
+fail over; semantic negative transaction answers remain authoritative. Historical
+payment blocks retain their original verification rules. A timed-out broadcast
+still resolves by its existing transaction hash, without constructing a replacement.
+The watcher does not advance or refresh its cursor on a stale head. Its cached
+health also expires, and new NEAR/USDC quotes pause while monitoring is unhealthy;
+existing payment verification, outcomes and refunds remain accessible. Fault tests
+cover frozen/syncing/wrong-chain nodes, cached-head expiry and outage recovery.
+Deployment verification is required before treating these changes as live.
+
 The public Nano MCP ingress also needs its own free discovery probe; current discovery
 probes target the canonical NEAR listener.
 

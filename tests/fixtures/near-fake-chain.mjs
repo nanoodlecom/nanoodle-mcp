@@ -192,7 +192,8 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     const { id, method, params } = req || {};
     log.push({ method, params });
     if (method === "status") {
-      return ok(id, { chain_id: chainId, sync_info: { latest_block_hash: head.header.hash, latest_block_height: head.header.height, syncing: false }, version: { version: "fake" } });
+      return ok(id, { chain_id: chainId, sync_info: { latest_block_hash: head.header.hash, latest_block_height: head.header.height,
+        latest_block_time: new Date(Number(BigInt(head.header.timestamp_nanosec) / 1_000_000n)).toISOString(), syncing: false }, version: { version: "fake" } });
     }
     if (method === "block") {
       if (params && params.finality) return ok(id, head);

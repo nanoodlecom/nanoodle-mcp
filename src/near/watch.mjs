@@ -6,6 +6,7 @@
  * transaction hashes durably). Existing quotes get a bounded, resumable backfill.
  */
 import { NearError } from "./errors.mjs";
+import { assertFreshBlock, MAX_HEAD_AGE_MS, MAX_CLOCK_SKEW_MS } from "./freshness.mjs";
 
 const META = "paymentWatch";
 const timeMs = (block) => Number(BigInt(block.header.timestamp_nanosec) / 1_000_000n);
@@ -14,6 +15,7 @@ export function createNearWatcher({
   rpc, ledger, merchantId, pendingQuotes, observeTransfer,
   tokenContracts = [],
   pollMs = 2000, maxBlocksPerTick = 25, log = () => {},
+  now = Date.now, maxHeadAgeMs = MAX_HEAD_AGE_MS, maxClockSkewMs = MAX_CLOCK_SKEW_MS,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   cancel = clearTimeout,
 }) {
@@ -22,7 +24,7 @@ export function createNearWatcher({
     || (state.backfill && (typeof state.backfill.nextHash !== "string" || !Number.isFinite(state.backfill.cutoffMs))))) {
     throw new NearError("STATE_UNREADABLE", "The NEAR payment watcher cursor is malformed");
   }
-  let timer = null, stopped = true, inflight = null, failures = 0, lastError = null, lastScanAt = null;
+  let timer = null, stopped = true, inflight = null, failures = 0, lastError = null, lastScanAt = null, lastHeadAt = null;
   function save(next) { ledger.setMeta(META, next); state = next; }
 
   async function inspect(block) {
@@ -51,6 +53,7 @@ export function createNearWatcher({
 
   async function scan() {
     const latest = await rpc.block({ finality: "final" });
+    const headAt = assertFreshBlock(latest, { now: now(), maxHeadAgeMs, maxClockSkewMs });
     const height = Number(latest?.header?.height);
     if (!Number.isSafeInteger(height) || typeof latest.header.hash !== "string") {
       throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received no finalized block height");
@@ -105,7 +108,8 @@ export function createNearWatcher({
         save({ ...state, backfill: { ...state.backfill, nextHash: block.header.prev_hash } });
       }
     }
-    lastScanAt = new Date().toISOString();
+    lastScanAt = new Date(now()).toISOString();
+    lastHeadAt = headAt;
     if (lastError) log("NEAR payment watcher recovered; finalized transfers are being checked again");
     failures = 0; lastError = null;
   }
@@ -132,6 +136,12 @@ export function createNearWatcher({
       if (!lastError) log(`NEAR payment watcher listening for finalized transfers to ${merchantId}`);
     },
     stop() { stopped = true; if (timer !== null) cancel(timer); },
-    status: () => ({ listening: !stopped && !lastError, merchant: merchantId, height: state?.height ?? null, backfilling: !!state?.backfill, lastScanAt, error: lastError }),
+    status: () => {
+      const fresh = lastHeadAt !== null && now() - lastHeadAt <= maxHeadAgeMs && lastHeadAt - now() <= maxClockSkewMs
+        && lastScanAt !== null && now() - Date.parse(lastScanAt) <= 120_000 && now() >= Date.parse(lastScanAt);
+      return { listening: !stopped && !lastError && fresh, merchant: merchantId, height: state?.height ?? null,
+        backfilling: !!state?.backfill, lastScanAt, headAt: lastHeadAt === null ? null : new Date(lastHeadAt).toISOString(),
+        error: lastError || (!stopped && !fresh ? "RPC_STALE" : null) };
+    },
   };
 }
