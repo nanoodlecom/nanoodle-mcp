@@ -7,13 +7,14 @@ observe those conditions periodically without running inference.
 This is the audit and completion checklist, not a claim that every item is done.
 Existing checks: one daily paid custom NEAR canary, quarter-hour public Market
 availability, durable Babel alerts to Ember. Those alone do not prove financial
-or worker readiness. Source/production baseline: `8357d57`, 2026-11-17.
+or worker readiness. Production baseline before the Nano read-guard rollout:
+`3a799c8`, 2026-11-17.
 
 | Requirement | Evidence required / remaining work |
 |---|---|
 | Bounded RPC operations and a queue that survives errors | Nano deadlines, malformed state/publish responses, invoice validation and cap protection deployed in PR #122 (`f0ba69b`), 877 tests passed. Ambiguous publishes retain identical-block recovery. Market response-body deadlines are included with the operational monitor. |
-| Stale/out-of-sync Nano and NEAR nodes | Check network identity, syncing/finalized head age, lag across independent reads, wallet frontier/confirmation consistency, watcher freshness and backfill. Prevent stale reads from authorizing new work. |
-| Funds cover provider invoices and customer/creator liabilities | Audit atomic shared-pool reservations across concurrent runs, price/deposit changes, refunds, author payouts, and Market's deferred revenue. Refuse unaffordable work before inference. |
+| Stale/out-of-sync Nano and NEAR nodes | NEAR identity, syncing/finalized age, monotonic heads and watcher expiry deployed in PR #125. The [Nano account read guard](nano-rpc-freshness.md) validates mainnet peers, compares current/confirmed account state, rejects regressions and stale negatives, and checks runtime coverage. Nano rollout qualification is recorded below. |
+| Funds cover provider invoices and customer/creator liabilities | PR #127 deployed atomic shared-pool reservations and live debt protection across direct runs and Market. Runtime funding telemetry is checked every five minutes. Restore-time signed-intent ambiguity remains a separate open requirement. |
 | Native NEAR gas and USDC refunds remain payable | Check spendable funds after storage, gas at current price, authorized signer, token registration, token balance and queued obligations. USDC liquidity alone cannot pay gas. |
 | Per-run and per-job budgets are enforced at payment time | Estimates alone are insufficient. Test unexpected invoice increases, missing/non-finite prices, multiple parallel paid nodes and partially failed runs. |
 | Prices and upstream fee assumptions stay current | Validate exchange-rate freshness, public model catalogs, all saved/custom workflow pricing and Market's actual platform fee; stale assumptions must not silently authorize losses. |
@@ -91,7 +92,17 @@ default is unbounded. The shared [hosted execution deadline](hosted-execution.md
 now covers saved/custom tools, nested built-ins, humanizer transports, Market
 runs and output downloads in source. Fault tests include in-flight payment
 reconciliation and full-refund/no-repay behavior through the actual server on
-Nano, NEAR and USDC. Deployment qualification is still required for this change.
+Nano, NEAR and USDC. PR #129 deployed `3a799c8` after 995 tests passed. A bounded
+two-step native NEAR canary at 05:19 UTC passed progress, result, finalized refund
+and replay; the automatic 05:20 UTC readiness check passed all 42 probes.
+Inventory PR #31 and deploy PR #124 record that deployment.
+
+The Nano read guard adds a frozen preferred peer to the actual hosted-server
+tests. It covers confirmed payment detection, provider sends, refunds and replay
+for all three direct payment assets. The complete suite passed 1,013 tests.
+Read-only preflight at 06:30 UTC verified the exact module against all four
+configured production RPCs and the wallet selected by the running process.
+Deployment and post-deployment readiness still need verification for this change.
 
 Independent whole-host/Babel outage notification and encrypted off-server recovery
 with a restore rehearsal are still open. Do not call the overall reliability goal

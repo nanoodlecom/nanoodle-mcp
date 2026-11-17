@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
-import { deriveAddress, derivePublicKey } from "nanocurrency";
+import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { createNearRpc, loadNearSigner, ftView, checkUsdcMerchant } from "../src/near/index.mjs";
@@ -17,6 +17,7 @@ import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
+import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -87,6 +88,12 @@ export async function runOperationalCheck(config, deps = {}) {
     need(Number.isSafeInteger(limit) && limit > 0 && limit <= 24 * 3_600_000, "funding-report-invalid");
     need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
       && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= limit + 15 * 60_000, "funding-run-stuck");
+    const rpc = value.nanoRpc;
+    need(rpc?.enforced === true && rpc.configuredPeers === config.nanoRpcUrls.length, "nano-read-guard-not-enforced");
+    const minimum = Math.min(2, config.nanoRpcUrls.length);
+    need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= config.nanoRpcUrls.length)
+      && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
+    need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -121,13 +128,13 @@ export async function runOperationalCheck(config, deps = {}) {
     }, []);
   }
   const nanoNodes = (await Promise.all(config.nanoRpcUrls.map((url, index) => check(`nano-node-${index}`, async () => {
-    const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true" });
-    need(/^\d{1,39}$/.test(info.confirmed_balance || "") && /^\d+$/.test(info.confirmed_height || "")
-      && /^[A-F0-9]{64}$/i.test(info.confirmed_frontier || ""), "nano-confirmed-state-missing");
+    checkNanoGenesis(await nanoRpc(url, { action: "block_info", hash: NANO_GENESIS, json_block: "true" }));
+    const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true", receivable: "true" });
+    nanoAccountView(info, checkAddress);
     return info;
   }, [])))).filter(Boolean);
   const nano = await check("nano-frontier-agreement", async () => {
-    need(nanoNodes.length >= 1, "nano-no-readable-node");
+    need(nanoNodes.length >= Math.min(2, config.nanoRpcUrls.length), "nano-read-quorum-unavailable");
     const highest = nanoNodes.reduce((a, b) => BigInt(a.confirmed_height) >= BigInt(b.confirmed_height) ? a : b);
     const consistent = nanoNodes.every(n => BigInt(highest.confirmed_height) - BigInt(n.confirmed_height) <= 2n
       && (n.confirmed_height !== highest.confirmed_height || n.confirmed_frontier === highest.confirmed_frontier));

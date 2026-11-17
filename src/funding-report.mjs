@@ -25,6 +25,16 @@ export async function startFundingReport({ outDir, snapshot, sources, intervalMs
           activeRuns: value.activeRuns, oldestStartedAt: value.oldestStartedAt,
           enforced: value.enforced === true, protectTransfers: value.protectTransfers === true,
           ok: balance >= liabilities + reserved };
+        if (value.nanoRpc) {
+          const n = value.nanoRpc;
+          if (![n.configuredPeers, n.minimumPeers, n.readablePeers, n.networkPeers, n.lastReadAt].every(x => Number.isSafeInteger(x) && x >= 0)) throw Error("invalid RPC snapshot");
+          report.nanoRpc = { enforced: n.enforced === true, configuredPeers: n.configuredPeers, minimumPeers: n.minimumPeers,
+            readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt };
+          const age = now() - n.lastReadAt;
+          report.ok &&= report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
+            && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
+            && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers && age <= 60_000 && age >= -30_000;
+        }
       } catch { report = { ok: false, code: "funding-state-unavailable" }; }
       report = { ...report, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };
       try {

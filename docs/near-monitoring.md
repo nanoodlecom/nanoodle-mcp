@@ -181,7 +181,9 @@ is written, fsynced and removed in the output directory to verify persistence.
 
 Coverage:
 
-- Confirmed Nano wallet height/frontier agreement across configured nodes.
+- Nano mainnet identity, confirmed wallet height/frontier agreement across
+  configured nodes, and the running wallet's fresh multi-peer read enforcement.
+  See [Nano RPC freshness](nano-rpc-freshness.md).
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.

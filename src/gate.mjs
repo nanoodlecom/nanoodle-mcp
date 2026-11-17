@@ -670,7 +670,7 @@ export function createChargeGate({
     // asking the node about one is pure load on an endpoint that is usually
     // already throttling us (that is why the refund is queued at all).
     if (!anyPaymentWatchable()) return;
-    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true" });
+    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true", include_only_confirmed: "true" });
     const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     for (const [hash, v] of blocks) {
       const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}

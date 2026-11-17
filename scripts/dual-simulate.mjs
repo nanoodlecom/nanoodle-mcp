@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFakeChain, throwawayNearKey, nanoGptMock, WORKED_GRAPH } from "../tests/fixtures/near-fake-chain.mjs";
+import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "../tests/fixtures/nano-protocol.mjs";
 import { parseNearToYocto } from "../src/near/amount.mjs";
 import { freePort, mcpClient } from "./near-simulate.mjs";
 
@@ -41,7 +42,8 @@ export async function nanoNode() {
     let body = {};
     try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { body = {}; }
     const answer = {
-      account_info: { frontier: "0".repeat(64), balance: "0", representative: body.account },
+      account_info: nanoAccountInfo({ frontier: "B".repeat(64), balance: "0", representative: body.account, height: 1 }),
+      block_info: body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY : { error: "Block not found" },
       receivable: { blocks: "" },
       account_history: { history: "" },
     }[body.action] || { error: "stand-in: not supported" };
