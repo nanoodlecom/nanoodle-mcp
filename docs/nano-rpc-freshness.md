@@ -1,5 +1,19 @@
 # Nano RPC account freshness
 
+The private `out/funding-health.json` includes `nanoRpc.checkpoint`: the network
+genesis, public account, highest observed account head and highest confirmed
+head, each with its hash and block count. Locally published unconfirmed heads
+remain in that floor; lagging peers cannot lower it. The report selects these
+fields explicitly and remains 0600 and inaccessible through `/out`. The public
+operational report contains only the checkpoint probe's status code.
+
+Capture a fresh healthy checkpoint while the original writer is still running
+and idle, then fence it before a migration or replacement. Compare the new
+confirmed account view and block ancestry against that floor. A missing,
+wrong-wallet, conflicting or behind-floor view must stop the handoff. This
+telemetry is an input to an operator handoff; it is not a durable journal,
+an automatic restore mechanism or permission to run two wallet writers.
+
 Hosted paid tools and Market workers enable the shared wallet's read guard.
 `NANO_RPC_URL` / `--nano-rpc` accepts one to eight distinct, comma-separated
 endpoints. Configure independently operated mainnet nodes: with multiple endpoints,

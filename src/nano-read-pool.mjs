@@ -183,6 +183,9 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     },
     observe,
     status: () => ({ enforced: true, configuredPeers: bases.length, minimumPeers: minimum, readablePeers: readPeers,
-      networkPeers: bases.filter(b => networks.get(b)?.ok && !expired(networks.get(b).at, networkTtlMs)).length, lastReadAt }),
+      networkPeers: bases.filter(b => networks.get(b)?.ok && !expired(networks.get(b).at, networkTtlMs)).length, lastReadAt,
+      checkpoint: high && final && !blocked ? { v: 1, networkGenesis: NANO_GENESIS, account,
+        head: { hash: high.frontier, blockCount: high.height.toString() },
+        confirmed: { hash: final.confirmedFrontier, blockCount: final.confirmedHeight.toString() } } : null }),
   };
 }
