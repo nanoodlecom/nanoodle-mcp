@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
-import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT, OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT } from "../scripts/near-alert.mjs";
+import { deliverAlerts, failureEvent, babelClient, EMBER, CHECK_UNIT, TEST_UNIT, MARKET_UNIT, MARKET_TEST_UNIT, OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT, BACKUP_UNIT, BACKUP_TEST_UNIT } from "../scripts/near-alert.mjs";
 
 const invocation = { MONITOR_UNIT: CHECK_UNIT, MONITOR_INVOCATION_ID: "a".repeat(32), MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" };
 const setup = () => ({ stateDir: mkdtempSync(join(tmpdir(), "near-alert-")), conversation: "near_check_alerts", sender: "bits255.codex.near_monitor" });
@@ -89,6 +89,26 @@ test("drafts and incorrect recipient responses remain pending, without bypassing
     assert.equal(result.ok, false);
     assert.equal(JSON.parse(readFileSync(join(config.stateDir, "alerts", result.messageId + ".json"))).status, "pending");
   }
+});
+
+test("backup failures and drills use fixed metadata instead of a payment or Market report", async () => {
+  const config = setup(), requests = [];
+  const latest = { ok: false, checkedAt: new Date().toISOString(), stage: "PRIVATE_REFUND_STAGE", error: "PRIVATE_ARCHIVE_KEY" };
+  writeFileSync(join(config.stateDir, "latest.json"), JSON.stringify(latest));
+  const env = { ...invocation, MONITOR_UNIT: BACKUP_UNIT };
+  const call = async (_name, args) => { requests.push(args); return { message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } }; };
+  const queued = await deliverAlerts(config, { env, call, enqueueOnly: true });
+  assert.equal(queued.persisted, true); assert.equal(requests.length, 0);
+  assert.equal((await deliverAlerts(config, { env: {}, call })).queued, 1);
+  assert.equal(requests[0].recipient, EMBER); assert.equal(requests[0].conversation_id, config.conversation);
+  assert.match(requests[0].text, /backup FAILED/); assert.match(requests[0].text, /Stage: backup/);
+  assert.match(requests[0].text, /resume.json/); assert.match(requests[0].text, /no models or transfers/);
+  assert.doesNotMatch(requests[0].text, /PRIVATE_|daily check|latest.json|replacement deposit/);
+  assert.equal((await deliverAlerts(config, { env, call })).queued, 0);
+  const drill = failureEvent({ ...env, MONITOR_UNIT: BACKUP_TEST_UNIT }, latest);
+  assert.equal(drill.test, true); assert.match(drill.text, /TEST ALERT.*backup/);
+  assert.match(drill.text, /not a production outage/); assert.match(drill.text, /claim and acknowledge/);
+  assert.notEqual(drill.messageId, queued.messageId);
 });
 
 test("Babel transport uses the dedicated credential, explicit conversation and bounded HTTP request", async () => {
