@@ -46,6 +46,8 @@ import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { redactUrl } from "../src/redact.mjs";
 import { startSweeper } from "../src/sweep.mjs";
+import { acquireWriterLocks, canonicalStatePath } from "../src/process-lock.mjs";
+import { verifyStartupState } from "../src/startup-state.mjs";
 /*
  * src/wallet.mjs and src/gate.mjs are the ONLY modules that reach `nanocurrency`,
  * and they load on demand (see loadWalletMod / loadGateMod below). `nanocurrency`
@@ -338,8 +340,10 @@ async function main() {
 
   const resolvedOut = resolve(outDir || "./nanoodle-out");
   const paidFunding = serveSpec !== null && (chargeUsd != null || nearMode);
-  const guardedFunding = paidFunding || (serveSpec !== null && !!(process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN));
+  const marketEnabled = serveSpec !== null && !!(process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN);
+  const guardedFunding = paidFunding || marketEnabled;
   let fundingSources = null;
+  let writerLocks = null;
   // The wallet exists for two independent jobs: paying NanoGPT x402 invoices when
   // there's no API key (a key always wins for runs, matching the library), and — in
   // --charge-usd mode — receiving callers' payments and sending refunds/payouts.
@@ -366,6 +370,10 @@ async function main() {
         requireFunding: paidFunding && !apiKey,
         protectTransfers: guardedFunding,
         verifyRpcReads: guardedFunding,
+        assertWriter: () => {
+          if (!writerLocks) throw Error("Payment writer protection not acquired");
+          writerLocks.assertHeld();
+        },
         log: (line) => console.error("nanoodle-mcp: " + line),
       });
     } catch (e) { console.error("nanoodle-mcp: " + e.message); process.exit(1); }
@@ -383,6 +391,40 @@ async function main() {
     console.error("nanoodle-mcp: --near-merchant needs a NanoGPT funding source to run the workflows it sells — " +
       "NANOGPT_API_KEY (env, --key or --env-file) or a Nano wallet (NANO_SEED / NANO_PRIVATE_KEY)");
     process.exit(1);
+  }
+
+  // createNanoWallet only constructs callbacks. Lock before invoking any of
+  // them, loading tools, sweeping files, resuming ledgers or starting workers.
+  // Account locks also cover another output directory or a stdio wallet client.
+  let marketRoot = null;
+  if (marketEnabled) {
+    const { defaultStateDir } = await import("../src/market/service.mjs");
+    marketRoot = resolve(process.env.MARKET_STATE_DIR || defaultStateDir());
+  }
+  const writerResources = [
+    ...(wallet ? [`nano:${wallet.address}`] : []),
+    ...(nearMode ? [`near:${nearNetwork}:${nearMerchant}`] : []),
+    ...(guardedFunding ? [`state:${canonicalStatePath(resolvedOut)}`] : []),
+    ...(marketRoot ? [`market:${canonicalStatePath(marketRoot)}`] : []),
+  ];
+  if (writerResources.length) {
+    writerLocks = acquireWriterLocks({ resources: writerResources });
+    process.once("exit", writerLocks.close); // Never release while asynchronous work drains.
+  }
+  let requiredState = null;
+  if (process.env.NANOODLE_STATE_POLICY) {
+    let marketHandles = marketEnabled ? [""] : [];
+    if (marketEnabled && process.env.MARKET_AGENTS_FILE) {
+      try {
+        const catalog = JSON.parse(await readFile(process.env.MARKET_AGENTS_FILE, "utf8"));
+        marketHandles = catalog.agents.map(a => a.handle);
+      } catch { throw Error("Cannot read Market catalog for required payment state policy"); }
+    }
+    requiredState = verifyStartupState({ policyFile: process.env.NANOODLE_STATE_POLICY, outDir: resolvedOut,
+      nanoAddress: wallet?.address ?? null, chargeNano: chargeUsd != null,
+      nearMerchant, nearNetwork, marketRoot, marketHandles });
+    fundingSources?.requireFiles(requiredState.files);
+    console.error(`nanoodle-mcp: required payment state verified (${requiredState.files.length} files)`);
   }
 
   const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");
@@ -522,6 +564,8 @@ async function main() {
         modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
         nanoOps: wallet?.ops,
         fundingSources,
+        requireExistingState: requiredState?.requireExisting === true,
+        assertWriter: () => writerLocks.assertHeld(),
         maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
       });
       ({ listTools, callTool, instructions, paymentNote, nearInfo, usagePath } = near);
@@ -575,6 +619,7 @@ async function main() {
       publicBase,
       // In-flight money (pending quotes, queued refunds) survives restarts here.
       stateFile: join(resolvedOut, "gate-state.json"),
+      requireExistingState: requiredState?.requireExisting === true,
       fundRun: !apiKey ? wallet.ops.withFunding : null,
       canQuote: () => !fundingSources || fundingSources.ready(),
       log: (line) => console.error("nanoodle-mcp: " + line),
@@ -626,6 +671,10 @@ async function main() {
   if (fundingSources) {
     const { startFundingReport } = await import("../src/funding-report.mjs");
     await startFundingReport({ outDir: resolvedOut, snapshot: wallet.ops.fundingReport, sources: fundingSources,
+      writerProtection: () => {
+        writerLocks.assertHeld();
+        return { enforced: true, requiredState: requiredState?.requireExisting === true };
+      },
       log: line => console.error("nanoodle-mcp: " + line) });
   }
   if (near?.gate.authorPayouts) {
@@ -703,6 +752,7 @@ async function main() {
   let marketService = null;
   if (process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN) {
     marketService = await startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources,
+      requireExistingState: requiredState?.requireExisting === true,
       fundingPair: gate?.fundingPair || (near ? async () => {
         const r = await near.rates.currentUsdc();
         const { parseUsdNano } = await import("../src/usd.mjs");
@@ -732,7 +782,7 @@ async function main() {
  * (MARKET_AGENTS_FILE, MARKET_PRICE_REFRESH_SECONDS, MARKET_AUTO_PRICE); and MARKET_STATE_DIR.
  * With a catalog, log lines name the listing ("[handle] …") and SIGTERM drains every listing.
  */
-async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources, fundingPair }) {
+async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creatorPayments, fundingSources, fundingPair, requireExistingState }) {
   const say = (line) => console.error("nanoodle-mcp: market worker: " + line);
   try {
     const [{ readConfig, startMarketService }, { logSafe }] = await Promise.all([
@@ -742,6 +792,7 @@ async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creato
     const cfg = readConfig([], env, { needKey: !wallet });
     const funded = !cfg.apiKey && wallet && fundingSources;
     const svc = await startMarketService(cfg, { payment: !cfg.apiKey && wallet ? wallet.payment : null, creatorPayments,
+      requireExistingState,
       fundRun: funded ? wallet.ops.withFunding : null, fundingPair: funded ? fundingPair : null,
       registerFundingSource: (file, reader) => fundingSources?.registerMarket(file, reader), log: (l) => say(logSafe(l)) });
     // The HTTP server is already listening; from here it passes the market's events on.
@@ -763,6 +814,8 @@ async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creato
 async function startNearMode({
   registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
   quoteTtlMin, refreshS, modelPayment, nanoOps, fundingSources, maxDepositUsd, outDir, publicBase, dual,
+  requireExistingState = false,
+  assertWriter = () => {},
 }) {
   // With both rails on one server a NEAR problem must never stop the Nano rail:
   // there this throws, and main() carries on in Nano only. NEAR on its own exits.
@@ -784,6 +837,7 @@ async function startNearMode({
   try {
     const localRpc = rpcUrls.every(url => ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname));
     rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, maxHeadAgeMs: 90_000, minIntervalMs: localRpc ? 0 : 100,
+      fetch: (...args) => { assertWriter(); return globalThis.fetch(...args); },
       log: (line) => console.error("nanoodle-mcp: " + line) });
   } catch (e) { fail(`--near-rpc: ${e.message}`); }
   // A public RPC can be briefly unreachable or rate limiting at boot; give it a few tries.
@@ -833,7 +887,7 @@ async function startNearMode({
 
   let ledger;
   try {
-    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant });
+    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant, requireExisting: requireExistingState });
   } catch (e) { fail(e.message); }
   // NEAR/USD, XNO/USD and the swap rate derived from them. When runs are paid
   // from the Nano wallet, XNO/USD is required to quote; with an API key it is informational.

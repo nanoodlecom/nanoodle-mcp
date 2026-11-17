@@ -213,7 +213,7 @@ test("inside the server: a signed hire.created is picked up at once, long before
   const port = await freePort();
   const child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", join(dir, "out"), "--serve", `127.0.0.1:${port}`], {
     env: {
-      PATH: process.env.PATH, HOME: dir, NANOGPT_API_KEY: "nanogpt-test-key-do-not-log", MARKET_STATE_DIR: join(dir, "market-state"),
+      PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_API_KEY: "nanogpt-test-key-do-not-log", MARKET_STATE_DIR: join(dir, "market-state"),
       NANOGPT_BASE_URL: nano.url, MARKET_BASE_URL: m.url, MARKET_AGENTS_FILE: catalog, MARKET_POLL_SECONDS: "60",
     },
     stdio: ["ignore", "ignore", "pipe"],

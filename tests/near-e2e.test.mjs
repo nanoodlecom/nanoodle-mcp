@@ -254,7 +254,7 @@ async function startDual({ graphsDir, outDir, port, nearRpc, nanoRpc, nanoUrl, s
     "--near-merchant", "merchant.testnet", "--near-network", "testnet", "--near-rpc", nearRpc,
     ...(nearPort ? ["--near-serve", `127.0.0.1:${nearPort}`, "--near-public-url", `http://127.0.0.1:${nearPort}`] : []),
   ], {
-    env: { PATH: process.env.PATH, HOME: outDir, NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: nanoUrl, NANO_SEED: randomBytes(32).toString("hex"), NEAR_PRIVATE_KEY: secretKey,
+    env: { PATH: process.env.PATH, HOME: outDir, NANOODLE_WRITER_LOCK_DIR: join(outDir, "writer-locks"), NANOGPT_API_KEY: "test-key", NANOGPT_BASE_URL: nanoUrl, NANO_SEED: randomBytes(32).toString("hex"), NEAR_PRIVATE_KEY: secretKey,
       NEAR_USDC: usdc ? "1" : "0", NEAR_PUBLIC_ALIASES: aliases },
     stdio: ["ignore", "ignore", "pipe"],
   });

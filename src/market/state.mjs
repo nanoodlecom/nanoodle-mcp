@@ -118,7 +118,8 @@ function takeLock(dir, hooks = {}) {
  * @param {() => number} [o.now]
  * @param {boolean} [o.lock]       take the one-process lock (default true)
  */
-export function openMarketState({ dir, now = Date.now, lock = true, _lockHooks }) {
+export function openMarketState({ dir, now = Date.now, lock = true, requireExisting = false, _lockHooks }) {
+  if (typeof requireExisting !== "boolean") throw TypeError("requireExisting must be a boolean");
   if (typeof dir !== "string" || !dir) throw new TypeError("openMarketState needs a directory");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch { /* not ours to change */ }
@@ -136,7 +137,10 @@ export function openMarketState({ dir, now = Date.now, lock = true, _lockHooks }
   let state;
   let text = null;
   try { text = readFileSync(file, "utf8"); } catch (e) {
-    if (e.code !== "ENOENT") throw new Error(`market state ${file} could not be read: ${e.message}`);
+    if (e.code !== "ENOENT" || requireExisting) {
+      if (held && ownsLock()) { try { unlinkSync(lockPath); } catch { /* preserve uncertain ownership */ } }
+      throw new Error(`market state ${file} could not be read; refusing to start empty`);
+    }
   }
   if (text === null) {
     state = { v: 1, assignments: {} };

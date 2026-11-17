@@ -19,13 +19,22 @@ for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, ex
   chain.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 10_000_000n });
   await chain.listen(); await provider.listen();
   const port = await freePort(), base = `http://127.0.0.1:${port}`, author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 2)), { useNanoPrefix: true });
+  const policyFile = join(dir, "state-policy.json");
+  if (optedIn) {
+    await mkdir(join(dir, "out"));
+    await writeFile(join(dir, "out", "near-state.json"), JSON.stringify({ v: 1, network: "testnet", merchant: "merchant.testnet", quotes: {}, consumedTx: {}, refunds: {}, payouts: {}, meta: {} }));
+    await writeFile(policyFile, JSON.stringify({ v: 1, outDir: join(dir, "out"),
+      nanoAddress: deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 0)), { useNanoPrefix: true }), chargeNano: false,
+      near: { network: "testnet", merchant: "merchant.testnet" }, marketRoot: null, marketHandles: [] }), { mode: 0o600 });
+  }
   const child = spawn(process.execPath, [new URL("../bin/nanoodle-mcp.mjs", import.meta.url).pathname, "--graphs", join(dir, "graphs"), "--out", join(dir, "out"), "--serve", `127.0.0.1:${port}`, "--public-url", base,
     "--near-merchant", "merchant.testnet", "--near-network", "testnet", "--near-rpc", chain.url, "--near-usd", "3.64", "--xno-usd", "0.5", "--nano-rpc", node.url, "--no-local-work"], {
-    env: { PATH: process.env.PATH, HOME: dir, NANOGPT_API_KEY: "test", NANOGPT_BASE_URL: provider.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANO_SEED: "0".repeat(64) }, stdio: ["ignore", "ignore", "pipe"],
+    env: { PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_API_KEY: "test", NANOGPT_BASE_URL: provider.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANO_SEED: "0".repeat(64), ...(optedIn ? { NANOODLE_STATE_POLICY: policyFile } : {}) }, stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = ""; child.stderr.on("data", data => { stderr += data; });
   try {
     for (let i = 0; !stderr.includes("MCP over HTTP on"); i++) { assert.equal(child.exitCode, null, stderr); assert.ok(i < 500, stderr); await new Promise(r => setTimeout(r, 20)); }
+    if (optedIn) assert.match(stderr, /required payment state verified \(1 files\)/);
     const response = await fetch(base + "/creators/workflows", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ graph: { ...WORKED_GRAPH, ...(optedIn ? { x402: { author } } : {}) }, name: "Hosted poster", description: "Make a poster" }) });
     assert.equal(response.status, 201); const hosted = await response.json(), snapshots = [];
     const request = (name, args, opts) => callMcp(name, args, { endpoint: hosted.mcpUrl, ...opts });

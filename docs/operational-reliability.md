@@ -15,14 +15,14 @@ or worker readiness. Production baseline before the Nano read-guard rollout:
 | Bounded RPC operations and a queue that survives errors | Nano deadlines, malformed state/publish responses, invoice validation and cap protection deployed in PR #122 (`f0ba69b`), 877 tests passed. Ambiguous publishes retain identical-block recovery. Market response-body deadlines are included with the operational monitor. |
 | Stale/out-of-sync Nano and NEAR nodes | NEAR identity, syncing/finalized age, monotonic heads and watcher expiry deployed in PR #125. The [Nano account read guard](nano-rpc-freshness.md) validates mainnet peers, compares current/confirmed account state, rejects regressions and stale negatives, and checks runtime coverage. Nano rollout qualification is recorded below. |
 | Funds cover provider invoices and customer/creator liabilities | PR #127 deployed atomic shared-pool reservations and live debt protection across direct runs and Market. Runtime funding telemetry is checked every five minutes. Restore-time signed-intent ambiguity remains a separate open requirement. |
-| Native NEAR gas and USDC refunds remain payable | The [refund funding guard](near-refund-funding.md) now covers quote/admission/fresh signing in source, uses the gas purchase floor and complete action fees, and retains outgoing-height checkpoints. Read-only live preflight covers both assets. Full regression, deployment and post-deployment monitoring qualification are required for this change. |
+| Native NEAR gas and USDC refunds remain payable | The [refund funding guard](near-refund-funding.md) deployed in PR #133 (`714cde3`) after 1,035 tests. It covers quote/admission/fresh signing, the gas purchase floor, complete action fees and outgoing-height checkpoints. Exact-module live preflight covered both assets; the bounded native canary and all 44 scheduled probes passed. Inventory #33 and deploy #126 record qualification. |
 | Per-run and per-job budgets are enforced at payment time | Estimates alone are insufficient. Test unexpected invoice increases, missing/non-finite prices, multiple parallel paid nodes and partially failed runs. |
 | Prices and upstream fee assumptions stay current | Validate exchange-rate freshness, public model catalogs, all saved/custom workflow pricing and Market's actual platform fee; stale assumptions must not silently authorize losses. |
 | Paid work/refunds/payouts cannot duplicate after ambiguous failures | Verify restart, receipt finality, nonce/frontier conflicts, persisted intents, stale snapshots and competing writers. No blind replacement transactions. |
 | Stuck work is visible | Observe old running payments/assignments, pending/failed refunds and creator payouts, polling errors, worker authorization and heartbeat age. Do not execute jobs from a health check. |
 | No-inference monitoring is installed and actually runs | Deployed PR #124 (`a9191d1`), 913 CI tests passed. Five-minute timer enabled; automatic 01:55 and 02:00 UTC runs passed all 40 checks. Actual systemd test alert `near_check_161a96f8d6df2e22d31e08c99018ea15df7fca3b` acknowledged by Ember with mcp-recipient receipt. Inventory #28 and deploy #121 record/mirror it. See near-monitoring.md. |
 | Monitoring failure is itself detectable | Check stopped/missed timers, disk capacity/state writability, and independent observation of a whole-host/Babel outage. Existing same-host alarms cannot report while the VPS is unavailable. |
-| Recovery preserves money state | Follow the inventory/deploy recovery audit: encrypted off-server backups and an isolated restore rehearsal remain unverified. Never start a second wallet writer or an empty ledger to bypass recovery. |
+| Recovery preserves money state | Follow the inventory/deploy recovery audit: two manual encrypted off-VPS data recovery points and isolated file restores verified. Periodic copies, retention/key escrow and full-host boot rehearsal remain open. The [startup ownership guard](state-ownership.md) adds local kernel locks and a required-existing-state policy in source; deployment qualification remains required. |
 
 Completion needs targeted failure tests, full regression tests, merged/deployed
 changes, live read-only observations, enabled schedules and authenticated alert
@@ -102,8 +102,9 @@ tests. It covers confirmed payment detection, provider sends, refunds and replay
 for all three direct payment assets. The complete suite passed 1,013 tests.
 Read-only preflight at 06:30 UTC verified the exact module against all four
 configured production RPCs and the wallet selected by the running process.
-Deployment and post-deployment readiness still need verification for this change.
+PRs #130–#132 deployed and qualified this behavior; a successful two-step native canary and automatic 42-probe readiness run are recorded in inventory #32/deploy #125.
 
-Independent whole-host/Babel outage notification and encrypted off-server recovery
-with a restore rehearsal are still open. Do not call the overall reliability goal
+Independent whole-host/Babel outage notification, periodic encrypted off-server
+recovery and full replacement-host rehearsal remain open. Two manual off-VPS
+data restore points are verified. Do not call the overall reliability goal
 complete based on the deployed monitoring milestone alone.

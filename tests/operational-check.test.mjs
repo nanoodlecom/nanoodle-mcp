@@ -17,6 +17,7 @@ function fixture(override = () => null) {
   const states = {
     "/state/gate-state.json": { v: 2, quotes: [], owed: [] },
     "/state/funding-health.json": { v: 1, checkedAt: new Date(NOW).toISOString(), ok: true, enforced: true, protectTransfers: true,
+      writerProtection: { enforced: true, requiredState: true },
       balanceRaw: "1000", liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
       nanoRpc: { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: NOW } },
     "/state/near-state.json": { v: 1, network: "mainnet", merchant: "nanoodle.near", quotes: {}, refunds: {}, payouts: {} },
@@ -124,6 +125,15 @@ test("stuck scope observations use the operator's execution limit plus reconcili
 test("disabled, stale or insufficient Nano read enforcement cannot be hidden by fresh funding telemetry", async () => {
   for (const change of [{ enforced: false }, { networkPeers: 1 }, { readablePeers: 1 }, { configuredPeers: 1 }, { lastReadAt: NOW - 61_000 }]) {
     const f = fixture(); Object.assign(f.states["/state/funding-health.json"].nanoRpc, change);
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
+    assert.ok(report.checks.some(c => c.stage === "runtime-funding" && !c.ok));
+  }
+});
+
+test("missing startup policy or writer protection fails the existing no-inference runtime probe", async () => {
+  for (const proof of [undefined, { enforced: false, requiredState: true }, { enforced: true, requiredState: false }]) {
+    const f = fixture(); f.states["/state/funding-health.json"].writerProtection = proof;
     const report = await runOperationalCheck(f.config, f.deps);
     assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
     assert.ok(report.checks.some(c => c.stage === "runtime-funding" && !c.ok));

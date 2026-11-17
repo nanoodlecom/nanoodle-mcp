@@ -14,17 +14,26 @@ function rows(value) {
 /** Register live ledger owners before they resume/start work. Disabled profiles
  * still contribute their recorded debts through read-only disk fallback. */
 export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
+  let requiredFiles = new Set();
+  function readState(file) {
+    const value = read(file);
+    if (value === null && requiredFiles.has(resolve(file))) throw Error("funding-state-missing");
+    return value;
+  }
   let nanoLive = null, nearLive = null, payoutsLive = null;
   let quoteReady = false, storageReady = true;
   const marketLive = new Map();
   function nearDisk() {
-    const s = read(nearFile);
+    const s = readState(nearFile);
     if (s && s.v !== 1) throw Error("invalid-funding-state");
     return s ? { quotes: rows(s.quotes), payouts: rows(s.payouts ?? {}) } : { quotes: [], payouts: [] };
   }
   function marketFiles() {
     const files = new Set(marketLive.keys());
     if (!marketRoot) return files;
+    for (const file of requiredFiles) {
+      if (file.startsWith(resolve(marketRoot) + "/") && file.endsWith("/market-state.json")) files.add(file);
+    }
     files.add(join(marketRoot, "market-state.json"));
     let entries;
     try { entries = readdirSync(marketRoot, { withFileTypes: true }); }
@@ -33,6 +42,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
     return files;
   }
   return {
+    requireFiles(files) { requiredFiles = new Set(files.map(file => resolve(file))); },
     ready: () => quoteReady,
     setReady(value) { quoteReady = value === true; },
     setStorageReady(value) { storageReady = value === true; if (!storageReady) quoteReady = false; },
@@ -46,7 +56,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
       let total;
       if (nanoLive) total = nanoLive(context);
       else {
-        const s = read(nanoFile);
+        const s = readState(nanoFile);
         if (s && ![1, 2].includes(s.v)) throw Error("invalid-funding-state");
         total = s ? nanoFundingLiabilities(s) : 0n;
       }
@@ -57,7 +67,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot }) {
         let records;
         if (marketLive.has(file)) records = marketLive.get(file)();
         else {
-          const s = read(file);
+          const s = readState(file);
           if (!s) continue;
           if (s.v !== 1) throw Error("invalid-funding-state");
           records = rows(s.assignments);

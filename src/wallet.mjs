@@ -119,12 +119,13 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, verifyRpcReads = false, now = Date.now, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, verifyRpcReads = false, assertWriter = () => {}, now = Date.now, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
   if (typeof protectTransfers !== "boolean") throw new TypeError("protectTransfers must be a boolean");
   if (typeof verifyRpcReads !== "boolean") throw new TypeError("verifyRpcReads must be a boolean");
+  if (typeof assertWriter !== "function") throw new TypeError("assertWriter must be a function");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
@@ -154,6 +155,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   //     safely retry; a publish must NOT (the node may have accepted it and only
   //     the response died), so that case is left to settleAfterTransportError.
   async function rpcOnce(body, base, { headers = {}, signal } = {}) {
+    assertWriter();
     let r, text;
     try {
       r = await fetch(base, {
@@ -384,6 +386,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       if (pocketed > 0 && stopEarly && stopEarly(state)) break;
       try {
         const work = await workFor(state.frontier, RECEIVE_WORK_THRESHOLD);
+        assertWriter();
         const { hash, block } = createBlock(secretKey, {
           work,
           previous: state.frontier,
@@ -443,6 +446,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     if (typeof amount !== "bigint" || amount <= 0n) throw new Error("Nano transfer amount must be positive");
     if (amount > state.balance) throw new Error("insufficient Nano wallet balance for transfer");
     const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
+    assertWriter();
     const prepared = createBlock(secretKey, {
       work, previous: state.frontier, representative: state.representative,
       balance: (state.balance - amount).toString(), link: to,
@@ -583,7 +587,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     draining = true;
     while (tasks.length) {
       const t = tasks.shift();
-      try { t.resolve(await t.fn()); } catch (e) { t.reject(e); }
+      try { assertWriter(); t.resolve(await t.fn()); } catch (e) { t.reject(e); }
     }
     draining = false;
   }

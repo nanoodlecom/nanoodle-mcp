@@ -70,3 +70,16 @@ test("funding telemetry cannot call degraded read coverage healthy", async t => 
   assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
   assert.equal(w.sources.ready(), false);
 });
+
+test("lost writer protection pauses quotes and its private error is not published", async t => {
+  const w = await setup(t); let lost = false;
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, snapshot: async () => value,
+    writerProtection: () => { if (lost) throw Error("PRIVATE_LOCK_PATH"); return { enforced: true, requiredState: true, privatePath: "PRIVATE_LOCK_PATH" }; } });
+  t.after(report.stop);
+  let saved = JSON.parse(await readFile(w.file, "utf8"));
+  assert.deepEqual(saved.writerProtection, { enforced: true, requiredState: true });
+  assert.equal(w.sources.ready(), true);
+  lost = true; await report.refresh(); saved = JSON.parse(await readFile(w.file, "utf8"));
+  assert.equal(saved.ok, false); assert.equal(w.sources.ready(), false);
+  assert.doesNotMatch(JSON.stringify(saved), /PRIVATE/);
+});

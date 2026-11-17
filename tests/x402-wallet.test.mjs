@@ -101,7 +101,7 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
     child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`, "--public-url", base,
       "--charge-usd", "0.05", "--xno-usd", "0.5", "--no-local-work", "--near-merchant", "merchant.testnet", "--near-network", "testnet",
       "--near-rpc", near.url, "--near-usd", "3.64"], { env: {
-        PATH: process.env.PATH, HOME: dir, NANO_SEED: SEED, NANO_RPC_URL: ["frozen", "fresh-a", "fresh-b"].map(p => `http://127.0.0.1:${rpcServer.address().port}/${p}`).join(","),
+        PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANO_SEED: SEED, NANO_RPC_URL: ["frozen", "fresh-a", "fresh-b"].map(p => `http://127.0.0.1:${rpcServer.address().port}/${p}`).join(","),
         NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANOODLE_RUN_TIMEOUT_MS: "2000",
       }, stdio: ["ignore", "ignore", "pipe"] });
     child.stderr.setEncoding("utf8"); child.stderr.on("data", part => { stderr += part; });
@@ -1038,9 +1038,9 @@ after(() => Promise.all([
 ]));
 
 test("E2E: keyless server pays a 402 invoice from NANO_SEED and returns the result", async () => {
-  const env = { ...process.env, NANOGPT_BASE_URL: apiUrl, NANO_SEED: SEED, NANO_RPC_URL: nanoRpcUrl };
-  delete env.NANOGPT_API_KEY;
   const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-x402-out-")); // keeps the cost sidecar out of the repo's ./nanoodle-out
+  const env = { ...process.env, NANOGPT_BASE_URL: apiUrl, NANOODLE_WRITER_LOCK_DIR: join(outDir, "writer-locks"), NANO_SEED: SEED, NANO_RPC_URL: nanoRpcUrl };
+  delete env.NANOGPT_API_KEY;
   const child = spawn(process.execPath, [BIN, "--graphs", FIXTURES, "--out", outDir, "--max-usd", "1"], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "", stderr = "";
   child.stdout.setEncoding("utf8"); child.stdout.on("data", (c) => { stdout += c; });

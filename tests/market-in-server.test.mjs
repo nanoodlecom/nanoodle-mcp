@@ -25,7 +25,7 @@ async function serve(env) {
   const def = join(dir, "default.json"); writeFileSync(def, JSON.stringify({ ...WORKED_GRAPH, name: "Idea to image" }));
   const port = await freePort();
   const child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", join(dir, "out"), "--serve", `127.0.0.1:${port}`], {
-    env: { PATH: process.env.PATH, HOME: dir, NANOGPT_API_KEY: NANO_KEY, MARKET_STATE_DIR: join(dir, "market-state"), MARKET_DEFAULT_GRAPH: def, ...env },
+    env: { PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_API_KEY: NANO_KEY, MARKET_STATE_DIR: join(dir, "market-state"), MARKET_DEFAULT_GRAPH: def, ...env },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";
