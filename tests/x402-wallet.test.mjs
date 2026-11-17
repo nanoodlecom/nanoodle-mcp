@@ -231,7 +231,7 @@ test("insufficient mainnet read peers refuses the hosted run before execution or
 });
 
 test("the hosted wallet honors numeric rate limits through funding, provider settlement and recovery", async () => {
-  for (const http of [false, true]) {
+  for (const mode of ["wrapped", "http-json", "http-text"]) {
     let at = 1_000, limited = true, limitedCalls = 0;
     const mock = fakeRpc();
     const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "https://limited,https://peer-a,https://peer-b", verifyRpcReads: true,
@@ -239,7 +239,8 @@ test("the hosted wallet honors numeric rate limits through funding, provider set
       fetch: async (url, init) => {
         if (url === "https://limited" && limited) {
           limitedCalls++;
-          return new Response(JSON.stringify({ error: 429, retry_after: 90 }), { status: http ? 429 : 200, headers: { "retry-after": "120" } });
+          return new Response(mode === "http-text" ? "Too many requests" : JSON.stringify({ error: 429, retry_after: 90 }),
+            { status: mode === "wrapped" ? 200 : 429, headers: { "retry-after": "120" } });
         }
         return mock.fetch(url, init);
       } });
