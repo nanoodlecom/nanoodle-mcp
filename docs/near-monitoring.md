@@ -145,6 +145,14 @@ Ember to claim and acknowledge it. Verify `message_status` for the resulting
 message using the sender's own credential. A queued message alone does not prove
 receipt. Never acknowledge on Ember's behalf.
 
+The operational probe allows a recently started app up to 45 seconds to initialize
+both listeners and the NEAR watcher before running its full check. This applies
+only when systemd reports a live app started within the last minute. An old,
+missing or failed app is checked immediately. A bounded grace expiring still runs
+all normal probes and alerts on failure; it never reports recovery by itself.
+These warm-up GET requests execute no workflows or payments. This avoids the
+temporary 502 alarm observed just after the planned 2026-11-17 backup drill.
+
 ## NEAR AI Market availability every 15 minutes
 
 `scripts/market-check.mjs` makes public GET requests to `market.near.ai`: the
