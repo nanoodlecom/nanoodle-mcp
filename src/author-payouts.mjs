@@ -15,7 +15,7 @@ export function createAuthorPayouts({ ledger, ops, now = Date.now, log = () => {
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   backoffMs = [30_000, 60_000, 120_000, 300_000, 600_000],
 }) {
-  if (typeof ops?.transferOnce !== "function") throw new TypeError("author payouts need the shared Nano wallet's durable transfer operation");
+  if (typeof ops?.transferOnce !== "function" && typeof ops?.transferId !== "function") throw new TypeError("author payouts need the shared Nano wallet's durable transfer operation");
   let running = null;
   function enqueue({ paymentId, to, amountRaw }) {
     if (!authorAddress({ author: to }) || !/^\d+$/.test(String(amountRaw)) || BigInt(amountRaw) <= 0n) throw new TypeError("invalid author payout");
@@ -29,7 +29,12 @@ export function createAuthorPayouts({ ledger, ops, now = Date.now, log = () => {
   }
   async function drive(rec) {
     try {
-      const hash = await ops.transferOnce(rec.to, rec.amountRaw, {
+      const hash = typeof ops.transferId === "function"
+        ? await ops.transferId(`creator:${rec.paymentId}`, rec.to, rec.amountRaw, "author payout", {
+          prepared: rec.prepared, liabilityRaw: rec.amountRaw,
+          fundingRunId: rec.paymentId.startsWith("market_") ? `market:${rec.paymentId.slice(7)}` : `near:${rec.paymentId}`,
+        })
+        : await ops.transferOnce(rec.to, rec.amountRaw, {
         liabilityRaw: rec.amountRaw,
         fundingRunId: rec.paymentId.startsWith("market_") ? `market:${rec.paymentId.slice(7)}` : `near:${rec.paymentId}`,
         prepared: rec.prepared,

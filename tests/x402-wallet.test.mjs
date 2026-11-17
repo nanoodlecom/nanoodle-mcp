@@ -33,7 +33,7 @@ const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
 
-test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server", { timeout: 60_000 }, async () => {
+for (const recovery of [false, true]) test(`hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server${recovery ? " with the journal" : ""}`, { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-funding-"));
   const graphs = join(dir, "graphs"), out = join(dir, "out");
   await mkdir(graphs); await mkdir(out);
@@ -58,7 +58,10 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
     })) }),
     block_info: (body, state, reply) => {
       const p = state.processed.find(p => hashBlock(p.block) === body.hash);
-      return p ? reply({ confirmed: "true", contents: p.block, height: String(state.processed.indexOf(p) + 2) }) : reply({ error: "Block not found" });
+      if (!p) return reply({ error: "Block not found" });
+      const i = state.processed.indexOf(p), previous = BigInt(i ? state.processed[i - 1].block.balance : BALANCE);
+      const delta = previous - BigInt(p.block.balance);
+      return reply({ confirmed: "true", contents: p.block, amount: (delta < 0n ? -delta : delta).toString(), height: String(i + 2) });
     },
   });
   const rpcServer = http.createServer(async (req, res) => {
@@ -98,7 +101,7 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
     await new Promise(resolve => rpcServer.listen(0, "127.0.0.1", resolve));
     await near.listen(); await nano.listen();
     const port = await freePort(), base = `http://127.0.0.1:${port}`;
-    child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`, "--public-url", base,
+    child = spawn(process.execPath, [BIN, ...(recovery ? ["--recovery-db", join(dir, "journal.sqlite")] : []), "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`, "--public-url", base,
       "--charge-usd", "0.05", "--xno-usd", "0.5", "--no-local-work", "--near-merchant", "merchant.testnet", "--near-network", "testnet",
       "--near-rpc", near.url, "--near-usd", "3.64"], { env: {
         PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANO_SEED: SEED, NANO_RPC_URL: ["frozen", "fresh-a", "fresh-b"].map(p => `http://127.0.0.1:${rpcServer.address().port}/${p}`).join(","),
@@ -1137,4 +1140,36 @@ test("a real node error still never fails over", async () => {
   const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "http://a,http://b,http://c", fetch });
   await assert.rejects(() => wallet.ops.rpc({ action: "account_info", account: ADDRESS }), /Fork/);
   assert.equal(tried, 1, "an authoritative error must stop at the first node");
+});
+
+test('durable confirmation prevents stale account peers from authorizing a fork after restart', async t => {
+  const { openRecoveryStore } = await import('../src/payments/recovery-store.mjs');
+  const { rm } = await import('node:fs/promises');
+  const dir = await mkdtemp(join(tmpdir(), 'nano-head-floor-'));
+  let store = openRecoveryStore(join(dir, 'journal.sqlite')), frozen = false, attempts = 0;
+  t.after(async () => { store.close(); await rm(dir, { recursive: true, force: true }); });
+  const mock = fakeRpc({
+    account_info: (_body, state, reply) => reply(nanoAccountInfo({
+      frontier: frozen ? FRONTIER : state.frontier, balance: frozen ? BALANCE : state.balance,
+      representative: ADDRESS, height: frozen ? 1 : state.processed.length + 1,
+    })),
+    process: (body, state, reply) => {
+      attempts++;
+      if (body.block.previous !== state.frontier) return reply({ error: 'Fork' });
+      state.processed.push(body); state.frontier = hashBlock(body.block); state.balance = body.block.balance;
+      return reply({ hash: state.frontier });
+    },
+    block_info: (body, state, reply) => {
+      const i = state.processed.findIndex(p => hashBlock(p.block) === body.hash);
+      if (i < 0) return reply({ error: 'Block not found' });
+      const block = state.processed[i].block, previous = BigInt(i ? state.processed[i - 1].block.balance : BALANCE);
+      return reply({ confirmed: 'true', contents: block, amount: (previous - BigInt(block.balance)).toString(), height: String(i + 2) });
+    },
+  });
+  const make = () => createNanoWallet({ secretKey: SECRET, recoveryStore: store, verifyRpcReads: true,
+    fetch: mock.fetch, rpcUrl: 'http://first.fixture,http://second.fixture', localWork: false });
+  await make().ops.transferId('first', PAY_TO, '100'); assert.equal(attempts, 1);
+  store.close(); store = openRecoveryStore(join(dir, 'journal.sqlite')); frozen = true;
+  await assert.rejects(make().ops.transferId('second', PAY_TO, '101'));
+  assert.equal(attempts, 1, 'known confirmed journal history must stop a new publish from stale account views');
 });

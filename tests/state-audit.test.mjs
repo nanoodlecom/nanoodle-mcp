@@ -35,10 +35,12 @@ function savedQuote(extra = {}) {
 }
 async function savedGate(t, quote, extra = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'mcp-state-audit-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  let gate;
+  t.after(async () => { await gate?.stopWatching(); await rm(dir, { recursive: true, force: true }); });
   const stateFile = join(dir, 'gate-state.json');
   await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [quote], owed: [] }));
-  return { stateFile, gate: createChargeGate(gateOptions({ stateFile, ...extra })) };
+  gate = createChargeGate(gateOptions({ stateFile, ...extra }));
+  return { stateFile, gate };
 }
 
 test('artifact delivery withholds bookkeeping, staging files, directories and symlinks', async (t) => {

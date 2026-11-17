@@ -22,7 +22,7 @@ or worker readiness. Production baseline before the Nano read-guard rollout:
 | Stuck work is visible | Observe old running payments/assignments, pending/failed refunds and creator payouts, polling errors, worker authorization and heartbeat age. Do not execute jobs from a health check. |
 | No-inference monitoring is installed and actually runs | Deployed PR #124 (`a9191d1`), 913 CI tests passed. Five-minute timer enabled; automatic 01:55 and 02:00 UTC runs passed all 40 checks. Actual systemd test alert `near_check_161a96f8d6df2e22d31e08c99018ea15df7fca3b` acknowledged by Ember with mcp-recipient receipt. Inventory #28 and deploy #121 record/mirror it. See near-monitoring.md. |
 | Monitoring failure is itself detectable | Check stopped/missed timers, disk capacity/state writability, and independent observation of a whole-host/Babel outage. Existing same-host alarms cannot report while the VPS is unavailable. |
-| Recovery preserves money state | Follow the inventory/deploy recovery audit: two manual encrypted off-VPS data recovery points and isolated file restores verified. Periodic copies, retention/key escrow and full-host boot rehearsal remain open. The [startup ownership guard](state-ownership.md) adds local kernel locks and a required-existing-state policy in source; deployment qualification remains required. |
+| Recovery preserves money state | Follow the inventory/deploy recovery audit: three manual encrypted off-VPS data recovery points and isolated file restores verified. Periodic copies, retention/key escrow and full-host boot rehearsal remain open. The [startup ownership guard](state-ownership.md) deployed local kernel locks and the required-existing-state policy in PR #134 (`246ef51`), with 1,059 tests, a live native canary and 44 automatic probes. Inventory #34/deploy #127 record qualification. |
 
 Completion needs targeted failure tests, full regression tests, merged/deployed
 changes, live read-only observations, enabled schedules and authenticated alert
@@ -56,8 +56,7 @@ Check the actual bound graph/model options before choosing a cap.
 Draft [durable Nano recovery PR #96](https://github.com/nanoodlecom/nanoodle-mcp/pull/96)
 qualifies a schema-2 journal against an older base. It is unmerged/unactivated and
 has an operational hold for ownership coordination, backups and compatible rollback.
-Do not blindly enable it. Review/rebase against current Nano + NEAR/USDC + Market
-paths, preserve the current timeout fixes, qualify current-state migration read-only,
+Do not blindly enable it. The [current-source integration](durable-nano-recovery.md) preserves the funding/read/deadline/startup guards and adds a persisted confirmed Nano height floor. Its schema 3 remains inactive and requires a new migration/monitoring/backup qualification and independent review. Qualify current-state migration,
 and verify backups/restore/fencing before any cutover. Existing JSON sends can have
 ambiguous restart outcomes; monitoring does not correct that. Audit ownership locks
 before startup money effects and behavior after an unclean reboot.
@@ -105,6 +104,6 @@ configured production RPCs and the wallet selected by the running process.
 PRs #130–#132 deployed and qualified this behavior; a successful two-step native canary and automatic 42-probe readiness run are recorded in inventory #32/deploy #125.
 
 Independent whole-host/Babel outage notification, periodic encrypted off-server
-recovery and full replacement-host rehearsal remain open. Two manual off-VPS
+recovery and full replacement-host rehearsal remain open. Three manual off-VPS
 data restore points are verified. Do not call the overall reliability goal
 complete based on the deployed monitoring milestone alone.

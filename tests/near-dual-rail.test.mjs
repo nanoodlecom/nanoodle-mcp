@@ -429,7 +429,7 @@ test("one saved workflow keeps Nano, NEAR and USDC quotes, retries, charges and 
     const paid = await call(asset, proof);
     assert.ok(!paid.isError, text(paid));
     const copy = text(paid);
-    assert.match(copy, /refund|change returned/i);
+    assert.match(copy, /refund|change queued for return/i);
     isolated(asset, copy, "receipt");
     if (asset !== "nano") {
       const r = paid.structuredContent.receipt;

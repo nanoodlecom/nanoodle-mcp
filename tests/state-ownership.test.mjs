@@ -157,7 +157,7 @@ test('CLI refuses a competing Nano wallet even with another output directory bef
     const wallet = createNanoWallet({ secretKey: resolveWalletKey({ seed: '0'.repeat(64) }) });
     const lockDir = join(root, 'nanoodle-mcp', 'writer-locks');
     held = acquireWriterLocks({ dir: lockDir, resources: [`nano:${wallet.address}`] });
-    for (const args of [[], ['--serve', '0', '--charge-usd', '0.05']]) {
+    for (const args of [[], ['--serve', '0', '--charge-usd', '0.05'], ['--recovery-db', join(root, 'journal.sqlite')]]) {
       const child = spawn(process.execPath, [bin, '--graphs', join(root, 'missing-graphs'), '--out', join(root, 'other-out'), ...args], {
         env: { PATH: process.env.PATH, HOME: root, NANOODLE_WRITER_LOCK_DIR: lockDir, NANO_SEED: '0'.repeat(64), NANO_RPC_URL: 'http://127.0.0.1:1', NANO_WORK_URL: 'http://127.0.0.1:1' }, stdio: ['ignore', 'ignore', 'pipe'],
       });
@@ -165,6 +165,7 @@ test('CLI refuses a competing Nano wallet even with another output directory bef
       const [code] = await once(child, 'exit'); assert.equal(code, 1); assert.match(stderr, /Another payment writer/);
       assert.doesNotMatch(stderr, /fetch|graphs.*not found|work prewarm/);
       assert.equal(existsSync(join(root, 'other-out')), false);
+      assert.equal(existsSync(join(root, 'journal.sqlite')), false, 'contender cannot open/create a journal before locking');
     }
   } finally { held?.close(); rmSync(root, { recursive: true, force: true }); }
 });

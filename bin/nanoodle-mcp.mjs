@@ -93,6 +93,10 @@ function usage(code = 1) {
                  remote work source fails, the send fails cleanly instead. Local
                  CPU work blocks the whole process for minutes; recommended off
                  in --serve mode when --work-rpc points somewhere dependable
+  --recovery-db p opt in to the durable Nano recovery journal at p. Share this
+                  exact database with the charge gate and wallet. Existing JSON
+                  state is retained; ambiguous legacy payments require review.
+                  Older versions cannot safely resume this journal after activation.
 
 Serve mode (host your noodles over HTTP instead of stdio):
   --serve [h:]p    speak MCP over streamable HTTP on [host:]port (default 127.0.0.1:8402);
@@ -167,6 +171,7 @@ async function main() {
   let nearMerchantFlag = null, nearNetworkFlag = null, nearRpcFlag = null, nearKeyFile = null, nearUsdFlag = null, nearMaxDepositFlag = null;
   let nearSpreadFlag = null, nearQuoteTtlFlag = null, nearRefreshFlag = null;
   let nearServeFlag = null, nearPublicFlag = null;
+  let recoveryDbFlag = null;
   let i = 0;
   const val = (flag) => {
     const v = argv[++i];
@@ -183,6 +188,7 @@ async function main() {
     else if (a === "--nano-rpc") nanoRpcFlag = val("--nano-rpc");
     else if (a === "--work-rpc") workRpcFlag = val("--work-rpc");
     else if (a === "--max-usd") maxUsdFlag = val("--max-usd");
+    else if (a === "--recovery-db") recoveryDbFlag = val("--recovery-db");
     else if (a === "--serve") {
       // the value is optional: `--serve` alone binds 127.0.0.1:8402
       serveSpec = argv[i + 1] !== undefined && !argv[i + 1].startsWith("--") ? argv[++i] : "";
@@ -348,10 +354,15 @@ async function main() {
   // there's no API key (a key always wins for runs, matching the library), and — in
   // --charge-usd mode — receiving callers' payments and sending refunds/payouts.
   // NEAR creator payouts share that wallet too, including API-key-funded runs.
+  let recoveryStore = null;
   let wallet = null;
+  let walletOptions = null, walletFactory = null, nanoAddress = null;
   if ((nanoKey || nanoSeed) && (!apiKey || chargeUsd != null || nearMode)) {
     try {
-      const { createNanoWallet, resolveWalletKey } = await loadWalletMod();
+      const { createNanoWallet, resolveWalletKey, walletAddress } = await loadWalletMod();
+      const secretKey = resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed });
+      nanoAddress = walletAddress(secretKey);
+      walletFactory = createNanoWallet;
       if (guardedFunding) {
         const [{ createHostedFundingSources }, { defaultStateDir }] = await Promise.all([
           import("../src/hosted-funding.mjs"), import("../src/market/service.mjs"),
@@ -359,8 +370,8 @@ async function main() {
         fundingSources = createHostedFundingSources({ nanoFile: join(resolvedOut, "gate-state.json"),
           nearFile: join(resolvedOut, "near-state.json"), marketRoot: resolve(process.env.MARKET_STATE_DIR || defaultStateDir()) });
       }
-      wallet = createNanoWallet({
-        secretKey: resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed }),
+      walletOptions = {
+        secretKey,
         rpcUrl: nanoRpcFlag || process.env.NANO_RPC_URL || undefined,
         workUrl,
         workKey,
@@ -369,32 +380,32 @@ async function main() {
         fundingLiabilities: context => fundingSources ? fundingSources.liabilitiesRaw(context) : 0n,
         requireFunding: paidFunding && !apiKey,
         protectTransfers: guardedFunding,
-        verifyRpcReads: guardedFunding,
+        verifyRpcReads: guardedFunding || !!recoveryDbFlag,
         assertWriter: () => {
           if (!writerLocks) throw Error("Payment writer protection not acquired");
           writerLocks.assertHeld();
         },
         log: (line) => console.error("nanoodle-mcp: " + line),
-      });
+      };
     } catch (e) { console.error("nanoodle-mcp: " + e.message); process.exit(1); }
   }
   if (apiKey && (nanoKey || nanoSeed) && chargeUsd == null && !nearMode) {
     console.error("nanoodle-mcp: both an API key and a Nano wallet are configured — using the key (wallet ignored)");
   }
-  if (chargeUsd != null && !wallet) {
+  if (chargeUsd != null && !walletOptions) {
     console.error("nanoodle-mcp: --charge-usd needs a Nano wallet (NANO_SEED or NANO_PRIVATE_KEY, env or --env-file) " +
       "to receive payments and send refunds");
     process.exit(1);
   }
 
-  if (nearMode && !apiKey && !wallet) {
+  if (nearMode && !apiKey && !walletOptions) {
     console.error("nanoodle-mcp: --near-merchant needs a NanoGPT funding source to run the workflows it sells — " +
       "NANOGPT_API_KEY (env, --key or --env-file) or a Nano wallet (NANO_SEED / NANO_PRIVATE_KEY)");
     process.exit(1);
   }
 
-  // createNanoWallet only constructs callbacks. Lock before invoking any of
-  // them, loading tools, sweeping files, resuming ledgers or starting workers.
+  // Lock before opening the financial journal, constructing wallet callbacks,
+  // loading tools, sweeping files, resuming ledgers or starting workers.
   // Account locks also cover another output directory or a stdio wallet client.
   let marketRoot = null;
   if (marketEnabled) {
@@ -402,14 +413,15 @@ async function main() {
     marketRoot = resolve(process.env.MARKET_STATE_DIR || defaultStateDir());
   }
   const writerResources = [
-    ...(wallet ? [`nano:${wallet.address}`] : []),
+    ...(nanoAddress ? [`nano:${nanoAddress}`] : []),
     ...(nearMode ? [`near:${nearNetwork}:${nearMerchant}`] : []),
     ...(guardedFunding ? [`state:${canonicalStatePath(resolvedOut)}`] : []),
     ...(marketRoot ? [`market:${canonicalStatePath(marketRoot)}`] : []),
+    ...(recoveryDbFlag ? [`recovery:${canonicalStatePath(resolve(recoveryDbFlag))}`] : []),
   ];
   if (writerResources.length) {
     writerLocks = acquireWriterLocks({ resources: writerResources });
-    process.once("exit", writerLocks.close); // Never release while asynchronous work drains.
+    process.once("exit", () => { try { recoveryStore?.close(); } finally { writerLocks.close(); } });
   }
   let requiredState = null;
   if (process.env.NANOODLE_STATE_POLICY) {
@@ -421,11 +433,22 @@ async function main() {
       } catch { throw Error("Cannot read Market catalog for required payment state policy"); }
     }
     requiredState = verifyStartupState({ policyFile: process.env.NANOODLE_STATE_POLICY, outDir: resolvedOut,
-      nanoAddress: wallet?.address ?? null, chargeNano: chargeUsd != null,
+      nanoAddress, chargeNano: chargeUsd != null,
       nearMerchant, nearNetwork, marketRoot, marketHandles });
     fundingSources?.requireFiles(requiredState.files);
     console.error(`nanoodle-mcp: required payment state verified (${requiredState.files.length} files)`);
   }
+
+  if (recoveryDbFlag) {
+    if (!walletOptions) throw Error("--recovery-db requires an active Nano wallet");
+    // The existing v1 production policy pins JSON authority. Journal activation
+    // needs a qualified migration/rollback policy; do not silently bypass it.
+    if (requiredState) throw Error("The current production state policy does not authorize journal migration");
+    writerLocks.assertHeld();
+    const { openRecoveryStore } = await import("../src/payments/recovery-store.mjs");
+    recoveryStore = openRecoveryStore(resolve(recoveryDbFlag));
+  }
+  if (walletOptions) wallet = walletFactory({ ...walletOptions, recoveryStore });
 
   const publicBase = (publicUrlFlag || `http://${serveHost === "0.0.0.0" ? "127.0.0.1" : serveHost}:${servePort}`).replace(/\/+$/, "");
   if (chargeUsd != null && serveHost === "0.0.0.0" && !publicUrlFlag) {
@@ -622,6 +645,7 @@ async function main() {
       requireExistingState: requiredState?.requireExisting === true,
       fundRun: !apiKey ? wallet.ops.withFunding : null,
       canQuote: () => !fundingSources || fundingSources.ready(),
+      recoveryStore,
       log: (line) => console.error("nanoodle-mcp: " + line),
       usage: usageLog,
     });
