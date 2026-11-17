@@ -22,9 +22,57 @@ floor cannot authorize a new block. The fixture reproduces the fork attempt on
 the preceding draft and verifies zero work generation or publication with this
 guard, then resumes the same operation when the real head becomes available.
 Receipt creation requires an empty outgoing journal and no outstanding Nano
-claims. A separate offline migration must still qualify every other rail,
-preserve the running wallet's high-water checkpoint and pin the complete frozen
+claims. The explicit offline preparation below also checks every other rail,
+preserves the running wallet's high-water checkpoint and pins the complete frozen
 source set. No production version-two policy has been installed.
+
+## Offline preparation
+
+`scripts/prepare-payment-migration.mjs` is an explicit same-host operator command,
+not a startup importer. Stop the original service, keep it fenced throughout the
+cutover, and run the command as its OS user with the same writer-lock namespace.
+It takes the same Nano, NEAR, output, Market and target-database locks as the app
+before reading financial files or making read-only RPC requests. Local locks do
+not fence another VM: disable the original host before replacement recovery.
+
+The complete pinned source set must exist with private ownership/permissions.
+Unlisted dormant Market profiles, pending checkout payments, unfinished work,
+customer/creator debts and unverified historical creator payouts stop preparation.
+No old record is automatically reclassified as confirmed to clear a hold.
+Provide every configured Nano mainnet RPC as a repeated `--rpc` argument; at least
+two distinct peers are required. A fresh, idle private funding checkpoint must
+remain from the original live process. The confirmed chain must include both its
+observed and confirmed heads, with signatures and every intervening block checked.
+Behind-floor, conflicting, unconfirmed, overly long or timed-out ancestry stops
+before journal creation. Only `account_info` and `block_info` requests can leave
+the tool; response size and request/overall deadlines are bounded.
+
+For a reviewed cutover, prepare an existing app-owned 0700 state parent outside
+the public output directory. Example (repeat `--rpc` for all configured peers):
+
+```sh
+node scripts/prepare-payment-migration.mjs \
+  --policy /etc/nanoodle-mcp/state-policy.json \
+  --destination /srv/nanoodle-mcp/state/qualified-migration \
+  --rpc https://first-mainnet-rpc.example \
+  --rpc https://second-mainnet-rpc.example
+```
+
+The destination must be new. The command imports sanitized Nano records while
+checking their financial digest, creates the immutable receipt, closes and
+reopens the existing database under its proposed V2 authority, and rechecks all
+original file hashes and identities. It emits private `recovery.sqlite`,
+`migration-receipt.json`, `preparation.json` and `state-policy.v2.json` artifacts.
+It never reads wallet keys, signs, publishes, runs a workflow, installs a policy
+or restarts a service. Original policy/ledger bytes remain unchanged. A partial
+failed directory is retained privately and is never reused automatically.
+
+Inspect the artifacts and qualify backup/restore and compatible rollback before
+installing anything. Keep the original writer fenced between preparation and
+activation. Resuming the legacy writer invalidates that frozen cutover point;
+prepare a new set instead of reusing old artifacts. The production backup script
+must include the canonical database and WAL before V2 activation. The existing
+V1 manual archive alone does not establish journal recovery.
 
 ## Authority before effects
 
@@ -200,7 +248,7 @@ Before production activation, finish and verify:
 
 1. Qualify the implemented version-two policy pinning the canonical existing DB,
    account, schema, legacy bytes, complete source set and initial signed head.
-   Implement/qualify the offline current-state migration and a
+   Qualify the implemented offline current-state migration and a
    schema-3-compatible rollback without modifying production authority. Include
    every NEAR/USDC/Market creator outbox: any legacy prepared Nano payout needs
    account-level reconciliation before fresh signing can be authorized.

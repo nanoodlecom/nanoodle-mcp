@@ -46,7 +46,7 @@ import { serveMcp } from "../src/server.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { redactUrl } from "../src/redact.mjs";
 import { startSweeper } from "../src/sweep.mjs";
-import { acquireWriterLocks, canonicalStatePath } from "../src/process-lock.mjs";
+import { acquireWriterLocks, paymentWriterResources } from "../src/process-lock.mjs";
 import { verifyStartupState } from "../src/startup-state.mjs";
 /*
  * src/wallet.mjs and src/gate.mjs are the ONLY modules that reach `nanocurrency`,
@@ -416,13 +416,10 @@ async function main() {
     const { defaultStateDir } = await import("../src/market/service.mjs");
     marketRoot = resolve(process.env.MARKET_STATE_DIR || defaultStateDir());
   }
-  const writerResources = [
-    ...(nanoAddress ? [`nano:${nanoAddress}`] : []),
-    ...(nearMode ? [`near:${nearNetwork}:${nearMerchant}`] : []),
-    ...(guardedFunding ? [`state:${canonicalStatePath(resolvedOut)}`] : []),
-    ...(marketRoot ? [`market:${canonicalStatePath(marketRoot)}`] : []),
-    ...(recoveryDbFlag ? [`recovery:${canonicalStatePath(resolve(recoveryDbFlag))}`] : []),
-  ];
+  const writerResources = paymentWriterResources({ nanoAddress,
+    nearMerchant: nearMode ? nearMerchant : null, nearNetwork,
+    outDir: guardedFunding ? resolvedOut : null, marketRoot,
+    recoveryDb: recoveryDbFlag ? resolve(recoveryDbFlag) : null });
   if (writerResources.length) {
     writerLocks = acquireWriterLocks({ resources: writerResources });
     process.once("exit", () => {

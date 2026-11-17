@@ -26,6 +26,18 @@ export function defaultWriterLockDir(env = process.env) {
   return join(userInfo().homedir, ".local", "state", "nanoodle-mcp", "writer-locks");
 }
 
+/** Use the same account/path scopes for the app and an offline migration. */
+export function paymentWriterResources({ nanoAddress = null, nearMerchant = null, nearNetwork = null,
+  outDir = null, marketRoot = null, recoveryDb = null }) {
+  return [
+    ...(nanoAddress ? [`nano:${nanoAddress}`] : []),
+    ...(nearMerchant ? [`near:${nearNetwork}:${nearMerchant}`] : []),
+    ...(outDir ? [`state:${canonicalStatePath(outDir)}`] : []),
+    ...(marketRoot ? [`market:${canonicalStatePath(marketRoot)}`] : []),
+    ...(recoveryDb ? [`recovery:${canonicalStatePath(recoveryDb)}`] : []),
+  ];
+}
+
 export function acquireWriterLocks({ resources, dir = defaultWriterLockDir() }) {
   if (!Array.isArray(resources) || resources.some(r => typeof r !== "string" || !r)) throw TypeError("invalid writer resources");
   if (!resources.length) throw TypeError("no writer resources");
