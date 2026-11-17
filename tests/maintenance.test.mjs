@@ -73,7 +73,7 @@ test("a detached callback cannot inherit admission from a completed parent", asy
 test("missing or unsafe state fails closed without leaking raw values", async t => {
   const w = world(t);
   assert.equal(w.barrier.accepting(), true);
-  for (const value of (['{', 'x'.repeat(5000), { ...flag, secret: "PRIVATE_VALUE" }, { ...flag, v: 2 }, { ...flag, token: "PRIVATE_VALUE" }])) {
+  for (const value of (['{', 'x'.repeat(5000), { ...flag, secret: "PRIVATE_VALUE" }, { ...flag, v: 2 }, { ...flag, token: "PRIVATE_VALUE" }, { ...flag, token: [token] }, { ...flag, revision: [revision] }])) {
     w.put(value);
     const snapshot = w.barrier.snapshot();
     assert.equal(snapshot.accepting, false);

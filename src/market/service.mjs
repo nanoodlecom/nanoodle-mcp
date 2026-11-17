@@ -9,6 +9,7 @@
  *     run it sells. One wallet has one account chain, so the worker shares the
  *     server's wallet queue rather than opening the same wallet in a second process.
  */
+import { moneyStateStatus } from "../service-lifecycle.mjs";
 import { MaintenanceError } from "../maintenance.mjs";
 import { parseArgs } from "node:util";
 import { readFileSync, statSync } from "node:fs";
@@ -354,7 +355,7 @@ export async function startMarketService(cfg, { maintenance = null, payment = nu
   if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s; per-job budget $${cfg.budgetUsd}${cfg.listingPriceUsd != null ? `, listing price $${cfg.listingPriceUsd}` : ""}; state in ${cfg.stateDir}`);
   const loop = runLoop(worker, store, { pollMs: cfg.pollMs, once: cfg.once, log });
-  return { done: loop.done, stop: loop.stop, store,
+  return { done: loop.done, stop: loop.stop, store, persistenceStatus: store.persistenceStatus,
     fundingLiabilitiesRaw: context => marketCreatorLiabilities(store.all(), { ...context, payouts: creatorPayments?.payoutRecords?.() ?? [] }) };
 }
 
@@ -511,7 +512,7 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
     const micros = usdMicros(escrowAmount);
     return micros != null && micros > 0 ? { priceUsd: micros / 1e6, budgetUsd: budgetFromPrice(micros / 1e6) } : null;
   };
-  let bidder = null;
+  let bidder = null, bidState = null, bidReadFailed = false;
   let bidProblem = null;
   /** One pass over the job board (only for a listing with "bids": true that is taking jobs). Never throws. */
   async function bidTick() {
@@ -519,8 +520,10 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
     try {
       await checkFee();
       if (!bidder) {
+        try { bidState = openBidState(join(cfg.stateDir, agent.handle, "bids.json")); bidReadFailed = false; }
+        catch (error) { bidReadFailed = true; throw error; }
         bidder = createBidder({
-          client, runner, state: openBidState(join(cfg.stateDir, agent.handle, "bids.json")),
+          client, runner, state: bidState,
           priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, log: (line) => L(`bids: ${line}`),
         });
       }
@@ -536,7 +539,8 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
     tick: async () => { if (worker) await worker.tick(); },
     drain: async () => { if (worker) await worker.drain(); },
   };
-  return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
+  return { persistenceStatus: () => moneyStateStatus([store.persistenceStatus(), bidState?.persistenceStatus(), { ok: !bidReadFailed, pendingWrites: 0 }]),
+    handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
 }
 
 async function startCatalogService(cfg, { maintenance, payment, creatorPayments, fundRun, fundingPair, registerFundingSource, checkFee, log, baseLog, notify, fetch, requireExistingState }) {
@@ -621,6 +625,7 @@ async function startCatalogService(cfg, { maintenance, payment, creatorPayments,
   const webhook = hooked.size && !cfg.once ? createWebhookHandler({ listings: hooked }) : null;
   if (webhook) log(`webhooks: ${[...hooked.keys()].join(", ")} also poll at once on a signed event at /market/webhook/<handle>`);
   return { done, stop, store: { close: closeAll }, listings, webhook,
+    persistenceStatus: () => moneyStateStatus(listings.map(listing => listing.persistenceStatus())),
     fundingLiabilitiesRaw: context => marketCreatorLiabilities(listings.flatMap(l => l.store.all()),
       { ...context, payouts: creatorPayments?.payoutRecords?.() ?? [] }) };
 }

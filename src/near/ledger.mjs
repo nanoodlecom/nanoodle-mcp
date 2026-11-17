@@ -10,8 +10,8 @@
  * Values must be JSON-safe; callers store yocto amounts as integer strings.
  * One process owns a state file.
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { writePrivateStateSync } from "../private-state.mjs";
 import { NearError } from "./errors.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
@@ -31,18 +31,6 @@ function assertJsonSafe(value, path = "value") {
 
 function copy(v) {
   return v === undefined ? undefined : structuredClone(v);
-}
-
-function fsyncDir(dir) {
-  let fd;
-  try {
-    fd = openSync(dir, "r");
-    fsyncSync(fd);
-  } catch {
-    // Directory fsync is not supported everywhere; the file itself is synced.
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
 }
 
 export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false }) {
@@ -79,25 +67,16 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
         `NEAR state file ${file} belongs to ${state.merchant} on ${state.network}, not ${merchant} on ${network}`);
     }
   }
-  let persisted = JSON.stringify(state);
+  let persisted = JSON.stringify(state), persistenceFailed = false;
 
   function persist() {
     const next = JSON.stringify(state);
-    const tmp = `${file}.tmp-${process.pid}`;
     try {
-      const dir = dirname(file);
-      mkdirSync(dir, { recursive: true });
-      const fd = openSync(tmp, "w", 0o600);
-      try {
-        writeSync(fd, next);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(tmp, file);
-      fsyncDir(dir);
+      writePrivateStateSync(file, next);
+      persistenceFailed = false;
       persisted = next;
     } catch (e) {
+      persistenceFailed = true;
       state = JSON.parse(persisted); // roll the in-memory state back to what is on disk
       throw e;
     }
@@ -110,6 +89,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
 
   const ledger = {
     file,
+    persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0 }),
 
     getQuote(id) {
       return Object.hasOwn(state.quotes, id) ? copy(state.quotes[id]) : null;

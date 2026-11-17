@@ -50,9 +50,9 @@ export function createMaintenanceBarrier({ file = null, ownerUid = 0, now = Date
         || current.uid !== ownerUid || (current.mode & 0o022) || current.isSymbolicLink()) return unavailable();
       if (!value || typeof value !== "object" || Array.isArray(value)
         || Object.keys(value).sort().join(",") !== "operation,revision,token,v"
-        || value.v !== 1 || !/^[a-f0-9]{32}$/.test(value.token || "")
+        || value.v !== 1 || typeof value.token !== "string" || !/^[a-f0-9]{32}$/.test(value.token)
         || !["deploy", "backup"].includes(value.operation)
-        || (value.operation === "deploy" ? !/^[a-f0-9]{40}$/.test(value.revision || "") : value.revision !== null)) return unavailable();
+        || (value.operation === "deploy" ? typeof value.revision !== "string" || !/^[a-f0-9]{40}$/.test(value.revision) : value.revision !== null)) return unavailable();
       return { accepting: false, token: value.token, operation: value.operation, revision: value.revision, code: "maintenance-active" };
     } catch { return unavailable(); }
     finally { if (fd !== undefined) closeSync(fd); }

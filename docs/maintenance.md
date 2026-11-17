@@ -2,8 +2,9 @@
 
 The CLI supplies one process-wide barrier to its HTTP listeners, wallets,
 payment gates, settlement queues and Market service. This branch is not deployed.
-The root deployment hook and backup service still need the private drain
-acknowledgement and controller integration described below.
+The CLI writes a private drain acknowledgement when the operator file is
+configured. The root deployment hook and backup service still need controller
+integration before this can protect production maintenance.
 
 A configured operator-owned JSON file closes admission. Its schema is:
 
@@ -62,6 +63,15 @@ funding report selects aggregate write health and pauses new checkout admission
 on a failed state/log write. It runs no inference. Normal pending writes do not
 make the service unhealthy, but must finish before maintenance stops it.
 
+The NEAR ledger, Market assignment stores and Market bid stores expose the same
+write-health contract. Their synchronous snapshots use a shared writer that
+checks the staging inode before truncating or changing its mode, writes the
+complete private file, synchronizes it, renames it and synchronizes its parent.
+A failed complete snapshot remains unhealthy until another complete snapshot
+succeeds. Losing a Market store's ownership also makes it unhealthy. The CLI
+combines these writers with Nano state and both money logs for checkout health,
+shutdown qualification and maintenance telemetry.
+
 `close()` irreversibly closes local admission for process shutdown.
 `waitForIdle()` requires closed admission and cannot await its own active scope.
 The CLI installs signal handlers before async initialization. A separate startup
@@ -71,11 +81,30 @@ observation, workflows, settlement, log/state writes and paid response flushing.
 Repeated signals wait for the same shutdown. The old 20-second exit timer is
 removed. The host's service manager must allow this drain to finish.
 
+With an operator file configured, `maintenance-health.json` in the output
+directory is refreshed every second. It is mode 0600 and excluded from HTTP
+output serving. It contains process PID, UID, Linux boot ID and process start
+ticks, the selected operator token, operation counts, aggregate write health and
+writer-lock qualification. It contains no wallet secrets, workflow inputs or
+results. It performs no RPC or inference. A missing, failed or stale report
+cannot authorize a stop. Telemetry writes do not count themselves as financial
+work.
+
+`readyToStop` requires an externally paused process, the same valid token,
+zero registered operations, zero pending writes, healthy financial writers,
+held writer locks and a required-existing-state policy. Local signal shutdown,
+unsafe control state and an unqualified self-hosted configuration cannot produce
+this acknowledgement. The actual funded-service fixture checks that it becomes
+ready only after provider payments, creator payout, customer change, state/log
+writes and the result response finish.
+
 Before operational use, the root controller must hold its maintenance lock and
-keep the external flag present while qualifying a fresh private acknowledgement
-from the same live process, for the same token, zero operations and healthy fully
-flushed state. That acknowledgement/controller is not implemented yet. Build
-releases away from the live checkout, then integrate deployment and backup
-stop/resume handling. A zero funding-reservation count alone is insufficient.
+keep the external flag present while independently qualifying a fresh private
+acknowledgement against systemd's MainPID and the kernel process identity. A
+read-only verifier exists in the private deploy repository; it does not create
+the flag, stop a service or authorize a rollout by itself. Build releases away
+from the live checkout, integrate deployment and backup stop/resume handling,
+and replace the service manager's 90-second forced-stop deadline. A zero
+funding-reservation count alone is insufficient.
 The durable recovery journal and its independent cutover/rollback review remain
 separate; these lifecycle changes do not activate it.

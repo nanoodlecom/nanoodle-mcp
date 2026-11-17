@@ -347,7 +347,7 @@ async function main() {
   const maintenance = serveSpec === null ? null : createMaintenanceBarrier(maintenanceConfig());
   const httpServers = [];
   let gate = null, near = null, marketService = null, usageWriter = null;
-  const moneyState = () => moneyStateStatus([gate?.persistenceStatus(), usageWriter?.status(), near?.usageStatus()]);
+  const moneyState = () => moneyStateStatus([gate?.persistenceStatus(), near?.persistenceStatus(), marketService?.persistenceStatus(), usageWriter?.status(), near?.usageStatus()]);
   if (maintenance) {
     maintenance.assertAdmitted(); // A retained/unsafe operator flag must fail before recovery or signing.
     const startup = new Promise(resolve => { finishStartup = resolve; });
@@ -780,6 +780,15 @@ async function main() {
       } : null) });
   }
 
+  if (maintenance.snapshot().enforced && !serviceLifecycle.isStopping()) {
+    const { startMaintenanceReport } = await import("../src/maintenance-report.mjs");
+    await startMaintenanceReport({ outDir: resolvedOut, maintenance, moneyState,
+      writerProtection: () => {
+        writerLocks?.assertHeld();
+        return { enforced: !!writerLocks, requiredState: requiredState?.requireExisting === true, scopes: writerLocks?.count || 0 };
+      }, log: line => console.error("nanoodle-mcp: " + line) });
+  }
+
 }
 
 /**
@@ -1000,7 +1009,7 @@ async function startNearMode({
     "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." +
     (usdcEnabled ? ` Choose _pay_with: "usdc" for Circle-issued USDC on NEAR, including USDC change and refunds; otherwise the quote is in native NEAR.` : "") + ratesLine;
   return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions: dual ? instructions : nearInstructions,
-    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant, funding: refundFunding.status }, usagePath, usageStatus: usageWriter.status };
+    paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant, funding: refundFunding.status }, usagePath, usageStatus: usageWriter.status, persistenceStatus: ledger.persistenceStatus };
 }
 
 main().then(() => finishStartup(), error => {

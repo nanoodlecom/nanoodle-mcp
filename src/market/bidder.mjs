@@ -22,8 +22,8 @@
  *   is priced again then, against the awarded amount, and declined with a full
  *   refund if it no longer fits.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { writePrivateStateSync } from "../private-state.mjs";
 import { parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
 
@@ -48,13 +48,13 @@ export function openBidState(file, { now = Date.now, retainMs = 30 * 86_400_000 
   } catch (e) {
     if (!(e && e.code === "ENOENT")) throw new Error(`bid state ${file} cannot be read (${(e && e.message) || e}); inspect or move it aside`);
   }
+  let persistenceFailed = false;
   const persist = () => {
-    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
-    renameSync(tmp, file);
+    try { writePrivateStateSync(file, JSON.stringify(state), { temporary: `${file}.tmp` }); persistenceFailed = false; }
+    catch (error) { persistenceFailed = true; throw error; }
   };
   return {
+    persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0 }),
     get: (jobId) => state.jobs[jobId] || null,
     all: () => Object.entries(state.jobs).map(([jobId, r]) => ({ jobId, ...r })),
     set(jobId, rec) {

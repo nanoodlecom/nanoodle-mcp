@@ -24,9 +24,10 @@
  * the run's text outputs until the delivery is no longer needed.
  */
 import {
-  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync, unlinkSync, rmSync, chmodSync,
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync, unlinkSync, rmSync, chmodSync,
 } from "node:fs";
 import { join } from "node:path";
+import { writePrivateStateSync } from "../private-state.mjs";
 import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
 
@@ -36,19 +37,6 @@ const LOCK_FILE = "worker.lock";
 function fsyncDir(dir) {
   let fd;
   try { fd = openSync(dir, "r"); fsyncSync(fd); } catch { /* not supported everywhere */ } finally { if (fd !== undefined) closeSync(fd); }
-}
-
-function writeAtomic(file, dir, text) {
-  const tmp = `${file}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try {
-    writeSync(fd, text);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, file);
-  fsyncDir(dir);
 }
 
 function pidAlive(pid) {
@@ -153,19 +141,23 @@ export function openMarketState({ dir, now = Date.now, lock = true, requireExist
     }
   }
 
-  let closed = false;
+  let closed = false, persistenceFailed = false;
   const persist = () => {
-    if (closed) throw new Error("market state is closed");
-    if (!ownsLock()) {
-      closed = true;
-      throw new Error(`${lockPath} is no longer this process's lock (another worker took the state directory over); stopping without writing`);
-    }
-    writeAtomic(file, dir, JSON.stringify(state, null, 1));
+    try {
+      if (closed) throw new Error("market state is closed");
+      if (!ownsLock()) {
+        closed = true;
+        throw new Error(`${lockPath} is no longer this process's lock (another worker took the state directory over); stopping without writing`);
+      }
+      writePrivateStateSync(file, JSON.stringify(state, null, 1), { temporary: `${file}.${process.pid}.tmp` });
+      persistenceFailed = false;
+    } catch (error) { persistenceFailed = true; throw error; }
   };
 
   return {
     dir,
     file,
+    persistenceStatus: () => ({ ok: !persistenceFailed && (closed || ownsLock()), pendingWrites: 0 }),
     outDir: (id) => {
       const d = join(dir, "out", String(id).replace(/[^\w.-]+/g, "_"));
       mkdirSync(d, { recursive: true, mode: 0o700 });
@@ -204,6 +196,7 @@ export function openMarketState({ dir, now = Date.now, lock = true, requireExist
     },
     close() {
       if (closed && !held) return;
+      if (!closed && !ownsLock()) persistenceFailed = true;
       closed = true;
       // Only our own lock is removed; one another process holds now stays.
       if (lockPath && ownsLock()) try { unlinkSync(lockPath); } catch { /* gone */ }

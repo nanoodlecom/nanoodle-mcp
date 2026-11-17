@@ -1219,7 +1219,7 @@ test("a funded run remains admitted through pause and always releases its reserv
   assert.equal(w.maintenance.snapshot().activeOperations, 0);
 });
 
-async function hostedShutdownWorld(t, withMarket, { operatorControl = false } = {}) {
+async function hostedShutdownWorld(t, withMarket, { operatorControl = false, requiredState = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "hosted-shutdown-")), graphs = join(dir, "graphs"), out = join(dir, "out");
   await mkdir(graphs); await mkdir(out);
   const graph = structuredClone(WORKED_GRAPH);
@@ -1272,6 +1272,14 @@ async function hostedShutdownWorld(t, withMarket, { operatorControl = false } = 
   });
   await new Promise(resolve => rpcServer.listen(0, "127.0.0.1", resolve)); await chain.listen(); await provider.listen(); await market?.listen();
   const port = await freePort(), secondaryPort = await freePort(), base = `http://127.0.0.1:${port}`, secondary = `http://127.0.0.1:${secondaryPort}`;
+  const policyFile = join(dir, "state-policy.json");
+  if (requiredState) {
+    if (withMarket) throw Error("This fixture's required-state profile has no Market catalog");
+    await writeFile(join(out, "gate-state.json"), JSON.stringify({ v: 2, quotes: [], owed: [] }), { mode: 0o600 });
+    await writeFile(join(out, "near-state.json"), JSON.stringify({ v: 1, network: "testnet", merchant: "merchant.testnet", quotes: {}, consumedTx: {}, refunds: {}, payouts: {}, meta: {} }), { mode: 0o600 });
+    await writeFile(policyFile, JSON.stringify({ v: 1, outDir: out, nanoAddress: ADDRESS, chargeNano: true,
+      near: { network: "testnet", merchant: "merchant.testnet" }, marketRoot: null, marketHandles: [] }), { mode: 0o600 });
+  }
   child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", out, "--serve", `127.0.0.1:${port}`, "--public-url", base,
     "--charge-usd", "0.05", "--xno-usd", "0.5", "--no-local-work", "--near-merchant", "merchant.testnet", "--near-network", "testnet",
     "--near-rpc", chain.url, "--near-usd", "3.64", "--near-serve", `127.0.0.1:${secondaryPort}`, "--near-public-url", secondary], {
@@ -1279,6 +1287,7 @@ async function hostedShutdownWorld(t, withMarket, { operatorControl = false } = 
       NANO_RPC_URL: `http://127.0.0.1:${rpcServer.address().port}`, NANOGPT_BASE_URL: provider.url, NEAR_PRIVATE_KEY: key.secretKey,
       NEAR_USDC: "1", NANOODLE_RUN_TIMEOUT_MS: "10000", MARKET_STATE_DIR: join(dir, "market"),
       ...(operatorControl ? { NANOODLE_MAINTENANCE_FILE: join(dir, "maintenance.json"), NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) } : {}),
+      ...(requiredState ? { NANOODLE_STATE_POLICY: policyFile } : {}),
       ...(market ? { MARKET_BASE_URL: market.url, MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.1", MARKET_LISTING_PRICE_USD: "1", MARKET_POLL_SECONDS: "1" } : {}) },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -1352,4 +1361,38 @@ test("operator pause covers both actual listeners and preserves an already-paid 
   const count = w.providerBlocks.size;
   await client.call("run_noodle", { ...args, _payment_id: payment.paymentId });
   assert.equal(w.providerBlocks.size, count); assert.equal(w.provider.runs(), 1);
+});
+
+test("the actual funded service acknowledges the operator token only after its paid graph and every money writer finish", { timeout: 20000 }, async t => {
+  const w = await hostedShutdownWorld(t, false, { operatorControl: true, requiredState: true }), client = mcpClient(w.secondary);
+  const args = { graph: w.graph, inputs: { Idea: "finish before acknowledging stop" }, _pay_with: "near" };
+  const payment = (await client.call("run_noodle", args)).structuredContent.payment;
+  const tx = w.chain.transfer("payer.testnet", "merchant.testnet", BigInt(payment.amountYocto));
+  const result = client.call("run_noodle", { ...args, _payment_id: payment.paymentId, _payment_tx: tx, _payment_sender: "payer.testnet" });
+  await w.running;
+  await writeFile(w.controlFile, JSON.stringify({ v: 1, token: "c".repeat(32), operation: "backup", revision: null }), { mode: 0o600 });
+  const reportFile = join(w.out, "maintenance-health.json");
+  const until = async predicate => {
+    const began = Date.now();
+    for (;;) {
+      let frame; try { frame = JSON.parse(await readFile(reportFile, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      if (frame && predicate(frame)) return frame;
+      assert.ok(Date.now() - began < 5000, "private acknowledgement did not reach its expected state: " + w.stderr());
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  const busy = await until(frame => frame.control?.token === "c".repeat(32) && frame.operations.active > 0);
+  assert.equal(busy.readyToStop, false); assert.equal(busy.process.pid, w.child.pid); assert.equal(busy.process.uid, process.getuid());
+  assert.equal((await fetch(w.base + "/out/maintenance-health.json")).status, 404);
+  w.release(); const done = await result;
+  assert.equal(done.structuredContent.receipt.refund.status, "sent");
+  const idle = await until(frame => frame.readyToStop);
+  assert.deepEqual(idle.process, busy.process);
+  assert.equal(idle.control.operation, "backup"); assert.equal(idle.control.token, "c".repeat(32));
+  assert.deepEqual(idle.moneyState, { ok: true, pendingWrites: 0 }); assert.equal(idle.writerProtection.requiredState, true);
+  assert.deepEqual(idle.operations, { active: 0, oldestStartedAt: null, counts: { request: 0, wallet: 0, background: 0 } });
+  const state = JSON.parse(await readFile(join(w.out, "near-state.json"), "utf8"));
+  assert.equal(Object.values(state.refunds)[0].status, "sent"); assert.equal(Object.values(state.payouts)[0].status, "sent");
+  const exited = new Promise(resolve => w.child.once("exit", (code, signal) => resolve({ code, signal })));
+  w.child.kill("SIGTERM"); assert.deepEqual(await exited, { code: 0, signal: null }, w.stderr());
 });
