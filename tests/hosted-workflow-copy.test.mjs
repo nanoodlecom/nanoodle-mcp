@@ -10,8 +10,8 @@ import { serveHttp } from "../src/http.mjs";
 
 const target = "wf_9f17576586b5b53ecf7fcc27", other = "wf_111111111111111111111111";
 const author = "nano_1111111111111111111111111111111111111111111111111111hifc8npp";
-const description = "Day to night between two keyframes. Inspired by @Audrius1454663's open-source rebuild (https://x.com/Audrius1454663/status/2111177673842012349).";
-const creatorText = /Audrius1454663|2111177673842012349|[Cc]reator payout|[Cc]reator earnings|Nano earnings|embedded.*author|A CREATOR WORKFLOW/;
+const description = "Day to night between two keyframes. Synthetic credit: @fixture_creator_only (https://creator-fixture.invalid/example).";
+const creatorText = /fixture_creator_only|creator-fixture\.invalid|[Cc]reator payout|[Cc]reator earnings|Nano earnings|embedded.*author|A CREATOR WORKFLOW/;
 const link = (id, from, to, port, out = "text") => ({ id, from: { node: from, port: out }, to: { node: to, port } });
 // Synthetic day/night recipe. No production record, private prompts or providers.
 const graph = {
@@ -52,13 +52,16 @@ test("only the requested workflow loses creator copy across HTML, metadata and a
   assert.equal(control.description, description);
   assert.match(hostedWorkflowPage(control, { publicBase: "https://near.example" }).body, /No creator payout is configured/);
   assert.match(creators.instructions(other), /No creator payout is configured/);
-  assert.match(creators.listTools(other)[0].description, /Audrius1454663/);
+  assert.match(creators.listTools(other)[0].description, /fixture_creator_only/);
   const copy = creatorAgentInstructions(record), core = creators.instructions(target);
   assert.ok(copy.includes(core)); assert.ok(copy.includes(record.mcpUrl));
   for (const requirement of [/Day_keyframe_prompt/, /Night_keyframe_instruction/, /optional strings with saved defaults/, /motion prompt stay hosted/]) assert.match(copy, requirement);
   for (const requirement of [/price_workflow is free/, /authorized wallet/, /payment link for approval/, /payment\.watchUrl/, /payment\.statusUrl\?wait=1/,
-    /automatically repeat run_workflow with identical arguments/, /_pay_with/, /_payment_id: payment\.paymentId/, /never pay again or create a replacement quote/,
+    /automatically call run_workflow with identical arguments/, /_pay_with/, /_payment_id: payment\.paymentId/, /Never create another quote or payment to retry/,
     /progressToken/, /Show final media\/text/, /same asset/]) assert.match(core, requirement);
+  assert.deepEqual(copy.match(/^(?:Input|Quote|Pay|Resume|Result):/gm), ["Input:", "Quote:", "Pay:", "Resume:", "Result:"]);
+  assert.match(core, /After authorization, pay the exact quote once/);
+  assert.match(core, /Reuse that ID and arguments on retries\/disconnects/);
   assert.ok(copy.split(/\s+/).length < 166, "copy panel is shorter than the 166-word public original");
   assert.ok(core.split(/\s+/).length < 102, "discovery instructions are shorter than the 102-word public original");
 });

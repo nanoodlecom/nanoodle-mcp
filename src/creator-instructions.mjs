@@ -3,9 +3,10 @@ import { hostedWorkflowCopy } from "./hosted-workflow-copy.mjs";
 /** Shared public contract for the workflow's copy panel and MCP discovery. */
 export function conciseHostedInstructions() {
   return [
-    `price_workflow is free; it never runs models. Quote with run_workflow and _pay_with: "near" or "usdc". Pay the exact quote from an authorized wallet, or show the payment link for approval.`,
-    `Watch payment.watchUrl (SSE) or payment.statusUrl?wait=1. When paid, automatically repeat run_workflow with identical arguments plus _payment_id: payment.paymentId. Reuse that ID on retries/reconnects; never pay again or create a replacement quote as a retry.`,
-    `Use SSE with a progressToken for steps. Show final media/text. Unused funds return to the paying wallet in the same asset.`,
+    `Quote: price_workflow is free; no models run. Call run_workflow with _pay_with: "near" or "usdc" for a quote.`,
+    `Pay: After authorization, pay the exact quote once from an authorized wallet, or show the payment link for approval.`,
+    `Resume: Watch payment.watchUrl (SSE) or payment.statusUrl?wait=1. When paid, automatically call run_workflow with identical arguments plus _payment_id: payment.paymentId. Reuse that ID and arguments on retries/disconnects. Never create another quote or payment to retry.`,
+    `Result: Stream steps using SSE and a progressToken. Show final media/text. Unused funds return to the paying wallet in the same asset.`,
   ].join("\n\n");
 }
 
@@ -13,7 +14,7 @@ export function conciseHostedInstructions() {
 export function creatorAgentInstructions(record) {
   if (!hostedWorkflowCopy(record).showCreatorInfo) return [
     `MCP: ${record.mcpUrl}`,
-    `Inputs: Day_keyframe_prompt (day scene), Night_keyframe_instruction (night edit). Both are optional strings with saved defaults. Keep scene and framing consistent; the graph and motion prompt stay hosted.`,
+    `Input: Day_keyframe_prompt describes the day scene. Night_keyframe_instruction describes the night edit. Both are optional strings with saved defaults. Keep the same scene and framing. The graph and motion prompt stay hosted.`,
     conciseHostedInstructions(),
     `Schema: ${record.url}/llms.txt`,
   ].join("\n\n");
