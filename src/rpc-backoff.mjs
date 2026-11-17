@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export const MAX_RPC_RETRY_MS = 86_400_000;
+export const MAX_RPC_RETRY_MS = 30 * 86_400_000;
 
 /** Provider JSON retry_after uses seconds; Retry-After can also be an HTTP date. */
 export function rpcRetryAfterMs({ body, header, now = Date.now() } = {}) {

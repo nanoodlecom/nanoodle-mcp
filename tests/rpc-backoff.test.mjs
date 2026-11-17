@@ -5,6 +5,7 @@ import { rpcRetryAfterMs, rpcPeerSetId, selectRpcCooldowns, MAX_RPC_RETRY_MS } f
 test("RPC backoff reads JSON seconds and HTTP delta/date hints without retrying early", () => {
   const now = Date.parse("2026-11-17T12:00:00Z");
   assert.equal(rpcRetryAfterMs({ body: 90, header: "120", now }), 120_000);
+  assert.equal(rpcRetryAfterMs({ body: 602746, now }), 602_746_000, "the observed multi-day provider penalty must not be shortened to daily retries");
   assert.equal(rpcRetryAfterMs({ body: "0.0011", now }), 2);
   assert.equal(rpcRetryAfterMs({ header: "Tue, 17 Nov 2026 12:02:00 GMT", now }), 120_000);
   assert.equal(rpcRetryAfterMs({ header: "Tue, 17 Nov 2026 11:59:00 GMT", now }), 0);

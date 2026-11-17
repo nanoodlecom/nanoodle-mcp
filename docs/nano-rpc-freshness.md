@@ -32,7 +32,8 @@ peer into cooldown. The read guard honors JSON `retry_after` seconds and HTTP
 `Retry-After` seconds/date hints, as described in the
 [provider's retry guidance](https://docs.nano.to/rate-limits). Without a longer
 hint, repeated refusals back off from 30 seconds to five minutes; provider hints
-are bounded to 24 hours. Successful account or block reads reset that escalation.
+are bounded to 30 days, covering observed multi-day IP penalties. Successful
+account or block reads reset that escalation.
 Cooling peers receive no read or publish attempts. Other qualified peers keep
 serving, and the required independent-peer minimum stays the same.
 
