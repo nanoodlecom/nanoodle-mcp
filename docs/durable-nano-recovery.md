@@ -92,6 +92,10 @@ USDC deposit paid and retryable. It clears the unstarted Nano execution intent;
 the customer retries the same payment ID without paying again. Offline tests
 include a restart during this pause. Once execution has started, its existing
 failure/refund and ambiguous-execution rules apply instead.
+Market assignments whose admission guard proves execution never started return
+to their started phase with durable backoff, rather than being declined. They
+resume the same assignment after recovery, including across restart. An error
+without that positive pre-execution proof keeps the normal failure path.
 
 Before starting any worker/outbox, hosted funding registers existing canonical
 Nano obligations even when Nano checkout is disabled. After registration, a

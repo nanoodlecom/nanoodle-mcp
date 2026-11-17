@@ -62,7 +62,7 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
   function admit() {
     let ready = false;
     try { ready = canAdmit() === true; } catch { /* Unknown recovery state grants no work. */ }
-    if (!ready) throw new FundingError("FUNDING_RECOVERY_REQUIRED", "Shared Nano payment recovery is pending; no model work was started");
+    if (!ready) throw Object.assign(new FundingError("FUNDING_RECOVERY_REQUIRED", "Shared Nano payment recovery is pending; no model work was started"), { executionNotStarted: true });
   }
 
   async function run({ id, maxUsd, maxRaw, overheadRaw = 0n }, execute) {

@@ -37,6 +37,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { FundingError } from "../run-funding.mjs";
 import { join } from "node:path";
 import { splitPlainBrief, resolveFields, parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
@@ -301,6 +302,12 @@ export function createMarketWorker({
         },
       });
     } catch (e) {
+      if (e instanceof FundingError && e.code === "FUNDING_RECOVERY_REQUIRED" && e.executionNotStarted === true) {
+        prepared.set(rec.id, prep);
+        rec = backoff(set(rec.id, { phase: "started", runStartedAt: null }), e);
+        await progress(rec.id, "Temporarily paused. Your workflow has not started; it will retry automatically.", 5);
+        return rec;
+      }
       log(`assignment ${short(rec.id)}: run failed (${errText(e)}); handing it back`);
       // Only the provider's own per-step message (runner.mjs marks it buyerMessage) goes to the
       // buyer. Anything else (a local file-system error, a bug) can name this machine's paths:

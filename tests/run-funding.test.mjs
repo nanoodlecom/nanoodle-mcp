@@ -30,7 +30,7 @@ test("unresolved recovery pauses admission before and after a balance await with
   const pool = createRunFunding({ serial: fn => fn(), canAdmit: () => ready,
     balance: async () => { reads++; if (hold) await waiting.promise; return 1000n; } });
   const execute = async () => { executes++; };
-  await assert.rejects(pool.run(budget("before"), execute), { code: "FUNDING_RECOVERY_REQUIRED" });
+  await assert.rejects(pool.run(budget("before"), execute), { code: "FUNDING_RECOVERY_REQUIRED", executionNotStarted: true });
   assert.equal(reads, 0); assert.equal(executes, 0);
   ready = true; hold = true;
   const pending = pool.run(budget("during"), execute);

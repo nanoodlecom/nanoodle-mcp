@@ -13,6 +13,7 @@ import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState } from "../src/market/state.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
+import { createRunFunding } from "../src/run-funding.mjs";
 import { createMarketWorker, logSafe } from "../src/market/worker.mjs";
 import { runLoop, defaultStateDir, readConfig } from "../scripts/market-worker.mjs";
 
@@ -35,6 +36,42 @@ async function rig({ market, dir = null, runner = null, backoffMs = 0 }) {
   const once = async () => { await worker.tick(); await worker.drain(); };
   return { store, worker, once, logs, stateDir };
 }
+
+test("Market pauses proven unstarted recovery refusals and resumes the same assignment after restart", async () => {
+  const market = createMarketMock(); await market.listen(); let ready = false;
+  const real = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 0.5, baseUrl: nano.url });
+  const pool = createRunFunding({ serial: fn => fn(), balance: async () => 1000n, canAdmit: () => ready });
+  const runner = { price: real.price, run: options => pool.run({ id: options.fundingId, maxUsd: 1, maxRaw: 100n }, () => real.run(options)) };
+  const A = await rig({ market, runner, backoffMs: 3_600_000 }), before = nano.runs();
+  const id = market.hire({ description: WORKED() });
+  await A.once();
+  assert.equal(A.store.get(id).phase, "started");
+  assert.equal(A.store.get(id).runStartedAt, null);
+  assert.equal(market.rows.get(id).assignment.status, "in_progress");
+  assert.equal(nano.runs(), before);
+  const dir = A.stateDir; A.store.close();
+  const B = await rig({ market, runner, dir });
+  await B.once(); assert.equal(nano.runs(), before, "restart still honors the recorded backoff");
+  ready = true; B.store.update(id, { nextAttemptAt: 0 });
+  await B.once();
+  assert.equal(B.store.get(id).phase, "submitted");
+  const runs = nano.runs(); assert.ok(runs > before);
+  await B.once(); assert.equal(nano.runs(), runs);
+  B.store.close(); await market.close();
+});
+
+test("a generic runner error cannot claim recovery admission proof to authorize another execution", async () => {
+  const market = createMarketMock(); await market.listen();
+  const real = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 0.5, baseUrl: nano.url });
+  const runner = { price: real.price, run: async () => {
+    throw Object.assign(Error("unproven execution state"), { code: "FUNDING_RECOVERY_REQUIRED", executionNotStarted: true });
+  } };
+  const A = await rig({ market, runner });
+  const id = market.hire({ description: WORKED() }); await A.once();
+  assert.equal(market.rows.get(id).assignment.status, "cancelled");
+  assert.equal(market.rows.get(id).assignment.cancelReason, "failed");
+  A.store.close(); await market.close();
+});
 
 test("a job already started by a worker whose state is gone is NOT run again (fresh or different --state-dir)", async () => {
   const market = createMarketMock();
