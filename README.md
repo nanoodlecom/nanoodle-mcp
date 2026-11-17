@@ -577,8 +577,10 @@ yourself remains supported by this open-source repository.
 `POST /creators/check` validates and prices without executing; `POST
 /creators/workflows` hosts it. Both accept `{graph, name, description}`;
 the check response includes the same customer `schema` as the hosted endpoint.
-Legacy `inputName` submissions remain accepted, and existing hosted records keep
-their published schemas. ComfyUI/OpenArt exports receive a format error before
+Explicit legacy `inputName` submissions still select a named Text node for the
+single-input pricing probe and publish their former full input schema. The
+automatic form omits `inputName`; existing hosted records keep their published
+schemas. ComfyUI/OpenArt exports receive a format error before
 pricing or hosting: rebuild or open a supported native graph in the Nanoodle
 editor and use Save to export `noodle-graph.json`. Renaming a foreign JSON file
 does not convert it. A successful upload returns `/workflows/wf_…` and

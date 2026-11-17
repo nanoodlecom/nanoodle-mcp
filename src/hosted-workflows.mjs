@@ -71,9 +71,13 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
     if (typeof graph === "string") { try { graph = JSON.parse(graph); } catch { throw new ParamsError("The workflow is not valid JSON"); } }
     try { assertCreatorGraph(graph); } catch (e) { throw new ParamsError(e.message); }
     const wf = Workflow.fromJSON(JSON.stringify(graph), { quiet: true });
-    const inputNodeIds = detectInputNodes(wf), shape = inputShape(graph, inputNodeIds);
+    // Explicit legacy clients selected one named Text for the pricing probe,
+    // while publishing all formerly visible inputs. Preserve that contract;
+    // the automatic browser flow omits inputName and uses inferred inputs.
+    const legacy = !!body.inputName;
+    if (legacy && !graph.nodes.some(n => n.type === "text" && typeof n.name === "string" && n.name && n.name === body.inputName)) throw new ParamsError("Choose the named text input for the user’s request");
+    const inputNodeIds = legacy ? undefined : detectInputNodes(wf), shape = inputShape(graph, inputNodeIds);
     if (!shape.inputs.length) throw new ParamsError("No customer inputs were detected. Connect named Text or Choice nodes to the workflow. Keep internal prompts locked; leave a saved default on optional prompts. Image upload nodes are not supported by hosted workflows.");
-    if (body.inputName && !shape.inputs.some(({ inp }) => inp.key === body.inputName)) throw new ParamsError("The named customer input is not an available workflow input");
     const inputName = body.inputName || (shape.inputs.length === 1 ? shape.inputs[0].inp.key : null);
     let author; try { author = authorAddress(graph.x402); } catch { throw new ParamsError("The embedded x402.author must be a valid Nano payout address"); }
     if (!author) throw new ParamsError('Add your Nano payout address as "x402": {"author":"nano_…"} at the top level of the graph');
@@ -81,7 +85,9 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
     if (!name || name.length > 80) throw new ParamsError("Give this workflow a name of 1–80 characters");
     const description = String(body.description || "").trim();
     if (description.length > 2000) throw new ParamsError("Keep the description under 2,000 characters");
-    const priced = await runner.price({ graph, inputs: Object.fromEntries(shape.inputs.map(({ inp }) => [inp.key, inp.options?.[0] ?? PROBE_BRIEF])) });
+    const probeInputs = legacy ? { [inputName]: PROBE_BRIEF }
+      : Object.fromEntries(shape.inputs.map(({ inp }) => [inp.key, inp.options?.[0] ?? PROBE_BRIEF]));
+    const priced = await runner.price({ graph, inputs: probeInputs });
     if (!priced.ok) { const e = new ParamsError(priced.refusals.map(r => r.message).join("\n")); e.refusals = priced.refusals; throw e; }
     // Keep only the executable graph and the explicit payout field. Unknown
     // top-level editor/provider settings must not become hosted credentials.

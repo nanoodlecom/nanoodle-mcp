@@ -212,3 +212,47 @@ test("HTTP free check and hosted run page publish the same two fields and action
   }
   assert.equal(posts(provider).length, 0);
 });
+
+test("both POST endpoints preserve explicit legacy named-text intake without changing automatic inputs", async t => {
+  const { creators, provider } = await setup(t);
+  const server = await serveHttp({ host: "127.0.0.1", port: 0, publicBase: "https://near.example", name: "test", version: "test", listTools: () => [], callTool: async () => ({}), creators, log: () => {} });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`, inputName = "Transition · motion prompt";
+  const post = (path, graph, extra = {}) => fetch(base + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body(graph), ...extra }) });
+  let legacyId;
+  for (const path of ["/creators/check", "/creators/workflows"]) {
+    const success = path === "/creators/check" ? 200 : 201;
+    const response = await post(path, dayNight(), { inputName });
+    assert.equal(response.status, success, await response.clone().text());
+    const legacy = await response.json();
+    if (path === "/creators/workflows") assert.equal(legacy.inputName, inputName);
+    assert.deepEqual(Object.keys(legacy.schema.properties), [...keys, "Transition_motion_prompt"]);
+    if (legacy.id) legacyId = legacy.id;
+    const auto = await post(path, dayNight());
+    assert.equal(auto.status, success);
+    assert.deepEqual(Object.keys((await auto.json()).schema.properties), keys);
+
+    // Legacy intake chose a named Text node, never a Choice or an arbitrary key.
+    const choice = dayNight(); choice.nodes.find(n => n.id === "p-move").type = "choice";
+    choice.nodes.find(n => n.id === "p-move").fields = { options: "Slow\nFast", selected: "Slow" };
+    for (const [graph, name] of [[choice, inputName], [dayNight(), "clip"], [dayNight(), "Not a field"]]) {
+      const rejected = await post(path, graph, { inputName: name });
+      assert.equal(rejected.status, 400);
+      assert.match((await rejected.json()).error, /named text input/);
+    }
+    const locked = dayNight(); locked.nodes.find(n => n.id === "p-move").fields.locked = true;
+    assert.equal((await post(path, locked, { inputName })).status, 400, "legacy selection cannot unlock a field");
+    // The legacy probe fills only its selected primary, not the new inferred set.
+    const missing = dayNight(); missing.nodes.find(n => n.id === "p-day").fields.text = "";
+    assert.equal((await post(path, missing, { inputName })).status, 400);
+    assert.equal((await post(path, missing)).status, success);
+  }
+  assert.equal(creators.get(legacyId).inputNodeIds, undefined);
+  assert.equal((await creators.submit({ ...body(dayNight()), inputName })).id, legacyId, "legacy resubmission is stable");
+  const restored = createHostedWorkflows({ dir: creators.dir, publicBase: creators.publicBase, baseUrl: provider.url,
+    callTool: async args => ({ content: [], structuredContent: { inputs: args.arguments.inputs } }) });
+  assert.deepEqual(Object.keys(restored.publicView(legacyId).schema.properties), [...keys, "Transition_motion_prompt"]);
+  const result = await restored.callTool(legacyId, { name: "run_workflow", arguments: { Transition_motion_prompt: "Legacy caller motion" } });
+  assert.deepEqual(result.structuredContent.inputs, { [inputName]: "Legacy caller motion" });
+  assert.equal(posts(provider).length, 0, "all endpoint validation uses catalogs only");
+});
