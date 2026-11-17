@@ -7,6 +7,16 @@ import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 import { selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { maintenanceProcessIdentity } from "./maintenance-report.mjs";
 
+const readFailureCodes = new Map([
+  ["NANO_RPC_NETWORK_QUORUM", "nano-rpc-network-quorum"],
+  ["NANO_RPC_READ_QUORUM", "nano-rpc-read-quorum"],
+  ["NANO_RPC_CONFLICT", "nano-rpc-frontier-conflict"],
+  ["NANO_RPC_REGRESSION", "nano-rpc-frontier-regressed"],
+  ["NANO_RPC_UNCONFIRMED_FRONTIER", "nano-rpc-unconfirmed-frontier"],
+]);
+const reportFailureCodes = new Set(["funding-state-unavailable", ...readFailureCodes.values()]);
+export const fundingReportFailure = code => reportFailureCodes.has(code) ? code : "funding-state-unavailable";
+
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
 export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, durableState = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
@@ -56,7 +66,9 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           if (proof?.enforced !== true || typeof proof.requiredState !== "boolean") throw Error("writer protection unavailable");
           report.writerProtection = { enforced: true, requiredState: proof.requiredState };
         }
-      } catch { report = { ok: false, code: "funding-state-unavailable" }; }
+      } catch (error) {
+        report = { ok: false, code: fundingReportFailure(readFailureCodes.get(error?.code)) };
+      }
       report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(now()).toISOString() };
       try {
         const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);

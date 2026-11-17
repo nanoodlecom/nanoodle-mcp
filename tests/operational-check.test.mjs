@@ -136,6 +136,18 @@ test("mismatched or malformed cooldown observations cannot hide live peer failur
   }
 });
 
+test("the no-inference check distinguishes wallet read refusal from missing funding enforcement", async () => {
+  for (const [stored, expected] of [["nano-rpc-frontier-regressed", "nano-rpc-frontier-regressed"],
+    ["funding-state-unavailable", "funding-state-unavailable"], ["PRIVATE_PROVIDER_DETAILS", "funding-state-unavailable"]]) {
+    const f = fixture();
+    f.states["/state/funding-health.json"] = { v: 1, checkedAt: new Date(NOW).toISOString(), ok: false, code: stored };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(check => check.stage === "runtime-funding" && check.code === expected));
+    assert.deepEqual(report.admission, { nano: false, near: false, usdc: false, market: false });
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PROVIDER_DETAILS/);
+  }
+});
+
 test("stale, disabled, underfunded or stuck live reservations fail independently of the public site", async () => {
   for (const change of [
     { checkedAt: new Date(NOW - 61_000).toISOString() }, { enforced: false }, { protectTransfers: false },

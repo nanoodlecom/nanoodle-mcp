@@ -21,6 +21,7 @@ import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
+import { fundingReportFailure } from "../src/funding-report.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
@@ -89,6 +90,7 @@ export async function runOperationalCheck(config, deps = {}) {
     need(value?.v === 1, "funding-report-missing");
     const age = now() - Date.parse(value.checkedAt);
     need(Number.isFinite(age) && age <= 60_000 && age >= -30_000, "funding-report-stale");
+    if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
     need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
     need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
     need(value.writerProtection.requiredState === true, "required-state-policy-not-enforced");

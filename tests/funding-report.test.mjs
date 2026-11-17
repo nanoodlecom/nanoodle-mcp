@@ -46,6 +46,22 @@ test("unreadable financial state fails closed and later recovery can resume quot
   fail = false; await report.refresh(); assert.equal(w.sources.ready(), true);
 });
 
+test("runtime funding reports a known read guard refusal without copying RPC diagnostics", async t => {
+  const w = await setup(t);
+  let cause = "NANO_RPC_READ_QUORUM";
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
+    snapshot: async () => { throw Object.assign(Error("PRIVATE_RPC_URL"), { code: cause }); } });
+  t.after(report.stop);
+  const currentCode = async () => { await report.refresh(); return JSON.parse(await readFile(w.file, "utf8")).code; };
+  assert.equal(await currentCode(), "nano-rpc-read-quorum");
+  cause = "NANO_RPC_UNCONFIRMED_FRONTIER";
+  assert.equal(await currentCode(), "nano-rpc-unconfirmed-frontier");
+  cause = "PRIVATE_ERROR_CODE";
+  assert.equal(await currentCode(), "funding-state-unavailable");
+  assert.equal(w.sources.ready(), false);
+  assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
+});
+
 test("a write failure pauses sending; read-only recovery does not need to enable sends first", async t => {
   const w = await setup(t);
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
