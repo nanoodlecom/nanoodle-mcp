@@ -14,6 +14,8 @@ const readFailureCodes = new Map([
   ["NANO_RPC_CONFLICT", "nano-rpc-frontier-conflict"],
   ["NANO_RPC_REGRESSION", "nano-rpc-frontier-regressed"],
   ["NANO_RPC_UNCONFIRMED_FRONTIER", "nano-rpc-unconfirmed-frontier"],
+  ["NANO_RPC_STANDBY_DISAGREES", "nano-rpc-standby-disagrees"],
+  ["NANO_RPC_STANDBY_BUDGET", "nano-rpc-standby-budget"],
 ]);
 const reportFailureCodes = new Set([
   "funding-state-unavailable", "funding-underfunded", "funding-durable-state-unavailable",
@@ -64,6 +66,12 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           report.nanoRpc = { enforced: n.enforced === true, configuredPeers: n.configuredPeers, minimumPeers: n.minimumPeers,
             readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt,
             checkpoint: selectNanoCheckpoint(n.checkpoint) };
+          if (n.standby !== undefined) {
+            const { inUse, requestsPerMinute } = n.standby;
+            if (typeof inUse !== "boolean" || !Number.isSafeInteger(requestsPerMinute) || requestsPerMinute < 3 || requestsPerMinute > 120
+                || n.configuredPeers < 3 || (inUse && (n.minimumPeers !== 2 || n.readablePeers !== 2))) throw Error("invalid standby observation");
+            report.nanoRpc.standby = { inUse, requestsPerMinute };
+          }
           if (n.cooldowns !== undefined || n.configuration !== undefined) {
             if (typeof n.configuration !== "string" || !/^[a-f0-9]{64}$/.test(n.configuration)) throw Error("invalid RPC configuration observation");
             report.nanoRpc.configuration = n.configuration;

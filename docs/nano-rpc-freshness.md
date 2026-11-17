@@ -74,6 +74,23 @@ upstream request. Invalid metadata or changed configuration cannot hide a peer
 failure. The monitor still queries the other peers and independently verifies
 their frontier agreement and available quorum; loss of quorum closes admission.
 
+For a standby on a separate provider, set both `NANO_RPC_STANDBY_URL` and
+`NANO_RPC_STANDBY_REQUESTS_PER_MINUTE`. Use two to seven primary peers and a
+standby on a different hostname. Set the budget from the provider's spare quota
+after accounting for other uses of the account. The setting accepts 3–120
+attempts per rolling minute in the hosted process. Genesis proof, account and
+block reads, and failed attempts all count. The wallet also honors the provider's
+rate-limit cooldown. The local budget restarts with the process.
+
+When two primary peers provide account views, the standby stays idle. When one
+provides a view, the standby must prove mainnet and corroborate that entire
+account view. A conflicting, behind, or exhausted standby cannot fill quorum.
+The standby may read a block outcome. The wallet publishes only through the
+corroborated primary when the account read used the standby. The standby role
+does not request work or broadcast blocks. The five-minute monitor checks a
+fresh standby-assisted checkpoint against a directly readable primary. It
+reports when the standby covers quorum and makes no separate standby requests.
+
 Offline tests include a real hosted server with a frozen preferred peer and two
 current peers. Nano, NEAR and USDC saved/custom runs, timeout refunds and replay
 all use that fixture. The frozen peer returns empty pending/history lists and

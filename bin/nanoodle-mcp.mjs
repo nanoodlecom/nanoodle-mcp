@@ -396,6 +396,8 @@ async function main() {
         wallet = createNanoWallet({
           secretKey: resolveWalletKey({ privateKey: nanoKey, seed: nanoSeed }),
           rpcUrl: nanoRpcFlag || process.env.NANO_RPC_URL || undefined,
+          rpcStandby: guardedFunding ? { url: process.env.NANO_RPC_STANDBY_URL,
+            requestsPerMinute: process.env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE } : undefined,
           workUrl,
           workKey,
           localWork: !noLocalWork,

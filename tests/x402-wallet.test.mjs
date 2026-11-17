@@ -232,6 +232,38 @@ test("insufficient mainnet read peers refuses the hosted run before execution or
   assert.equal(executed, false); assert.equal(mock.state.processed.length, 0);
 });
 
+test("guarded funded payments use the corroborated primary and leave the standby read-only", async () => {
+  const mock = fakeRpc(), calls = [];
+  const primary = "https://primary.example", secondary = "https://secondary.example";
+  const standby = "https://standby.example/nano?key=SYNTHETIC";
+  let at = 1000, limited = true;
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: [secondary, primary].join(","),
+    rpcStandby: { url: standby, requestsPerMinute: 12 }, verifyRpcReads: true, protectTransfers: true,
+    requireFunding: true, localWork: false, now: () => at,
+    fetch: async (url, init) => {
+      const { action } = JSON.parse(init.body);
+      calls.push({ action, url });
+      if (url === secondary && limited) return new Response("", { status: 429 });
+      if (url === standby) assert.ok(["account_info", "block_info", "receivable"].includes(action));
+      return mock.fetch(url, init);
+    } });
+  let state = await wallet.ops.fundingReport();
+  assert.equal(state.nanoRpc.standby.inUse, true);
+  assert.equal(mock.state.processed.length, 0);
+  await wallet.ops.withFunding({ id: "standby-payment", maxUsd: 0.01, maxRaw: BigInt(AMOUNT) }, () => wallet.payment(invoice()));
+  assert.deepEqual(calls.filter(call => call.action === "process"), [{ action: "process", url: primary }]);
+  assert.ok(calls.some(call => call.action === "work_generate"));
+  assert.ok(calls.filter(call => call.action === "work_generate").every(call => call.url === primary));
+  assert.equal(BigInt(mock.state.balance), BigInt(BALANCE) - BigInt(AMOUNT));
+
+  const lastStandbyCallCount = calls.filter(call => call.url === standby).length;
+  at += 30_001; limited = false;
+  state = await wallet.ops.fundingReport();
+  assert.equal(state.nanoRpc.standby.inUse, false);
+  assert.equal(calls.filter(call => call.url === standby).length, lastStandbyCallCount);
+  assert.doesNotMatch(JSON.stringify(state), /SYNTHETIC|standby\.example/);
+});
+
 test("the hosted wallet honors numeric rate limits through funding, provider settlement and recovery", async () => {
   for (const mode of ["wrapped", "http-json", "http-text"]) {
     let at = 1_000, limited = true, limitedCalls = 0;

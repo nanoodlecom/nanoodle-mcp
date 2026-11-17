@@ -19,7 +19,7 @@ import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
+import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
@@ -70,7 +70,9 @@ export async function runOperationalCheck(config, deps = {}) {
   const request = createProbeFetch({ fetch: deps.fetch || globalThis.fetch, timeoutMs: config.timeoutMs || 12_000 });
   const priceWorkflow = deps.computePrice || computePrice;
   const checks = [];
+  const peerUrls = config.nanoStandby ? [...config.nanoRpcUrls, config.nanoStandby.url] : config.nanoRpcUrls;
   let nanoCooldowns = [];
+  let standbyCheckpoint = null;
   const check = async (stage, fn, domains = ALL) => {
     try { const value = await fn(); checks.push({ stage, ok: true }); return value; }
     catch (e) { checks.push({ stage, ok: false, code: safeCode(e), domains }); return null; }
@@ -118,17 +120,24 @@ export async function runOperationalCheck(config, deps = {}) {
     need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
       && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= limit + 15 * 60_000, "funding-run-stuck");
     const rpc = value.nanoRpc;
-    need(rpc?.enforced === true && rpc.configuredPeers === config.nanoRpcUrls.length, "nano-read-guard-not-enforced");
+    need(rpc?.enforced === true && rpc.configuredPeers === peerUrls.length, "nano-read-guard-not-enforced");
     const minimum = Math.min(2, config.nanoRpcUrls.length);
-    need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= config.nanoRpcUrls.length)
+    need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
-    try { selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
+    let checkpoint;
+    try { checkpoint = selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
-    if (rpc.cooldowns !== undefined || rpc.configuration !== undefined) {
-      need(rpc.configuration === rpcPeerSetId(config.nanoRpcUrls), "nano-peer-configuration-mismatch");
-      try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, config.nanoRpcUrls.length, now()); }
+    if (config.nanoStandby || rpc.cooldowns !== undefined || rpc.configuration !== undefined) {
+      need(rpc.configuration === rpcPeerSetId(peerUrls), "nano-peer-configuration-mismatch");
+      try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, peerUrls.length, now()); }
       catch { need(false, "nano-cooldown-observation-invalid"); }
+    }
+    if (config.nanoStandby) {
+      const { inUse, requestsPerMinute } = rpc.standby ?? {};
+      need(typeof inUse === "boolean" && requestsPerMinute === config.nanoStandby.requestsPerMinute
+        && (!inUse || (rpc.readablePeers === 2 && !nanoCooldowns.some(item => item.peer === peerUrls.length - 1))), "nano-standby-observation-invalid");
+      if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
     return pause?.recoveredAt != null ? pause : null;
@@ -173,13 +182,19 @@ export async function runOperationalCheck(config, deps = {}) {
     return info;
   }, [])))).filter(Boolean);
   const nano = await check("nano-frontier-agreement", async () => {
-    need(nanoNodes.length >= Math.min(2, config.nanoRpcUrls.length), "nano-read-quorum-unavailable");
+    if (nanoNodes.length < Math.min(2, config.nanoRpcUrls.length)) {
+      need(nanoNodes.length === 1 && standbyCheckpoint, "nano-read-quorum-unavailable");
+      const primary = nanoNodes[0];
+      need(BigInt(primary.confirmed_height) === BigInt(standbyCheckpoint.blockCount)
+        && primary.confirmed_frontier.toUpperCase() === standbyCheckpoint.hash, "nano-standby-checkpoint-disagrees");
+    }
     const highest = nanoNodes.reduce((a, b) => BigInt(a.confirmed_height) >= BigInt(b.confirmed_height) ? a : b);
     const consistent = nanoNodes.every(n => BigInt(highest.confirmed_height) - BigInt(n.confirmed_height) <= 2n
       && (n.confirmed_height !== highest.confirmed_height || n.confirmed_frontier === highest.confirmed_frontier));
     need(consistent, "nano-wallet-nodes-disagree");
     return highest;
   });
+  if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
   const nearNodes = (await Promise.all(config.nearRpcUrls.map((url, index) => check(`near-node-${index}`, async () => {
     const rpc = createNearRpc({ url, fetch: request, timeoutMs: config.timeoutMs || 12_000 });
     const status = await rpc.status();
@@ -311,10 +326,12 @@ async function productionConfig(env = process.env) {
   need(secret, "nano-wallet-not-configured");
   const merchant = env.NEAR_MERCHANT;
   const signer = await loadNearSigner({ accountId: merchant, keyFile: env.NEAR_KEY_FILE || null, env });
+  const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
+  const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", outDir: "/srv/nanoodle-mcp/out",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
-    nanoRpcUrls: env.NANO_RPC_URL.split(",").map(s => s.trim()), nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
+    nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
     nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }

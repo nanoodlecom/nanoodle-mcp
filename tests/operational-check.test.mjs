@@ -163,6 +163,33 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_URL|configuration|cooldowns/);
 });
 
+test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
+  for (const failure of [null, "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+    const f = fixture(({ url, body }) => {
+      assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
+      if (url.hostname === "nano-0.example") return new Response("", { status: 503 });
+      if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
+        return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
+      }
+      return null;
+    });
+    const url = "https://standby.example/rpc?api_key=PRIVATE_STANDBY";
+    f.config.nanoStandby = { url, requestsPerMinute: 10 };
+    const rpc = f.states["/state/funding-health.json"].nanoRpc;
+    Object.assign(rpc, { configuredPeers: 3,
+      configuration: failure === "digest" ? "a".repeat(64) : rpcPeerSetId([...f.config.nanoRpcUrls, url]),
+      standby: { inUse: failure !== "inactive", requestsPerMinute: failure === "quota" ? 11 : 10 },
+      cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.nano, failure === null);
+    assert.equal(report.admission.near, failure === null);
+    if (!failure) assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
+    if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
+  }
+});
+
 test("mismatched or malformed cooldown observations cannot hide live peer failures", async () => {
   for (const patch of [{ configuration: "a".repeat(64) }, { cooldowns: [{ peer: true, until: NOW + 60_000 }] }]) {
     const f = fixture(); Object.assign(f.states["/state/funding-health.json"].nanoRpc,
