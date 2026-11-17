@@ -104,6 +104,38 @@ development journal can still import its legacy source. The future production
 policy must require the canonical scope after migration; that policy remains
 unimplemented and production activation remains refused.
 
+The shared account now also fences fresh sends, provider payments and receives
+while any older creator payout lacks canonical proof. This includes historical
+`sent` records: older writers used that label after publication, before the new
+confirmation/height contract. NEAR, USDC and Market creator claims are read even
+with their payment rail/profile disabled. Matching a declared hash is insufficient;
+the journal's binding/signature and the actual prepared block must agree. A
+completed journal receipt can discharge an outbox with no retained prepared block.
+Original signed-operation reconciliation remains available during this hold.
+
+Queued Market creator records must retain their corresponding payout intent with
+the same author/amount. Missing or conflicting outboxes fail closed, and raw
+canonical dispatch intents stay held until the live Nano owner classifies them.
+Private health includes `unverifiedCreatorPayouts`; required monitoring rejects
+missing fields as well as a positive count. No legacy record is marked confirmed,
+erased or repaid automatically to clear this barrier.
+
+The release planner can inspect the whole legacy set without opening SQLite or
+using keys/RPCs:
+
+```sh
+node scripts/inspect-payment-migration.mjs /path/gate-state.json \
+  --near /path/near-state.json \
+  --market /path/first-profile/market-state.json \
+  --market /path/disabled-profile/market-state.json
+```
+
+It reports only aggregates, including historical creator proofs still needed,
+untraceable payouts, missing settlement/Market outboxes, active work and existing
+creator obligations. It does not authorize activation. The V2 migration must
+verify those original hashes and preserve a durable finalized account floor
+before new signing. Do not clear a hold by deleting records or their signed bytes.
+
 ## Legacy state and recovery
 
 `scripts/inspect-payment-migration.mjs` is a read-only aggregate planner. It opens

@@ -127,7 +127,7 @@ export function walletAddress(secretKey) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, recoveryStore = null, fundingLiabilities = () => 0n, fundingReady = () => true, requireFunding = false, protectTransfers = false, verifyRpcReads = false, assertWriter = () => {}, now = Date.now, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, recoveryStore = null, fundingLiabilities = () => 0n, fundingReady = () => true, fundingRecovery = () => ({ heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, unverifiedCreatorPayouts: 0 }), requireFunding = false, protectTransfers = false, verifyRpcReads = false, assertWriter = () => {}, now = Date.now, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
@@ -135,6 +135,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   if (typeof verifyRpcReads !== "boolean") throw new TypeError("verifyRpcReads must be a boolean");
   if (typeof assertWriter !== "function") throw new TypeError("assertWriter must be a function");
   if (typeof fundingReady !== "function") throw new TypeError("fundingReady must be a function");
+  if (typeof fundingRecovery !== "function") throw new TypeError("fundingRecovery must be a function");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
@@ -471,10 +472,12 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
    * block hash. `describe` labels the log line ("paid", "refunded", …).
    */
   async function prepareSend(state, to, amount, beforeSign = null) {
+    assertFreshRecovery();
     if (typeof amount !== "bigint" || amount <= 0n) throw new Error("Nano transfer amount must be positive");
     if (amount > state.balance) throw new Error("insufficient Nano wallet balance for transfer");
     const work = await workFor(state.frontier, SEND_WORK_THRESHOLD);
     assertWriter();
+    assertFreshRecovery();
     beforeSign?.();
     const prepared = createBlock(secretKey, {
       work, previous: state.frontier, representative: state.representative,
@@ -612,9 +615,11 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         requireHeight: !!readPool,
         onConfirmed: refreshRecoveryHead,
         async prepare(sourceHash, amountRaw) {
+          assertFreshRecovery();
           const state = await currentState(true);
           const work = await workFor(state.frontier, RECEIVE_WORK_THRESHOLD);
           assertWriter();
+          assertFreshRecovery();
           const { hash, block } = createBlock(secretKey, {
             work,
             previous: state.frontier,
@@ -638,6 +643,27 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         lookup: (hash) => rpc({ action: "block_info", hash, json_block: "true" }),
       })
     : null;
+
+  function recoveryStatus() {
+    const own = recoveryStore.status(address);
+    const external = fundingRecovery({ isJournaled: p => durableSender.matchesPayout(`creator:${p.paymentId}`, {
+      to: p.to, amountRaw: p.amountRaw, prepared: p.prepared, txHash: p.txHash,
+    }) });
+    if (!external || ![external.heldRuns, external.heldPayouts, external.queuedPayouts, external.unverifiedCreatorPayouts]
+      .every(n => Number.isSafeInteger(n) && n >= 0) || external.heldPayouts > external.queuedPayouts) throw Error("recovery-obligations-invalid");
+    const heldRuns = Math.max(own.heldRuns, external.heldRuns), heldPayouts = Math.max(own.heldPayouts, external.heldPayouts);
+    return { ...own, heldRuns, heldPayouts, queuedPayouts: Math.max(own.queuedPayouts, external.queuedPayouts),
+      unverifiedCreatorPayouts: external.unverifiedCreatorPayouts,
+      ready: own.ready && heldRuns + heldPayouts + external.unverifiedCreatorPayouts === 0 };
+  }
+  function assertFreshRecovery() {
+    if (!recoveryStore) return;
+    let status;
+    try { status = recoveryStatus(); } catch { /* Missing state cannot grant a fresh signature. */ }
+    if (!status || status.heldRuns + status.heldPayouts + status.unverifiedCreatorPayouts > 0) {
+      throw new FundingError("WALLET_RECOVERY_REQUIRED", "Unresolved earlier Nano operations prevent fresh signing");
+    }
+  }
 
   function isReceiveOperation(operation) {
     return (
@@ -671,6 +697,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     const operation = recoveryStore.getSend(id);
     if (operation && operation.state !== "intent")
       return durableSender.transfer(id, to, amountRaw);
+    assertFreshRecovery();
     await reconcileActiveReceive();
     // Fund the send through independently journaled receives before claiming
     // its account slot. Once claimed, preparation may only build this send.
@@ -775,7 +802,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     serial: fn => enqueue(fn, URGENT),
     liabilitiesRaw: fundingLiabilities,
     requireScope: requireFunding,
-    canAdmit: () => !recoveryStore || fundingReady() === true && recoveryStore.status(address).ready,
+    canAdmit: () => !recoveryStore || fundingReady() === true && recoveryStatus().ready,
     balance: async required => {
       let state = await currentState();
       if (state.balance < required) state = await pocketReceivables(true, s => s.balance >= required);
@@ -833,7 +860,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
         return sent;
       }),
       ...(durableSender ? {
-        recoveryStatus: () => recoveryStore.status(address),
+        recoveryStatus,
         // Recovery only observes an existing signed hash or releases a proven
         // unsigned slot. It never prepares, publishes, pockets or runs PoW.
         reconcileActive: (options = {}) => enqueue(async () => {
@@ -851,7 +878,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
           return { state: "confirmed" };
         }),
         transferId: (id, to, amountRaw, describe = "sent", { liabilityRaw = 0n, fundingRunId = null, prepared = null } = {}) => enqueue(() => {
-          if (prepared && recoveryStore.getSend(id)?.hash !== prepared.hash) throw Error("Legacy payout requires reconciliation before journaled transfer");
+          if (prepared && !durableSender.matchesPayout(id, { to, amountRaw, prepared })) throw Error("Legacy payout requires reconciliation before journaled transfer");
           return sendDurable(id, to, amountRaw, { terms: { amountRaw, liabilityRaw: protectTransfers ? liabilityRaw : 0n, fundingRunId } });
         }),
         reconcileTransfer:id=>enqueue(()=>durableSender.reconcile(id)),

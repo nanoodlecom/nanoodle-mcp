@@ -1,7 +1,7 @@
 /** Offline qualification only. Every Nano RPC and provider effect is synthetic. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -1555,6 +1555,66 @@ test('a legacy creator signed block cannot become a fresh shared-journal payment
   ledger.updatePayout('legacy', { status: 'signed', prepared: candidate() });
   await payouts.resume(); assert.equal(rpc.state.publishes, 0); assert.equal(store.getSend('creator:legacy'), null);
   assert.equal(ledger.getPayout('legacy').status, 'signed');
+});
+
+for (const paymentId of ["nq_near", "nq_usdc", "market_job"]) test(`legacy prepared creator ${paymentId} fences unrelated account activity`, async t => {
+  const { openNearLedger } = await import("../src/near/ledger.mjs");
+  const { createHostedFundingSources } = await import("../src/hosted-funding.mjs");
+  const f = await fixture(t), store = f.open(), rpc = fakeRpc(), calls = [];
+  const nanoFile = join(f.dir, "gate.json"), nearFile = join(f.dir, "near.json");
+  await writeFile(nanoFile, JSON.stringify({ v: 2, quotes: [], owed: [] }));
+  const ledger = openNearLedger({ file: nearFile, network: "testnet", merchant: "merchant.testnet" });
+  ledger.putPayout({ paymentId, to: payer, amountRaw: "100", status: "signed", prepared: candidate() });
+  const sources = createHostedFundingSources({ nanoFile, nearFile });
+  const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false, rpcUrl: "https://fixture.invalid",
+    fundingRecovery: context => sources.recoveryObligations(context), fundingLiabilities: context => sources.liabilitiesRaw(context),
+    fetch: (url, init) => { calls.push(JSON.parse(init.body).action); return rpc.fetch(url, init); } });
+  assert.equal(wallet.ops.recoveryStatus().unverifiedCreatorPayouts, 1);
+  assert.equal(wallet.ops.recoveryStatus().ready, false);
+  await assert.rejects(wallet.ops.transferId("unrelated", payer, "20"), { code: "WALLET_RECOVERY_REQUIRED" });
+  await assert.rejects(wallet.payment({ paymentId: "invoice", completeUrl: "https://provider.invalid/complete", payTo: payer,
+    amountRaw: "20", amountUsd: 0.01 }), { code: "WALLET_RECOVERY_REQUIRED" });
+  let executed = false;
+  await assert.rejects(wallet.ops.withFunding({ id: "another-run", maxUsd: 1, maxRaw: 20n }, () => { executed = true; }), { code: "FUNDING_RECOVERY_REQUIRED" });
+  assert.equal(executed, false);
+  rpc.state.receivable["D".repeat(64)] = { amount: "50", source: payer };
+  await wallet.ops.pocket();
+  assert.equal(calls.includes("work_generate"), false); assert.equal(calls.includes("process"), false);
+  assert.equal(rpc.state.publishes, 0, "no send or receive can change the uncertain account frontier");
+});
+
+test("an unrepresented signed payout prevents an unrelated fresh publish", async t => {
+  const f = await fixture(t), store = f.open(), rpc = fakeRpc();
+  const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false, rpcUrl: "https://fixture.invalid", fetch: rpc.fetch,
+    fundingRecovery: () => ({ heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, unverifiedCreatorPayouts: 1 }) });
+  let failure;
+  try { await wallet.ops.transferId("unrelated", payer, "100"); } catch (e) { failure = e; }
+  assert.equal(rpc.state.publishes, 0, "an earlier unrepresented signed payout must prevent a new account block");
+  assert.equal(failure?.code, "WALLET_RECOVERY_REQUIRED");
+});
+
+test("only the actual journaled creator block can clear a legacy prepared-payout barrier", async t => {
+  const { openNearLedger } = await import("../src/near/ledger.mjs");
+  const { createHostedFundingSources } = await import("../src/hosted-funding.mjs");
+  const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
+  const f = await fixture(t), store = f.open(), rpc = fakeRpc(), nearFile = join(f.dir, "near.json");
+  const ledger = openNearLedger({ file: nearFile, network: "testnet", merchant: "merchant.testnet" });
+  const sources = createHostedFundingSources({ nanoFile: join(f.dir, "empty-nano.json"), nearFile });
+  const wallet = createNanoWallet({ secretKey: secret, recoveryStore: store, localWork: false, rpcUrl: "https://fixture.invalid", fetch: rpc.fetch,
+    fundingRecovery: context => sources.recoveryObligations(context) });
+  const hash = await wallet.ops.transferId("creator:known", payer, "100"), known = store.getSend("creator:known");
+  const prepared = { hash, block: known.block }; // Older outboxes did not retain previousBalance.
+  ledger.putPayout({ paymentId: "known", to: payer, amountRaw: "100", status: "signed", prepared });
+  assert.equal(wallet.ops.recoveryStatus().unverifiedCreatorPayouts, 0);
+  const corrupted = { hash, block: { ...known.block, balance: (BigInt(known.block.balance) + 1n).toString() } };
+  ledger.updatePayout("known", { prepared: corrupted });
+  assert.equal(wallet.ops.recoveryStatus().unverifiedCreatorPayouts, 1, "a matching declared hash cannot disguise different signed bytes");
+  await assert.rejects(wallet.ops.transferId("creator:known", payer, "100", "payout", { prepared: corrupted }), /Legacy payout requires reconciliation/);
+  assert.equal(await wallet.ops.reconcileTransfer("creator:known"), hash, "read-only original proof remains available");
+  ledger.updatePayout("known", { prepared });
+  const payouts = createAuthorPayouts({ ledger, ops: wallet.ops, schedule: () => {} }); await payouts.resume();
+  assert.equal(ledger.getPayout("known").status, "sent"); assert.equal(ledger.getPayout("known").txHash, hash);
+  assert.equal(rpc.state.publishes, 1, "repairing the outbox replays its original confirmed payment");
 });
 
 test('a canonical journal rejects a different wallet identity before any chain or payment effect', async t => {

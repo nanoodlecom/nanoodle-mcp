@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { nanoFundingLiabilities, nearCreatorLiabilities, marketCreatorLiabilities } from "./funding-liabilities.mjs";
+import { nanoRecoveryObligations, creatorRecoveryObligations, marketRecoveryObligations } from "./payments/recovery-obligations.mjs";
 
 function read(file) {
   try { return JSON.parse(readFileSync(file, "utf8")); }
@@ -23,7 +24,7 @@ export function registerCanonicalNanoFunding(sources, store, account, { required
     return nanoFundingLiabilities(data);
   };
   reader();
-  sources.registerNano(reader);
+  sources.registerNano(reader, () => nanoRecoveryObligations(store.load(scope).data));
   return true;
 }
 
@@ -36,7 +37,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     if (value === null && requiredFiles.has(resolve(file))) throw Error("funding-state-missing");
     return value;
   }
-  let nanoLive = null, nearLive = null, payoutsLive = null;
+  let nanoLive = null, nanoRecoveryLive = null, nearLive = null, payoutsLive = null;
   let quoteReady = false, storageReady = true, readyAt = null;
   const marketLive = new Map();
   function nearDisk() {
@@ -57,6 +58,13 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     for (const e of entries) if (e.isDirectory()) files.add(join(marketRoot, e.name, "market-state.json"));
     return files;
   }
+  function marketRecords(file) {
+    if (marketLive.has(file)) return marketLive.get(file)();
+    const s = readState(file);
+    if (!s) return [];
+    if (s.v !== 1) throw Error("invalid-funding-state");
+    return rows(s.assignments);
+  }
   return {
     requireFiles(files) { requiredFiles = new Set(files.map(file => resolve(file))); },
     ready() {
@@ -71,9 +79,22 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     },
     setReady(value) { quoteReady = storageReady && value === true; readyAt = quoteReady ? now() : null; },
     setStorageReady(value) { storageReady = value === true; if (!storageReady) { quoteReady = false; readyAt = null; } },
-    registerNano(reader) { nanoLive = reader; },
+    registerNano(reader, recovery = null) {
+      if (typeof reader !== "function" || recovery !== null && typeof recovery !== "function") throw TypeError("Nano funding owners need readers");
+      nanoLive = reader;
+      if (recovery !== null) nanoRecoveryLive = recovery;
+    },
     registerNear(reader, payouts) { nearLive = reader; payoutsLive = payouts; },
     registerMarket(file, reader) { marketLive.set(resolve(file), reader); },
+    recoveryObligations(options) {
+      const data = nanoRecoveryLive ? null : readState(nanoFile);
+      const nano = nanoRecoveryLive ? nanoRecoveryLive() : data ? nanoRecoveryObligations(data)
+        : { heldRuns: 0, heldPayouts: 0, queuedPayouts: 0 };
+      const payouts = payoutsLive ? payoutsLive() : nearDisk().payouts;
+      let { unverifiedCreatorPayouts } = creatorRecoveryObligations(payouts, options);
+      for (const file of marketFiles()) unverifiedCreatorPayouts += marketRecoveryObligations(marketRecords(file), payouts).orphanedCreatorPayouts;
+      return { ...nano, unverifiedCreatorPayouts };
+    },
     liabilitiesRaw(context) {
       // Recovery telemetry can read debts while storage is unavailable; it
       // grants no spending authority. Actual authorizations remain paused.
@@ -89,15 +110,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
       const payouts = payoutsLive ? payoutsLive() : near?.payouts ?? nearDisk().payouts;
       total += nearLive ? nearLive(context) : nearCreatorLiabilities(near, context);
       for (const file of marketFiles()) {
-        let records;
-        if (marketLive.has(file)) records = marketLive.get(file)();
-        else {
-          const s = readState(file);
-          if (!s) continue;
-          if (s.v !== 1) throw Error("invalid-funding-state");
-          records = rows(s.assignments);
-        }
-        total += marketCreatorLiabilities(records, { ...context, payouts });
+        total += marketCreatorLiabilities(marketRecords(file), { ...context, payouts });
       }
       return total;
     },

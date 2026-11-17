@@ -39,6 +39,7 @@ import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
 import { nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
+import { nanoRecoveryObligations } from "./payments/recovery-obligations.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
 /**
@@ -1224,6 +1225,7 @@ export function createChargeGate({
     address,
     fundingPair: ratePair,
     fundingLiabilitiesRaw: () => nanoFundingLiabilities({ quotes: [...quotes.values()], owed, pending: [...pendingTransfers] }),
+    recoveryObligations: () => nanoRecoveryObligations({ v: recoveryStore ? 3 : 2, quotes: [...quotes.values()], owed }, { live: true }),
     async stopWatching() {
       stopped=true;
       if(timer){clearTimeout(timer);timer=null;}

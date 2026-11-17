@@ -142,14 +142,14 @@ test("missing startup policy or writer protection fails the existing no-inferenc
 
 test("required recovery enforcement cannot disappear or hide held operations behind healthy funding", async () => {
   const healthy = () => ({ enforced: true, schema: 3, heightProtected: true, activeOperations: 0,
-    heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, ready: true,
+    heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, unverifiedCreatorPayouts: 0, ready: true,
     reconciler: { enforced: true, ok: true, checkedAt: NOW, pending: false, code: "ok" } });
   const good = fixture(); good.config.requireRecovery = true;
   good.states["/state/funding-health.json"].recovery = healthy();
   assert.equal((await runOperationalCheck(good.config, good.deps)).ok, true);
   for (const change of [
     undefined, { enforced: false }, { schema: 2 }, { heightProtected: false }, { activeOperations: 1 },
-    { heldRuns: 1 }, { heldPayouts: 1, queuedPayouts: 1 }, { ready: false },
+    { heldRuns: 1 }, { heldPayouts: 1, queuedPayouts: 1 }, { unverifiedCreatorPayouts: 1 }, { ready: false },
     { reconciler: { ...healthy().reconciler, checkedAt: NOW - 60_000 } },
     { reconciler: { ...healthy().reconciler, ok: false, code: "recovery-reconcile-timeout" } },
     { reconciler: { ...healthy().reconciler, code: "PRIVATE_PROVIDER_ERROR" } },

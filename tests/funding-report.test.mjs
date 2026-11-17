@@ -107,7 +107,7 @@ test("a pending refresh cannot keep stale checkout admission alive or discard pr
 test("journal recovery readiness and reconciler freshness gate quotes without leaking operation data", async t => {
   const w = await setup(t); let clock = 2000;
   const recovery = { enforced: true, schema: 3, heightProtected: true, activeOperations: 0,
-    heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, ready: true, operationId: "PRIVATE_OPERATION",
+    heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, unverifiedCreatorPayouts: 0, ready: true, operationId: "PRIVATE_OPERATION",
     reconciler: { enforced: true, ok: true, checkedAt: clock, pending: false, code: "ok", url: "PRIVATE_RPC" } };
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => clock,
     snapshot: async () => value, recovery: () => recovery });

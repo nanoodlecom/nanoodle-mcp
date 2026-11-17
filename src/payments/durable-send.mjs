@@ -137,6 +137,17 @@ function createDurableWriter(
     }
   }
   return Object.freeze({
+    matchesPayout(id, { to, amountRaw, prepared = null, txHash = null }) {
+      const r = store.getSend(id);
+      if (!r || r.state === "intent" || r.account !== account || r.to !== to || r.amountRaw !== String(amountRaw)) return false;
+      try {
+        signed(r);
+        if (!prepared) return r.state === "completed" && typeof txHash === "string" && r.hash === txHash.toUpperCase();
+        signed({ ...r, hash: typeof prepared.hash === "string" ? prepared.hash.toUpperCase() : null,
+          block: prepared.block, previousBalance: prepared.previousBalance ?? r.previousBalance });
+        return r.hash === prepared.hash.toUpperCase();
+      } catch { return false; }
+    },
     transfer(id, to, amountRaw) {
       // Binding is still checked by beginSend for sequential/restart calls;
       // concurrent local calls must not hide a rebound operation identity.

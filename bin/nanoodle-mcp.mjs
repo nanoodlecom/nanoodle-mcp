@@ -379,6 +379,8 @@ async function main() {
         maxUsd,
         fundingLiabilities: context => fundingSources ? fundingSources.liabilitiesRaw(context) : 0n,
         fundingReady: () => !fundingSources || fundingSources.ready(),
+        fundingRecovery: context => fundingSources ? fundingSources.recoveryObligations(context)
+          : { heldRuns: 0, heldPayouts: 0, queuedPayouts: 0, unverifiedCreatorPayouts: 0 },
         requireFunding: paidFunding && !apiKey,
         protectTransfers: guardedFunding,
         verifyRpcReads: guardedFunding || !!recoveryDbFlag,
@@ -662,7 +664,7 @@ async function main() {
       log: (line) => console.error("nanoodle-mcp: " + line),
       usage: usageLog,
     });
-    fundingSources?.registerNano(gate.fundingLiabilitiesRaw);
+    fundingSources?.registerNano(gate.fundingLiabilitiesRaw, gate.recoveryObligations);
     const nanoWrapped = gate.wrapRegistry(registry);
     ({ listTools, callTool } = nanoWrapped);
     const nanoInstructions =

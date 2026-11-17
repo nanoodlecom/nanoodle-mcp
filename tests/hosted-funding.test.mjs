@@ -111,3 +111,46 @@ test("a new journal may use its legacy import source, but required canonical sta
   assert.equal(w.sources.liabilitiesRaw(), 50n);
   assert.throws(() => registerCanonicalNanoFunding(w.sources, store, "account", { required: true }), /canonical-funding-state-unavailable/);
 });
+
+test("raw canonical execution intents remain held until a live Nano owner establishes their state", async () => {
+  const { nanoRecoveryObligations } = await import("../src/payments/recovery-obligations.mjs");
+  const w = await setup();
+  await w.write(w.options.nanoFile, { v: 2, quotes: [], owed: [] });
+  const data = { v: 3, quotes: [{ id: "interrupted", status: "consumed", settled: false, amountRaw: "100", execution: "intent" }], owed: [] };
+  const store = { load: () => ({ data }) };
+  registerCanonicalNanoFunding(w.sources, store, "account");
+  assert.equal(w.sources.recoveryObligations().heldRuns, 1, "startup cannot treat a persisted dispatch as unstarted work");
+  w.sources.registerNano(() => 100n);
+  assert.equal(w.sources.recoveryObligations().heldRuns, 1, "omitting a new recovery reader cannot revive stale JSON authority");
+  w.sources.registerNano(() => 100n, () => nanoRecoveryObligations(data, { live: true }));
+  assert.equal(w.sources.recoveryObligations().heldRuns, 0, "a live owner may distinguish its own running dispatch");
+  data.quotes[0].recoveryRequired = true;
+  assert.equal(w.sources.recoveryObligations().heldRuns, 1, "a recovered ambiguous dispatch remains held");
+});
+
+test("disabled rails and live payout owners both retain legacy prepared-payout barriers", async () => {
+  const w = await setup();
+  const signed = { paymentId: "market_legacy", status: "signed", amountRaw: "100", prepared: { hash: "PRIVATE_HASH" } };
+  await w.write(w.options.nearFile, { v: 1, quotes: {}, payouts: { market_legacy: signed } });
+  assert.equal(w.sources.recoveryObligations().unverifiedCreatorPayouts, 1);
+  let live = [signed]; w.sources.registerNear(() => 100n, () => live);
+  assert.equal(w.sources.recoveryObligations().unverifiedCreatorPayouts, 1);
+  assert.equal(w.sources.recoveryObligations({ isJournaled: () => true }).unverifiedCreatorPayouts, 0);
+  live = [{ ...signed, status: "sent" }];
+  assert.equal(w.sources.recoveryObligations().unverifiedCreatorPayouts, 1, "an old publish receipt alone does not prove confirmation");
+  assert.equal(w.sources.recoveryObligations({ isJournaled: () => true }).unverifiedCreatorPayouts, 0);
+  live = [{ ...signed, status: "unknown" }];
+  assert.throws(() => w.sources.recoveryObligations(), /recovery-obligations-invalid/);
+});
+
+test("a queued creator claim cannot lose its payout intent or change its binding during restore", async () => {
+  const w = await setup(), file = join(w.options.marketRoot, "disabled", "market-state.json");
+  await mkdir(join(w.options.marketRoot, "disabled"), { recursive: true });
+  await w.write(file, { v: 1, assignments: { job: { id: "job", phase: "submitted", creator: { status: "queued", author: "creator", amountRaw: "100" } } } });
+  assert.equal(w.sources.recoveryObligations().unverifiedCreatorPayouts, 1, "a disabled profile must retain its missing-outbox barrier");
+  const payout = { paymentId: "market_job", status: "queued", to: "creator", amountRaw: "100", prepared: null };
+  await w.write(w.options.nearFile, { v: 1, quotes: {}, payouts: { market_job: payout } });
+  assert.equal(w.sources.recoveryObligations().unverifiedCreatorPayouts, 0);
+  await w.write(w.options.nearFile, { v: 1, quotes: {}, payouts: { market_job: { ...payout, amountRaw: "99" } } });
+  assert.throws(() => w.sources.recoveryObligations(), /recovery-obligations-invalid/);
+});
