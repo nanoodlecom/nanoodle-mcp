@@ -27,6 +27,16 @@ representative and `confirmed_receivable`. Network identity expires after
 30 seconds and is rechecked. Read requests, including their bodies, have a
 2.5-second limit per request; configured shorter RPC limits still apply.
 
+HTTP 429 and numeric or string 429 errors inside HTTP 200 responses put that
+peer into cooldown. The read guard honors JSON `retry_after` seconds and HTTP
+`Retry-After` seconds/date hints, as described in the
+[provider's retry guidance](https://docs.nano.to/rate-limits). Without a longer
+hint, repeated refusals back off from 30 seconds to five minutes; provider hints
+are bounded to 30 days, covering observed multi-day IP penalties. Successful
+account or block reads reset that escalation.
+Cooling peers receive no read or publish attempts. Other qualified peers keep
+serving, and the required independent-peer minimum stays the same.
+
 Reads fan out to qualified peers. The wallet selects the newest consistent
 account height; at the same head, the greater confirmed pending total wins over
 a stale empty view. It rejects malformed amounts, conflicting heads/balances,
@@ -55,6 +65,14 @@ health fail and pause new quotes. The existing five-minute readiness monitor
 checks runtime enforcement as well as each peer's mainnet identity and confirmed
 account view. It performs no inference, work generation, signing or publication.
 No endpoint URLs or credentials are included in that report.
+
+Private funding telemetry additionally selects a configuration digest and
+cooldown peer indices/deadlines. The monitor verifies that the digest matches its
+own ordered endpoint configuration before using those indices. A fresh known
+cooldown remains a reported `nano-rpc-rate-limited` degradation without another
+upstream request. Invalid metadata or changed configuration cannot hide a peer
+failure. The monitor still queries the other peers and independently verifies
+their frontier agreement and available quorum; loss of quorum closes admission.
 
 Offline tests include a real hosted server with a frozen preferred peer and two
 current peers. Nano, NEAR and USDC saved/custom runs, timeout refunds and replay

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
+import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 function fixture(override = () => null) {
@@ -99,6 +100,40 @@ test("operational probes cover live readiness with no inference, signing or Mark
   const file = join(f.config.stateDir, "latest.json"), text = readFileSync(file, "utf8");
   assert.doesNotMatch(text, /SYNTHETIC|PRIVATE_BUYER|public|ed25519|assignment|account_id/);
   assert.equal(statSync(file).mode & 0o777, 0o644); assert.equal(JSON.stringify(f.states), before);
+});
+
+test("numeric and HTTP rate limits have precise diagnostics without hiding loss of quorum", async () => {
+  for (const http of [false, true]) {
+    const f = fixture(({ url }) => url.hostname === "nano-0.example"
+      ? http ? new Response("private rate limit body", { status: 429 }) : Response.json({ error: 429, retry_after: 120 }) : null);
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(check => check.stage === "nano-node-0" && check.code === "nano-rpc-rate-limited"));
+    assert.equal(report.admission.nano, false, "two configured peers still require two readable peers");
+    assert.doesNotMatch(JSON.stringify(report), /private rate limit/);
+  }
+});
+
+test("a fresh runtime cooldown prevents monitor retries while other independent peers remain healthy", async () => {
+  const f = fixture(); f.config.nanoRpcUrls.push("https://nano-2.example");
+  Object.assign(f.states["/state/funding-health.json"].nanoRpc, { configuredPeers: 3, configuration: rpcPeerSetId(f.config.nanoRpcUrls),
+    cooldowns: [{ peer: 0, until: NOW + 60_000, secret: "PRIVATE_URL" }] });
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(f.calls.filter(call => call.url.hostname === "nano-0.example").length, 0);
+  assert.ok(report.checks.some(check => check.stage === "nano-node-0" && check.code === "nano-rpc-rate-limited"));
+  assert.ok(report.checks.some(check => check.stage === "nano-frontier-agreement" && check.ok));
+  assert.equal(report.ok, false); assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_URL|configuration|cooldowns/);
+});
+
+test("mismatched or malformed cooldown observations cannot hide live peer failures", async () => {
+  for (const patch of [{ configuration: "a".repeat(64) }, { cooldowns: [{ peer: true, until: NOW + 60_000 }] }]) {
+    const f = fixture(); Object.assign(f.states["/state/funding-health.json"].nanoRpc,
+      { configuration: rpcPeerSetId(f.config.nanoRpcUrls), cooldowns: [], ...patch });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(check => check.stage === "runtime-funding" && !check.ok));
+    assert.ok(f.calls.some(call => call.url.hostname === "nano-0.example"));
+    assert.equal(report.admission.nano, false);
+  }
 });
 
 test("stale, disabled, underfunded or stuck live reservations fail independently of the public site", async () => {

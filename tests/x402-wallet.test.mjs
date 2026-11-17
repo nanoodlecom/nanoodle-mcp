@@ -232,6 +232,52 @@ test("insufficient mainnet read peers refuses the hosted run before execution or
   assert.equal(executed, false); assert.equal(mock.state.processed.length, 0);
 });
 
+test("the hosted wallet honors numeric rate limits through funding, provider settlement and recovery", async () => {
+  for (const mode of ["wrapped", "http-json", "http-text"]) {
+    let at = 1_000, limited = true, limitedCalls = 0;
+    const mock = fakeRpc();
+    const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "https://limited,https://peer-a,https://peer-b", verifyRpcReads: true,
+      protectTransfers: true, requireFunding: true, now: () => at,
+      fetch: async (url, init) => {
+        if (url === "https://limited" && limited) {
+          limitedCalls++;
+          return new Response(mode === "http-text" ? "Too many requests" : JSON.stringify({ error: 429, retry_after: 90 }),
+            { status: mode === "wrapped" ? 200 : 429, headers: { "retry-after": "120" } });
+        }
+        return mock.fetch(url, init);
+      } });
+    const first = await wallet.ops.fundingReport();
+    assert.deepEqual(first.nanoRpc.cooldowns, [{ peer: 0, until: 121_000 }]);
+    assert.equal(first.nanoRpc.networkPeers, 2); assert.equal(limitedCalls, 1);
+    assert.equal(mock.state.processed.length, 0); assert.equal(mock.state.workHashes.length, 0);
+    await wallet.ops.withFunding({ id: "limited-peer-run", maxUsd: 0.01, maxRaw: BigInt(AMOUNT) }, () => wallet.payment(invoice()));
+    assert.equal(mock.state.processed.length, 1, "an accepted funded invoice still settles on the healthy peers");
+    assert.equal(limitedCalls, 1, "public PoW fallback also respects the same endpoint cooldown");
+    at += 30_001; await wallet.ops.fundingReport(); assert.equal(limitedCalls, 1);
+    at = 121_000; limited = false;
+    const recovered = await wallet.ops.fundingReport();
+    assert.deepEqual(recovered.nanoRpc.cooldowns, []); assert.equal(recovered.nanoRpc.readablePeers, 3);
+    assert.equal(mock.state.processed.length, 1, "read-only recovery does not publish another transfer");
+  }
+});
+
+test("a separately authenticated work service retains its own quota during public RPC cooldown", async () => {
+  const mock = fakeRpc(); let publicAttempts = 0, keyedWork = 0;
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: "https://limited,https://peer-a,https://peer-b", verifyRpcReads: true,
+    workUrl: "https://limited", workKey: "SYNTHETIC_WORK_KEY", requireFunding: true, protectTransfers: true,
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (url === "https://limited") {
+        if (body.action === "work_generate" && body.key === "SYNTHETIC_WORK_KEY") {
+          keyedWork++; assert.equal(init.headers["nodes-api-key"], "SYNTHETIC_WORK_KEY");
+        } else { publicAttempts++; return Response.json({ error: 429, retry_after: 120 }); }
+      }
+      return mock.fetch(url, init);
+    } });
+  await wallet.ops.withFunding({ id: "keyed-work-run", maxUsd: 0.01, maxRaw: BigInt(AMOUNT) }, () => wallet.payment(invoice()));
+  assert.equal(publicAttempts, 1); assert.ok(keyedWork >= 1); assert.equal(mock.state.processed.length, 1);
+});
+
 test("the wallet captures each queued caller's budget rather than the queue drainer's context", async () => {
   const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true });
   await Promise.all(["first", "second"].map((id, n) => wallet.ops.withFunding({ id, maxRaw: BigInt(AMOUNT), maxUsd: (n + 1) * 0.1 },

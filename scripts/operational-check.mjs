@@ -12,7 +12,8 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/index.mjs";
-import { resolveWalletKey } from "../src/wallet.mjs";
+import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
+import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
@@ -52,6 +53,7 @@ export async function runOperationalCheck(config, deps = {}) {
   const request = createProbeFetch({ fetch: deps.fetch || globalThis.fetch, timeoutMs: config.timeoutMs || 12_000 });
   const priceWorkflow = deps.computePrice || computePrice;
   const checks = [];
+  let nanoCooldowns = [];
   const check = async (stage, fn, domains = ALL) => {
     try { const value = await fn(); checks.push({ stage, ok: true }); return value; }
     catch (e) { checks.push({ stage, ok: false, code: safeCode(e), domains }); return null; }
@@ -61,7 +63,11 @@ export async function runOperationalCheck(config, deps = {}) {
   };
   const nanoRpc = async (url, body) => {
     need(["account_info", "block_count", "version", "block_info"].includes(body.action), "probe-action-forbidden");
-    const result = await http(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    need(response.status !== 429, "nano-rpc-rate-limited");
+    need(response.ok, `http-${response.status}`);
+    const result = await response.json();
+    need(!result.error || !isThrottleError(result.error), "nano-rpc-rate-limited");
     need(!result.error, "nano-rpc-error"); return result;
   };
   const mcp = async (method, params, site = config.site) => {
@@ -101,6 +107,11 @@ export async function runOperationalCheck(config, deps = {}) {
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
     try { selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
+    if (rpc.cooldowns !== undefined || rpc.configuration !== undefined) {
+      need(rpc.configuration === rpcPeerSetId(config.nanoRpcUrls), "nano-peer-configuration-mismatch");
+      try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, config.nanoRpcUrls.length, now()); }
+      catch { need(false, "nano-cooldown-observation-invalid"); }
+    }
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -135,6 +146,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, []);
   }
   const nanoNodes = (await Promise.all(config.nanoRpcUrls.map((url, index) => check(`nano-node-${index}`, async () => {
+    need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
     checkNanoGenesis(await nanoRpc(url, { action: "block_info", hash: NANO_GENESIS, json_block: "true" }));
     const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true", receivable: "true" });
     nanoAccountView(info, checkAddress);

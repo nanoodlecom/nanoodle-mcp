@@ -16,10 +16,12 @@ function world(count = 3) {
     rpc: async (body, base) => {
       calls.push({ action: body.action, base });
       const p = peers.find(p => p.base === base);
+      if (p.error && (!p.errorAction || p.errorAction === body.action)) throw p.error;
       if (body.action === "block_info" && body.hash === NANO_GENESIS_HASH) {
         if (!p.network) throw absent(); return NANO_GENESIS_REPLY;
       }
       if (p.down) throw Error("offline");
+      if (body.action === "account_info" && p.accountRead) return p.accountRead();
       if (body.action === "account_info") return p.info;
       if (body.action === "receivable") { assert.equal(body.include_only_confirmed, "true"); return p.receivable; }
       if (body.action === "account_history") return p.history;
@@ -30,6 +32,66 @@ function world(count = 3) {
 }
 const receivable = { action: "receivable", account: ACCOUNT, count: "50", threshold: "1", source: "true" };
 const info = { action: "account_info", account: ACCOUNT };
+
+test("a rate-limited peer stays out of reads and publishes until its retry hint expires", async () => {
+  const w = world(), peer = w.peers[0];
+  peer.error = Object.assign(Error("429"), { rateLimited: true, retryAfterMs: 90_000 });
+  await w.pool.read(info);
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 0, until: 91_000 }]);
+  assert.equal(w.pool.status().readablePeers, 2);
+  const calls = () => w.calls.filter(call => call.base === "0").length, before = calls();
+  w.tick(89_999); await w.pool.read(info);
+  assert.equal(calls(), before); assert.deepEqual(await w.pool.publishBases(), ["1", "2"]);
+  delete peer.error; w.tick(1); await w.pool.read(info);
+  assert.ok(calls() > before); assert.deepEqual(w.pool.status().cooldowns, []);
+  assert.equal(w.pool.status().readablePeers, 3);
+});
+
+test("account throttling invalidates a cached network proof and repeated refusals back off", async () => {
+  const w = world(), peer = w.peers[0]; await w.pool.read(info);
+  peer.error = Object.assign(Error("429"), { rateLimited: true, retryAfterMs: null }); peer.errorAction = "account_info";
+  await w.pool.read(info); assert.equal(w.pool.status().cooldowns[0].until, 31_000);
+  w.tick(30_000); await w.pool.read(info); assert.equal(w.pool.status().cooldowns[0].until, 91_000);
+  const before = w.calls.filter(call => call.base === "0").length;
+  w.tick(59_999); await w.pool.read(info); assert.equal(w.calls.filter(call => call.base === "0").length, before);
+  delete peer.error; w.tick(1); await w.pool.read(info); assert.deepEqual(w.pool.status().cooldowns, []);
+  peer.error = Object.assign(Error("429"), { rateLimited: true });
+  await w.pool.read(info); assert.equal(w.pool.status().cooldowns[0].until, 121_000, "successful reads reset escalating backoff");
+});
+
+test("losing quorum to cooldown pauses new reads instead of treating one peer as sufficient", async () => {
+  const w = world(2);
+  w.peers[0].error = Object.assign(Error("429"), { rateLimited: true, retryAfterMs: 60_000 });
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_NETWORK_QUORUM" });
+  assert.equal(w.pool.status().readablePeers, 0); assert.equal(w.pool.status().networkPeers, 1);
+  const before = w.calls.filter(call => call.base === "0").length;
+  w.tick(5_001); await assert.rejects(w.pool.read(info), { code: "NANO_RPC_NETWORK_QUORUM" });
+  assert.equal(w.calls.filter(call => call.base === "0").length, before);
+});
+
+test("an older successful read cannot erase a concurrent rate-limit refusal", async () => {
+  const w = world(); await w.pool.read(info);
+  const replies = [];
+  w.peers[0].accountRead = () => new Promise((resolve, reject) => replies.push({ resolve, reject }));
+  const older = w.pool.read(info), newer = w.pool.read(info);
+  while (replies.length < 2) await new Promise(resolve => setImmediate(resolve));
+  replies[1].reject(Object.assign(Error("429"), { rateLimited: true, retryAfterMs: 60_000 }));
+  await newer;
+  replies[0].resolve(w.peers[0].info); await older;
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 0, until: 61_000 }]);
+  assert.equal(w.pool.status().readablePeers, 2);
+});
+
+test("a throttled block lookup cannot be mistaken for an authoritative absence", async () => {
+  const w = world(); await w.pool.read(info);
+  w.peers[0].error = Object.assign(Error("429"), { rateLimited: true, retryAfterMs: 60_000 });
+  w.peers[0].errorAction = "block_info";
+  await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), { code: "NANO_RPC_BLOCK_UNCERTAIN" });
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 0, until: 61_000 }]);
+  const before = w.calls.filter(call => call.base === "0").length;
+  await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), e => e.authoritative === true);
+  assert.equal(w.calls.filter(call => call.base === "0").length, before);
+});
 
 test("a frozen first peer cannot hide a confirmed payment behind an empty list", async () => {
   const w = world();
