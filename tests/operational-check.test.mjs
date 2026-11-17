@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
-import { deliverAlerts, EMBER } from "../scripts/near-alert.mjs";
+import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
@@ -105,7 +105,7 @@ function fixture(override = () => null) {
       if (url.hostname === "site.example" || url.hostname === "nano-site.example") {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
-          funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 } });
+          funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
         if (body.method === "initialize") return json({ serverInfo: { name: "nanoodle" } });
         if (body.method === "tools/list") return json({ tools: ["sing", "price_noodle", "run_noodle", "noodle_guide"].map(name => ({ name })) });
         assert.equal(body.method, "tools/call"); assert.equal(body.params.name, "price_noodle", "never execute a paid tool or request a deposit");
@@ -328,12 +328,55 @@ test("loss of the separate Nano ingress is visible without executing tools or di
 test("periodic readiness verifies fresh enforced refund funding and each asset's admission capacity", async () => {
   for (const change of [{ enforced: false }, { checkedAt: NOW - 60_001 }, { ok: false }, { canQuoteUsdc: false }]) {
     const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
-      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 },
+      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false },
       funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true, ...change } }) : null);
     const result = await runOperationalCheck(f.config, f.deps);
     assert.equal(result.ok, false); assert.equal(result.admission.usdc, false);
     if (change.canQuoteUsdc === false) assert.equal(result.admission.near, true);
     else assert.equal(result.admission.near, false);
+  }
+});
+
+test("historical NEAR scan delays reach the existing alert route while a fresh tip remains ready", async t => {
+  let backfilling = true;
+  const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
+    watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling },
+    funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true } }) : null);
+  const dir = f.config.stateDir;
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const started = NOW - 300_000;
+  const first = finishOperationalReport(dir, [], started, { nearBackfilling: true });
+  assert.equal(first.ok, true, "a newly observed backfill gets time to complete");
+  assert.equal(first.nearBackfillSince, started);
+  assert.equal(finishOperationalReport(dir, [], NOW - 1).nearBackfillSince, started, "missing observations do not clear the episode");
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, false);
+  assert.equal(report.nearBackfillSince, started);
+  assert.equal(report.admission.near, true);
+  assert.equal(report.admission.usdc, true);
+  assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.ok));
+  const event = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: "a".repeat(32) }, report, NOW);
+  assert.match(event.text, /near-watcher-backfill=near-watcher-backfill-delayed/);
+  assert.equal((await runOperationalCheck(f.config, f.deps)).incidentId, report.incidentId);
+  backfilling = false;
+  const recovered = await runOperationalCheck(f.config, f.deps);
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.nearBackfillSince, undefined);
+  backfilling = true;
+  assert.equal((await runOperationalCheck(f.config, f.deps)).nearBackfillSince, NOW);
+});
+
+test("watcher readiness rejects malformed heights, impossible leads and unknown backfill status", async t => {
+  for (const [change, code] of [[{ height: "Infinity" }, "near-watcher-observation-invalid"], [{ height: 221 }, "near-watcher-ahead"],
+    [{ backfilling: null }, "near-watcher-observation-invalid"]]) {
+    const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
+      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false, ...change },
+      funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true } }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.near, false);
+    assert.equal(report.admission.usdc, false);
+    assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.code === code));
   }
 });
 

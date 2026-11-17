@@ -212,6 +212,9 @@ Coverage:
   See [Nano RPC freshness](nano-rpc-freshness.md).
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
+  If the watcher is still scanning historical blocks five minutes after the
+  first observation, the same alert route reports delayed payment detection.
+  The report distinguishes this from a failure to follow the live chain tip.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
 - Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
   separate NEAR/USDC quote capacity. Fee calculations include the protocol's

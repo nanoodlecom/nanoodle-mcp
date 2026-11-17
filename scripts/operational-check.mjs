@@ -26,6 +26,7 @@ import { readNearFunding } from "../src/near/funding.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
+const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 class CheckError extends Error {}
 const need = (condition, code) => { if (!condition) throw new CheckError(code); };
 const readJson = file => JSON.parse(readFileSync(file, "utf8"));
@@ -47,9 +48,18 @@ export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("
   }
 }
 
-export function finishOperationalReport(stateDir, checks, now = Date.now(), fundingPause = null) {
+export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null } = {}) {
   const latest = join(stateDir, "latest.json");
   let previous; try { previous = readJson(latest); } catch { /* first probe */ }
+  const priorBackfill = previous?.nearBackfillSince;
+  let nearBackfillSince = Number.isSafeInteger(priorBackfill) && priorBackfill > 0 && priorBackfill <= now ? priorBackfill : null;
+  if (nearBackfilling === false) nearBackfillSince = null;
+  if (nearBackfilling === true) {
+    nearBackfillSince ??= now;
+    if (now - nearBackfillSince >= NEAR_BACKFILL_ALERT_MS) {
+      checks = [...checks, { stage: "near-watcher-backfill", ok: false, code: "near-watcher-backfill-delayed", domains: [] }];
+    }
+  }
   const failed = checks.filter(c => !c.ok);
   const fingerprint = createHash("sha256").update(JSON.stringify(failed.map(c => [c.stage, c.code]).sort())).digest("hex");
   const firstSeenAt = previous?.fingerprint === fingerprint && previous.ok === false ? previous.firstSeenAt : now;
@@ -57,7 +67,8 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), fund
   const incidentId = createHash("sha256").update(`${fingerprint}:${firstSeenAt}:${reminder}`).digest("hex").slice(0, 32);
   const admission = Object.fromEntries(ALL.map(asset => [asset, !failed.some(c => c.domains?.includes(asset))]));
   const report = { v: 1, ok: failed.length === 0, checkedAt: new Date(now).toISOString(), stage: failed[0]?.stage || "complete",
-    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }) };
+    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
+    ...(nearBackfillSince !== null && { nearBackfillSince }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
   // The separate alert user needs to read it, without access to app secrets.
@@ -218,10 +229,16 @@ export async function runOperationalCheck(config, deps = {}) {
     need(health.active && health.merchant === config.merchant && health.network === config.network, "near-listener-not-active");
     const age = now() - Date.parse(health.watcher?.lastScanAt);
     need(health.watcher?.listening && Number.isFinite(age) && age < 120_000 && age >= -30_000, "near-watcher-stale");
+    need(Number.isSafeInteger(health.watcher.height) && health.watcher.height >= 0
+      && typeof health.watcher.backfilling === "boolean", "near-watcher-observation-invalid");
     need(health.funding?.enforced === true, "near-refund-funding-not-enforced");
     need(health.funding.ok === true && Number.isSafeInteger(health.funding.checkedAt)
       && now() - health.funding.checkedAt <= 60_000 && now() - health.funding.checkedAt >= -30_000, "near-refund-funding-unhealthy");
-    if (near) need(Number(near.block.header.height) - Number(health.watcher.height) <= 120, "near-watcher-behind");
+    if (near) {
+      const lag = Number(near.block.header.height) - health.watcher.height;
+      need(lag <= 120, "near-watcher-behind");
+      need(lag >= -120, "near-watcher-ahead");
+    }
     return health;
   }, ["near", "usdc"]);
   if (site) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
@@ -318,7 +335,8 @@ export async function runOperationalCheck(config, deps = {}) {
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
     }, ["market"]);
   }));
-  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(), fundingPause);
+  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
+    { fundingPause, nearBackfilling: site?.watcher.backfilling });
 }
 
 async function productionConfig(env = process.env) {
