@@ -1025,6 +1025,7 @@ async function startNearMode({
     "For a human payer, show payment.payUrl and immediately open payment.watchUrl to monitor payment. " +
     "The user connects a wallet and approves the deposit there. When the monitor closes with status paid and done:true, " +
     "repeat the original tool call with identical arguments plus _payment_id; continue automatically without another confirmation. " +
+    "If the quote expires with checkingPayment:true, keep monitoring the same paymentId until done:true. A submitted transfer can be confirmed with its original hash and sender. " +
     "Alternatively, an agent paying directly can send ONE native NEAR transfer of exactly payment.amountYocto to payment.payTo " +
     "(one Transfer action, nothing else), then call the same tool again with identical arguments plus _payment_id, _payment_tx " +
     "(the transaction hash) and _payment_sender (the account you paid from). " +

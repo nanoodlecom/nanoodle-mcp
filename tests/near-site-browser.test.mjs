@@ -19,17 +19,19 @@ test("paid output stays visible while the current structured receipt replaces st
 });
 
 for (const name of ["run_noodle", "poster"]) test(`browser studio ${name}: quoting does not run, then payment resumes the immutable request`, async () => {
-  const calls = [], storage = store(); let checks = 0, finish;
+  const calls = [], storage = store(); let checks = 0, finish, showChecking;
   const done = new Promise(resolve => { finish = resolve; });
+  const checking = new Promise(resolve => { showChecking = resolve; });
   let permitPayment; const paid = new Promise(resolve => { permitPayment = resolve; });
   const studio = startStudio({ config, storage, pause: async () => {},
     rpc: async (tool, args) => {
       calls.push({ tool, args: structuredClone(args) });
       return args._payment_id ? complete : { structuredContent: { payment, pricing: {} } };
-    }, status: async () => { checks++; await paid; return { status: "paid" }; },
-    update: session => { if (session.phase === "finished") finish(session); } });
+    }, status: async () => { if (checks++ === 0) return { status: "expired", checkingPayment: true }; await paid; return { status: "paid" }; },
+    update: session => { if (session.phase === "checking") showChecking(); if (session.phase === "finished") finish(session); } });
   const args = name === "run_noodle" ? { graph: { v: 1 }, inputs: { Topic: "original" }, _pay_with: "usdc" } : { Idea: "original", _pay_with: "usdc" };
   await studio.quote(name, args);
+  await checking;
   assert.equal(calls.length, 1); assert.ok(!calls[0].args._payment_id);
   if (args.inputs) args.inputs.Topic = "edited after quote"; else args.Idea = "edited after quote";
   permitPayment(); const session = await done;

@@ -40,6 +40,7 @@ import { MaintenanceError } from "./maintenance.mjs";
 import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
+import { isExpiredPayment } from "./near/payment-view.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { creatorPage, hostedWorkflowPage } from "./creator-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
@@ -591,22 +592,25 @@ function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [],
 function nearPayPageHtml(q) {
   const asset = q.asset === "USDC" ? "USDC" : "NEAR";
   const amount = q.amount ?? q.amountNear;
-  return htmlPage(`Pay in ${asset} · nanoodle`, `
+  const canPay = q.status === "pending", canConfirm = canPay || q.status === "expired";
+  const title = canPay ? `Pay in ${asset}` : q.checkingPayment ? "Checking payment" : "Your workflow";
+  return htmlPage(`${title} · nanoodle`, `
     <a class="pay-brand" href="/">nanoodle</a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
-      <h1 id="near-title">Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
-      <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
-      <details class="card" id="near-deposit" open>
+      <h1 id="near-title">${title}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
+      <p id="near-status" role="status" aria-live="polite">${q.checkingPayment ? esc(q.next) : "Checking payment…"}</p>
+      <details class="card" id="near-deposit"${canPay ? " open" : ""}>
         <summary>Maximum deposit <strong>${esc(amount)} ${asset}</strong></summary>
         <p>You pay the model cost + 20%. Unused ${asset} returns to the wallet that pays. A failed run refunds the whole deposit.</p>
         <p class="muted">Send on <strong>${esc(q.network)}</strong> to:</p><code>${esc(q.payTo)}</code>
         ${asset === "USDC" ? `<p class="muted">Circle-issued USDC · six decimals. Use the NEAR network. Network gas is paid separately.</p>` : ""}
-        <p><button id="near-pay" type="button">Connect wallet &amp; pay</button></p>
-        <p id="near-error" role="alert"></p>
+        <p><button id="near-pay" type="button"${canPay ? "" : " hidden disabled"}>Connect wallet &amp; pay</button></p>
       </details>
+      <p id="near-error" role="alert"></p>
       ${runViewHtml("pay")}
-      <details id="near-manual"><summary>Already paid with another wallet?</summary>
-        <p>Send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The server detects the payment automatically. You can also confirm its transaction here.</p>
+      <details id="near-manual"${canConfirm ? "" : " hidden"}><summary>Confirm a transfer you already sent</summary>
+        <p id="near-transfer-instructions"${canPay ? "" : " hidden"}>For manual payment, send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The watcher can detect it automatically.</p>
+        <p>Enter the original transaction hash and the account that paid.</p>
         <form id="near-confirm">
           <p><label>Your paying account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
           <p><label>Transaction hash <input name="txHash" required autocomplete="off"></label></p>
@@ -1061,17 +1065,19 @@ export async function serveHttp({
        * `next` imperative telling the agent how to open the result stream
        * (tools/call with _payment_id) — then the connection closes. Without that,
        * a subscriber sees bare "paid" and a loading gap with no path forward.
-       * The pay page only reads `.status` (extra fields are harmless). Rides the
-       * gate's shared waiter list; at the held-connection cap it 503s so the
-       * caller falls back to polling.
+       * An expired NEAR quote can still be checking finalized payments. Keep
+       * the stream open while checking, with the same quote and disabled pay UI.
+       * At the held-connection cap it 503s so callers can fall back to polling.
        */
       const watchMatch = url.pathname.match(/^\/(x402|near)\/watch\/([^/]+)$/);
       const watchGate = watchMatch?.[1] === "near" ? nearGate : gate;
       if (watchMatch && watchGate) {
-        const followRun = watchMatch[1] === "near" && url.searchParams.get("run") === "1";
-        const runDone = q => ["settled", "failed", "rejected", "expired", "unknown"].includes(q?.status) && q?.receipt?.refund?.status !== "pending";
+        const nearWatch = watchMatch[1] === "near";
+        const followRun = nearWatch && url.searchParams.get("run") === "1";
+        const runDone = q => (isExpiredPayment(q) || ["settled", "failed", "rejected", "unknown"].includes(q?.status))
+          && q?.receipt?.refund?.status !== "pending";
         const id = decodeURIComponent(watchMatch[2]);
-        if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: "too many open streams — poll /x402/status instead" }));
+        if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: `too many open streams — poll /${watchMatch[1]}/status instead` }));
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -1085,7 +1091,7 @@ export async function serveHttp({
         // done + next so the agent knows how to access the result stream after close.
         const frame = (q) => {
           if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
-          if (watchMatch[1] === "near") return followRun ? { ...q, done: runDone(q) } : q;
+          if (nearWatch) return followRun ? { ...q, done: runDone(q) } : q;
           const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
           if (q.done) { f.done = true; if (q.next) f.next = q.next; }
           return f;
@@ -1108,13 +1114,15 @@ export async function serveHttp({
           // the client leaves. Each wait resolves on the shared watcher firing
           // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
           // dropped connection be noticed and cleaned up.
-          const deadline = followRun ? Date.now() + 20 * 60 * 1000 : watchMatch[1] === "near" ? Date.parse(q?.expiresAt) : Date.now() + 20 * 60 * 1000;
-          while (alive && q && (followRun ? !runDone(q) : q.status === "pending") && Date.now() < deadline) {
+          const watchFrom = nearWatch && !followRun ? Math.max(Date.now(), Date.parse(q?.expiresAt) || 0) : Date.now();
+          const deadline = watchFrom + 20 * 60 * 1000;
+          const waiting = q => followRun ? !runDone(q) : nearWatch ? !q.done : q.status === "pending";
+          while (alive && q && waiting(q) && Date.now() < deadline) {
             if (followRun) await watchGate.waitForUpdate(id, q.receipt ? 2000 : 25_000, { signal: stop.signal, previous: JSON.stringify(q) });
-            else await watchGate.waitForPayment(id, 25_000, { signal: stop.signal });
+            else await watchGate.waitForPayment(id, 25_000, { signal: stop.signal, ...(nearWatch && { previous: JSON.stringify(q) }) });
             if (!alive) break;
             q = watchGate.quote(id);
-            if (q) sse("status", frame(q));
+            sse("status", frame(q));
             // On settle the final frame already carried done+next; the loop exits
             // and finally{} closes the stream — that close IS the acknowledgment.
           }

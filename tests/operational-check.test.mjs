@@ -139,6 +139,18 @@ function fixture(override = () => null) {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
           funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
+        if (url.pathname.endsWith("/nq_operational_probe_unissued")) {
+          assert.equal(init.method || "GET", "GET");
+          assert.equal(body, null);
+          const missing = { status: "unknown", done: true };
+          if (url.pathname.startsWith("/pay/")) return new Response("<h1>Unknown or expired payment</h1>", { status: 404, headers: { "content-type": "text/html" } });
+          if (url.pathname.startsWith("/near/status/")) return Response.json(missing, { status: 404 });
+          if (url.pathname.startsWith("/near/watch/")) {
+            assert.equal(url.searchParams.get("run"), "1");
+            return new Response(`event: status\ndata: ${JSON.stringify(missing)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+          }
+          if (url.pathname.startsWith("/near/result/")) return Response.json({ error: "Unknown or expired payment" }, { status: 404 });
+        }
         if (/^\/(?:graph|examples)\//.test(url.pathname)) {
           assert.equal(init.method || "GET", "GET");
           const name = url.pathname.split("/")[2].slice(0, -5);
@@ -172,6 +184,9 @@ test("operational probes cover live readiness with no inference, signing or Mark
   assert.ok(report.checks.some(c => c.stage === "nano-liquidity")); assert.ok(report.checks.some(c => c.stage === "usdc-liquidity"));
   assert.ok(report.checks.some(c => c.stage === "workflow-price-nanoodle-image"));
   assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+  for (const stage of ["near-payment-page", "near-payment-status-route", "near-payment-event-stream", "near-payment-result-route"]) {
+    assert.ok(report.checks.some(c => c.stage === stage && c.ok));
+  }
   const saved = report.checks.filter(c => c.stage.startsWith("saved-workflow-"));
   assert.equal(saved.length, 17);
   assert.ok(saved.every(c => c.ok));
@@ -180,6 +195,18 @@ test("operational probes cover live readiness with no inference, signing or Mark
   const file = join(f.config.stateDir, "latest.json"), text = readFileSync(file, "utf8");
   assert.doesNotMatch(text, /SYNTHETIC|PRIVATE_BUYER|public|ed25519|assignment|account_id/);
   assert.equal(statSync(file).mode & 0o777, 0o644); assert.equal(JSON.stringify(f.states), before);
+});
+
+test("the scheduled check alerts when the payment stream stops returning a terminal status frame", async t => {
+  const f = fixture(({ url }) => url.pathname.startsWith("/near/watch/")
+    ? new Response("event: status\ndata: {\"status\":\"unknown\",\"done\":false,\"private\":\"PRIVATE_BODY\"}\n\n", { headers: { "content-type": "text/event-stream" } })
+    : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.filter(c => !c.ok), [{ stage: "near-payment-event-stream", ok: false,
+    code: "near-payment-stream-response-invalid", domains: ["near", "usdc"] }]);
+  assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_BODY/);
 });
 
 test("saved workflow probes flag thin Nano deposits, invalid USDC previews and missing templates independently", async () => {

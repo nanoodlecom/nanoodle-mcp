@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { fetchCatalogs, loadTools } from "../src/tools.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
+import { serveHttp } from "../src/http.mjs";
 import {
   createNearRpc, createNearWatcher, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
 } from "../src/near/index.mjs";
@@ -341,6 +342,71 @@ test("a restart beyond retention backfills on-time NEAR and USDC checkout deposi
   assert.equal(restarted.gate.quote(unpaid.paymentId), null);
   assert.equal((await quote(restarted, "near")).amountYocto, unpaid.amountYocto);
   assert.equal(mock.runs(), runs);
+});
+
+test("payment and workflow streams keep following an expired quote while its original deposit is checked", { timeout: 10_000 }, async t => {
+  let clock = Date.now() - 60 * 60_000;
+  const w = await world({ now: () => clock, watchPaymentHistory: true });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS, { blockTimeMs: clock + 1 });
+  const unpaid = (await call(w, "idea-poster", INPUTS)).structuredContent.payment;
+  clock = Date.parse(p.expiresAt) + 1;
+
+  const server = await serveHttp({ port: 0, commit: null, name: "test", version: "test", nearGate: w.gate,
+    listTools: w.listTools, callTool: w.callTool, publicBase: "https://checkout.test", log() {} });
+  const stop = new AbortController(), base = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => {
+    stop.abort();
+    server.closeAllConnections();
+    return new Promise(resolve => server.close(resolve));
+  });
+  const get = path => realFetch(base + path, { signal: stop.signal });
+  async function openWatch(suffix) {
+    const response = await get(`/near/watch/${p.paymentId}${suffix}`);
+    assert.equal(response.status, 200);
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffered = "";
+    return async () => {
+      while (!buffered.includes("\n\n")) {
+        const chunk = await reader.read();
+        if (chunk.done) return null;
+        buffered += chunk.value;
+      }
+      const end = buffered.indexOf("\n\n");
+      const frame = buffered.slice(0, end);
+      buffered = buffered.slice(end + 2);
+      return JSON.parse(frame.split("\n").find(line => line.startsWith("data: ")).slice(6));
+    };
+  }
+  const statusUrl = `/near/status/${p.paymentId}`;
+  const checking = await (await get(statusUrl)).json();
+  assert.equal(checking.status, "expired");
+  assert.equal(checking.checkingPayment, true);
+  assert.equal(checking.done, false);
+  const page = await (await get(`/pay/${p.paymentId}`)).text();
+  assert.match(page, /id="near-title">Checking payment/);
+  assert.match(page, /id="near-pay" type="button" hidden disabled/);
+  const retry = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(retry.structuredContent.payment.checkingPayment, true);
+
+  const [paymentFrame, runFrame] = await Promise.all([openWatch(""), openWatch("?run=1")]);
+  assert.deepEqual(await paymentFrame(), checking);
+  assert.deepEqual(await runFrame(), checking);
+  const polled = get(statusUrl + "?wait=1").then(response => response.json());
+  const runs = mock.runs();
+  await w.gate.observeTransfer(tx, PAYER);
+  assert.equal((await polled).txHash, tx);
+  const paid = await paymentFrame();
+  assert.equal(paid.status, "paid");
+  assert.equal(paid.done, true);
+  assert.equal(await paymentFrame(), null);
+  assert.deepEqual(await runFrame(), { ...paid, done: false });
+  assert.equal(mock.runs(), runs);
+
+  w.ledger.setMeta("paymentWatch", { coveredThroughMs: clock });
+  const expired = await (await get(`/near/status/${unpaid.paymentId}`)).json();
+  assert.equal(expired.status, "expired");
+  assert.equal(expired.checkingPayment, undefined);
+  assert.equal(expired.done, true);
 });
 
 test("wallet confirmation refunds wrong and late transfers without running a model", async () => {

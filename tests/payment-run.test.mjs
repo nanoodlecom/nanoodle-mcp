@@ -19,6 +19,8 @@ test("payment page follows paid and running events, then reads the result withou
     update: (state, output) => seen.push({ state, output }),
   });
   assert.match(events.url, /\?run=1$/);
+  events.emit({ status: "expired", checkingPayment: true, done: false }); await flush();
+  assert.ok(!events.closed, "an expired quote stays open while watcher recovery is incomplete");
   events.emit({ status: "paid", done: false }); await flush(); assert.ok(!events.closed);
   events.emit({ status: "running", workflow: { nodes: [{ id: "anything", status: "running" }] }, done: false }); await flush();
   assert.equal(seen.at(-1).state.workflow.nodes[0].status, "running"); assert.equal(requests.length, 0);
@@ -37,10 +39,10 @@ test("reopening a finished payment fetches its result immediately", async () => 
   await flush(); assert.deepEqual(seen.at(-1), result); monitor.stop();
 });
 
-test("a dropped event stream keeps polling beyond payment and retries the same result after a temporary failure", async () => {
+test("a dropped event stream keeps polling during payment recovery and retries the same result after a temporary failure", async () => {
   let events, resultReads = 0, statusReads = 0; const urls = [], outputs = [];
   class Events { constructor() { events = this; } addEventListener() {} close() {} }
-  const monitor = monitorPaymentRun({ initial: { paymentId: id, status: "paid" }, EventSource: Events, pause: async () => {},
+  const monitor = monitorPaymentRun({ initial: { paymentId: id, status: "expired", checkingPayment: true }, EventSource: Events, pause: async () => {},
     update: (state, output) => outputs.push(output),
     fetch: async url => {
       urls.push(url);
