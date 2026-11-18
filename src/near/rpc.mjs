@@ -22,6 +22,8 @@
  */
 import { NearError } from "./errors.mjs";
 import { assertFreshBlock, assertFreshStatus, assertFreshTime, MAX_CLOCK_SKEW_MS, nearBlockIdentity } from "./freshness.mjs";
+import { isNearAccountId } from "./account.mjs";
+import { base58Decode } from "./base58.mjs";
 
 export function parseRpcJson(text) {
   return JSON.parse(text, (key, value, ctx) => {
@@ -40,6 +42,35 @@ function rpcError(error) {
   else message = typeof error?.message === "string" ? error.message : "RPC error";
   return new NearError(code, message, { data: error });
 }
+
+function isNearHash(value) {
+  if (typeof value !== "string" || value.length < 32 || value.length > 44) return false;
+  try { base58Decode(value, 32); return true; } catch { return false; }
+}
+
+export function requireNearAccountChanges(result, blockHash, accounts) {
+  if (result?.block_hash !== blockHash || !Array.isArray(result?.changes)) {
+    throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received changes for a different block");
+  }
+  for (const row of result.changes) {
+    const account = row?.change?.account_id, cause = row?.cause;
+    if (!isNearAccountId(account) || typeof cause?.type !== "string"
+        || (accounts.includes(account) && cause.type === "receipt_processing" && !isNearHash(cause.receipt_hash))) {
+      throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received malformed account changes");
+    }
+  }
+  return result;
+}
+
+export function requireNearReceiptTransaction(result) {
+  if (!isNearHash(result?.transaction_hash) || !isNearAccountId(result?.sender_account_id)) {
+    throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher could not resolve a receipt's transaction");
+  }
+  return result;
+}
+
+const isAnchoredAccountChanges = (method, params) => method === "EXPERIMENTAL_changes"
+  && params?.changes_type === "account_changes" && typeof params.block_id === "string" && Array.isArray(params.account_ids);
 
 export function createNearRpc({ url, fetch = globalThis.fetch, timeoutMs = 10_000 } = {}) {
   if (typeof url !== "string" || !/^https?:\/\//.test(url)) throw new TypeError("createNearRpc needs an http(s) url");
@@ -92,6 +123,8 @@ export function createNearRpc({ url, fetch = globalThis.fetch, timeoutMs = 10_00
     if (method === "query" && typeof result.error === "string") {
       throw new NearError("QUERY_ERROR", result.error, { data: result });
     }
+    if (isAnchoredAccountChanges(method, params)) requireNearAccountChanges(result, params.block_id, params.account_ids);
+    if (method === "EXPERIMENTAL_receipt_to_tx") requireNearReceiptTransaction(result);
     return result;
   }
 
@@ -131,6 +164,18 @@ export function parseRpcUrls(value) {
 const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE", "RPC_STALE", "RPC_SYNCING"]);
 const RECOVERABLE_READS = new Set(["status", "block", "query", "gas_price", "EXPERIMENTAL_protocol_config",
   "EXPERIMENTAL_changes", "EXPERIMENTAL_receipt_to_tx"]);
+const RECEIPT_LOOKUP_NODE_ERRORS = new Set(["UNKNOWN_RECEIPT", "UNSUPPORTED", "OUTCOMES_NOT_STORED",
+  "DEPTH_EXCEEDED", "BUDGET_EXCEEDED", "INTERNAL_ERROR"]);
+const ACCOUNT_CHANGES_NODE_ERRORS = new Set(["UNKNOWN_BLOCK", "NOT_SYNCED_YET", "SHARD_NOT_APPLIED", "INTERNAL_ERROR"]);
+
+function discoveryReadCanFailOver(method, params, error) {
+  const missingMethod = error?.code === "METHOD_NOT_FOUND" || error?.data?.code === -32601;
+  if (method === "EXPERIMENTAL_receipt_to_tx") return missingMethod || RECEIPT_LOOKUP_NODE_ERRORS.has(error?.code);
+  if (isAnchoredAccountChanges(method, params)) return missingMethod || ACCOUNT_CHANGES_NODE_ERRORS.has(error?.code);
+  // A missing numeric height may be a skipped block. A missing known hash
+  // can come from a provider with a shorter history than its peer.
+  return method === "block" && typeof params?.block_id === "string" && error?.code === "UNKNOWN_BLOCK";
+}
 
 /**
  * The same client over several endpoints, tried in order with failover.
@@ -141,7 +186,8 @@ const RECOVERABLE_READS = new Set(["status", "block", "query", "gas_price", "EXP
  *
  *  - A call moves to the next endpoint on transport or node-health failures.
  *    Unnamed server errors also allow failover on watcher and funding reads.
- *    A named answer, including "unknown transaction", is final for that call.
+ *    A named answer such as "unknown transaction" is final for that call.
+ *    Node-local discovery misses and missing historical hashes can fail over.
  *  - Once attempted, `send_tx` moves on only for RPC_HTTP. Preflight health
  *    failures may move on before any bytes are broadcast. Signed bytes are identical on
  *    every endpoint, so a second submission is the same transaction, never a
@@ -285,6 +331,7 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
       } catch (e) {
         if (e?.code === "RPC_WRONG_NETWORK" && ep.wrongChain) continue;
         const retry = TRANSPORT_CODES.has(e?.code)
+          || discoveryReadCanFailOver(method, params, e)
           || (e?.code === "RPC_ERROR" && (!attempted || RECOVERABLE_READS.has(method)));
         if (!retry || (method === "send_tx" && attempted && e.code !== "RPC_HTTP")) throw e;
         lastErr = e;

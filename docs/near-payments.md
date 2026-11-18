@@ -154,24 +154,27 @@ float pays model invoices.
 ### Automatic transfer detection
 
 One shared watcher polls finalized NEAR blocks every two seconds. While quotes
-are outstanding it checks only the merchant's account changes, resolves receipt
-IDs with `EXPERIMENTAL_receipt_to_tx`, and runs the same FINAL payment verifier.
+are outstanding it checks the merchant's account changes and includes the
+USDC contract when a quote uses it. It resolves receipt IDs with
+`EXPERIMENTAL_receipt_to_tx` and runs the same FINAL payment verifier.
 An exact amount matching a quote is accepted automatically; the caller does not
 need to paste a transaction hash. A payment must be in a block created after
 its quote for automatic matching. A late exact payment for a retained quote is
 refunded in full. An unmatched top-up is not treated as a workflow purchase.
 Wrong-amount payments can still be confirmed explicitly for a full refund.
 
-The processed block cursor is durable. RPC failures leave it unchanged and
-retry with backoff; restarts catch up, and an existing quote is backfilled when
+The processed block cursor is durable. If an RPC returns malformed discovery
+data or lacks the requested receipt or historical block hash, the watcher
+tries another configured RPC. When no peer can complete the read, the cursor
+stays unchanged and the watcher retries with backoff. Restarts catch up, and an existing quote is backfilled when
 the watcher is first introduced. Re-reading a receipt cannot spend twice: the
 payment gate keeps the consumed transaction hashes. `GET /near/health` reports
 the watcher cursor and status without exposing workflow inputs.
 
-The RPC must support `EXPERIMENTAL_changes` and `EXPERIMENTAL_receipt_to_tx`
-(including receipt-to-transaction tracking). Public FastNEAR RPC was checked
-read-only on mainnet on 2026-11-13. An RPC without those methods leaves automatic
-detection unavailable; the payment page's explicit confirmation remains usable.
+Automatic detection needs an RPC that supports `EXPERIMENTAL_changes` and
+`EXPERIMENTAL_receipt_to_tx` with receipt-to-transaction tracking. Public
+FastNEAR RPC was checked read-only on mainnet on 2026-11-13. Explicit
+confirmation remains available when transaction verification is healthy.
 
 ### Live mainnet verification
 
