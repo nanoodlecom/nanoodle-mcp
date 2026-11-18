@@ -16,6 +16,10 @@ import { NearError } from "./errors.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
 
+function awaitingPayment(quote) {
+  return (quote?.status === "pending" || quote?.status === "expired") && !quote.payTx;
+}
+
 function isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
@@ -68,6 +72,12 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     }
   }
   let persisted = JSON.stringify(state), persistenceFailed = false;
+  // Earlier releases could persist the claim before attaching it to its quote.
+  // Index those exceptions once so watching blocks does not scan the tx history.
+  const unattachedPayments = new Set();
+  for (const id of Object.values(state.consumedTx)) {
+    if (awaitingPayment(state.quotes[id])) unattachedPayments.add(id);
+  }
 
   function persist() {
     const next = JSON.stringify(state);
@@ -117,10 +127,29 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       }
       if (Object.hasOwn(state.consumedTx, txHash)) return false;
       mutate(() => { state.consumedTx[txHash] = paymentId; });
+      if (awaitingPayment(state.quotes[paymentId])) unattachedPayments.add(paymentId);
       return true;
     },
     consumedBy(txHash) {
       return Object.hasOwn(state.consumedTx, txHash) ? state.consumedTx[txHash] : null;
+    },
+    hasUnattachedPayment(id) {
+      return unattachedPayments.has(id) && awaitingPayment(state.quotes[id]);
+    },
+    recordPayment(id, txHash, patch) {
+      if (typeof txHash !== "string" || !txHash || !isPlainObject(patch) || !["paid", "rejected"].includes(patch.status)) {
+        throw new TypeError("recordPayment needs a tx hash and payment fields");
+      }
+      assertJsonSafe(patch, "payment");
+      const quote = state.quotes[id], owner = ledger.consumedBy(txHash);
+      if (!awaitingPayment(quote) || (owner !== null && owner !== id)
+        || (unattachedPayments.has(id) && owner !== id)) return null;
+      mutate(() => {
+        state.consumedTx[txHash] = id;
+        state.quotes[id] = { ...quote, ...copy(patch), id, payTx: txHash };
+      });
+      unattachedPayments.delete(id);
+      return copy(state.quotes[id]);
     },
 
     putRefund(refund) {
@@ -179,16 +208,16 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     },
 
     /**
-     * Delete finished quotes older than retainMs, and unpaid quotes (pending or
-     * expired) more than unpaidRetainMs past their expiry. Consumed hashes and
-     * refunds are never pruned.
+     * Delete old finished quotes and unpaid quotes past retention. Preserve
+     * unpaid quotes that still need to be reconciled with a recorded tx claim.
+     * Consumed hashes and refunds are never pruned.
      */
     prune({ retainMs = 86_400_000, unpaidRetainMs = 86_400_000 } = {}) {
       const t = now();
       const doomed = [];
       for (const [id, q] of Object.entries(state.quotes)) {
-        if ((q.status === "pending" || q.status === "expired") && !q.payTx) {
-          if (typeof q.expiresAt === "number" && t - q.expiresAt > unpaidRetainMs) doomed.push(id);
+        if (awaitingPayment(q)) {
+          if (!unattachedPayments.has(id) && typeof q.expiresAt === "number" && t - q.expiresAt > unpaidRetainMs) doomed.push(id);
           continue;
         }
         if (!FINAL_QUOTE.has(q.status)) continue;

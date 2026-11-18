@@ -11,10 +11,11 @@ export function holdsNearQuoteAmount(quote, now, retainMs) {
   return (quote.status === "pending" || quote.status === "expired") && now <= quote.expiresAt + retainMs;
 }
 
-export function heldNearQuoteAmounts(quotes, asset, now, retainMs) {
+export function heldNearQuoteAmounts(quotes, asset, now, retainMs, additionallyHeld) {
   const amounts = new Set();
   for (const quote of quotes) {
-    if ((quote.asset === "usdc" ? "usdc" : "near") === asset && holdsNearQuoteAmount(quote, now, retainMs)) {
+    if ((quote.asset === "usdc" ? "usdc" : "near") === asset
+      && (holdsNearQuoteAmount(quote, now, retainMs) || additionallyHeld?.(quote.id))) {
       amounts.add(quote.amountYocto);
     }
   }

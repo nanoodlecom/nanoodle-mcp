@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile, readdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -199,5 +199,29 @@ test("a failed write rolls the in-memory state back", async () => {
     await writeFile(parent, "x");
     assert.throws(() => l.consumeTx("H", "nq_a"));
     assert.equal(l.consumedBy("H"), null);
+  });
+});
+
+test("payment attachment and duplicate protection commit together after a write failure", async () => {
+  await withDir(async (dir) => {
+    const file = join(dir, "near-state.json"), stage = `${file}.tmp-${process.pid}`;
+    const ledger = openNearLedger({ file, ...OPTS });
+    ledger.putQuote({ id: "first", status: "pending" });
+    ledger.putQuote({ id: "second", status: "pending" });
+    const old = await readFile(file, "utf8"), payment = { status: "paid", paidYocto: "1" };
+    await mkdir(stage);
+    assert.throws(() => ledger.recordPayment("first", "hash", payment));
+    assert.equal(ledger.consumedBy("hash"), null);
+    assert.deepEqual(ledger.getQuote("first"), { id: "first", status: "pending" });
+    assert.equal(await readFile(file, "utf8"), old);
+    await rm(stage, { recursive: true });
+    assert.equal(ledger.recordPayment("first", "hash", payment).payTx, "hash");
+    const reopened = openNearLedger({ file, ...OPTS });
+    assert.equal(reopened.consumedBy("hash"), "first");
+    assert.equal(reopened.getQuote("first").status, "paid");
+    assert.equal(reopened.recordPayment("second", "hash", payment), null);
+    assert.equal(reopened.recordPayment("first", "different-hash", payment), null);
+    assert.equal(reopened.consumedBy("different-hash"), null);
+    assert.equal(reopened.getQuote("second").status, "pending");
   });
 });

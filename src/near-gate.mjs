@@ -388,7 +388,7 @@ export function createNearGate({
 
   /** Deposit amounts of unpaid quotes still held (open, or expired within expiredRetainMs). */
   function openAmounts(asset = "near") {
-    return heldNearQuoteAmounts(ledger.quotes(), asset, now(), expiredRetainMs);
+    return heldNearQuoteAmounts(ledger.quotes(), asset, now(), expiredRetainMs, ledger.hasUnattachedPayment);
   }
 
   function openQuoteCount() {
@@ -599,6 +599,9 @@ export function createNearGate({
     if (consumed && consumed !== q0.id) {
       return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
     }
+    if (ledger.hasUnattachedPayment(q0.id) && consumed !== q0.id) {
+      return errResult("A transfer is already recorded for this quote. Confirm that original transaction or contact the operator. Do not pay again.");
+    }
 
     const note = (s) => {
       if (ctx && typeof ctx.announce === "function") ctx.announce(s);
@@ -628,7 +631,7 @@ export function createNearGate({
     }
 
     const wrongAmount = t.amountYocto !== BigInt(q0.amountYocto);
-    if (wrongAmount && openAmounts(assetOf(q0)).has(t.amountYocto.toString())) {
+    if (wrongAmount && consumed !== q0.id && openAmounts(assetOf(q0)).has(t.amountYocto.toString())) {
       // The transfer carries the exact amount of ANOTHER open quote: it belongs to
       // that quote's payer. Consuming it here would let anyone who sees a payment
       // on chain burn it against a free quote of their own, so it is left untouched.
@@ -636,27 +639,25 @@ export function createNearGate({
         `so it was not used for this one (which asks for ${amountText(q0, q0.amountYocto)} ${symbol(q0)}). Nothing was consumed.`);
     }
 
-    // From here to updateQuote there is no await: the consume and the status
-    // change cannot interleave with another call.
-    if (!ledger.getQuote(q0.id)) {
-      return errResult("This quote expired while the transfer was being checked. Nothing was consumed; contact the operator if you already paid.");
-    }
-    if (consumed !== q0.id && !ledger.consumeTx(txHash, q0.id)) {
+    const reject = wrongAmount ? "wrong_amount" : t.blockTimeMs > q0.expiresAt ? "late_payment" : null;
+    const paidFields = { payer: t.payer, paidYocto: t.amountYocto.toString(), paidAtBlockMs: t.blockTimeMs };
+    const outcome = reject ? {
+      status: "rejected", outcome: reject, finishedAt: now(),
+      error: wrongAmount ? `The quote asked for exactly ${amountText(q0, q0.amountYocto)} ${symbol(q0)}.`
+        : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`,
+    } : { status: "paid" };
+    const q = ledger.recordPayment(q0.id, txHash, { ...paidFields, ...outcome });
+    if (!q) {
+      if (!ledger.getQuote(q0.id)) {
+        return errResult("This quote expired while the transfer was being checked. Nothing was consumed; contact the operator if you already paid.");
+      }
       return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
     }
-    const paidFields = { payTx: txHash, payer: t.payer, paidYocto: t.amountYocto.toString(), paidAtBlockMs: t.blockTimeMs };
-    const reject = wrongAmount ? "wrong_amount" : t.blockTimeMs > q0.expiresAt ? "late_payment" : null;
     if (reject) {
-      const error = reject === "wrong_amount"
-        ? `The quote asked for exactly ${amountText(q0, q0.amountYocto)} ${symbol(q0)}.`
-        : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`;
-      let q = ledger.updateQuote(q0.id, { ...paidFields, status: "rejected", outcome: reject, error, finishedAt: now() });
       ev("paid", { paymentId: q.id, tool: q.tool, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
       const rf = await refundFor(q, t.payer, t.amountYocto, reject);
-      q = ledger.updateQuote(q.id, { refundId: rf.refundId });
-      return replay(q);
+      return replay(ledger.updateQuote(q.id, { refundId: rf.refundId }));
     }
-    const q = ledger.updateQuote(q0.id, { ...paidFields, status: "paid" });
     ev("paid", { paymentId: q.id, tool: q.tool, ok: true, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
     return null;
   }
@@ -702,12 +703,23 @@ export function createNearGate({
 
   function pendingQuotes() {
     const t = now();
-    return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs));
+    return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs) || ledger.hasUnattachedPayment(q.id));
+  }
+
+  async function confirmDiscoveredPayment(id, txHash, senderId) {
+    const result = await confirmPayment(id, txHash, senderId);
+    if (result.error && !result.txHash) {
+      throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
+    }
   }
 
   /** Discovered receipts are only hints: verify FINAL, then match an exact quote. */
   async function observeTransfer(txHash, senderId) {
-    if (ledger.consumedBy(txHash)) return;
+    const claimed = ledger.consumedBy(txHash);
+    if (claimed) {
+      if (ledger.hasUnattachedPayment(claimed)) await confirmDiscoveredPayment(claimed, txHash, senderId);
+      return;
+    }
     let transfer;
     try {
       transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
@@ -724,10 +736,7 @@ export function createNearGate({
     }
     const q = pendingQuotes().find((q) => assetOf(q) === (transfer.asset || "near") && q.amountYocto === transfer.amountYocto.toString()
       && transfer.blockTimeMs >= q.createdAt);
-    if (q) {
-      const result = await confirmPayment(q.id, txHash, senderId);
-      if (result.error && result.status === "pending") throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
-    }
+    if (q && !ledger.hasUnattachedPayment(q.id)) await confirmDiscoveredPayment(q.id, txHash, senderId);
   }
 
   function waitForPayment(id, timeoutMs = 25_000, { signal } = {}) {

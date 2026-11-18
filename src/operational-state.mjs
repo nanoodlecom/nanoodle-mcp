@@ -14,10 +14,16 @@ function values(value) { if (!object(value)) throw Error("invalid-state-shape");
 
 export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now(), stuckMs = 3_600_000, debtMs = 900_000 } = {}) {
   if (![1, 2].includes(nano?.v) || !Array.isArray(nano.quotes) || !Array.isArray(nano.owed)
-    || near?.v !== 1 || !object(near.quotes) || !object(near.refunds) || !object(near.payouts ?? {})) throw Error("invalid-state-shape");
+    || near?.v !== 1 || !object(near.quotes) || !object(near.refunds) || !object(near.payouts ?? {})
+    || !object(near.consumedTx ?? {})) throw Error("invalid-state-shape");
   let nanoRaw = nanoFundingLiabilities({ quotes: nano.quotes, owed: nano.owed }), marketUsdNano = 0n;
   const nearClaims = nearRefundClaims(near, { now });
   const issues = new Set();
+  for (const [hash, id] of Object.entries(near.consumedTx ?? {})) {
+    const quote = near.quotes[id];
+    // The replay index outlives intentionally pruned quotes.
+    if (quote && quote.payTx !== hash) issues.add("near-payment-claim-unattached");
+  }
   const old = (stamp, ms) => Number.isFinite(stamp) && now - stamp > ms;
   const nanoRefundIds = new Set(nano.owed.filter(d => d.event === "refund").map(d => d.fields?.paymentId));
   for (const q of nano.quotes) {
