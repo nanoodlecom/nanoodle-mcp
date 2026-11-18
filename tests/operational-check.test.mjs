@@ -1406,6 +1406,27 @@ test("Market intake catches unclaimed hires, remote starts missing local state a
   }
 });
 
+test("a Market listing can cover the demo brief and still be underpriced for its supported fields", async t => {
+  const f = fixture(), originalPrice = f.deps.computePrice;
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const workflow = f.config.agents[0].defaultWorkflow;
+  workflow.fieldNames = ["Duration", "Style"];
+  workflow.fieldSpecs = { Duration: { seconds: { min: 30, max: 240, defaultMin: 120, defaultMax: 180 } } };
+  f.deps.computePrice = async (args, options) => {
+    if (args.graph !== workflow.graph) return originalPrice(args, options);
+    // The live listing leaves $0.95 after the Market fee. Only the longer
+    // brief with both supported fields requires $0.96 for the run.
+    const full = args.inputs.Idea?.length === 20_000 && args.inputs.Style?.length === 20_000
+      && args.inputs.Duration === "240 seconds";
+    return { safety: { ok: true }, pricing: { estimatedCostUsd: full ? 0.80 : 0.01 } };
+  };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === "workflow-price-nanoodle-image"), {
+    stage: "workflow-price-nanoodle-image", ok: false, code: "market-workflow-underpriced", domains: ["market"],
+  });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: false });
+});
+
 test("Market intake reads later pages and reports an exhausted scan budget", async () => {
   for (const exhausted of [false, true]) {
     const page = Array.from({ length: 100 }, () => ({ job: { jobKind: "competition" } }));

@@ -99,7 +99,7 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
       const limits = { ...L, maxDepositUsd: Number.MAX_SAFE_INTEGER };
       let computed;
       try {
-        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits });
+        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits, requireFreshCatalogs: true });
       } catch (e) {
         if (e instanceof GraphArgsError || e instanceof ParamsError) {
           return { ok: false, refusals: [{ code: "BAD_REQUEST", message: e.message }], pricing: null, inputs: {} };
