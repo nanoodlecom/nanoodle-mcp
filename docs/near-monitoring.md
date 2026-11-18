@@ -344,12 +344,23 @@ failed probe marks the scheduled event failed. Check the Worker's logs or Cron
 Events in the Cloudflare dashboard for execution evidence. This deployment has
 no notification integration. [Cloudflare Cron Events](https://developers.cloudflare.com/workers/configuration/cron-triggers/#view-past-events)
 
-Run the Worker against the production public URLs from the local Workers runtime
-before deploying.
+The [Worker release workflow](../.github/workflows/deploy-public-availability.yml)
+tests the public probes and builds the Worker for PRs. After a merge to `main`
+that changes an input, it publishes the tested bundle, verifies the active
+Worker version has the merge SHA, and checks the schedule and disabled public
+subdomain. The `cloudflare-availability` GitHub environment uses
+`CLOUDFLARE_ACCOUNT_ID` and a dedicated Worker credential named
+`CLOUDFLARE_AVAILABILITY_API_TOKEN`.
+
+To exercise the scheduled handler locally against the public endpoints:
 
 ```sh
 npx wrangler@4.164.0 dev --local --test-scheduled --config ops/cloudflare-public-check.jsonc
 curl -fsS 'http://127.0.0.1:8787/cdn-cgi/local/scheduled?format=json'
-npx wrangler@4.164.0 deploy --config ops/cloudflare-public-check.jsonc
 npx wrangler@4.164.0 tail nanoodle-public-availability --format json
 ```
+
+After the first release, check that the next scheduled event logs the expected
+probe count. The deployment job records the previous Cloudflare deployment for
+rollback. Restore its version in Cloudflare and revert the change in Git if a
+release fails the scheduled check.
