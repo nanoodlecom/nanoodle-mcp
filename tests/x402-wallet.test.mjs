@@ -409,6 +409,42 @@ test("live liabilities refuse a funded-looking run before work or a block is pub
   assert.equal(ran, false); assert.equal(mock.state.processed.length, 0);
 });
 
+test("a provider invoice rechecks newly recorded debts after waiting for proof of work", async () => {
+  let debt = 0n;
+  const mock = fakeRpc({ work_generate: (_body, _state, reply) => {
+    debt = BigInt(BALANCE) - BigInt(AMOUNT);
+    return reply({ work: WORK });
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true, fundingLiabilities: () => debt });
+  await wallet.ops.withFunding({ id: "growing-debt", maxRaw: 2n * BigInt(AMOUNT), maxUsd: 0.2 }, async () => {
+    await assert.rejects(wallet.payment(invoice()), { code: "FUNDING_INSUFFICIENT" });
+    debt = 0n;
+    await assert.rejects(wallet.payment(invoice()), { code: "FUNDING_INVOICE_USED" });
+  });
+  assert.equal(mock.state.processed.length, 0);
+});
+
+test("a provider invoice cannot rebuild on a lower balance needed for other claims", async () => {
+  const amount = BigInt(AMOUNT);
+  let attempts = 0;
+  const mock = fakeRpc({ process: (body, state, reply) => {
+    if (++attempts === 1) {
+      state.frontier = "D".repeat(64);
+      state.balance = (3n * amount).toString();
+      return reply({ error: "Fork" });
+    }
+    state.processed.push(body);
+    return reply({ hash: hashBlock(body.block) });
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true, fundingLiabilities: () => 2n * amount });
+  await wallet.ops.withFunding({ id: "lower-balance", maxRaw: 2n * amount, maxUsd: 0.2 }, async () => {
+    await assert.rejects(wallet.payment(invoice()), { code: "FUNDING_INSUFFICIENT" });
+  });
+  assert.equal(mock.state.infoCalls, 2);
+  assert.equal(attempts, 1);
+  assert.equal(mock.state.processed.length, 0);
+});
+
 test("refunds fulfill their debt while withdrawals cannot consume another run's capital", async () => {
   const mock = fakeRpc(); let debt = 4n * 10n ** 30n;
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true,
@@ -443,6 +479,18 @@ test("a creator payout consumes its overhead reservation rather than the model's
 test("an unrecorded outgoing claim cannot bypass protected transfer funds", async () => {
   const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true });
   await assert.rejects(wallet.ops.transfer(PAY_TO, "1", "invalid claim", { liabilityRaw: 1n }), { code: "FUNDING_INVALID" });
+  assert.equal(mock.state.processed.length, 0);
+});
+
+test("a pool withdrawal rechecks debts accrued while its proof of work was prepared", async () => {
+  let debt = 0n;
+  const mock = fakeRpc({ work_generate: async (_body, _state, reply) => {
+    await new Promise(resolve => setImmediate(resolve));
+    debt = BigInt(BALANCE);
+    return reply({ work: WORK });
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true, fundingLiabilities: () => debt });
+  await assert.rejects(wallet.ops.transfer(PAY_TO, AMOUNT), { code: "FUNDING_INSUFFICIENT" });
   assert.equal(mock.state.processed.length, 0);
 });
 

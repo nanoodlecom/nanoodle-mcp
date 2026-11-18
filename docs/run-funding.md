@@ -13,6 +13,9 @@ The quote's locked exchange pair determines these limits. Creator markup stays
 outside model authority. Provider maximum prepayments differ from final model
 cost: a provider refund increases future spendable capital and never resets the
 current run's cap. Failed or ambiguous payments still consume authority.
+The wallet checks current liabilities again right before publishing a provider
+payment. A send rebuilt on a fresher frontier must still fit the balance after
+covering other reservations and claims.
 
 Concurrent nodes inherit one opaque async scope. The wallet captures the
 enqueuer's scope before entering the queue, so another caller's queue drainer
