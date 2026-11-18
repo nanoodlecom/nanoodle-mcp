@@ -101,6 +101,11 @@ cooldown remains a reported `nano-rpc-rate-limited` degradation without another
 upstream request. Invalid metadata or changed configuration cannot hide a peer
 failure. The monitor still queries the other peers and independently verifies
 their frontier agreement and available quorum; loss of quorum closes admission.
+Those peers must also corroborate the latest confirmed wallet checkpoint from
+the runtime report. A peer already beyond that height proves the checkpoint
+with a confirmed historical block whose contents hash to the expected ID.
+The monitor needs two witnesses in a multi-node configuration. It can use a
+fresh standby-assisted checkpoint alongside one matching direct observation.
 
 For a standby on a separate provider, set both `NANO_RPC_STANDBY_URL` and
 `NANO_RPC_STANDBY_REQUESTS_PER_MINUTE`. Use two to seven primary peers and a
