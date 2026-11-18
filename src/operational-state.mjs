@@ -9,6 +9,7 @@ import { creatorNanoTransferClaims, gateNanoTransferClaims, hasConflictingNanoTr
 
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const U128_MAX = (1n << 128n) - 1n;
+const NANO_EXECUTION_GRACE_MS = 5 * 60_000;
 function amount(value) {
   if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128_MAX) throw Error("invalid-state-amount");
   return BigInt(value);
@@ -41,7 +42,10 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     // Text-only results can persist as paid + settled after restart. They are
     // completed financial settlements, not fresh refundable deposits.
     if (["paid", "consumed"].includes(q.status) && !q.settled && !q.result && !q.error) {
-      if (old(q.paidAt ?? q.createdAt, stuckMs)) issues.add("nano-paid-work-stuck");
+      if (q.executionNeedsReconciliation) issues.add("nano-execution-legacy-unverified");
+      else if (q.status === "consumed" && Number.isSafeInteger(q.runDeadlineAt)) {
+        if (old(q.runDeadlineAt, NANO_EXECUTION_GRACE_MS)) issues.add("nano-execution-overdue");
+      } else if (old(q.paidAt ?? q.createdAt, stuckMs)) issues.add("nano-paid-work-stuck");
     }
     if (nanoQuoteClaim(q) > 0n && ((q.error && !nanoRefundIds.has(q.id)) || q.settled)) issues.add("nano-refund-unresolved");
     if (q.historyUnproven === true) issues.add("nano-history-payment-unproven");

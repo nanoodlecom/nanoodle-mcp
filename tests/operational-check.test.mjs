@@ -237,6 +237,23 @@ test("the scheduled check detects legacy send debt and a Nano block claimed by t
   assert.doesNotMatch(JSON.stringify(report), /private-fixture-|AAAAAAA/);
 });
 
+test("the scheduled check detects overdue Nano execution and unverified legacy execution without inference", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/state/gate-state.json"].quotes.push(
+    { id: "private-exec-overdue", amountRaw: "10", status: "consumed", runDeadlineAt: NOW - 300_001 },
+    { id: "private-exec-legacy", amountRaw: "10", status: "paid", executionNeedsReconciliation: true },
+    { id: "private-exec-ready", amountRaw: "10", status: "paid", runDeadlineAt: null, paidAt: NOW },
+  );
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.filter(c => c.stage.startsWith("nano-execution-")).map(({ stage, ok, code }) => ({ stage, ok, code })), [
+    { stage: "nano-execution-legacy-unverified", ok: false, code: "nano-execution-legacy-unverified" },
+    { stage: "nano-execution-overdue", ok: false, code: "nano-execution-overdue" },
+  ]);
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-exec-/);
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

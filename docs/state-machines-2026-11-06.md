@@ -69,6 +69,13 @@ customer change and creator payouts, funding checks just before publication,
 and duplicate transfer detection across the shared wallet. They neither use
 real wallet credentials nor invoke inference.
 
+Nano records a durable execution claim before opening a provider budget.
+When a writer restarts with an unfinished claim, it records a failure and
+full-deposit refund intent together. An unused payment remains ready for
+its first run. A paid quote from before execution claims requires
+reconciliation if its outcome is absent. Its funds stay reserved.
+The scheduled check reports those holds and claims beyond their deadlines.
+
 The Nano writer records outgoing intent with the payment outcome and saves
 the exact signed block before publication. Retries reconcile that block.
 A replacement requires a confirmed competing block on the same account
