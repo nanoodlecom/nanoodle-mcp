@@ -30,8 +30,7 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     if (nanoQuoteClaim(q) > 0n && ((q.error && !nanoRefundIds.has(q.id)) || q.settled)) issues.add("nano-refund-unresolved");
   }
   for (const debt of nano.owed) {
-    // Legacy debts have a next-attempt time, not an original creation time.
-    if (debt.held || debt.tries >= 5 || old(debt.at, debtMs)) issues.add("nano-settlement-stuck");
+    if (debt.held || debt.tries >= 5 || old(debt.createdAt ?? debt.at, debtMs)) issues.add("nano-settlement-stuck");
   }
   const refunds = values(near.refunds), refundPayments = new Set(refunds.map(r => r.paymentId));
   for (const refund of refunds) {
