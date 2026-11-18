@@ -41,6 +41,7 @@ import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
 import { isExpiredPayment } from "./near/payment-view.mjs";
+import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_CONNECTOR, NANO_WORDMARK, NANO_SURFACE_CSS, NANO_PORT_CSS } from "./brand.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { creatorPage, hostedWorkflowPage } from "./creator-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
@@ -91,6 +92,17 @@ const ASSETS = {
   "/near-site.js": "text/javascript; charset=utf-8",
   "/creator-site.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/tokens/tokens.css`]: "text/css; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/fonts.css`]: "text/css; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/righteous-latin.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/righteous-latin-ext.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/manrope-latin-variable.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/ibm-plex-mono-latin-400.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/Righteous-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/Manrope-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/IBM-Plex-Mono-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/assets/wordmark-gradient.svg`]: "image/svg+xml",
+  [`${NANOODLE_BRAND}/assets/connector.png`]: "image/png",
   [`${BRAND_BASE}/255labs-tokens.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-ui.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-lockup-paper.svg`]: "image/svg+xml",
@@ -143,8 +155,7 @@ const PAGE_CSS = `
 `;
 
 /*
- * The landing page commits to a dark look (the pay pages stay theme-following):
- * its job is a first impression, and the hero is one copyable command.
+ * Shared dark landing styles for the Nano and NEAR workflow cards and setup commands.
  */
 const LANDING_CSS = `
   /* Brand: nanoodle's own tokens (nanoodle.com :root) — same bg/panel/ink/line,
@@ -247,6 +258,43 @@ const LANDING_CSS = `
   .labs .ltag{font:.78rem/1 ui-monospace,monospace;color:var(--muted)}
   ${RECEIPTS_CSS}
 `;
+
+// Nano has its own presentation on top of the shared workflow card structure.
+const NANO_LANDING_CSS = `
+  h1{font-size:clamp(2.1rem,6.6vw,4rem);line-height:1.07;letter-spacing:-.025em}
+  h1 span{color:var(--accent-ink)}
+  h2{font-size:clamp(1.4rem,4vw,2rem)}
+  .eyebrow,.step .n,.flow,.chip,.tool .cost,.labs .ltag{font-family:var(--nano-font-mono)}
+  .top{align-items:center}
+  .top .brand img{width:26px;height:26px}
+  .top .brand .product-wordmark{width:108px;height:auto;border-radius:0}
+  .top .v{font-family:var(--nano-font-mono);font-size:.73rem}
+  .hero-links a,.tabs .tab,.connect button,.tool>button{min-height:var(--nano-control-height);border-radius:var(--nano-radius-control)}
+  .hero-links a,.tool>button{border-color:var(--nano-color-control-line)}
+  .connect,.card,.tool,.step,.flow{border-radius:var(--nano-radius-card)}
+  .hero-links a:first-child,.connect button{background:var(--accent);color:var(--nano-color-on-accent);font-weight:750}
+  .hero-links a:first-child:hover{filter:brightness(1.1)}
+  .tools{grid-template-columns:repeat(auto-fill,minmax(min(19rem,100%),1fr))}
+  .tool .links{white-space:normal}
+  .tool .sample summary{display:list-item;min-height:var(--nano-control-height);align-content:center}
+  @media(max-width:440px){.top nav{width:100%;gap:.85rem}.connect{gap:.55rem;padding:.7rem}.connect pre{font-size:.76rem}.connect button{padding-inline:.65rem}}
+`;
+
+const NANO_CHECKOUT_CSS = `
+  .pay-header{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem}
+  .pay-header a,.pay-brand{display:inline-flex;align-items:center;gap:.5rem}
+  .pay-header .product-wordmark,.pay-brand .product-wordmark{display:block;width:112px;height:auto}
+  .pay-header span{font:400 .8rem/1.5 var(--nano-font-mono);color:var(--muted)}
+  h1{font-size:clamp(1.5rem,5vw,2rem);line-height:1.2}
+  .card{border-radius:var(--nano-radius-card)}
+  button{min-height:var(--nano-control-height);border-radius:var(--nano-radius-control);border-color:var(--nano-color-control-line);background:var(--card2)}
+  button:hover{border-color:var(--accent)}
+  .qr{width:min(280px,100%)}
+  .qr svg{display:block;width:100%;height:auto}
+`;
+const nanoCheckoutPage = (title, body) => htmlPage(title,
+  `<header class="pay-header"><a href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a><span>Nano payment</span></header>${body}`,
+  PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS, NANO_BRAND_HEAD);
 
 const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
@@ -352,7 +400,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     const page = nearSitePage({ version, publicBase, merchant, network, tools: templates, usdc, hosting, scriptUrl: scriptUrls["near-site.js"],
       cards: templates.map(t => cardHtml(t, nearWorkflowCopy[t.name], true).replace(/last run \$/g, "last model cost $")).join(""),
       notes: receiptsHtml({ toolNames: templates.map(t => t.name), compact: true }) });
-    return htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head);
+    return htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head);
   }
   const tagline = near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}` : charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
   const desc = near
@@ -360,10 +408,10 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     : charged
     ? "Give your agents new abilities with x402. Run or build AI workflows over MCP, pay per call in Nano, and earn as a workflow author. Open source."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
-  const ogHead =
-    `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">` +
+  const isNanoodle = name === "nanoodle-mcp";
+  const ogHead = NANO_BRAND_HEAD +
     `<meta name="theme-color" content="#0b0d12">` +
-    `<link rel="preload" href="/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
+    `<link rel="preload" href="${NANOODLE_BRAND}/fonts/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
     `<meta name="description" content="${esc(desc)}">` +
     `<meta property="og:type" content="website">` +
     `<meta property="og:site_name" content="${esc(name)}">` +
@@ -379,13 +427,13 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
     <header class="top">
-      <a class="brand" href="/"><img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span></a><span class="v">v${esc(version)}</span>
-      <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
+      <a class="brand" href="/">${isNanoodle ? NANO_CONNECTOR + NANO_WORDMARK : `<img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
+      <nav aria-label="Product"><a href="https://nanoodle.com/">Editor</a><a href="https://nanoodle.com/guide/examples/">Examples</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source</a></nav>
     </header>
     <p class="eyebrow">${charged ? "Open source · MCP + x402 · Nano" : "public MCP server"}</p>
-    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents new abilities." : "AI media workflows over MCP."}</h1>
-    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect Nanoodle over MCP, then let your agent discover workflows and pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
-      ${charged || near ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
+    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents <span>new abilities.</span>" : "AI media workflows over MCP."}</h1>
+    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect over MCP to discover and run nanoodle workflows. Get a quote first, then pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
+      ${charged || near ? "You can connect without an account or an API key." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
     ${charged ? `<p class="hero-links"><a href="#connect">Connect your agent ↓</a><a href="https://nanoodle.com">Build a workflow ↗</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">View source ↗</a></p>` : ""}
     <div id="connect" class="connect-wrap">
@@ -408,8 +456,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     </div>
     ${near && !charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>deposit quote</span><span class="arr">→</span><span>pay in your NEAR wallet</span><span class="arr">→</span><span>result + automatic NEAR change</span></div>` : ""}
     ${charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>402 payment quote</span>
-      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
-    <p class="tagline">No tab, no tip, no signup.</p>` : ""}
+      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>` : ""}
     ${receiptsHtml()}
     ${paymentNote ? `<div class="card"><h2>${charged ? "Or pay in NEAR" : "What a call costs"}</h2><p class="muted">${esc(paymentNote)}</p></div>` : ""}
     ${charged ? `<div class="card"><h2>What a call costs</h2>
@@ -471,7 +518,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
     </div>
-    <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a>
+    <footer><a href="/llms.txt">Agent instructions</a> · <a href="https://branding.nanoodle.com/">Brand guidelines</a>
       <div class="labs"><a href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" height="36" alt="255labs"></a><span class="ltag">Full signal. Zero noise. · 0xFF</span></div>
     </footer>
     <script>
@@ -493,7 +540,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         });
       }
     </script>
-  `, LANDING_CSS, ogHead);
+  `, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + NANO_LANDING_CSS, ogHead);
 }
 
 /** The landing page's story as plain text — the version an agent should read. */
@@ -595,7 +642,7 @@ function nearPayPageHtml(q) {
   const canPay = q.status === "pending", canConfirm = canPay || q.status === "expired";
   const title = canPay ? `Pay in ${asset}` : q.checkingPayment ? "Checking payment" : "Your workflow";
   return htmlPage(`${title} · nanoodle`, `
-    <a class="pay-brand" href="/">nanoodle</a>
+    <a class="pay-brand" href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
       <h1 id="near-title">${title}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
       <p id="near-status" role="status" aria-live="polite">${q.checkingPayment ? esc(q.next) : "Checking payment…"}</p>
@@ -619,25 +666,25 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted" id="near-note">Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="${scriptUrls["near-wallet.js"]}"></script>
-  `, PAGE_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--brand-font-sans),system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--brand-font-mono),monospace;margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;background:linear-gradient(105deg,#99a5ff,#e7a4d3);color:#0b0d12;font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:2px solid #d7ff3f;outline-offset:3px}`, `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">`);
+  `, PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--nano-font-body);background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--nano-font-mono);margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;border-radius:var(--nano-radius-control);background:var(--nano-color-accent);color:var(--nano-color-on-accent);font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:var(--nano-control-focus-width) solid var(--nano-color-accent-ink);outline-offset:3px}`, NANO_BRAND_HEAD);
 }
 
 function payPageHtml(q) {
   const statusUrl = `/x402/status/${encodeURIComponent(q.id)}?wait=1`;
   const watchUrl = `/x402/watch/${encodeURIComponent(q.id)}`;
   const canPay = q.status === "pending" && !q.checkingPayment;
-  return htmlPage(`Pay ${q.amountXno} XNO`, `
+  return nanoCheckoutPage(`Pay ${q.amountXno} XNO`, `
     <div class="card center" id="paybox">
       <div id="pay-instructions"${canPay ? "" : " hidden"}>
       <h1>Pay ${esc(q.amountXno)} XNO <span class="muted">(≈$${esc(q.usd.toFixed(q.usd < 0.01 ? 4 : 2))})</span></h1>
       <p class="muted">for one run of <code>${esc(q.tool)}</code> — scan with any Nano wallet</p>
-      <a class="qr" href="${esc(q.uri)}">${qrSvg(q.uri)}</a>
+      <a class="qr" href="${esc(q.uri)}" aria-label="Open this quote in your Nano wallet">${qrSvg(q.uri)}</a>
       <p><button onclick="navigator.clipboard.writeText('${esc(q.address)}')">copy address</button>
          <button onclick="navigator.clipboard.writeText('${esc(q.amountXno)}')">copy amount</button></p>
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
          Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
       </div>
-      <p class="muted" id="status" role="status">${q.checkingHistory ? "Checking Nano payment history for this quote." : q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "waiting for payment… settles in about a second"}</p>
+      <p class="muted" id="status" role="status">${q.checkingHistory ? "Checking Nano payment history for this quote." : q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "Waiting for payment. Keep this page open while your transfer is confirmed."}</p>
       <p class="muted" id="expiry"${canPay ? "" : " hidden"}></p>
     </div>
     <script>
@@ -962,7 +1009,7 @@ export async function serveHttp({
           scriptUrl: scriptUrls["near-site.js"], creatorScriptUrl: scriptUrls["creator-site.js"] };
         const page = hosted ? hostedWorkflowPage(hosted, opts) : creatorPage(opts);
         res.setHeader("Cache-Control", "no-cache");
-        return send(200, htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head), "text/html; charset=utf-8");
+        return send(200, htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/") {
@@ -1032,7 +1079,7 @@ export async function serveHttp({
       if (payMatch && (gate || nearGate)) {
         const id = decodeURIComponent(payMatch[1]);
         const q = id.startsWith("nq_") ? nearGate?.quote(id) : gate?.quote(id);
-        if (!q) return send(404, htmlPage("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
+        if (!q) return send(404, (id.startsWith("nq_") ? htmlPage : nanoCheckoutPage)("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
         res.setHeader("X-Robots-Tag", "noindex, nofollow");

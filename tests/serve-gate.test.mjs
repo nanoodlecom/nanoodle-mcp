@@ -1835,7 +1835,7 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
     assert.match(html, /data-client="grok"/);
     assert.match(html, /selectClient/);
     assert.match(html, /402 payment quote/);
-    assert.match(html, /No tab, no tip, no signup\./);
+    assert.match(html, /You can connect without an account or an API key\./);
     assert.match(html, /href="\/llms\.txt"/);
     assert.match(html, /Claude Code, Grok, Cursor/);
   } finally {
@@ -1862,6 +1862,7 @@ test("landing carries OG/social meta and the favicon; brand assets are served", 
     assert.match(html, /property="og:url" content="http:\/\/pay\.test\/"/);
     assert.match(html, /property="og:image:alt"/);
     assert.match(html, /name="twitter:card" content="summary_large_image"/);
+    assert.match(html, /href="\/brand\/nanoodle-v1\.0\.0\/tokens\/tokens\.css"/);
     // favicon links + the icon sits next to the brand name
     assert.match(html, /rel="icon" href="\/favicon\.ico"/);
     assert.match(html, /rel="apple-touch-icon"/);
@@ -1878,9 +1879,22 @@ test("landing carries OG/social meta and the favicon; brand assets are served", 
       assert.ok((await r.arrayBuffer()).byteLength > 500, `${path} should have real image bytes`);
     }
 
+    for (const [path, type] of [
+      ["tokens/tokens.css", "text/css"],
+      ["fonts/manrope-latin-variable.woff2", "font/woff2"],
+      ["assets/wordmark-gradient.svg", "image/svg+xml"],
+    ]) {
+      const r = await fetch(`${base}/brand/nanoodle-v1.0.0/${path}`);
+      assert.equal(r.status, 200, path);
+      assert.ok(r.headers.get("content-type").startsWith(type), path);
+      assert.ok((await r.arrayBuffer()).byteLength > 500, path);
+    }
+
     // pay pages get the favicon links too
     const arg = argOf(await callTool({ name: "poster", arguments: { Text: "x" } }));
     const pay = await (await fetch(`${base}/pay/${arg.paymentId}`)).text();
+    assert.match(pay, /<span>Nano payment<\/span>/);
+    assert.match(pay, /href="\/brand\/nanoodle-v1\.0\.0\/fonts\/fonts\.css"/);
     assert.match(pay, /rel="icon" href="\/favicon\.ico"/);
   } finally {
     server.close();
