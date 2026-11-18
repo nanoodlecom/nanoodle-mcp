@@ -247,7 +247,7 @@ test("authoringGuide: node types, rules, example, and filtered priced models", (
   assert.deepEqual(llm.textPorts, ["prompt", "system"]);
   // the text says which ports take wires (llm has no NODE_TYPES inputs, yet its prompt is wireable)
   assert.match(g.text, /^- llm \(LLM\): wire text into \[prompt, system\]; media inputs \[img1, img2/m);
-  assert.match(g.text, /^Model kinds: chat -> llm, decide; image -> image, edit;/m);
+  assert.match(g.text, /^Model kinds: chat -> llm; decision -> decide, decide-branch; image -> image, edit;/m);
   assert.deepEqual(llm.keyFields, ["model", "system", "prompt", "maxTokens"]);
   assert.deepEqual(llm.outputs, [{ name: "text", type: "text" }]);
   const ep = g.structured.nodeTypes.find((t) => t.type === "endpoint");
