@@ -11,7 +11,7 @@
  * One process owns a state file.
  */
 import { readFileSync } from "node:fs";
-import { writePrivateStateSync } from "../private-state.mjs";
+import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../private-state.mjs";
 import { NearError } from "./errors.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META } from "./quote-capacity.mjs";
 
@@ -72,8 +72,12 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       throw new NearError("STATE_MISMATCH",
         `NEAR state file ${file} belongs to ${state.merchant} on ${state.network}, not ${merchant} on ${network}`);
     }
+    // A previous writer may have stopped after replacing the file. Confirm
+    // the directory entry before using the selected snapshot for recovery.
+    try { syncPrivateStateParentSync(file); }
+    catch (cause) { throw new NearError("STATE_DURABILITY_UNCERTAIN", "The NEAR ledger could not be made durable on open", { cause }); }
   }
-  let persisted = JSON.stringify(state), persistenceFailed = false;
+  let persisted = JSON.stringify(state), persistenceFailed = false, uncertainCommit = null;
   // Earlier releases could persist the claim before attaching it to its quote.
   // Index those exceptions once so watching blocks does not scan the tx history.
   const unattachedPayments = new Set();
@@ -89,19 +93,29 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       persisted = next;
     } catch (e) {
       persistenceFailed = true;
-      state = JSON.parse(persisted); // roll the in-memory state back to what is on disk
+      if (e instanceof PrivateStateDurabilityError) uncertainCommit = e;
+      state = JSON.parse(persisted); // Only expose the last successfully synced snapshot.
       throw e;
     }
   }
 
   function mutate(fn) {
+    assertDurable();
     fn();
     persist();
   }
 
+  function assertDurable() {
+    // Only a fresh open can reconcile which complete snapshot survived. Another
+    // mutation in this process could overwrite the visible replacement from the
+    // older in-memory state.
+    if (uncertainCommit) throw new NearError("STATE_DURABILITY_UNCERTAIN", "The NEAR ledger needs recovery before it can accept more work", { cause: uncertainCommit });
+  }
+
   const ledger = {
     file,
-    persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0 }),
+    persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0, ...(uncertainCommit && { durabilityUncertain: true }) }),
+    assertDurable,
     paymentWatchCoverage: () => nearPaymentWatchCoverage(state.meta[PAYMENT_WATCH_META], watchPaymentHistory),
 
     getQuote(id) {

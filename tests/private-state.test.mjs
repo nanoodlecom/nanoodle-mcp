@@ -37,3 +37,13 @@ for (const [kind, makeLink] of [["symlink", symlink], ["hardlink", link]]) test(
   assert.equal(await readFile(target, "utf8"), "KEEP");
   assert.equal((await stat(target)).mode & 0o777, 0o640);
 });
+
+test("a directory that cannot be synced is rejected before any state is replaced", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "financial-parent-link-")); t.after(() => rm(dir, { recursive: true, force: true }));
+  const actual = join(dir, "actual"), alias = join(dir, "alias");
+  await mkdir(actual);
+  await symlink(actual, alias, "dir");
+  await writeFile(join(actual, "state.json"), "KEEP", { mode: 0o600 });
+  assert.throws(() => writePrivateStateSync(join(alias, "state.json"), "attempted replacement"));
+  assert.equal(await readFile(join(actual, "state.json"), "utf8"), "KEEP");
+});

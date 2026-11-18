@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFundingReport } from "../src/funding-report.mjs";
 import { createHostedFundingSources } from "../src/hosted-funding.mjs";
+import { moneyStateStatus } from "../src/service-lifecycle.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY } from "./fixtures/nano-protocol.mjs";
 
 const value = { balanceRaw: "100", liabilitiesRaw: "20", reservedRaw: "80", activeRuns: 1,
@@ -203,6 +204,10 @@ test("failed money-state persistence pauses checkout admission without inference
   state.ok = false; await report.refresh();
   assert.equal(w.sources.ready(), false);
   assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
+  state = moneyStateStatus([{ ...state, durabilityUncertain: true }, { ok: true, pendingWrites: 0 }]);
+  await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).code, "funding-state-durability-uncertain");
   state = { ok: true, pendingWrites: "unknown" }; await report.refresh();
   assert.equal(w.sources.ready(), false);
   assert.equal(JSON.parse(await readFile(w.file, "utf8")).code, "funding-state-unavailable");

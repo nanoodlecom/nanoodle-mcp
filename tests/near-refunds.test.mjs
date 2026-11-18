@@ -6,7 +6,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import fs, { readFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createHash, createPublicKey, verify } from "node:crypto";
@@ -74,6 +75,44 @@ async function withLedger(fn) {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test("a failed directory sync after a refund is sent blocks later writes until recovery", async t => {
+  const sync = fs.fsyncSync;
+  let failDirectorySync = false;
+  t.mock.method(fs, "fsyncSync", fd => {
+    if (failDirectorySync && fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("simulated I/O error"), { code: "EIO" });
+    return sync(fd);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+
+  await withLedger(async ({ file, open }) => {
+    const ledger = open();
+    const { rpc, log } = mockChain({ onSend() { failDirectorySync = true; return { result: DONE }; } });
+    const { refunder } = make(rpc, ledger);
+    const args = { paymentId: "nq_sync_fault", to: "alice.testnet", amountYocto: AMOUNT, reason: "change" };
+    await assert.rejects(refunder.refund(args), { code: "STATE_DURABILITY_UNCERTAIN" });
+    assert.equal(log.sends.length, 1);
+    assert.equal(ledger.refundForPayment(args.paymentId).status, "signed");
+    assert.deepEqual(ledger.persistenceStatus(), { ok: false, pendingWrites: 0, durabilityUncertain: true });
+    const visible = readFileSync(file, "utf8");
+    assert.equal(Object.values(JSON.parse(visible).refunds)[0].status, "sent");
+    assert.throws(open, { code: "STATE_DURABILITY_UNCERTAIN" });
+
+    failDirectorySync = false;
+    assert.throws(() => ledger.setMeta("unrelated", "must not overwrite the refund"), { code: "STATE_DURABILITY_UNCERTAIN" });
+    await assert.rejects(refunder.resume(), { code: "STATE_DURABILITY_UNCERTAIN" });
+    assert.equal(readFileSync(file, "utf8"), visible);
+    assert.equal(log.sends.length, 1);
+
+    const recovered = open();
+    assert.equal(recovered.refundForPayment(args.paymentId).status, "sent");
+    recovered.setMeta("unrelated", "safe after recovery");
+    await make(rpc, recovered).refunder.resume();
+    assert.equal(log.sends.length, 1);
+    assert.equal(open().refundForPayment(args.paymentId).status, "sent");
+  });
+});
 
 function make(rpc, ledger, extra = {}) {
   const timers = [];

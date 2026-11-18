@@ -30,6 +30,7 @@ export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Dat
     return ledger.getPayout(paymentId);
   }
   async function drive(rec) {
+    ledger.assertDurable();
     try {
       const hash = await ops.transferOnce(rec.to, rec.amountRaw, {
         liabilityRaw: rec.amountRaw,
