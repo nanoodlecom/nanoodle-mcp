@@ -103,6 +103,54 @@ test("an older pending start cannot spend against a listing price above its escr
   } finally { r.store.close(); await r.m.close(); }
 });
 
+test("the worker rechecks the paid assignment after Market confirms start", async t => {
+  const cases = [
+    ["cancelled", (m, id) => m.cancel(id), "gone", undefined],
+    ["reduced escrow", (m, id) => { m.rows.get(id).assignment.escrowAmount = "0.02"; }, "declined", "MARKET_ESCROW_TOO_LOW"],
+    ["expired SLA", (m, id) => { m.rows.get(id).assignment.slaDeadlineAt = new Date(Date.now() - 1000).toISOString(); }, "declined", "MARKET_SLA_EXPIRED"],
+  ];
+  for (const [name, update, phase, code] of cases) {
+    await t.test(name, async () => {
+      const r = await rig();
+      try {
+        const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+        const start = r.client.start;
+        r.client.start = async (id) => {
+          const started = await start(id);
+          update(r.m, id);
+          return started;
+        };
+        await r.once();
+        assert.equal(nano.runs(), before);
+        assert.equal(r.store.get(id).phase, phase);
+        assert.equal(r.store.get(id).decline?.code, code);
+        assert.equal(r.m.calls("POST", /\/submit$/).length, 0);
+      } finally { r.store.close(); await r.m.close(); }
+    });
+  }
+});
+
+test("the worker retries an unavailable post-start read without starting or running twice", async () => {
+  const r = await rig({ backoffMs: 60_000 });
+  try {
+    const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+    const start = r.client.start;
+    r.client.start = async (id) => {
+      const started = await start(id);
+      r.m.fault({ method: "GET", path: /\/v1\/agents\/me\/assignments$/, mode: "status", status: 503 });
+      return started;
+    };
+    await r.once();
+    assert.equal(r.store.get(id).phase, "started");
+    assert.equal(nano.runs(), before);
+    r.store.update(id, { nextAttemptAt: 0 });
+    await r.once();
+    assert.equal(r.store.get(id).phase, "submitted");
+    assert.equal(nano.runs(), before + 1);
+    assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
 test("accepted market hires pay the embedded Nano author once, at the locked rate, including after restart", async () => {
   const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
   const owed = new Map(); let xnoUsd = "0.5";

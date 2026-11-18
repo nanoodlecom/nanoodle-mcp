@@ -400,6 +400,13 @@ export async function runOperationalCheck(config, deps = {}) {
           need(!a.startedAt && !a.submittedAt && !a.deliverableUrl && row.latestMessage?.senderSide !== "worker",
             "market-intake-start-without-record");
           need(checkedAt - hiredAt <= MARKET_PICKUP_GRACE_MS, "market-intake-untracked");
+        } else {
+          const record = state.assignments[a.assignmentId];
+          const needUsd = record?.pricing?.depositUsd;
+          if ((record?.phase === "starting" || record?.phase === "started") && Number.isFinite(needUsd)) {
+            const { budgetUsd } = marketEscrowTerms(a);
+            if (budgetUsd !== undefined) need(needUsd <= budgetUsd, "market-intake-escrow-below-priced-need");
+          }
         }
       }
     }, ["market"]);

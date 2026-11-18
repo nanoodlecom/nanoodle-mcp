@@ -573,6 +573,7 @@ test("Market intake catches unclaimed hires, remote starts missing local state a
     [marketIntakeRow(40_000, { deliverableUrl: "/PRIVATE_REWORK_DELIVERABLE" }), false, "market-intake-start-without-record"],
     [{ ...fresh, latestMessage: { senderSide: "worker" } }, false, "market-intake-start-without-record"],
     [marketIntakeRow(301_000), true, null],
+    [marketIntakeRow(40_000, { escrowAmount: "0.02" }), true, "market-intake-escrow-below-priced-need"],
     [marketIntakeRow(301_000, { slaDeadlineAt: new Date(NOW - 1).toISOString() }), true, "market-intake-sla-expired"],
     [marketIntakeRow(40_000, { createdAt: "unavailable" }), false, "market-intake-timing-invalid"],
     [{ ...fresh, job: { jobKind: "competition" }, assignment: {} }, false, null],
@@ -580,7 +581,7 @@ test("Market intake catches unclaimed hires, remote starts missing local state a
   for (const [row, local, code] of cases) {
     const f = fixture(({ url }) => {
       if (url.pathname !== "/v1/agents/me/assignments") return null;
-      if (local) f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = { phase: "starting" };
+      if (local) f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = { phase: "starting", pricing: { depositUsd: 0.03 } };
       return Response.json({ assignments: [row] });
     });
     const report = await runOperationalCheck(f.config, f.deps);
