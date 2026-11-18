@@ -16,6 +16,7 @@ import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms } from "../src/market/catalog.mjs";
+import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
@@ -28,6 +29,8 @@ import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
+const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
+const MARKET_MAX_PAGES = 5;
 const REFUND_FUNDING_CODES = new Map([
   ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
   ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
@@ -328,15 +331,45 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
     const assignments = await check(`market-auth-${agent.handle}`, async () => {
       const token = (deps.readText || (file => readFileSync(file, "utf8")))(agent.tokenFile).trim();
-      const result = await http(config.marketUrl + "/v1/agents/me/assignments?status=in_progress&limit=100&offset=0", { headers: { authorization: `Bearer ${token}` } });
-      need(Array.isArray(result.assignments) && result.assignments.length <= 100, "market-auth-response-invalid");
-      return result.assignments;
+      const client = createMarketClient({ baseUrl: config.marketUrl, token, fetch: request });
+      try { return await client.listActionable({ maxPages: MARKET_MAX_PAGES }); }
+      catch (error) {
+        if (error instanceof MarketApiError && error.status !== null) {
+          throw new CheckError(error.status === 200 ? "market-auth-response-invalid" : `http-${error.status}`);
+        }
+        throw error;
+      }
     }, ["market"]);
     if (assignments) await check(`market-escrow-${agent.handle}`, () => {
       for (const row of assignments) {
         if (row?.job?.jobKind === "competition") continue;
         const { code } = marketEscrowTerms(row?.assignment);
         need(!code, code?.toLowerCase().replaceAll("_", "-"));
+      }
+    }, ["market"]);
+    if (assignments) await check(`market-intake-${agent.handle}`, () => {
+      need(assignments.length < MARKET_MAX_PAGES * 100, "market-intake-scan-incomplete");
+      const active = assignments.filter(row => row?.job?.jobKind !== "competition");
+      if (!active.length) return;
+      // Read after the remote poll. The worker persists its record before starting a hire.
+      const state = read(join(config.marketStateDir, agent.handle, "market-state.json"));
+      need(state?.v === 1 && state.assignments && typeof state.assignments === "object" && !Array.isArray(state.assignments),
+        "market-intake-state-invalid");
+      const checkedAt = now(), seen = new Set();
+      for (const row of active) {
+        const a = row?.assignment;
+        need(typeof a?.assignmentId === "string" && a.assignmentId && a.status === "in_progress" && !seen.has(a.assignmentId),
+          "market-intake-response-invalid");
+        seen.add(a.assignmentId);
+        const hiredAt = Date.parse(a.createdAt), deadline = Date.parse(a.slaDeadlineAt);
+        need(Number.isFinite(hiredAt) && Number.isFinite(deadline) && deadline >= hiredAt && hiredAt <= checkedAt + 30_000,
+          "market-intake-timing-invalid");
+        need(deadline > checkedAt, "market-intake-sla-expired");
+        if (!Object.hasOwn(state.assignments, a.assignmentId)) {
+          need(!a.startedAt && !a.submittedAt && !a.deliverableUrl && row.latestMessage?.senderSide !== "worker",
+            "market-intake-start-without-record");
+          need(checkedAt - hiredAt <= MARKET_PICKUP_GRACE_MS, "market-intake-untracked");
+        }
       }
     }, ["market"]);
     if (!agent.defaultWorkflow) return;
