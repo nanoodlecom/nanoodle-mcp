@@ -13,6 +13,7 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
+import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
 import { USDC_RATE } from "../src/near/ft.mjs";
 import {
@@ -336,16 +337,27 @@ export async function runOperationalCheck(config, deps = {}) {
     need(status.chain_id === config.network, "near-wrong-network");
     need(status.sync_info?.syncing === false, "near-node-syncing");
     const block = await rpc.block({ finality: "final" });
-    need(Number.isSafeInteger(Number(block.header.height)) && typeof block.header.hash === "string", "near-block-invalid");
-    const age = now() - Number(BigInt(block.header.timestamp_nanosec) / 1_000_000n);
-    need(age <= 90_000 && age >= -30_000, "near-finalized-head-stale");
-    return { rpc, block };
+    try { assertFreshBlock(block, { now: now() }); }
+    catch (error) { throw new CheckError(error.code === "RPC_STALE" ? "near-finalized-head-stale" : "near-block-invalid"); }
+    return { rpc, block, identity: nearBlockIdentity(block) };
   }, [])))).filter(Boolean);
   const near = await check("near-rpc-ready", async () => {
     need(nearNodes.length >= 1, "near-no-fresh-node");
-    const highest = nearNodes.reduce((a, b) => Number(a.block.header.height) >= Number(b.block.header.height) ? a : b);
-    need(nearNodes.every(n => Number(highest.block.header.height) - Number(n.block.header.height) <= 60
-      && (Number(n.block.header.height) !== Number(highest.block.header.height) || n.block.header.hash === highest.block.header.hash)), "near-finalized-nodes-disagree");
+    const highest = nearNodes.reduce((a, b) => a.identity.height >= b.identity.height ? a : b);
+    const top = highest.identity;
+    need(nearNodes.every(({ identity }) => top.height - identity.height <= 60), "near-finalized-nodes-disagree");
+    const canonical = new Map([[top.height, top.hash]]);
+    const heights = [...new Set(nearNodes.map(({ identity }) => identity.height))].filter(height => height !== top.height);
+    await Promise.all(heights.map(async height => {
+      try {
+        const overlap = nearBlockIdentity(await highest.rpc.block({ blockId: height }));
+        if (overlap.height === height) canonical.set(height, overlap.hash);
+      } catch { /* Compare every available proof before reporting a missing one. */ }
+    }));
+    need(new Set(canonical.values()).size === canonical.size
+      && nearNodes.every(({ identity }) => !canonical.has(identity.height) || canonical.get(identity.height) === identity.hash),
+    "near-finalized-nodes-disagree");
+    need(canonical.size === heights.length + 1, "near-finalized-overlap-unverified");
     return highest;
   }, ["near", "usdc"]);
   let refundHealth = null;

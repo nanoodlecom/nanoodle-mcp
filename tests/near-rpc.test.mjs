@@ -458,3 +458,124 @@ test("pool: the same finalized height cannot silently change its block hash", as
   await rpc.block({ finality: "final" }); changed = true;
   await assert.rejects(rpc.block({ finality: "final" }), { code: "RPC_BAD_RESPONSE" });
 });
+
+test("pool: a failover endpoint must match the previous finalized block before it can answer or send", async () => {
+  let at = 1_800_000_000_000, offline = false, disagrees = true;
+  const sent = [];
+  const f = hostFetch({
+    "a.test": req => offline ? { status: 503, body: {} } : { body: { result: req.method === "status" ? healthyStatus(at) : healthyHead(at) } },
+    "b.test": req => {
+      if (req.method === "status") return { body: { result: healthyStatus(at) } };
+      if (req.method === "block") {
+        assert.deepEqual(req.params, { block_id: 100 });
+        return { body: { result: { header: { ...healthyHead(at).header, hash: disagrees ? "other-finalized-chain" : "block-100" } } } };
+      }
+      if (req.method === "send_tx") sent.push(req.params.signed_tx_base64);
+      return { body: { result: { from: "b" } } };
+    },
+  });
+  const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet",
+    maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  assert.deepEqual(await rpc.block({ finality: "final" }), healthyHead(at));
+  offline = true;
+  at += 31_000;
+  await assert.rejects(rpc.sendTx("ORIGINAL_SIGNED_BYTES"), { code: "RPC_BAD_RESPONSE" });
+  assert.deepEqual(sent, []);
+  assert.ok(!f.calls.includes("b.test send_tx"));
+
+  disagrees = false;
+  at += 31_000;
+  f.calls.length = 0;
+  assert.deepEqual(await Promise.all([rpc.viewAccessKey({}), rpc.viewAccessKey({})]), [{ from: "b" }, { from: "b" }]);
+  assert.equal(f.calls.filter(c => c === "b.test block").length, 1);
+  assert.deepEqual(await rpc.sendTx("ORIGINAL_SIGNED_BYTES"), { from: "b" });
+  assert.deepEqual(sent, ["ORIGINAL_SIGNED_BYTES"]);
+});
+
+test("pool: an in-flight overlap check cannot authorize reads after another endpoint advances finality", { timeout: 5000 }, async t => {
+  const at = 1_800_000_000_000, checked = [];
+  const advancing = Promise.withResolvers(), advance = Promise.withResolvers();
+  const comparing = Promise.withResolvers(), finishComparison = Promise.withResolvers();
+  t.after(() => { advance.resolve(); finishComparison.resolve(); });
+  let readyToAdvance = false;
+  const f = hostFetch({
+    "a.test": async req => {
+      if (req.method === "query") return { status: 503, body: {} };
+      if (req.method === "status") return { body: { result: healthyStatus(at) } };
+      if (!readyToAdvance) return { body: { result: healthyHead(at) } };
+      advancing.resolve();
+      await advance.promise;
+      return { body: { result: healthyHead(at, 101) } };
+    },
+    "b.test": async req => {
+      if (req.method === "status") return { body: { result: healthyStatus(at) } };
+      if (req.method === "block") {
+        checked.push(req.params.block_id);
+        if (req.params.block_id === 100) {
+          comparing.resolve();
+          await finishComparison.promise;
+          return { body: { result: healthyHead(at) } };
+        }
+        assert.equal(req.params.block_id, 101);
+        return { body: { result: { header: { ...healthyHead(at, 101).header, hash: "other-101" } } } };
+      }
+      return { body: { result: { from: "wrong-chain" } } };
+    },
+  });
+  const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet",
+    maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
+  await rpc.block({ finality: "final" });
+  readyToAdvance = true;
+  const next = rpc.block({ finality: "final" });
+  await advancing.promise;
+  const rejected = assert.rejects(rpc.viewAccessKey({}), { code: "RPC_BAD_RESPONSE" });
+  await comparing.promise;
+  advance.resolve();
+  assert.deepEqual(await next, healthyHead(at, 101));
+  finishComparison.resolve();
+  await rejected;
+  assert.deepEqual(checked, [100, 101]);
+  assert.ok(!f.calls.includes("b.test query"));
+});
+
+test("pool: a paced request rechecks agreement at dispatch after waiting for a slot", { timeout: 5000 }, async t => {
+  let at = 1_800_000_000_000, advancing = false, alternateProven = false;
+  const readingLatest = Promise.withResolvers(), returnLatest = Promise.withResolvers();
+  const waitingToSend = Promise.withResolvers(), send = Promise.withResolvers();
+  t.after(() => { returnLatest.resolve(); send.resolve(); });
+  const f = hostFetch({
+    "a.test": async req => {
+      if (req.method === "status") return { body: { result: healthyStatus(at) } };
+      if (req.method === "query") return { status: 503, body: {} };
+      if (!advancing) return { body: { result: healthyHead(at) } };
+      readingLatest.resolve();
+      await returnLatest.promise;
+      return { body: { result: healthyHead(at, 101) } };
+    },
+    "b.test": req => {
+      if (req.method === "status") return { body: { result: healthyStatus(at) } };
+      if (req.method === "block") {
+        assert.equal(req.params.block_id, 100);
+        alternateProven = true;
+        return { body: { result: healthyHead(at) } };
+      }
+      return { body: { result: { from: "unchecked-endpoint" } } };
+    },
+  });
+  const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet", maxHeadAgeMs: 90_000,
+    minIntervalMs: 100, now: () => at, fetch: f.fetch, pause: async ms => {
+      at += ms;
+      if (alternateProven) { waitingToSend.resolve(); await send.promise; }
+    } });
+  await rpc.block({ finality: "final" });
+  advancing = true;
+  const next = rpc.block({ finality: "final" });
+  await readingLatest.promise;
+  const checked = assert.rejects(rpc.viewAccessKey({}), { code: "RPC_STALE" });
+  await waitingToSend.promise;
+  returnLatest.resolve();
+  assert.equal((await next).header.height, 101);
+  send.resolve();
+  await checked;
+  assert.ok(!f.calls.includes("b.test query"));
+});
