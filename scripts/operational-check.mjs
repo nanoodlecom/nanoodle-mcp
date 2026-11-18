@@ -14,7 +14,8 @@ import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
-import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
+import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
+import { readNearPaymentReceipts, readNearReceiptTransaction } from "../src/near/watch.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
 import { USDC_RATE } from "../src/near/ft.mjs";
@@ -41,6 +42,7 @@ import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs
 
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
+const NEAR_DISCOVERY_MAX_PROOF_AGE_MS = 27 * 3600_000;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
 const SHARED_SAVED_WORKFLOWS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
@@ -496,6 +498,43 @@ export async function runOperationalCheck(config, deps = {}) {
     }
     return health.watcher;
   }, ["near", "usdc"]);
+  if (config.nearDiscoveryReport) {
+    const sample = await check("near-canary-discovery-proof", () => {
+      let report;
+      try { report = read(config.nearDiscoveryReport); }
+      catch { throw new CheckError("near-discovery-canary-proof-unavailable"); }
+      const age = now() - Date.parse(report?.checkedAt);
+      const payer = config.canaryPayer?.accountId;
+      need(payer && payer !== config.merchant && report?.v === 1 && Number.isFinite(age) && age >= -30_000,
+        "near-discovery-canary-proof-invalid");
+      need(age <= NEAR_DISCOVERY_MAX_PROOF_AGE_MS, "near-discovery-canary-proof-stale");
+      try { base58Decode(report.paymentTx, 32); }
+      catch { throw new CheckError("near-discovery-canary-proof-invalid"); }
+      return { paymentTx: report.paymentTx, payer };
+    }, []);
+    if (sample) await check("near-payment-discovery", async () => {
+      need(near, "near-discovery-finalized-anchor-unavailable");
+      const { paymentTx, payer } = sample;
+      const accounts = [config.merchant, USDC_CONTRACTS[config.network]];
+      const witnessed = await Promise.all(nearNodes.map(({ index, rpc, identity }) => check(`near-discovery-peer-${index}`, async () => {
+        const tx = await rpc.txStatus({ txHash: paymentTx, senderId: payer });
+        const receipt = Array.isArray(tx.receipts_outcome)
+          && tx.receipts_outcome.find(row => row.outcome?.executor_id === config.merchant);
+        need(tx.final_execution_status === "FINAL" && Object.hasOwn(tx.status ?? {}, "SuccessValue")
+          && tx.transaction?.hash === paymentTx && tx.transaction.signer_id === payer && tx.transaction.receiver_id === config.merchant
+          && typeof receipt?.id === "string" && typeof receipt.block_hash === "string"
+          && Object.hasOwn(receipt.outcome.status ?? {}, "SuccessValue"), "near-discovery-canary-transaction-unverified");
+        const block = nearBlockIdentity(await rpc.block({ blockId: receipt.block_hash }));
+        need(block.hash === receipt.block_hash && block.height <= identity.height, "near-discovery-canary-block-mismatch");
+        const ids = await readNearPaymentReceipts(rpc, block.hash, accounts);
+        need(ids.has(receipt.id), "near-discovery-canary-receipt-missing");
+        const resolved = await readNearReceiptTransaction(rpc, receipt.id, block.height);
+        need(resolved.transaction_hash === paymentTx && resolved.sender_account_id === payer, "near-discovery-canary-receipt-mismatch");
+        return true;
+      }, [])));
+      need(witnessed.some(Boolean), "near-payment-discovery-unverified");
+    }, []);
+  }
   // Real checkout IDs use 12 characters after their prefix. These GETs
   // exercise public routing and stream termination without accessing a quote.
   const missingNearQuote = "nq_operational_probe_unissued";
@@ -819,6 +858,7 @@ async function productionConfig(env = process.env) {
   const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", invocationId: env.INVOCATION_ID,
     backupExportReport: env.OPERATIONAL_BACKUP_EXPORT_REPORT, backupCopyReport: env.OPERATIONAL_BACKUP_COPY_REPORT,
+    nearDiscoveryReport: env.OPERATIONAL_NEAR_DISCOVERY_REPORT,
     outDir: "/srv/nanoodle-mcp/out",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK, canaryPayer,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
