@@ -768,7 +768,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     if (value instanceof MediaRef) {
       await mkdir(outDir, { recursive: true });
       // bytes() before naming: for hosted media the mime is only known after the fetch
-      const bytes = await value.bytes();
+      const bytes = await value.bytes(hostedRunOptions());
       const safeKey = o.key.replace(/[^\w.-]+/g, "_");
       const ext = extForMedia(bytes, value.mime);
       const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
