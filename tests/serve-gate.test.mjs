@@ -998,30 +998,84 @@ test("payment-required text carries the tool's typical runtime when known", asyn
   assert.match(quote.content[0].text, /send exactly 0\.08\d* XNO/);
 });
 
-test("gate state survives a restart: pending quote pays and settles under the reloaded gate", async () => {
-  const { mkdtemp } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-state-")), "gate-state.json");
+test("gate state survives a restart: pending quote pays and settles under the reloaded gate", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "gate-state-"));
+  const stateFile = join(dir, "gate-state.json");
+  let original, restored, server;
+  t.after(async () => {
+    if (server) {
+      server.close();
+      server.closeAllConnections();
+    }
+    await restored?.stop();
+    await original?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
 
   const chain1 = fakeChain();
   const registry1 = fakeRegistry();
-  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  original = makeGate(chain1, { registry: registry1, stateFile });
+  const gate1 = original.wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
   await untilState(stateFile, "the quote to reach the state file", quoteIn(x.paymentId));
+  await original.stop();
 
-  // "deploy": a brand-new gate + chain, same state file
   const chain2 = fakeChain();
   const registry2 = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.02 }) });
-  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
-  chain2.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
-  const res = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
-  assert.ok(!res.isError, JSON.stringify(res.content));
+  restored = makeGate(chain2, { registry: registry2, stateFile });
+  const { callTool, listTools } = restored.wrapRegistry(registry2);
+  server = await serveHttp({ host: "127.0.0.1", port: 0, name: "t", version: "0", listTools, callTool,
+    gate: restored, publicBase: "http://pay.test", log: () => {} });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const watch = await fetch(`${base}/x402/watch/${x.paymentId}`, {
+    headers: { Accept: "text/event-stream" }, signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(watch.status, 200);
+  assert.match(watch.headers.get("content-type"), /^text\/event-stream/);
+  const frames = [], paymentHash = "A".repeat(64);
+  await readSse(watch, ({ event, data }) => {
+    if (event !== "status") return;
+    frames.push(data);
+    if (frames.length === 1) {
+      assert.equal(data.status, "pending");
+      assert.equal(data.done, undefined);
+      chain2.state.receivable[paymentHash] = { amount: x.amountRaw, source: PAYER };
+    }
+  });
+  const paid = frames.at(-1);
+  assert.equal(paid?.status, "paid");
+  assert.equal(paid.done, true);
+  assert.ok(paid.next.includes(x.paymentId));
+  const committed = quoteIn(x.paymentId)(JSON.parse(await readFile(stateFile, "utf8")));
+  assert.equal(committed.status, "paid");
+  assert.equal(committed.payHash, paymentHash);
+  assert.equal(registry2.callCount(), 0);
+
+  const run = async () => {
+    const reply = await fetch(`${base}/mcp`, {
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } } }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    assert.equal(reply.status, 200);
+    return (await reply.json()).result;
+  };
+  const result = await run();
+  assert.ok(!result.isError, JSON.stringify(result.content));
+  const replay = await run();
+  assert.ok(!replay.isError);
+  assert.equal(replay.content[0].text, result.content[0].text);
   assert.equal(registry2.callCount(), 1);
-  // settle math still exact after the pair's BigInts round-tripped through JSON
-  const change = await until("the change send to reach the chain",
-    () => chain2.state.transfers.find((t) => t.describe === "change:"));
+  const saved = await untilState(stateFile, "the settled run and its recorded change",
+    state => { const q = quoteIn(x.paymentId)(state); return q?.settled && q.transferReceipts?.change; });
+  assert.equal(chain2.state.transfers.length, 1);
+  const [change] = chain2.state.transfers;
+  assert.equal(change.describe, "change:");
   assert.equal(BigInt(x.amountRaw) - 24n * 10n ** 27n, BigInt(change.amountRaw));
+  const receipt = quoteIn(x.paymentId)(saved).transferReceipts.change;
+  assert.equal(receipt.amountRaw, change.amountRaw);
+  assert.equal(receipt.to, PAYER);
 });
 
 test("gate state survives a restart: completed runs replay, they never run twice", async () => {

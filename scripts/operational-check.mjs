@@ -406,31 +406,37 @@ export async function runOperationalCheck(config, deps = {}) {
     }
     return health.watcher;
   }, ["near", "usdc"]);
-  // Real checkout IDs use 12 characters after nq_. These GETs exercise
-  // public routing and the terminal watch reply without accessing a quote.
-  const missingQuote = "nq_operational_probe_unissued";
-  await Promise.all([
-    check("near-payment-page", async () => {
-      const response = await request(`${config.site}/pay/${missingQuote}`);
+  // Real checkout IDs use 12 characters after their prefix. These GETs
+  // exercise public routing and stream termination without accessing a quote.
+  const missingNearQuote = "nq_operational_probe_unissued";
+  const unknownTerminal = value => value?.status === "unknown" && value.done === true
+    && typeof value.next === "string" && value.next.trim().length > 0;
+  const checkCheckout = ({ rail, site, prefix, id, statusCode, watchQuery = "", domains }) => Promise.all([
+    check(`${rail}-payment-page`, async () => {
+      const response = await request(`${site}/pay/${id}`);
       need(response.status === 404 && /^text\/html\b/.test(response.headers.get("content-type") || "")
-        && /Unknown or expired payment/.test(await response.text()), "near-payment-page-response-invalid");
-    }, ["near", "usdc"]),
-    check("near-payment-status-route", async () => {
-      const response = await request(`${config.site}/near/status/${missingQuote}?wait=1`);
-      need(response.status === 404, "near-payment-status-response-invalid");
-      const value = await response.json();
-      need(value?.status === "unknown" && value.done === true, "near-payment-status-response-invalid");
-    }, ["near", "usdc"]),
-    check("near-payment-event-stream", async () => {
-      const response = await request(`${config.site}/near/watch/${missingQuote}?run=1`, { headers: { accept: "text/event-stream" } });
-      need(response.ok && /^text\/event-stream\b/.test(response.headers.get("content-type") || ""), "near-payment-stream-response-invalid");
+        && /Unknown or expired payment/.test(await response.text()), `${rail}-payment-page-response-invalid`);
+    }, domains),
+    check(`${rail}-payment-status-route`, async () => {
+      const response = await request(`${site}${prefix}/status/${id}?wait=1`);
+      need(response.status === statusCode && /^application\/json\b/.test(response.headers.get("content-type") || "")
+        && unknownTerminal(await response.json()), `${rail}-payment-status-response-invalid`);
+    }, domains),
+    check(`${rail}-payment-event-stream`, async () => {
+      const response = await request(`${site}${prefix}/watch/${id}${watchQuery}`, { headers: { accept: "text/event-stream" } });
+      need(response.status === 200 && /^text\/event-stream\b/.test(response.headers.get("content-type") || ""),
+        `${rail}-payment-stream-response-invalid`);
       const frame = /^event: status\r?\ndata: (.+)\r?\n\r?\n/m.exec(await response.text());
-      need(frame, "near-payment-stream-response-invalid");
-      const value = JSON.parse(frame[1]);
-      need(value?.status === "unknown" && value.done === true, "near-payment-stream-response-invalid");
-    }, ["near", "usdc"]),
+      need(frame && unknownTerminal(JSON.parse(frame[1])), `${rail}-payment-stream-response-invalid`);
+    }, domains),
+  ]);
+  await Promise.all([
+    checkCheckout({ rail: "near", site: config.site, prefix: "/near", id: missingNearQuote, statusCode: 404,
+      watchQuery: "?run=1", domains: ["near", "usdc"] }),
+    checkCheckout({ rail: "nano", site: config.nanoSite, prefix: "/x402", id: "pay_operational_probe_unissued",
+      statusCode: 200, domains: ["nano"] }),
     check("near-payment-result-route", async () => {
-      const response = await request(`${config.site}/near/result/${missingQuote}`);
+      const response = await request(`${config.site}/near/result/${missingNearQuote}`);
       need(response.status === 404 && (await response.json())?.error === "Unknown or expired payment", "near-payment-result-response-invalid");
     }, ["near", "usdc"]),
   ]);
