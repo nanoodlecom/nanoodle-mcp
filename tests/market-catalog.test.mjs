@@ -6,7 +6,7 @@
 // catalog and graph files. Against the market and NanoGPT stand-ins.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -581,14 +581,22 @@ test("notifications: listing-prefixed lines still match; the webhook gets them a
 
 /* ------------------------------ the two commands ------------------------------ */
 
-function runNode(args, env = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, args, { env: { PATH: process.env.PATH, HOME: tmpdir(), ...env }, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-    child.on("exit", (status) => resolve({ status, stdout, stderr }));
-  });
+async function runNode(args, env = {}) {
+  const lockDir = mkdtempSync(join(tmpdir(), "market-cli-locks-"));
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, args, {
+        env: { PATH: process.env.PATH, ...env, NANOODLE_WRITER_LOCK_DIR: lockDir }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, stdout, stderr }));
+    });
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
 }
 
 test("market-worker.mjs --agents-file: serves the listings with a token, skips the one without; a malformed catalog exits 2", { timeout: 60_000 }, async () => {
