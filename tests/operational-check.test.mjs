@@ -12,6 +12,7 @@ import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtur
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 import { USDC_CONTRACTS } from "../src/near/index.mjs";
+import { nearFundingNeed, nearRefundClaims, nearRefundCosts } from "../src/near/funding.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 
@@ -507,6 +508,65 @@ test("independent token reads preserve native readiness unless a paid USDC claim
     assert.ok(report.checks.some(c => c.stage === "usdc-funding-reads" && c.code === "usdc-refund-funding-unavailable"));
     assert.equal(report.checks.some(c => c.stage === "usdc-liquidity"), false);
   }
+});
+
+test("independent funding rejects a balance before a refund finalized during the read", async t => {
+  for (const fallback of [false, true]) {
+    let completed = false;
+    const f = fixture(({ url, body }, _config, states) => {
+      if (body?.params?.request_type === "view_account" && url.hostname === "near-0.example") {
+        const key = "/state/near-state.json";
+        states[key] = { ...states[key], meta: { refundFinalHeight: 101 } };
+        completed = true;
+      }
+      if (!fallback || !completed || url.hostname !== "near-1.example") return null;
+      const rpc = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
+      const at = { block_height: 101, block_hash: "post-refund" };
+      if (body?.method === "block") {
+        return rpc({ header: { height: 101, hash: at.block_hash, timestamp_nanosec: String(BigInt(NOW) * 1_000_000n) } });
+      }
+      if (body?.method !== "query" || body.params.block_id !== at.block_hash) return null;
+      if (body.params.request_type === "view_access_key") return rpc({ permission: "FullAccess", nonce: 101, ...at });
+      if (body.params.request_type === "view_account") return rpc({ amount: "1000000000000000000000000", storage_usage: 500, ...at });
+      const result = body.params.method_name === "ft_balance_of" ? "1000000" : { total: "1" };
+      return rpc({ result: [...Buffer.from(JSON.stringify(result))], ...at });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const proof = report.checks.find(c => c.stage === "near-fee-and-balance-reads");
+    assert.equal(proof.ok, fallback);
+    assert.equal(proof.code, fallback ? undefined : "near-refund-balance-before-checkpoint");
+    assert.deepEqual(report.admission, { nano: true, near: fallback, usdc: fallback, market: true });
+    assert.ok(f.calls.some(c => c.url.hostname === "near-1.example" && c.body?.params?.request_type === "view_account"
+      && c.body.params.block_id === (fallback ? "post-refund" : "same-block")));
+    assert.doesNotMatch(JSON.stringify(report), /post-refund|block_height|refundFinalHeight/);
+  }
+});
+
+test("independent refund headroom distinguishes paid liabilities from the next quote fee", async t => {
+  const costs = nearRefundCosts(nearProtocol({ chainId: "mainnet" }), "100000000");
+  const claims = nearRefundClaims({ quotes: {}, refunds: {} });
+  const storageUsage = 500;
+  const nearBalance = nearFundingNeed({ claims, costs, storageUsage, extraAsset: "near" });
+  const f = fixture(({ body }) => body?.params?.request_type === "view_account" && body.params.block_id
+    ? Response.json({ jsonrpc: "2.0", id: body.id, result: { block_height: 100, block_hash: "same-block", amount: nearBalance.toString(), storage_usage: storageUsage } })
+    : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  const check = stage => report.checks.find(c => c.stage === stage);
+  assert.equal(check("near-liquidity").ok, true);
+  assert.equal(check("near-independent-refund-headroom").ok, true);
+  assert.equal(check("usdc-independent-refund-headroom").code, "independent-refund-headroom-insufficient");
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: false, market: true });
+});
+
+test("an independently proven USDC refund shortfall pauses both quote rails", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/state/near-state.json"].quotes.paid = { id: "paid", asset: "usdc", status: "paid", paidYocto: "1000001" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+  assert.ok(report.checks.some(c => c.stage === "near-independent-refund-headroom" && c.code === "independent-usdc-refund-debt-uncovered"));
 });
 
 test("an unverified outgoing refund alerts immediately while its principal remains in the accounting", async () => {

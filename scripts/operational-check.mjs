@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
-import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
+import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
 import { USDC_RATE } from "../src/near/ft.mjs";
@@ -27,7 +27,7 @@ import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
-import { readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
+import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
 import { RAW_PER_XNO } from "../src/near/rates.mjs";
 import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
@@ -190,9 +190,13 @@ export async function runOperationalCheck(config, deps = {}) {
       }, [])));
     }
   }
+  const readNearLedger = () => {
+    const ledger = read(join(config.outDir, "near-state.json"));
+    need(ledger?.v === 1 && ledger.network === config.network && ledger.merchant === config.merchant, "ledger-account-mismatch");
+    return ledger;
+  };
   const state = await check("payment-state", async () => {
-    const nano = read(join(config.outDir, "gate-state.json")), near = read(join(config.outDir, "near-state.json"));
-    need(near.network === config.network && near.merchant === config.merchant, "ledger-account-mismatch");
+    const nano = read(join(config.outDir, "gate-state.json")), near = readNearLedger();
     const market = config.agents.map(a => read(join(config.marketStateDir, a.handle, "market-state.json")));
     const liabilities = paymentLiabilities({ nano, near, market }, { now: now() });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
@@ -409,31 +413,51 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["near", "usdc"]);
     const tokenContract = USDC_CONTRACTS[config.network];
     await check("usdc-receive-registration", () => checkUsdcMerchant({ rpc: near.rpc, network: config.network, merchantId: config.merchant }), ["usdc"]);
-    const funding = await check("near-fee-and-balance-reads", async () => {
+    const fundingProof = await check("near-fee-and-balance-reads", async () => {
+      let floor = nearRefundFinalHeight((state?.near ?? readNearLedger()).meta?.refundFinalHeight);
+      const qualify = (frame) => {
+        // A refund can finalize while the account and fee RPCs are in flight.
+        // Use the latest money state and require a block that includes it.
+        const ledger = readNearLedger();
+        floor = Math.max(floor, nearRefundFinalHeight(ledger.meta?.refundFinalHeight));
+        need(frame.blockHeight >= floor, "near-refund-balance-before-checkpoint");
+        return { frame, claims: nearRefundClaims(ledger, { now: now() }) };
+      };
       let last, nativeFrame;
       for (const node of [near, ...nearNodes.filter(n => n !== near)]) {
         try {
           const frame = await readNearFunding({ rpc: node.rpc, network: config.network, accountId: config.merchant,
             publicKey: config.nearPublicKey, tokenContract, optionalTokenBalance: true, now });
-          if (!tokenContract || frame.usdcAtomic != null && frame.usdcRegistered) return frame;
-          nativeFrame ??= frame;
+          const proof = qualify(frame);
+          if (!tokenContract || frame.usdcAtomic != null && frame.usdcRegistered) return proof;
+          if (!nativeFrame || frame.blockHeight > nativeFrame.blockHeight) nativeFrame = frame;
         } catch (e) { last = e; }
       }
-      if (nativeFrame) return nativeFrame;
+      if (nativeFrame) return qualify(nativeFrame);
       throw last;
     }, ["near", "usdc"]);
-    if (funding && tokenContract) {
-      const sharedDebtUnverified = funding.usdcAtomic == null && state?.liabilities.usdcAtomic > 0n;
+    if (fundingProof && tokenContract) {
+      const { frame, claims } = fundingProof;
+      const sharedDebtUnverified = frame.usdcAtomic == null && claims.usdcAtomic > 0n;
       await check("usdc-funding-reads", () => {
-        need(funding.usdcAtomic != null && funding.usdcRegistered, "usdc-refund-funding-unavailable");
+        need(frame.usdcAtomic != null && frame.usdcRegistered, "usdc-refund-funding-unavailable");
       }, sharedDebtUnverified ? ["near", "usdc"] : ["usdc"]);
     }
-    if (funding && state && rates) await check("refund-liquidity-accounting", async () => {
-      const results = liquidityChecks({ nearBalanceYocto: funding.balanceYocto.toString(), storageUsage: funding.storageUsage,
-        costs: funding.costs, usdcBalanceAtomic: funding.usdcAtomic?.toString() ?? "0", liabilities: state.liabilities,
-        nanoBalanceRaw: nano?.confirmed_balance || "0", xnoUsd: rates.xnoUsd, providerReserveUsd });
-      for (const result of results.filter(r => r.stage === "near-liquidity" || r.stage === "usdc-liquidity" && funding.usdcAtomic != null)) {
+    if (fundingProof) await check("refund-liquidity-accounting", async () => {
+      const { frame, claims } = fundingProof;
+      const results = nearLiquidityChecks({ nearBalanceYocto: frame.balanceYocto.toString(), storageUsage: frame.storageUsage,
+        costs: frame.costs, usdcBalanceAtomic: frame.usdcAtomic?.toString() ?? "0", liabilities: claims });
+      for (const result of results.filter(r => r.stage === "near-liquidity" || frame.usdcAtomic != null)) {
         checks.push({ ...result, ...(result.ok ? {} : { domains: result.stage === "usdc-liquidity" ? ["usdc"] : ["near", "usdc"] }) });
+      }
+      const coversTokenDebt = claims.usdcAtomic === 0n || frame.usdcAtomic != null && frame.usdcAtomic >= claims.usdcAtomic;
+      for (const asset of ["near", "usdc"]) {
+        if (asset === "usdc" && (frame.usdcAtomic == null || !frame.usdcRegistered)) continue;
+        await check(`${asset}-independent-refund-headroom`, () => {
+          need(coversTokenDebt, "independent-usdc-refund-debt-uncovered");
+          need(frame.balanceYocto >= nearFundingNeed({ claims, costs: frame.costs, storageUsage: frame.storageUsage, extraAsset: asset }),
+            "independent-refund-headroom-insufficient");
+        }, [asset]);
       }
     }, ["near", "usdc"]);
   }
