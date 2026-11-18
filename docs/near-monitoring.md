@@ -275,10 +275,27 @@ systemd-run --unit=nanoodle-operational-check-alert-test \
 ```
 
 Read the broader [reliability audit](operational-reliability.md) for remaining
-runtime prevention and full-host recovery requirements. These probes still run
-on the app's VPS; an independent missing-heartbeat observer and an alert path
-available during a Babel/host outage remain necessary.
+runtime prevention and full-host recovery requirements.
 
 Protocol references: [Nano confirmed account fields](https://docs.nano.org/commands/rpc-protocol/#account_info),
 [NEAR gas prices](https://docs.near.org/api/rpc/gas) and
 [NEAR storage/transaction configuration](https://docs.near.org/api/rpc/protocol).
+
+## Public availability from outside production
+
+The [public availability workflow](../.github/workflows/public-check.yml) runs
+on a GitHub-hosted runner every 15 minutes. It checks MCP discovery on the Nano
+and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund funding,
+the Babel authentication challenge, and NEAR AI Market's public site, API and
+Nanoodle listings. It uses public discovery and status requests with bounded
+retries and records only the check results. The workflow uses no wallet keys,
+payment quotes, transfers or inference.
+
+Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
+or use **Run workflow** to check from a separate network. GitHub routes scheduled
+failure notifications to the account that last changed the schedule, according
+to its notification settings. Scheduled runs may be delayed or skipped. The
+VPS monitors still check wallet balances, agreement between nodes and private
+payment state. They send their alerts to Ember through Babel. A whole VPS
+outage can interrupt that route, while GitHub can still record the public
+failure. [GitHub schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
