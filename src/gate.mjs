@@ -38,6 +38,7 @@ import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
 import { nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
+import { syncPrivateStateParentSync } from "./private-state.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -303,16 +304,29 @@ export function createChargeGate({
     for (const w of q.waiters.splice(0)) w();
   }
 
-  async function markPaid(q, { source, hash, via }) {
-    q.status = "paid";
-    q.paidAt = now();
-    q.source = source || null;
-    q.payHash = hash || null;
+  const statusOf = q => q.depositPending && q.status === "paid" ? "pending" : q.status;
+
+  function publishDeposit(q) {
+    const via = q.depositPending;
+    delete q.depositPending;
+    if (q.status === "expired") {
+      resolveWaiters(q);
+      log(`late payment for expired quote ${q.id} — refunding`);
+      refund(q, "late_payment").catch(() => log(`could not start the late refund for quote ${q.id}`));
+      return;
+    }
     log(`payment ${q.id}: ${rawToXno(q.amountRaw)} XNO received via ${via}` +
-      (source ? ` from ${source}` : "") + ` (${q.tool})`);
+      (q.source ? ` from ${q.source}` : "") + ` (${q.tool})`);
     usage("paid", { paymentId: q.id, tool: q.tool, amountRaw: q.amountRaw, usd: q.usd, source: q.source, via, settleMs: q.paidAt - q.createdAt });
-    persist();
     resolveWaiters(q);
+  }
+
+  async function commitDeposits() {
+    const pending = [...quotes.values()].filter(q => q.depositPending);
+    if (!pending.length && !persistenceFailed) return;
+    if (!await persist()) throw new Error("Nano payment storage is unavailable");
+    // Another observation may have committed the same records while we waited.
+    for (const q of pending) if (q.depositPending) publishDeposit(q);
   }
 
   /*
@@ -428,10 +442,10 @@ export function createChargeGate({
    * retry after restart can resume it. Settled text receipts never buy another
    * model run merely because their content was deliberately not persisted.
    */
-  let saveChain = Promise.resolve();
+  let saveChain = Promise.resolve(true);
   let saveQueued = false, pendingWrites = 0, persistenceFailed = false;
   function persist() {
-    if (!stateFile || saveQueued) return;
+    if (!stateFile || saveQueued) return saveChain;
     const write = async () => {
       saveQueued = false; // snapshot at write time — later mutations queue another write
       const data = JSON.stringify({
@@ -472,25 +486,28 @@ export function createChargeGate({
         owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields,
           createdAt: o.createdAt, tries: o.tries, held: o.held === true })),
       });
-      await mkdir(dirname(stateFile), { recursive: true });
+      const parent = dirname(stateFile);
+      await mkdir(parent, { recursive: true });
       const tmp = stateFile + ".tmp";
-      const handle = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+      const directory = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try {
-        const state = await handle.stat();
-        if (!state.isFile() || state.nlink !== 1 || state.uid !== process.getuid()) throw Error("unsafe payment-state staging file");
-        await handle.chmod(0o600);
-        await handle.truncate(0);
-        await handle.writeFile(data);
-        await handle.sync();
-      } finally { await handle.close(); }
-      await rename(tmp, stateFile);
-      const directory = await open(dirname(stateFile), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      try { await directory.sync(); } finally { await directory.close(); }
+        const handle = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+        try {
+          const state = await handle.stat();
+          if (!state.isFile() || state.nlink !== 1 || state.uid !== process.getuid()) throw Error("unsafe payment-state staging file");
+          await handle.chmod(0o600);
+          await handle.truncate(0);
+          await handle.writeFile(data);
+          await handle.sync();
+        } finally { await handle.close(); }
+        await rename(tmp, stateFile);
+        await directory.sync();
+      } finally { await directory.close(); }
       persistenceFailed = false;
     };
     const complete = async () => {
-      try { await write(); }
-      catch (error) { persistenceFailed = true; log(`cannot persist gate state to ${stateFile}: ${error.message}`); }
+      try { await write(); return true; }
+      catch (error) { persistenceFailed = true; log(`cannot persist gate state to ${stateFile}: ${error.message}`); return false; }
       finally { pendingWrites--; }
     };
     // Count the queued write before yielding. Completion of a refund or model
@@ -498,6 +515,7 @@ export function createChargeGate({
     const scheduled = maintenance ? maintenance.capture(complete, "wallet") : complete;
     saveQueued = true; pendingWrites++;
     saveChain = saveChain.then(scheduled);
+    return saveChain;
   }
 
   if (stateFile) {
@@ -506,6 +524,8 @@ export function createChargeGate({
       if (!data || typeof data !== "object" || !Array.isArray(data.quotes) || !Array.isArray(data.owed)) {
         throw new Error("invalid gate state structure");
       }
+      try { syncPrivateStateParentSync(stateFile); }
+      catch (cause) { throw new Error("cannot synchronize the restored Nano payment state", { cause }); }
       // A pre-v2 file predates content stripping: its results may be full tool
       // output (text included) and its errors may be free-text upstream messages
       // — both can quote user content. We can't prove any legacy field is clean,
@@ -597,6 +617,7 @@ export function createChargeGate({
     const t = now();
     let changed = false;
     for (const q of quotes.values()) {
+      if (q.unpublished || q.depositPending) continue;
       if (q.status === "pending" && t > q.expiresAt) {
         q.status = "expired";
         resolveWaiters(q);
@@ -623,16 +644,15 @@ export function createChargeGate({
     const bucket = BigInt(amt) / GRAIN;
     for (const q of quotes.values()) {
       if (BigInt(q.amountRaw) / GRAIN !== bucket) continue;
-      if (q.status === "pending") return void markPaid(q, meta);
-      if (q.status === "expired" && !q.refunding) {
-        log(`late payment for expired quote ${q.id} — refunding`);
-        q.source = q.source || meta.source || null;
-        q.payHash = q.payHash || meta.hash || null;
-        q.paidAt = q.paidAt ?? now();
-        persist();
-        return void refund(q, "late_payment");
-      }
-      return; // paid/consumed already — a re-scan of the same block, not a new payment
+      if (q.unpublished || q.depositPending || q.refunding || !["pending", "expired"].includes(q.status)) return;
+      const observedAt = now();
+      if (q.status === "pending") q.status = observedAt <= q.expiresAt ? "paid" : "expired";
+      q.source = q.source || meta.source || null;
+      q.payHash = q.payHash || meta.hash || null;
+      q.paidAt ??= observedAt;
+      q.depositPending = meta.via;
+      if (!stateFile) publishDeposit(q);
+      return;
     }
   }
 
@@ -641,7 +661,7 @@ export function createChargeGate({
   let timer = null;
   let wsConnected = false;
 
-  const anyPending = () => [...quotes.values()].some((q) => q.status === "pending");
+  const anyPending = () => [...quotes.values()].some(q => !q.unpublished && statusOf(q) === "pending");
   // Recently expired quotes stay watched so a payment that arrives too late is
   // noticed and bounced straight back instead of silently kept.
   const LATE_WATCH_MS = 60 * 60 * 1000;
@@ -649,7 +669,7 @@ export function createChargeGate({
   const anyPaymentWatchable = () => {
     const t = now();
     return [...quotes.values()].some((q) =>
-      q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS));
+      !q.unpublished && (q.depositPending || q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS)));
   };
   // Keep ticking for the owed queue too, but that is money going OUT on its own
   // backoff (OWED_BACKOFF_MS) — it must never pull the receivable poll up to
@@ -658,7 +678,7 @@ export function createChargeGate({
   // refund kept failing — and since a refund typically fails because the RPC is
   // throttling, that poll fed the very rate limit that was blocking it. One
   // failed refund held the loop for 34h and 5,158 calls on 2026-07-23/25.
-  const anyWatchable = () => owed.length > 0 || anyPaymentWatchable();
+  const anyWatchable = () => persistenceFailed || owed.length > 0 || anyPaymentWatchable();
 
   /**
    * Race cover for pocketed payments: the wallet (same process, other duties)
@@ -701,11 +721,13 @@ export function createChargeGate({
     // Empty history seeds an empty-string sentinel: it matches no real hash, so
     // once the account's FIRST blocks appear the walk reads them all (bounded by
     // the page cap) instead of treating that scan as another one-page seeding.
+    await commitDeposits();
     if (newest) lastHistoryHash = newest;
     else if (lastHistoryHash === null) lastHistoryHash = "";
   }
 
   async function scan() {
+    await commitDeposits();
     prune();
     await retryOwed();
     // Only the owed queue left → retryOwed above is the whole job. Skip the
@@ -720,6 +742,7 @@ export function createChargeGate({
       const source = typeof v === "object" && v !== null ? v.source : null;
       matchAmount(amount, { source, hash, via: "receivable poll" });
     }
+    await commitDeposits();
     // A full window means blocks beyond it are invisible — ask the wallet to
     // pocket (queued housekeeping, never blocks a payment) so the overflow
     // reappears in account_history, which the walk below reads exhaustively.
@@ -819,11 +842,13 @@ export function createChargeGate({
       if (m && m.topic === "confirmation" && m.message) {
         const blk = m.message.block || {};
         if (blk.subtype === "send" && blk.link_as_account === address) {
-          const observe = () => matchAmount(m.message.amount, { source: blk.account, hash: m.message.hash, via: "websocket" });
-          if (maintenance) maintenance.run(observe, "background").catch(error => {
+          const observe = async () => {
+            matchAmount(m.message.amount, { source: blk.account, hash: m.message.hash, via: "websocket" });
+            await commitDeposits();
+          };
+          (maintenance ? maintenance.run(observe, "background") : observe()).catch(error => {
             if (error.code !== "SERVICE_DRAINING") log("Websocket payment observation needs retry through polling");
           });
-          else observe();
         }
       }
     };
@@ -937,16 +962,18 @@ export function createChargeGate({
     quote(id) {
       prune();
       const q = quotes.get(String(id));
-      if (!q) return null;
+      if (!q || q.unpublished) return null;
+      const status = statusOf(q);
       const out = {
-        id: q.id, tool: q.tool, status: q.status, usd: q.usd,
+        id: q.id, tool: q.tool, status, usd: q.usd,
         amountRaw: q.amountRaw, amountXno: rawToXno(q.amountRaw),
         address, uri: nanoUri(q), expiresAt: new Date(q.expiresAt).toISOString(),
+        ...(q.depositPending && q.status === "paid" && { checkingPayment: true }),
       };
       // Terminal states close the watch SSE — package the next-step so an agent
       // (or any event-loop subscriber) does not sit on a bare "paid" with no path
       // to the result stream.
-      if (q.status !== "pending") {
+      if (status !== "pending") {
         out.done = true;
         const next = nextFor(q);
         if (next) out.next = next;
@@ -979,8 +1006,8 @@ export function createChargeGate({
      */
     waitForPayment(id, ms, { signal } = {}) {
       const q = quotes.get(String(id));
-      if (!q) return Promise.resolve("unknown");
-      if (q.status !== "pending" || signal?.aborted) return Promise.resolve(q.status);
+      if (!q || q.unpublished) return Promise.resolve("unknown");
+      if (statusOf(q) !== "pending" || signal?.aborted) return Promise.resolve(statusOf(q));
       ensureWatching();
       return new Promise((res) => {
         const finish = () => {
@@ -988,7 +1015,7 @@ export function createChargeGate({
           signal?.removeEventListener("abort", finish);
           const index = q.waiters.indexOf(finish);
           if (index !== -1) q.waiters.splice(index, 1);
-          res(q.status);
+          res(statusOf(q));
         };
         const t = setTimeout(finish, ms);
         q.waiters.push(finish);
@@ -1233,6 +1260,7 @@ export function createChargeGate({
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
           if (validate) await validate({ name, arguments: args });
+          if (persistenceFailed && !await persist()) return errResult("Cannot issue a Nano quote while payment storage is unavailable. Try again shortly.");
           if (await canQuote() !== true) return errResult("Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
@@ -1248,11 +1276,18 @@ export function createChargeGate({
             pair, // settle math must use the exact pair the deposit was priced at
             amountRaw,
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
-            status: "pending", waiters: [],
+            status: "pending", unpublished: true, waiters: [],
             etaMs: etaOf(name),
           };
           quotes.set(q.id, q);
-          persist();
+          let committed = false;
+          try { committed = await persist(); }
+          finally { if (!committed) quotes.delete(q.id); }
+          if (!committed) {
+            ensureWatching();
+            return errResult("Cannot issue a Nano quote while payment storage is unavailable. Try again shortly.");
+          }
+          delete q.unpublished;
           watchNow();
           usage("quote", { paymentId: q.id, tool: name, usd: q.usd, amountRaw: q.amountRaw, xnoUsd: rateDisplay(pair), rateSource: rateSource() });
           // Phase 1: this tools/call always HANGS UP with the payment-required
@@ -1264,7 +1299,7 @@ export function createChargeGate({
           return paymentRequiredResult(q);
         } else {
           q = quotes.get(String(_payment_id));
-          if (!q) {
+          if (!q || q.unpublished) {
             return errResult(`unknown or expired payment id "${_payment_id}" — call the tool again without _payment_id for a fresh quote.`);
           }
           if (q.tool !== name || q.argsHash !== argsHash) {
@@ -1290,7 +1325,7 @@ export function createChargeGate({
           else if (ctx && typeof ctx.report === "function") ctx.report(s);
         };
 
-        if (q.status === "pending") {
+        if (statusOf(q) === "pending") {
           // Phase 3 is the RESULTS stream — it must not also be the payment
           // monitor. A short waitMs covers the race where payment lands as the
           // agent switches from watch → results; it never holds through the
@@ -1299,6 +1334,7 @@ export function createChargeGate({
           note(`checking payment ${q.id}`);
           const st = await gate.waitForPayment(q.id, waitMs);
           if (st === "pending") {
+            if (q.depositPending) return errResult("The original Nano transfer is being recorded. Keep monitoring this payment ID.");
             return errResult(
               `payment ${q.id} hasn't arrived yet — this tools/call is the RESULTS stream, not the payment monitor. ` +
               `Hang it up. Open the agent-only watch SSE ${watchUrl(q)} (never show that URL to the user), ` +

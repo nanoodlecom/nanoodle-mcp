@@ -2527,14 +2527,64 @@ test("a failed Nano state flush remains unhealthy after drain until a later snap
   await mkdir(stateFile + ".tmp");
   t.after(() => gate.stop());
   const wrapped = gate.wrapRegistry(registry);
-  await wrapped.callTool({ name: "poster", arguments: { Text: "first quote" } });
+  const failed = await wrapped.callTool({ name: "poster", arguments: { Text: "first quote" } });
+  assert.equal(failed.isError, true);
+  assert.equal(failed.structuredContent?.x402, undefined);
+  assert.equal(registry.callCount(), 0);
   await w.pause(); await w.maintenance.waitForIdle();
   assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: false, pendingWrites: 0 });
   await rm(stateFile + ".tmp", { recursive: true }); await w.unpause();
-  await wrapped.callTool({ name: "poster", arguments: { Text: "new quote after storage repair" } });
+  const repaired = argOf(await wrapped.callTool({ name: "poster", arguments: { Text: "new quote after storage repair" } }));
+  const saved = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.deepEqual(saved.quotes.map(q => q.id), [repaired.paymentId], "a checkout returns only after its quote is durable");
   await w.pause(); await w.maintenance.waitForIdle();
   assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: true, pendingWrites: 0 });
-  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).quotes.length, 2);
+});
+
+test("a Nano payment stays pending until its original transfer is durable, even after it leaves the RPC window", { timeout: 5000 }, async t => {
+  const chain = fakeChain(), registry = fakeRegistry(), dir = await mkdtemp(join(tmpdir(), "nano-pending-deposit-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateFile = join(dir, "state.json"), temporary = stateFile + ".tmp";
+  const gate = makeGate(chain, { registry, stateFile, waitMs: 25, pollMs: 5 });
+  t.after(() => gate.stop());
+  const wrapped = gate.wrapRegistry(registry), args = { Text: "original payment" };
+  const quote = async args => {
+    const payment = argOf(await wrapped.callTool({ name: "poster", arguments: args }));
+    const snapshot = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.ok(snapshot.quotes.some(q => q.id === payment.paymentId && q.status === "pending"));
+    return payment;
+  };
+  const [payment, another] = await Promise.all([quote(args), quote({ Text: "simultaneous quote" })]);
+  assert.notEqual(payment.amountRaw, another.amountRaw);
+  await mkdir(temporary);
+  const hash = "A".repeat(64);
+  const callPaid = wrapped => wrapped.callTool({ name: "poster", arguments: { ...args, _payment_id: payment.paymentId } });
+  chain.state.receivable[hash] = { amount: payment.amountRaw, source: PAYER };
+  await until("a failed write of the payment", () => gate.persistenceStatus().ok === false, 1000);
+  const view = gate.quote(payment.paymentId);
+  assert.equal(view.status, "pending");
+  assert.equal(view.checkingPayment, true);
+  assert.equal(view.done, undefined);
+  assert.equal(await gate.waitForPayment(payment.paymentId, 25), "pending");
+  assert.equal((await callPaid(wrapped)).isError, true);
+  assert.equal(registry.callCount(), 0);
+  assert.equal(chain.state.transfers.length, 0);
+
+  delete chain.state.receivable[hash];
+  await rm(temporary, { recursive: true });
+  assert.equal(await gate.waitForPayment(payment.paymentId, 2000), "paid");
+  const written = JSON.parse(await readFile(stateFile, "utf8")).quotes.find(q => q.id === payment.paymentId);
+  assert.equal(written.payHash, hash);
+  assert.equal(written.status, "paid");
+  await gate.stop();
+
+  const reopened = makeGate(chain, { registry, stateFile });
+  t.after(() => reopened.stop());
+  const running = reopened.wrapRegistry(registry);
+  assert.equal((await callPaid(running)).isError, undefined);
+  assert.equal((await callPaid(running)).isError, undefined);
+  assert.equal(registry.callCount(), 1);
+  await reopened.stop();
 });
 
 for (const [kind, makeLink] of [["symlink", symlink], ["hardlink", link]]) test(`Nano state snapshots reject a ${kind} staging file without modifying its target`, async t => {
