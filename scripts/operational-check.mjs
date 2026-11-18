@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
-import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync, realpathSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, chmodSync, statfsSync, rmSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
+import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../src/private-state.mjs";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
@@ -261,13 +262,18 @@ export async function runOperationalCheck(config, deps = {}) {
   });
   await check("state-writable", async () => {
     if (deps.probeStateWrite) return deps.probeStateWrite(config.outDir);
-    const path = join(config.outDir, `.operational-check-${process.pid}-${randomBytes(6).toString("hex")}`);
-    let fd, created = false;
+    let dir;
     try {
-      fd = openSync(path, "wx", 0o600); created = true;
-      writeSync(fd, "operational-check\n"); fsyncSync(fd);
+      dir = mkdtempSync(join(config.outDir, ".operational-check-"));
+      const path = join(dir, "probe.json"), data = '{"probe":true}\n';
+      writePrivateStateSync(path, data);
+      need(readFileSync(path, "utf8") === data, "state-disk-readback-mismatch");
+      syncPrivateStateParentSync(dir); // also verify the production state directory itself
+    } catch (error) {
+      if (error instanceof CheckError) throw error;
+      throw new CheckError(error instanceof PrivateStateDurabilityError ? "state-disk-commit-uncertain" : "state-disk-write-failed");
     } finally {
-      try { if (fd != null) closeSync(fd); } finally { if (created) unlinkSync(path); }
+      if (dir) rmSync(dir, { recursive: true, force: true });
     }
   });
   for (const [name, maxAgeMs] of [["nanoodle-market-check", 20 * 60_000], ["nanoodle-near-check", 26 * 3_600_000], ["nanoodle-near-alert-retry", 10 * 60_000]]) {

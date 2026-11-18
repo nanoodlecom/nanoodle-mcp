@@ -24,6 +24,7 @@ const readFailureCodes = new Map([
 ]);
 const reportFailureCodes = new Set([
   "funding-state-unavailable", "funding-underfunded", "funding-durable-state-unavailable",
+  "funding-state-durability-uncertain",
   "funding-storage-unavailable", "funding-report-stale", "nano-read-guard-unhealthy",
   ...readFailureCodes.values(),
 ]);
@@ -91,9 +92,13 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         if (durableState) {
           const state = durableState();
           if (typeof state?.ok !== "boolean" || !Number.isSafeInteger(state.pendingWrites) || state.pendingWrites < 0) throw Error("durable write health unavailable");
-          report.durableState = { ok: state.ok, pendingWrites: state.pendingWrites };
+          const durabilityUncertain = state.durabilityUncertain === true;
+          report.durableState = { ok: state.ok && !durabilityUncertain, pendingWrites: state.pendingWrites, ...(durabilityUncertain && { durabilityUncertain: true }) };
           // Normal queued writes do not indicate a failed snapshot.
-          if (!state.ok) { report.ok = false; report.code = "funding-durable-state-unavailable"; }
+          if (!report.durableState.ok) {
+            report.ok = false;
+            report.code = durabilityUncertain ? "funding-state-durability-uncertain" : "funding-durable-state-unavailable";
+          }
         }
         if (writerProtection) {
           const proof = writerProtection();

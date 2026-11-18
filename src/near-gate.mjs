@@ -445,6 +445,7 @@ export function createNearGate({
   }
 
   async function quote(registry, name, args, tool, asset = "near", resumeTool = null) {
+    ledger.assertDurable();
     if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server.");
     const { pricing, author } = await prepare(registry, name, args, tool);
     if (await canQuote() !== true) {
@@ -589,6 +590,7 @@ export function createNearGate({
   /* ---------------- pay → run → settle ---------------- */
 
   async function acceptPayment(q0, tx, sender, ctx = null) {
+    ledger.assertDurable();
     if (q0.status === "paid" || q0.status === "running" || FINAL.has(q0.status)) return null;
     if (typeof tx !== "string" || !tx.trim() || typeof sender !== "string" || !sender.trim()) {
       throw new GraphArgsError("the paying call needs _payment_tx (your transfer's transaction hash) and _payment_sender (the account you paid from) together with _payment_id");
@@ -666,6 +668,7 @@ export function createNearGate({
 
   /** Public payment state contains no workflow inputs or result text. */
   function paymentView(id) {
+    ledger.assertDurable();
     const q = ledger.getQuote(id);
     if (!q) return null;
     const status = q.status === "pending" && now() > q.expiresAt ? "expired" : q.status;
@@ -1018,6 +1021,9 @@ export function createNearGate({
         }));
       } catch (e) {
         if (e instanceof GraphRefusedError) return refusedResult(e.refusals);
+        if (e.code === "STATE_DURABILITY_UNCERTAIN") {
+          return errResult("NEAR checkout is paused while the ledger is recovered. Keep your original payment ID and transaction details.");
+        }
         throw e;
       }
     }

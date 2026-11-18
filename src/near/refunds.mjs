@@ -95,6 +95,7 @@ export function createRefunder({
     // Existing signed bytes still reconcile through drive/confirm unchanged.
     const admission = await beforeSign(rec);
     const key = admission?.accessKey ?? await rpc.viewAccessKey({ accountId, publicKey: signer.publicKey });
+    ledger.assertDurable();
     const chainNonce = BigInt(key.nonce);
     const lastNonce = BigInt(ledger.getMeta("lastNonce") ?? 0);
     const nonce = renew ? BigInt(rec.nonce) : (chainNonce > lastNonce ? chainNonce : lastNonce) + 1n;
@@ -214,6 +215,7 @@ export function createRefunder({
 
   /** Drive one record forward: sign if needed, broadcast, classify the outcome. */
   async function drive(rec, { renewed = false } = {}) {
+    ledger.assertDurable();
     if (rec.status === "queued") {
       try {
         rec = await signFor(rec);
@@ -267,6 +269,7 @@ export function createRefunder({
     if (asset === "usdc" && (!usdcToken || tokenContract !== usdcToken)) throw new TypeError("Unknown USDC contract");
     if (amountYocto < (asset === "usdc" ? 1n : minRefundYocto)) return { refundId: null, status: "none", txHash: null };
     return serialized(async () => {
+      ledger.assertDurable();
       const existing = ledger.refundForPayment(paymentId);
       if (existing) return view(existing);
       const rec = {

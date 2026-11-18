@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -207,6 +207,26 @@ test("the scheduled check alerts when the payment stream stops returning a termi
     code: "near-payment-stream-response-invalid", domains: ["near", "usdc"] }]);
   assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_BODY/);
+});
+
+test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
+  const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const actual = join(tmp, "actual"), alias = join(tmp, "alias");
+  mkdirSync(actual);
+  symlinkSync(actual, alias, "dir");
+  const previousRead = f.deps.readJson, standard = f.config.outDir;
+  delete f.deps.probeStateWrite;
+  const check = async outDir => {
+    f.config.outDir = outDir;
+    f.deps.readJson = path => previousRead(path.startsWith(outDir + "/") ? standard + path.slice(outDir.length) : path);
+    const report = await runOperationalCheck(f.config, f.deps);
+    return report.checks.find(c => c.stage === "state-writable");
+  };
+  assert.deepEqual(await check(actual), { stage: "state-writable", ok: true });
+  assert.deepEqual(await check(alias), { stage: "state-writable", ok: false, code: "state-disk-write-failed", domains: ["nano", "near", "usdc", "market"] });
+  assert.deepEqual(readdirSync(actual), []);
 });
 
 test("saved workflow probes flag thin Nano deposits, invalid USDC previews and missing templates independently", async () => {
