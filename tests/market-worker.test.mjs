@@ -69,6 +69,40 @@ test("a changed Market fee prevents both starting a hire and inference after a s
   }
 });
 
+test("direct hires use verified escrow even when the listing's displayed price is higher", async () => {
+  const r = await rig();
+  try {
+    const low = r.m.hire({ description: WORKED(), priceUsd: "0.02" });
+    const unknown = r.m.hire({ description: WORKED(), priceUsd: "unavailable" });
+    const foreign = r.m.hire({ description: WORKED(), priceUsd: "1.00", escrowToken: "NEAR" });
+    const covered = r.m.hire({ description: WORKED(), priceUsd: "0.10", escrowToken: "USDC" });
+    const before = nano.runs();
+    await r.once();
+    assert.equal(r.store.get(low).decline.code, "OVER_BUDGET");
+    assert.equal(r.store.get(unknown).phase, "new");
+    assert.match(r.store.get(unknown).lastError, /escrow could not be verified/);
+    assert.equal(r.store.get(foreign).decline.code, "MARKET_ESCROW_CURRENCY");
+    assert.equal(r.store.get(covered).phase, "submitted");
+    assert.equal(r.store.get(covered).budgetUsd, 0.09);
+    assert.equal(r.store.get(covered).listingPriceUsd, 0.10);
+    assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+    assert.equal(nano.runs() - before, 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("an older pending start cannot spend against a listing price above its escrow", async () => {
+  const r = await rig();
+  try {
+    const id = r.m.hire({ description: WORKED(), priceUsd: "0.02" });
+    r.store.create(id, { phase: "starting", budgetUsd: 0.5, listingPriceUsd: 1, pricing: { depositUsd: 0.02 } });
+    const before = nano.runs();
+    await r.once();
+    assert.equal(r.store.get(id).decline.code, "MARKET_ESCROW_TOO_LOW");
+    assert.equal(r.m.calls("POST", /\/start$/).length, 0);
+    assert.equal(nano.runs(), before);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
 test("accepted market hires pay the embedded Nano author once, at the locked rate, including after restart", async () => {
   const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
   const owed = new Map(); let xnoUsd = "0.5";

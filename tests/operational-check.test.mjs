@@ -453,6 +453,24 @@ test("the monitor reports a lagging peer and requires two current views for paym
   }
 });
 
+test("the read-only Market probe reports unverified active escrow without retaining assignment data", async () => {
+  const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments"
+    ? Response.json({ assignments: [
+      { job: { jobKind: "competition" }, assignment: { escrowToken: "NEAR", escrowAmount: "0" } },
+      { assignment: { escrowToken: "USDC", escrowAmount: "unavailable" }, private: "SECRET_ESCROW_FIXTURE" },
+    ] })
+    : null);
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.admission.market, false);
+  assert.deepEqual(report.checks.find(check => check.stage === "market-escrow-nanoodle-image"), {
+    stage: "market-escrow-nanoodle-image", ok: false, code: "market-escrow-unavailable", domains: ["market"],
+  });
+  assert.doesNotMatch(JSON.stringify(report), /SECRET_ESCROW_FIXTURE/);
+  const entry = f.calls.find(call => call.url.pathname === "/v1/agents/me/assignments");
+  assert.equal(entry.init.method || "GET", "GET");
+  assert.equal(entry.url.searchParams.get("limit"), "100");
+});
+
 test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {
   for (const kind of ["fee", "token"]) {
     const f = fixture(({ url }) => {

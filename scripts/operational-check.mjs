@@ -15,7 +15,8 @@ import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/in
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
-import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
+import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms } from "../src/market/catalog.mjs";
+import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
@@ -317,7 +318,7 @@ export async function runOperationalCheck(config, deps = {}) {
   }
   const platform = await check("market-platform-fee", async () => {
     const result = await http(config.marketUrl + "/v1/platform/config");
-    need(result.platform_fee_bps === 500, "market-fee-assumption-changed"); return result;
+    need(result.platform_fee_bps === MARKET_PLATFORM_FEE_BPS, "market-fee-assumption-changed"); return result;
   }, ["market"]);
   await Promise.all(config.agents.map(async agent => {
     await check(`market-process-${agent.handle}`, async () => {
@@ -325,10 +326,18 @@ export async function runOperationalCheck(config, deps = {}) {
       const alive = deps.isWorkerAlive || isMarketWorkerAlive;
       need(Number.isSafeInteger(lock?.pid) && lock.pid > 0 && alive(lock), "market-worker-process-missing");
     }, ["market"]);
-    await check(`market-auth-${agent.handle}`, async () => {
+    const assignments = await check(`market-auth-${agent.handle}`, async () => {
       const token = (deps.readText || (file => readFileSync(file, "utf8")))(agent.tokenFile).trim();
-      const result = await http(config.marketUrl + "/v1/agents/me/assignments?status=in_progress&limit=1&offset=0", { headers: { authorization: `Bearer ${token}` } });
-      need(Array.isArray(result.assignments), "market-auth-response-invalid");
+      const result = await http(config.marketUrl + "/v1/agents/me/assignments?status=in_progress&limit=100&offset=0", { headers: { authorization: `Bearer ${token}` } });
+      need(Array.isArray(result.assignments) && result.assignments.length <= 100, "market-auth-response-invalid");
+      return result.assignments;
+    }, ["market"]);
+    if (assignments) await check(`market-escrow-${agent.handle}`, () => {
+      for (const row of assignments) {
+        if (row?.job?.jobKind === "competition") continue;
+        const { code } = marketEscrowTerms(row?.assignment);
+        need(!code, code?.toLowerCase().replaceAll("_", "-"));
+      }
     }, ["market"]);
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
@@ -338,7 +347,7 @@ export async function runOperationalCheck(config, deps = {}) {
       const listing = await fetchListingPrice({ baseUrl: config.marketUrl, handle: agent.handle, fetch: request });
       need(listing.ok && listing.listingStatus === "live", "market-price-unavailable");
       const needUsd = marketNeedUsd(priced.pricing.estimatedCostUsd);
-      need(platform && parseUsdNano(String(listing.priceUsd)) * 9500n >= parseUsdNano(String(needUsd)) * 10000n, "market-workflow-underpriced");
+      need(platform && budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
       const remote = await mcp("tools/call", { name: "price_noodle", arguments: { graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } } });
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
     }, ["market"]);

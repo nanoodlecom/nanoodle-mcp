@@ -22,14 +22,14 @@ import { createMarketWorker, logSafe } from "./worker.mjs";
 import { createWebhookHandler, secretFileReader } from "./webhook.mjs";
 import { createBidder, openBidState } from "./bidder.mjs";
 import { marketCreatorLiabilities } from "../funding-liabilities.mjs";
-import { createMarketFeeGuard } from "./fee-guard.mjs";
+import { createMarketFeeGuard, MARKET_PLATFORM_FEE_BPS } from "./fee-guard.mjs";
 import {
   readCatalog, fetchListingPrice, patchListingPrice, budgetFromPrice, recommendPrice, fmtUsd, usdMicros,
   PRICE_REFRESH_SECONDS, PROBE_BRIEF,
 } from "./catalog.mjs";
 
 /** The market's platform fee (GET /v1/platform/config: platform_fee_bps 500), taken from the price on acceptance. */
-export const PLATFORM_FEE_RATE = 0.05;
+export const PLATFORM_FEE_RATE = MARKET_PLATFORM_FEE_BPS / 10_000;
 
 export const HELP = `Usage: node scripts/market-worker.mjs --budget-usd <usd> [options]
        node scripts/market-worker.mjs --agents-file <catalog.json> [options]
@@ -476,7 +476,7 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
         worker = createMarketWorker({
           client, store, runner, budgetUsd, listingPriceUsd: price.priceUsd,
           defaultWorkflow: agent.defaultWorkflow, customWorkflows: agent.custom, customHandle: agent.custom ? null : customHandle,
-          bidTerms: agent.bids ? bidTerms : null,
+          useBidBudget: agent.bids,
           concurrency: cfg.concurrency, retainMs: cfg.retainMs, log: L, creatorPayments, checkFee, maintenance,
         });
       } else {
@@ -507,24 +507,18 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
     }
   }
 
-  // A job awarded from one of this listing's bids: its escrow is the quoted price.
-  const bidTerms = (escrowAmount) => {
-    const micros = usdMicros(escrowAmount);
-    return micros != null && micros > 0 ? { priceUsd: micros / 1e6, budgetUsd: budgetFromPrice(micros / 1e6) } : null;
-  };
   let bidder = null, bidState = null, bidReadFailed = false;
   let bidProblem = null;
   /** One pass over the job board (only for a listing with "bids": true that is taking jobs). Never throws. */
   async function bidTick() {
     if (!agent.bids || !worker) return;
     try {
-      await checkFee();
       if (!bidder) {
         try { bidState = openBidState(join(cfg.stateDir, agent.handle, "bids.json")); bidReadFailed = false; }
         catch (error) { bidReadFailed = true; throw error; }
         bidder = createBidder({
           client, runner, state: bidState,
-          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, log: (line) => L(`bids: ${line}`),
+          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, checkFee, log: (line) => L(`bids: ${line}`),
         });
       }
       await bidder.tick();

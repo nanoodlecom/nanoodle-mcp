@@ -1,8 +1,10 @@
 import { createProbeFetch } from "../probe-http.mjs";
 
+export const MARKET_PLATFORM_FEE_BPS = 500;
+
 /** Fresh public config before accepting/starting inference; no buyer token or
  * estimated future revenue is used to vouch for a stale fee assumption. */
-export function createMarketFeeGuard({ baseUrl, fetch = globalThis.fetch, maxFeeBps = 500, timeoutMs = 10_000 }) {
+export function createMarketFeeGuard({ baseUrl, fetch = globalThis.fetch, maxFeeBps = MARKET_PLATFORM_FEE_BPS, timeoutMs = 10_000 }) {
   if (!Number.isSafeInteger(maxFeeBps) || maxFeeBps < 0 || maxFeeBps > 10_000) throw new TypeError("maxFeeBps must be an integer from 0 to 10000");
   const request = createProbeFetch({ fetch, timeoutMs, maxBytes: 32_768 });
   let inflight = null;

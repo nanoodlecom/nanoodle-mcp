@@ -19,14 +19,13 @@ import { readFileSync, existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MarketConfigError, readDefaultWorkflow } from "./service.mjs";
+import { MARKET_PLATFORM_FEE_BPS } from "./fee-guard.mjs";
 
 /** The package directory: relative graph paths in a catalog resolve against it. */
 export const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
 /** Handles as the market allows them, kept to the length the catalog accepts. */
 export const HANDLE_RE = /^[a-z][a-z0-9-]{2,29}$/;
-/** The market keeps 5% of the price (GET /v1/platform/config: platform_fee_bps 500). */
-const FEE_BPS = 500;
 /** Prices are recommended in steps of this many cents. */
 const MIN_PRICE_CENTS = 2; // at $0.01 nothing is left after the market's 5% fee
 /** The default refresh of the market price. */
@@ -71,10 +70,26 @@ export function fmtUsd(usd) {
  */
 export function budgetFromPrice(priceUsd) {
   const micros = usdMicros(priceUsd);
-  if (micros == null) return 0;
+  if (!Number.isSafeInteger(micros) || micros < 0) return 0;
   // micros × (10000 − 500) / 10000 → micro-dollars after the fee; / 10000 → cents.
-  const cents = Math.floor((micros * (10_000 - FEE_BPS)) / 100_000_000);
-  return cents / 100;
+  const cents = BigInt(micros) * BigInt(10_000 - MARKET_PLATFORM_FEE_BPS) / 100_000_000n;
+  return Number(cents) / 100;
+}
+
+export const isMarketDollarToken = token => token === "USD" || token === "USDC";
+
+/** An assignment's locked escrow, in the marketplace's dollar denominations. */
+export function marketEscrowTerms(assignment) {
+  const { escrowAmount, escrowToken } = assignment ?? {};
+  if (typeof escrowToken !== "string" || !escrowToken || typeof escrowAmount !== "string") {
+    return { code: "MARKET_ESCROW_UNAVAILABLE" };
+  }
+  if (!isMarketDollarToken(escrowToken)) return { code: "MARKET_ESCROW_CURRENCY" };
+  const micros = usdMicros(escrowAmount);
+  if (!Number.isSafeInteger(micros)) return { code: "MARKET_ESCROW_UNAVAILABLE" };
+  const budgetUsd = budgetFromPrice(escrowAmount);
+  if (budgetUsd <= 0) return { code: "MARKET_ESCROW_TOO_LOW" };
+  return { priceUsd: micros / 1e6, budgetUsd };
 }
 
 /**
@@ -91,7 +106,7 @@ export function recommendPrice({ depositUsd }) {
   // (The float is first rounded at 1e-8, so 0.37 × 1e6 = 370000.00000000006 is not taken for 370001.)
   const d = Math.ceil(Math.round(depositUsd * 1e8) / 100);
   // price = c cents = 10000c micro-dollars; 0.95 × 10000c = 9500c ≥ d.
-  const c = Math.max(MIN_PRICE_CENTS, Math.ceil(d / 9_500));
+  const c = Math.max(MIN_PRICE_CENTS, Math.ceil(d / (10_000 - MARKET_PLATFORM_FEE_BPS)));
   return c / 100;
 }
 

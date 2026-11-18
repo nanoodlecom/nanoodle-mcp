@@ -15,20 +15,19 @@ import { openMarketState } from "../src/market/state.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { createBidder, openBidState, bidProposal } from "../src/market/bidder.mjs";
-import { readCatalog, recommendPrice, budgetFromPrice, usdMicros } from "../src/market/catalog.mjs";
+import { readCatalog, recommendPrice, budgetFromPrice } from "../src/market/catalog.mjs";
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "nanoodle-mcp.mjs");
 const NANO_KEY = "nanogpt-test-key-do-not-log";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const brief = (req, prose = "Please run my workflow and quote it.") => `${prose}\n\n\`\`\`nanoodle\n${JSON.stringify(req, null, 2)}\n\`\`\`\n`;
 const WORKED = (idea = "a lighthouse at dawn") => brief({ graph: WORKED_GRAPH, inputs: { Idea: idea } });
-const bidTerms = (escrow) => { const m = usdMicros(escrow); return m > 0 ? { priceUsd: m / 1e6, budgetUsd: budgetFromPrice(m / 1e6) } : null; };
 
 let nano;
 before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
-async function rig({ maxBidUsd = 5 } = {}) {
+async function rig({ maxBidUsd = 5, checkFee } = {}) {
   const m = createMarketMock();
   await m.listen();
   const dir = mkdtempSync(join(tmpdir(), "market-bidder-"));
@@ -36,9 +35,9 @@ async function rig({ maxBidUsd = 5 } = {}) {
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
   const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 1, baseUrl: nano.url });
   const state = openBidState(join(dir, "bids.json"));
-  const bidder = createBidder({ client, runner, state, priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd, log: (l) => logs.push(l) });
+  const bidder = createBidder({ client, runner, state, priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd, checkFee, log: (l) => logs.push(l) });
   const store = openMarketState({ dir });
-  const worker = createMarketWorker({ client, store, runner, budgetUsd: 0.95, listingPriceUsd: 1, bidTerms, log: (l) => logs.push(l) });
+  const worker = createMarketWorker({ client, store, runner, budgetUsd: 0.95, listingPriceUsd: 1, useBidBudget: true, log: (l) => logs.push(l) });
   const work = async () => { await worker.tick(); await worker.drain(); };
   return { m, dir, logs, bidder, state, work };
 }
@@ -65,6 +64,26 @@ test("a posted workflow gets one bid: estimated cost + 20%, plus the market's fe
   assert.equal(m.calls("POST", /\/bids$/).length, 1);
   assert.deepEqual(m.violations, []);
   await m.close();
+});
+
+test("the bidder verifies the fee before posting and skips an unsupported budget denomination", async () => {
+  let feeChanged = true;
+  const { m, bidder, state } = await rig({ checkFee: async () => {
+    assert.ok(m.calls("GET", /\/jobs\/board/).length, "check after reading the opportunity");
+    if (feeChanged) throw Object.assign(Error("fee changed"), { code: "MARKET_FEE_CHANGED" });
+    return 500;
+  } });
+  try {
+    const other = m.postJob({ description: WORKED(), budgetToken: "NEAR" });
+    const usd = m.postJob({ description: WORKED(), budgetToken: "USD" });
+    await assert.rejects(bidder.tick(), { code: "MARKET_FEE_CHANGED" });
+    assert.equal(m.calls("POST", /\/bids$/).length, 0);
+    assert.equal(state.get(usd), null, "unverified fees do not burn the opportunity");
+    feeChanged = false;
+    assert.deepEqual(await bidder.tick(), { placed: 1 });
+    assert.ok(state.get(usd).bidId);
+    assert.equal(m.board.get(other).bids.length, 0);
+  } finally { await m.close(); }
 });
 
 test("jobs that are not ours are left alone; a workflow that cannot run here gets no bid", async () => {
