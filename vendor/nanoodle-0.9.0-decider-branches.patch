@@ -1,0 +1,125 @@
+--- /dev/null
++++ b/src/branches.mjs
+@@ -0,0 +1,55 @@
++import { NanoodleError } from "./errors.mjs";
++
++export function isBranchDecider(node) {
++  return node.type === "decide" && node.fields?.branch === true;
++}
++
++const branchPort = (port) => port === "yes" || port === "no";
++
++/**
++ * Build per-run routing over a topologically ordered set of node IDs.
++ * Explicit Yes/No wires control entry to a branch. Further downstream, any
++ * active routed input opens a join. Ordinary dependencies never open a branch.
++ */
++export function planBranches(graph, order) {
++  const deciders = new Map(graph.nodes.filter(n => n.type === "decide").map(n => [n.id, n]));
++  const direct = new Set();
++  for (const link of graph.links) {
++    const source = deciders.get(link.from.node);
++    if (!source || !branchPort(link.from.port)) continue;
++    if (!isBranchDecider(source)) {
++      throw new NanoodleError(`node ${source.id}: enable branching on Decide to wire ${link.from.port}`, { code: "decide-branch" });
++    }
++    direct.add(link);
++  }
++  if (!direct.size) return null;
++
++  const inbound = new Map(order.map(id => [id, []]));
++  for (const link of graph.links) inbound.get(link.to.node)?.push(link);
++  const selectors = new Map();
++  for (const id of order) {
++    const links = inbound.get(id);
++    const fromDeciders = links.filter(link => direct.has(link));
++    const controls = fromDeciders.length ? fromDeciders : links.filter(link => selectors.has(link.from.node));
++    if (controls.length) selectors.set(id, controls);
++  }
++  const skipped = new Set();
++  return {
++    // Call after this node's upstreams have settled. A failed router is left
++    // to the usual upstream-error handling, which must also prevent execution.
++    activeLinks(id, outFor) {
++      const closed = (link) => {
++        if (skipped.has(link.from.node)) return true;
++        if (!direct.has(link)) return false;
++        const branch = outFor(link.from.node)?.decision?.branch;
++        return branchPort(branch) && branch !== link.from.port;
++      };
++      const controls = selectors.get(id);
++      if (controls?.every(closed)) {
++        skipped.add(id);
++        return null;
++      }
++      return inbound.get(id).filter(link => !closed(link));
++    },
++  };
++}
+--- a/src/browser.mjs
++++ b/src/browser.mjs
+@@ -34,0 +35 @@
++export { planBranches } from "./branches.mjs";
+--- a/src/decide.mjs
++++ b/src/decide.mjs
+@@ -13,0 +14 @@
++  if (f?.branch === true) return "yesno";
+@@ -157 +158,11 @@
+-  const out = decideOutputs(mode, j && j.answers && j.answers.answer, q, imgs, j && j.usage, model);
++  const answer = j?.answers?.answer;
++  const branching = f?.branch === true;
++  if (branching && (answer?.type !== "noul" || !Number.isFinite(answer.noul) || answer.noul < 0 || answer.noul > 1)) {
++    throw new NanoodleError("Decide needs a valid yes/no answer to select a branch", { code: "decide-branch" });
++  }
++  const out = decideOutputs(mode, answer, q, imgs, j && j.usage, model);
++  if (branching) {
++    out.decision.branch = out.text;
++    out[out.text] = text || out.text;
++    return out;
++  }
+--- a/src/estimate.mjs
++++ b/src/estimate.mjs
+@@ -46 +46 @@
+-  llm: "chat", vision: "chat", decide: "chat",
++  llm: "chat", vision: "chat", decide: "chat", "decide-branch": "chat",
+@@ -315 +315 @@
+-  if (node.type === "decide") {
++  if (node.type === "decide" || node.type === "decide-branch") {
+@@ -321 +321 @@
+-    const pick = !(f.mode === "choose" || f.mode === "score" || f.mode === "yesno");
++    const pick = !(node.type === "decide-branch" || f.branch === true || f.mode === "choose" || f.mode === "score" || f.mode === "yesno");
+--- a/src/graph.mjs
++++ b/src/graph.mjs
+@@ -155 +155 @@
+-    const type = raw.type === "audio" ? "tts" : raw.type;
++    const type = raw.type === "audio" ? "tts" : raw.type === "decide-branch" ? "decide" : raw.type;
+@@ -156,0 +157 @@
++    if (raw.type === "decide-branch") n.fields.branch = true;
+--- a/src/index.mjs
++++ b/src/index.mjs
+@@ -8,0 +9 @@
++export { planBranches } from "./branches.mjs";
+--- a/src/workflow.mjs
++++ b/src/workflow.mjs
+@@ -9,0 +10 @@
++import { isBranchDecider, planBranches } from "./branches.mjs";
+@@ -280,0 +282 @@
++    const branches = planBranches(graph, order.map(n => n.id));
+@@ -389 +391,11 @@
+-        const inbound = graph.links.filter((l) => l.to.node === n.id);
++        let inbound = graph.links.filter((l) => l.to.node === n.id);
++        if (branches) {
++          await Promise.allSettled(inbound.map(l => promises.get(l.from.node)));
++          inbound = branches.activeLinks(n.id, id => nodesRec[id]?.status === "done" ? nodesRec[id].out : null);
++          if (inbound === null) {
++            rec.status = "skipped";
++            rec.skipReason = "branch";
++            emit({ type: "node-skipped", nodeId: n.id, name: displayName(n), reason: "branch" });
++            return {};
++          }
++        }
+@@ -443,0 +456 @@
++        if (n.type === "decide" && fields.branch !== n.fields.branch) fields = { ...fields, branch: n.fields.branch };
+@@ -512 +525 @@
+-        if (onError === "skip" && !ac.signal.aborted) {
++        if (onError === "skip" && !isBranchDecider(n) && !ac.signal.aborted) {
