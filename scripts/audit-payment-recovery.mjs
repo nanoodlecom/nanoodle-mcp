@@ -18,11 +18,21 @@ const checks = [
   "earlier Nano outcomes preserve the receipt formats",
   "Nano restore retains aged settlement gaps",
   "the scheduled check reserves incomplete Nano settlements",
+  "NEAR and USDC refund evidence cannot release",
+  "restored NEAR refund evidence that conflicts",
+  "NEAR and Market creator payout evidence covers",
+  "restored NEAR and Market creator payouts",
+  "a replayed USDC receipt cannot show",
+  "Market creator payout verification reads",
+  "Market retention preserves an assignment",
+  "NEAR retention keeps quotes",
+  "the scheduled check detects NEAR, USDC and Market settlement mismatches",
   "a durable Nano send preserves new liabilities",
   "two identical obligations cannot claim the same signed Nano transfer",
   "the scheduled check detects legacy send debt",
 ];
-const suites = ["serve-gate", "x402-wallet", "operational-check", "state-audit", "funding-liabilities"].map(name =>
+const suites = ["serve-gate", "x402-wallet", "operational-check", "state-audit", "funding-liabilities",
+  "near-funding", "near-refunds", "near-author-payouts", "hosted-funding", "market-worker", "near-ledger"].map(name =>
   fileURLToPath(new URL(`../tests/${name}.test.mjs`, import.meta.url)));
 const result = spawnSync(process.execPath, ["--test", "--test-reporter=spec",
   "--test-name-pattern", checks.join("|"), ...suites], { stdio: "inherit" });

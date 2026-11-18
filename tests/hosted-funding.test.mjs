@@ -51,6 +51,19 @@ test("a Nano transfer is claimed across both live and inactive payment ledgers",
   assert.equal(w.sources.nanoTransferClaimed(sent, "creator:market_accepted"), false);
 });
 
+test("Market creator payout verification reads the owning ledger even before the worker starts", async () => {
+  const w = await setup(), dir = join(w.options.marketRoot, "inactive"), file = join(dir, "market-state.json");
+  await mkdir(dir, { recursive: true });
+  const record = { id: "a", phase: "submitted", creator: { status: "queued", author: "author", amountRaw: "20" } };
+  await w.write(file, { v: 1, assignments: { a: record } });
+  const expected = { paymentId: "market_a", to: "author", amountRaw: "20" };
+  assert.equal(w.sources.marketPayoutMatches(expected), true);
+  assert.equal(w.sources.marketPayoutMatches({ ...expected, amountRaw: "10" }), false);
+  w.sources.registerMarket(file, () => [record]);
+  record.creator.status = "awaiting_acceptance";
+  assert.equal(w.sources.marketPayoutMatches(expected), false);
+});
+
 test("fresh state may be empty; existing malformed financial files cannot become zero debts", async () => {
   const w = await setup();
   assert.equal(w.sources.liabilitiesRaw(), 0n);

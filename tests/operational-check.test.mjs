@@ -272,6 +272,28 @@ test("the scheduled check reserves incomplete Nano settlements and flags their e
   assert.doesNotMatch(JSON.stringify(report), /private-payment-proof|private-refund-proof|AAAAAAA|nano_3t6k35/);
 });
 
+test("the scheduled check detects NEAR, USDC and Market settlement mismatches without inference", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const state = f.states["/state/near-state.json"];
+  state.quotes = { privateJob: { id: "private-near-job", status: "settled", payer: "private.testnet",
+    asset: "usdc", tokenContract: f.config.usdcToken, refundId: "private-refund",
+    settlement: { refundYocto: "70", authorPayout: { amountRaw: "30", to: "private-author" } } } };
+  state.refunds = { refund: { id: "private-refund", paymentId: "private-near-job", status: "sent",
+    asset: "near", amountYocto: "10", to: "private.testnet" } };
+  state.payouts = { near: { paymentId: "private-near-job", status: "sent", amountRaw: "15", to: "private-author" },
+    market: { paymentId: "market_private-market-job", status: "sent", amountRaw: "15", to: "wrong-author" } };
+  const marketFile = Object.keys(f.states).find(path => path.endsWith("/market-state.json"));
+  f.states[marketFile].assignments = { job: { id: "private-market-job", phase: "submitted",
+    creator: { status: "queued", author: "private-author", amountRaw: "30" } } };
+  const report = await runOperationalCheck(f.config, f.deps);
+  for (const stage of ["near-refund-evidence-mismatch", "creator-payout-evidence-mismatch"]) {
+    assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: false, code: stage, domains: [] });
+  }
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-near-job|private-refund|private-market-job|private\.testnet|private-author|wrong-author/);
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

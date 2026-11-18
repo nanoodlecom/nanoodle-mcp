@@ -24,6 +24,7 @@ import { MIN_REFUND_YOCTO, formatYoctoAsNear } from "./amount.mjs";
 import { matchesSignedNonce, signTransfer } from "./tx.mjs";
 import { signFtTransfer, hasFtTransfer, formatUsdc } from "./ft.mjs";
 import { NearError } from "./errors.mjs";
+import { nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
 
 const REASONS = new Set(["change", "run_failed", "wrong_amount", "late_payment", "interrupted"]);
 
@@ -36,13 +37,14 @@ function invalidTxKind(err) {
 }
 
 function publicStatus(rec) {
+  if (rec.reconciliationRequired) return "failed_permanent";
   if (rec.status === "sent") return "sent";
   if (rec.status === "failed_permanent") return "failed_permanent";
   return "pending";
 }
 
 function view(rec) {
-  return { refundId: rec.id, status: publicStatus(rec), txHash: rec.txHash ?? null };
+  return { refundId: rec.id, status: publicStatus(rec), txHash: rec.reconciliationRequired ? null : rec.txHash ?? null };
 }
 const amountLabel = (rec) => rec.asset === "usdc" ? `${formatUsdc(rec.amountYocto)} USDC` : `${formatYoctoAsNear(rec.amountYocto)} NEAR`;
 
@@ -75,6 +77,13 @@ export function createRefunder({
   if (maintenance !== null && typeof maintenance.capture !== "function") throw new TypeError("maintenance must provide operation capture");
 
   let chain = Promise.resolve();
+  function hold(rec) {
+    if (rec.reconciliationRequired) return view(rec);
+    const held = ledger.updateRefund(rec.id, { reconciliationRequired: true, nextAttemptAt: null });
+    log("NEAR refund records need reconciliation before a retry");
+    return view(held);
+  }
+
   function serialized(task) {
     // Register before queueing: a nonce task waiting behind another refund
     // still prevents a drain. Accepted settlement retains its caller's scope.
@@ -142,7 +151,7 @@ export function createRefunder({
     }
     const delay = backoffMs[Math.min(attempts - 1, backoffMs.length - 1)];
     const next = ledger.updateRefund(rec.id, { ...failure, nextAttemptAt: now() + delay });
-    schedule(() => { tick().catch(() => {}); }, delay);
+    schedule(() => { retry({ force: false }).catch(() => {}); }, delay);
     return view(next);
   }
 
@@ -216,6 +225,12 @@ export function createRefunder({
   /** Drive one record forward: sign if needed, broadcast, classify the outcome. */
   async function drive(rec, { renewed = false } = {}) {
     ledger.assertDurable();
+    if (rec.reconciliationRequired) return view(rec);
+    const quote = ledger.getQuote(rec.paymentId);
+    const expected = nearRefundTerms(quote);
+    if ((rec.asset != null && !["near", "usdc"].includes(rec.asset))
+      || (rec.asset === "usdc" && (!usdcToken || rec.tokenContract !== usdcToken))
+      || (expected && !sameNearRefund(expected, rec)) || (quote && !expected)) return hold(rec);
     if (rec.status === "queued") {
       try {
         rec = await signFor(rec);
@@ -271,7 +286,11 @@ export function createRefunder({
     return serialized(async () => {
       ledger.assertDurable();
       const existing = ledger.refundForPayment(paymentId);
-      if (existing) return view(existing);
+      if (existing) {
+        const duplicate = ledger.refunds().some(other => other.id !== existing.id && other.paymentId === paymentId);
+        return !duplicate && sameNearRefund({ paymentId, to, amountYocto: amountYocto.toString(), asset, tokenContract }, existing)
+          ? view(existing) : hold(existing);
+      }
       const rec = {
         id: `rf_${randomBytes(9).toString("base64url")}`,
         paymentId,
@@ -293,29 +312,26 @@ export function createRefunder({
     });
   }
 
-  function tick() {
+  function retry({ force }) {
     return serialized(async () => {
-      const t = now();
-      for (const rec of ledger.refunds()) {
-        if (rec.status !== "queued" && rec.status !== "signed") continue;
-        if (rec.nextAttemptAt != null && rec.nextAttemptAt > t) continue;
-        await drive(rec);
+      const t = now(), records = ledger.refunds(), seen = new Set(), duplicates = new Set();
+      for (const rec of records) {
+        if (seen.has(rec.paymentId)) duplicates.add(rec.paymentId);
+        seen.add(rec.paymentId);
       }
-    });
-  }
-
-  function resume() {
-    return serialized(async () => {
-      for (const rec of ledger.refunds()) {
-        if (rec.status === "queued" || rec.status === "signed") await drive(rec);
+      for (const rec of records) {
+        if (rec.reconciliationRequired || (rec.status !== "queued" && rec.status !== "signed")) continue;
+        if (duplicates.has(rec.paymentId)) { hold(rec); continue; }
+        if (!force && rec.nextAttemptAt != null && rec.nextAttemptAt > t) continue;
+        await drive(rec);
       }
     });
   }
 
   return {
     refund,
-    resume,
-    tick,
+    resume: () => retry({ force: true }),
+    tick: () => retry({ force: false }),
     get(refundId) {
       return ledger.getRefund(refundId);
     },

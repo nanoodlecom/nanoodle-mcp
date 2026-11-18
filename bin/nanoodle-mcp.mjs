@@ -991,7 +991,8 @@ async function startNearMode({
   const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken,
     beforeSign: refundFunding.beforeSign, beforeComplete: refundFunding.beforeComplete, maintenance });
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
-  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance }) : null;
+  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance,
+    marketPayoutMatches: payout => fundingSources?.marketPayoutMatches(payout) ?? true }) : null;
   let watcher = null;
   const gate = createNearGate({
     merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled, authorPayouts,

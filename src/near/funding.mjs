@@ -2,6 +2,7 @@ import { NearError } from "./errors.mjs";
 import { assertFreshBlock } from "./freshness.mjs";
 import { DEFAULT_FUNCTION_CALL_GAS } from "./tx.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./quote-capacity.mjs";
+import { nearRefundTerms, sameNearRefundDestination } from "./refund-terms.mjs";
 
 const U128 = (1n << 128n) - 1n;
 export const NEAR_OPERATING_RESERVE = 50_000_000_000_000_000_000_000n;
@@ -33,9 +34,9 @@ export function nearRefundClaims({ quotes, refunds, meta }, {
   now = Date.now(), unpaidRetainMs = RETAIN_NEAR_QUOTE_MS, coveredThroughMs = nearPaymentWatchCoverage(meta?.[PAYMENT_WATCH_META]),
 } = {}) {
   let nearYocto = 0n, usdcAtomic = 0n, nativeRefunds = 0, tokenRefunds = 0, pendingNativeRefunds = 0, pendingTokenRefunds = 0;
-  const issues = new Set(), paid = new Set(rows(refunds).map(r => r.paymentId).filter(Boolean));
+  const issues = new Set(), refundsByPayment = new Map();
   const add = (asset, value) => {
-    const n = raw(value);
+    const n = typeof value === "bigint" ? value : raw(value);
     if (asset != null && !["near", "usdc"].includes(asset)) throw bad();
     if (!n) return;
     if (asset === "usdc") { usdcAtomic += n; tokenRefunds++; }
@@ -44,18 +45,35 @@ export function nearRefundClaims({ quotes, refunds, meta }, {
   for (const r of rows(refunds)) {
     if (!["queued", "signed", "sent", "failed_permanent"].includes(r.status)) throw bad();
     if (r.status !== "sent") add(r.asset, r.amountYocto);
+    if (r.reconciliationRequired) issues.add("near-refund-evidence-mismatch");
+    if (r.status === "sent" && r.outcomeUnverified) issues.add("near-refund-outcome-unverified");
+    if (typeof r.paymentId === "string") {
+      if (!refundsByPayment.has(r.paymentId)) refundsByPayment.set(r.paymentId, []);
+      refundsByPayment.get(r.paymentId).push(r);
+    }
   }
   for (const q of rows(quotes)) {
     if (!["pending", "paid", "running", "settled", "failed", "rejected", "expired"].includes(q.status)) throw bad();
-    if (paid.has(q.id)) continue; // outbox is authoritative, even during handoff
-    if (["paid", "running"].includes(q.status)) add(q.asset, q.settlement?.refundYocto ?? q.paidYocto);
-    else if (q.settlement) {
-      add(q.asset, q.settlement.refundYocto);
-      if (raw(q.settlement.refundYocto) > 0n) issues.add("near-refund-intent-missing");
-    } else if (["failed", "rejected"].includes(q.status) && q.paidYocto != null) {
-      add(q.asset, q.paidYocto);
-      if (raw(q.paidYocto) > 0n) issues.add("near-refund-intent-missing");
-    } else if (["pending", "expired"].includes(q.status)) {
+    const expected = nearRefundTerms(q), associated = refundsByPayment.get(q.id) ?? [];
+    if (expected) {
+      const amount = raw(expected.amountYocto);
+      let covered = 0n;
+      if (associated.length > 1 || (q.refundId && associated.length === 0)) issues.add("near-refund-evidence-mismatch");
+      for (const r of associated) {
+        const recorded = raw(r.amountYocto);
+        const matches = sameNearRefundDestination(expected, r);
+        if (!matches || recorded !== amount) issues.add("near-refund-evidence-mismatch");
+        // A pending outbox amount is included above. A confirmed amount can
+        // also cover this obligation, but neither can erase another asset's debt.
+        if (matches && recorded > covered && !(r.status === "sent" && r.outcomeUnverified)) covered = recorded;
+      }
+      if (amount > covered) {
+        add(expected.asset, amount - covered);
+        if (!associated.length && !["paid", "running"].includes(q.status)) issues.add("near-refund-intent-missing");
+      }
+    } else {
+      if (associated.length) issues.add("near-refund-evidence-mismatch");
+      if (!["pending", "expired"].includes(q.status)) continue;
       if (!Number.isSafeInteger(q.expiresAt)) throw bad();
       if (holdsNearQuoteAmount(q, now, unpaidRetainMs, coveredThroughMs)) {
         if (q.asset === "usdc") pendingTokenRefunds++;

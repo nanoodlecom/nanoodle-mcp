@@ -179,6 +179,28 @@ test("the signed record (with hash) is on disk when send_tx is called; success -
   });
 });
 
+test("restored NEAR refund evidence that conflicts with the quote is held before signing or rebroadcasting", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open();
+    const { rpc, log } = mockChain();
+    for (const status of ["queued", "signed"]) {
+      ledger.putQuote({ id: status, status: "settled", payer: "payer.testnet", refundId: `refund_${status}`,
+        settlement: { refundYocto: AMOUNT.toString() } });
+      ledger.putRefund({ id: `refund_${status}`, paymentId: status, to: "other.testnet", status,
+        amountYocto: AMOUNT.toString(), signedTxBase64: status === "signed" ? "fixture-signed-bytes" : null });
+    }
+    const { refunder } = make(rpc, ledger);
+    await refunder.resume();
+    await refunder.tick();
+    for (const status of ["queued", "signed"]) assert.equal(ledger.getRefund(`refund_${status}`).reconciliationRequired, true);
+    assert.equal(log.sends.length, 0);
+    assert.equal(ledger.getMeta("lastNonce"), undefined);
+    const original = await refunder.refund({ paymentId: "signed", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    assert.deepEqual(original, { refundId: "refund_signed", status: "failed_permanent", txHash: null });
+    assert.equal(ledger.getRefund("refund_signed").signedTxBase64, "fixture-signed-bytes");
+  });
+});
+
 test("transient failure -> pending; a later tick rebroadcasts identical bytes", async () => {
   await withLedger(async ({ open }) => {
     const ledger = open();

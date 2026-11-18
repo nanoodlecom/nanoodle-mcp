@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { nanoFundingCoverage, nanoFundingLiabilities, nearCreatorLiabilities, nearRunFundingBudget, marketCreatorLiabilities } from "../src/funding-liabilities.mjs";
+import { nanoFundingCoverage, nanoFundingLiabilities, nearCreatorCoverage, nearCreatorLiabilities,
+  nearRunFundingBudget, marketCreatorCoverage, marketCreatorLiabilities } from "../src/funding-liabilities.mjs";
 import { createRunFunding, runFundingBudget } from "../src/run-funding.mjs";
 
 const XNO = 10n ** 30n;
@@ -128,6 +129,34 @@ test("Market fees remain held after a run and deduplicate against actual payout 
   assert.equal(marketCreatorLiabilities([r], { payouts }) + nearCreatorLiabilities({ quotes: [], payouts }), 0n);
   r.creator.status = "cancelled";
   assert.equal(marketCreatorLiabilities([r]), 0n);
+});
+
+test("NEAR and Market creator payout evidence covers only the matching amount and recipient", () => {
+  const quote = { id: "near-job", status: "settled", settlement: { authorPayout: { amountRaw: "100", to: creator } } };
+  const assignment = { id: "market-job", phase: "submitted", creator: { status: "queued", author: creator, amountRaw: "100" } };
+  const base = { to: creator, amountRaw: "50", status: "sent" };
+  const payouts = [{ ...base, paymentId: quote.id }, { ...base, paymentId: `market_${assignment.id}` }];
+  const near = () => nearCreatorCoverage({ quotes: [quote], payouts });
+  const market = () => marketCreatorCoverage([assignment], { payouts });
+  assert.deepEqual(near(), { totalRaw: 50n, missing: false, mismatch: true });
+  assert.deepEqual(market(), { totalRaw: 50n, missing: false, mismatch: true });
+
+  payouts[0].to = payer; payouts[1].to = payer;
+  assert.equal(near().totalRaw, 100n);
+  assert.equal(market().totalRaw, 100n);
+  for (const record of payouts) Object.assign(record, { to: creator, amountRaw: "60", status: "signed" });
+  const context = { overheadRawByRun: new Map([["near:near-job", 70n], ["market:market-job", 70n]]) };
+  assert.equal(nearCreatorLiabilities({ quotes: [quote], payouts }, context)
+    + marketCreatorLiabilities([assignment], { ...context, payouts }), 60n,
+  "each run's overhead offsets the recorded debt and the uncovered remainder only once");
+
+  for (const record of payouts) Object.assign(record, { amountRaw: "100", status: "sent" });
+  assert.deepEqual(near(), { totalRaw: 0n, missing: false, mismatch: false });
+  assert.deepEqual(market(), { totalRaw: 0n, missing: false, mismatch: false });
+  assignment.creator.status = "awaiting_acceptance";
+  assignment.creator.reserveRaw = "100";
+  assert.equal(market().totalRaw, 100n, "an outbox row cannot prove a Market buyer accepted the work");
+  assert.equal(market().mismatch, true);
 });
 
 test("legacy completed Market work still reserves its earned fee without counting deferred revenue", () => {

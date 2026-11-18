@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { nanoFundingLiabilities, nearCreatorLiabilities, marketCreatorLiabilities } from "./funding-liabilities.mjs";
 import { creatorNanoTransferClaims, gateNanoTransferClaims, hasOtherNanoTransferClaim } from "./nano-transfer-journal.mjs";
+import { marketCreatorPayoutTerms, sameCreatorPayout } from "./creator-payout-evidence.mjs";
 
 function read(file) {
   try { return JSON.parse(readFileSync(file, "utf8")); }
@@ -48,6 +49,17 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     for (const e of entries) if (e.isDirectory()) files.add(join(marketRoot, e.name, "market-state.json"));
     return files;
   }
+  function* marketRecords() {
+    for (const file of marketFiles()) {
+      if (marketLive.has(file)) yield* marketLive.get(file)();
+      else {
+        const s = readState(file);
+        if (!s) continue;
+        if (s.v !== 1) throw Error("invalid-funding-state");
+        yield* rows(s.assignments);
+      }
+    }
+  }
   return {
     requireFiles(files) { requiredFiles = new Set(files.map(file => resolve(file))); },
     ready() {
@@ -70,6 +82,15 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
       const creators = creatorNanoTransferClaims(payoutsLive ? payoutsLive() : nearDisk().payouts);
       return hasOtherNanoTransferClaim(nano, hash, id) || hasOtherNanoTransferClaim(creators, hash, id);
     },
+    marketPayoutMatches(payout) {
+      for (const record of marketRecords()) {
+        if (`market_${record.id}` !== payout.paymentId) continue;
+        const expected = marketCreatorPayoutTerms(record);
+        if (!expected || !sameCreatorPayout(expected, payout)) return false;
+      }
+      // A matching standalone outbox can survive its pruned assignment.
+      return true;
+    },
     liabilitiesRaw(context) {
       // Recovery telemetry can read debts while storage is unavailable; it
       // grants no spending authority. Actual authorizations remain paused.
@@ -78,17 +99,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
       const near = nearLive ? null : nearDisk();
       const payouts = payoutsLive ? payoutsLive() : near?.payouts ?? nearDisk().payouts;
       total += nearLive ? nearLive(context) : nearCreatorLiabilities(near, context);
-      for (const file of marketFiles()) {
-        let records;
-        if (marketLive.has(file)) records = marketLive.get(file)();
-        else {
-          const s = readState(file);
-          if (!s) continue;
-          if (s.v !== 1) throw Error("invalid-funding-state");
-          records = rows(s.assignments);
-        }
-        total += marketCreatorLiabilities(records, { ...context, payouts });
-      }
+      total += marketCreatorLiabilities([...marketRecords()], { ...context, payouts });
       return total;
     },
   };
