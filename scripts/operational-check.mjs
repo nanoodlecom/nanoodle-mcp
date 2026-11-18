@@ -315,15 +315,34 @@ export async function runOperationalCheck(config, deps = {}) {
       need(service.ActiveState !== "failed" && (!service.Result || service.Result === "success" || service.ActiveState === "activating"), "scheduled-check-failed");
     }, []);
   }
-  const nanoNodes = (await Promise.all(config.nanoRpcUrls.map((url, index) => check(`nano-node-${index}`, async () => {
-    need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
-    checkNanoGenesis(await nanoRpc(url, { action: "block_info", hash: NANO_GENESIS, json_block: "true" }));
-    const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true", receivable: "true" });
-    return { info, peer: index, view: nanoAccountView(info, checkAddress) };
-  }, [])))).filter(Boolean);
-  const nano = await check("nano-frontier-agreement", async () => {
+  const nanoAnchor = runtimeFunding?.checkpoint.confirmed;
+  const nanoAnchorHeight = nanoAnchor ? BigInt(nanoAnchor.blockCount) : null;
+  const nanoNodes = (await Promise.all(config.nanoRpcUrls.map(async (url, index) => {
+    let observation;
+    await check(`nano-node-${index}`, async () => {
+      need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
+      checkNanoGenesis(await nanoRpc(url, { action: "block_info", hash: NANO_GENESIS, json_block: "true" }));
+      const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true", receivable: "true" });
+      const view = nanoAccountView(info, checkAddress);
+      // Keep a valid account observation for detecting a conflicting view
+      // even if this peer cannot prove the earlier block.
+      observation = { info, peer: index, view, witnessed: false };
+      if (nanoAnchor && view.confirmedHeight > nanoAnchorHeight) {
+        const block = await nanoRpc(url, { action: "block_info", hash: nanoAnchor.hash, json_block: "true" });
+        need(matchesNanoConfirmedBlock(block, { account: config.nanoAddress, anchor: nanoAnchor, hashBlock }),
+          "nano-confirmed-checkpoint-unverified");
+      }
+      observation.witnessed = !nanoAnchor || view.confirmedHeight > nanoAnchorHeight
+        || (view.confirmedHeight === nanoAnchorHeight && view.confirmedFrontier === nanoAnchor.hash);
+    }, []);
+    return observation;
+  }))).filter(Boolean);
+  const nano = await check("nano-frontier-agreement", () => {
     const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(nanoNodes);
-    for (const { peer } of lagging) checks.push({ stage: `nano-node-${peer}-lag`, ok: false, code: "nano-rpc-peer-lagging", domains: [] });
+    const behind = current.filter(({ view }) => nanoAnchor && view.confirmedHeight < nanoAnchorHeight);
+    for (const { peer } of [...lagging, ...behind]) {
+      checks.push({ stage: `nano-node-${peer}-lag`, ok: false, code: "nano-rpc-peer-lagging", domains: [] });
+    }
     const minimum = Math.min(2, config.nanoRpcUrls.length);
     const standbyMatches = standbyCheckpoint && latestConfirmed?.confirmedHeight === BigInt(standbyCheckpoint.blockCount)
       && latestConfirmed.confirmedFrontier === standbyCheckpoint.hash;
@@ -331,23 +350,15 @@ export async function runOperationalCheck(config, deps = {}) {
       need(current.length === 1 && standbyCheckpoint, lagging.length ? "nano-rpc-lagging-peers" : "nano-read-quorum-unavailable");
       need(standbyMatches, "nano-standby-checkpoint-disagrees");
     }
-    const anchor = runtimeFunding?.checkpoint.confirmed;
-    if (anchor) {
-      const height = BigInt(anchor.blockCount);
-      need(latestConfirmed.confirmedHeight >= height, "nano-confirmed-checkpoint-regressed");
-      need(nanoNodes.every(({ view }) => view.confirmedHeight !== height || view.confirmedFrontier === anchor.hash),
+    if (nanoAnchor) {
+      need(latestConfirmed.confirmedHeight >= nanoAnchorHeight, "nano-confirmed-checkpoint-regressed");
+      need(nanoNodes.every(({ view }) => view.confirmedHeight !== nanoAnchorHeight || view.confirmedFrontier === nanoAnchor.hash),
         "nano-confirmed-checkpoint-disagrees");
-      const witnesses = await Promise.all(current.map(async ({ peer, view }) => {
-        if (view.confirmedHeight <= height) return view.confirmedHeight === height;
-        try {
-          const block = await nanoRpc(config.nanoRpcUrls[peer], { action: "block_info", hash: anchor.hash, json_block: "true" });
-          return matchesNanoConfirmedBlock(block, { account: config.nanoAddress, anchor, hashBlock });
-        } catch { return false; }
-      }));
-      need(witnesses.filter(Boolean).length + Number(Boolean(standbyMatches)) >= minimum,
-        "nano-confirmed-checkpoint-unverified");
     }
-    return current.find(row => row.view === latestConfirmed).info;
+    const witnesses = current.filter(row => row.witnessed);
+    const newest = witnesses.find(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight);
+    need(newest && witnesses.length + Number(Boolean(standbyMatches)) >= minimum, "nano-confirmed-checkpoint-unverified");
+    return newest.info;
   });
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
   const nearNodes = (await Promise.all(config.nearRpcUrls.map((url, index) => check(`near-node-${index}`, async () => {

@@ -582,24 +582,32 @@ test("independent Nano peers must corroborate the runtime's confirmed checkpoint
     ["newer", 11, "D".repeat(64), undefined],
     ["newer-with-unconfirmed-history", 11, "D".repeat(64), "nano-confirmed-checkpoint-unverified"],
     ["newer-with-wrong-history", 11, "D".repeat(64), "nano-confirmed-checkpoint-unverified"],
+    ["redundant-with-wrong-history", 11, "D".repeat(64), undefined],
+    ["newest-unverified", 10, anchor.hash, "nano-confirmed-checkpoint-unverified"],
   ]) {
+    const wrongHistory = ["newer-with-wrong-history", "redundant-with-wrong-history", "newest-unverified"].includes(scenario);
     const f = fixture(({ url, body }) => {
       if (!url.hostname.startsWith("nano-")) return null;
+      const secondary = url.hostname === "nano-1.example";
       if (body.action === "account_info") {
-        const behind = scenario === "one-peer-behind" && url.hostname === "nano-1.example";
-        return Response.json(nanoAccountInfo({ height: behind ? 9 : height, frontier: behind ? "B".repeat(64) : frontier,
-          balance: block.balance }));
+        if (secondary && scenario === "one-peer-behind") return Response.json(nanoAccountInfo({ height: 9, frontier: "B".repeat(64) }));
+        if (secondary && scenario === "newest-unverified") return Response.json(nanoAccountInfo({ height: 11, frontier: "D".repeat(64) }));
+        return Response.json(nanoAccountInfo({ height, frontier, balance: block.balance }));
       }
       if (body.action !== "block_info" || body.hash !== anchor.hash) return null;
-      const secondary = url.hostname === "nano-1.example";
       return Response.json({
         height: anchor.blockCount,
         confirmed: !secondary || scenario !== "newer-with-unconfirmed-history",
-        contents: secondary && scenario === "newer-with-wrong-history" ? { ...block, link: "E".repeat(64) } : block,
+        contents: secondary && wrongHistory ? { ...block, link: "E".repeat(64) } : block,
       });
     });
     t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
-    const checkpoint = f.states["/state/funding-health.json"].nanoRpc.checkpoint;
+    const rpc = f.states["/state/funding-health.json"].nanoRpc;
+    if (["redundant-with-wrong-history", "newest-unverified"].includes(scenario)) {
+      f.config.nanoRpcUrls.push("https://nano-2.example");
+      rpc.configuredPeers = 3;
+    }
+    const { checkpoint } = rpc;
     checkpoint.confirmed = anchor;
     // A locally published head can be ahead of the last confirmed block.
     checkpoint.head = { hash: "A".repeat(64), blockCount: "11" };
@@ -609,7 +617,12 @@ test("independent Nano peers must corroborate the runtime's confirmed checkpoint
     assert.equal(check.ok, expected === undefined, scenario);
     assert.ok(Object.values(report.admission).every(ready => ready === (expected === undefined)), scenario);
     const history = f.calls.filter(c => c.body?.action === "block_info" && c.body.hash === anchor.hash);
-    assert.equal(history.length, height > 10 ? 2 : 0, scenario);
+    assert.equal(history.length, height > 10 ? f.config.nanoRpcUrls.length : Number(scenario === "newest-unverified"), scenario);
+    if (wrongHistory) {
+      assert.deepEqual(report.checks.find(c => c.stage === "nano-node-1"),
+        { stage: "nano-node-1", ok: false, code: "nano-confirmed-checkpoint-unverified", domains: [] }, scenario);
+    }
+    if (scenario === "newest-unverified") assert.ok(!report.checks.some(c => c.stage === "nano-liquidity"));
     assert.ok(!JSON.stringify(report).includes(anchor.hash), scenario);
   }
 });
