@@ -32,7 +32,7 @@ import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
+import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
@@ -416,7 +416,7 @@ export async function runOperationalCheck(config, deps = {}) {
     return { ...newest, peers: currentWitnesses.map(row => row.peer) };
   });
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
-  if (config.nanoRpcUrls.length >= 3) await check("nano-fallback-payment-reads", async () => {
+  const fallbackPaymentReads = config.nanoRpcUrls.length >= 3 && await check("nano-fallback-payment-reads", async () => {
     need(nano, "nano-fallback-payment-read-anchor-unavailable");
     const account = config.nanoAddress, head = nano.view.confirmedFrontier;
     // The preferred node and quota-limited standby are excluded from this rehearsal.
@@ -440,6 +440,10 @@ export async function runOperationalCheck(config, deps = {}) {
     const { current, latestConfirmed } = qualifyNanoAccountViews(views);
     need(current.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight).length >= 2,
       "nano-fallback-payment-read-quorum-unavailable");
+    return true;
+  }, []);
+  if (config.nanoStandby && !fallbackPaymentReads) await check("nano-standby-cold-scan-budget", () => {
+    need(config.nanoStandby.requestsPerMinute >= NANO_COLD_STANDBY_SCAN_REQUESTS, "nano-standby-cold-scan-budget-insufficient");
   }, []);
   if (state) await check("nano-payment-scan-progress", async () => {
     const at = now(), ledger = readNanoLedger();

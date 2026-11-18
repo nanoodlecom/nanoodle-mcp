@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createBlock, checkAddress, hashBlock } from "nanocurrency";
-import { createNanoReadPool, nanoStandbyConfig } from "../src/nano-read-pool.mjs";
+import { createNanoReadPool, nanoStandbyConfig, NANO_COLD_STANDBY_SCAN_REQUESTS } from "../src/nano-read-pool.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
 const ACCOUNT = NANO_GENESIS_REPLY.contents.account, PAYER = "nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7";
@@ -136,6 +136,54 @@ test("standby quota covers all attempted reads and refills on monotonic time", a
   w.tick(1);
   await w.pool.read(info);
   assert.equal(standbyCalls().length, 5);
+});
+
+test("a standby defers a payment read if only part of its budget is available", async () => {
+  const w = world(2, 4), [, spare, standby] = w.peers;
+  const standbyActions = () => w.calls.filter(call => call.base === standby.base).map(call => call.action);
+  spare.down = true;
+  await w.pool.read(receivable);
+  await assert.rejects(w.pool.read(receivable), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.deepEqual(standbyActions(), ["block_info", "receivable", "account_info"]);
+  w.tick(30_000);
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.deepEqual(standbyActions(), ["block_info", "receivable", "account_info"]);
+  w.tick(30_000);
+  await w.pool.read(receivable);
+  assert.deepEqual(standbyActions(), ["block_info", "receivable", "account_info", "block_info", "receivable", "account_info"]);
+});
+
+test("concurrent payment reads cannot consume each other's standby validation budget", async () => {
+  const w = world(2, 4), [, spare, standby] = w.peers;
+  spare.down = true;
+  const results = await Promise.allSettled([w.pool.read(receivable), w.pool.read(receivable)]);
+  assert.deepEqual(results.map(result => result.status), ["fulfilled", "rejected"]);
+  assert.equal(results[1].reason.code, "NANO_RPC_STANDBY_BUDGET");
+  assert.deepEqual(w.calls.filter(call => call.base === standby.base).map(call => call.action),
+    ["block_info", "receivable", "account_info"]);
+  await w.pool.read(info);
+});
+
+test("a cold standby needs room for both halves of a one-page payment scan", async () => {
+  for (const budget of [4, 5]) {
+    const w = world(2, budget), [owned, spare, standby] = w.peers;
+    const head = owned.info.confirmed_frontier;
+    const request = { action: "account_history", account: ACCOUNT, head, raw: "true", count: "1" };
+    owned.history = standby.history = { account: ACCOUNT, previous: OTHER, history: [
+      { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+    ] };
+    spare.down = true;
+    const standbyActions = () => w.calls.filter(call => call.base === standby.base).map(call => call.action);
+    await w.pool.read(receivable);
+    if (budget === 4) {
+      await assert.rejects(w.pool.read(request), { code: "NANO_RPC_STANDBY_BUDGET" });
+      assert.equal(standbyActions().length, 3);
+    } else {
+      assert.equal((await w.pool.read(request)).history[0].hash, head);
+      assert.deepEqual(standbyActions(), ["block_info", "receivable", "account_info", "account_history", "account_info"]);
+      assert.equal(standbyActions().length, NANO_COLD_STANDBY_SCAN_REQUESTS);
+    }
+  }
 });
 
 test("a standby rate limit remains private and prevents attempts until its retry time", async () => {
