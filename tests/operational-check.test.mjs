@@ -19,6 +19,14 @@ import { nearFundingNeed, nearRefundClaims, nearRefundCosts } from "../src/near/
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 
+function rawHistory(request, receive = null) {
+  const previous = "E".repeat(64);
+  const history = [{ hash: request.head, type: "state", subtype: "change",
+    height: "10", confirmed: "true", previous: receive?.hash ?? previous }];
+  if (receive) history.push({ height: "9", confirmed: "true", previous, ...receive });
+  return { account: request.account, history, previous };
+}
+
 test("the readiness CLI reports preflight failure when run through a release symlink", t => {
   const root = mkdtempSync(join(tmpdir(), "operational-check-entry-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -116,8 +124,10 @@ function fixture(override = () => null) {
       const json = result => Response.json(body?.jsonrpc ? { jsonrpc: "2.0", id: body.id, result } : result);
       if (/^nano-\d/.test(url.hostname)) {
         if (body.action === "block_info") return json(NANO_GENESIS_REPLY);
-        if (body.action === "account_history") return json({ account: body.account,
-          history: [{ hash: body.head, type: "send", confirmed: "true" }] });
+        if (body.action === "account_history") {
+          assert.equal(body.raw, "true");
+          return json(rawHistory(body));
+        }
         if (body.action === "receivable") return json({ blocks: "" });
         assert.equal(body.action, "account_info");
         return json(nanoAccountInfo({ frontier: "A".repeat(64), balance: "10000000000000000000000000000000" }));
@@ -313,9 +323,10 @@ test("a legacy Nano writer alerts on an aged confirmed matching transfer missing
         if (scenario === "observation-unavailable" || (scenario === "fallback" && url.hostname === "nano-0.example")) {
           return new Response(null, { status: 503 });
         }
-        const history = ["already-pocketed", "known-receive-alias"].includes(scenario) ? [{ type: "state", subtype: "receive", hash: receiveHash,
-          link: hash, amount, confirmed: "true" }] : [];
-        return Response.json({ account, history });
+        const receive = ["already-pocketed", "known-receive-alias"].includes(scenario) ? {
+          type: "state", subtype: "receive", hash: receiveHash, link: hash, amount, account: sender,
+        } : null;
+        return Response.json(rawHistory(body, receive));
       }
       if (body.hash !== hash) return null;
       if (scenario === "recorded-during-read") Object.assign(states["/state/gate-state.json"].quotes[0], { status: "paid", payHash: hash });
@@ -812,12 +823,17 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
 });
 
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
-  for (const failure of [null, "history-http", "wrong-head", "inconsistent-receivable", "moved-after-history"]) {
+  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "moved-after-history"]) {
     const f = fixture(({ url, body }) => {
       if (url.hostname !== "nano-2.example") return null;
       if (body.action === "account_history" && failure === "history-http") return new Response("PRIVATE_RPC_DETAIL", { status: 503 });
       if (body.action === "account_history" && failure === "wrong-head") {
-        return Response.json({ account: body.account, history: [{ hash: "B".repeat(64), type: "send", confirmed: "true" }] });
+        return Response.json(rawHistory({ ...body, head: "B".repeat(64) }));
+      }
+      if (body.action === "account_history" && failure === "cut-short") {
+        const page = rawHistory(body);
+        delete page.previous;
+        return Response.json(page);
       }
       if (body.action === "receivable" && failure === "inconsistent-receivable") {
         return Response.json({ blocks: { ["B".repeat(64)]: { amount: "1", source: body.account } } });
@@ -842,7 +858,7 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
     }
     const calls = f.calls.filter(c => ["account_history", "receivable"].includes(c.body?.action));
     assert.ok(calls.every(c => ["nano-1.example", "nano-2.example"].includes(c.url.hostname)));
-    assert.ok(calls.some(c => c.body.action === "account_history" && c.body.count === "100"));
+    assert.ok(calls.some(c => c.body.action === "account_history" && c.body.count === "100" && c.body.raw === "true"));
     assert.ok(calls.some(c => c.body.action === "receivable" && c.body.count === "500" && c.body.include_only_confirmed === "true"));
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_RPC_DETAIL|nano-2\.example|BBBBBBBB/);
