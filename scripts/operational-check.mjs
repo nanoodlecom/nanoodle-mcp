@@ -22,7 +22,7 @@ import { USDC_RATE } from "../src/near/ft.mjs";
 import {
   countOpenNearQuotes, heldNearQuoteAmounts, nearPaymentWatchCoverage, MAX_OPEN_NEAR_QUOTES, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS,
 } from "../src/near/quote-capacity.mjs";
-import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
+import { authorAddress, resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
@@ -38,6 +38,8 @@ import { fundingReportFailure, selectFundingPause } from "../src/funding-report.
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
 import { RAW_PER_XNO, parseSpreadBps, spreadPair } from "../src/near/rates.mjs";
 import { exactUsd } from "../src/custom-workflow.mjs";
+import { nearRunFundingBudget } from "../src/funding-liabilities.mjs";
+import { runFundingBudget } from "../src/run-funding.mjs";
 import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -99,7 +101,7 @@ function previewDeposit(content, asset, network) {
   if (asset === "usdc") {
     need(currency.tokenContract === USDC_CONTRACTS[network] && currency.decimals === 6
       && currency.usdcUsd === "1", "saved-workflow-denomination-invalid");
-    return usdToYocto(depositUsd, USDC_RATE, "ceil");
+    return { base: usdToYocto(depositUsd, USDC_RATE, "ceil"), rate: USDC_RATE, step: 1n };
   }
   need(positiveDecimal(currency.rate?.nearUsd) && positiveDecimal(currency.depositNear)
     && positiveDecimal(currency.likelyChargeNear), "saved-workflow-denomination-invalid");
@@ -109,7 +111,7 @@ function previewDeposit(content, asset, network) {
   const yocto = usdToYocto(depositUsd, rate, "ceil");
   const base = ((yocto + DUST_STEP_YOCTO - 1n) / DUST_STEP_YOCTO) * DUST_STEP_YOCTO;
   need(amount === base, "near-deposit-conversion-invalid");
-  return amount;
+  return { base: amount, rate, step: DUST_STEP_YOCTO };
 }
 
 export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("../", import.meta.url))) {
@@ -246,12 +248,12 @@ export async function runOperationalCheck(config, deps = {}) {
           need(deposit >= charge && deposit >= parseUsdNano(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
         } else {
           need(parseUsdNano(content.pricing.deposit.usd) >= charge, "saved-workflow-deposit-too-low");
-          const base = previewDeposit(content, asset, config.network);
+          const denomination = previewDeposit(content, asset, config.network);
+          const { base, step } = denomination;
           const held = heldAmounts?.[asset];
           if (held?.size >= Math.ceil(QUOTE_DUST_SLOTS * CAPACITY_WARNING)) {
             // The native preview gives the dust-rounded base, before a unique
             // payment amount is assigned. USDC uses whole micro-USDC units.
-            const step = asset === "near" ? DUST_STEP_YOCTO : 1n;
             let occupied = 0;
             for (let dust = 1; dust <= QUOTE_DUST_SLOTS; dust++) {
               if (held.has((base + BigInt(dust) * step).toString())) occupied++;
@@ -259,6 +261,7 @@ export async function runOperationalCheck(config, deps = {}) {
             need(occupied < QUOTE_DUST_SLOTS, "saved-workflow-quote-amounts-exhausted");
             need(occupied < Math.ceil(QUOTE_DUST_SLOTS * CAPACITY_WARNING), "saved-workflow-quote-amounts-low");
           }
+          await checkNearPreviewCapital(`workflow-nano-capital-${asset}-${name}`, published, content, denomination);
         }
       }, [])));
     }
@@ -623,12 +626,13 @@ export async function runOperationalCheck(config, deps = {}) {
     const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
     need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
   }, []);
+  let queuedNearRaw = null;
   if (state) await check("near-paid-run-funding", () => {
     // The runtime sample came first. Re-read the ledger so a quote that has
     // since acquired a live reservation is not counted again as unstarted.
-    let requiredRaw;
-    try { requiredRaw = paidNearRunFundingRaw(readNearLedger().quotes); }
+    try { queuedNearRaw = paidNearRunFundingRaw(readNearLedger().quotes); }
     catch { throw new CheckError("near-paid-run-funding-unverified"); }
+    const requiredRaw = queuedNearRaw;
     if (requiredRaw === 0n) return;
     need(nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000, "near-paid-run-funding-unverified");
     need(runtimeFunding.availableRaw >= requiredRaw, "near-paid-run-funding-insufficient");
@@ -638,6 +642,35 @@ export async function runOperationalCheck(config, deps = {}) {
       nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
     need(result.ok, "near-paid-run-funding-insufficient");
   }, []);
+  async function checkRunCapital(stage, buildBudget) {
+    if (config.providerUsesWallet === false) return;
+    await check(stage, () => {
+      need(state && nano && rates && runtimeFunding && queuedNearRaw !== null
+        && now() - runtimeFunding.checkedAt <= 60_000, "workflow-nano-capital-unverified");
+      const { maxRaw, overheadRaw } = buildBudget();
+      // A prospective run must fit alongside already paid work that has yet
+      // to reserve Nano. Compare the runtime and durable balances separately.
+      const requiredRaw = maxRaw + overheadRaw + queuedNearRaw;
+      const independent = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
+        nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
+      need(runtimeFunding.availableRaw >= requiredRaw && independent.ok, "workflow-nano-capital-insufficient");
+    }, []);
+  }
+  function checkNearPreviewCapital(stage, graph, content, { base, rate, step }) {
+    return checkRunCapital(stage, () => nearRunFundingBudget({
+      id: "operational-preview", depositUsd: content.pricing.deposit.usd, author: authorAddress(graph.x402),
+      // This is the largest transfer this preview can produce, including
+      // quote dust, for the creator payout overhead computed at run time.
+      paidYocto: (base + BigInt(QUOTE_DUST_SLOTS) * step).toString(),
+      rate: { usdNano: rate.usdNano.toString(), yocto: rate.yocto.toString(),
+        xnoUsd: content.near?.rate?.xnoUsd ?? rates.xnoUsd },
+    }));
+  }
+  function checkMarketRunCapital(stage, budgetUsd, creator) {
+    return checkRunCapital(stage, () => runFundingBudget({
+      id: "operational-market", budgetUsd, pair: { usdNano: parseUsdNano(rates.xnoUsd), raw: RAW_PER_XNO }, creator,
+    }));
+  }
   const nearTools = await check("mcp-discovery", async () => {
     await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } });
     const result = await mcp("tools/list", {});
@@ -663,7 +696,8 @@ export async function runOperationalCheck(config, deps = {}) {
       const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph, inputs, _pay_with: asset } });
       const content = savedPricingContent(result);
       need(parseUsdNano(content.pricing.deposit.usd) >= charge, "custom-workflow-deposit-too-low");
-      previewDeposit(content, asset, config.network);
+      const denomination = previewDeposit(content, asset, config.network);
+      await checkNearPreviewCapital(`workflow-nano-capital-${asset}-custom`, graph, content, denomination);
     }
   }, ["near", "usdc", "market"]);
   if (near) {
@@ -845,6 +879,9 @@ export async function runOperationalCheck(config, deps = {}) {
         }
       }
     }, ["market"]);
+    if (agent.bids && platform) {
+      await checkMarketRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
+    }
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
       const priced = await priceWorkflow(listingWorkflowPriceSample(agent.defaultWorkflow), freshPriceOptions);
@@ -855,6 +892,7 @@ export async function runOperationalCheck(config, deps = {}) {
       need(platform && budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
       const remote = await mcp("tools/call", { name: "price_noodle", arguments: { graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } } });
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
+      await checkMarketRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
   }));
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
@@ -879,7 +917,8 @@ async function productionConfig(env = process.env) {
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
     nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
-    nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
+    nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
+    agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 
 if (import.meta.main) {

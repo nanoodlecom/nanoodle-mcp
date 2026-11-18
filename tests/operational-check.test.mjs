@@ -795,6 +795,101 @@ test("paid NEAR and USDC workflows must fit together at their locked Nano rates"
   }
 });
 
+test("valid NEAR and USDC previews must fit both independent Nano balances and already paid work", async t => {
+  const raw = 10n ** 30n;
+  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting"]) {
+    const f = fixture(({ url, body }) => {
+      const args = body?.params?.arguments;
+      if (url.hostname !== "site.example" || !(args?.graph?.name === "sing" || args?.inputs?.Marker)) return null;
+      const preview = pricePreview(args._pay_with);
+      preview.pricing.deposit.usd = "3";
+      if (preview.near) preview.near.depositNear = "1";
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { structuredContent: preview } });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const funding = f.states["/state/funding-health.json"];
+    funding.liabilitiesRaw = "0";
+    funding.reservedRaw = String(mode === "runtime-reserved" ? 15n * raw / 2n : 69n * raw / 10n);
+    funding.activeRuns = 1;
+    funding.oldestStartedAt = NOW - 1000;
+    if (mode === "chain-obligations") {
+      f.states["/state/gate-state.json"].owed.push({ amountRaw: String(15n * raw / 2n), journaled: true, tries: 0, createdAt: NOW });
+    }
+    if (mode === "paid-waiting") {
+      f.states["/state/near-state.json"].quotes.queued = { id: "private-queued-funding-sample", status: "paid", asset: "usdc",
+        depositUsd: "1", paidYocto: "1000000", paidAtBlockMs: NOW, rate: { xnoUsd: "2" } };
+    }
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "saved-workflow-near-sing",
+      "saved-workflow-usdc-sing", "custom-workflow-pricing"]) assert.ok(check(stage)?.ok, mode + " " + stage);
+    for (const stage of ["workflow-nano-capital-near-sing", "workflow-nano-capital-usdc-sing",
+      "workflow-nano-capital-near-custom", "workflow-nano-capital-usdc-custom"]) {
+      assert.equal(check(stage)?.ok, mode === "healthy", mode + " " + stage);
+      if (mode !== "healthy") assert.deepEqual(check(stage), { stage, ok: false, code: "workflow-nano-capital-insufficient", domains: [] });
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-queued-funding-sample|reservedRaw|depositUsd/);
+    if (mode === "runtime-reserved") {
+      const invocationId = ID.replaceAll("-", "");
+      const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+        MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, { ...report, invocationId }, NOW);
+      assert.match(alert.text, /workflow-nano-capital-insufficient/);
+      assert.doesNotMatch(alert.text, /private-queued-funding-sample|reservedRaw|depositUsd/);
+    }
+  }
+});
+
+test("the maximum quote dust is included in the saved creator workflow's Nano funding", async t => {
+  for (const author of [null, NANO_GENESIS_REPLY.contents.account]) {
+    const f = fixture(({ url, body }) => {
+      if (url.hostname !== "site.example") return null;
+      if (url.pathname === "/graph/sing.json") {
+        return Response.json({ v: 1, name: "sing", x402: { author },
+          nodes: [{ id: "input", type: "text", fields: { text: "sample" } }], links: [] });
+      }
+      const args = body?.params?.arguments;
+      if (args?.graph?.name !== "sing") return null;
+      const preview = pricePreview(args._pay_with);
+      preview.pricing.deposit.usd = "3";
+      if (preview.near) preview.near.depositNear = "1";
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { structuredContent: preview } });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const funding = f.states["/state/funding-health.json"];
+    Object.assign(funding, { liabilitiesRaw: "0", reservedRaw: String(7n * 10n ** 30n), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    const checks = (await runOperationalCheck(f.config, f.deps)).checks;
+    for (const asset of ["near", "usdc"]) {
+      assert.ok(checks.find(check => check.stage === `saved-workflow-${asset}-sing`)?.ok);
+      const proof = checks.find(check => check.stage === `workflow-nano-capital-${asset}-sing`);
+      assert.equal(proof?.ok, author === null, asset);
+      if (author) assert.equal(proof.code, "workflow-nano-capital-insufficient");
+    }
+  }
+});
+
+test("profitable Market listings and bid caps still need spendable Nano upfront", async t => {
+  for (const providerUsesWallet of [true, false]) {
+    const f = fixture(({ url }) => url.pathname === `/v1/agents/${ID}/pricing-plans`
+      ? Response.json([{ is_default: true, price_amount: "4.00", listing_status: "live" }]) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.providerUsesWallet = providerUsesWallet;
+    const agent = f.config.agents[0];
+    Object.assign(agent, { bids: true, maxBidUsd: 4 });
+    const original = f.deps.computePrice;
+    f.deps.computePrice = (args, options) => args.graph === agent.defaultWorkflow.graph
+      ? { safety: { ok: true }, pricing: { estimatedCostUsd: 2.50 } } : original(args, options);
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: "0",
+      reservedRaw: String(15n * 10n ** 30n / 2n), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.find(check => check.stage === "workflow-price-nanoodle-image")?.ok);
+    assert.equal(report.admission.market, true);
+    const capital = report.checks.filter(check => check.stage.startsWith("workflow-nano-capital-market"));
+    assert.equal(capital.length, providerUsesWallet ? 2 : 0);
+    assert.ok(capital.every(check => !check.ok && check.code === "workflow-nano-capital-insufficient"));
+  }
+});
+
 test("a low canary payer is visible without closing customer payment lanes", async t => {
   const payer = "dedicated-canary.testnet";
   const f = fixture(({ body }) => body?.params?.request_type === "view_account" && body.params.account_id === payer
