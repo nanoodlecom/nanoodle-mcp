@@ -123,6 +123,14 @@ export async function readNearFunding({ rpc, network, accountId, publicKey, toke
     costs: nearRefundCosts(protocol, gas.gas_price), blockHeight: Number(head.height), accessKey: key };
 }
 
+/** A native transfer needs spendable principal, storage, and fee prepayment. */
+export async function readNearTransferFunding({ amountYocto, ...options }) {
+  const frame = await readNearFunding(options);
+  const required = nearFundingNeed({ ...frame, reserveYocto: 0n,
+    claims: { nearYocto: amountYocto, nativeRefunds: 1, tokenRefunds: 0 } });
+  return { accessKey: frame.accessKey, sufficient: frame.balanceYocto >= required };
+}
+
 /** Serial admission/quote commit; financial debts remain in the existing ledger.
  * No model work, signing, publication or refund retry is performed here. */
 export function createNearFunding({ rpc, ledger, network, accountId, publicKey, usdcToken = null, now = Date.now, unpaidRetainMs = 3_600_000 }) {

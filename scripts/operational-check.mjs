@@ -3,7 +3,7 @@
 // signing, receive sweep, assignment start, bid, submission or price mutation.
 import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -11,11 +11,12 @@ import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
-import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/index.mjs";
+import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto } from "../src/near/index.mjs";
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms } from "../src/market/catalog.mjs";
+import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
@@ -23,11 +24,14 @@ import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
-import { readNearFunding } from "../src/near/funding.mjs";
-import { atomicJson, checkGraph } from "./near-check.mjs";
+import { readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
+import { RAW_PER_XNO } from "../src/near/rates.mjs";
+import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
+const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
+const MARKET_MAX_PAGES = 5;
 const REFUND_FUNDING_CODES = new Map([
   ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
   ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
@@ -86,6 +90,7 @@ export async function runOperationalCheck(config, deps = {}) {
   const now = deps.now || Date.now, read = deps.readJson || readJson;
   const request = createProbeFetch({ fetch: deps.fetch || globalThis.fetch, timeoutMs: config.timeoutMs || 12_000 });
   const priceWorkflow = deps.computePrice || computePrice;
+  const providerReserveUsd = config.providerReserveUsd || "2";
   const checks = [];
   const peerUrls = config.nanoStandby ? [...config.nanoRpcUrls, config.nanoStandby.url] : config.nanoRpcUrls;
   let nanoCooldowns = [];
@@ -120,7 +125,7 @@ export async function runOperationalCheck(config, deps = {}) {
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
   });
-  const fundingPause = await check("runtime-funding", async () => {
+  const runtimeFunding = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
     const checkedAt = Date.parse(value.checkedAt), age = now() - checkedAt;
@@ -130,7 +135,8 @@ export async function runOperationalCheck(config, deps = {}) {
     need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
     need(value.writerProtection.requiredState === true, "required-state-policy-not-enforced");
     need([value.balanceRaw, value.liabilitiesRaw, value.reservedRaw].every(v => typeof v === "string" && /^\d{1,39}$/.test(v)), "funding-report-invalid");
-    need(value.ok === true && BigInt(value.balanceRaw) >= BigInt(value.liabilitiesRaw) + BigInt(value.reservedRaw), "funding-underfunded");
+    const availableRaw = BigInt(value.balanceRaw) - BigInt(value.liabilitiesRaw) - BigInt(value.reservedRaw);
+    need(value.ok === true && availableRaw >= 0n, "funding-underfunded");
     need(Number.isSafeInteger(value.activeRuns) && value.activeRuns >= 0, "funding-report-invalid");
     const limit = Object.hasOwn(value, "runTimeoutMs") ? value.runTimeoutMs : DEFAULT_HOSTED_RUN_MS;
     need(Number.isSafeInteger(limit) && limit > 0 && limit <= 24 * 3_600_000, "funding-report-invalid");
@@ -157,7 +163,7 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return pause?.recoveredAt != null ? pause : null;
+    return { availableRaw, fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -270,9 +276,15 @@ export async function runOperationalCheck(config, deps = {}) {
   });
   if (state && nano && rates) await check("nano-liquidity", async () => {
     const result = nanoLiquidityCheck({ liabilities: state.liabilities, nanoBalanceRaw: nano.confirmed_balance,
-      xnoUsd: rates.xnoUsd, providerReserveUsd: config.providerReserveUsd || "2" });
+      xnoUsd: rates.xnoUsd, providerReserveUsd });
     need(result.ok, result.code);
   });
+  if (runtimeFunding && rates) await check("nano-unreserved-liquidity", () => {
+    // The runtime already accounts for live reservations and liabilities. The
+    // on-disk accounting above remains independent so neither counts them twice.
+    const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
+    need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
+  }, []);
   await check("mcp-discovery", async () => {
     await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } });
     const result = await mcp("tools/list", {});
@@ -293,6 +305,14 @@ export async function runOperationalCheck(config, deps = {}) {
     }
   }, ["near", "usdc", "market"]);
   if (near) {
+    if (config.canaryPayer) await check("near-canary-payer-funding", async () => {
+      const { accountId, publicKey, maxNear } = config.canaryPayer;
+      need(accountId !== config.merchant && publicKey, "near-canary-payer-proof-unconfigured");
+      const amountYocto = parseNearToYocto(maxNear);
+      need(amountYocto > 0n, "near-canary-payer-proof-unconfigured");
+      const funding = await readNearTransferFunding({ rpc: near.rpc, network: config.network, accountId, publicKey, amountYocto, now });
+      need(funding.sufficient, "near-canary-payer-insufficient");
+    }, []);
     await check("near-refund-authority", async () => {
       const key = await near.rpc.viewAccessKey({ accountId: config.merchant, publicKey: config.nearPublicKey });
       need(key.permission === "FullAccess", "near-refund-key-not-authorized");
@@ -312,7 +332,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["near", "usdc"]);
     if (funding && state && rates) await check("refund-liquidity-accounting", async () => {
       const results = liquidityChecks({ ...funding, usdcBalanceAtomic: funding.usdcBalanceAtomic ?? "0", liabilities: state.liabilities, nanoBalanceRaw: nano?.confirmed_balance || "0",
-        xnoUsd: rates.xnoUsd, providerReserveUsd: config.providerReserveUsd || "2" });
+        xnoUsd: rates.xnoUsd, providerReserveUsd });
       for (const result of results.filter(r => r.stage !== "nano-liquidity")) checks.push({ ...result, ...(result.ok ? {} : { domains: result.stage === "usdc-liquidity" ? ["usdc"] : ["near", "usdc"] }) });
     }, ["near", "usdc"]);
   }
@@ -328,15 +348,45 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
     const assignments = await check(`market-auth-${agent.handle}`, async () => {
       const token = (deps.readText || (file => readFileSync(file, "utf8")))(agent.tokenFile).trim();
-      const result = await http(config.marketUrl + "/v1/agents/me/assignments?status=in_progress&limit=100&offset=0", { headers: { authorization: `Bearer ${token}` } });
-      need(Array.isArray(result.assignments) && result.assignments.length <= 100, "market-auth-response-invalid");
-      return result.assignments;
+      const client = createMarketClient({ baseUrl: config.marketUrl, token, fetch: request });
+      try { return await client.listActionable({ maxPages: MARKET_MAX_PAGES }); }
+      catch (error) {
+        if (error instanceof MarketApiError && error.status !== null) {
+          throw new CheckError(error.status === 200 ? "market-auth-response-invalid" : `http-${error.status}`);
+        }
+        throw error;
+      }
     }, ["market"]);
     if (assignments) await check(`market-escrow-${agent.handle}`, () => {
       for (const row of assignments) {
         if (row?.job?.jobKind === "competition") continue;
         const { code } = marketEscrowTerms(row?.assignment);
         need(!code, code?.toLowerCase().replaceAll("_", "-"));
+      }
+    }, ["market"]);
+    if (assignments) await check(`market-intake-${agent.handle}`, () => {
+      need(assignments.length < MARKET_MAX_PAGES * 100, "market-intake-scan-incomplete");
+      const active = assignments.filter(row => row?.job?.jobKind !== "competition");
+      if (!active.length) return;
+      // Read after the remote poll. The worker persists its record before starting a hire.
+      const state = read(join(config.marketStateDir, agent.handle, "market-state.json"));
+      need(state?.v === 1 && state.assignments && typeof state.assignments === "object" && !Array.isArray(state.assignments),
+        "market-intake-state-invalid");
+      const checkedAt = now(), seen = new Set();
+      for (const row of active) {
+        const a = row?.assignment;
+        need(typeof a?.assignmentId === "string" && a.assignmentId && a.status === "in_progress" && !seen.has(a.assignmentId),
+          "market-intake-response-invalid");
+        seen.add(a.assignmentId);
+        const hiredAt = Date.parse(a.createdAt), deadline = Date.parse(a.slaDeadlineAt);
+        need(Number.isFinite(hiredAt) && Number.isFinite(deadline) && deadline >= hiredAt && hiredAt <= checkedAt + 30_000,
+          "market-intake-timing-invalid");
+        need(deadline > checkedAt, "market-intake-sla-expired");
+        if (!Object.hasOwn(state.assignments, a.assignmentId)) {
+          need(!a.startedAt && !a.submittedAt && !a.deliverableUrl && row.latestMessage?.senderSide !== "worker",
+            "market-intake-start-without-record");
+          need(checkedAt - hiredAt <= MARKET_PICKUP_GRACE_MS, "market-intake-untracked");
+        }
       }
     }, ["market"]);
     if (!agent.defaultWorkflow) return;
@@ -353,7 +403,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
   }));
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
-    { fundingPause, nearBackfilling: watcherHealth?.backfilling });
+    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling });
 }
 
 async function productionConfig(env = process.env) {
@@ -361,17 +411,20 @@ async function productionConfig(env = process.env) {
   need(secret, "nano-wallet-not-configured");
   const merchant = env.NEAR_MERCHANT;
   const signer = await loadNearSigner({ accountId: merchant, keyFile: env.NEAR_KEY_FILE || null, env });
+  const payer = env.CHECK_PAYER;
+  const canaryPayer = payer ? { accountId: payer, maxNear: env.CHECK_MAX_NEAR || DEFAULT_CHECK_MAX_NEAR,
+    publicKey: env.CHECK_PAYER_PUBLIC_KEY || (/^[a-f0-9]{64}$/.test(payer) ? "ed25519:" + base58Encode(Buffer.from(payer, "hex")) : null) } : null;
   const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
   const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", outDir: "/srv/nanoodle-mcp/out",
-    marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK,
+    marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK, canaryPayer,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
     nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
     nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   let report;
   try {
     const config = await productionConfig();

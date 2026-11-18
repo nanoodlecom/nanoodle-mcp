@@ -47,6 +47,18 @@ test("stuck work, permanently failed refunds and long-pending creator payouts re
   assert.deepEqual(l.issues, ["creator-payout-stuck", "market-assignment-stuck", "market-work-stuck", "nano-paid-work-stuck", "nano-settlement-stuck", "near-paid-work-stuck", "near-refund-failed"]);
 });
 
+test("the Nano debt alert uses the original age when the next retry is in the future", () => {
+  const s = snapshots();
+  const debt = { amountRaw: "20", createdAt: NOW - 900_001, at: NOW + 60_000, tries: 1 };
+  s.nano.owed.push(debt);
+  let result = paymentLiabilities(s, { now: NOW });
+  assert.deepEqual(result.issues, ["nano-settlement-stuck"]);
+  assert.equal(result.nanoRaw, 20n);
+  debt.createdAt++;
+  result = paymentLiabilities(s, { now: NOW });
+  assert.deepEqual(result.issues, []);
+});
+
 test("deferred Market income is not spendable and concurrent accepted work reserves the shared pool", () => {
   const s = snapshots();
   s.market.push({ v: 1, assignments: { a: { phase: "running", pricing: { depositUsd: 2 } }, b: { phase: "starting", budgetUsd: 3 }, c: { phase: "submitted", budgetUsd: 999 } } });

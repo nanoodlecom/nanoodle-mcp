@@ -330,7 +330,8 @@ export function createChargeGate({
   const OWED_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000];
   const OWED_MAX_TRIES = 100; // ≈16h at the 10-min cap — after that it needs a human
   function owe(to, amountRaw, describe, event, fields, onOk) {
-    owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, tries: 0, at: now() + OWED_BACKOFF_MS[0] });
+    const createdAt = now();
+    owed.push({ to, amountRaw: String(amountRaw), describe, event, fields, onOk, tries: 0, createdAt, at: createdAt + OWED_BACKOFF_MS[0] });
     log(`${describe} ${rawToXno(amountRaw)} XNO to ${to} failed — queued for retry`);
     persist();
     ensureWatching();
@@ -367,6 +368,7 @@ export function createChargeGate({
           continue;
         }
         o.at = t + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
+        persist();
         log(`retry ${o.tries} of ${o.describe} to ${o.to} failed: ${e.message}`);
       } finally {
         o.sending = false;
@@ -460,7 +462,8 @@ export function createChargeGate({
             error,
           };
         }),
-        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields, tries: o.tries, held: o.held === true })),
+        owed: owed.map((o) => ({ to: o.to, amountRaw: o.amountRaw, describe: o.describe, event: o.event, fields: o.fields,
+          createdAt: o.createdAt, tries: o.tries, held: o.held === true })),
       });
       await mkdir(dirname(stateFile), { recursive: true });
       const tmp = stateFile + ".tmp";
@@ -539,6 +542,7 @@ export function createChargeGate({
       for (const s of Array.isArray(data.owed) ? data.owed : []) {
         if (!s || !checkAddress(s.to) || !/^\d+$/.test(s.amountRaw) || BigInt(s.amountRaw) <= 0n ||
             !["refund", "change", "author_payout"].includes(s.event) ||
+            (s.createdAt != null && (!Number.isSafeInteger(s.createdAt) || s.createdAt < 0)) ||
             (s.tries != null && (!Number.isSafeInteger(s.tries) || s.tries < 0)) ||
             (s.held != null && typeof s.held !== "boolean")) {
           throw new Error("invalid owed send in gate state");
@@ -552,7 +556,7 @@ export function createChargeGate({
         const fields = s.fields && typeof s.fields === "object" ? { ...s.fields } : s.fields;
         if (fields && "reason" in fields && !REFUND_REASONS.has(fields.reason)) fields.reason = "run_failed";
         owed.push({
-          ...s, fields, tries: s.tries ?? 0, held: s.held === true || s.tries >= OWED_MAX_TRIES,
+          ...s, fields, createdAt: s.createdAt ?? now(), tries: s.tries ?? 0, held: s.held === true || s.tries >= OWED_MAX_TRIES,
           at: s.held === true || s.tries >= OWED_MAX_TRIES ? Infinity : now() + OWED_BACKOFF_MS[0],
           onOk: s.event === "refund" && s.fields && s.fields.paymentId
             ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }

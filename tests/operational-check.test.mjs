@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
 import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
@@ -12,6 +13,22 @@ import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
+
+test("the readiness CLI reports preflight failure when run through a release symlink", t => {
+  const root = mkdtempSync(join(tmpdir(), "operational-check-entry-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const selected = join(root, "current"), stateDir = join(root, "state");
+  symlinkSync(fileURLToPath(new URL("..", import.meta.url)), selected, "junction");
+  // No wallet configuration or inherited runtime flags. Preflight stops before networking.
+  const child = spawnSync(process.execPath, [join(selected, "scripts/operational-check.mjs")], {
+    env: { OPERATIONAL_CHECK_STATE_DIR: stateDir }, encoding: "utf8", timeout: 10_000,
+  });
+  assert.ifError(child.error);
+  assert.equal(child.status, 1, child.stderr);
+  const report = JSON.parse(readFileSync(join(stateDir, "latest.json"), "utf8"));
+  assert.equal(report.ok, false);
+  assert.equal(report.checks[0].code, "check-could-not-finish");
+});
 
 test("Market liveness follows the selected release and rejects a worker left behind by a switched symlink", async t => {
   const root = mkdtempSync(join(tmpdir(), "operational-market-release-")), children = [];
@@ -57,7 +74,7 @@ function fixture(override = () => null) {
     "/state/gate-state.json": { v: 2, quotes: [], owed: [] },
     "/state/funding-health.json": { v: 1, checkedAt: new Date(NOW).toISOString(), ok: true, enforced: true, protectTransfers: true,
       writerProtection: { enforced: true, requiredState: true },
-      balanceRaw: "1000", liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
+      balanceRaw: String(10n * 10n ** 30n), liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
       nanoRpc: { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: NOW,
         checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: config.nanoAddress,
           head: { hash: "A".repeat(64), blockCount: "10" }, confirmed: { hash: "A".repeat(64), blockCount: "10" } } } },
@@ -149,6 +166,42 @@ test("numeric and HTTP rate limits have precise diagnostics without hiding loss 
     assert.equal(report.admission.nano, false, "two configured peers still require two readable peers");
     assert.doesNotMatch(JSON.stringify(report), /private rate limit/);
   }
+});
+
+test("live Nano reservations can exhaust working capital while disk and runtime coverage still pass", async t => {
+  const raw = 10n ** 30n;
+  for (const shortfall of [0n, 1n]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    Object.assign(f.states["/state/funding-health.json"], {
+      balanceRaw: String(10n * raw), liabilitiesRaw: String(raw),
+      reservedRaw: String(7n * raw + shortfall), activeRuns: 1, oldestStartedAt: NOW - 1000,
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(c => c.stage === "nano-liquidity" && c.ok));
+    assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+    const headroom = report.checks.find(c => c.stage === "nano-unreserved-liquidity");
+    assert.equal(headroom.ok, shortfall === 0n);
+    assert.equal(report.ok, headroom.ok);
+    if (shortfall) assert.equal(headroom.code, "nano-pool-insufficient-after-reservations");
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /balanceRaw|liabilitiesRaw|reservedRaw|availableRaw/);
+  }
+});
+
+test("a low canary payer is visible without closing customer payment lanes", async t => {
+  const payer = "dedicated-canary.testnet";
+  const f = fixture(({ body }) => body?.params?.request_type === "view_account" && body.params.account_id === payer
+    ? Response.json({ jsonrpc: "2.0", id: body.id, result: { amount: "10000000000000000000000",
+      storage_usage: 182, block_height: 100, block_hash: "same-block" } }) : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.canaryPayer = { accountId: payer, publicKey: "ed25519:PRIVATE_CHECK_TEST_KEY", maxNear: "0.01" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === "near-canary-payer-funding"), {
+    stage: "near-canary-payer-funding", ok: false, code: "near-canary-payer-insufficient", domains: [],
+  });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /dedicated-canary|PRIVATE_CHECK_TEST_KEY|10000000000000000000000/);
 });
 
 test("a fresh runtime cooldown prevents monitor retries while other independent peers remain healthy", async () => {
@@ -470,6 +523,56 @@ test("the read-only Market probe reports unverified active escrow without retain
   const entry = f.calls.find(call => call.url.pathname === "/v1/agents/me/assignments");
   assert.equal(entry.init.method || "GET", "GET");
   assert.equal(entry.url.searchParams.get("limit"), "100");
+});
+
+function marketIntakeRow(age, fields = {}) {
+  return { assignment: { assignmentId: ID, status: "in_progress", escrowAmount: "1.00", escrowToken: "USDC",
+    createdAt: new Date(NOW - age).toISOString(), slaDeadlineAt: new Date(NOW + 600_000).toISOString(), ...fields },
+  job: { jobKind: "instant", title: "PRIVATE_BUYER_BRIEF" } };
+}
+
+test("Market intake catches unclaimed hires, remote starts missing local state and expired SLAs", async () => {
+  const fresh = marketIntakeRow(40_000);
+  const cases = [
+    [fresh, false, null],
+    [marketIntakeRow(301_000), false, "market-intake-untracked"],
+    [marketIntakeRow(40_000, { startedAt: new Date(NOW - 1000).toISOString() }), false, "market-intake-start-without-record"],
+    [marketIntakeRow(40_000, { deliverableUrl: "/PRIVATE_REWORK_DELIVERABLE" }), false, "market-intake-start-without-record"],
+    [{ ...fresh, latestMessage: { senderSide: "worker" } }, false, "market-intake-start-without-record"],
+    [marketIntakeRow(301_000), true, null],
+    [marketIntakeRow(301_000, { slaDeadlineAt: new Date(NOW - 1).toISOString() }), true, "market-intake-sla-expired"],
+    [marketIntakeRow(40_000, { createdAt: "unavailable" }), false, "market-intake-timing-invalid"],
+    [{ ...fresh, job: { jobKind: "competition" }, assignment: {} }, false, null],
+  ];
+  for (const [row, local, code] of cases) {
+    const f = fixture(({ url }) => {
+      if (url.pathname !== "/v1/agents/me/assignments") return null;
+      if (local) f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = { phase: "starting" };
+      return Response.json({ assignments: [row] });
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const intake = report.checks.find(check => check.stage === "market-intake-nanoodle-image");
+    assert.equal(intake.code ?? null, code);
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: code === null });
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(`${ID}|PRIVATE_BUYER_BRIEF|PRIVATE_REWORK_DELIVERABLE`));
+  }
+});
+
+test("Market intake reads later pages and reports an exhausted scan budget", async () => {
+  for (const exhausted of [false, true]) {
+    const page = Array.from({ length: 100 }, () => ({ job: { jobKind: "competition" } }));
+    const f = fixture(({ url }) => {
+      if (url.pathname !== "/v1/agents/me/assignments") return null;
+      const offset = Number(url.searchParams.get("offset"));
+      return Response.json({ assignments: exhausted || offset === 0 ? page : [marketIntakeRow(301_000)] });
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.market, false);
+    assert.equal(report.checks.find(check => check.stage === "market-intake-nanoodle-image").code,
+      exhausted ? "market-intake-scan-incomplete" : "market-intake-untracked");
+    const offsets = f.calls.filter(call => call.url.pathname === "/v1/agents/me/assignments").map(call => call.url.searchParams.get("offset"));
+    assert.deepEqual(offsets, exhausted ? ["0", "100", "200", "300", "400"] : ["0", "100"]);
+  }
 });
 
 test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {

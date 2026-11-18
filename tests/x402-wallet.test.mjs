@@ -15,7 +15,7 @@ import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock
 import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
-import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
+import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH, WORKED_CATALOGS } from "./fixtures/near-fake-chain.mjs";
 import { USDC_CONTRACTS, parseNearToYocto } from "../src/near/index.mjs";
 import { mcpClient, freePort, stopServerChild } from "../scripts/near-simulate.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
@@ -68,7 +68,7 @@ test("a hosted wallet persists only a corroborated advance and stops spending if
   assert.ok(actions.every(action => ["account_info", "block_info"].includes(action)));
 });
 
-test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server", { timeout: 60_000 }, async () => {
+test("the hosted wallet settles saved, custom and conditional graphs on Nano, NEAR and USDC", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-funding-"));
   const graphs = join(dir, "graphs"), out = join(dir, "out");
   await mkdir(graphs); await mkdir(out);
@@ -116,7 +116,19 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
   near.addAccount("merchant.testnet", parseNearToYocto("10"), key.publicKey);
   near.addAccount("payer.testnet", parseNearToYocto("5"));
   near.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 1_000_000n });
-  const nano = nanoGptMock({ walletPayments: true, walletPaymentSeen(invoice) {
+  const { cases, legacy, ...branchGraph } = JSON.parse(await readFile(join(FIXTURES, "conditional", "decider-branches.json"), "utf8"));
+  await writeFile(join(graphs, "conditional.json"), JSON.stringify(branchGraph));
+  const branchModels = new Map(branchGraph.nodes.filter(node => node.fields.model).map(node => [node.id, node.fields.model]));
+  const chatModels = new Set(branchGraph.nodes.filter(node => node.type === "llm").map(node => node.fields.model));
+  const decisionModels = new Set(branchGraph.nodes.filter(node => node.type === "decide-branch").map(node => node.fields.model));
+  const extraChatModels = [...chatModels].filter(id => !WORKED_CATALOGS.chat.some(entry => entry.id === id));
+  const catalogs = {
+    ...WORKED_CATALOGS,
+    chat: [...WORKED_CATALOGS.chat, ...extraChatModels.map(id => ({ id, pricing: WORKED_CATALOGS.chat[0].pricing, context_length: 32768 }))],
+    decision: [...decisionModels].map(id => ({ id, pricing: { prompt: 0.02, completion: 0 }, context_length: 262144 })),
+  };
+  let decisions = [];
+  const nano = nanoGptMock({ catalogs, walletPayments: true, decisionAnswer: () => decisions.shift(), walletPaymentSeen(invoice) {
     let previous = BigInt(BALANCE);
     for (const p of rpc.state.processed) {
       const amount = previous - BigInt(p.block.balance); previous = BigInt(p.block.balance);
@@ -213,6 +225,46 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
       assert.equal(providerBlocks.size, count, "replaying a timed-out payment cannot pay another invoice");
     }
     assert.equal(providerBlocks.size, 11, "each failed run pays at most its one started invoice and no downstream image");
+    for (const [index, asset] of ["nano", "near", "usdc", "usdc"].entries()) {
+      const scenario = cases[index];
+      decisions = [...scenario.answers];
+      const beforeInvoices = providerBlocks.size, beforeChat = nano.chatBodies().length;
+      const tool = asset === "nano" ? "conditional" : "run_noodle";
+      const args = asset === "nano" ? {} : { graph: branchGraph, _pay_with: asset };
+      const price = await client.call("price_noodle", { graph: branchGraph, _pay_with: asset === "usdc" ? "usdc" : "near" });
+      assert.equal(price.structuredContent?.pricing?.safety?.ok, true, JSON.stringify(price));
+      assert.equal(price.structuredContent.pricing.estimatedCost.items.filter(item => item.type === "decide").length, 2);
+      assert.match(JSON.stringify(price.content), /all branches/);
+      const quote = await client.call(tool, args);
+      assert.ok(!quote.isError, JSON.stringify(quote));
+      assert.equal(providerBlocks.size, beforeInvoices, "pricing and a quote never pay for a branch");
+      const payment = quote.structuredContent.payment ?? quote.structuredContent.x402;
+      const resume = { ...args, _payment_id: payment.paymentId };
+      if (asset === "nano") {
+        deposits.set("E".repeat(64), { amount: payment.amountRaw, source: PAY_TO });
+      } else {
+        resume._payment_tx = asset === "usdc"
+          ? near.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(payment.amountAtomic))
+          : near.transfer("payer.testnet", "merchant.testnet", BigInt(payment.amountYocto));
+        resume._payment_sender = "payer.testnet";
+      }
+      const settled = await client.call(tool, resume);
+      assert.equal(!!settled.isError, !!scenario.error, JSON.stringify(settled));
+      assert.equal(decisions.length, 0);
+      assert.equal(providerBlocks.size - beforeInvoices, scenario.calls.length, "only the selected branch pays provider invoices");
+      assert.deepEqual(nano.chatBodies().slice(beforeChat).map(body => body.model).sort(),
+        scenario.calls.filter(id => branchGraph.nodes.find(node => node.id === id).type === "llm").map(id => branchModels.get(id)).sort());
+      if (asset !== "nano") {
+        const r = settled.structuredContent.receipt;
+        assert.equal(r.outcome, scenario.error ? "run_failed" : "succeeded");
+        assert.equal(r.refund.status, "sent");
+        assert.equal(Number(r.charged.usd), scenario.error ? 0 : scenario.calls.length * 0.000492);
+        assert.equal(BigInt(r.deposit.amountAtomic ?? r.deposit.yocto) - BigInt(r.refund.amountAtomic ?? r.refund.yocto),
+          BigInt(r.charged.amountAtomic ?? r.charged.yocto));
+      }
+      assert.equal(!!(await client.call(tool, resume)).isError, !!scenario.error);
+      assert.equal(providerBlocks.size - beforeInvoices, scenario.calls.length, "replaying the branch never pays again");
+    }
     assert.ok(frozenReads > 0, "the preferred stale peer really answered the scanner and reconciliation reads");
     assert.equal(frozenPublishes, 0, "new sends use the current observed peers rather than the frozen first entry");
     assert.doesNotMatch(stderr, /unhandled|FUNDING_INVALID|cannot persist gate state/i);

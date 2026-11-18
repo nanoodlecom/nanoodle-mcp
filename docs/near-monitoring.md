@@ -15,6 +15,18 @@ charge fails the check after settlement. Only a small dedicated payer wallet is
 available to this process; it cannot access the merchant key. Funding is manual,
 so total losses are also bounded by that wallet's balance.
 
+Before signing, the canary checks the payer's balance, storage requirements,
+full-access key and gas prepayment at a single fresh finalized block. A shortfall
+leaves the graph ready for a new quote after funding. Any previously signed
+payment still follows the same-hash recovery path.
+
+The five-minute operational probe reads the dedicated payer's public balance and
+key status and warns when the payer cannot cover the maximum canary deposit,
+storage and gas. It derives an implicit account's public key from its account
+ID. For a named payer, set `CHECK_PAYER_PUBLIC_KEY` in the canary environment
+file. `CHECK_MAX_NEAR` configures the canary's default cap and the monitoring
+threshold together. The operational service's payer key file remains inaccessible.
+
 ## Installation on the production box
 
 Create a `nanoodle-check` system user. Generate a dedicated key with
@@ -65,7 +77,9 @@ stays failed and is not automatically rerun or replaced.
 State and signed transaction bytes are saved atomically before broadcasting.
 Reruns resume the same payment and graph. They never re-sign an ambiguous or
 expired transaction or replace an unfinished quote. A completed day performs
-free MCP checks and returns the saved paid result, without another deposit.
+free MCP checks and reads the payment page's status and result endpoints. Both
+must still return the verified receipt, and the result must contain the exact
+canary output. The check reuses the original deposit and performs no inference.
 After recovering an older unfinished day, the next invocation can start today's
 check. Always run under the same `flock` as the systemd service to avoid overlap.
 
@@ -153,6 +167,13 @@ all normal probes and alerts on failure; it never reports recovery by itself.
 These warm-up GET requests execute no workflows or payments. This avoids the
 temporary 502 alarm observed just after the planned 2026-11-17 backup drill.
 
+The readiness check reads active Market assignments, then compares each paid
+hire with the worker's local state. It flags hires still untracked after five
+minutes, remote starts without a corresponding local record, and active
+assignments past their Market deadline. It reports if the bounded five-page
+scan cannot cover the full queue. The reports and Babel alerts carry fixed
+diagnostic codes. They omit assignment IDs and buyer text.
+
 ## NEAR AI Market availability every 15 minutes
 
 `scripts/market-check.mjs` makes public GET requests to `market.near.ai`: the
@@ -225,6 +246,9 @@ Coverage:
   buffer and 0.05 NEAR native reserve are checked in addition to recorded debts.
 - Stuck paid runs, missing refund/payout intents, pending/permanently failed
   refunds, creator payouts and Market work requiring an operator.
+  Nano settlement alerts use the age of the debt and the persisted failed
+  attempt count. A restored debt without a creation time starts aging from
+  the time it is loaded.
 - Fresh private runtime funding telemetry, enforced spend/transfer protection,
   and active scopes older than the configured execution limit plus 15 minutes
   for payment reconciliation. See [hosted deadlines](hosted-execution.md).
@@ -287,9 +311,10 @@ The [public availability workflow](../.github/workflows/public-check.yml) runs
 on a GitHub-hosted runner every 15 minutes. It checks MCP discovery on the Nano
 and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund funding,
 the Babel authentication challenge, and NEAR AI Market's public site, API and
-Nanoodle listings. It uses public discovery and status requests with bounded
-retries and records only the check results. The workflow uses no wallet keys,
-payment quotes, transfers or inference.
+Nanoodle listings. The free `price_noodle` probes check that the decision model
+and both branches are priced in NEAR and USDC, and the estimated charge fits
+the deposit. All probes use bounded retries and record only check results.
+The workflow uses no wallet keys, payment quotes, transfers or inference.
 
 Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
 or use **Run workflow** to check from a separate network. GitHub routes scheduled
@@ -299,3 +324,21 @@ VPS monitors still check wallet balances, agreement between nodes and private
 payment state. They send their alerts to Ember through Babel. A whole VPS
 outage can interrupt that route, while GitHub can still record the public
 failure. [GitHub schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+
+The same public probes can also run on Cloudflare as the
+`nanoodle-public-availability` Worker. Its configuration in
+`ops/cloudflare-public-check.jsonc` schedules the checks every 15 minutes and
+exposes no HTTP route. The Worker logs a count and fixed failure codes, and a
+failed probe marks the scheduled event failed. Check the Worker's logs or Cron
+Events in the Cloudflare dashboard for execution evidence. This deployment has
+no notification integration. [Cloudflare Cron Events](https://developers.cloudflare.com/workers/configuration/cron-triggers/#view-past-events)
+
+Run the Worker against the production public URLs from the local Workers runtime
+before deploying.
+
+```sh
+npx wrangler@4.164.0 dev --local --test-scheduled --config ops/cloudflare-public-check.jsonc
+curl -fsS 'http://127.0.0.1:8787/cdn-cgi/local/scheduled?format=json'
+npx wrangler@4.164.0 deploy --config ops/cloudflare-public-check.jsonc
+npx wrangler@4.164.0 tail nanoodle-public-availability --format json
+```

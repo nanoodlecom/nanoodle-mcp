@@ -3,10 +3,13 @@
 import { mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { createNearRpcPool, loadNearSigner, NEAR_NETWORKS, signTransfer, parseNearToYocto, formatYoctoAsNear } from "../src/near/index.mjs";
+import { readNearTransferFunding } from "../src/near/funding.mjs";
 import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib.mjs";
 import { callMcp, resultText } from "../src/near-site-browser.mjs";
+
+export const DEFAULT_CHECK_MAX_NEAR = "0.01";
 
 export function checkGraph(marker, twoSteps = false) {
   // This checks the payment/runtime path, not reasoning. A thinking model can
@@ -45,7 +48,7 @@ export function atomicJson(file, value) {
 /** Dependencies are injectable so crash recovery and payment limits run offline. */
 export async function runCheck(config, deps = {}) {
   const { stateDir, payer, keyFile, merchant = "nanoodle.near", network = "mainnet", twoSteps = false,
-    maxNear = "0.01", maxUsd = 0.001, url = "https://near.nanoodle.com" } = config;
+    maxNear = DEFAULT_CHECK_MAX_NEAR, maxUsd = 0.001, url = "https://near.nanoodle.com" } = config;
   const base = url.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
   const now = deps.now || Date.now, sleep = deps.sleep || (ms => new Promise(r => setTimeout(r, ms)));
   const request = deps.fetch || ((input, init = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(240_000) }));
@@ -56,13 +59,27 @@ export async function runCheck(config, deps = {}) {
   const save = () => atomicJson(file, state);
   const require = (condition, message) => { if (!condition) throw Object.assign(new Error(message), { checkFailure: true }); };
   let id = 0;
-  const json = async path => { const response = await request(base + path); require(response.ok, "HTTP status check failed"); return response.json(); };
+  const json = async path => {
+    const response = await request(base + path, { cache: "no-store" });
+    require(response.status === 200, "HTTP status check failed"); return response.json();
+  };
   const mcp = async (method, params) => {
     const response = await request(base + "/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }) });
     require(response.ok, "MCP HTTP check failed"); const body = await response.json();
     require(!body.error && body.result, "MCP returned an error"); return body.result;
   };
   const call = (name, args) => mcp("tools/call", { name, arguments: args });
+  async function verifyPaymentPage(receipt) {
+    stage = "payment_page";
+    const paymentId = state.quote?.paymentId;
+    require(/^nq_[A-Za-z0-9_-]+$/.test(paymentId) && receipt?.outcome === "succeeded" && receipt.refund?.status === "sent",
+      "Verified payment or refund is missing from retained state");
+    const [view, cached] = await Promise.all([json(`/near/status/${paymentId}`), json(`/near/result/${paymentId}`)]);
+    require(view?.paymentId === paymentId && view.status === "settled" && isDeepStrictEqual(view.receipt, receipt),
+      "Payment page status or refund differs from the verified receipt");
+    require(cached && !cached.isError && correctOutput(cached, state) && isDeepStrictEqual(cached.structuredContent?.receipt, receipt),
+      "Payment page result or receipt differs from the verified run");
+  }
   try {
     const day = new Date(now()).toISOString().slice(0, 10);
     require(payer && payer !== merchant && keyFile, "A separate payer and key file are required");
@@ -74,6 +91,7 @@ export async function runCheck(config, deps = {}) {
     require(["run_noodle", "price_noodle", "noodle_guide"].every(name => tools?.some(t => t.name === name)), "Required MCP tools are missing");
     require(!(await call("noodle_guide", {})).isError, "Agent guide failed");
     if (state?.done && state.day === day) {
+      await verifyPaymentPage(state.receipt);
       const report = { ...state.report, checkedAt: new Date(now()).toISOString(), reused: true };
       atomicJson(latest, report); return report;
     }
@@ -83,28 +101,35 @@ export async function runCheck(config, deps = {}) {
       save();
     }
     stage = "quote";
-    if (!state.quote) {
+    let q = state.quote;
+    if (!q) {
       const priced = await call("price_noodle", { graph: state.args.graph, inputs: state.args.inputs });
       const pricing = priced.structuredContent?.pricing;
       require(!priced.isError && pricing?.safety?.ok && Number.isFinite(Number(pricing.estimatedCost?.usd)) && Number(pricing.estimatedCost.usd) <= Number(maxUsd), "Price exceeds the model-cost cap or cannot be estimated");
       const quoted = await call("run_noodle", state.args);
       require(!quoted.isError, "Workflow quote failed");
-      state.quote = quoted.structuredContent?.payment; save();
+      q = quoted.structuredContent?.payment;
     }
-    const q = state.quote;
     require(q?.status === "payment_required" && /^nq_[A-Za-z0-9_-]+$/.test(q.paymentId) && /^\d+$/.test(q.amountYocto), "Invalid NEAR quote");
     require(q.network === network && q.payTo === merchant && (!q.asset || q.asset === "NEAR"), "Unexpected network, asset or payment destination");
     const deposit = BigInt(q.amountYocto);
     require(deposit > 0n && deposit <= parseNearToYocto(maxNear) && Number(q.depositUsd) <= Number(maxUsd) * 10, "Deposit exceeds the spending cap");
-    stage = "payment";
     let newlySigned = false;
     if (!state.signed) {
       require(Date.parse(q.expiresAt) > now() + 60_000, "Unpaid quote expired; operator must archive this state before trying a new run");
+      stage = "payer_funding";
       const signer = await (deps.loadSigner || loadNearSigner)({ accountId: payer, keyFile, env: {} });
-      const key = await rpc.viewAccessKey({ accountId: payer, publicKey: signer.publicKey });
+      const { accessKey: key, sufficient } = await readNearTransferFunding({ rpc, network, accountId: payer,
+        publicKey: signer.publicKey, amountYocto: deposit, now });
+      require(sufficient, "Canary payer cannot cover this deposit, storage and gas");
+      stage = "payment";
+      require(Date.parse(q.expiresAt) > now() + 60_000, "Unpaid quote expired while checking payer funding");
+      state.day = new Date(now()).toISOString().slice(0, 10);
+      state.quote = q;
       state.signed = signTransfer({ signer, signerId: payer, receiverId: merchant, nonce: BigInt(key.nonce) + 1n, blockHash: key.block_hash, amountYocto: deposit });
       save(); newlySigned = true;
     }
+    stage = "payment";
     if (!state.paymentFinal) {
       // On recovery, query first; if unknown, only re-broadcast these SAME bytes.
       let tx;
@@ -151,10 +176,9 @@ export async function runCheck(config, deps = {}) {
     require((await checkTransferOnChain({ rpc, txHash: receipt.refund.txHash, sender: merchant, receiver: payer, amountYocto: refunded })).ok, "Refund does not match the finalized on-chain transfer");
     stage = "replay_and_result";
     const replay = await call("run_noodle", paidArgs);
-    require(JSON.stringify(replay.structuredContent?.receipt) === JSON.stringify(receipt), "Replay changed the receipt");
+    require(isDeepStrictEqual(replay.structuredContent?.receipt, receipt), "Replay changed the receipt");
     require(correctOutput(replay, state), "Paid output is unavailable on replay; text results are not retained across server restarts");
-    const cached = await json(`/near/result/${q.paymentId}`);
-    require(JSON.stringify(cached).includes(expected), "Payment page result cache is missing the output");
+    await verifyPaymentPage(receipt);
     const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: state.args.graph.nodes.find(n => n.type === "llm").fields.model, modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
       output: expected, progressFrames: state.progress.length, chargedUsd: receipt.charged.usd, chargedNear: formatYoctoAsNear(charged), refundedNear: formatYoctoAsNear(refunded), payerGasNear: formatYoctoAsNear(BigInt(state.gasYocto)),
       paymentTx: state.signed.txHash, refundTx: receipt.refund.txHash, watcher: true, replay: true, paymentPageResult: true };
@@ -166,12 +190,13 @@ export async function runCheck(config, deps = {}) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   try {
     const o = parseArgs(process.argv.slice(2), ["two-steps"]);
     const report = await runCheck({ stateDir: o["state-dir"] || "/var/lib/nanoodle-near-check", payer: o.payer || process.env.CHECK_PAYER,
       keyFile: o["key-file"] || process.env.CHECK_KEY_FILE, url: o.url || process.env.CHECK_URL, network: o.network || "mainnet", rpc: o.rpc,
-      merchant: o.merchant || "nanoodle.near", maxNear: o["max-near"] || "0.01", maxUsd: Number(o["max-usd"] || "0.001"), twoSteps: !!o["two-steps"] });
+      merchant: o.merchant || "nanoodle.near", maxNear: o["max-near"] || process.env.CHECK_MAX_NEAR || DEFAULT_CHECK_MAX_NEAR,
+      maxUsd: Number(o["max-usd"] || "0.001"), twoSteps: !!o["two-steps"] });
     console.log(JSON.stringify(report));
   } catch (error) { console.error(JSON.stringify(error.report || { ok: false, error: "Invalid configuration or unreadable state" })); process.exitCode = 1; }
 }

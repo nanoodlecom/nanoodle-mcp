@@ -154,6 +154,34 @@ test("an exhausted Nano refund remains held across restart and is not retried or
   assert.equal(attempts, 1);
 });
 
+test("failed Nano settlement retries persist the debt age and attempt count across restart", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "gate-debt-watch-"));
+  const stateFile = join(dir, "state.json"), chain = fakeChain();
+  const restoredAt = 1_000_000;
+  let now = restoredAt;
+  let gate;
+  t.after(async () => {
+    await gate?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
+  await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [], owed: [{ to: PAYER, amountRaw: "100", describe: "refunded",
+    event: "refund", fields: { paymentId: "retained-debt" }, tries: 0 }] }));
+  chain.ops.transfer = async () => { throw Error("RPC unavailable"); };
+  const start = () => makeGate(chain, { stateFile, now: () => now, pollMs: 5 });
+  gate = start();
+  now += 31_000;
+  const first = await untilState(stateFile, "the failed retry to reach disk", s => s.owed[0]?.tries === 1);
+  assert.equal(first.owed[0].createdAt, restoredAt);
+  await gate.stop();
+  now += 180_000;
+  gate = start();
+  now += 31_000;
+  const second = await untilState(stateFile, "the next retry to reach disk", s => s.owed[0]?.tries === 2);
+  assert.equal(second.owed[0].createdAt, restoredAt);
+  assert.equal(gate.fundingLiabilitiesRaw(), 100n);
+  assert.equal(chain.state.transfers.length, 0);
+});
+
 test("Nano funding handoff uses the paid quote's locked pair and refuses before inference", async () => {
   for (const allowed of [true, false]) {
     const chain = fakeChain(), policies = [];
