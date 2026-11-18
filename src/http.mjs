@@ -73,6 +73,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const ASSET_DIR = fileURLToPath(new URL("../assets/", import.meta.url));
 const scriptUrls = Object.fromEntries(["near-site.js", "near-wallet.js", "creator-site.js"].map(file => [file,
   `/${file}?v=${createHash("sha256").update(readFileSync(join(ASSET_DIR, file))).digest("hex").slice(0, 12)}`]));
+const NANOODLE_BRAND = "/brand/nanoodle-v1.0.0";
 const ASSETS = {
   "/favicon.ico": "image/x-icon",
   "/favicon.png": "image/png",
@@ -91,6 +92,16 @@ const ASSETS = {
   "/near-site.js": "text/javascript; charset=utf-8",
   "/creator-site.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/tokens/tokens.css`]: "text/css; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/fonts.css`]: "text/css; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/righteous-latin.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/righteous-latin-ext.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/manrope-latin-variable.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/ibm-plex-mono-latin-400.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/Righteous-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/Manrope-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/IBM-Plex-Mono-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/assets/wordmark-gradient.svg`]: "image/svg+xml",
   [`${BRAND_BASE}/255labs-tokens.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-ui.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-lockup-paper.svg`]: "image/svg+xml",
@@ -248,6 +259,43 @@ const LANDING_CSS = `
   ${RECEIPTS_CSS}
 `;
 
+// The Nano landing page consumes the pinned Nanoodle brand kit. NEAR shares the
+// card structure but retains its own page stylesheet and payment presentation.
+const NANO_LANDING_CSS = `
+  :root {
+    --fg:var(--nano-color-ink); --bg:var(--nano-color-canvas); --muted:var(--nano-color-muted);
+    --card:var(--nano-color-panel); --card2:var(--nano-color-raised); --edge:var(--nano-color-line);
+    --accent:var(--nano-color-accent); --accent-ink:var(--nano-color-accent-ink);
+  }
+  body{font-family:var(--nano-font-body)}
+  h1,h2{font-family:var(--nano-font-display)}
+  h1{font-size:clamp(2.1rem,6.6vw,4rem);line-height:1.07;letter-spacing:-.025em}
+  h1 span{color:var(--accent-ink)}
+  h2{font-size:clamp(1.4rem,4vw,2rem)}
+  code,pre,.eyebrow,.step .n,.flow,.chip,.tool .cost,.labs .ltag{font-family:var(--nano-font-mono)}
+  a:hover{color:var(--fg)}
+  :focus-visible{outline:var(--nano-control-focus-width) solid var(--accent-ink);outline-offset:3px}
+  .top{align-items:center}
+  .top .brand img{width:26px;height:26px}
+  .top .brand .product-wordmark{width:108px;height:auto;border-radius:0}
+  .top .v{font-family:var(--nano-font-mono);font-size:.73rem}
+  .hero-links a,.tabs .tab,.connect button,.tool>button{min-height:var(--nano-control-height);border-radius:var(--nano-radius-control)}
+  .hero-links a,.tool>button{border-color:var(--nano-color-control-line)}
+  .connect,.card,.tool,.step,.flow{border-radius:var(--nano-radius-card)}
+  .hero-links a:first-child,.connect button{background:var(--accent);color:var(--nano-color-on-accent);font-weight:750}
+  .hero-links a:first-child:hover{filter:brightness(1.1)}
+  .tools{grid-template-columns:repeat(auto-fill,minmax(min(19rem,100%),1fr))}
+  .tool .links{white-space:normal}
+  .chip.k-text,.chip.k-llm{--port:var(--nano-color-text-port)}
+  .chip.k-image{--port:var(--nano-color-image-port)}
+  .chip.k-video{--port:var(--nano-color-video-port)}
+  .chip.k-audio{--port:var(--nano-color-audio-port)}
+  .chip.k-model3d{--port:var(--nano-color-model3d-port)}
+  .chip[class*="k-"]{background:color-mix(in srgb,var(--port,var(--muted)) 14%,var(--card));color:var(--port,var(--muted))}
+  .tool .sample summary{display:list-item;min-height:var(--nano-control-height);align-content:center}
+  @media(max-width:440px){.top nav{width:100%;gap:.85rem}.connect{gap:.55rem;padding:.7rem}.connect pre{font-size:.76rem}.connect button{padding-inline:.65rem}}
+`;
+
 const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
   `<title>${esc(title)}</title>${ICON_LINKS}${head}<style>${css}</style></head><body><main>${body}</main></body></html>`;
@@ -360,10 +408,11 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     : charged
     ? "Give your agents new abilities with x402. Run or build AI workflows over MCP, pay per call in Nano, and earn as a workflow author. Open source."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
+  const isNanoodle = name === "nanoodle-mcp";
   const ogHead =
-    `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">` +
+    `<link rel="stylesheet" href="${NANOODLE_BRAND}/tokens/tokens.css"><link rel="stylesheet" href="${NANOODLE_BRAND}/fonts/fonts.css">` +
     `<meta name="theme-color" content="#0b0d12">` +
-    `<link rel="preload" href="/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
+    `<link rel="preload" href="${NANOODLE_BRAND}/fonts/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
     `<meta name="description" content="${esc(desc)}">` +
     `<meta property="og:type" content="website">` +
     `<meta property="og:site_name" content="${esc(name)}">` +
@@ -379,13 +428,13 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
     <header class="top">
-      <a class="brand" href="/"><img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span></a><span class="v">v${esc(version)}</span>
-      <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
+      <a class="brand" href="/"><img src="/favicon.png" alt="">${isNanoodle ? `<img class="product-wordmark" src="${NANOODLE_BRAND}/assets/wordmark-gradient.svg" alt="nanoodle">` : `<span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
+      <nav aria-label="Product"><a href="https://nanoodle.com/">Editor</a><a href="https://nanoodle.com/guide/examples/">Examples</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source</a></nav>
     </header>
     <p class="eyebrow">${charged ? "Open source · MCP + x402 · Nano" : "public MCP server"}</p>
-    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents new abilities." : "AI media workflows over MCP."}</h1>
-    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect Nanoodle over MCP, then let your agent discover workflows and pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
-      ${charged || near ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
+    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents <span>new abilities.</span>" : "AI media workflows over MCP."}</h1>
+    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect over MCP to discover and run nanoodle workflows. Get a quote first, then pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
+      ${charged || near ? "You can connect without an account or an API key." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
     ${charged ? `<p class="hero-links"><a href="#connect">Connect your agent ↓</a><a href="https://nanoodle.com">Build a workflow ↗</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">View source ↗</a></p>` : ""}
     <div id="connect" class="connect-wrap">
@@ -408,8 +457,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     </div>
     ${near && !charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>deposit quote</span><span class="arr">→</span><span>pay in your NEAR wallet</span><span class="arr">→</span><span>result + automatic NEAR change</span></div>` : ""}
     ${charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>402 payment quote</span>
-      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
-    <p class="tagline">No tab, no tip, no signup.</p>` : ""}
+      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>` : ""}
     ${receiptsHtml()}
     ${paymentNote ? `<div class="card"><h2>${charged ? "Or pay in NEAR" : "What a call costs"}</h2><p class="muted">${esc(paymentNote)}</p></div>` : ""}
     ${charged ? `<div class="card"><h2>What a call costs</h2>
@@ -471,7 +519,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
     </div>
-    <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a>
+    <footer><a href="/llms.txt">Agent instructions</a> · <a href="https://branding.nanoodle.com/">Brand guidelines</a>
       <div class="labs"><a href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" height="36" alt="255labs"></a><span class="ltag">Full signal. Zero noise. · 0xFF</span></div>
     </footer>
     <script>
@@ -493,7 +541,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         });
       }
     </script>
-  `, LANDING_CSS, ogHead);
+  `, LANDING_CSS + NANO_LANDING_CSS, ogHead);
 }
 
 /** The landing page's story as plain text — the version an agent should read. */

@@ -51,7 +51,7 @@ test("page thumbs stay on the media host", () => {
 
 test("landing receipts sit between the flow strip and the cost card", async () => {
   const html = await withServer(true, async (base) => await (await fetch(`${base}/`)).text());
-  const flow = html.indexOf("No tab, no tip, no signup.");
+  const flow = html.indexOf('<div class="flow">');
   const runs = html.indexOf(HEADING);
   const cost = html.indexOf("What a call costs");
   assert.ok(flow >= 0 && runs > flow && cost > runs, "section is out of order");

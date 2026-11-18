@@ -1833,7 +1833,7 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
     assert.match(html, /data-client="grok"/);
     assert.match(html, /selectClient/);
     assert.match(html, /402 payment quote/);
-    assert.match(html, /No tab, no tip, no signup\./);
+    assert.match(html, /You can connect without an account or an API key\./);
     assert.match(html, /href="\/llms\.txt"/);
     assert.match(html, /Claude Code, Grok, Cursor/);
   } finally {
