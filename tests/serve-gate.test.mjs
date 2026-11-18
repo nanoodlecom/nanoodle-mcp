@@ -2796,6 +2796,43 @@ test("a failed Nano execution-claim write buys no inference and leaves the depos
   assert.equal(registry.callCount(), 1);
 });
 
+test("Nano restore retains aged settlement gaps and holds a send with the wrong recipient", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-settlement-evidence-"));
+  const stateFile = join(dir, "gate-state.json"), chain = fakeChain(), registry = fakeRegistry();
+  let gate;
+  t.after(async () => {
+    await gate?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const args = { Text: "completed workflow" };
+  const past = Date.now() - 25 * 60 * 60_000;
+  const result = { content: [{ type: "text", text: "recorded result" }] };
+  const settled = { tool: "poster", argsHash: hashArgs("poster", args), usd: 0.05,
+    pair: { usdNano: "1000000000", raw: String(10n ** 30n) }, amountRaw: "100", createdAt: past,
+    expiresAt: past + 900_000, completedAt: past + 30_000, status: "consumed", source: PAYER,
+    runDeadlineAt: past + 1_800_000, settled: true, result,
+    settleReceipt: { author: true, authorAddress: GATE_ADDR, change: "30", take: "20" } };
+  const wrong = { to: GATE_ADDR, amountRaw: "30", event: "change", fields: { paymentId: "pay_wrong" },
+    createdAt: past, journaled: true, prepared: null, nextAttemptAt: past };
+  await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [
+    { ...settled, id: "pay_missing" }, { ...settled, id: "pay_wrong" },
+    { ...settled, id: "pay_refund_claim", status: "refunded", settled: false, refundExpected: true, result: null, settleReceipt: null },
+  ], owed: [wrong] }));
+  gate = makeGate(chain, { stateFile, registry, pollMs: 5 });
+  await gate.resume();
+  assert.equal(gate.quote("pay_missing")?.status, "consumed", "retention must preserve the missing obligations");
+  const replay = await gate.wrapRegistry(registry).callTool({ name: "poster", arguments: { ...args, _payment_id: "pay_missing" } });
+  assert.deepEqual(replay, result);
+  assert.match(gate.quote("pay_refund_claim").next, /refund needs reconciliation/);
+  const refund = await gate.wrapRegistry(registry).callTool({ name: "poster", arguments: { ...args, _payment_id: "pay_refund_claim" } });
+  assert.match(refund.content[0].text, /refund needs reconciliation/);
+  const saved = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(saved.owed[0].held, true);
+  assert.equal(gate.fundingLiabilitiesRaw(), 230n, "reserve incomplete settlements, the mismatched intent and the unproven refund");
+  assert.equal(registry.callCount(), 0);
+  assert.deepEqual(chain.state.transfers, []);
+});
+
 async function gateMaintenance(t) {
   const dir = await mkdtemp(join(tmpdir(), "nano-gate-maintenance-")), file = join(dir, "flag.json");
   t.after(() => rm(dir, { recursive: true, force: true }));

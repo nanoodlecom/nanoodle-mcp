@@ -37,7 +37,7 @@ import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
 import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
-import { nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
+import { nanoFundingCoverage, nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
 import { syncPrivateStateParentSync } from "./private-state.mjs";
 import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
@@ -248,9 +248,10 @@ export function createChargeGate({
 
   /** @type {Map<string, object>} paymentId → quote */
   const quotes = new Map();
+  const refundsNeedingReview = new Set();
   const interruptedRuns = new Set();
-  let restoredRunsNeedWrite = false;
-  let recordingRestoredRuns = null;
+  let restoredStateNeedsWrite = false;
+  let recordingRestoredState = null;
   let historyScan = readNanoPaymentHistory();
 
   /* ---------------- pricing ---------------- */
@@ -314,7 +315,8 @@ export function createChargeGate({
 
   const historyPending = q => q.status === "expired" && !q.payHash
     && (q.historyUnproven || (historyScan.backfill !== null && (historyScan.coveredAt ?? 0) <= q.expiresAt));
-  const statusOf = q => (q.depositPending && q.status === "paid") || historyPending(q) ? "pending" : q.status;
+  const statusOf = q => (q.depositPending && q.status === "paid") || historyPending(q) ? "pending"
+    : refundsNeedingReview.has(q.id) ? "paid" : q.status;
 
   function publishDeposit(q) {
     const via = q.depositPending;
@@ -362,7 +364,7 @@ export function createChargeGate({
     o.completing = true;
     if (q) {
       q.transferReceipts ??= {};
-      q.transferReceipts[o.event] = { hash: o.confirmedHash, amountRaw: o.amountRaw, completedAt };
+      q.transferReceipts[o.event] = { hash: o.confirmedHash, amountRaw: o.amountRaw, to: o.to, completedAt };
     }
     if (refunded) q.refundCompletedAt = completedAt;
     let saved;
@@ -444,6 +446,7 @@ export function createChargeGate({
   }
 
   function queueRefund(q, reason) {
+    q.refundExpected = true;
     if (!q.refundOwed && checkAddress(q.source ?? "")) q.refundOwed = queueOwed(q.source, q.amountRaw, "refund", { paymentId: q.id, tool: q.tool, reason });
     return q.refundOwed;
   }
@@ -468,9 +471,9 @@ export function createChargeGate({
     return !q.outcomePending;
   }
 
-  function recordRestoredRuns() {
-    if (recordingRestoredRuns || !restoredRunsNeedWrite) return recordingRestoredRuns;
-    recordingRestoredRuns = (async () => {
+  function recordRestoredState() {
+    if (recordingRestoredState || !restoredStateNeedsWrite) return recordingRestoredState;
+    recordingRestoredState = (async () => {
       for (const q of interruptedRuns) {
         if (q.error) continue;
         queueRefund(q, "interrupted");
@@ -479,11 +482,11 @@ export function createChargeGate({
       }
       // Persist the failure and its refund together before allowing the queue
       // to publish anything. Another restart can resume the same refund.
-      if (!await persist()) throw Error("Could not record restored Nano execution state");
+      if (!await persist()) throw Error("Could not record restored Nano payment state");
       interruptedRuns.clear();
-      restoredRunsNeedWrite = false;
-    })().finally(() => { recordingRestoredRuns = null; });
-    return recordingRestoredRuns;
+      restoredStateNeedsWrite = false;
+    })().finally(() => { recordingRestoredState = null; });
+    return recordingRestoredState;
   }
 
   /* ---------------- durable state ---------------- */
@@ -535,6 +538,7 @@ export function createChargeGate({
             ...(q.historyUnproven && { historyUnproven: true }),
             ...(q.runDeadlineAt !== undefined && { runDeadlineAt: q.runDeadlineAt }),
             ...(q.executionNeedsReconciliation && { executionNeedsReconciliation: true }),
+            ...(q.refundExpected && { refundExpected: true }),
             completedAt: q.refundCompletedAt ?? q.completedAt ?? null,
             settled: q.settled === true,
             settleReceipt: q.settleReceipt ?? null, // money figures only; no user content
@@ -603,7 +607,8 @@ export function createChargeGate({
             || (s.historyAfter != null && !isNanoHistoryHeight(s.historyAfter))
             || (s.historyUnproven != null && typeof s.historyUnproven !== "boolean")
             || (s.runDeadlineAt != null && (!Number.isSafeInteger(s.runDeadlineAt) || s.runDeadlineAt < 0))
-            || (s.executionNeedsReconciliation != null && typeof s.executionNeedsReconciliation !== "boolean")) {
+            || (s.executionNeedsReconciliation != null && typeof s.executionNeedsReconciliation !== "boolean")
+            || (s.refundExpected != null && typeof s.refundExpected !== "boolean")) {
           throw new Error("invalid quote in gate state");
         }
         const q = { ...s, source: checkAddress(s.source ?? "") ? s.source : null,
@@ -691,7 +696,19 @@ export function createChargeGate({
         if (q.status === "paid" && q.runDeadlineAt === null) continue;
         if (q.status === "consumed" && q.runDeadlineAt != null) interruptedRuns.add(q);
         else q.executionNeedsReconciliation = true;
-        restoredRunsNeedWrite = true;
+        restoredStateNeedsWrite = true;
+      }
+      const coverage = nanoFundingCoverage({ quotes: [...quotes.values()], owed });
+      for (const id of coverage.unresolvedQuotes) {
+        const q = quotes.get(id);
+        if (q.status === "refunded") refundsNeedingReview.add(id);
+        if (q.refundExpected && ["paid", "consumed"].includes(q.status) && !q.error) q.settlementNeedsReconciliation = true;
+      }
+      for (const debt of coverage.unsafeDebts) {
+        if (debt.held) continue;
+        debt.held = true;
+        debt.at = Infinity;
+        restoredStateNeedsWrite = true;
       }
       if (quotes.size || owed.length) log(`restored ${quotes.size} quote(s) and ${owed.length} queued send(s) from ${stateFile}`);
     } catch (e) {
@@ -710,6 +727,7 @@ export function createChargeGate({
     const t = now();
     let changed = false;
     const unpaidTransfers = new Set(owed.map(o => o.fields?.paymentId));
+    const { unresolvedQuotes } = nanoFundingCoverage({ quotes: [...quotes.values()], owed });
     for (const q of quotes.values()) {
       if (q.unpublished || q.depositPending) continue;
       if (q.status === "pending" && t > q.expiresAt) {
@@ -719,7 +737,8 @@ export function createChargeGate({
       }
       // Retention may remove completed outcomes, never an unclaimed payment
       // or a run still in flight. Those records are outstanding obligations.
-      const unfinished = unpaidTransfers.has(q.id) || nanoQuoteClaim(q) > 0n || q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
+      const unfinished = unpaidTransfers.has(q.id) || unresolvedQuotes.has(q.id) || nanoQuoteClaim(q) > 0n
+        || q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
       if (!unfinished && !q.historyUnproven && !nanoQuoteNeedsHistory(q, historyScan.coveredAt, t)
         && t - (q.completedAt ?? q.createdAt) > RETAIN_MS) { quotes.delete(q.id); changed = true; }
     }
@@ -790,7 +809,7 @@ export function createChargeGate({
   // refund kept failing — and since a refund typically fails because the RPC is
   // throttling, that poll fed the very rate limit that was blocking it. One
   // failed refund held the loop for 34h and 5,158 calls on 2026-07-23/25.
-  const anyWatchable = () => restoredRunsNeedWrite || persistenceFailed || owed.some(o => !o.held) || anyPaymentWatchable();
+  const anyWatchable = () => restoredStateNeedsWrite || persistenceFailed || owed.some(o => !o.held) || anyPaymentWatchable();
 
   function initialHistoryFloor() {
     let floor = null;
@@ -876,7 +895,7 @@ export function createChargeGate({
 
   async function scan() {
     await commitDeposits();
-    await recordRestoredRuns();
+    await recordRestoredState();
     prune();
     await retryOwed();
     // Only the owed queue left → retryOwed above is the whole job. Skip the
@@ -1083,6 +1102,7 @@ export function createChargeGate({
    * with _payment_id) rather than sitting on a bare "paid" with no next step.
    */
   function nextFor(q) {
+    if (refundsNeedingReview.has(q.id)) return "The Nano payment was received. Its refund needs reconciliation. Keep the original payment ID.";
     if (q.settlementNeedsReconciliation) return "The Nano settlement for this payment needs reconciliation. Keep the original payment ID.";
     if (q.executionNeedsReconciliation) return "The execution history for this Nano payment needs reconciliation. Keep the original payment ID.";
     if (interruptedRuns.has(q)) return "The server is recording the interrupted Nano workflow. Keep the original payment ID.";
@@ -1114,7 +1134,7 @@ export function createChargeGate({
     persistenceStatus: () => ({ enabled: !!stateFile, ok: !persistenceFailed, pendingWrites }),
     fundingLiabilitiesRaw: () => nanoFundingLiabilities({ quotes: [...quotes.values()], owed }),
     nanoTransferClaims: () => gateNanoTransferClaims({ quotes: quotes.values(), owed }),
-    resume: recordRestoredRuns,
+    resume: recordRestoredState,
 
     /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
@@ -1431,6 +1451,7 @@ export function createChargeGate({
             return errResult(`payment ${q.id} was issued for a different call (tool/arguments changed) — ` +
               `call again without _payment_id to get a quote for these arguments.`);
           }
+          if (refundsNeedingReview.has(q.id)) return errResult(nextFor(q));
           if (q.status === "refunded") {
             return errResult(`payment ${q.id} was refunded${q.source ? ` to ${q.source}` : ""} — call again without _payment_id to retry.`);
           }
@@ -1502,7 +1523,7 @@ export function createChargeGate({
                 providerUsd: typeof providerUsd === "number" ? providerUsd : null,
                 providerExact: providerExact === true,
                 billedUsd: typeof billedUsd === "number" ? billedUsd : null,
-                clamped, take: s.take.toString(), change: s.change.toString(), author: !!s.author };
+                clamped, take: s.take.toString(), change: s.change.toString(), author: !!s.author, authorAddress: s.author ?? null };
               const receipt = settlementReceipt(q, !!stateFile);
               q.result = { ...result, content: [...result.content, { type: "text", text: receipt }] };
               q.completedAt = now();
