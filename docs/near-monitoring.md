@@ -114,6 +114,13 @@ confirm that the app and original timers resumed. This does not install or
 schedule a backup, provide an off-server destination, or keep Babel reachable
 during loss of the shared VPS.
 
+The five-minute readiness check also verifies backup capture and export age,
+offsite copy age, and whether the two proofs cover the same encrypted archive.
+A new export has 15 minutes for offsite verification. An overdue generation
+raises a backup warning through Babel while payment admission is assessed
+independently. The proof files contain a checksum-derived generation ID.
+Neither the monitor report nor the alert contains that ID or archive paths.
+
 The check's `OnFailure` starts `nanoodle-near-alert@<failed-unit>.service`.
 `scripts/near-alert.mjs` saves a selected-metadata message before attempting
 delivery. Each systemd invocation has a stable message ID; network failures and
