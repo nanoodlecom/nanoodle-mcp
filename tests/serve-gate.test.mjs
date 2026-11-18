@@ -68,6 +68,10 @@ function fakeChain() {
         state.transfers.push({ to, amountRaw, describe });
         return "F".repeat(64);
       },
+      async transferOnce(to, amountRaw, { prepared, onPrepared, describe }) {
+        if (!prepared) await onPrepared({ hash: "F".repeat(64), block: { account: GATE_ADDR, link_as_account: to } });
+        return this.transfer(to, amountRaw, describe);
+      },
       pocket: async () => {
         for (const [hash, v] of Object.entries(state.receivable)) {
           delete state.receivable[hash];
@@ -143,7 +147,7 @@ test("live liabilities retain change while a settlement transfer is still in fli
 test("an exhausted Nano refund remains held across restart and is not retried or erased", async () => {
   const stateFile = join(await mkdtemp(join(tmpdir(), "gate-held-debt-")), "state.json");
   await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [], owed: [{ to: PAYER, amountRaw: "100", describe: "refunded",
-    event: "refund", fields: { paymentId: "old-payment" }, tries: 99 }] }));
+    event: "refund", fields: { paymentId: "old-payment" }, tries: 99, journaled: true, prepared: null, nextAttemptAt: 1_030_000 }] }));
   let t = 1_000_000, attempts = 0;
   const chain = fakeChain(), registry = fakeRegistry();
   chain.ops.transfer = async () => { attempts++; throw Error("RPC unavailable"); };
@@ -172,7 +176,8 @@ test("failed Nano settlement retries persist the debt age and attempt count acro
     await rm(dir, { recursive: true, force: true });
   });
   await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [], owed: [{ to: PAYER, amountRaw: "100", describe: "refunded",
-    event: "refund", fields: { paymentId: "retained-debt" }, tries: 0 }] }));
+    event: "refund", fields: { paymentId: "retained-debt" }, tries: 0,
+    journaled: true, prepared: null, nextAttemptAt: restoredAt + 30_000 }] }));
   chain.ops.transfer = async () => { throw Error("RPC unavailable"); };
   const start = () => makeGate(chain, { stateFile, now: () => now, pollMs: 5 });
   gate = start();
@@ -1051,14 +1056,16 @@ test("gate state survives a restart: a queued refund retries under the new proce
 
   const chain1 = fakeChain();
   const registry1 = fakeRegistry({ onCall: async () => { throw new Error("model exploded"); } });
-  const gate1 = makeGate(chain1, { registry: registry1, stateFile, now: () => t, pollMs: 5 }).wrapRegistry(registry1);
+  const original = makeGate(chain1, { registry: registry1, stateFile, now: () => t, pollMs: 5 });
+  const gate1 = original.wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
   chain1.state.receivable["C".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   chain1.state.failTransfer = true; // refund bounces → owed queue
   const res = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(res.isError);
   await untilState(stateFile, "the bounced refund to reach the owed queue on disk",
-    (d) => (d.owed || []).length > 0);
+    d => d.owed.some(refund => refund.prepared && refund.nextAttemptAt > t));
+  await original.stop();
 
   const chain2 = fakeChain();
   const gate2 = makeGate(chain2, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5 });
@@ -1067,21 +1074,25 @@ test("gate state survives a restart: a queued refund retries under the new proce
   await until("the restored watcher to send the owed refund", () => chain2.state.transfers.length);
   assert.deepEqual(chain2.state.transfers, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }],
     "the customer's refund must land even though the process that owed it died");
+  await gate2.stop();
 });
 
-test("restore scrubs legacy free-text refund reasons: no upstream error text reaches a new ledger line", async () => {
+test("a pre-journal refund is held and reserved, with its legacy error redacted", async t => {
   const { mkdtemp, writeFile } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const stateFile = join(await mkdtemp(join(tmpdir(), "gate-legacy-")), "gate-state.json");
-  let t = 6_000_000;
+  let time = 6_000_000;
 
   // A state file written by a PRE-policy build: the queued refund's reason is
   // the old free-text form that can quote user content.
   const SENTINEL = "run failed: PROMPT LEAK abc123 SECRET";
+  const priorArgs = { Text: "prior charged workflow" };
   await writeFile(stateFile, JSON.stringify({
     v: 1,
-    quotes: [],
+    quotes: [{ id: "pay_legacy", tool: "poster", argsHash: hashArgs("poster", priorArgs),
+      amountRaw: "50000000000000000000000000000", usd: 0.05, source: PAYER,
+      pair: { usdNano: "1000000000", raw: String(10n ** 30n) }, createdAt: time, expiresAt: time + 900_000, status: "paid" }],
     owed: [{
       to: PAYER, amountRaw: "50000000000000000000000000000", describe: "refunded",
       event: "refund", fields: { paymentId: "pay_legacy", tool: "poster", reason: SENTINEL }, tries: 0,
@@ -1090,19 +1101,24 @@ test("restore scrubs legacy free-text refund reasons: no upstream error text rea
 
   const chain = fakeChain();
   const events = [];
-  // Restore under the new build; the owed send lands on the first retry tick.
-  makeGate(chain, { registry: fakeRegistry(), stateFile, now: () => t, pollMs: 5, usage: (e, f) => events.push([e, f]) })
-    .wrapRegistry(fakeRegistry());
-  t += 31_000; // past the first retry backoff
-  await until("the restored watcher to send the owed refund", () => chain.state.transfers.length);
-
-  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: "50000000000000000000000000000", describe: "refunded" }]);
-  const refund = events.find(([e, f]) => e === "refund" && f.ok);
-  assert.ok(refund, "the restored refund must land and log a money event");
-  assert.equal(refund[1].reason, "run_failed", "the legacy reason is coerced to a category");
-  const line = JSON.stringify({ ts: new Date().toISOString(), event: refund[0], ...refund[1] });
-  assert.doesNotMatch(line, /PROMPT LEAK|abc123|SECRET/,
-    "not one byte of the legacy free-text reason may reach the new ledger line");
+  const registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, stateFile, now: () => time, pollMs: 5, usage: (e, f) => events.push([e, f]) });
+  const args = { Text: "start watcher" };
+  const { callTool } = gate.wrapRegistry(registry);
+  const replay = await callTool({ name: "poster", arguments: { ...priorArgs, _payment_id: "pay_legacy" } });
+  assert.match(replay.content[0].text, /needs reconciliation/);
+  assert.equal(registry.callCount(), 0);
+  const payment = argOf(await callTool({ name: "poster", arguments: args }));
+  time += 61_000;
+  await gate.waitForPayment(payment.paymentId, 25);
+  await gate.stop();
+  const current = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(current.owed[0].held, true);
+  assert.equal(current.owed[0].fields.reason, "run_failed");
+  assert.equal(gate.fundingLiabilitiesRaw(), 50000000000000000000000000000n);
+  assert.deepEqual(chain.state.transfers, []);
+  assert.doesNotMatch(JSON.stringify({ current, events }), /PROMPT LEAK|abc123|SECRET/);
+  t.after(() => rm(dirname(stateFile), { recursive: true, force: true }));
 });
 
 test("a text output never touches disk and a settled payment cannot rerun inference after restart", async () => {
@@ -1117,7 +1133,8 @@ test("a text output never touches disk and a settled payment cannot rerun infere
 
   const chain1 = fakeChain();
   const registry1 = fakeRegistry({ onCall: async () => textOut });
-  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const original = makeGate(chain1, { registry: registry1, stateFile });
+  const gate1 = original.wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
@@ -1132,6 +1149,7 @@ test("a text output never touches disk and a settled payment cannot rerun infere
   // The persisted bytes must not contain the customer's output text.
   const bytes = await readFile(stateFile, "utf8");
   assert.doesNotMatch(bytes, /CROWN-JEWELS/, "no tool output text may be written to disk");
+  await original.stop();
 
   // A restart retains the financial outcome, not authority for fresh inference.
   const chain2 = fakeChain();
@@ -1315,14 +1333,16 @@ test("a lost text result reports the original settled cost and change without ru
   // First run: a known cost of $0.02 → partial change is sent, receipt says "$0.0200".
   const chain1 = fakeChain();
   const registry1 = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: SECRET }], costUsd: 0.02, textOutput: true }) });
-  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  const original = makeGate(chain1, { registry: registry1, stateFile });
+  const gate1 = original.wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
   chain1.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
   const first = await gate1.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.match(first.content.at(-1).text, /actual cost \$0\.02/);
-  assert.match(first.content.at(-1).text, /change returned to your wallet/);
-  await untilState(stateFile, "the first run's settlement to persist",
-    (d) => { const q = quoteIn(x.paymentId)(d); return q && q.settled && q.settleReceipt; });
+  assert.match(first.content.at(-1).text, /change due back to your wallet/);
+  await untilState(stateFile, "the first run's confirmed change to persist",
+    (d) => quoteIn(x.paymentId)(d)?.transferReceipts?.change);
+  await original.stop();
 
   // The attempted replacement would report no cost; it must never execute.
   const chain2 = fakeChain();
@@ -2504,13 +2524,12 @@ test("a restored owed refund blocks a second refund of the same late payment", a
   const x = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
 
   // #23 is specifically the LATE-payment path: the quote must EXPIRE unpaid,
-  // and only then does the payer's block show up. A consumed quote never
-  // reaches the `expired && !q.refunding` branch, so it cannot reproduce this.
+  // and only then does the payer's block show up.
   now += 16 * 60 * 1000; // past QUOTE_TTL_MS
   chain1.state.failTransfer = true; // the late-payment refund bounces → persisted owed entry
   chain1.state.receivable["D".repeat(64)] = { amount: x.amountRaw, source: PAYER };
-  const pending = await untilState(stateFile, "the late refund debt to reach disk", data =>
-    data.owed.some(refund => refund.event === "refund" && refund.fields?.paymentId === x.paymentId));
+  const pending = await untilState(stateFile, "the late refund and retry time to reach disk", data =>
+    data.owed.some(refund => refund.event === "refund" && refund.fields?.paymentId === x.paymentId && refund.nextAttemptAt > now));
   assert.equal(quoteIn(x.paymentId)(pending).status, "expired");
   assert.equal(pending.owed.length, 1);
   await gate1.stop();
@@ -2527,6 +2546,7 @@ test("a restored owed refund blocks a second refund of the same late payment", a
     return rpc(body);
   };
   restarted = makeGate(chain2, { stateFile, now: () => now, pollMs: 5 });
+  await restarted.wrapRegistry(fakeRegistry()).callTool({ name: "poster", arguments: { Text: "start another quote" } });
   await until("the restarted watcher to re-scan the late payment", () => rescanned);
   assert.equal(chain2.state.transfers.length, 0, "re-scanning must not send a second refund outside the owed queue");
   now += 61_000;
@@ -2536,6 +2556,118 @@ test("a restored owed refund blocks a second refund of the same late payment", a
 
   const refunds = chain2.state.transfers.filter((s) => s.describe === "refunded");
   assert.deepEqual(refunds, [{ to: PAYER, amountRaw: x.amountRaw, describe: "refunded" }]);
+});
+
+for (const outcome of ["failed", "late", "successful"]) {
+  test(`a restart reconciles signed Nano transfers for a ${outcome} payment without sending twice`, async t => {
+    const dir = await mkdtemp(join(tmpdir(), "gate-transfer-journal-"));
+    const stateFile = join(dir, "gate-state.json"), chain = fakeChain();
+    let time = 10_000_000, gate;
+    const accepted = new Map(), attempts = [];
+    const events = outcome === "successful" ? ["author_payout", "change"] : ["refund"];
+    const author = GATE_ADDR;
+    const registry = fakeRegistry({ author, onCall: async () => {
+      if (outcome === "failed") throw Error("provider failure");
+      return { content: [{ type: "text", text: "done" }], costUsd: 0.02, textOutput: true };
+    } });
+    t.after(async () => {
+      await gate?.stop();
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    const start = () => makeGate(chain, { registry, stateFile, now: () => time, pollMs: 5 });
+    gate = start();
+    const args = { Text: outcome }, wrapped = gate.wrapRegistry(registry);
+    const p = argOf(await wrapped.callTool({ name: "poster", arguments: args }));
+    chain.ops.transfer = async () => { assert.fail("durable checkout used the non-journaled wallet operation"); };
+    chain.ops.transferOnce = async (to, amountRaw, { prepared, onPrepared, describe }) => {
+      const event = describe === "refunded" ? "refund" : describe === "change:" ? "change" : "author_payout";
+      const hash = testHash(events.indexOf(event));
+      if (!prepared) {
+        assert.equal(accepted.has(hash), false, "a known transfer cannot be signed again");
+        prepared = { hash, block: { account: GATE_ADDR, link_as_account: to } };
+        await onPrepared(prepared);
+      }
+      const saved = JSON.parse(await readFile(stateFile, "utf8")), q = quoteIn(p.paymentId)(saved);
+      assert.deepEqual(saved.owed.find(o => o.event === event).prepared, prepared,
+        "the exact signed block is on disk before publish");
+      assert.equal(q.settled, outcome === "successful");
+      if (outcome === "successful" && accepted.size === 0) assert.deepEqual(saved.owed.map(o => o.event), events);
+      if (outcome === "failed") assert.match(q.error, /refund is pending/);
+      if (outcome === "late") assert.equal(q.status, "expired");
+      attempts.push(prepared.hash);
+      if (accepted.has(hash)) return hash;
+      accepted.set(hash, { to, amountRaw });
+      throw Error("block accepted, confirmation response unavailable");
+    };
+
+    if (outcome === "late") time += 16 * 60_000;
+    chain.state.receivable[testHash(900)] = { amount: p.amountRaw, source: PAYER };
+    const call = { name: "poster", arguments: { ...args, _payment_id: p.paymentId } };
+    if (outcome !== "late") await wrapped.callTool(call);
+    const pending = await untilState(stateFile, "all accepted sends to remain journaled", s =>
+      s.owed.length === events.length && s.owed.every(o => o.prepared && o.nextAttemptAt > time));
+    assert.equal(gate.fundingLiabilitiesRaw(), pending.owed.reduce((sum, o) => sum + BigInt(o.amountRaw), 0n));
+    await gate.stop();
+
+    time += 31_000;
+    gate = start();
+    const completed = await untilState(stateFile, "recovery to record all confirmed transfers together with queue removal", s =>
+      s.owed.length === 0 && events.every(event => quoteIn(p.paymentId)(s)?.transferReceipts?.[event]));
+    for (const event of events) {
+      const hash = testHash(events.indexOf(event));
+      assert.equal(quoteIn(p.paymentId)(completed).transferReceipts[event].hash, hash);
+      assert.equal(attempts.filter(h => h === hash).length, 2);
+    }
+    assert.equal(accepted.size, events.length);
+    await until("the committed receipt to release the in-memory liability", () => gate.fundingLiabilitiesRaw() === 0n);
+    assert.equal(quoteIn(p.paymentId)(completed).status, outcome === "successful" ? "paid" : "refunded");
+    await gate.wrapRegistry(registry).callTool(call);
+    assert.equal(registry.callCount(), outcome === "late" ? 0 : 1);
+  });
+}
+
+test("Nano payment recovery retains a signed send if the completion write fails", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-sent-write-failed-"));
+  const stateFile = join(dir, "gate-state.json"), chain = fakeChain(), hash = testHash(122);
+  let time = 1_000_000, gate, broadcast = 0;
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "fixture" }], costUsd: 0.02, textOutput: true }) });
+  t.after(async () => {
+    await gate?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const start = () => makeGate(chain, { registry, stateFile, now: () => time, pollMs: 5 });
+  gate = start();
+  const { callTool } = gate.wrapRegistry(registry);
+  const params = { name: "poster", arguments: { Text: "fixture" } };
+  const payment = argOf(await callTool(params));
+  chain.state.receivable[testHash(123)] = { amount: payment.amountRaw, source: PAYER };
+  chain.ops.transferOnce = async (to, _amount, { prepared, onPrepared }) => {
+    if (prepared) {
+      assert.equal(prepared.hash, hash);
+    } else {
+      await onPrepared({ hash, block: { account: GATE_ADDR, link_as_account: to } });
+      broadcast++;
+      await mkdir(stateFile + ".tmp");
+    }
+    return hash;
+  };
+  const result = await callTool({ ...params, arguments: { ...params.arguments, _payment_id: payment.paymentId } });
+  assert.equal(result.isError, undefined);
+  await until("the failed completion snapshot", () => !gate.persistenceStatus().ok && gate.persistenceStatus().pendingWrites === 0);
+  const durable = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(durable.owed.length, 1);
+  assert.equal(durable.owed[0].prepared.hash, hash);
+  assert.equal(gate.fundingLiabilitiesRaw(), BigInt(durable.owed[0].amountRaw));
+  await gate.stop();
+  await rm(stateFile + ".tmp", { recursive: true });
+
+  time += 31_000;
+  gate = start();
+  const recovered = await untilState(stateFile, "the original confirmation to be recorded", s =>
+    s.owed.length === 0 && quoteIn(payment.paymentId)(s)?.transferReceipts?.change);
+  assert.equal(quoteIn(payment.paymentId)(recovered).transferReceipts.change.hash, hash);
+  assert.equal(broadcast, 1);
 });
 
 async function gateMaintenance(t) {

@@ -221,6 +221,22 @@ test("the scheduled check flags a late Nano deposit that lacks a refund record o
   assert.doesNotMatch(JSON.stringify(report), /private-nano-/);
 });
 
+test("the scheduled check detects legacy send debt and a Nano block claimed by two obligations", async t => {
+  const f = fixture(), hash = "A".repeat(64);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/state/gate-state.json"].owed.push(
+    { amountRaw: "10", event: "refund", fields: { paymentId: "private-fixture-legacy" }, createdAt: NOW },
+    { amountRaw: "10", event: "change", fields: { paymentId: "private-fixture-quote" }, createdAt: NOW, journaled: true, prepared: { hash } },
+  );
+  f.states["/state/near-state.json"].payouts = { fixture: { paymentId: "private-fixture-creator", amountRaw: "10", status: "sent", txHash: hash } };
+  const report = await runOperationalCheck(f.config, f.deps);
+  for (const stage of ["nano-settlement-legacy-unverified", "nano-settlement-duplicate-block"]) {
+    assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: false, code: stage, domains: [] });
+  }
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-fixture-|AAAAAAA/);
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

@@ -524,11 +524,14 @@ test("durable Nano payouts journal before publishing and recover a lost response
 });
 
 test("a durable Nano send is replaced only when a different successor is confirmed", async () => {
-  const competing = "D".repeat(64), blocks = new Map(); let confirmed = false, journal, signed = 0;
+  const balance = (BigInt(BALANCE) - 1n).toString();
+  const competitor = previous => createBlock(SECRET, { work: WORK, previous, representative: ADDRESS, balance, link: PAY_TO });
+  const competing = competitor(FRONTIER), unrelated = competitor("D".repeat(64));
+  const blocks = new Map(); let reported = competing, confirmed = false, journal, signed = 0;
   const mock = fakeRpc({
     process(body, state, reply) {
       if (body.block.previous === FRONTIER) {
-        state.frontier = competing; state.balance = (BigInt(BALANCE) - 1n).toString();
+        state.frontier = competing.hash; state.balance = balance;
         return reply({ error: "Fork" });
       }
       const hash = hashBlock(body.block);
@@ -536,8 +539,8 @@ test("a durable Nano send is replaced only when a different successor is confirm
       return reply({ hash });
     },
     block_info(body, state, reply) {
-      if (body.hash === FRONTIER) return reply({ successor: competing });
-      if (body.hash === competing) return reply({ confirmed: String(confirmed) });
+      if (body.hash === FRONTIER) return reply({ successor: reported.hash });
+      if (body.hash === reported.hash) return reply({ confirmed: String(confirmed), contents: reported.block });
       return blocks.has(body.hash) ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
     },
   });
@@ -545,9 +548,13 @@ test("a durable Nano send is replaced only when a different successor is confirm
   const options = () => ({ prepared: journal, onPrepared: p => { journal = structuredClone(p); signed++; } });
   await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /Fork/);
   const first = journal.hash;
-  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /Fork/);
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /frontier to be reconciled/);
   assert.equal(signed, 1); assert.equal(mock.state.processed.length, 0);
   confirmed = true;
+  reported = unrelated;
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /frontier to be reconciled/);
+  assert.equal(signed, 1); assert.equal(mock.state.processed.length, 0);
+  reported = competing;
   const hash = await wallet.ops.transferOnce(PAY_TO, AMOUNT, options());
   assert.notEqual(hash, first); assert.equal(signed, 2); assert.equal(mock.state.processed.length, 1);
 });
@@ -556,6 +563,73 @@ test("a failed durable-send journal write publishes nothing", async () => {
   const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch });
   await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, { onPrepared() { throw new Error("disk full"); } }), /disk full/);
   assert.equal(mock.state.processed.length, 0);
+});
+
+test("a durable Nano send preserves new liabilities before its first publication and on replay", async () => {
+  let debt = 0n, prepared, signed = 0, hashOnNode;
+  const mock = fakeRpc({
+    process(body, state, reply) {
+      const hash = hashBlock(body.block);
+      state.processed.push(body);
+      state.frontier = hash; state.balance = body.block.balance;
+      hashOnNode = hash;
+      return reply({ hash });
+    },
+    block_info(body, _state, reply) {
+      if (body.hash === FRONTIER) return reply({ previous: "0".repeat(64), successor: hashOnNode ?? "0".repeat(64) });
+      return body.hash === hashOnNode ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
+    },
+  });
+  const make = () => createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true, fundingLiabilities: () => debt });
+  const onPrepared = value => { prepared = value; signed++; debt = BigInt(BALANCE); };
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, { onPrepared }), { code: "FUNDING_INSUFFICIENT" });
+  const replay = { prepared, onPrepared };
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, replay), { code: "FUNDING_INSUFFICIENT" });
+  assert.equal(signed, 1);
+  assert.equal(mock.state.processed.length, 0);
+  debt = 0n;
+  assert.equal(await make().ops.transferOnce(PAY_TO, AMOUNT, replay), prepared.hash);
+  assert.equal(signed, 1);
+  assert.equal(mock.state.processed.length, 1);
+});
+
+test("two identical obligations cannot claim the same signed Nano transfer", async () => {
+  const blocks = new Map(), owners = new Map(), signed = new Map();
+  let unavailable = true;
+  const mock = fakeRpc({
+    process(body, state, reply) {
+      if (unavailable) return { ok: false, status: 503, text: async () => "unavailable" };
+      const hash = hashBlock(body.block);
+      state.processed.push(body);
+      state.frontier = hash; state.balance = body.block.balance;
+      blocks.set(hash, body.block);
+      return reply({ hash });
+    },
+    block_info(body, _state, reply) {
+      if (unavailable) return { ok: false, status: 503, text: async () => "unavailable" };
+      if (body.hash === FRONTIER) return reply({ successor: "0".repeat(64) });
+      return blocks.has(body.hash) ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
+    },
+  });
+  const make = () => createNanoWallet({ secretKey: SECRET, fetch: mock.fetch,
+    nanoTransferClaimed: (hash, id) => owners.has(hash) && owners.get(hash) !== id });
+  const options = transferId => ({
+    transferId, prepared: signed.get(transferId),
+    onPrepared(value) {
+      assert.equal(owners.has(value.hash), false);
+      owners.set(value.hash, transferId);
+      signed.set(transferId, value);
+    },
+  });
+  const first = "nano:quote:change", second = "creator:job";
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, options(first)), /HTTP 503/);
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, options(second)), { code: "NANO_TRANSFER_ALREADY_CLAIMED" });
+  await assert.rejects(make().payment({ payTo: PAY_TO, amountRaw: AMOUNT }), { code: "NANO_TRANSFER_ALREADY_CLAIMED" });
+  assert.equal(signed.size, 1);
+  unavailable = false;
+  assert.equal(await make().ops.transferOnce(PAY_TO, AMOUNT, options(first)), signed.get(first).hash);
+  assert.notEqual(await make().ops.transferOnce(PAY_TO, AMOUNT, options(second)), signed.get(first).hash);
+  assert.equal(mock.state.processed.length, 2);
 });
 
 /** In-memory Nano RPC: account_info / work_generate / receivable / process, with a frontier that advances. */

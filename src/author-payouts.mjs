@@ -1,5 +1,6 @@
 /** Durable Nano creator payments, funded by the provider wallet's shared queue. */
 import { authorAddress } from "./wallet.mjs";
+import { nanoCreatorTransferId } from "./nano-transfer-journal.mjs";
 
 // Convert only the fee actually collected, after model costs and the deposit cap.
 // usdNano and xnoUsdNano share the same scale, so it cancels without rounding USD.
@@ -34,6 +35,7 @@ export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Dat
     try {
       const hash = await ops.transferOnce(rec.to, rec.amountRaw, {
         liabilityRaw: rec.amountRaw,
+        transferId: nanoCreatorTransferId(rec.paymentId),
         fundingRunId: rec.paymentId.startsWith("market_") ? `market:${rec.paymentId.slice(7)}` : `near:${rec.paymentId}`,
         prepared: rec.prepared,
         onPrepared(prepared) { ledger.updatePayout(rec.paymentId, { status: "signed", prepared }); },
