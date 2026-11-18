@@ -81,10 +81,13 @@ The controller refreshes every 30 seconds and expires its public health after
 60 seconds. `/near/health` exposes only enforcement, time, fixed error codes and
 coverage/capacity booleans. The five-minute no-inference monitor verifies those
 fields and independently reads the actual account, fee floor, obligations and
-balances. Its reports show watcher health, unverified or stale refund funding,
-confirmed shortfalls and per-asset capacity separately. Unnamed RPC errors can
-fall back to the other qualified endpoint on watcher and funding reads. The
-monitor never signs, generates work, runs inference or retries a refund.
+balances. It rereads the ledger after retrieving the account proof and
+requires a finalized block at or above the latest persisted refund checkpoint.
+It independently checks the extra fee for a new quote on each asset. Its reports
+show watcher health, unverified or stale refund funding, confirmed shortfalls
+and per-asset capacity separately. Unnamed RPC errors and balances below the
+refund checkpoint can fall back to another qualified endpoint. The monitor
+never signs, generates work, runs inference or retries a refund.
 
 Offline fixtures cover simultaneous payments, gas/price changes, unavailable
 funding, refund priority, exhausted nonces, same-payment resume, false/nonfinal

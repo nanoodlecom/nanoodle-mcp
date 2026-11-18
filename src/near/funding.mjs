@@ -8,6 +8,11 @@ export const NEAR_OPERATING_RESERVE = 50_000_000_000_000_000_000_000n;
 export const FT_REFUND_GAS = DEFAULT_FUNCTION_CALL_GAS;
 const bad = () => new NearError("NEAR_FUNDING_INVALID", "NEAR refund funding cannot be verified");
 const unavailable = () => new NearError("NEAR_FUNDING_UNAVAILABLE", "NEAR refund funding cannot be verified right now");
+export function nearRefundFinalHeight(value) {
+  const height = value ?? 0;
+  if (!Number.isSafeInteger(height) || height < 0) throw bad();
+  return height;
+}
 function raw(value) {
   if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128) throw bad();
   return BigInt(value);
@@ -180,8 +185,7 @@ export function createNearFunding({ rpc, ledger, network, accountId, publicKey, 
     if (!Array.isArray(result.receipts_outcome) || !result.receipts_outcome.length) throw bad();
     const hashes = [result.transaction_outcome?.block_hash, ...result.receipts_outcome.map(r => r.block_hash)];
     if (hashes.some(h => typeof h !== "string" || !h)) throw bad();
-    let height = ledger.getMeta("refundFinalHeight") ?? 0;
-    if (!Number.isSafeInteger(height) || height < 0) throw bad();
+    let height = nearRefundFinalHeight(ledger.getMeta("refundFinalHeight"));
     for (const hash of new Set(hashes)) {
       const block = await rpc.block({ blockId: hash });
       const n = Number(block?.header?.height);
@@ -219,8 +223,7 @@ export function createNearFunding({ rpc, ledger, network, accountId, publicKey, 
         frame = await readNearFunding({ rpc, network, accountId, publicKey, now,
           tokenContract: checkedToken ? usdcToken : null, optionalTokenBalance: true });
         if (integer(ledger.getMeta("lastNonce") ?? "0") >= (1n << 64n) - 1n) throw bad();
-        const floor = ledger.getMeta("refundFinalHeight") ?? 0;
-        if (!Number.isSafeInteger(floor) || floor < 0) throw bad();
+        const floor = nearRefundFinalHeight(ledger.getMeta("refundFinalHeight"));
         value = claims(); // include deposits discovered during RPC awaits
         if (frame.blockHeight < floor || value.usdcAtomic > 0n && frame.usdcAtomic == null) {
           if (attempt < 2) continue;

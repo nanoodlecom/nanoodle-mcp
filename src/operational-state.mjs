@@ -2,7 +2,7 @@
 // signs a transaction, retries an assignment, or returns customer content.
 import { parseUsdNano } from "./usd.mjs";
 import { nanoFundingLiabilities, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
-import { nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
+import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const U128_MAX = (1n << 128n) - 1n;
@@ -96,12 +96,15 @@ export function nanoLiquidityCheck({ liabilities, nanoBalanceRaw, xnoUsd, provid
 }
 
 /** Reserve in-progress obligations before declaring any funds available. */
-export function liquidityChecks({ liabilities, nanoBalanceRaw, nearBalanceYocto, storageUsage, costs,
-  usdcBalanceAtomic, xnoUsd, providerReserveUsd = "2", nearReserveYocto = "50000000000000000000000" }) {
+export function nearLiquidityChecks({ liabilities, nearBalanceYocto, storageUsage, costs,
+  usdcBalanceAtomic, nearReserveYocto = NEAR_OPERATING_RESERVE.toString() }) {
   const nativeNeed = nearFundingNeed({ claims: liabilities, costs, storageUsage, reserveYocto: amount(nearReserveYocto) });
   return [
-    nanoLiquidityCheck({ liabilities, nanoBalanceRaw, xnoUsd, providerReserveUsd }),
     { stage: "near-liquidity", ok: amount(nearBalanceYocto) >= nativeNeed, code: "near-insufficient-for-obligations-storage-and-gas" },
     { stage: "usdc-liquidity", ok: amount(usdcBalanceAtomic) >= liabilities.usdcAtomic, code: "usdc-refunds-underfunded" },
   ].map(check => check.ok ? { stage: check.stage, ok: true } : check);
+}
+
+export function liquidityChecks(config) {
+  return [nanoLiquidityCheck(config), ...nearLiquidityChecks(config)];
 }
