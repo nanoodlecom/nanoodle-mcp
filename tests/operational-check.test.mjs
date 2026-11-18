@@ -991,6 +991,31 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
   }
 });
 
+test("an exhausted fallback pair exposes an undersized cold standby scan budget without probing it", async t => {
+  for (const [peerCooling, requestsPerMinute, expected] of [[false, 4, undefined], [true, 4, false], [true, 5, true]]) {
+    const f = fixture(({ url }) => {
+      assert.notEqual(url.hostname, "standby.example");
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const url = "https://standby.example";
+    f.config.nanoRpcUrls.push("https://nano-2.example");
+    f.config.nanoStandby = { url, requestsPerMinute };
+    Object.assign(f.states["/state/funding-health.json"].nanoRpc, {
+      configuredPeers: 4, configuration: rpcPeerSetId([...f.config.nanoRpcUrls, url]),
+      standby: { inUse: false, requestsPerMinute }, cooldowns: peerCooling ? [{ peer: 2, until: NOW + 60_000 }] : [],
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const advisory = report.checks.find(c => c.stage === "nano-standby-cold-scan-budget");
+    assert.equal(advisory?.ok, expected);
+    if (expected === false) {
+      assert.equal(advisory.code, "nano-standby-cold-scan-budget-insufficient");
+      assert.deepEqual(advisory.domains, []);
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  }
+});
+
 test("independent Nano peers must corroborate the runtime's confirmed checkpoint", async t => {
   const account = NANO_GENESIS_REPLY.contents.account;
   const block = { type: "state", account, representative: account, balance: "10000000000000000000000000000000",
