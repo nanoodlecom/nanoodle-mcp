@@ -859,6 +859,46 @@ test("independent refund headroom distinguishes paid liabilities from the next q
   assert.deepEqual(report.admission, { nano: true, near: true, usdc: false, market: true });
 });
 
+test("retained NEAR and USDC quotes share refund gas and warn before deposits arrive", async t => {
+  const storageUsage = 500;
+  const costs = nearRefundCosts(nearProtocol({ chainId: "mainnet" }), "100000000");
+  const expiresAt = NOW - 3_660_000, retainThrough = expiresAt + 3_600_000;
+  const quotes = {
+    native: { id: "native", asset: "near", status: "pending", amountYocto: "500", expiresAt: NOW + 1000 },
+    token: { id: "token", asset: "usdc", status: "expired", amountYocto: "12347", expiresAt },
+    paid: { id: "paid", asset: "usdc", status: "paid", paidYocto: "17" },
+  };
+  const meta = { paymentWatch: { coveredThroughMs: retainThrough } };
+  const claims = nearRefundClaims({ quotes, refunds: {}, meta }, { now: NOW });
+  const threshold = nearFundingNeed({ claims, costs, storageUsage, pending: true });
+  assert.equal(claims.pendingNativeRefunds, 1);
+  assert.equal(claims.pendingTokenRefunds, 1);
+  let amount = threshold - 1n;
+  const f = fixture(({ body }) => body?.params?.request_type === "view_account" && body.params.block_id
+    ? Response.json({ id: body.id, result: { block_height: 100, block_hash: "same-block", amount: amount.toString(), storage_usage: storageUsage } })
+    : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const ledger = f.states["/state/near-state.json"];
+  Object.assign(ledger, { quotes, meta });
+  const stage = "near-open-quote-refund-fees";
+  let report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.deepEqual(report.checks.find(c => c.stage === stage),
+    { stage, ok: false, code: "near-open-quote-refund-fees-underfunded", domains: [] });
+  assert.doesNotMatch(JSON.stringify(report), /"12347"|"pendingNativeRefunds"|"pendingTokenRefunds"/);
+
+  amount = threshold;
+  report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: true });
+
+  // Once the watcher has scanned past the retained deadline, the expired
+  // token quote can no longer contribute a potential new refund.
+  amount = threshold - 1n;
+  meta.paymentWatch.coveredThroughMs = retainThrough + 1;
+  report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: true });
+});
+
 test("an independently proven USDC refund shortfall pauses both quote rails", async t => {
   const f = fixture();
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

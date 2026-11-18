@@ -567,6 +567,15 @@ export async function runOperationalCheck(config, deps = {}) {
       for (const result of results.filter(r => r.stage === "near-liquidity" || frame.usdcAtomic != null)) {
         checks.push({ ...result, ...(result.ok ? {} : { domains: result.stage === "usdc-liquidity" ? ["usdc"] : ["near", "usdc"] }) });
       }
+      await check("near-open-quote-refund-fees", () => {
+        // Both currencies spend native NEAR on refund gas. Pending deposits
+        // would bring their own principal, so only their fees are additional.
+        // Keep this advisory so unpaid quotes cannot block admission.
+        if (claims.pendingNativeRefunds || claims.pendingTokenRefunds) {
+          need(frame.balanceYocto >= nearFundingNeed({ claims, costs: frame.costs, storageUsage: frame.storageUsage, pending: true }),
+            "near-open-quote-refund-fees-underfunded");
+        }
+      }, []);
       const coversTokenDebt = claims.usdcAtomic === 0n || frame.usdcAtomic != null && frame.usdcAtomic >= claims.usdcAtomic;
       for (const asset of ["near", "usdc"]) {
         if (asset === "usdc" && (frame.usdcAtomic == null || !frame.usdcRegistered)) continue;
