@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
-import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
+import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
@@ -24,6 +24,13 @@ import { qrDecode, svgToMatrix } from "./qr-decode.mjs";
 // Any syntactically valid Nano addresses work — checkAddress validates the checksum.
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
 const PAYER = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
+
+test("Nano quote tags skip collisions after wrapping and stop when the range is full", () => {
+  const base = 875_000n;
+  const offset = span => span === 10_000 ? 0 : 999_999;
+  assert.equal(pickNanoQuoteGrain(base, new Set([base, base + 999_999n]), offset), base + 1n);
+  assert.equal(pickNanoQuoteGrain(base, { size: 1_000_000, has: () => true }, offset), null);
+});
 
 /**
  * Scripted chain: receivable/history state the gate polls, transfers it makes.

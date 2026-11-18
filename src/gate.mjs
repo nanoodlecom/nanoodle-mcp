@@ -27,7 +27,7 @@
  * a deploy landing between "customer paid" and "run replied" must never eat the
  * payment (observed live 2026-07-22).
  */
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, randomInt, createHash } from "node:crypto";
 import { readFileSync, constants } from "node:fs";
 import { open, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -69,6 +69,24 @@ const HISTORY_MAX_PAGES = 10; // churn cap per scan — far above real block thr
  * orphan a payment.
  */
 const GRAIN = 10n ** 22n;
+const NANO_TAG_SPAN = 1_000_000;
+
+/** Choose a free displayed grain within the quote's bounded amount range. */
+export function pickNanoQuoteGrain(base, taken, randomOffset = randomInt) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const grain = base + BigInt(randomOffset(10_000));
+    if (!taken.has(grain)) return grain;
+  }
+  // Starting anywhere in the wider range, one more probe than the number of
+  // occupied grains must find a free slot unless the entire range is held.
+  const start = randomOffset(NANO_TAG_SPAN);
+  const probes = Math.min(NANO_TAG_SPAN, taken.size + 1);
+  for (let i = 0; i < probes; i++) {
+    const grain = base + BigInt((start + i) % NANO_TAG_SPAN);
+    if (!taken.has(grain)) return grain;
+  }
+  return null;
+}
 
 /**
  * Exact money math — no floating point anywhere near an on-chain amount.
@@ -270,24 +288,13 @@ export function createChargeGate({
   function tagAmount(usdPrice, pair) {
     // exact conversion, ceiled so the deposit always covers its USD figure,
     // then ceiled again to a whole 1e-8 XNO…
-    let base = usdToRaw(usdPrice, pair, "ceil");
-    base = ((base + GRAIN - 1n) / GRAIN) * GRAIN;
-    if (base < GRAIN) base = GRAIN;
-    for (let attempt = 0; ; attempt++) {
-      // …plus up to 0.0001 XNO (a few thousandths of a cent) of random tag in
-      // whole 1e-8 XNO steps: visible to the matcher, negligible to the payer,
-      // and returned with the change anyway. If the retained-quote population
-      // ever crowds that space, widen it 100× (still under a cent) rather than
-      // loop forever.
-      const span = attempt < 50 ? 10_000n : 1_000_000n;
-      const tag = (BigInt("0x" + randomBytes(4).toString("hex")) % span) * GRAIN;
-      const amountRaw = (base + tag).toString();
-      // Unique across ALL retained quotes (not just pending) — the matcher
-      // compares at GRAIN resolution against every quote it still remembers.
-      let clash = false;
-      for (const q of quotes.values()) if (BigInt(q.amountRaw) / GRAIN === (base + tag) / GRAIN) { clash = true; break; }
-      if (!clash) return amountRaw;
-    }
+    const base = (usdToRaw(usdPrice, pair, "ceil") + GRAIN - 1n) / GRAIN;
+    // The payment matcher compares at this resolution against every quote
+    // it still remembers, including expired and settled records.
+    const taken = new Set();
+    for (const q of quotes.values()) taken.add(BigInt(q.amountRaw) / GRAIN);
+    const grain = pickNanoQuoteGrain(base > 0n ? base : 1n, taken);
+    return grain === null ? null : (grain * GRAIN).toString();
   }
 
   /* ---------------- quote lifecycle ---------------- */
@@ -1231,11 +1238,15 @@ export function createChargeGate({
           // the arguments the caller will pay for.
           const price = priceFor(name, args);
           const pair = await ratePair();
+          const amountRaw = tagAmount(price, pair);
+          if (amountRaw === null) {
+            return errResult("This server is holding too many Nano quotes at this price right now. Try again later. Nothing was quoted or charged.");
+          }
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,
             pair, // settle math must use the exact pair the deposit was priced at
-            amountRaw: tagAmount(price, pair),
+            amountRaw,
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             status: "pending", waiters: [],
             etaMs: etaOf(name),

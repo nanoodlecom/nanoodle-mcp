@@ -215,6 +215,50 @@ test("saved workflow probes flag thin Nano deposits, invalid USDC previews and m
   }
 });
 
+test("the monitor warns before the shared NEAR and USDC quote queue fills and reports it full at the limit", async t => {
+  for (const count of [799, 800, 1000]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const quotes = f.states["/state/near-state.json"].quotes;
+    for (let i = 0; i < count; i++) {
+      quotes[i] = { id: "private-open-" + i, status: "pending", asset: i % 2 ? "near" : "usdc",
+        amountYocto: String(i + 1), expiresAt: NOW };
+    }
+    quotes.old = { id: "private-expired", status: "pending", amountYocto: "5001", expiresAt: NOW - 1 };
+    const report = await runOperationalCheck(f.config, f.deps);
+    const capacity = report.checks.find(c => c.stage === "near-open-quote-capacity");
+    const warning = report.checks.find(c => c.stage === "near-open-quote-headroom");
+    assert.equal(capacity.ok, count !== 1000);
+    assert.equal(capacity.code, count === 1000 ? "near-open-quote-capacity-exhausted" : undefined);
+    assert.equal(warning?.code, count === 800 ? "near-open-quote-capacity-low" : undefined);
+    assert.deepEqual(report.admission, { nano: true, near: count !== 1000, usdc: count !== 1000, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-open|private-expired/);
+  }
+});
+
+test("expired but refundable quotes can exhaust a single price without closing the rail", async t => {
+  for (const [asset, retained] of [["usdc", 800], ["usdc", 999], ["near", 999]]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const quotes = f.states["/state/near-state.json"].quotes;
+    const step = asset === "near" ? 10n ** 18n : 1n;
+    const base = asset === "near" ? 10n ** 22n : 30_000n;
+    for (let i = 1; i <= 999; i++) {
+      quotes[i] = { id: "private-retained-quote-" + i, status: "expired", ...(asset === "usdc" && { asset }),
+        amountYocto: String(base + step * BigInt(i)), expiresAt: NOW - 3_600_000 - Number(i > retained) };
+    }
+    const report = await runOperationalCheck(f.config, f.deps);
+    const stage = (name) => report.checks.find(c => c.stage === name);
+    assert.equal(stage("near-open-quote-capacity").ok, true);
+    const other = asset === "usdc" ? "near" : "usdc";
+    assert.equal(stage(`saved-workflow-${other}-sing`).ok, true);
+    assert.equal(stage(`saved-workflow-${asset}-sing`).code,
+      retained === 999 ? "saved-workflow-quote-amounts-exhausted" : "saved-workflow-quote-amounts-low");
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-retained-quote/);
+  }
+});
+
 test("numeric and HTTP rate limits have precise diagnostics without hiding loss of quorum", async () => {
   for (const http of [false, true]) {
     const f = fixture(({ url }) => url.hostname === "nano-0.example"

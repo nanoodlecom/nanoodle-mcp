@@ -261,6 +261,11 @@ Coverage:
   site's advertised fixed deposits with the current estimated charge for the
   same published graphs. These per-workflow alerts preserve admission for other
   workflows.
+- NEAR and USDC share an open-quote limit. The check warns at 80% and
+  reports both quote lanes unavailable at the limit. The saved-workflow probes
+  also check capacity for their current exact payment amounts. Expired quotes
+  still hold an amount during the late-refund window. A full amount range
+  affects only workloads at that price and denomination.
 - Disk/inode headroom and a write/fsync probe; disabled/overdue check timers and
   failed scheduled services, including the paid canary and alert-queue retry.
 
