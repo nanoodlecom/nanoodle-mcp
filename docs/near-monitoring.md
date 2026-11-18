@@ -212,6 +212,9 @@ Coverage:
   See [Nano RPC freshness](nano-rpc-freshness.md).
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
+  If the watcher is still scanning historical blocks five minutes after the
+  first observation, the same alert route reports delayed payment detection.
+  The report distinguishes this from a failure to follow the live chain tip.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
 - Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
   separate NEAR/USDC quote capacity. Fee calculations include the protocol's
@@ -252,6 +255,13 @@ URLs. Its directory is 0755 and `latest.json` is 0644 so the separate Babel aler
 user can read this selected report without gaining access to the app's keys.
 The report's `admission` fields are readiness observations; this monitor does
 not itself enforce per-run reservations or alter the payment gates.
+
+The app retains its most recent shared-wallet funding pause for 15 minutes
+after recovery. The readiness probe includes the last failed sample, the
+recovery time, and an allowlisted reason when it confirms funding is healthy.
+This catches pauses between probes while preserving the current admission
+status. The existing alert retry timer queues one recovery notice per observed
+pause for Ember, even when the readiness probe succeeds.
 
 Failures use the existing sender/outbox/Ember route. An unchanged incident has
 one message ID across timer invocations, with a new reminder after six hours;

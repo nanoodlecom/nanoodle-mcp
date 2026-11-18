@@ -6,10 +6,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, mkdir, link, symlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createChargeGate, hashArgs, parseUsdNano } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd } from "../src/tools.mjs";
@@ -94,7 +95,7 @@ function fakeRegistry({ author = null, onCall } = {}) {
   return registry;
 }
 
-function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch, stateFile, fundRun } = {}) {
+function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch, stateFile, fundRun, maintenance } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
@@ -108,7 +109,7 @@ function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10,
     now,
     fetch,
     stateFile,
-    fundRun,
+    fundRun, maintenance,
   });
   return gate;
 }
@@ -2407,4 +2408,93 @@ test("a restored owed refund blocks a second refund of the same late payment", a
 
   const refunds = chain2.state.transfers.filter((s) => s.describe === "refunded");
   assert.equal(refunds.length, 1, `restart must not refund twice, got ${refunds.length}`);
+});
+
+async function gateMaintenance(t) {
+  const dir = await mkdtemp(join(tmpdir(), "nano-gate-maintenance-")), file = join(dir, "flag.json");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const maintenance = createMaintenanceBarrier({ file, ownerUid: process.getuid() });
+  return { maintenance,
+    pause: () => writeFile(file, JSON.stringify({ v: 1, token: "e".repeat(32), operation: "backup", revision: null }), { mode: 0o600 }),
+    unpause: () => rm(file) };
+}
+
+test("a paused Nano tool preserves a paid quote and retries it exactly once after reopening", async t => {
+  const w = await gateMaintenance(t), chain = fakeChain(), registry = fakeRegistry();
+  const gate = makeGate(chain, { registry, maintenance: w.maintenance });
+  t.after(() => gate.stop());
+  const wrapped = gate.wrapRegistry(registry), args = { Text: "one paid idea" };
+  const quote = await wrapped.callTool({ name: "poster", arguments: args });
+  const payment = quote.structuredContent.x402;
+  chain.state.receivable["A".repeat(64)] = { amount: payment.amountRaw, source: PAYER };
+  assert.equal(await gate.waitForPayment(payment.paymentId, 1000), "paid");
+  await w.pause();
+  await assert.rejects(wrapped.callTool({ name: "poster", arguments: { ...args, _payment_id: payment.paymentId } }), { code: "SERVICE_DRAINING", executionNotStarted: true });
+  assert.equal(registry.callCount(), 0);
+  assert.equal(gate.quote(payment.paymentId).status, "paid");
+  assert.equal(chain.state.transfers.length, 0);
+  await w.unpause();
+  await wrapped.callTool({ name: "poster", arguments: { ...args, _payment_id: payment.paymentId } });
+  await wrapped.callTool({ name: "poster", arguments: { ...args, _payment_id: payment.paymentId } });
+  assert.equal(registry.callCount(), 1);
+  w.maintenance.close(); await gate.stop(); await w.maintenance.waitForIdle();
+});
+
+test("Nano result completion cannot hide an unfinished change send or its durable owed fallback", { timeout: 5000 }, async t => {
+  const w = await gateMaintenance(t), chain = fakeChain(); let entered, release;
+  const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+  t.after(() => release());
+  const original = chain.ops.transfer;
+  chain.ops.transfer = async (...args) => { entered(); await hold; return original(...args); };
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "result" }], costUsd: 0.001 }) });
+  const stateFile = join(await mkdtemp(join(tmpdir(), "nano-drain-owed-")), "state.json");
+  t.after(() => rm(dirname(stateFile), { recursive: true, force: true }));
+  const gate = makeGate(chain, { registry, stateFile, maintenance: w.maintenance }); t.after(() => gate.stop());
+  const wrapped = gate.wrapRegistry(registry), args = { Text: "with change" };
+  const quote = await wrapped.callTool({ name: "poster", arguments: args }), payment = quote.structuredContent.x402;
+  chain.state.receivable["B".repeat(64)] = { amount: payment.amountRaw, source: PAYER };
+  await gate.waitForPayment(payment.paymentId, 1000);
+  const result = await wrapped.callTool({ name: "poster", arguments: { ...args, _payment_id: payment.paymentId } });
+  assert.equal(result.isError, undefined); await reached;
+  w.maintenance.close(); await gate.stop();
+  let drained = false; const idle = w.maintenance.waitForIdle().then(() => { drained = true; });
+  await Promise.resolve(); assert.equal(drained, false);
+  assert.equal(w.maintenance.snapshot().counts.wallet, 1);
+  chain.state.failTransfer = true; release(); await idle;
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(state.owed.length, 1, "the retry debt must exist before the drain acknowledgement");
+  assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+  assert.equal(state.owed[0].fields.paymentId, payment.paymentId);
+  assert.equal(w.maintenance.snapshot().activeOperations, 0);
+});
+
+test("a failed Nano state flush remains unhealthy after drain until a later snapshot succeeds", { timeout: 5000 }, async t => {
+  const w = await gateMaintenance(t), chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-drain-storage-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateFile = join(dir, "state.json");
+  const gate = makeGate(chain, { registry, stateFile, maintenance: w.maintenance });
+  await mkdir(stateFile + ".tmp");
+  t.after(() => gate.stop());
+  const wrapped = gate.wrapRegistry(registry);
+  await wrapped.callTool({ name: "poster", arguments: { Text: "first quote" } });
+  await w.pause(); await w.maintenance.waitForIdle();
+  assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: false, pendingWrites: 0 });
+  await rm(stateFile + ".tmp", { recursive: true }); await w.unpause();
+  await wrapped.callTool({ name: "poster", arguments: { Text: "new quote after storage repair" } });
+  await w.pause(); await w.maintenance.waitForIdle();
+  assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: true, pendingWrites: 0 });
+  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).quotes.length, 2);
+});
+
+for (const [kind, makeLink] of [["symlink", symlink], ["hardlink", link]]) test(`Nano state snapshots reject a ${kind} staging file without modifying its target`, async t => {
+  const w = await gateMaintenance(t), chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-staging-link-")), file = join(dir, "state.json"), target = join(dir, "private-target");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(target, "KEEP PRIVATE STATE"); await makeLink(target, file + ".tmp");
+  const gate = makeGate(chain, { registry, stateFile: file, maintenance: w.maintenance }); t.after(() => gate.stop());
+  await gate.wrapRegistry(registry).callTool({ name: "poster", arguments: { Text: "refuse unsafe storage" } });
+  await w.pause(); await w.maintenance.waitForIdle();
+  assert.equal(await readFile(target, "utf8"), "KEEP PRIVATE STATE");
+  assert.deepEqual(gate.persistenceStatus(), { enabled: true, ok: false, pendingWrites: 0 });
 });

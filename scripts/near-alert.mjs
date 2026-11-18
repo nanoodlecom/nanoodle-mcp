@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { request as httpRequest } from "node:http";
+import { selectFundingPause } from "../src/funding-report.mjs";
 import { atomicJson } from "./near-check.mjs";
 
 export const CHECK_UNIT = "nanoodle-near-check.service";
@@ -47,6 +48,19 @@ export function failureEvent(env, latest, now = Date.now()) {
     ].join("\n") };
 }
 
+function recoveredFundingEvent(latest, now) {
+  const checkedAt = Date.parse(latest?.checkedAt);
+  const pause = selectFundingPause(latest?.fundingPause, Math.min(now, checkedAt));
+  if (latest?.v !== 1 || pause?.recoveredAt == null || !selectFundingPause(pause, now)
+      || !Array.isArray(latest.checks) || !latest.checks.some(check => check?.stage === "runtime-funding" && check.ok === true)) return null;
+  const id = createHash("sha256").update(`funding-recovery:${pause.lastFailedAt}:${pause.recoveredAt}:${pause.code}`).digest("hex").slice(0, 40);
+  return { messageId: "near_check_" + id, test: false, text: [
+    "Nanoodle shared wallet funding paused and recovered.",
+    `The last failure at ${new Date(pause.lastFailedAt).toISOString()} reported ${pause.code}. Funding recovered at ${new Date(pause.recoveredAt).toISOString()}.`,
+    "The read-only probe confirmed wallet funding health. See /var/lib/nanoodle-operational-check/latest.json for other readiness checks. Keep the original deposit for any pending payment.",
+  ].join("\n") };
+}
+
 // Node's fetch ignores a supplied Host header. Use HTTP for the loopback
 // gateway's explicit virtual host; credentials never leave the local machine.
 export function babelRequest(input, init) {
@@ -84,11 +98,15 @@ export function babelClient(config, request = babelRequest) {
 export async function deliverAlerts(config, { env = process.env, now = Date.now, call = babelClient(config), enqueueOnly = false } = {}) {
   const dir = join(config.stateDir, "alerts"); mkdirSync(dir, { recursive: true, mode: 0o700 });
   let latest;
-  const reportFile = [BACKUP_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT) ? null : [OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT)
-    ? config.operationalReportFile || "/var/lib/nanoodle-operational-check/latest.json"
+  const operationalReportFile = config.operationalReportFile || "/var/lib/nanoodle-operational-check/latest.json";
+  const reportFile = !env.MONITOR_UNIT ? (enqueueOnly ? null : operationalReportFile)
+    : [BACKUP_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT) ? null
+    : [OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT) ? operationalReportFile
     : join(config.stateDir, [MARKET_UNIT, MARKET_TEST_UNIT].includes(env.MONITOR_UNIT) ? "market-latest.json" : "latest.json");
   if (reportFile) try { latest = JSON.parse(readFileSync(reportFile)); } catch { /* early exit or timeout */ }
-  const event = failureEvent(env, latest, now());
+  // The retry service reads successful readiness runs too. It enqueues recovery
+  // under the existing alert lock, since OnFailure's ExecStartPre has no lock.
+  const event = env.MONITOR_UNIT ? failureEvent(env, latest, now()) : recoveredFundingEvent(latest, now());
   if (event) {
     const file = join(dir, event.messageId + ".json");
     if (!existsSync(file)) atomicJson(file, { ...event, status: "pending", createdAt: new Date(now()).toISOString() });

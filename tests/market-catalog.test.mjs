@@ -6,7 +6,7 @@
 // catalog and graph files. Against the market and NanoGPT stand-ins.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { readConfig, startMarketService, MarketConfigError, NOTIFY_LINES, createNotifier } from "../src/market/service.mjs";
 import {
   recommendPrice, budgetFromPrice, priceVerdict, usdMicros, fmtUsd, readCatalog, fetchListingPrice, patchListingPrice,
@@ -288,7 +289,7 @@ test("several listings: each runs on its own token and state; custom:false decli
     { handle: "wf-any", token: TOKEN2, custom: true, priceUsd: 1 },
     { handle: "later-one", custom: true, priceUsd: 2 }, // no token file yet
   ], { once: true });
-  const plainImg = m.hire({ agent: "img-one", title: "Poster", description: "A poster for a small coffee shop opening on Saturday." });
+  const plainImg = m.hire({ agent: "img-one", priceUsd: "0.50", title: "Poster", description: "A poster for a small coffee shop opening on Saturday." });
   const blockImg = m.hire({ agent: "img-one", description: WORKED() });
   const plainAny = m.hire({ agent: "wf-any", description: "Draw a cat, thanks!" });
   const blockAny = m.hire({ agent: "wf-any", description: `Run mine\n\n${BRIEF_TEMPLATE}` });
@@ -348,14 +349,14 @@ test("a job keeps the budget it was accepted under when the listing's budget cha
   };
   const worker = createMarketWorker({ client: createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN }), store, runner, budgetUsd: 0.5, listingPriceUsd: 0.55 });
   try {
-    const first = m.hire({ description: WORKED() });
+    const first = m.hire({ description: WORKED(), priceUsd: "0.55" });
     worker.tick();
     await until(() => store.get(first) && store.get(first).phase === "running", "the first job running");
     worker.setBudget({ budgetUsd: 0.02, listingPriceUsd: 0.03 });
     assert.deepEqual(worker.budget(), { budgetUsd: 0.02, listingPriceUsd: 0.03 });
     release();
     await worker.drain();
-    const second = m.hire({ description: WORKED() });
+    const second = m.hire({ description: WORKED(), priceUsd: "0.03" });
     await worker.tick(); await worker.drain();
     const md = m.rows.get(first).versions[0].markdown;
     assert.match(md, /per-job budget of \$0\.5 /, "the deliverable states the budget the job was accepted under");
@@ -398,7 +399,7 @@ test("price refresh: a price changed on the market takes effect; the drift alarm
     await until(() => logs.includes(recovered), "the recovery line");
     assert.ok(NOTIFY_LINES.test(recovered));
     assert.equal(listing.worker().budget().budgetUsd, budgetFromPrice(rec));
-    const fine = m.hire({ agent: "img-one", description: "a lighthouse at dawn" });
+    const fine = m.hire({ agent: "img-one", priceUsd: fmtUsd(rec), description: "a lighthouse at dawn" });
     await until(() => m.rows.get(fine).assignment.status === "submitted", "the job delivered at the new price");
     assert.match(m.rows.get(fine).versions[0].markdown, new RegExp(`listing's fixed price \\(\\$${rec}\\)`));
     const n1 = m.calls("GET", /pricing-plans$/).length;
@@ -580,14 +581,22 @@ test("notifications: listing-prefixed lines still match; the webhook gets them a
 
 /* ------------------------------ the two commands ------------------------------ */
 
-function runNode(args, env = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, args, { env: { PATH: process.env.PATH, HOME: tmpdir(), ...env }, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-    child.on("exit", (status) => resolve({ status, stdout, stderr }));
-  });
+async function runNode(args, env = {}) {
+  const lockDir = mkdtempSync(join(tmpdir(), "market-cli-locks-"));
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, args, {
+        env: { PATH: process.env.PATH, ...env, NANOODLE_WRITER_LOCK_DIR: lockDir }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, stdout, stderr }));
+    });
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
 }
 
 test("market-worker.mjs --agents-file: serves the listings with a token, skips the one without; a malformed catalog exits 2", { timeout: 60_000 }, async () => {
@@ -667,4 +676,28 @@ test("marketNeedUsd: estimated cost + 20%, rounded up to the cent, at least $0.0
   assert.equal(under.ok, false);
   assert.deepEqual(under.refusals.map((r) => r.code), ["OVER_BUDGET"]);
   assert.match(under.refusals[0].message, /estimated cost plus 20% is \$[\d.]+; this listing covers at most \$[\d.]+/);
+});
+
+test("catalog stop retains state locks until an in-flight price refresh is complete", { timeout: 10000 }, async t => {
+  const market = createMarketMock({ handle: "drain-image", priceAmount: "0.50" }); await market.listen();
+  let entered, release, profiles = 0;
+  const reached = new Promise(resolve => { entered = resolve; }), hold = new Promise(resolve => { release = resolve; });
+  const files = catalogFiles([{ handle: "drain-image", token: MOCK_TOKEN, graph: "default" }]);
+  const cfg = readConfig(files.args(market), { NANOGPT_API_KEY: NANO_KEY, MARKET_PRICE_REFRESH_SECONDS: "0.05" });
+  const maintenance = createMaintenanceBarrier();
+  const service = await startMarketService(cfg, { maintenance, log: () => {}, fetch: async (url, options) => {
+    if (new URL(url).pathname === "/v1/agents/drain-image" && ++profiles === 2) { entered(); await hold; }
+    return fetch(url, options);
+  } });
+  t.after(async () => { release(); service.stop(); await service.done; await market.close(); });
+  await reached; service.stop(); maintenance.close();
+  let stopped = false; const done = service.done.then(() => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  const lock = join(files.stateDir, "drain-image", "worker.lock");
+  assert.equal(stopped, false);
+  assert.equal(existsSync(lock), true, "a price pass still owns this store");
+  assert.ok(maintenance.snapshot().counts.background >= 1);
+  release(); await done; await maintenance.waitForIdle();
+  assert.equal(existsSync(lock), false);
+  assert.equal(maintenance.snapshot().activeOperations, 0);
 });

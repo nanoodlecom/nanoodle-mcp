@@ -34,6 +34,7 @@ import {
 import { redactUrl } from "./redact.mjs";
 import { createRunFunding } from "./run-funding.mjs";
 import { createNanoReadPool } from "./nano-read-pool.mjs";
+import { rpcRetryAfterMs } from "./rpc-backoff.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -119,13 +120,15 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, verifyRpcReads = false, assertWriter = () => {}, now = Date.now, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, verifyRpcReads = false, assertWriter = () => {}, maintenance = null, now = Date.now, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
   if (typeof protectTransfers !== "boolean") throw new TypeError("protectTransfers must be a boolean");
   if (typeof verifyRpcReads !== "boolean") throw new TypeError("verifyRpcReads must be a boolean");
+  if (rpcStandby && !verifyRpcReads) throw new TypeError("Nano RPC standby requires verified reads");
   if (typeof assertWriter !== "function") throw new TypeError("assertWriter must be a function");
+  if (maintenance !== null && typeof maintenance.capture !== "function") throw new TypeError("maintenance must provide operation capture");
   const publicKey = derivePublicKey(secretKey);
   const address = deriveAddress(publicKey, { useNanoPrefix: true });
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
@@ -173,7 +176,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     try { json = JSON.parse(text); } catch { /* handled below */ }
     if (!r.ok || json == null || typeof json !== "object" || Array.isArray(json)) {
       const e = new Error(`Nano RPC ${body.action} failed at ${redactUrl(base)} (HTTP ${r.status}): ${text.slice(0, 200)}`);
-      if (r.status === 429) e.rejected = true; // throttled: request never reached the node
+      if (r.status === 429) {
+        e.rejected = e.rateLimited = true; // throttled: request never reached the node
+        e.retryAfterMs = rpcRetryAfterMs({ body: json?.retry_after, header: r.headers?.get?.("retry-after"), now: now() });
+      }
       else if (r.status >= 500 || r.ok) e.ambiguous = true;
       throw e;
     }
@@ -188,7 +194,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
       // payment, while three other endpoints sat unused. A refusal is a refusal
       // — classify it like the 429 status it is, including for publishes: the
       // proxy declined to forward, so the block provably did not land.
-      if (isThrottleError(json.error)) e.rejected = true;
+      if (isThrottleError(json.error)) {
+        e.rejected = e.rateLimited = true;
+        e.retryAfterMs = rpcRetryAfterMs({ body: json.retry_after, header: r.headers?.get?.("retry-after"), now: now() });
+      }
       else e.authoritative = true;
       throw e;
     }
@@ -198,7 +207,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     return json;
   }
 
-  const readPool = verifyRpcReads ? createNanoReadPool({ bases: rpcBases, account: address, checkAddress, hashBlock, now,
+  const readPool = verifyRpcReads ? createNanoReadPool({ bases: rpcBases, standby: rpcStandby, account: address, checkAddress, hashBlock, now,
     rpc: (body, base) => rpcOnce(body, base, { signal: AbortSignal.timeout(Math.min(rpcTimeoutMs, 2500)) }),
   }) : null;
 
@@ -291,6 +300,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     ];
     for (const [label, base] of workSources) {
       const withKey = workKey && workBases.includes(base);
+      // Public RPC fallback shares the unauthenticated endpoint's cooldown.
+      // A separately keyed work service has its own quota/authorization.
+      if (!withKey && readPool?.isCooling(base)) continue;
       try {
         return (await rpc(
           { action: "work_generate", hash: frontier, difficulty: threshold, ...(withKey ? { key: workKey } : {}) },
@@ -575,9 +587,13 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   // A customer's payment is queued RIGHT NOW — running housekeeping passes
   // check this between blocks and hand the chain over instead of finishing.
   const urgentWaiting = () => tasks.length > 0 && tasks[0].priority === URGENT;
-  function enqueue(fn, priority = HOUSEKEEPING) {
+  function enqueue(fn, priority = HOUSEKEEPING, tracked = true) {
     return new Promise((resolve, reject) => {
-      const task = { fn, priority, resolve, reject };
+      const execute = () => { assertWriter(); return fn(); };
+      // Capture the ENQUEUER's admission context before the queue yields or
+      // another request drains it. Writer failures also release this scope.
+      const scheduled = tracked && maintenance ? maintenance.capture(execute, "wallet") : execute;
+      const task = { fn: scheduled, priority, resolve, reject };
       const at = priority === URGENT ? tasks.findIndex((t) => t.priority !== URGENT) : -1;
       if (at === -1) tasks.push(task); else tasks.splice(at, 0, task);
       if (!draining) drain();
@@ -587,7 +603,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
     draining = true;
     while (tasks.length) {
       const t = tasks.shift();
-      try { assertWriter(); t.resolve(await t.fn()); } catch (e) { t.reject(e); }
+      try { t.resolve(await t.fn()); } catch (e) { t.reject(e); }
     }
     draining = false;
   }
@@ -599,7 +615,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
   function queueSweep() {
     if (sweepQueued) return;
     sweepQueued = true;
-    enqueue(() => { sweepQueued = false; return pocketReceivables(false, urgentWaiting); }).catch(() => {});
+    enqueue(() => { sweepQueued = false; return pocketReceivables(false, urgentWaiting); }).catch(() => { sweepQueued = false; });
   }
   const funding = createRunFunding({
     serial: fn => enqueue(fn, URGENT),
@@ -633,13 +649,18 @@ export function createNanoWallet({ secretKey, rpcUrl = null, workUrl = null, wor
      */
     ops: {
       rpc,
-      withFunding: funding.run,
+      withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
       fundingStatus: funding.snapshot,
+      checkpoint: () => readPool?.status().checkpoint ?? null,
+      verifyCheckpoint: checkpoint => enqueue(async () => {
+        if (!readPool) throw Error("Nano wallet checkpoint verification requires the read guard");
+        await readPool.verifyCheckpoint(checkpoint);
+      }, HOUSEKEEPING, false),
       fundingReport: () => enqueue(async () => {
         const state = await currentState();
         return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers,
           ...(readPool ? { nanoRpc: readPool.status() } : {}) };
-      }),
+      }, HOUSEKEEPING, false), // read-only telemetry must not keep drain permanently nonzero
       // The journal callback MUST persist the signed block before returning.
       // Retrying after a lost response or a restart uses the same block hash.
       transferOnce: (to, amountRaw, { prepared = null, onPrepared, liabilityRaw = 0n, fundingRunId = null } = {}) => enqueue(async () => {

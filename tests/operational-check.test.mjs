@@ -1,13 +1,52 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { runOperationalCheck, finishOperationalReport } from "../scripts/operational-check.mjs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
+import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
+import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
+
+test("Market liveness follows the selected release and rejects a worker left behind by a switched symlink", async t => {
+  const root = mkdtempSync(join(tmpdir(), "operational-market-release-")), children = [];
+  t.after(async () => {
+    await Promise.all(children.map(async child => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    }));
+    rmSync(root, { recursive: true, force: true });
+  });
+  const old = join(root, "old"), next = join(root, "next"), current = join(root, "current");
+  for (const dir of [old, next]) {
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    writeFileSync(join(dir, "bin/nanoodle-mcp.mjs"), 'console.log("ready"); setInterval(() => {}, 1000);');
+  }
+  const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), host = hostname();
+  const start = async directory => {
+    const child = spawn(process.execPath, [join(directory, "bin/nanoodle-mcp.mjs")],
+      { cwd: directory, env: {}, stdio: ["ignore", "pipe", "ignore"] });
+    children.push(child);
+    await Promise.race([once(child.stdout, "data"), once(child, "exit").then(() => assert.fail("Worker fixture exited early"))]);
+    return { pid: child.pid, boot, host };
+  };
+  assert.equal(isMarketWorkerAlive(await start(old), old), true, "the legacy layout still works");
+  symlinkSync(old, current);
+  const original = await start(current);
+  assert.equal(isMarketWorkerAlive(original, old), true);
+  symlinkSync(next, current + ".new"); renameSync(current + ".new", current);
+  assert.equal(isMarketWorkerAlive(original, next), false, "resolving argv alone would mistake the original worker for its replacement");
+  assert.equal(isMarketWorkerAlive(await start(current), next), true);
+  assert.throws(() => isMarketWorkerAlive({ ...original, boot: "foreign" }, next), /market-worker-lock-is-foreign/);
+});
+
 function fixture(override = () => null) {
   const calls = [], stateDir = mkdtempSync(join(tmpdir(), "operational-check-"));
   const config = { stateDir, outDir: "/state", marketStateDir: "/jobs", network: "mainnet", merchant: "nanoodle.near", nearPublicKey: "ed25519:public",
@@ -66,7 +105,7 @@ function fixture(override = () => null) {
       if (url.hostname === "site.example" || url.hostname === "nano-site.example") {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
-          funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 } });
+          funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
         if (body.method === "initialize") return json({ serverInfo: { name: "nanoodle" } });
         if (body.method === "tools/list") return json({ tools: ["sing", "price_noodle", "run_noodle", "noodle_guide"].map(name => ({ name })) });
         assert.equal(body.method, "tools/call"); assert.equal(body.params.name, "price_noodle", "never execute a paid tool or request a deposit");
@@ -99,6 +138,131 @@ test("operational probes cover live readiness with no inference, signing or Mark
   const file = join(f.config.stateDir, "latest.json"), text = readFileSync(file, "utf8");
   assert.doesNotMatch(text, /SYNTHETIC|PRIVATE_BUYER|public|ed25519|assignment|account_id/);
   assert.equal(statSync(file).mode & 0o777, 0o644); assert.equal(JSON.stringify(f.states), before);
+});
+
+test("numeric and HTTP rate limits have precise diagnostics without hiding loss of quorum", async () => {
+  for (const http of [false, true]) {
+    const f = fixture(({ url }) => url.hostname === "nano-0.example"
+      ? http ? new Response("private rate limit body", { status: 429 }) : Response.json({ error: 429, retry_after: 120 }) : null);
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(check => check.stage === "nano-node-0" && check.code === "nano-rpc-rate-limited"));
+    assert.equal(report.admission.nano, false, "two configured peers still require two readable peers");
+    assert.doesNotMatch(JSON.stringify(report), /private rate limit/);
+  }
+});
+
+test("a fresh runtime cooldown prevents monitor retries while other independent peers remain healthy", async () => {
+  const f = fixture(); f.config.nanoRpcUrls.push("https://nano-2.example");
+  Object.assign(f.states["/state/funding-health.json"].nanoRpc, { configuredPeers: 3, configuration: rpcPeerSetId(f.config.nanoRpcUrls),
+    cooldowns: [{ peer: 0, until: NOW + 60_000, secret: "PRIVATE_URL" }] });
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(f.calls.filter(call => call.url.hostname === "nano-0.example").length, 0);
+  assert.ok(report.checks.some(check => check.stage === "nano-node-0" && check.code === "nano-rpc-rate-limited"));
+  assert.ok(report.checks.some(check => check.stage === "nano-frontier-agreement" && check.ok));
+  assert.equal(report.ok, false); assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_URL|configuration|cooldowns/);
+});
+
+test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
+  for (const failure of [null, "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+    const f = fixture(({ url, body }) => {
+      assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
+      if (url.hostname === "nano-0.example") return new Response("", { status: 503 });
+      if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
+        return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
+      }
+      return null;
+    });
+    const url = "https://standby.example/rpc?api_key=PRIVATE_STANDBY";
+    f.config.nanoStandby = { url, requestsPerMinute: 10 };
+    const rpc = f.states["/state/funding-health.json"].nanoRpc;
+    Object.assign(rpc, { configuredPeers: 3,
+      configuration: failure === "digest" ? "a".repeat(64) : rpcPeerSetId([...f.config.nanoRpcUrls, url]),
+      standby: { inUse: failure !== "inactive", requestsPerMinute: failure === "quota" ? 11 : 10 },
+      cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.nano, failure === null);
+    assert.equal(report.admission.near, failure === null);
+    if (!failure) assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
+    if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
+  }
+});
+
+test("mismatched or malformed cooldown observations cannot hide live peer failures", async () => {
+  for (const patch of [{ configuration: "a".repeat(64) }, { cooldowns: [{ peer: true, until: NOW + 60_000 }] }]) {
+    const f = fixture(); Object.assign(f.states["/state/funding-health.json"].nanoRpc,
+      { configuration: rpcPeerSetId(f.config.nanoRpcUrls), cooldowns: [], ...patch });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(check => check.stage === "runtime-funding" && !check.ok));
+    assert.ok(f.calls.some(call => call.url.hostname === "nano-0.example"));
+    assert.equal(report.admission.nano, false);
+  }
+});
+
+test("the no-inference check distinguishes wallet read refusal from missing funding enforcement", async () => {
+  for (const [stored, expected] of [["nano-rpc-frontier-regressed", "nano-rpc-frontier-regressed"],
+    ["funding-state-unavailable", "funding-state-unavailable"], ["PRIVATE_PROVIDER_DETAILS", "funding-state-unavailable"]]) {
+    const f = fixture();
+    f.states["/state/funding-health.json"] = { v: 1, checkedAt: new Date(NOW).toISOString(), ok: false, code: stored };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(check => check.stage === "runtime-funding" && check.code === expected));
+    assert.deepEqual(report.admission, { nano: false, near: false, usdc: false, market: false });
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PROVIDER_DETAILS/);
+  }
+});
+
+test("a funding pause that recovers between probes leaves readiness open and reaches the existing durable alert queue", async () => {
+  const f = fixture();
+  const runtime = f.states["/state/funding-health.json"];
+  const pause = { lastFailedAt: NOW - 10_000, recoveredAt: NOW - 5000, code: "nano-rpc-read-quorum" };
+  runtime.pause = { ...pause, secret: "PRIVATE_RPC_URL" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.deepEqual(report.fundingPause, pause);
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_RPC_URL/);
+
+  const requests = [];
+  const config = { stateDir: f.config.stateDir, operationalReportFile: join(f.config.stateDir, "latest.json"), conversation: "near_check_alerts" };
+  const alert = { env: {}, now: () => NOW, call: async (_tool, args) => {
+    requests.push(args);
+    assert.equal(JSON.parse(readFileSync(join(config.stateDir, "alerts", args.message_id + ".json"), "utf8")).status, "pending");
+    if (requests.length === 1) throw Error("lost response");
+    return { message: { id: args.message_id, recipient: EMBER, status: "queued" } };
+  } };
+  assert.equal((await deliverAlerts(config, { ...alert, enqueueOnly: true })).messageId, undefined);
+  assert.equal((await deliverAlerts(config, alert)).ok, false);
+  assert.equal((await deliverAlerts(config, alert)).queued, 1);
+  assert.equal((await deliverAlerts(config, alert)).queued, 0);
+  assert.deepEqual(requests[0], requests[1]);
+  assert.match(requests[0].text, /wallet funding paused and recovered/);
+  assert.match(requests[0].text, /reported nano-rpc-read-quorum/);
+  assert.doesNotMatch(requests[0].text, /PRIVATE_RPC_URL|FAILED/);
+
+  runtime.pause = { ...pause, lastFailedAt: NOW - 4000, recoveredAt: NOW - 3000 };
+  await runOperationalCheck(f.config, f.deps);
+  assert.equal((await deliverAlerts(config, alert)).queued, 1);
+  assert.notEqual(requests[2].message_id, requests[0].message_id);
+});
+
+test("ongoing, expired, or invalid pause history cannot announce a funding recovery", async () => {
+  const f = fixture(), runtime = f.states["/state/funding-health.json"];
+  for (const pause of [
+    { lastFailedAt: NOW - 5000, recoveredAt: null },
+    { lastFailedAt: NOW - 5000, recoveredAt: NOW + 5 },
+    { lastFailedAt: NOW - 16 * 60_000, recoveredAt: NOW - 15 * 60_000 - 1 },
+    { lastFailedAt: NOW - 5000, recoveredAt: NOW - 6000 },
+  ]) {
+    runtime.pause = pause;
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.ok, true); assert.equal(report.fundingPause, undefined);
+  }
+  runtime.pause = { lastFailedAt: NOW - 10_000, recoveredAt: NOW - 5000, code: "nano-rpc-read-quorum" };
+  runtime.ok = false; runtime.code = "funding-state-unavailable";
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.fundingPause, undefined); assert.equal(report.admission.near, false);
 });
 
 test("stale, disabled, underfunded or stuck live reservations fail independently of the public site", async () => {
@@ -164,12 +328,77 @@ test("loss of the separate Nano ingress is visible without executing tools or di
 test("periodic readiness verifies fresh enforced refund funding and each asset's admission capacity", async () => {
   for (const change of [{ enforced: false }, { checkedAt: NOW - 60_001 }, { ok: false }, { canQuoteUsdc: false }]) {
     const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
-      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100 },
+      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false },
       funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true, ...change } }) : null);
     const result = await runOperationalCheck(f.config, f.deps);
     assert.equal(result.ok, false); assert.equal(result.admission.usdc, false);
     if (change.canQuoteUsdc === false) assert.equal(result.admission.near, true);
     else assert.equal(result.admission.near, false);
+  }
+});
+
+test("historical NEAR scan delays reach the existing alert route while a fresh tip remains ready", async t => {
+  let backfilling = true;
+  const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
+    watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling },
+    funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true } }) : null);
+  const dir = f.config.stateDir;
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const started = NOW - 300_000;
+  const first = finishOperationalReport(dir, [], started, { nearBackfilling: true });
+  assert.equal(first.ok, true, "a newly observed backfill gets time to complete");
+  assert.equal(first.nearBackfillSince, started);
+  assert.equal(finishOperationalReport(dir, [], NOW - 1).nearBackfillSince, started, "missing observations do not clear the episode");
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.ok, false);
+  assert.equal(report.nearBackfillSince, started);
+  assert.equal(report.admission.near, true);
+  assert.equal(report.admission.usdc, true);
+  assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.ok));
+  const event = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: "a".repeat(32) }, report, NOW);
+  assert.match(event.text, /near-watcher-backfill=near-watcher-backfill-delayed/);
+  assert.equal((await runOperationalCheck(f.config, f.deps)).incidentId, report.incidentId);
+  backfilling = false;
+  const recovered = await runOperationalCheck(f.config, f.deps);
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.nearBackfillSince, undefined);
+  backfilling = true;
+  assert.equal((await runOperationalCheck(f.config, f.deps)).nearBackfillSince, NOW);
+});
+
+test("watcher readiness rejects malformed heights, impossible leads and unknown backfill status", async t => {
+  for (const [change, code] of [[{ height: "Infinity" }, "near-watcher-observation-invalid"], [{ height: 221 }, "near-watcher-ahead"],
+    [{ backfilling: null }, "near-watcher-observation-invalid"]]) {
+    const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
+      watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false, ...change },
+      funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true } }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.near, false);
+    assert.equal(report.admission.usdc, false);
+    assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.code === code));
+  }
+});
+
+test("scheduled readiness separates watcher failure from refund proof, shortfall and stale funding", async t => {
+  for (const [code, expected] of [
+    ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
+    ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
+    ["NEAR_FUNDING_STALE", "near-refund-funding-stale"],
+    ["PRIVATE_UPSTREAM_DETAIL", "near-refund-funding-unhealthy"],
+  ]) {
+    const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({
+      active: true, network: "mainnet", merchant: "nanoodle.near",
+      watcher: { listening: false, lastScanAt: new Date(NOW).toISOString(), height: 100 },
+      funding: { enforced: true, ok: false, checkedAt: NOW, code },
+    }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.near, false);
+    assert.equal(report.admission.usdc, false);
+    assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.code === "near-watcher-stale"));
+    assert.ok(report.checks.some(c => c.stage === "near-refund-funding" && c.code === expected));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_UPSTREAM_DETAIL/);
   }
 });
 
@@ -204,6 +433,42 @@ test("a readable endpoint on the wrong Nano network cannot satisfy operational r
   const report = await runOperationalCheck(f.config, f.deps);
   assert.equal(report.ok, false); assert.equal(report.admission.nano, false);
   assert.ok(report.checks.some(c => c.stage === "nano-node-0" && c.code === "NANO_RPC_WRONG_NETWORK"));
+});
+
+test("the monitor reports a lagging peer and requires two current views for payment readiness", async t => {
+  for (const third of [true, false]) {
+    const f = fixture(({ url, body }) => url.hostname === "nano-0.example" && body?.action === "account_info"
+      ? Response.json(nanoAccountInfo({ height: 7, frontier: "B".repeat(64) })) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    if (third) {
+      f.config.nanoRpcUrls.push("https://nano-2.example");
+      f.states["/state/funding-health.json"].nanoRpc.configuredPeers = 3;
+    }
+    const result = await runOperationalCheck(f.config, f.deps);
+    assert.equal(result.ok, false);
+    assert.ok(Object.values(result.admission).every(value => value === third));
+    assert.ok(result.checks.some(c => c.stage === "nano-node-0-lag" && c.code === "nano-rpc-peer-lagging"));
+    assert.ok(result.checks.some(c => c.stage === "nano-frontier-agreement" && c.ok === third
+      && (third || c.code === "nano-rpc-lagging-peers")));
+  }
+});
+
+test("the read-only Market probe reports unverified active escrow without retaining assignment data", async () => {
+  const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments"
+    ? Response.json({ assignments: [
+      { job: { jobKind: "competition" }, assignment: { escrowToken: "NEAR", escrowAmount: "0" } },
+      { assignment: { escrowToken: "USDC", escrowAmount: "unavailable" }, private: "SECRET_ESCROW_FIXTURE" },
+    ] })
+    : null);
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(report.admission.market, false);
+  assert.deepEqual(report.checks.find(check => check.stage === "market-escrow-nanoodle-image"), {
+    stage: "market-escrow-nanoodle-image", ok: false, code: "market-escrow-unavailable", domains: ["market"],
+  });
+  assert.doesNotMatch(JSON.stringify(report), /SECRET_ESCROW_FIXTURE/);
+  const entry = f.calls.find(call => call.url.pathname === "/v1/agents/me/assignments");
+  assert.equal(entry.init.method || "GET", "GET");
+  assert.equal(entry.url.searchParams.get("limit"), "100");
 });
 
 test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {

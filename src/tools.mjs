@@ -48,6 +48,7 @@ const CATALOG_PATH = {
 /** Cached catalog arrays by `${base}|${kind}` — the public catalogs move slowly and every fetch is unauthenticated. */
 const catalogCache = new Map();
 const CATALOG_TTL_MS = 60 * 60 * 1000;
+const PAID_CATALOG_TTL_MS = 5 * 60 * 1000;
 /**
  * Failure markers by the same key. An endpoint that's down stays down for more
  * than one call, so one failed round trip covers the next minute instead of
@@ -78,10 +79,13 @@ const CATALOG_TIMEOUT_MS = 8000;
  * `maxAgeMs: 0` forces a refetch (the hourly estimate refresh) and bypasses the
  * failure marker; anything else serves a cached array younger than that, so a
  * per-call path (run_noodle) doesn't pay a round trip on every run.
+ * `requireFresh` uses a five-minute cache and omits a catalog if its refresh
+ * fails. Hosted price checks need to see that models are currently priceable.
  * `consequence` is appended to the failure log line, so each caller can name
  * what its own users lose.
  */
-export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
+export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {},
+  requireFresh = false, maxAgeMs = requireFresh ? PAID_CATALOG_TTL_MS : CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const base = String(baseUrl).replace(/\/+$/, "");
   const catalogs = {};
   // A stale copy still beats nothing: the payload gates and the forecast are both
@@ -99,7 +103,7 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
     if (hit && Date.now() - hit.at < maxAgeMs) { catalogs[kind] = hit.data; return; }
     const failed = catalogFailures.get(key);
     if (failed && Date.now() - failed.at < Math.min(CATALOG_FAIL_TTL_MS, maxAgeMs)) {
-      if (hit) serveStale(kind, hit, failed.why);
+      if (hit && !requireFresh) serveStale(kind, hit, failed.why);
       return; // already logged when the failure was recorded
     }
     try {
@@ -115,12 +119,14 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
         catalogFailures.delete(key);
       } else {
         catalogFailures.set(key, { at: Date.now(), why: "empty" });
-        log(`${kind} catalog came back empty — those graphs run without the model's declared limits${consequence}`);
+        const impact = requireFresh ? "" : " — those graphs run without the model's declared limits";
+        log(`${kind} catalog came back empty${impact}${consequence}`);
       }
     } catch (e) {
       const why = e && e.name === "TimeoutError" ? `no response in ${timeoutMs}ms` : e.message;
       catalogFailures.set(key, { at: Date.now(), why });
-      if (hit) { serveStale(kind, hit, why); return; }
+      if (hit && !requireFresh) { serveStale(kind, hit, why); return; }
+      if (requireFresh) { log(`could not refresh ${kind} catalog (${why})${consequence}`); return; }
       log(`could not load ${kind} catalog (${why}) — those graphs run without the model's declared limits${consequence}`);
     }
   }));
@@ -810,7 +816,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * checked the graph first does not decode it twice.
  * @returns {Promise<{ graph: object, workflowGraph: object, inputs: object, wf: Workflow, catalogs: object, source: string, url: string|null }>}
  */
-export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs, allowShortLinks = true, read = null } = {}) {
+export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
+  allowShortLinks = true, read = null, requireFreshCatalogs = false } = {}) {
   if (args == null) args = {};
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
@@ -830,8 +837,9 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch =
     baseUrl: baseUrl || undefined,
     fetch,
     log,
+    requireFresh: requireFreshCatalogs,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
-    consequence: ", so this link runs with whatever payload it asked for",
+    consequence: requireFreshCatalogs ? ", so graphs using it cannot be quoted" : ", so this link runs with whatever payload it asked for",
   });
   const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs, fetch: hostedRunFetch(fetch) });
   if (wf.warnings.length) {
@@ -884,7 +892,8 @@ function inputRefusals(workflowGraph, given) {
  * throw GraphArgsError (-32602); everything else is reported, not thrown.
  * @returns {Promise<{ read: object|null, safety: {ok, refusals}, pricing: object|null, catalogs: object }>}
  */
-export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs, allowShortLinks = true, limits = DEFAULT_LIMITS } = {}) {
+export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
+  allowShortLinks = true, limits = DEFAULT_LIMITS, requireFreshCatalogs = false } = {}) {
   let read;
   try {
     read = await readGraphArgs(args == null ? {} : args, { allowShortLinks, fetch, limits });
@@ -900,6 +909,7 @@ export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, lo
     baseUrl: baseUrl || undefined,
     fetch,
     log,
+    requireFresh: requireFreshCatalogs,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so price_noodle cannot price those nodes",
   });

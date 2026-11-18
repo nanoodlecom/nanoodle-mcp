@@ -108,7 +108,7 @@ export async function readNearFunding({ rpc, network, accountId, publicKey, toke
     query({ request_type: "view_account", account_id: accountId }),
     query({ request_type: "view_access_key", account_id: accountId, public_key: publicKey }),
     rpc.call("EXPERIMENTAL_protocol_config", { block_id: head.hash }),
-    rpc.call("gas_price", [Number(head.height)]),
+    rpc.call("gas_price", [head.hash]),
     tokenContract ? query({ request_type: "call_function", account_id: tokenContract, method_name: "ft_balance_of",
       args_base64: Buffer.from(JSON.stringify({ account_id: accountId })).toString("base64") }) : null,
   ]);

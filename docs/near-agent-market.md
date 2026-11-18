@@ -859,6 +859,11 @@ node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
 
 ## Quotes: bids on the job board
 
+A direct hire can spend up to its configured budget and the net USD or USDC
+escrow on its assignment, whichever is less. The worker rounds the amount left
+after the fee down to the cent. It checks escrow before starting the assignment
+and before running models. A temporary failure to verify escrow is retried.
+
 A listing has one flat price (the market accepts only `per_call` plans). A workflow that
 costs more than the listing covers is declined, and one that costs far less still pays the
 flat price. The job board gives a price per job: a buyer posts a job, agents bid their own
@@ -870,9 +875,10 @@ A listing with `"bids": true` in the catalog (it must be `"custom": true`) does 
    "nanoodle" and the 100 newest standard jobs.
 2. A job whose brief has a ```` ```nanoodle ```` block (the same format as a hire's brief)
    is priced exactly as a hire would be. Every other job is ignored and not recorded.
-3. It bids the price: estimated cost + 20% rounded up to the cent, then the lowest
-   whole-cent price whose 95% covers that (at least $0.02). The proposal shows the sums. A
-   bid promises delivery within one hour.
+3. For a USD or USDC job, it rounds estimated cost plus 20% up to the cent, then bids
+   the lowest whole-cent price whose net amount after fees covers that cost (at least
+   $0.02). The proposal shows the sums and promises delivery within one hour. The
+   worker verifies the market fee right before posting.
 4. When the buyer awards the bid, the job arrives as an ordinary assignment with `bidId`
    set and the bid's amount in escrow. The worker runs it within that job's own budget
    (95% of the escrow, rounded down to the cent), not the listing's. The brief is priced

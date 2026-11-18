@@ -59,6 +59,7 @@ export function createRefunder({
   usdcToken = null,
   beforeSign = async () => {},
   beforeComplete = async () => {},
+  maintenance = null,
   backoffMs = [30_000, 60_000, 120_000, 300_000, 600_000],
   maxAttempts = 100,
   resignWindowMs = 36 * 3_600_000,
@@ -73,9 +74,16 @@ export function createRefunder({
   if (typeof beforeSign !== "function") throw new TypeError("beforeSign must be a function");
   if (typeof beforeComplete !== "function") throw new TypeError("beforeComplete must be a function");
 
+  if (maintenance !== null && typeof maintenance.capture !== "function") throw new TypeError("maintenance must provide operation capture");
+
   let chain = Promise.resolve();
   function serialized(task) {
-    const run = chain.then(task);
+    // Register before queueing: a nonce task waiting behind another refund
+    // still prevents a drain. Accepted settlement retains its caller's scope.
+    let scheduled;
+    try { scheduled = maintenance ? maintenance.capture(task, "wallet") : task; }
+    catch (error) { return Promise.reject(error); }
+    const run = chain.then(scheduled);
     chain = run.catch(() => {});
     return run;
   }

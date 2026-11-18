@@ -13,12 +13,13 @@ const timeMs = (block) => Number(BigInt(block.header.timestamp_nanosec) / 1_000_
 
 export function createNearWatcher({
   rpc, ledger, merchantId, pendingQuotes, observeTransfer,
-  tokenContracts = [],
+  tokenContracts = [], maintenance = null,
   pollMs = 2000, maxBlocksPerTick = 25, log = () => {},
   now = Date.now, maxHeadAgeMs = MAX_HEAD_AGE_MS, maxClockSkewMs = MAX_CLOCK_SKEW_MS,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   cancel = clearTimeout,
 }) {
+  if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.accepting !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
   let state = ledger.getMeta(META) || null;
   if (state && (!Number.isSafeInteger(state.height) || state.height < 0 || typeof state.hash !== "string"
     || (state.backfill && (typeof state.backfill.nextHash !== "string" || !Number.isFinite(state.backfill.cutoffMs))))) {
@@ -116,7 +117,9 @@ export function createNearWatcher({
 
   function tick() {
     if (inflight) return inflight;
-    inflight = scan().catch((e) => {
+    if (stopped) return Promise.resolve();
+    inflight = (maintenance ? maintenance.run(scan, "background") : scan()).catch((e) => {
+      if (e.code === "SERVICE_DRAINING") return; // Pause preserves the cursor and RPC error history.
       failures++;
       if (!lastError) log(`NEAR payment watcher paused (${e.code || "error"}); will retry without advancing its cursor`);
       lastError = e.code || "WATCH_FAILED";
@@ -135,13 +138,20 @@ export function createNearWatcher({
       await loop();
       if (!lastError) log(`NEAR payment watcher listening for finalized transfers to ${merchantId}`);
     },
-    stop() { stopped = true; if (timer !== null) cancel(timer); },
+    stop() {
+      stopped = true;
+      if (timer !== null) { cancel(timer); timer = null; }
+      // A caller preparing to stop the process must await the actual scan and
+      // payment-observation callback, not just cancellation of its next timer.
+      return inflight || Promise.resolve();
+    },
     status: () => {
       const fresh = lastHeadAt !== null && now() - lastHeadAt <= maxHeadAgeMs && lastHeadAt - now() <= maxClockSkewMs
         && lastScanAt !== null && now() - Date.parse(lastScanAt) <= 120_000 && now() >= Date.parse(lastScanAt);
-      return { listening: !stopped && !lastError && fresh, merchant: merchantId, height: state?.height ?? null,
+      const paused = maintenance && !maintenance.accepting();
+      return { listening: !stopped && !lastError && fresh && !paused, merchant: merchantId, height: state?.height ?? null,
         backfilling: !!state?.backfill, lastScanAt, headAt: lastHeadAt === null ? null : new Date(lastHeadAt).toISOString(),
-        error: lastError || (!stopped && !fresh ? "RPC_STALE" : null) };
+        error: lastError || (paused ? "SERVICE_DRAINING" : !stopped && !fresh ? "RPC_STALE" : null) };
     },
   };
 }

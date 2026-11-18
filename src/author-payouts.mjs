@@ -11,14 +11,16 @@ export function authorPayoutRaw(settlement, rate, xnoUsdNano) {
   return collected * BigInt(rate.usdNano) * 10n ** 30n / (BigInt(rate.yocto) * xnoUsdNano);
 }
 
-export function createAuthorPayouts({ ledger, ops, now = Date.now, log = () => {}, usage = () => {},
+export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Date.now, log = () => {}, usage = () => {},
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   backoffMs = [30_000, 60_000, 120_000, 300_000, 600_000],
 }) {
   if (typeof ops?.transferOnce !== "function") throw new TypeError("author payouts need the shared Nano wallet's durable transfer operation");
-  let running = null;
+  if (maintenance !== null && (typeof maintenance.capture !== "function" || typeof maintenance.assertAdmitted !== "function")) throw new TypeError("maintenance must provide operation capture");
+  let chain = Promise.resolve();
   function enqueue({ paymentId, to, amountRaw }) {
     if (!authorAddress({ author: to }) || !/^\d+$/.test(String(amountRaw)) || BigInt(amountRaw) <= 0n) throw new TypeError("invalid author payout");
+    maintenance?.assertAdmitted();
     const existing = ledger.getPayout(paymentId);
     if (existing) {
       if (existing.to !== to || existing.amountRaw !== String(amountRaw)) throw new Error("author payout does not match its recorded intent");
@@ -48,11 +50,15 @@ export function createAuthorPayouts({ ledger, ops, now = Date.now, log = () => {
     }
   }
   function tick({ force = false } = {}) {
-    if (running) return running.then(() => tick({ force }));
-    running = (async () => {
+    const pass = async () => {
       for (const rec of ledger.payouts()) if (rec.status !== "sent" && (force || rec.nextAttemptAt <= now())) await drive(rec);
-    })().finally(() => { running = null; });
-    return running;
+    };
+    let scheduled;
+    try { scheduled = maintenance ? maintenance.capture(pass, "wallet") : pass; }
+    catch (error) { return Promise.reject(error); }
+    const run = chain.then(scheduled);
+    chain = run.catch(() => {});
+    return run;
   }
   return { enqueue, tick, resume: () => tick({ force: true }), records: () => ledger.payouts() };
 }

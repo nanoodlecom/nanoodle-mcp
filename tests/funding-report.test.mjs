@@ -19,13 +19,18 @@ async function setup(t, options = {}) {
 test("funding health is private aggregate telemetry and insufficient funds pause new quotes", async t => {
   const w = await setup(t); let balanceRaw = "100";
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000,
-    snapshot: async () => ({ ...value, balanceRaw }) });
+    snapshot: async () => ({ ...value, balanceRaw, process: { pid: -1, secret: "PROVIDER_PRIVATE" } }) });
   t.after(report.stop);
   assert.equal(w.sources.ready(), true);
   assert.equal((await stat(w.file)).mode & 0o777, 0o600);
   const saved = await readFile(w.file, "utf8");
   assert.doesNotMatch(saved, /SECRET|privateExtra/);
   assert.equal(JSON.parse(saved).checkedAt, new Date(2000).toISOString());
+  const identity = JSON.parse(saved).process;
+  assert.equal(identity.pid, process.pid); assert.equal(identity.uid, process.getuid());
+  assert.match(identity.startTicks, /^[1-9][0-9]*$/);
+  assert.match(identity.bootId, /^[a-f0-9-]{36}$/);
+  assert.doesNotMatch(saved, /PROVIDER_PRIVATE/);
   balanceRaw = "99"; await report.refresh();
   assert.equal(w.sources.ready(), false);
   assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
@@ -37,8 +42,52 @@ test("unreadable financial state fails closed and later recovery can resume quot
     snapshot: async () => { if (fail) throw Error("PRIVATE_PROVIDER_ERROR"); return value; } });
   t.after(report.stop);
   assert.equal(w.sources.ready(), false);
-  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "runTimeoutMs", "v"]);
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(w.file, "utf8"))).sort(), ["checkedAt", "code", "ok", "pause", "process", "runTimeoutMs", "v"]);
   fail = false; await report.refresh(); assert.equal(w.sources.ready(), true);
+});
+
+test("runtime funding reports a known read guard refusal without copying RPC diagnostics", async t => {
+  const w = await setup(t);
+  let cause = "NANO_RPC_READ_QUORUM";
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
+    snapshot: async () => { throw Object.assign(Error("PRIVATE_RPC_URL"), { code: cause }); } });
+  t.after(report.stop);
+  const currentCode = async () => { await report.refresh(); return JSON.parse(await readFile(w.file, "utf8")).code; };
+  assert.equal(await currentCode(), "nano-rpc-read-quorum");
+  cause = "NANO_RPC_UNCONFIRMED_FRONTIER";
+  assert.equal(await currentCode(), "nano-rpc-unconfirmed-frontier");
+  cause = "PRIVATE_ERROR_CODE";
+  assert.equal(await currentCode(), "funding-state-unavailable");
+  assert.equal(w.sources.ready(), false);
+  assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
+});
+
+test("a funding pause keeps the last failed sample and first recovery across a reporter restart", async t => {
+  const w = await setup(t);
+  let clock = 1000, fail = false;
+  const options = { outDir: w.dir, sources: w.sources, now: () => clock, intervalMs: 1_000_000,
+    snapshot: async () => {
+      if (fail) throw Object.assign(Error("PRIVATE_RPC_URL"), { code: "NANO_RPC_READ_QUORUM" });
+      return value;
+    } };
+  const saved = async () => JSON.parse(await readFile(w.file, "utf8"));
+  const before = await startFundingReport(options);
+  t.after(before.stop);
+  assert.equal((await saved()).pause, undefined);
+  fail = true; clock = 6000; await before.refresh();
+  clock = 11_000; await before.refresh();
+  assert.deepEqual((await saved()).pause, { lastFailedAt: 11_000, recoveredAt: null, code: "nano-rpc-read-quorum" });
+  before.stop();
+  fail = false; clock = 16_000;
+  const after = await startFundingReport(options);
+  t.after(after.stop);
+  const pause = { lastFailedAt: 11_000, recoveredAt: 16_000, code: "nano-rpc-read-quorum" };
+  assert.deepEqual((await saved()).pause, pause);
+  assert.equal(w.sources.ready(), true);
+  clock += 300_000; await after.refresh();
+  assert.deepEqual((await saved()).pause, pause, "the next scheduled probe can still see the failure");
+  clock += 15 * 60_000; await after.refresh();
+  assert.equal((await saved()).pause, undefined);
 });
 
 test("a write failure pauses sending; read-only recovery does not need to enable sends first", async t => {
@@ -53,6 +102,7 @@ test("a write failure pauses sending; read-only recovery does not need to enable
   await rm(w.file + ".tmp", { recursive: true });
   await report.refresh();
   assert.equal(w.sources.ready(), true); assert.equal(w.sources.liabilitiesRaw(), 0n);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).pause.code, "funding-storage-unavailable");
 });
 
 test("the report writer refuses a staging symlink and does not overwrite its target", async t => {
@@ -107,11 +157,27 @@ test("the private handoff retains only validated public-chain facts and never tr
   rpc.checkpoint = checkpoint; await report.refresh(); assert.equal(w.sources.ready(), true);
 });
 
+test("private RPC cooldown telemetry selects safe fields and malformed state pauses admission", async t => {
+  const w = await setup(t), head = { hash: "A".repeat(64), blockCount: "10" };
+  const rpc = { enforced: true, configuredPeers: 3, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: 2000,
+    checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: NANO_GENESIS_REPLY.contents.account, head, confirmed: head },
+    configuration: "a".repeat(64), cooldowns: [{ peer: 0, until: 32_000, endpoint: "PRIVATE_CREDENTIAL_URL" }] };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000, snapshot: async () => ({ ...value, nanoRpc: rpc }) });
+  t.after(report.stop);
+  let text = await readFile(w.file, "utf8");
+  assert.deepEqual(JSON.parse(text).nanoRpc.cooldowns, [{ peer: 0, until: 32_000 }]);
+  assert.doesNotMatch(text, /PRIVATE|endpoint/); assert.equal(w.sources.ready(), true);
+  rpc.cooldowns = [{ peer: 3, until: 32_000 }]; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  text = await readFile(w.file, "utf8"); assert.equal(JSON.parse(text).ok, false);
+});
+
 test("a pending refresh cannot keep stale checkout admission alive or discard protected debts", async t => {
   let clock = 1000, finish, snapshots = 0;
   const w = await setup(t, { now: () => clock });
   w.sources.registerNano(() => 20n);
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, intervalMs: 1_000_000,
+    now: () => clock,
     snapshot: async () => { snapshots++; if (snapshots > 1) await new Promise(resolve => { finish = resolve; }); return value; } });
   t.after(report.stop);
   assert.equal(w.sources.ready(), true);
@@ -124,5 +190,22 @@ test("a pending refresh cannot keep stale checkout admission alive or discard pr
   assert.equal(w.sources.liabilitiesRaw(), 20n, "settlement still sees the existing obligations");
   finish(); await pending;
   assert.equal(w.sources.ready(), true, "a fresh successful observation restores admission");
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).pause.code, "funding-report-stale");
   assert.equal(snapshots, 2);
+});
+
+test("failed money-state persistence pauses checkout admission without inference and normal queued writes do not", async t => {
+  const w = await setup(t); let state = { ok: true, pendingWrites: 2, privateExtra: "PRIVATE_MONEY_EVENT" };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, snapshot: async () => value, durableState: () => state });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  assert.deepEqual(JSON.parse(await readFile(w.file, "utf8")).durableState, { ok: true, pendingWrites: 2 });
+  state.ok = false; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
+  state = { ok: true, pendingWrites: "unknown" }; await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).code, "funding-state-unavailable");
+  state = { ok: true, pendingWrites: 0 }; await report.refresh();
+  assert.equal(w.sources.ready(), true);
 });

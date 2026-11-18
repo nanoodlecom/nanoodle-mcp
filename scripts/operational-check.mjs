@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
-import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync, realpathSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -12,26 +12,60 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/index.mjs";
-import { resolveWalletKey } from "../src/wallet.mjs";
+import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
+import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
-import { readCatalog, fetchListingPrice } from "../src/market/catalog.mjs";
+import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms } from "../src/market/catalog.mjs";
+import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_GENESIS, checkNanoGenesis, nanoAccountView } from "../src/nano-read-pool.mjs";
+import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
+import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
+const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
+const REFUND_FUNDING_CODES = new Map([
+  ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
+  ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
+  ["NEAR_FUNDING_STALE", "near-refund-funding-stale"],
+]);
 class CheckError extends Error {}
 const need = (condition, code) => { if (!condition) throw new CheckError(code); };
 const readJson = file => JSON.parse(readFileSync(file, "utf8"));
 const safeCode = e => e instanceof CheckError ? e.message : /^[A-Z_]{2,60}$/.test(e?.code || "") ? e.code : /Timeout|Abort/.test(e?.name || "") ? "request-timeout" : "probe-failed";
 
-export function finishOperationalReport(stateDir, checks, now = Date.now()) {
+export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("../", import.meta.url))) {
+  if (!Number.isSafeInteger(lock?.pid) || lock.pid <= 0) return false;
+  need(lock.host === hostname() && lock.boot === readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), "market-worker-lock-is-foreign");
+  const processDir = `/proc/${lock.pid}`, releaseDir = realpathSync(appDirectory);
+  try {
+    const [, entrypoint] = readFileSync(join(processDir, "cmdline"), "utf8").split("\0");
+    // A former worker can still have "/current" in argv after that symlink
+    // moves. Its kernel working directory stays in the release it started in.
+    return isAbsolute(entrypoint || "") && realpathSync(join(processDir, "cwd")) === releaseDir
+      && realpathSync(entrypoint) === join(releaseDir, "bin/nanoodle-mcp.mjs");
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null } = {}) {
   const latest = join(stateDir, "latest.json");
   let previous; try { previous = readJson(latest); } catch { /* first probe */ }
+  const priorBackfill = previous?.nearBackfillSince;
+  let nearBackfillSince = Number.isSafeInteger(priorBackfill) && priorBackfill > 0 && priorBackfill <= now ? priorBackfill : null;
+  if (nearBackfilling === false) nearBackfillSince = null;
+  if (nearBackfilling === true) {
+    nearBackfillSince ??= now;
+    if (now - nearBackfillSince >= NEAR_BACKFILL_ALERT_MS) {
+      checks = [...checks, { stage: "near-watcher-backfill", ok: false, code: "near-watcher-backfill-delayed", domains: [] }];
+    }
+  }
   const failed = checks.filter(c => !c.ok);
   const fingerprint = createHash("sha256").update(JSON.stringify(failed.map(c => [c.stage, c.code]).sort())).digest("hex");
   const firstSeenAt = previous?.fingerprint === fingerprint && previous.ok === false ? previous.firstSeenAt : now;
@@ -39,7 +73,8 @@ export function finishOperationalReport(stateDir, checks, now = Date.now()) {
   const incidentId = createHash("sha256").update(`${fingerprint}:${firstSeenAt}:${reminder}`).digest("hex").slice(0, 32);
   const admission = Object.fromEntries(ALL.map(asset => [asset, !failed.some(c => c.domains?.includes(asset))]));
   const report = { v: 1, ok: failed.length === 0, checkedAt: new Date(now).toISOString(), stage: failed[0]?.stage || "complete",
-    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}) };
+    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
+    ...(nearBackfillSince !== null && { nearBackfillSince }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
   // The separate alert user needs to read it, without access to app secrets.
@@ -52,6 +87,9 @@ export async function runOperationalCheck(config, deps = {}) {
   const request = createProbeFetch({ fetch: deps.fetch || globalThis.fetch, timeoutMs: config.timeoutMs || 12_000 });
   const priceWorkflow = deps.computePrice || computePrice;
   const checks = [];
+  const peerUrls = config.nanoStandby ? [...config.nanoRpcUrls, config.nanoStandby.url] : config.nanoRpcUrls;
+  let nanoCooldowns = [];
+  let standbyCheckpoint = null;
   const check = async (stage, fn, domains = ALL) => {
     try { const value = await fn(); checks.push({ stage, ok: true }); return value; }
     catch (e) { checks.push({ stage, ok: false, code: safeCode(e), domains }); return null; }
@@ -61,7 +99,11 @@ export async function runOperationalCheck(config, deps = {}) {
   };
   const nanoRpc = async (url, body) => {
     need(["account_info", "block_count", "version", "block_info"].includes(body.action), "probe-action-forbidden");
-    const result = await http(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    need(response.status !== 429, "nano-rpc-rate-limited");
+    need(response.ok, `http-${response.status}`);
+    const result = await response.json();
+    need(!result.error || !isThrottleError(result.error), "nano-rpc-rate-limited");
     need(!result.error, "nano-rpc-error"); return result;
   };
   const mcp = async (method, params, site = config.site) => {
@@ -78,11 +120,12 @@ export async function runOperationalCheck(config, deps = {}) {
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
   });
-  await check("runtime-funding", async () => {
+  const fundingPause = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
-    const age = now() - Date.parse(value.checkedAt);
+    const checkedAt = Date.parse(value.checkedAt), age = now() - checkedAt;
     need(Number.isFinite(age) && age <= 60_000 && age >= -30_000, "funding-report-stale");
+    if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
     need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
     need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
     need(value.writerProtection.requiredState === true, "required-state-policy-not-enforced");
@@ -94,13 +137,27 @@ export async function runOperationalCheck(config, deps = {}) {
     need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
       && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= limit + 15 * 60_000, "funding-run-stuck");
     const rpc = value.nanoRpc;
-    need(rpc?.enforced === true && rpc.configuredPeers === config.nanoRpcUrls.length, "nano-read-guard-not-enforced");
+    need(rpc?.enforced === true && rpc.configuredPeers === peerUrls.length, "nano-read-guard-not-enforced");
     const minimum = Math.min(2, config.nanoRpcUrls.length);
-    need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= config.nanoRpcUrls.length)
+    need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
-    try { selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
+    let checkpoint;
+    try { checkpoint = selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
+    if (config.nanoStandby || rpc.cooldowns !== undefined || rpc.configuration !== undefined) {
+      need(rpc.configuration === rpcPeerSetId(peerUrls), "nano-peer-configuration-mismatch");
+      try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, peerUrls.length, now()); }
+      catch { need(false, "nano-cooldown-observation-invalid"); }
+    }
+    if (config.nanoStandby) {
+      const { inUse, requestsPerMinute } = rpc.standby ?? {};
+      need(typeof inUse === "boolean" && requestsPerMinute === config.nanoStandby.requestsPerMinute
+        && (!inUse || (rpc.readablePeers === 2 && !nanoCooldowns.some(item => item.peer === peerUrls.length - 1))), "nano-standby-observation-invalid");
+      if (inUse) standbyCheckpoint = checkpoint.confirmed;
+    }
+    const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
+    return pause?.recoveredAt != null ? pause : null;
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -135,19 +192,22 @@ export async function runOperationalCheck(config, deps = {}) {
     }, []);
   }
   const nanoNodes = (await Promise.all(config.nanoRpcUrls.map((url, index) => check(`nano-node-${index}`, async () => {
+    need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
     checkNanoGenesis(await nanoRpc(url, { action: "block_info", hash: NANO_GENESIS, json_block: "true" }));
     const info = await nanoRpc(url, { action: "account_info", account: config.nanoAddress, representative: "true", include_confirmed: "true", receivable: "true" });
-    nanoAccountView(info, checkAddress);
-    return info;
+    return { info, peer: index, view: nanoAccountView(info, checkAddress) };
   }, [])))).filter(Boolean);
   const nano = await check("nano-frontier-agreement", async () => {
-    need(nanoNodes.length >= Math.min(2, config.nanoRpcUrls.length), "nano-read-quorum-unavailable");
-    const highest = nanoNodes.reduce((a, b) => BigInt(a.confirmed_height) >= BigInt(b.confirmed_height) ? a : b);
-    const consistent = nanoNodes.every(n => BigInt(highest.confirmed_height) - BigInt(n.confirmed_height) <= 2n
-      && (n.confirmed_height !== highest.confirmed_height || n.confirmed_frontier === highest.confirmed_frontier));
-    need(consistent, "nano-wallet-nodes-disagree");
-    return highest;
+    const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(nanoNodes);
+    for (const { peer } of lagging) checks.push({ stage: `nano-node-${peer}-lag`, ok: false, code: "nano-rpc-peer-lagging", domains: [] });
+    if (current.length < Math.min(2, config.nanoRpcUrls.length)) {
+      need(current.length === 1 && standbyCheckpoint, lagging.length ? "nano-rpc-lagging-peers" : "nano-read-quorum-unavailable");
+      need(latestConfirmed.confirmedHeight === BigInt(standbyCheckpoint.blockCount)
+        && latestConfirmed.confirmedFrontier === standbyCheckpoint.hash, "nano-standby-checkpoint-disagrees");
+    }
+    return current.find(row => row.view === latestConfirmed).info;
   });
+  if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
   const nearNodes = (await Promise.all(config.nearRpcUrls.map((url, index) => check(`near-node-${index}`, async () => {
     const rpc = createNearRpc({ url, fetch: request, timeoutMs: config.timeoutMs || 12_000 });
     const status = await rpc.status();
@@ -166,20 +226,33 @@ export async function runOperationalCheck(config, deps = {}) {
       && (Number(n.block.header.height) !== Number(highest.block.header.height) || n.block.header.hash === highest.block.header.hash)), "near-finalized-nodes-disagree");
     return highest;
   }, ["near", "usdc"]);
-  const site = await check("near-payment-watcher", async () => {
+  let refundHealth = null;
+  const watcherHealth = await check("near-payment-watcher", async () => {
     const health = await http(config.site + "/near/health");
     need(health.active && health.merchant === config.merchant && health.network === config.network, "near-listener-not-active");
+    refundHealth = health;
     const age = now() - Date.parse(health.watcher?.lastScanAt);
     need(health.watcher?.listening && Number.isFinite(age) && age < 120_000 && age >= -30_000, "near-watcher-stale");
-    need(health.funding?.enforced === true, "near-refund-funding-not-enforced");
-    need(health.funding.ok === true && Number.isSafeInteger(health.funding.checkedAt)
-      && now() - health.funding.checkedAt <= 60_000 && now() - health.funding.checkedAt >= -30_000, "near-refund-funding-unhealthy");
-    if (near) need(Number(near.block.header.height) - Number(health.watcher.height) <= 120, "near-watcher-behind");
-    return health;
+    need(Number.isSafeInteger(health.watcher.height) && health.watcher.height >= 0
+      && typeof health.watcher.backfilling === "boolean", "near-watcher-observation-invalid");
+    if (near) {
+      const lag = Number(near.block.header.height) - health.watcher.height;
+      need(lag <= 120, "near-watcher-behind");
+      need(lag >= -120, "near-watcher-ahead");
+    }
+    return health.watcher;
   }, ["near", "usdc"]);
-  if (site) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
+  const fundingHealth = refundHealth && await check("near-refund-funding", async () => {
+    const funding = refundHealth.funding;
+    need(funding?.enforced === true, "near-refund-funding-not-enforced");
+    const age = now() - funding.checkedAt;
+    need(Number.isSafeInteger(funding.checkedAt) && age <= 60_000 && age >= -30_000, "near-refund-funding-stale");
+    need(funding.ok === true, REFUND_FUNDING_CODES.get(funding.code) || "near-refund-funding-unhealthy");
+    return funding;
+  }, ["near", "usdc"]);
+  if (fundingHealth) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
     await check(`${asset}-refund-admission`, async () => {
-      need(site.funding[key] === true, "near-refund-capacity-exhausted");
+      need(fundingHealth[key] === true, "near-refund-capacity-exhausted");
     }, [asset]);
   }
   const rates = await check("exchange-rates", async () => {
@@ -245,23 +318,26 @@ export async function runOperationalCheck(config, deps = {}) {
   }
   const platform = await check("market-platform-fee", async () => {
     const result = await http(config.marketUrl + "/v1/platform/config");
-    need(result.platform_fee_bps === 500, "market-fee-assumption-changed"); return result;
+    need(result.platform_fee_bps === MARKET_PLATFORM_FEE_BPS, "market-fee-assumption-changed"); return result;
   }, ["market"]);
   await Promise.all(config.agents.map(async agent => {
     await check(`market-process-${agent.handle}`, async () => {
       const lock = read(join(config.marketStateDir, agent.handle, "worker.lock"));
-      const alive = deps.isWorkerAlive || (value => {
-        need(value.host === hostname() && value.boot === readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), "market-worker-lock-is-foreign");
-        process.kill(value.pid, 0);
-        const command = readFileSync(`/proc/${value.pid}/cmdline`, "utf8").split("\0");
-        return command.includes("/srv/nanoodle-mcp/app/bin/nanoodle-mcp.mjs");
-      });
+      const alive = deps.isWorkerAlive || isMarketWorkerAlive;
       need(Number.isSafeInteger(lock?.pid) && lock.pid > 0 && alive(lock), "market-worker-process-missing");
     }, ["market"]);
-    await check(`market-auth-${agent.handle}`, async () => {
+    const assignments = await check(`market-auth-${agent.handle}`, async () => {
       const token = (deps.readText || (file => readFileSync(file, "utf8")))(agent.tokenFile).trim();
-      const result = await http(config.marketUrl + "/v1/agents/me/assignments?status=in_progress&limit=1&offset=0", { headers: { authorization: `Bearer ${token}` } });
-      need(Array.isArray(result.assignments), "market-auth-response-invalid");
+      const result = await http(config.marketUrl + "/v1/agents/me/assignments?status=in_progress&limit=100&offset=0", { headers: { authorization: `Bearer ${token}` } });
+      need(Array.isArray(result.assignments) && result.assignments.length <= 100, "market-auth-response-invalid");
+      return result.assignments;
+    }, ["market"]);
+    if (assignments) await check(`market-escrow-${agent.handle}`, () => {
+      for (const row of assignments) {
+        if (row?.job?.jobKind === "competition") continue;
+        const { code } = marketEscrowTerms(row?.assignment);
+        need(!code, code?.toLowerCase().replaceAll("_", "-"));
+      }
     }, ["market"]);
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
@@ -271,12 +347,13 @@ export async function runOperationalCheck(config, deps = {}) {
       const listing = await fetchListingPrice({ baseUrl: config.marketUrl, handle: agent.handle, fetch: request });
       need(listing.ok && listing.listingStatus === "live", "market-price-unavailable");
       const needUsd = marketNeedUsd(priced.pricing.estimatedCostUsd);
-      need(platform && parseUsdNano(String(listing.priceUsd)) * 9500n >= parseUsdNano(String(needUsd)) * 10000n, "market-workflow-underpriced");
+      need(platform && budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
       const remote = await mcp("tools/call", { name: "price_noodle", arguments: { graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } } });
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
     }, ["market"]);
   }));
-  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now());
+  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
+    { fundingPause, nearBackfilling: watcherHealth?.backfilling });
 }
 
 async function productionConfig(env = process.env) {
@@ -284,10 +361,12 @@ async function productionConfig(env = process.env) {
   need(secret, "nano-wallet-not-configured");
   const merchant = env.NEAR_MERCHANT;
   const signer = await loadNearSigner({ accountId: merchant, keyFile: env.NEAR_KEY_FILE || null, env });
+  const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
+  const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", outDir: "/srv/nanoodle-mcp/out",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
-    nanoRpcUrls: env.NANO_RPC_URL.split(",").map(s => s.trim()), nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
+    nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
     nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }

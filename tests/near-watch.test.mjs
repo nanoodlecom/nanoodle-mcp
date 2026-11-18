@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearWatcher, createNearRpc, openNearLedger, NearError } from "../src/near/index.mjs";
 import { createFakeChain } from "./fixtures/near-fake-chain.mjs";
 
@@ -134,4 +135,52 @@ test("a malformed or future finalized head is rejected before writing initial st
     assert.equal(w.ledger.getMeta("paymentWatch"), undefined);
     watcher.stop();
   }
+});
+
+test("stop waits for the watcher to durably finish an in-flight payment observation", async () => {
+  const w = await world(); let entered, release, completed = false;
+  const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+  const watcher = createNearWatcher({ ...w.opts, observeTransfer: async (hash, sender) => {
+    entered(); await hold; w.observed.push({ hash, sender });
+  } });
+  await watcher.start(); w.quote(); const tx = w.pay();
+  const scan = watcher.tick(); await reached;
+  const stopped = watcher.stop().then(() => { completed = true; });
+  await Promise.resolve(); assert.equal(completed, false);
+  assert.equal(w.observed.length, 0);
+  release(); await Promise.all([scan, stopped]);
+  assert.equal(completed, true); assert.equal(w.observed[0].hash, tx);
+  const cursor = w.ledger.getMeta("paymentWatch");
+  w.pay(); await watcher.tick();
+  assert.deepEqual(w.ledger.getMeta("paymentWatch"), cursor, "explicit ticks cannot restart a stopped watcher");
+  assert.equal(watcher.status().listening, false);
+});
+
+test("maintenance pauses new NEAR scans without losing finalized payments or hiding an active scan", async t => {
+  const w = await world(), dir = await mkdtemp(join(tmpdir(), "watch-maintenance-")), file = join(dir, "flag.json");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const maintenance = createMaintenanceBarrier({ file, ownerUid: process.getuid() });
+  let entered, release;
+  const reached = new Promise(r => { entered = r; }), hold = new Promise(r => { release = r; });
+  const watcher = createNearWatcher({ ...w.opts, maintenance, observeTransfer: async (hash, sender) => {
+    entered(); await hold; w.observed.push({ hash, sender });
+  } });
+  await watcher.start(); w.quote(); const first = w.pay();
+  const scan = watcher.tick(); await reached;
+  await writeFile(file, JSON.stringify({ v: 1, token: "a".repeat(32), operation: "backup", revision: null }), { mode: 0o600 });
+  assert.equal(maintenance.snapshot().counts.background, 1);
+  assert.equal(watcher.status().listening, false);
+  release(); await scan;
+  assert.equal(w.observed[0].hash, first);
+  assert.equal(maintenance.snapshot().activeOperations, 0);
+  const before = w.ledger.getMeta("paymentWatch"), scanAt = watcher.status().lastScanAt;
+  const second = w.pay(); await watcher.tick();
+  assert.deepEqual(w.ledger.getMeta("paymentWatch"), before);
+  assert.equal(watcher.status().lastScanAt, scanAt);
+  assert.equal(watcher.status().error, "SERVICE_DRAINING");
+  await rm(file); await watcher.tick();
+  assert.ok(w.observed.some(o => o.hash === second));
+  assert.equal(watcher.status().listening, true);
+  assert.equal(maintenance.snapshot().activeOperations, 0);
+  await watcher.stop();
 });

@@ -1,4 +1,4 @@
-import { NANO_GENESIS } from "./nano-read-pool.mjs";
+export const NANO_GENESIS = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948";
 
 /** Selected public-chain facts for a private operator handoff. This is telemetry,
  * not a durable journal or permission to start another account writer. */

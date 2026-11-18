@@ -80,7 +80,69 @@ retain their deliberate first-run behavior.
 
 The private `funding-health.json` includes only `writerProtection.enforced` and
 `writerProtection.requiredState` booleans, checked within the existing five-minute
-runtime-funding probe. Missing/disabled protection fails readiness; schedules
-and healthy probe count are unchanged. These checks run no inference, signing,
+runtime-funding probe. Funding telemetry also binds its Linux PID, UID, boot ID
+and process start ticks; a resume controller must reject an earlier process's
+report even when its timestamp is recent. Missing/disabled protection fails
+readiness; schedules and healthy probe count are unchanged. These checks run no inference, signing,
 publication or PoW. Local startup errors remain visible in systemd/readiness;
 an independent observer is still needed during a whole-server/Babel outage.
+
+
+## Starting a verified release while admission remains paused
+
+The package declares `nanoodleMaintenanceProtocol: 1` for the paused startup,
+writer proof and process-bound funding telemetry contract. The root release
+store must refuse older artifacts without that contract before starting them.
+
+Draft source supports a process-bound startup handoff; it is not deployed and
+has no installed root controller yet. With only `NANOODLE_MAINTENANCE_FILE`
+configured, a retained or unsafe pause still refuses startup before wallet
+initialization or recovery. A pause never expires or reopens by itself.
+
+A future root controller may also configure
+`NANOODLE_MAINTENANCE_STARTUP_FILE` as a separate file beside the pause. On a
+valid retained pause, the app waits up to two minutes for that file without
+initializing wallets, making provider requests or opening HTTP listeners.
+Missing permission does not infer consent. An unsafe permit, changed flag
+(including an identical replacement inode), orphan permit or deadline refuses
+startup and leaves both operator files alone.
+
+The permit is root-owned, service-group readable and not group/world writable.
+Its version-one object binds the complete operator request to Linux PID, UID,
+boot ID and process start ticks, plus the canonical release path, full revision
+and sealed-tree hash. The app compares those fields to its own kernel identity
+and the root-owned, read-only `.nanoodle-release.json` attestation. The root
+controller must independently verify the complete immutable tree and intended
+service command before issuing permission; a reported Git SHA or an app-written
+health frame is insufficient. Graphs and MCP arguments cannot configure this.
+
+The maintenance handoff also requires every configured checkout rail and Market
+service to have initialized its financial writer. A missing configured component
+cannot disappear from the aggregate and leave a healthy-looking stop proof.
+Active rails retain their existing runtime funding behavior when another rail
+is unavailable.
+
+Authorized initialization is counted as accepted work while request entry and
+routine background passes still check closed admission. Only explicit startup
+recovery scopes can resume recorded obligations and initialize listing metadata.
+An interrupted NEAR run is refunded under its existing recovery rules, never
+rerun. Listener and polling callbacks cannot borrow initialization permission,
+even while initialization is still pending. After initialization, the permit
+gives no permission to a new request or background pass.
+
+Recovery can sign and publish previously owed refunds or creator payouts. Once
+that permission is granted, financial state must never be restored to an older
+snapshot. The future root controller must keep the pause through fresh process-
+bound write/writer/required-state qualification, remove its known startup permit,
+and explicitly reopen only that verified process. A failed or uncertain startup
+must retain maintenance state for reconciliation; neither a timeout nor a failed
+health check authorizes financial rollback or a blind restart into older code.
+
+Local fixtures exercise identity reuse, changed request/release, unsafe files,
+waiting/replacement/deadline behavior and callback isolation. The real CLI also
+starts against a local NEAR chain with a previously interrupted paid quote: two
+separate authorized startups send exactly one full refund, execute no model,
+and keep both the payment watcher and MCP admission paused. These fixtures use
+synthetic release attestations and throwaway keys, not a production release or
+real funds. Root release selection, permission issuance, resume journaling and
+legacy-process first cutover still require qualification before activation.
