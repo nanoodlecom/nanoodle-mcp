@@ -28,6 +28,7 @@ import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
+import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
@@ -47,6 +48,8 @@ const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 const NEAR_DISCOVERY_MAX_PROOF_AGE_MS = 27 * 3600_000;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
+const MARKET_SLA_WARNINGS = ["market-sla-execution-overdue", "market-sla-start-window-ended",
+  "market-sla-retry-after-cutoff", "market-sla-delivery-due"];
 const SHARED_SAVED_WORKFLOWS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
 const NEAR_WORKFLOW_TEMPLATE = "idea-to-3d-model";
 const CAPACITY_WARNING = 0.8;
@@ -847,10 +850,11 @@ export async function runOperationalCheck(config, deps = {}) {
         need(!code, code?.toLowerCase().replaceAll("_", "-"));
       }
     }, ["market"]);
-    if (assignments) await check(`market-intake-${agent.handle}`, () => {
+    const intake = assignments && await check(`market-intake-${agent.handle}`, () => {
       need(assignments.length < MARKET_MAX_PAGES * 100, "market-intake-scan-incomplete");
       const active = assignments.filter(row => row?.job?.jobKind !== "competition");
-      if (!active.length) return;
+      const risks = new Set();
+      if (!active.length) return risks;
       // Read after the remote poll. The worker persists its record before starting a hire.
       const state = read(join(config.marketStateDir, agent.handle, "market-state.json"));
       need(state?.v === 1 && state.assignments && typeof state.assignments === "object" && !Array.isArray(state.assignments),
@@ -861,24 +865,39 @@ export async function runOperationalCheck(config, deps = {}) {
         need(typeof a?.assignmentId === "string" && a.assignmentId && a.status === "in_progress" && !seen.has(a.assignmentId),
           "market-intake-response-invalid");
         seen.add(a.assignmentId);
-        const hiredAt = Date.parse(a.createdAt), deadline = Date.parse(a.slaDeadlineAt);
-        need(Number.isFinite(hiredAt) && Number.isFinite(deadline) && deadline >= hiredAt && hiredAt <= checkedAt + 30_000,
-          "market-intake-timing-invalid");
+        const timing = marketDeliveryWindow(a);
+        need(timing && timing.hiredAt <= checkedAt + 30_000, "market-intake-timing-invalid");
+        const { hiredAt, deadline, executionDeadlineAt, warningAt } = timing;
         need(deadline > checkedAt, "market-intake-sla-expired");
-        if (!Object.hasOwn(state.assignments, a.assignmentId)) {
+        const hasRecord = Object.hasOwn(state.assignments, a.assignmentId);
+        const record = hasRecord ? state.assignments[a.assignmentId] : null;
+        if (!hasRecord) {
           need(!a.startedAt && !a.submittedAt && !a.deliverableUrl && row.latestMessage?.senderSide !== "worker",
             "market-intake-start-without-record");
           need(checkedAt - hiredAt <= MARKET_PICKUP_GRACE_MS, "market-intake-untracked");
         } else {
-          const record = state.assignments[a.assignmentId];
           const needUsd = record?.pricing?.depositUsd;
           if ((record?.phase === "starting" || record?.phase === "started") && Number.isFinite(needUsd)) {
             const { budgetUsd } = marketEscrowTerms(a);
             if (budgetUsd !== undefined) need(needUsd <= budgetUsd, "market-intake-escrow-below-priced-need");
           }
         }
+        const beforeRun = !record || ["new", "starting", "started"].includes(record.phase);
+        const cutoff = beforeRun ? executionDeadlineAt : deadline;
+        if (beforeRun && checkedAt >= executionDeadlineAt) risks.add("market-sla-start-window-ended");
+        if (record?.phase === "running") {
+          const recorded = Number.isSafeInteger(record.executionDeadlineAt) ? record.executionDeadlineAt : executionDeadlineAt;
+          if (checkedAt >= Math.min(recorded, executionDeadlineAt)) risks.add("market-sla-execution-overdue");
+        }
+        if (Number.isSafeInteger(record?.nextAttemptAt) && record.nextAttemptAt >= cutoff) risks.add("market-sla-retry-after-cutoff");
+        if (checkedAt >= warningAt) risks.add("market-sla-delivery-due");
       }
+      return risks;
     }, ["market"]);
+    if (intake) await check(`market-sla-${agent.handle}`, () => {
+      const risk = MARKET_SLA_WARNINGS.find(code => intake.has(code));
+      need(!risk, risk);
+    }, []);
     if (agent.bids && platform) {
       await checkMarketRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
     }
