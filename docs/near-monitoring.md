@@ -65,7 +65,9 @@ stays failed and is not automatically rerun or replaced.
 State and signed transaction bytes are saved atomically before broadcasting.
 Reruns resume the same payment and graph. They never re-sign an ambiguous or
 expired transaction or replace an unfinished quote. A completed day performs
-free MCP checks and returns the saved paid result, without another deposit.
+free MCP checks and reads the payment page's status and result endpoints. Both
+must still return the verified receipt, and the result must contain the exact
+canary output. The check reuses the original deposit and performs no inference.
 After recovering an older unfinished day, the next invocation can start today's
 check. Always run under the same `flock` as the systemd service to avoid overlap.
 

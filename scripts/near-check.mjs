@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync,
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { createNearRpcPool, loadNearSigner, NEAR_NETWORKS, signTransfer, parseNearToYocto, formatYoctoAsNear } from "../src/near/index.mjs";
 import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib.mjs";
 import { callMcp, resultText } from "../src/near-site-browser.mjs";
@@ -56,13 +57,27 @@ export async function runCheck(config, deps = {}) {
   const save = () => atomicJson(file, state);
   const require = (condition, message) => { if (!condition) throw Object.assign(new Error(message), { checkFailure: true }); };
   let id = 0;
-  const json = async path => { const response = await request(base + path); require(response.ok, "HTTP status check failed"); return response.json(); };
+  const json = async path => {
+    const response = await request(base + path, { cache: "no-store" });
+    require(response.status === 200, "HTTP status check failed"); return response.json();
+  };
   const mcp = async (method, params) => {
     const response = await request(base + "/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }) });
     require(response.ok, "MCP HTTP check failed"); const body = await response.json();
     require(!body.error && body.result, "MCP returned an error"); return body.result;
   };
   const call = (name, args) => mcp("tools/call", { name, arguments: args });
+  async function verifyPaymentPage(receipt) {
+    stage = "payment_page";
+    const paymentId = state.quote?.paymentId;
+    require(/^nq_[A-Za-z0-9_-]+$/.test(paymentId) && receipt?.outcome === "succeeded" && receipt.refund?.status === "sent",
+      "Verified payment or refund is missing from retained state");
+    const [view, cached] = await Promise.all([json(`/near/status/${paymentId}`), json(`/near/result/${paymentId}`)]);
+    require(view?.paymentId === paymentId && view.status === "settled" && isDeepStrictEqual(view.receipt, receipt),
+      "Payment page status or refund differs from the verified receipt");
+    require(cached && !cached.isError && correctOutput(cached, state) && isDeepStrictEqual(cached.structuredContent?.receipt, receipt),
+      "Payment page result or receipt differs from the verified run");
+  }
   try {
     const day = new Date(now()).toISOString().slice(0, 10);
     require(payer && payer !== merchant && keyFile, "A separate payer and key file are required");
@@ -74,6 +89,7 @@ export async function runCheck(config, deps = {}) {
     require(["run_noodle", "price_noodle", "noodle_guide"].every(name => tools?.some(t => t.name === name)), "Required MCP tools are missing");
     require(!(await call("noodle_guide", {})).isError, "Agent guide failed");
     if (state?.done && state.day === day) {
+      await verifyPaymentPage(state.receipt);
       const report = { ...state.report, checkedAt: new Date(now()).toISOString(), reused: true };
       atomicJson(latest, report); return report;
     }
@@ -151,10 +167,9 @@ export async function runCheck(config, deps = {}) {
     require((await checkTransferOnChain({ rpc, txHash: receipt.refund.txHash, sender: merchant, receiver: payer, amountYocto: refunded })).ok, "Refund does not match the finalized on-chain transfer");
     stage = "replay_and_result";
     const replay = await call("run_noodle", paidArgs);
-    require(JSON.stringify(replay.structuredContent?.receipt) === JSON.stringify(receipt), "Replay changed the receipt");
+    require(isDeepStrictEqual(replay.structuredContent?.receipt, receipt), "Replay changed the receipt");
     require(correctOutput(replay, state), "Paid output is unavailable on replay; text results are not retained across server restarts");
-    const cached = await json(`/near/result/${q.paymentId}`);
-    require(JSON.stringify(cached).includes(expected), "Payment page result cache is missing the output");
+    await verifyPaymentPage(receipt);
     const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: state.args.graph.nodes.find(n => n.type === "llm").fields.model, modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
       output: expected, progressFrames: state.progress.length, chargedUsd: receipt.charged.usd, chargedNear: formatYoctoAsNear(charged), refundedNear: formatYoctoAsNear(refunded), payerGasNear: formatYoctoAsNear(BigInt(state.gasYocto)),
       paymentTx: state.signed.txHash, refundTx: receipt.refund.txHash, watcher: true, replay: true, paymentPageResult: true };
