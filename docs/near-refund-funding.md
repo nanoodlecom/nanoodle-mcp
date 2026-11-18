@@ -57,6 +57,11 @@ signing. A blocked fresh signature leaves the existing unsigned debt and does
 not consume a nonce. Already signed transfers remain queryable and retry the
 same bytes, even while fresh signing is paused.
 
+Expiry renewal keeps the original access key and nonce. The refunder checks
+the hash and signer fields in the saved transaction before changing its block
+reference. If a node rejects the nonce and the transfer remains unverified,
+the debt stays recorded and the read-only monitor alerts immediately.
+
 ## Completion and restart
 
 An outgoing result must be FINAL and match the stored transaction hash, sender,

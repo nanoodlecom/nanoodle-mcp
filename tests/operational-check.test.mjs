@@ -409,6 +409,18 @@ test("independent token reads preserve native readiness unless a paid USDC claim
   }
 });
 
+test("an unverified outgoing refund alerts immediately while its principal remains in the accounting", async () => {
+  const f = fixture();
+  f.states["/state/near-state.json"].refunds.pending = { id: "pending", paymentId: "paid", amountYocto: "17",
+    status: "signed", lastError: "RPC_HTTP", outcomeUnverified: true, createdAt: NOW - 1000 };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.ok(report.checks.some(check => check.stage === "near-refund-outcome-unverified"
+    && check.code === "near-refund-outcome-unverified"));
+  assert.ok(report.checks.some(check => check.stage === "refund-liquidity-accounting" && check.ok));
+  assert.equal(report.admission.near, true);
+  assert.equal(JSON.stringify(report).includes("paymentId"), false);
+});
+
 test("historical NEAR scan delays reach the existing alert route while a fresh tip remains ready", async t => {
   let backfilling = true;
   const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",

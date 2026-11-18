@@ -1,6 +1,6 @@
 /**
- * Refund sender: persist-before-broadcast, identical rebroadcasts, re-signing
- * only when the old transaction is provably dead, one refund per payment, and
+ * Refund sender: persist-before-broadcast, identical rebroadcasts, renewal
+ * with the original nonce, one refund per payment, and
  * restart recovery. The chain is a mock fetch; the key is a test-only seed.
  */
 import { test } from "node:test";
@@ -15,6 +15,7 @@ import { openNearLedger } from "../src/near/ledger.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createRefunder } from "../src/near/refunds.mjs";
 import { parseNearSecretKey } from "../src/near/keys.mjs";
+import { USDC_CONTRACTS } from "../src/near/ft.mjs";
 import { base58Encode, base58Decode } from "../src/near/base58.mjs";
 
 const SIGNER = parseNearSecretKey(`ed25519:${base58Encode(Buffer.alloc(32, 7))}`); // test-only seed
@@ -170,7 +171,7 @@ test("transient failure -> pending; a later tick rebroadcasts identical bytes", 
   });
 });
 
-test("Expired + old hash unknown -> re-signed with a fresh nonce, old hash kept", async () => {
+test("an expired transaction with an unknown outcome renews its original nonce and retains both hashes", async () => {
   await withLedger(async ({ file, open }) => {
     const ledger = open();
     let keyView = { nonce: 100, block_hash: BLOCK_A };
@@ -194,18 +195,129 @@ test("Expired + old hash unknown -> re-signed with a fresh nonce, old hash kept"
     const first = decodeSigned(log.sends[0]);
     const second = decodeSigned(log.sends[1]);
     assert.equal(first.nonce, 101n);
-    assert.equal(second.nonce, 102n);
+    assert.equal(second.nonce, first.nonce);
     assert.equal(second.blockHash, BLOCK_B);
     assert.notEqual(first.hash, second.hash);
     assert.equal(out.txHash, second.hash);
-    assert.deepEqual(log.txs, [{ tx_hash: first.hash, sender_account_id: MERCHANT, wait_until: "NONE" }]);
+    assert.deepEqual(log.txs, [{ tx_hash: first.hash, sender_account_id: MERCHANT, wait_until: "FINAL" }]);
     // the new record was persisted before its broadcast, under the same id
     assert.equal(resignedOnDisk.id, out.refundId);
     assert.equal(resignedOnDisk.txHash, second.hash);
     assert.deepEqual(resignedOnDisk.supersededTxHashes, [first.hash]);
+    assert.equal(resignedOnDisk.replacementNonce, "101");
+    assert.equal(ledger.getMeta("lastNonce"), "101");
     assert.equal(resignedOnDisk.status, "signed");
     assert.deepEqual(ledger.getRefund(out.refundId).supersededTxHashes, [first.hash]);
     assert.equal(ledger.refunds().length, 1);
+  });
+});
+
+test("a nonce rejection with an unknown hash retains the original transfer until a final outcome arrives", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open();
+    let known = false;
+    const { rpc, log } = mockChain({
+      onSend: (_bytes, n) => n === 2 ? { http: 503 } : { error: RPC_ERR.invalidNonce },
+      onTx: () => known ? { result: DONE } : { error: RPC_ERR.unknownTx },
+    });
+    const { refunder, advance } = make(rpc, ledger);
+    const first = await refunder.refund({ paymentId: "split-rpc", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    assert.equal(first.status, "pending");
+    assert.equal(ledger.getRefund(first.refundId).lastError, "UNPROVABLE");
+    advance(31_000);
+    await refunder.tick();
+    assert.equal(ledger.getRefund(first.refundId).lastError, "RPC_HTTP");
+    assert.equal(ledger.getRefund(first.refundId).outcomeUnverified, true);
+    known = true;
+    advance(61_000);
+    await refunder.tick();
+    assert.equal(ledger.getRefund(first.refundId).status, "sent");
+    assert.equal(ledger.getRefund(first.refundId).outcomeUnverified, false);
+    assert.equal(ledger.getRefund(first.refundId).txHash, first.txHash);
+    assert.equal(log.keys, 1);
+    assert.deepEqual(log.sends, [log.sends[0], log.sends[0], log.sends[0]]);
+  });
+});
+
+test("a renewed refund reconciles the original hash if it later appears finalized", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), completed = [];
+    let keyView = { nonce: 100, block_hash: BLOCK_A }, original, known = false;
+    const { rpc, log } = mockChain({
+      key: () => keyView,
+      onSend: (bytes, n) => {
+        if (n === 1) {
+          original = decodeSigned(bytes).hash;
+          keyView = { nonce: 100, block_hash: BLOCK_B };
+          return { error: RPC_ERR.expired };
+        }
+        known = true;
+        return { error: RPC_ERR.invalidNonce };
+      },
+      onTx: hash => known && hash === original ? { result: DONE } : { error: RPC_ERR.unknownTx },
+    });
+    const { refunder } = make(rpc, ledger, { beforeComplete: rec => completed.push(rec.txHash) });
+    const result = await refunder.refund({ paymentId: "original-arrives", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    assert.deepEqual(completed, [original]);
+    assert.equal(result.status, "sent");
+    assert.equal(result.txHash, original);
+    const alternative = decodeSigned(log.sends[1]);
+    assert.equal(alternative.nonce, 101n);
+    assert.deepEqual(ledger.getRefund(result.refundId).supersededTxHashes, [alternative.hash]);
+    assert.equal(ledger.getRefund(result.refundId).signedTxBase64, null);
+    assert.equal(ledger.getMeta("lastNonce"), "101");
+  });
+});
+
+test("an older replacement with unproven nonce lineage performs status reads only", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), older = base58Encode(createHash("sha256").update("older refund").digest());
+    let known = false;
+    const { rpc, log } = mockChain({
+      onSend: () => ({ http: 503 }),
+      onTx: hash => known && hash === older ? { result: DONE } : { error: RPC_ERR.unknownTx },
+    });
+    const { refunder, advance } = make(rpc, ledger);
+    const out = await refunder.refund({ paymentId: "old-lineage", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    ledger.updateRefund(out.refundId, { supersededTxHashes: [older] });
+    advance(31_000);
+    await refunder.tick();
+    assert.equal(ledger.getRefund(out.refundId).lastError, "UNPROVABLE");
+    known = true;
+    advance(61_000);
+    await refunder.tick();
+    assert.equal(ledger.getRefund(out.refundId).status, "sent");
+    assert.equal(ledger.getRefund(out.refundId).txHash, older);
+    assert.equal(log.sends.length, 1);
+  });
+});
+
+test("expiry requires the original signer and an unconsumed finalized nonce", async () => {
+  for (const rotated of [false, true]) await withLedger(async ({ open }) => {
+    const ledger = open();
+    const { rpc, log } = mockChain({
+      key: () => ({ nonce: log.sends.length && !rotated ? 101 : 100, block_hash: log.sends.length ? BLOCK_B : BLOCK_A }),
+      onSend: (_bytes, n) => n === 1 ? { http: 503 } : { error: RPC_ERR.expired },
+    });
+    const first = await make(rpc, ledger).refunder.refund({ paymentId: "key-change", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
+    const different = parseNearSecretKey(`ed25519:${base58Encode(Buffer.alloc(32, 30))}`);
+    await make(rpc, ledger, { signer: rotated ? different : SIGNER }).refunder.resume();
+    assert.deepEqual(log.sends, [log.sends[0], log.sends[0]]);
+    assert.equal(ledger.getRefund(first.refundId).lastError, "UNPROVABLE");
+    assert.equal(ledger.getMeta("lastNonce"), "101");
+  });
+});
+
+test("a final USDC receipt without a transfer event requires reconciliation", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), token = USDC_CONTRACTS.testnet;
+    const { rpc } = mockChain({ onSend: () => ({ result: DONE }) });
+    const { refunder, lines } = make(rpc, ledger, { usdcToken: token });
+    const result = await refunder.refund({ paymentId: "no-token-event", to: "payer.testnet", amountYocto: 17n,
+      reason: "change", asset: "usdc", tokenContract: token });
+    assert.equal(result.status, "failed_permanent");
+    assert.equal(ledger.getRefund(result.refundId).lastError, "UNPROVABLE");
+    assert.match(lines.join("\n"), /Verify the original transaction outcome/);
   });
 });
 
@@ -411,7 +523,7 @@ test("a refund whose transfer receipt failed on chain is failed_permanent and lo
     const { refunder, lines } = make(rpc, ledger);
     const out = await refunder.refund({ paymentId: "nq_a", to: "gone.testnet", amountYocto: AMOUNT, reason: "change" });
     assert.equal(out.status, "failed_permanent");
-    assert.match(lines.join("\n"), /failed on chain.*send them manually/);
+    assert.match(lines.join("\n"), /failed on chain.*Verify the receipt/);
   });
 });
 
