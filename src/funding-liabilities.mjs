@@ -3,6 +3,7 @@ import { fundingRaw, runFundingBudget } from "./run-funding.mjs";
 import { parseUsdNano, knownUsd } from "./usd.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { isNanoHistoryHash } from "./nano-payment-history.mjs";
+import { marketCreatorPayoutTerms, sameCreatorDestination } from "./creator-payout-evidence.mjs";
 
 const nanoStates = new Set(["pending", "paid", "consumed", "expired", "refunded"]);
 const nearStates = new Set(["pending", "paid", "running", "settled", "failed", "rejected", "expired"]);
@@ -156,52 +157,93 @@ export function nearRunFundingBudget(q) {
   return terms;
 }
 
-/** All actual Nano payout intents, plus creator obligations before their intent. */
-export function nearCreatorLiabilities({ quotes, payouts }, context) {
+function unusedCreatorOverhead(held, record) {
+  const available = record && record.status !== "sent" ? held - stateRaw(record.amountRaw) : held;
+  return available > 0n ? available : 0n;
+}
+
+function creatorPayoutGap(expected, record, held) {
+  const amount = stateRaw(expected.amountRaw);
+  const recorded = record ? stateRaw(record.amountRaw) : 0n;
+  const matches = record && sameCreatorDestination(expected, record);
+  const covered = matches ? recorded : 0n;
+  const uncovered = amount > covered ? amount - covered : 0n;
+  // An unpaid outbox row already consumes some of this run's overhead in
+  // the shared account. The same overhead cannot cover a second obligation.
+  const unusedHeld = unusedCreatorOverhead(held, record);
+  return { totalRaw: uncovered > unusedHeld ? uncovered - unusedHeld : 0n,
+    mismatch: Boolean(record && (!matches || recorded !== amount || record.reconciliationRequired)),
+    missing: !record && amount > 0n };
+}
+
+/** Actual payout intents plus any part of an earned payout they fail to cover. */
+export function nearCreatorCoverage({ quotes, payouts }, context) {
   array(quotes); array(payouts);
-  const payoutIds = new Set();
-  let total = 0n;
+  const payoutByPayment = new Map();
+  let totalRaw = 0n, missing = false, mismatch = false;
   for (const p of payouts) {
-    if (payoutIds.has(p.paymentId) || typeof p.paymentId !== "string") throw Error("invalid-payout-snapshot");
-    payoutIds.add(p.paymentId);
+    if (payoutByPayment.has(p.paymentId) || typeof p.paymentId !== "string") throw Error("invalid-payout-snapshot");
+    payoutByPayment.set(p.paymentId, p);
     if (!["queued", "signed", "sent"].includes(p.status)) throw Error("invalid-payout-status");
+    mismatch ||= p.reconciliationRequired === true;
     if (p.status !== "sent") {
       const id = p.paymentId.startsWith("market_") ? `market:${p.paymentId.slice(7)}` : `near:${p.paymentId}`;
       const held = fundingRaw(context?.overheadRawByRun?.get(id) ?? 0n);
       const amount = stateRaw(p.amountRaw);
-      total += amount > held ? amount - held : 0n;
+      totalRaw += amount > held ? amount - held : 0n;
     }
   }
   for (const q of quotes) {
     if (!nearStates.has(q?.status)) throw Error("invalid-near-quote-status");
-    if (payoutIds.has(q.id)) continue; // Sent is final; pending is counted above.
+    const recorded = payoutByPayment.get(q.id);
+    const held = fundingRaw(context?.overheadRawByRun?.get(`near:${q.id}`) ?? 0n);
     if (q.settlement?.authorPayout) {
-      const amount = stateRaw(q.settlement.authorPayout.amountRaw);
-      const held = fundingRaw(context?.overheadRawByRun?.get(`near:${q.id}`) ?? 0n);
-      total += amount > held ? amount - held : 0n;
+      const gap = creatorPayoutGap(q.settlement.authorPayout, recorded, held);
+      totalRaw += gap.totalRaw;
+      missing ||= gap.missing;
+      mismatch ||= gap.mismatch;
     } else if (q.author && q.fundingOutcomeReady === true && ["paid", "running"].includes(q.status) && !q.settlement) {
-      const amount = nearCreatorMaximum(q);
-      const held = fundingRaw(context?.overheadRawByRun?.get(`near:${q.id}`) ?? 0n);
-      total += amount > held ? amount - held : 0n;
-    }
+      const maximum = nearCreatorMaximum(q);
+      const available = unusedCreatorOverhead(held, recorded);
+      totalRaw += maximum > available ? maximum - available : 0n;
+      mismatch ||= Boolean(recorded);
+    } else mismatch ||= Boolean(recorded);
   }
-  return total;
+  return { totalRaw, missing, mismatch };
+}
+
+export function nearCreatorLiabilities(snapshot, context) {
+  return nearCreatorCoverage(snapshot, context).totalRaw;
 }
 
 /** Future creator earnings are a liability; Market revenue is never cash here. */
-export function marketCreatorLiabilities(records, { payouts = [], ...context } = {}) {
+export function marketCreatorCoverage(records, { payouts = [], ...context } = {}) {
   array(records); array(payouts);
-  const payoutIds = new Set(payouts.map(p => p.paymentId));
-  let total = 0n;
+  const payoutByPayment = new Map(payouts.map(p => [p.paymentId, p]));
+  let totalRaw = 0n, missing = false, mismatch = false;
   for (const r of records) {
     const c = r.creator;
+    const payout = payoutByPayment.get(`market_${r.id}`);
+    mismatch ||= Boolean(payout && !["owed", "queued"].includes(c?.status));
     if (!c) continue;
     if (!["awaiting_acceptance", "owed", "queued", "none", "cancelled"].includes(c.status)) throw Error("invalid-market-creator-status");
-    if (["none", "cancelled"].includes(c.status) || payoutIds.has(`market_${r.id}`)) continue;
-    const claim = ["owed", "queued"].includes(c.status) ? stateRaw(c.amountRaw)
-      : potentialMarket.has(r.phase) ? c.reserveRaw != null ? stateRaw(c.reserveRaw) : legacyMarketReserve(r) : 0n;
+    if (["none", "cancelled"].includes(c.status)) continue;
     const held = fundingRaw(context.overheadRawByRun?.get(`market:${r.id}`) ?? 0n);
-    total += claim > held ? claim - held : 0n;
+    const expected = marketCreatorPayoutTerms(r);
+    if (expected) {
+      const gap = creatorPayoutGap(expected, payout, held);
+      totalRaw += gap.totalRaw;
+      missing ||= gap.missing;
+      mismatch ||= gap.mismatch;
+    } else if (potentialMarket.has(r.phase)) {
+      const claim = c.reserveRaw != null ? stateRaw(c.reserveRaw) : legacyMarketReserve(r);
+      const available = unusedCreatorOverhead(held, payout);
+      totalRaw += claim > available ? claim - available : 0n;
+    }
   }
-  return total;
+  return { totalRaw, missing, mismatch };
+}
+
+export function marketCreatorLiabilities(records, options) {
+  return marketCreatorCoverage(records, options).totalRaw;
 }

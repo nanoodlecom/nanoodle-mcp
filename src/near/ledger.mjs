@@ -14,6 +14,8 @@ import { readFileSync } from "node:fs";
 import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../private-state.mjs";
 import { NearError } from "./errors.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META } from "./quote-capacity.mjs";
+import { nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
+import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
 
@@ -233,6 +235,11 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       const t = now();
       const coveredThroughMs = ledger.paymentWatchCoverage();
       const doomed = [];
+      const refundsByPayment = new Map();
+      for (const refund of Object.values(state.refunds)) {
+        if (!refundsByPayment.has(refund.paymentId)) refundsByPayment.set(refund.paymentId, []);
+        refundsByPayment.get(refund.paymentId).push(refund);
+      }
       for (const [id, q] of Object.entries(state.quotes)) {
         if (awaitingPayment(q)) {
           if (!unattachedPayments.has(id) && Number.isFinite(q.expiresAt)
@@ -240,6 +247,14 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
           continue;
         }
         if (!FINAL_QUOTE.has(q.status)) continue;
+        const expected = nearRefundTerms(q), associated = refundsByPayment.get(id) ?? [];
+        if (expected && expected.amountYocto !== "0") {
+          const [refund] = associated;
+          if (associated.length !== 1 || refund.reconciliationRequired || refund.outcomeUnverified
+            || refund.status === "failed_permanent" || !sameNearRefund(expected, refund)) continue;
+        }
+        const creator = q.settlement?.authorPayout, payout = state.payouts[id];
+        if (creator && (!payout || payout.reconciliationRequired || !sameCreatorPayout(creator, payout))) continue;
         const at = typeof q.finishedAt === "number" ? q.finishedAt : null;
         if (at !== null && t - at > retainMs) doomed.push(id);
       }

@@ -48,8 +48,11 @@ import { rawToXno, authorAddress } from "./wallet.mjs";
 import { nearCreatorLiabilities, nearRunFundingBudget } from "./funding-liabilities.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
+import { nearRefundTerms, sameNearRefund } from "./near/refund-terms.mjs";
+import { sameCreatorPayout } from "./creator-payout-evidence.mjs";
 
 const RUN_NOODLE = "run_noodle";
+const refundReference = result => ({ refundId: result.refundId, ...(result.status === "none" && { refundWaived: true }) });
 const FINAL = new Set(["settled", "failed", "rejected"]);
 const SIDE_CARS = ["costUsd", "costExact", "providerUsd", "providerExact", "billedUsd", "textOutput"];
 const TEXT_NOT_RETAINED = "The result text was not retained across a server restart; the run is not repeated.";
@@ -248,15 +251,22 @@ export function createNearGate({
     const intent = q.settlement?.authorPayout;
     if (!intent) return null;
     const rec = ledger.getPayout(q.id);
+    const verified = rec && !rec.reconciliationRequired && sameCreatorPayout(intent, rec);
+    const hash = verified ? rec.txHash || null : null;
     return { asset: "XNO", to: intent.to, amountRaw: intent.amountRaw, amount: rawToXno(intent.amountRaw, 30),
-      status: rec?.status === "sent" ? "sent" : "pending", txHash: rec?.txHash || null,
-      explorerUrl: rec?.txHash ? `https://nanexplorer.com/nano/block/${rec.txHash}` : null };
+      status: verified && rec.status === "sent" ? "sent" : "pending", txHash: hash,
+      explorerUrl: hash ? `https://nanexplorer.com/nano/block/${hash}` : null };
   }
 
   function ensureAuthorPayout(q) {
     const intent = q.settlement?.authorPayout;
     if (!intent) return;
-    if (ledger.getPayout(q.id)?.status === "sent") return;
+    const existing = ledger.getPayout(q.id);
+    if (existing && !sameCreatorPayout(intent, existing)) {
+      log("Nano creator payout needs reconciliation");
+      return;
+    }
+    if (existing?.status === "sent") return;
     if (!authorPayouts) throw new Error("A Nano creator payout is owed; configure the original Nano wallet to recover it");
     authorPayouts.enqueue({ paymentId: q.id, ...intent });
     // Independent of customer delivery and same-asset change. The durable
@@ -265,9 +275,13 @@ export function createNearGate({
   }
 
   function refundView(q) {
-    if (!q.refundId) return { status: "none", txHash: null };
-    const r = ledger.getRefund(q.refundId);
-    if (!r) return { status: "none", txHash: null };
+    const expected = nearRefundTerms(q);
+    const due = expected && ["settled", "failed", "rejected"].includes(q.status) && BigInt(expected.amountYocto) > 0n;
+    if (!q.refundId && !due) return { status: "none", txHash: null };
+    const r = q.refundId ? ledger.getRefund(q.refundId) : ledger.refundForPayment(q.id);
+    if (!r || r.paymentId !== q.id || r.reconciliationRequired || r.outcomeUnverified || (expected && !sameNearRefund(expected, r))) {
+      return { status: "failed_permanent", txHash: null, amountYocto: expected?.amountYocto, to: q.payer };
+    }
     const status = r.status === "sent" ? "sent" : r.status === "failed_permanent" ? "failed_permanent" : "pending";
     return { status, txHash: r.txHash || null, amountYocto: r.amountYocto, to: r.to };
   }
@@ -281,7 +295,7 @@ export function createNearGate({
     if (s) { chargedYocto = BigInt(s.chargedYocto); refundYocto = BigInt(s.refundYocto); }
     const rv = refundView(q);
     // A refund below the minimum is not sent; it counts toward the charge.
-    if (!q.refundId && refundYocto > 0n && !s) { chargedYocto += refundYocto; refundYocto = 0n; }
+    if (q.refundWaived && refundYocto > 0n && !s) { chargedYocto += refundYocto; refundYocto = 0n; }
     const costKnown = !!(s && s.costUsd != null);
     const capped = !!(s && costKnown && BigInt(s.chargedYocto) < BigInt(s.costYocto) + BigInt(s.feeYocto));
     const receipt = {
@@ -660,7 +674,7 @@ export function createNearGate({
     if (reject) {
       ev("paid", { paymentId: q.id, tool: q.tool, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
       const rf = await refundFor(q, t.payer, t.amountYocto, reject);
-      return replay(ledger.updateQuote(q.id, { refundId: rf.refundId }));
+      return replay(ledger.updateQuote(q.id, refundReference(rf)));
     }
     ev("paid", { paymentId: q.id, tool: q.tool, ok: true, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
     return null;
@@ -841,7 +855,7 @@ export function createNearGate({
       q = ledger.updateQuote(q.id, { status: "failed", outcome: "run_failed", error, finishedAt: now() });
       results.set(q.id, { details: `Details: ${msg}` });
       const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), "run_failed");
-      q = ledger.updateQuote(q.id, { refundId: rf.refundId });
+      q = ledger.updateQuote(q.id, refundReference(rf));
       return replay(q);
     }
 
@@ -880,7 +894,7 @@ export function createNearGate({
     const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change", ...refundAsset(q) });
     // Media-only results (links) may be kept; text output is the caller's paid content and stays in memory.
     const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
-    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: persisted, finishedAt: now() });
+    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), result: persisted, finishedAt: now() });
     ev("change", {
       paymentId: q.id, tool: name, to: q.payer, costUsd,
       chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(), status: rf.status, hash: rf.txHash || null,
@@ -902,20 +916,20 @@ export function createNearGate({
           ensureAuthorPayout(q);
           // The run finished and was settled; only the refund intent may be missing.
           const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change", ...refundAsset(q) });
-          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: null, finishedAt: t });
+          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), result: null, finishedAt: t });
           log(`NEAR payment ${q.id}: settled after a restart (the result text was not kept)`);
         } else {
           const error = "The server restarted while this run was in progress.";
           const done = ledger.updateQuote(q.id, { status: "failed", outcome: "interrupted", error, finishedAt: t });
           const rf = await refundFor(done, q.payer, BigInt(q.paidYocto), "interrupted");
-          ledger.updateQuote(q.id, { refundId: rf.refundId });
+          ledger.updateQuote(q.id, refundReference(rf));
           log(`NEAR payment ${q.id}: interrupted by a restart — whole deposit refunded (${rf.status}), not re-run`);
         }
-      } else if ((q.status === "failed" || q.status === "rejected") && q.paidYocto && !q.refundId) {
+      } else if ((q.status === "failed" || q.status === "rejected") && q.paidYocto && !q.refundId && !q.refundWaived) {
         // Stopped between recording the outcome and recording the refund: owe it now.
         const reason = q.outcome === "wrong_amount" || q.outcome === "late_payment" || q.outcome === "interrupted" ? q.outcome : "run_failed";
         const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), reason);
-        if (rf.refundId) ledger.updateQuote(q.id, { refundId: rf.refundId });
+        if (rf.refundId || rf.status === "none") ledger.updateQuote(q.id, refundReference(rf));
       } else if (q.status === "pending" && t > q.expiresAt) {
         ledger.updateQuote(q.id, { status: "expired" });
       }

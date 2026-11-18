@@ -48,6 +48,30 @@ test("refund claims cover paid/running work, failed handoffs and pending quotes 
   assert.throws(() => nearRefundClaims({ quotes: [], refunds: null }));
 });
 
+test("NEAR and USDC refund evidence cannot release another asset or payer's reserve", () => {
+  const q = { id: "payment", status: "settled", payer: "payer.testnet", asset: "usdc", tokenContract: TOKEN,
+    refundId: "refund", settlement: { refundYocto: "70" } };
+  const original = { id: "refund", paymentId: q.id, status: "sent", asset: "usdc", tokenContract: TOKEN,
+    amountYocto: "70", to: q.payer };
+  const inspect = record => nearRefundClaims({ quotes: [q], refunds: [record] });
+  for (const patch of [{ asset: "near" }, { tokenContract: "wrong.testnet" }, { to: "other.testnet" }, { id: "wrong-refund" }]) {
+    const result = inspect({ ...original, ...patch });
+    assert.equal(result.usdcAtomic, 70n);
+    assert.equal(result.tokenRefunds, 1);
+    assert.deepEqual(result.issues, ["near-refund-evidence-mismatch"]);
+  }
+  const partial = inspect({ ...original, amountYocto: "20" });
+  assert.equal(partial.usdcAtomic, 50n);
+  assert.equal(partial.tokenRefunds, 1);
+  const wrongPending = inspect({ ...original, status: "signed", asset: "near" });
+  assert.equal(wrongPending.nearYocto, 70n);
+  assert.equal(wrongPending.usdcAtomic, 70n);
+  assert.equal(wrongPending.nativeRefunds, 1);
+  assert.equal(inspect(original).usdcAtomic, 0n);
+  assert.deepEqual(inspect(original).issues, []);
+  assert.deepEqual(nearRefundClaims({ quotes: [{ id: "dust", status: "rejected", paidYocto: "5", refundWaived: true }], refunds: [] }).issues, []);
+});
+
 test("unscanned quote windows count as potential refunds until coverage advances", () => {
   const deadline = 1_000, now = deadline + 60_000;
   const state = { quotes: [{ id: "old", status: "expired", asset: "usdc", expiresAt: deadline - 10 }], refunds: [],

@@ -58,7 +58,7 @@ test("stuck work, permanently failed refunds and long-pending creator payouts re
   s.nano.owed.push({ amountRaw: "20", journaled: true, tries: 5, at: NOW + 60_000 });
   s.near.quotes.q = { status: "running", paidYocto: "30", paidAtBlockMs: 1 };
   s.near.refunds.r = { amountYocto: "40", status: "failed_permanent" };
-  s.near.payouts.p = { amountRaw: "50", status: "signed", createdAt: 1 };
+  s.near.payouts.p = { paymentId: "p", amountRaw: "50", status: "signed", createdAt: 1 };
   s.market.push({ v: 1, assignments: { a: { phase: "stuck" }, b: { phase: "delivering", updatedAt: 1 } } });
   const l = paymentLiabilities(s, { now: NOW });
   assert.equal(l.nanoRaw, 80n); assert.equal(l.nearYocto, 70n);

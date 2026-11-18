@@ -170,6 +170,23 @@ test("accepted market hires pay the embedded Nano author once, at the locked rat
   restarted.store.close(); await r.m.close();
 });
 
+test("Market retention preserves an assignment whose creator payout evidence is incomplete", async () => {
+  let amountRaw = "10";
+  const creatorPayments = { payoutRecords: () => [{ paymentId: "market_a", to: "author", amountRaw, status: "sent" }] };
+  const w = await rig({ creatorPayments });
+  try {
+    w.store.create("a", { phase: "submitted", finishedAt: Date.now() - 31 * 86_400_000,
+      creator: { status: "queued", author: "author", amountRaw: "20" } });
+    const before = nano.runs();
+    await w.once();
+    assert.ok(w.store.get("a"));
+    amountRaw = "20";
+    await w.once();
+    assert.equal(w.store.get("a"), null);
+    assert.equal(nano.runs(), before);
+  } finally { w.store.close(); await w.m.close(); }
+});
+
 test("creator workflows are refused before running when Nano payouts are unavailable", async () => {
   const r = await rig(), before = nano.runs();
   const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author: "nano_missing" } }, inputs: { Idea: "a lighthouse" } }) });

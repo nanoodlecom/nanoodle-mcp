@@ -66,6 +66,43 @@ async function quoteAndPay(w, asset, name = "poster", args = INPUTS) {
   return { p, pay: () => w.call(name, { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: P }) };
 }
 
+test("restored NEAR and Market creator payouts with mismatched evidence stay held before Nano wallet work", async () => {
+  const w = await world();
+  w.ledger.putQuote({ id: "near-job", status: "settled", settlement: { authorPayout: { to: AUTHOR, amountRaw: "100" } } });
+  for (const [paymentId, to, amountRaw] of [["near-job", OTHER, "100"], ["market_job", AUTHOR, "50"]]) {
+    w.ledger.putPayout({ paymentId, to, amountRaw, status: "signed", prepared: { hash: "B".repeat(64) }, nextAttemptAt: 0 });
+  }
+  let walletCalls = 0;
+  const payouts = createAuthorPayouts({ ledger: w.ledger, ops: { async transferOnce() { walletCalls++; return "A".repeat(64); } },
+    marketPayoutMatches: record => record.to === AUTHOR && record.amountRaw === "100", schedule: () => null });
+  await payouts.resume();
+  await payouts.tick();
+  assert.equal(walletCalls, 0);
+  for (const record of w.ledger.payouts()) {
+    assert.equal(record.reconciliationRequired, true);
+    assert.equal(record.status, "signed");
+    assert.equal(record.prepared.hash, "B".repeat(64));
+  }
+});
+
+test("a replayed USDC receipt cannot show a wrong-asset refund or mismatched creator payout as sent", async () => {
+  const w = await world(), { p, pay } = await quoteAndPay(w, "usdc");
+  await pay();
+  await w.payouts.tick();
+  const q = w.ledger.getQuote(p.paymentId), runs = mock.runs(), transfers = w.chain.sendTxCount;
+  assert.equal(w.ledger.getRefund(q.refundId).status, "sent");
+  assert.equal(w.ledger.getPayout(q.id).status, "sent");
+  w.ledger.updateRefund(q.refundId, { asset: "near" });
+  w.ledger.updatePayout(q.id, { to: OTHER });
+  const replay = (await pay()).structuredContent.receipt;
+  assert.equal(replay.refund.status, "failed_permanent");
+  assert.equal(replay.refund.txHash, null);
+  assert.equal(replay.authorPayout.status, "pending");
+  assert.equal(replay.authorPayout.txHash, null);
+  assert.equal(mock.runs(), runs);
+  assert.equal(w.chain.sendTxCount, transfers);
+});
+
 for (const asset of ["near", "usdc"]) for (const name of ["poster", "run_noodle"]) {
   test(`${asset}: ${name} pays its author in Nano at the locked rate and replays without another send`, async () => {
     const w = await world(), args = name === "poster" ? INPUTS : { graph: GRAPH, inputs: INPUTS };

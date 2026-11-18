@@ -1,7 +1,7 @@
 // Read-only accounting for probes and admission checks. Never opens a ledger,
 // signs a transaction, retries an assignment, or returns customer content.
 import { parseUsdNano } from "./usd.mjs";
-import { nanoFundingCoverage, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
+import { nanoFundingCoverage, nanoQuoteClaim, nearCreatorCoverage, marketCreatorCoverage } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
 import { NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
@@ -66,7 +66,7 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     if (debt.journaled !== true) issues.add("nano-settlement-legacy-unverified");
     if (debt.held || debt.tries >= 5 || old(debt.createdAt ?? debt.at, debtMs)) issues.add("nano-settlement-stuck");
   }
-  const refunds = values(near.refunds), refundPayments = new Set(refunds.map(r => r.paymentId));
+  const refunds = values(near.refunds);
   for (const refund of refunds) {
     if (refund.status === "sent") continue;
     if (!["queued", "signed", "failed_permanent"].includes(refund.status)) throw Error("invalid-refund-status");
@@ -76,11 +76,15 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     } else if (refund.status === "failed_permanent") issues.add("near-refund-failed");
     else if (old(refund.createdAt, debtMs)) issues.add("near-refund-stuck");
   }
-  const payouts = values(near.payouts ?? {}), payoutPayments = new Set(payouts.map(p => p.paymentId));
+  const payouts = values(near.payouts ?? {});
+  const addCreatorCoverage = coverage => {
+    nanoRaw += coverage.totalRaw;
+    if (coverage.missing) issues.add("creator-payout-intent-missing");
+    if (coverage.mismatch) issues.add("creator-payout-evidence-mismatch");
+  };
+  addCreatorCoverage(nearCreatorCoverage({ quotes: values(near.quotes), payouts }));
   for (const payout of payouts) {
     if (payout.status === "sent") continue;
-    if (!["queued", "signed"].includes(payout.status)) throw Error("invalid-payout-status");
-    nanoRaw += amount(payout.amountRaw);
     if (old(payout.createdAt, debtMs)) issues.add("creator-payout-stuck");
   }
   for (const q of values(near.quotes)) {
@@ -90,21 +94,11 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     }
     if (["paid", "running"].includes(q.status)) {
       if (old(q.paidAtBlockMs ?? q.createdAt, stuckMs)) issues.add("near-paid-work-stuck");
-    } else if (q.settlement && !refundPayments.has(q.id)) {
-      // A crash can happen after settlement is persisted but before the refund
-      // intent is created. That money is still owed and must not disappear.
-      if (amount(q.settlement.refundYocto) > 0n) {
-        issues.add("near-refund-intent-missing");
-      }
-    }
-    if (q.settlement?.authorPayout && !payoutPayments.has(q.id)) {
-      nanoRaw += amount(q.settlement.authorPayout.amountRaw);
-      issues.add("creator-payout-intent-missing");
     }
   }
   for (const state of market) {
     if (state?.v !== 1 || !object(state.assignments)) throw Error("invalid-market-state");
-    nanoRaw += marketCreatorLiabilities(values(state.assignments), { payouts });
+    addCreatorCoverage(marketCreatorCoverage(values(state.assignments), { payouts }));
     for (const rec of values(state.assignments)) {
       if (rec.phase === "stuck") issues.add("market-assignment-stuck");
       if (["new", "reworking", "running", "submitting", "delivering", "started", "starting", "pricing", "declining"].includes(rec.phase)

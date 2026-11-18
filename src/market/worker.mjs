@@ -42,6 +42,7 @@ import { join } from "node:path";
 import { splitPlainBrief, resolveFields, parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
 import { marketEscrowTerms } from "./catalog.mjs";
+import { marketCreatorPayoutTerms, sameCreatorPayout } from "../creator-payout-evidence.mjs";
 import {
   pricingSummary, buildDeliverable, textOutputsFile, briefDeclineDetail, refusalDeclineDetail, failureDeclineDetail, customNotOfferedDetail,
   startedMessage, REWORK_MESSAGE, MAX_INLINE_TEXT_BYTES, MAX_DELIVERABLE_BYTES, MAX_LISTED_FILES,
@@ -616,8 +617,15 @@ export function createMarketWorker({
     for (const rec of store.all()) {
       try { await reconcileCreator(rec); } catch { log(`assignment ${short(rec.id)}: creator settlement is pending; will retry`); }
     }
-    try { store.prune(now() - retainMs, (r) => ["declined", "gone", "ignored", "submitted"].includes(r.phase)
-      && (!r.creator || ["queued", "none", "cancelled"].includes(r.creator.status))); } catch { /* next time */ }
+    try {
+      const payouts = new Map((creatorPayments?.payoutRecords?.() ?? []).map(p => [p.paymentId, p]));
+      store.prune(now() - retainMs, r => {
+        if (!["declined", "gone", "ignored", "submitted"].includes(r.phase)) return false;
+        const payout = payouts.get(`market_${r.id}`), expected = marketCreatorPayoutTerms(r);
+        if (expected) return r.creator.status === "queued" && payout && !payout.reconciliationRequired && sameCreatorPayout(expected, payout);
+        return !payout && (!r.creator || ["none", "cancelled"].includes(r.creator.status));
+      });
+    } catch { /* next time */ }
   }
 
   /** Wait for every assignment being advanced right now. */

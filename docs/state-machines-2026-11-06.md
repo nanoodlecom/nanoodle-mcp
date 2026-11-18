@@ -87,6 +87,13 @@ each outgoing leg. Missing or incomplete evidence keeps the balance reserved
 and preserves the quote for reconciliation. The writer holds any restored
 send whose amount or recipient conflicts with its settlement.
 
+NEAR and USDC refunds also match the payer, asset and token contract. The
+ledger preserves every uncovered remainder and the gas needed to send it.
+NEAR and Market creator payouts cover only the matching recipient and
+amount. Restored outbox entries that disagree with the original obligation
+stay held with their signed bytes. The payment and assignment records remain
+available after ordinary retention until their financial evidence matches.
+
 The Nano gate and creator payout ledger still share one wallet writer.
 Activation and rollback require the guarded release procedure. A writer
 without signed-transfer recovery cannot safely retry a ledger that contains
