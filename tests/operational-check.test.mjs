@@ -20,13 +20,15 @@ test("the readiness CLI reports preflight failure when run through a release sym
   const selected = join(root, "current"), stateDir = join(root, "state");
   symlinkSync(fileURLToPath(new URL("..", import.meta.url)), selected, "junction");
   // No wallet configuration or inherited runtime flags. Preflight stops before networking.
+  const invocationId = "a".repeat(32);
   const child = spawnSync(process.execPath, [join(selected, "scripts/operational-check.mjs")], {
-    env: { OPERATIONAL_CHECK_STATE_DIR: stateDir }, encoding: "utf8", timeout: 10_000,
+    env: { OPERATIONAL_CHECK_STATE_DIR: stateDir, INVOCATION_ID: invocationId }, encoding: "utf8", timeout: 10_000,
   });
   assert.ifError(child.error);
   assert.equal(child.status, 1, child.stderr);
   const report = JSON.parse(readFileSync(join(stateDir, "latest.json"), "utf8"));
   assert.equal(report.ok, false);
+  assert.equal(report.invocationId, invocationId);
   assert.equal(report.checks[0].code, "check-could-not-finish");
 });
 
@@ -403,14 +405,17 @@ test("historical NEAR scan delays reach the existing alert route while a fresh t
   assert.equal(first.ok, true, "a newly observed backfill gets time to complete");
   assert.equal(first.nearBackfillSince, started);
   assert.equal(finishOperationalReport(dir, [], NOW - 1).nearBackfillSince, started, "missing observations do not clear the episode");
+  f.config.invocationId = "a".repeat(32);
   const report = await runOperationalCheck(f.config, f.deps);
   assert.equal(report.ok, false);
   assert.equal(report.nearBackfillSince, started);
   assert.equal(report.admission.near, true);
   assert.equal(report.admission.usdc, true);
   assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.ok));
-  const event = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: "a".repeat(32) }, report, NOW);
+  const event = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: f.config.invocationId,
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, report, NOW);
   assert.match(event.text, /near-watcher-backfill=near-watcher-backfill-delayed/);
+  assert.match(event.text, /readiness advisory/);
   assert.equal((await runOperationalCheck(f.config, f.deps)).incidentId, report.incidentId);
   backfilling = false;
   const recovered = await runOperationalCheck(f.config, f.deps);
@@ -616,10 +621,15 @@ test("disabled and overdue timers are detected, while a newly enabled daily time
 test("unchanged incidents retain one identity; six-hour reminders, recovery and new incidents remain distinct", () => {
   const dir = mkdtempSync(join(tmpdir(), "operational-incident-"));
   const issues = [{ stage: "nano-liquidity", ok: false, code: "insufficient", domains: ["nano"] }];
-  const first = finishOperationalReport(dir, issues, NOW);
-  assert.equal(finishOperationalReport(dir, issues, NOW + 300_000).incidentId, first.incidentId);
+  const first = finishOperationalReport(dir, issues, NOW, { invocationId: "a".repeat(32) });
+  const next = finishOperationalReport(dir, issues, NOW + 300_000, { invocationId: "b".repeat(32) });
+  assert.equal(next.invocationId, "b".repeat(32));
+  assert.equal(next.incidentId, first.incidentId);
   const reminder = finishOperationalReport(dir, issues, NOW + 6 * 3_600_000);
   assert.notEqual(reminder.incidentId, first.incidentId);
   assert.equal(finishOperationalReport(dir, [], NOW + 7 * 3_600_000).ok, true);
   assert.notEqual(finishOperationalReport(dir, issues, NOW + 8 * 3_600_000).incidentId, reminder.incidentId);
+  const scoped = finishOperationalReport(dir, issues, NOW + 8 * 3_600_000 + 300_000);
+  const advisory = finishOperationalReport(dir, [{ ...issues[0], domains: [] }], NOW + 8 * 3_600_000 + 600_000);
+  assert.notEqual(advisory.incidentId, scoped.incidentId, "an admission impact change opens a new incident");
 });

@@ -58,7 +58,7 @@ export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("
   }
 }
 
-export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null } = {}) {
+export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null, invocationId = null } = {}) {
   const latest = join(stateDir, "latest.json");
   let previous; try { previous = readJson(latest); } catch { /* first probe */ }
   const priorBackfill = previous?.nearBackfillSince;
@@ -71,13 +71,14 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), { fu
     }
   }
   const failed = checks.filter(c => !c.ok);
-  const fingerprint = createHash("sha256").update(JSON.stringify(failed.map(c => [c.stage, c.code]).sort())).digest("hex");
+  const admission = Object.fromEntries(ALL.map(asset => [asset, !failed.some(c => c.domains?.includes(asset))]));
+  const fingerprint = createHash("sha256").update(JSON.stringify([failed.map(c => [c.stage, c.code]).sort(), admission])).digest("hex");
   const firstSeenAt = previous?.fingerprint === fingerprint && previous.ok === false ? previous.firstSeenAt : now;
   const reminder = Math.floor((now - firstSeenAt) / (6 * 3_600_000));
   const incidentId = createHash("sha256").update(`${fingerprint}:${firstSeenAt}:${reminder}`).digest("hex").slice(0, 32);
-  const admission = Object.fromEntries(ALL.map(asset => [asset, !failed.some(c => c.domains?.includes(asset))]));
   const report = { v: 1, ok: failed.length === 0, checkedAt: new Date(now).toISOString(), stage: failed[0]?.stage || "complete",
-    admission, checks, ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
+    admission, checks, ...(/^[a-f0-9]{32}$/.test(invocationId || "") && { invocationId }),
+    ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
     ...(nearBackfillSince !== null && { nearBackfillSince }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
@@ -403,7 +404,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
   }));
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
-    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling });
+    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, invocationId: config.invocationId });
 }
 
 async function productionConfig(env = process.env) {
@@ -416,7 +417,8 @@ async function productionConfig(env = process.env) {
     publicKey: env.CHECK_PAYER_PUBLIC_KEY || (/^[a-f0-9]{64}$/.test(payer) ? "ed25519:" + base58Encode(Buffer.from(payer, "hex")) : null) } : null;
   const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
   const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
-  return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", outDir: "/srv/nanoodle-mcp/out",
+  return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", invocationId: env.INVOCATION_ID,
+    outDir: "/srv/nanoodle-mcp/out",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK, canaryPayer,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
     nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
@@ -431,6 +433,10 @@ if (import.meta.main) {
     await waitForRecentAppStart(config);
     report = await runOperationalCheck(config);
   }
-  catch { report = finishOperationalReport(process.env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", [{ stage: "preflight", ok: false, code: "check-could-not-finish", domains: ALL }]); }
+  catch {
+    report = finishOperationalReport(process.env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check",
+      [{ stage: "preflight", ok: false, code: "check-could-not-finish", domains: ALL }], Date.now(),
+      { invocationId: process.env.INVOCATION_ID });
+  }
   console.log(JSON.stringify(report)); if (!report.ok) process.exitCode = 1;
 }
