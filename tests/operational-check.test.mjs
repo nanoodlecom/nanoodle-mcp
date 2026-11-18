@@ -307,6 +307,42 @@ test("the scheduled check detects NEAR, USDC and Market settlement mismatches wi
   assert.ok(!JSON.stringify(report).includes(proof.txHash));
 });
 
+test("the VPS monitor reports backup capture and export age without closing payment admission", async t => {
+  const f = fixture(), date = at => new Date(at).toISOString();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.backupExportReport = "/backup-health/latest.json";
+  const proof = { v: 1, capturedAt: date(NOW - 27 * 3600_000), verifiedAt: date(NOW - 3 * 3600_000),
+    path: "private-archive-path" };
+  f.states[f.config.backupExportReport] = proof;
+  const report = await runOperationalCheck(f.config, f.deps);
+  for (const [stage, code] of [["backup-export-freshness", "backup-export-overdue"], ["backup-capture-freshness", "backup-capture-overdue"]]) {
+    assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: false, code, domains: [] });
+  }
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-archive-path|\/backup-health|2026-11-1[56]T/);
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: ID.replaceAll("-", ""),
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" },
+    { ...report, invocationId: ID.replaceAll("-", "") }, NOW);
+  assert.match(alert.text, /backup-capture-overdue/);
+  assert.match(alert.text, /backup-export-overdue/);
+  assert.doesNotMatch(alert.text, /private-archive-path/);
+
+  proof.verifiedAt = date(NOW - 60_000);
+  const currentExport = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(currentExport.checks.find(c => c.stage === "backup-export-freshness"), { stage: "backup-export-freshness", ok: true });
+  assert.equal(currentExport.checks.find(c => c.stage === "backup-capture-freshness").code, "backup-capture-overdue");
+  proof.verifiedAt = date(NOW + 60_000);
+  const future = await runOperationalCheck(f.config, f.deps);
+  assert.equal(future.checks.find(c => c.stage === "backup-export-proof").code, "backup-export-proof-invalid");
+  const read = f.deps.readJson;
+  f.deps.readJson = path => {
+    if (path === f.config.backupExportReport) throw Error("backup report unavailable");
+    return read(path);
+  };
+  const missing = await runOperationalCheck(f.config, f.deps);
+  assert.equal(missing.checks.find(c => c.stage === "backup-export-proof").code, "backup-export-proof-unavailable");
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
