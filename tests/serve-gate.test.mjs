@@ -853,13 +853,24 @@ test("guarded Nano quotes share a read-only proof and stay unpublished until bot
 test("a failed Nano watcher read invalidates quote readiness while issued payments still resolve", async t => {
   const chain = fakeChain(), registry = fakeRegistry();
   const head = "A".repeat(64);
-  let historyReady = true, failed = false;
+  let historyReady = true, failed = false, combinedReads = 0, fallbackReads = 0;
   chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
   const rpc = chain.ops.rpc;
+  chain.ops.readPaymentWindow = async () => {
+    combinedReads++;
+    if (!historyReady) throw Object.assign(new Error("test combined budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+    return { receivable: await rpc({ action: "receivable", count: "500" }), history: {
+      account: GATE_ADDR, previous: null, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }],
+    } };
+  };
   chain.ops.rpc = body => {
-    if (body.action !== "account_history") return rpc(body);
-    if (!historyReady) throw new Error("test history unavailable");
-    return { account: body.account, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }] };
+    assert.equal(historyReady, false, "a verified combined window needs no further RPC");
+    if (body.action === "receivable") {
+      fallbackReads++;
+      return rpc(body);
+    }
+    assert.equal(body.action, "account_history");
+    throw new Error("test history unavailable");
   };
   const gate = createChargeGate({ address: GATE_ADDR, ops: chain.ops, usd: 0.05, xnoUsd: 1, publicBase: "http://pay.test",
     pollMs: 5, verifyPaymentReads: true, log: line => { if (line.includes("payment scan failed")) failed = true; } });
@@ -867,6 +878,7 @@ test("a failed Nano watcher read invalidates quote readiness while issued paymen
   const { callTool } = gate.wrapRegistry(registry);
   const request = text => callTool({ name: "poster", arguments: { Text: text } });
   const original = argOf(await request("issued before the outage"));
+  assert.ok(combinedReads > 0);
   historyReady = false;
   await until("the watcher to report its broken history RPC", () => failed);
   assert.equal((await request("new customer")).isError, true, "a watcher failure supersedes a fresh positive quote probe");
@@ -874,6 +886,7 @@ test("a failed Nano watcher read invalidates quote readiness while issued paymen
 
   chain.state.receivable["D".repeat(64)] = { amount: original.amountRaw, source: PAYER };
   assert.equal(await gate.waitForPayment(original.paymentId, 1_000), "paid");
+  assert.ok(fallbackReads > 0, "the watcher still looks for receivables for existing quotes");
 });
 
 test("anchored history does not advance past a truncated page and then finds the pocketed payment", async t => {

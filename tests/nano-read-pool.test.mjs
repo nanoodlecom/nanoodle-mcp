@@ -164,24 +164,52 @@ test("concurrent payment reads cannot consume each other's standby validation bu
   await w.pool.read(info);
 });
 
-test("a cold standby needs room for both halves of a one-page payment scan", async () => {
-  for (const budget of [4, 5]) {
-    const w = world(2, budget), [owned, spare, standby] = w.peers;
+test("a cold standby can prove a payment window in four requests with its own account view", async () => {
+  for (const budget of [3, 4]) {
+    const saved = [];
+    const w = world(2, budget, ACCOUNT, checkpoint => saved.push(checkpoint)), [owned, spare, standby] = w.peers;
     const head = owned.info.confirmed_frontier;
-    const request = { action: "account_history", account: ACCOUNT, head, raw: "true", count: "1" };
+    owned.info = standby.info = nanoAccountInfo({ pending: "7" });
+    owned.receivable = standby.receivable = pending(7);
     owned.history = standby.history = { account: ACCOUNT, previous: OTHER, history: [
       { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
     ] };
     spare.down = true;
     const standbyActions = () => w.calls.filter(call => call.base === standby.base).map(call => call.action);
-    await w.pool.read(receivable);
-    if (budget === 4) {
-      await assert.rejects(w.pool.read(request), { code: "NANO_RPC_STANDBY_BUDGET" });
-      assert.equal(standbyActions().length, 3);
+    if (budget === 3) {
+      await assert.rejects(w.pool.readPaymentWindow(), { code: "NANO_RPC_STANDBY_BUDGET" });
+      assert.deepEqual(standbyActions(), []);
+      assert.deepEqual(saved, []);
     } else {
-      assert.equal((await w.pool.read(request)).history[0].hash, head);
-      assert.deepEqual(standbyActions(), ["block_info", "receivable", "account_info", "account_history", "account_info"]);
+      const window = await w.pool.readPaymentWindow();
+      assert.deepEqual(window, { receivable: pending(7), history: owned.history });
+      assert.equal(saved.at(-1).confirmed.hash, head);
+      assert.deepEqual(standbyActions(), ["block_info", "receivable", "account_info", "account_history"]);
       assert.equal(standbyActions().length, NANO_COLD_STANDBY_SCAN_REQUESTS);
+      assert.deepEqual(await w.pool.publishBases(), [owned.base]);
+    }
+  }
+});
+
+test("unproven standby history leaves only the independently verified receivable window", async () => {
+  for (const rateLimited of [false, true]) {
+    const w = world(2, 4), [owned, spare, standby] = w.peers;
+    const head = owned.info.confirmed_frontier;
+    owned.info = standby.info = nanoAccountInfo({ pending: "7" });
+    owned.receivable = standby.receivable = pending(7);
+    owned.history = { account: ACCOUNT, previous: OTHER, history: [
+      { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+    ] };
+    standby.history = { ...owned.history, previous: null };
+    if (rateLimited) {
+      standby.errorAction = "account_history";
+      standby.error = Object.assign(new Error("RPC refused"), { rateLimited: true, retryAfterMs: 60_000 });
+    }
+    spare.down = true;
+    assert.deepEqual(await w.pool.readPaymentWindow(), { receivable: pending(7), history: null });
+    if (rateLimited) {
+      assert.deepEqual(w.pool.status().cooldowns, [{ peer: 2, until: 61_000 }]);
+      await assert.rejects(w.pool.publishBases(), { code: "NANO_RPC_NETWORK_QUORUM" });
     }
   }
 });

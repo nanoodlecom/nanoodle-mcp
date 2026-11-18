@@ -32,7 +32,7 @@ import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
+import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
@@ -392,14 +392,17 @@ export async function runOperationalCheck(config, deps = {}) {
       try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, peerUrls.length, now()); }
       catch { need(false, "nano-cooldown-observation-invalid"); }
     }
+    let coldPaymentScanRequests = NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS;
     if (config.nanoStandby) {
-      const { inUse, requestsPerMinute } = rpc.standby ?? {};
+      const { inUse, requestsPerMinute, coldPaymentScanRequests: reportedCost } = rpc.standby ?? {};
       need(typeof inUse === "boolean" && requestsPerMinute === config.nanoStandby.requestsPerMinute
+        && (reportedCost === undefined || reportedCost === NANO_COLD_STANDBY_SCAN_REQUESTS)
         && (!inUse || (rpc.readablePeers === 2 && !nanoCooldowns.some(item => item.peer === peerUrls.length - 1))), "nano-standby-observation-invalid");
+      if (reportedCost !== undefined) coldPaymentScanRequests = reportedCost;
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, checkedAt, checkpoint, fundingPause: pause?.recoveredAt != null ? pause : null };
+    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -539,7 +542,8 @@ export async function runOperationalCheck(config, deps = {}) {
     return true;
   }, []);
   if (config.nanoStandby && !fallbackPaymentReads) await check("nano-standby-cold-scan-budget", () => {
-    need(config.nanoStandby.requestsPerMinute >= NANO_COLD_STANDBY_SCAN_REQUESTS, "nano-standby-cold-scan-budget-insufficient");
+    const needed = runtimeFunding?.coldPaymentScanRequests ?? NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS;
+    need(config.nanoStandby.requestsPerMinute >= needed, "nano-standby-cold-scan-budget-insufficient");
   }, []);
   if (state) await check("nano-payment-scan-progress", async () => {
     const at = now(), ledger = readNanoLedger();

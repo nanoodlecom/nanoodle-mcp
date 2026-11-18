@@ -1079,7 +1079,10 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
 });
 
 test("an exhausted fallback pair exposes an undersized cold standby scan budget without probing it", async t => {
-  for (const [peerCooling, requestsPerMinute, expected] of [[false, 4, undefined], [true, 4, false], [true, 5, true]]) {
+  for (const [peerCooling, requestsPerMinute, coldPaymentScanRequests, expected] of [
+    [false, 4, undefined, undefined], [true, 4, undefined, false], [true, 5, undefined, true],
+    [true, 3, 4, false], [true, 4, 4, true],
+  ]) {
     const f = fixture(({ url }) => {
       assert.notEqual(url.hostname, "standby.example");
       return null;
@@ -1090,7 +1093,7 @@ test("an exhausted fallback pair exposes an undersized cold standby scan budget 
     f.config.nanoStandby = { url, requestsPerMinute };
     Object.assign(f.states["/state/funding-health.json"].nanoRpc, {
       configuredPeers: 4, configuration: rpcPeerSetId([...f.config.nanoRpcUrls, url]),
-      standby: { inUse: false, requestsPerMinute }, cooldowns: peerCooling ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      standby: { inUse: false, requestsPerMinute, coldPaymentScanRequests }, cooldowns: peerCooling ? [{ peer: 2, until: NOW + 60_000 }] : [],
     });
     const report = await runOperationalCheck(f.config, f.deps);
     const advisory = report.checks.find(c => c.stage === "nano-standby-cold-scan-budget");

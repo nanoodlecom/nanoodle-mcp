@@ -1,12 +1,12 @@
 import { performance } from "node:perf_hooks";
 import { MAX_RPC_RETRY_MS, rpcPeerSetId } from "./rpc-backoff.mjs";
 import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
-import { checkedAnchoredNanoHistory } from "./nano-payment-history.mjs";
+import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "./nano-payment-history.mjs";
 
 export { NANO_GENESIS } from "./nano-checkpoint.mjs";
-// A cold single-page payment scan needs a genesis proof and an account view
-// for each of its receivable and account_history reads.
-export const NANO_COLD_STANDBY_SCAN_REQUESTS = 5;
+// Genesis, receivable, account_info, and history at that confirmed account head.
+export const NANO_COLD_STANDBY_SCAN_REQUESTS = 4;
+export const NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS = 5;
 const GENESIS_KEY = "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65093BA";
 const GENESIS_ACCOUNT = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
 const HASH = /^[A-F0-9]{64}$/i, U128 = (1n << 128n) - 1n;
@@ -250,7 +250,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     if (witnesses.length < 2) throw unprovenCheckpoint();
     return witnesses;
   }
-  async function read(body, anchor = null) {
+  async function read(body, anchor = null, paymentWindow = null) {
     if (!["account_info", "receivable", "account_history"].includes(body.action)) throw fail("NANO_RPC_READ_ACTION");
     if (body.account !== account) throw fail("NANO_RPC_ACCOUNT_SCOPE");
     const eligible = await networkBases(), errors = [], primaryViews = [];
@@ -271,9 +271,18 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
             ? checkedAnchoredNanoHistory(data, body, checkAddress, view.confirmedFrontier === body.head.toUpperCase() ? view.confirmedHeight : null)
             : checkedHistory(data, checkAddress);
         }
+        let history = null;
+        if (paymentWindow) {
+          const request = { action: "account_history", account, head: view.confirmedFrontier, count: String(NANO_HISTORY_PAGE), raw: "true" };
+          try {
+            history = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, view.confirmedHeight);
+          } catch (error) {
+            if (error?.rateLimited === true) paymentWindow.historyRefusals.push({ base, error });
+          }
+        }
         // An older in-flight success cannot erase a newer concurrent refusal.
         if (cooldowns.get(base) === priorCooldown) cooldowns.delete(base);
-        return { ...row, data };
+        return { ...row, data, history };
       } catch (error) { rateLimit(base, error); errors.push(error); }
       return null;
     }
@@ -301,6 +310,11 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         if (lagging.length) throw fail("NANO_RPC_LAGGING_PEERS", "Not enough Nano peers have a current confirmed account view");
       }
       const best = select(anchor ? await anchoredRows(valid, anchor) : valid);
+      if (paymentWindow) {
+        const complete = valid.filter(row => row.history && row.view.confirmedFrontier === final.confirmedFrontier
+          && row.view.confirmedHeight === final.confirmedHeight);
+        return { receivable: best.data, history: complete.length >= minimum ? complete[0].history : null };
+      }
       return body.action === "account_info" ? best.info : best.data;
     }
     if (rows.length === 1 && standby && !blocked) {
@@ -310,7 +324,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       if (current.some(row => confirmedNow(row) && !sameAccountView(primary, row.view))) {
         readPeers = 0; throw fail("NANO_RPC_CONFLICT");
       }
-      const readRequests = body.action === "account_info" ? 1 : 2;
+      const readRequests = paymentWindow ? NANO_COLD_STANDBY_SCAN_REQUESTS - 1 : body.action === "account_info" ? 1 : 2;
       const historicWitness = anchor !== null && primary.confirmedHeight > BigInt(anchor.blockCount);
       const confirmed = await withStandbyReads(readRequests + Number(historicWitness), async () => {
         if (!hasProof(base)) return null;
@@ -335,7 +349,18 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     return true;
   }
   return {
-    read,
+    read: (body, anchor) => read(body, anchor),
+    async readPaymentWindow() {
+      const historyRefusals = [];
+      try {
+        return await read({ action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
+          source: "true" }, null, { historyRefusals });
+      } finally {
+        // A refusal of the later history request cools the endpoint for
+        // future reads without discarding its already verified receivables.
+        for (const { base, error } of historyRefusals) rateLimit(base, error);
+      }
+    },
     async verifyCheckpoint(value) {
       const checkpoint = selectNanoCheckpoint(value, account);
       if (minimum < 2) throw unprovenCheckpoint();
@@ -408,7 +433,8 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       readablePeers: standbyInUse && !hasStandbyQuorum() ? 0 : readPeers,
       networkPeers: bases.filter(hasProof).length + Number(standbyInUse && hasStandbyQuorum()), lastReadAt,
       configuration, cooldowns: allBases.flatMap((base, peer) => cooling(base) ? [{ peer, until: cooldowns.get(base).until }] : []),
-      ...(standby && { standby: { inUse: standbyInUse && hasStandbyQuorum(), requestsPerMinute: standby.requestsPerMinute } }),
+      ...(standby && { standby: { inUse: standbyInUse && hasStandbyQuorum(), requestsPerMinute: standby.requestsPerMinute,
+        coldPaymentScanRequests: NANO_COLD_STANDBY_SCAN_REQUESTS } }),
       checkpoint: high && final && !blocked ? { v: 1, networkGenesis: NANO_GENESIS, account,
         head: { hash: high.frontier, blockCount: high.height.toString() },
         confirmed: { hash: final.confirmedFrontier, blockCount: final.confirmedHeight.toString() } } : null }),

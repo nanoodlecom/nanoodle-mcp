@@ -854,14 +854,30 @@ export function createChargeGate({
     return { entries, next };
   }
 
-  async function readReceivableBlocks() {
-    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1",
-      source: "true", include_only_confirmed: "true" });
-    const blocks = r?.blocks;
+  function receivableBlocks(reply) {
+    const blocks = reply?.blocks;
     if (verifyPaymentReads && blocks !== "" && (!blocks || typeof blocks !== "object" || Array.isArray(blocks))) {
       throw new Error("Invalid Nano receivable window");
     }
     return blocks && typeof blocks === "object" ? Object.entries(blocks) : [];
+  }
+
+  async function readPaymentWindow({ existingPayments = false } = {}) {
+    if (verifyPaymentReads && ops.readPaymentWindow) {
+      try {
+        const { receivable, history } = await ops.readPaymentWindow();
+        return { blocks: receivableBlocks(receivable), history: history && {
+          anchored: true, latest: { entries: history.history, next: history.previous },
+        } };
+      } catch (error) {
+        // Keep finding already-issued payments when the standby has enough
+        // budget to corroborate receivables but cannot also read history.
+        if (!existingPayments || error?.code !== "NANO_RPC_STANDBY_BUDGET") throw error;
+      }
+    }
+    const receivable = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1",
+      source: "true", include_only_confirmed: "true" });
+    return { blocks: receivableBlocks(receivable), history: null };
   }
 
   async function readLatestHistory() {
@@ -896,8 +912,8 @@ export function createChargeGate({
     quoteReadInFlight ||= (async () => {
       const sequence = ++paymentReadSequence;
       try {
-        await readReceivableBlocks();
-        await readLatestHistory();
+        const { history } = await readPaymentWindow();
+        if (!history) await readLatestHistory();
         recordPaymentRead(true, sequence);
       } catch {
         recordPaymentRead(false, sequence);
@@ -935,9 +951,9 @@ export function createChargeGate({
   /** Pocketed payments disappear from receivable. Inspect the latest page for
    * quick confirmation, while a fixed backfill resumes older pages across
    * ticks and restarts until it reaches the last completed checkpoint. */
-  async function scanHistory(startedAt, fullReceivableWindow) {
+  async function scanHistory(startedAt, fullReceivableWindow, history) {
     const prior = historyScan;
-    const { anchored, latest } = await readLatestHistory();
+    const { anchored, latest } = history ?? await readLatestHistory();
     const replay = prior.backfill;
     const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
     const floor = prior.through === null ? initialHistoryFloor() : null;
@@ -974,7 +990,7 @@ export function createChargeGate({
     const startedAt = now();
     const sequence = ++paymentReadSequence;
     try {
-      const blocks = await readReceivableBlocks();
+      const { blocks, history } = await readPaymentWindow({ existingPayments: true });
       for (const [hash, v] of blocks) {
         const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
         const source = typeof v === "object" && v !== null ? v.source : null;
@@ -988,7 +1004,7 @@ export function createChargeGate({
         ops.pocket().catch(() => {}); // best-effort; the next tick retries
       }
       if (anyPaymentWatchable()) {
-        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT);
+        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT, history);
         recordPaymentRead(true, sequence);
       }
     } catch (error) {
