@@ -142,14 +142,20 @@ function fixture(override = () => null) {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
           funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
-        if (url.pathname.endsWith("/nq_operational_probe_unissued")) {
+        const near = url.hostname === "site.example";
+        const unissued = near ? "/nq_operational_probe_unissued" : "/pay_operational_probe_unissued";
+        const prefix = near ? "/near" : "/x402";
+        if (url.pathname.endsWith(unissued)) {
           assert.equal(init.method || "GET", "GET");
           assert.equal(body, null);
-          const missing = { status: "unknown", done: true };
+          const missing = { status: "unknown", done: true, next: "Ask for a fresh quote." };
           if (url.pathname.startsWith("/pay/")) return new Response("<h1>Unknown or expired payment</h1>", { status: 404, headers: { "content-type": "text/html" } });
-          if (url.pathname.startsWith("/near/status/")) return Response.json(missing, { status: 404 });
-          if (url.pathname.startsWith("/near/watch/")) {
-            assert.equal(url.searchParams.get("run"), "1");
+          if (url.pathname.startsWith(prefix + "/status/")) {
+            assert.equal(url.searchParams.get("wait"), "1");
+            return Response.json(missing, { status: near ? 404 : 200 });
+          }
+          if (url.pathname.startsWith(prefix + "/watch/")) {
+            assert.equal(url.searchParams.get("run"), near ? "1" : null);
             return new Response(`event: status\ndata: ${JSON.stringify(missing)}\n\n`, { headers: { "content-type": "text/event-stream" } });
           }
           if (url.pathname.startsWith("/near/result/")) return Response.json({ error: "Unknown or expired payment" }, { status: 404 });
@@ -187,7 +193,8 @@ test("operational probes cover live readiness with no inference, signing or Mark
   assert.ok(report.checks.some(c => c.stage === "nano-liquidity")); assert.ok(report.checks.some(c => c.stage === "usdc-liquidity"));
   assert.ok(report.checks.some(c => c.stage === "workflow-price-nanoodle-image"));
   assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
-  for (const stage of ["near-payment-page", "near-payment-status-route", "near-payment-event-stream", "near-payment-result-route"]) {
+  for (const stage of ["nano-payment-page", "nano-payment-status-route", "nano-payment-event-stream",
+    "near-payment-page", "near-payment-status-route", "near-payment-event-stream", "near-payment-result-route"]) {
     assert.ok(report.checks.some(c => c.stage === stage && c.ok));
   }
   const saved = report.checks.filter(c => c.stage.startsWith("saved-workflow-"));
@@ -201,15 +208,33 @@ test("operational probes cover live readiness with no inference, signing or Mark
 });
 
 test("the scheduled check alerts when the payment stream stops returning a terminal status frame", async t => {
-  const f = fixture(({ url }) => url.pathname.startsWith("/near/watch/")
-    ? new Response("event: status\ndata: {\"status\":\"unknown\",\"done\":false,\"private\":\"PRIVATE_BODY\"}\n\n", { headers: { "content-type": "text/event-stream" } })
+  for (const [rail, path, domains, done] of [
+    ["near", "/near/watch/", ["near", "usdc"], false],
+    ["nano", "/x402/watch/", ["nano"], false],
+    ["nano", "/x402/watch/", ["nano"], true],
+  ]) {
+    const frame = { status: "unknown", done, private: "PRIVATE_BODY" };
+    const f = fixture(({ url }) => url.pathname.startsWith(path)
+      ? new Response(`event: status\ndata: ${JSON.stringify(frame)}\n\n`, { headers: { "content-type": "text/event-stream" } })
+      : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(report.checks.filter(c => !c.ok), [{ stage: `${rail}-payment-event-stream`, ok: false,
+      code: `${rail}-payment-stream-response-invalid`, domains }]);
+    assert.deepEqual(report.admission, { nano: rail !== "nano", near: rail !== "near", usdc: rail !== "near", market: true });
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_BODY/);
+  }
+});
+
+test("the Nano checkout probe expects the existing unknown-payment status contract", async t => {
+  const f = fixture(({ url }) => url.pathname.startsWith("/x402/status/")
+    ? Response.json({ status: "unknown", done: true, next: "Ask for a fresh quote." }, { status: 404 })
     : null);
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
   const report = await runOperationalCheck(f.config, f.deps);
-  assert.deepEqual(report.checks.filter(c => !c.ok), [{ stage: "near-payment-event-stream", ok: false,
-    code: "near-payment-stream-response-invalid", domains: ["near", "usdc"] }]);
-  assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
-  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_BODY/);
+  assert.deepEqual(report.checks.filter(c => !c.ok), [{ stage: "nano-payment-status-route", ok: false,
+    code: "nano-payment-status-response-invalid", domains: ["nano"] }]);
+  assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
 });
 
 test("the scheduled check flags a late Nano deposit that lacks a refund record on a legacy writer", async t => {
@@ -587,7 +612,7 @@ test("independent Nano peers must corroborate the runtime's confirmed checkpoint
   ]) {
     const wrongHistory = ["newer-with-wrong-history", "redundant-with-wrong-history", "newest-unverified"].includes(scenario);
     const f = fixture(({ url, body }) => {
-      if (!url.hostname.startsWith("nano-")) return null;
+      if (!/^nano-\d/.test(url.hostname)) return null;
       const secondary = url.hostname === "nano-1.example";
       if (body.action === "account_info") {
         if (secondary && scenario === "one-peer-behind") return Response.json(nanoAccountInfo({ height: 9, frontier: "B".repeat(64) }));
