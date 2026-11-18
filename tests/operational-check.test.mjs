@@ -151,6 +151,21 @@ test("numeric and HTTP rate limits have precise diagnostics without hiding loss 
   }
 });
 
+test("a low canary payer is visible without closing customer payment lanes", async t => {
+  const payer = "dedicated-canary.testnet";
+  const f = fixture(({ body }) => body?.params?.request_type === "view_account" && body.params.account_id === payer
+    ? Response.json({ jsonrpc: "2.0", id: body.id, result: { amount: "10000000000000000000000",
+      storage_usage: 182, block_height: 100, block_hash: "same-block" } }) : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.canaryPayer = { accountId: payer, publicKey: "ed25519:PRIVATE_CHECK_TEST_KEY", maxNear: "0.01" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === "near-canary-payer-funding"), {
+    stage: "near-canary-payer-funding", ok: false, code: "near-canary-payer-insufficient", domains: [],
+  });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /dedicated-canary|PRIVATE_CHECK_TEST_KEY|10000000000000000000000/);
+});
+
 test("a fresh runtime cooldown prevents monitor retries while other independent peers remain healthy", async () => {
   const f = fixture(); f.config.nanoRpcUrls.push("https://nano-2.example");
   Object.assign(f.states["/state/funding-health.json"].nanoRpc, { configuredPeers: 3, configuration: rpcPeerSetId(f.config.nanoRpcUrls),

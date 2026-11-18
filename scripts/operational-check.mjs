@@ -11,7 +11,7 @@ import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
-import { createNearRpc, loadNearSigner, checkUsdcMerchant } from "../src/near/index.mjs";
+import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto } from "../src/near/index.mjs";
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
@@ -23,8 +23,8 @@ import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
-import { readNearFunding } from "../src/near/funding.mjs";
-import { atomicJson, checkGraph } from "./near-check.mjs";
+import { readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
+import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
@@ -293,6 +293,14 @@ export async function runOperationalCheck(config, deps = {}) {
     }
   }, ["near", "usdc", "market"]);
   if (near) {
+    if (config.canaryPayer) await check("near-canary-payer-funding", async () => {
+      const { accountId, publicKey, maxNear } = config.canaryPayer;
+      need(accountId !== config.merchant && publicKey, "near-canary-payer-proof-unconfigured");
+      const amountYocto = parseNearToYocto(maxNear);
+      need(amountYocto > 0n, "near-canary-payer-proof-unconfigured");
+      const funding = await readNearTransferFunding({ rpc: near.rpc, network: config.network, accountId, publicKey, amountYocto, now });
+      need(funding.sufficient, "near-canary-payer-insufficient");
+    }, []);
     await check("near-refund-authority", async () => {
       const key = await near.rpc.viewAccessKey({ accountId: config.merchant, publicKey: config.nearPublicKey });
       need(key.permission === "FullAccess", "near-refund-key-not-authorized");
@@ -361,10 +369,13 @@ async function productionConfig(env = process.env) {
   need(secret, "nano-wallet-not-configured");
   const merchant = env.NEAR_MERCHANT;
   const signer = await loadNearSigner({ accountId: merchant, keyFile: env.NEAR_KEY_FILE || null, env });
+  const payer = env.CHECK_PAYER;
+  const canaryPayer = payer ? { accountId: payer, maxNear: env.CHECK_MAX_NEAR || DEFAULT_CHECK_MAX_NEAR,
+    publicKey: env.CHECK_PAYER_PUBLIC_KEY || (/^[a-f0-9]{64}$/.test(payer) ? "ed25519:" + base58Encode(Buffer.from(payer, "hex")) : null) } : null;
   const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
   const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", outDir: "/srv/nanoodle-mcp/out",
-    marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK,
+    marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK, canaryPayer,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
     nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
