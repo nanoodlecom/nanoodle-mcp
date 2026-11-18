@@ -19,11 +19,11 @@ import { nearFundingNeed, nearRefundClaims, nearRefundCosts } from "../src/near/
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 
-function rawHistory(request, receive = null) {
+function rawHistory(request, receive = null, height = 10) {
   const previous = "E".repeat(64);
   const history = [{ hash: request.head, type: "state", subtype: "change",
-    height: "10", confirmed: "true", previous: receive?.hash ?? previous }];
-  if (receive) history.push({ height: "9", confirmed: "true", previous, ...receive });
+    height: String(height), confirmed: "true", previous: receive?.hash ?? previous }];
+  if (receive) history.push({ height: String(height - 1), confirmed: "true", previous, ...receive });
   return { account: request.account, history, previous };
 }
 
@@ -312,7 +312,11 @@ test("a legacy Nano writer alerts on an aged confirmed matching transfer missing
   for (const scenario of ["receivable", "already-pocketed", "fresh", "old", "unconfirmed", "fallback",
     "recorded-during-read", "known-receive-alias", "observation-unavailable"]) {
     const f = fixture(({ url, body }, _config, states) => {
-      if (!/^nano-\d/.test(url.hostname) || !["receivable", "account_history", "block_info"].includes(body?.action)) return null;
+      if (!/^nano-\d/.test(url.hostname)) return null;
+      if (body?.action === "account_info") return Response.json(nanoAccountInfo({
+        frontier: "A".repeat(64), balance: "10000000000000000000000000000000", pending: scenario === "already-pocketed" ? "0" : amount,
+      }));
+      if (!["receivable", "account_history", "block_info"].includes(body?.action)) return null;
       if (body.action !== "block_info") assert.equal(body.account, account);
       if (body.action === "receivable") {
         assert.equal(body.include_only_confirmed, "true");
@@ -346,7 +350,7 @@ test("a legacy Nano writer alerts on an aged confirmed matching transfer missing
     const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
     assert.equal(probe?.ok, !missed, scenario);
     assert.equal(probe?.code, missed ? "nano-confirmed-payment-unrecorded" : undefined, scenario);
-    assert.deepEqual(report.admission, { nano: !missed, near: true, usdc: true, market: true }, scenario);
+    assert.deepEqual(report.admission, { nano: !missed && scenario !== "observation-unavailable", near: true, usdc: true, market: true }, scenario);
     if (scenario === "observation-unavailable") assert.deepEqual(report.checks.find(c => c.stage === "nano-legacy-payment-observation"),
       { stage: "nano-legacy-payment-observation", ok: false, code: "http-503", domains: [] });
     assert.doesNotMatch(JSON.stringify(report), /private-watched-quote|50000000000000000000123/);
@@ -918,7 +922,7 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
 });
 
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
-  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "moved-after-history"]) {
+  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "moved-after-history", "inconsistent-newer-view"]) {
     const f = fixture(({ url, body }) => {
       if (url.hostname !== "nano-2.example") return null;
       if (body.action === "account_history" && failure === "history-http") return new Response("PRIVATE_RPC_DETAIL", { status: 503 });
@@ -930,10 +934,10 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
         delete page.previous;
         return Response.json(page);
       }
-      if (body.action === "receivable" && failure === "inconsistent-receivable") {
+      if (body.action === "receivable" && ["inconsistent-receivable", "inconsistent-newer-view"].includes(failure)) {
         return Response.json({ blocks: { ["B".repeat(64)]: { amount: "1", source: body.account } } });
       }
-      if (body.action === "account_info" && failure === "moved-after-history"
+      if (body.action === "account_info" && ["moved-after-history", "inconsistent-newer-view"].includes(failure)
         && f.calls.some(c => c.url.hostname === url.hostname && c.body.action === "receivable")) {
         return Response.json(nanoAccountInfo({ height: 11, frontier: "B".repeat(64) }));
       }
@@ -952,11 +956,38 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
       assert.deepEqual(readiness.domains, []);
     }
     const calls = f.calls.filter(c => ["account_history", "receivable"].includes(c.body?.action));
-    assert.ok(calls.every(c => ["nano-1.example", "nano-2.example"].includes(c.url.hostname)));
+    assert.ok(calls.every(c => ["nano-0.example", "nano-1.example", "nano-2.example"].includes(c.url.hostname)));
+    assert.equal(calls.filter(c => c.body.action === "account_history").length, 3, "share peer reads between both checks");
     assert.ok(calls.some(c => c.body.action === "account_history" && c.body.count === "100" && c.body.raw === "true"));
     assert.ok(calls.some(c => c.body.action === "receivable" && c.body.count === "500" && c.body.include_only_confirmed === "true"));
-    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.deepEqual(report.admission, { nano: !["moved-after-history", "inconsistent-newer-view"].includes(failure),
+      near: true, usdc: true, market: true });
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_RPC_DETAIL|nano-2\.example|BBBBBBBB/);
+  }
+});
+
+test("ordinary peers can agree on the wallet checkpoint without serving the active Nano payment quorum", async t => {
+  for (const [peer, method, extraPeer] of [[0, "account_history", false], [1, "receivable", false], [0, "account_history", true]]) {
+    const f = fixture(({ url, body }) => url.hostname === `nano-${peer}.example` && body?.action === method
+      ? new Response("PRIVATE_PROVIDER_DETAIL", { status: 503 }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    if (extraPeer) {
+      f.config.nanoRpcUrls.push("https://nano-2.example");
+      f.states["/state/funding-health.json"].nanoRpc.configuredPeers = 3;
+    }
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.checks.find(c => c.stage === "nano-frontier-agreement")?.ok, true);
+    assert.equal(report.checks.find(c => c.stage === `nano-payment-read-peer-${peer}`)?.code, "http-503");
+    const quorum = report.checks.find(c => c.stage === "nano-payment-read-quorum");
+    if (extraPeer) {
+      assert.equal(quorum?.ok, true);
+      assert.equal(report.checks.find(c => c.stage === "nano-fallback-payment-reads")?.ok, true);
+    } else {
+      assert.deepEqual(quorum, { stage: "nano-payment-read-quorum", ok: false,
+        code: "nano-payment-read-quorum-unavailable", domains: ["nano"] });
+    }
+    assert.deepEqual(report.admission, { nano: extraPeer, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PROVIDER_DETAIL|nano-[01]\.example/);
   }
 });
 
@@ -1036,9 +1067,12 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
     const report = await runOperationalCheck(f.config, f.deps);
     const ready = failure === null || failure === "matching-with-lagging-peer";
-    assert.equal(report.admission.nano, ready);
+    assert.equal(report.admission.nano, false);
     assert.equal(report.admission.near, ready);
-    if (ready) assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
+    if (ready) {
+      assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
+      assert.ok(report.checks.some(c => c.stage === "nano-payment-read-quorum" && c.code === "nano-payment-read-standby-unverified"));
+    }
     if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
   }
@@ -1094,6 +1128,7 @@ test("independent Nano peers must corroborate the runtime's confirmed checkpoint
         if (secondary && scenario === "newest-unverified") return Response.json(nanoAccountInfo({ height: 11, frontier: "D".repeat(64) }));
         return Response.json(nanoAccountInfo({ height, frontier, balance: block.balance }));
       }
+      if (body.action === "account_history") return Response.json(rawHistory(body, null, height));
       if (body.action !== "block_info" || body.hash !== anchor.hash) return null;
       return Response.json({
         height: anchor.blockCount,
