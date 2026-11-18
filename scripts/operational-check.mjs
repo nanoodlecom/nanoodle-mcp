@@ -46,6 +46,8 @@ import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 const NEAR_DISCOVERY_MAX_PROOF_AGE_MS = 27 * 3600_000;
+const NANO_TELEMETRY_AGE_MS = 90_000;
+const NANO_LEDGER_LAG_BLOCKS = 1_000n;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
 const MARKET_SLA_WARNINGS = ["market-sla-execution-overdue", "market-sla-start-window-ended",
@@ -67,6 +69,32 @@ const readJson = file => JSON.parse(readFileSync(file, "utf8"));
 const safeCode = e => e instanceof CheckError ? e.message : /^[A-Z_]{2,60}$/.test(e?.code || "") ? e.code : /Timeout|Abort/.test(e?.name || "") ? "request-timeout" : "probe-failed";
 const positiveDecimal = value => typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value)
   && Number.isFinite(Number(value)) && Number(value) > 0;
+
+function nanoLedgerCounters(count, cemented) {
+  if (![count, cemented].every(value => typeof value === "string" && /^[1-9]\d{0,19}$/.test(value))) return null;
+  const blocks = BigInt(count), confirmed = BigInt(cemented);
+  if (confirmed > blocks || blocks >= (1n << 64n)) return null;
+  return { blocks, confirmed };
+}
+
+function nanoPeerLedgerBaseline(metrics, now) {
+  // The local node validates telemetry signatures on receipt. Use its raw
+  // cached peer observations: the non-raw RPC can return the local counters.
+  const peers = new Map();
+  for (const sample of Array.isArray(metrics) ? metrics : []) {
+    if (sample?.genesis_block !== NANO_GENESIS || !/^node_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$/.test(sample.node_id)
+      || !/^[a-f0-9]{128}$/i.test(sample.signature)) continue;
+    const at = typeof sample.timestamp === "string" && /^\d{13}$/.test(sample.timestamp) ? Number(sample.timestamp) : NaN;
+    if (!Number.isFinite(at) || now - at > NANO_TELEMETRY_AGE_MS || at - now > 30_000) continue;
+    const ledger = nanoLedgerCounters(sample.block_count, sample.cemented_count);
+    if (ledger && (!peers.has(sample.node_id) || at > peers.get(sample.node_id).at)) {
+      peers.set(sample.node_id, { at, confirmed: ledger.confirmed });
+    }
+  }
+  need(peers.size >= 3, "nano-ledger-peer-telemetry-insufficient");
+  const counts = Array.from(peers.values(), peer => peer.confirmed).sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+  return { median: counts[Math.floor((counts.length - 1) / 2)], peers: counts.length };
+}
 
 function backupVerificationProof(file, read, now, stage) {
   let record;
@@ -133,7 +161,7 @@ export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("
   }
 }
 
-export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null, invocationId = null } = {}) {
+export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null, nanoLedgerSync = null, invocationId = null } = {}) {
   const latest = join(stateDir, "latest.json");
   let previous; try { previous = readJson(latest); } catch { /* first probe */ }
   const priorBackfill = previous?.nearBackfillSince;
@@ -154,7 +182,7 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), { fu
   const report = { v: 1, ok: failed.length === 0, checkedAt: new Date(now).toISOString(), stage: failed[0]?.stage || "complete",
     admission, checks, ...(/^[a-f0-9]{32}$/.test(invocationId || "") && { invocationId }),
     ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
-    ...(nearBackfillSince !== null && { nearBackfillSince }) };
+    ...(nearBackfillSince !== null && { nearBackfillSince }), ...(nanoLedgerSync && { nanoLedgerSync }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
   // The separate alert user needs to read it, without access to app secrets.
@@ -200,7 +228,7 @@ export async function runOperationalCheck(config, deps = {}) {
     const response = await request(url, init); need(response.ok, `http-${response.status}`); return response.json();
   };
   const nanoRpc = async (url, body, signal) => {
-    need(["account_info", "account_history", "receivable", "block_count", "version", "block_info"].includes(body.action), "probe-action-forbidden");
+    need(["account_info", "account_history", "receivable", "block_count", "version", "block_info", "telemetry"].includes(body.action), "probe-action-forbidden");
     const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal });
     need(response.status !== 429, "nano-rpc-rate-limited");
     need(response.ok, `http-${response.status}`);
@@ -391,6 +419,22 @@ export async function runOperationalCheck(config, deps = {}) {
     }, []);
     return observation;
   }))).filter(Boolean);
+  let nanoLedgerSync = null;
+  if (config.nanoLedgerTelemetry) await check("nano-ledger-sync", async () => {
+    need(nanoNodes.some(({ peer }) => peer === 0), "nano-ledger-primary-unavailable");
+    const owned = config.nanoRpcUrls[0];
+    const [counts, telemetry] = await Promise.all([
+      nanoRpc(owned, { action: "block_count", include_cemented: "true" }),
+      nanoRpc(owned, { action: "telemetry", raw: "true" }),
+    ]);
+    const local = nanoLedgerCounters(counts.count, counts.cemented);
+    need(local, "nano-ledger-local-counters-invalid");
+    const network = nanoPeerLedgerBaseline(telemetry.metrics, now());
+    nanoLedgerSync = { localBlocks: local.blocks.toString(), localConfirmed: local.confirmed.toString(),
+      peerMedianConfirmed: network.median.toString(), peers: network.peers };
+    need(network.median - local.blocks < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-blocks-behind");
+    need(network.median - local.confirmed < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-confirmations-behind");
+  }, []);
   const nano = await check("nano-frontier-agreement", () => {
     const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(nanoNodes);
     const behind = current.filter(({ view }) => nanoAnchor && view.confirmedHeight < nanoAnchorHeight);
@@ -919,7 +963,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
   }));
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
-    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, invocationId: config.invocationId });
+    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync, invocationId: config.invocationId });
 }
 
 async function productionConfig(env = process.env) {
@@ -938,7 +982,8 @@ async function productionConfig(env = process.env) {
     outDir: "/srv/nanoodle-mcp/out",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK, canaryPayer,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
-    nanoRpcUrls, nanoStandby, nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
+    nanoRpcUrls, nanoStandby, nanoLedgerTelemetry: env.OPERATIONAL_NANO_LEDGER_TELEMETRY === "1",
+    nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
     nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
     agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
