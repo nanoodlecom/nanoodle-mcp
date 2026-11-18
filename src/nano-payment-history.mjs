@@ -1,5 +1,3 @@
-import { checkAddress } from "nanocurrency";
-
 export const NANO_LATE_WATCH_MS = 60 * 60_000;
 // Keep enough room for a payment burst and bound each history page.
 export const NANO_RECEIVABLE_COUNT = 500;
@@ -24,7 +22,7 @@ export function nanoHistoryKind(row) {
 
 /** Raw history includes change and epoch blocks. An anchored, confirmed page
  * must follow every predecessor, including the continuation to the next page. */
-export function checkedAnchoredNanoHistory(page, { account, head, count }, height = null) {
+export function checkedAnchoredNanoHistory(page, { account, head, count }, checkAddress, height = null) {
   const limit = Number(count), owner = canon(account);
   if (!isNanoHistoryHash(head) || !owner || canon(page?.account) !== owner || !Number.isSafeInteger(limit)
     || limit < 1 || !Array.isArray(page?.history) || !page.history.length || page.history.length > limit) throw badHistory();

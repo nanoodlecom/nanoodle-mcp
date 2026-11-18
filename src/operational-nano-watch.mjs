@@ -22,10 +22,10 @@ export function nanoWatchDemand(ledger, now) {
 /** The legacy writer has no coverage cursor. Sample confirmed deposits from
  * both sides of pocketing. Check the original send time, since a receive
  * block can be written long after the payment was sent. */
-export async function findUnrecordedNanoPayments({ rpc, matchesSend, account, head, height, ledger, waiting, now }) {
+export async function findUnrecordedNanoPayments({ rpc, matchesSend, checkAddress, account, head, height, ledger, waiting, now }) {
   const historyRequest = { action: "account_history", account, head, count: String(HISTORY_LIMIT), raw: "true" };
   const [history, receivable] = await Promise.all([
-    rpc(historyRequest).then(value => checkedAnchoredNanoHistory(value, historyRequest, height)),
+    rpc(historyRequest).then(value => checkedAnchoredNanoHistory(value, historyRequest, checkAddress, height)),
     rpc({ action: "receivable", account, count: String(RECEIVABLE_LIMIT), threshold: "1",
       source: "true", include_only_confirmed: "true" }),
   ]);

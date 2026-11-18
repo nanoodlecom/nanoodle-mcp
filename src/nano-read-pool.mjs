@@ -256,7 +256,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         if (body.action === "receivable") data = checkedReceivable(data, body, view, checkAddress);
         if (body.action === "account_history") {
           data = body.head && yes(body.raw)
-            ? checkedAnchoredNanoHistory(data, body, view.confirmedFrontier === body.head.toUpperCase() ? view.confirmedHeight : null)
+            ? checkedAnchoredNanoHistory(data, body, checkAddress, view.confirmedFrontier === body.head.toUpperCase() ? view.confirmedHeight : null)
             : checkedHistory(data, checkAddress);
         }
         // An older in-flight success cannot erase a newer concurrent refusal.

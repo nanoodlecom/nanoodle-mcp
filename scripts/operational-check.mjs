@@ -420,7 +420,7 @@ export async function runOperationalCheck(config, deps = {}) {
       const deadline = AbortSignal.timeout(config.timeoutMs || 12_000);
       const rpc = body => nanoRpc(url, body, deadline);
       const historyRequest = { action: "account_history", account, head, count: String(NANO_HISTORY_PAGE), raw: "true" };
-      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, nano.view.confirmedHeight);
+      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, nano.view.confirmedHeight);
       const receivableRequest = { action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
         source: "true", include_only_confirmed: "true" };
       const pending = await rpc(receivableRequest);
@@ -451,7 +451,7 @@ export async function runOperationalCheck(config, deps = {}) {
       let failure;
       for (const index of nano.peers) {
         try {
-          return await findUnrecordedNanoPayments({ rpc: body => nanoRpc(config.nanoRpcUrls[index], body), matchesSend,
+          return await findUnrecordedNanoPayments({ rpc: body => nanoRpc(config.nanoRpcUrls[index], body), matchesSend, checkAddress,
             account: config.nanoAddress, head: nano.view.confirmedFrontier, height: nano.view.confirmedHeight, ledger, waiting, now: at });
         } catch (error) {
           if (error.code === "NANO_PAYMENT_OBSERVATION_LIMIT") throw error;

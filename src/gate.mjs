@@ -819,7 +819,7 @@ export function createChargeGate({
       ...(head && { head }), ...(raw && { raw: "true" }) };
     const page = await ops.rpc(request);
     if (raw) {
-      const proved = checkedAnchoredNanoHistory(page, request, height);
+      const proved = checkedAnchoredNanoHistory(page, request, checkAddress, height);
       return { entries: proved.history, next: proved.previous };
     }
     if (page?.history !== "" && !Array.isArray(page?.history)) throw new Error("Invalid Nano history page");
