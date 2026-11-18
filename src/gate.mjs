@@ -31,6 +31,7 @@ import { randomBytes, randomInt, createHash } from "node:crypto";
 import { readFileSync, constants } from "node:fs";
 import { open, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { performance } from "node:perf_hooks";
 import { checkAddress } from "nanocurrency";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { knownUsd, parseUsdNano } from "./usd.mjs";
@@ -46,6 +47,10 @@ import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-jour
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
+const QUOTE_READ_PROOF_TTL_MS = 30_000;
+const QUOTE_READ_RETRY_MS = 5_000;
+const QUOTE_READ_UNAVAILABLE = "Nano payment detection is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
+const QUOTE_FUNDING_UNAVAILABLE = "Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
 /**
  * The ONLY refund reasons the payments ledger may record — fixed categories,
  * never free text. A ledger line must never carry an upstream error string
@@ -225,8 +230,10 @@ export function createChargeGate({
   log = () => {},
   usage = () => {},
   now = () => Date.now(),
+  monotonicNow = () => performance.now(),
   fundRun = null,
   canQuote = () => true,
+  verifyPaymentReads = false,
   maintenance = null,
   runTimeoutMs = undefined,
 }) {
@@ -236,6 +243,9 @@ export function createChargeGate({
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (typeof verifyPaymentReads !== "boolean" || (verifyPaymentReads && typeof ops.checkpoint !== "function")) {
+    throw new TypeError("verifying Nano payment reads requires a wallet checkpoint");
+  }
   if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.accepting !== "function" || typeof maintenance.assertAdmitted !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
 
   /** @type {Map<string, object>} paymentId → quote */
@@ -245,6 +255,9 @@ export function createChargeGate({
   let restoredStateNeedsWrite = false;
   let recordingRestoredState = null;
   let historyScan = readNanoPaymentHistory();
+  let paymentReadSequence = 0;
+  let lastPaymentRead = null;
+  let quoteReadInFlight = null;
 
   /* ---------------- pricing ---------------- */
 
@@ -841,6 +854,60 @@ export function createChargeGate({
     return { entries, next };
   }
 
+  async function readReceivableBlocks() {
+    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1",
+      source: "true", include_only_confirmed: "true" });
+    const blocks = r?.blocks;
+    if (verifyPaymentReads && blocks !== "" && (!blocks || typeof blocks !== "object" || Array.isArray(blocks))) {
+      throw new Error("Invalid Nano receivable window");
+    }
+    return blocks && typeof blocks === "object" ? Object.entries(blocks) : [];
+  }
+
+  async function readLatestHistory() {
+    const anchor = ops.checkpoint?.()?.confirmed;
+    const anchored = isNanoHistoryHash(anchor?.hash);
+    if (verifyPaymentReads && (!anchored || !isNanoHistoryHeight(anchor.blockCount))) {
+      throw new Error("Nano payment history lacks a confirmed checkpoint");
+    }
+    const latest = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored, anchored ? anchor.blockCount : null);
+    return { anchored, latest };
+  }
+
+  function recordPaymentRead(ready, sequence) {
+    // A response from an older overlapping read must not erase newer evidence.
+    if (verifyPaymentReads && (!lastPaymentRead || sequence >= lastPaymentRead.sequence)) {
+      lastPaymentRead = { ready, sequence, at: monotonicNow() };
+    }
+  }
+
+  function recentPaymentRead() {
+    if (!lastPaymentRead) return null;
+    const age = monotonicNow() - lastPaymentRead.at;
+    const interval = lastPaymentRead.ready ? QUOTE_READ_PROOF_TTL_MS : QUOTE_READ_RETRY_MS;
+    return age >= 0 && age < interval ? lastPaymentRead.ready : null;
+  }
+
+  async function paymentReadsReady() {
+    const recent = recentPaymentRead();
+    if (recent !== null) return recent;
+    // Idle wallets have no regular incoming scan. Concurrent quoters share
+    // this read-only probe without waiting for outgoing transfers or for PoW.
+    quoteReadInFlight ||= (async () => {
+      const sequence = ++paymentReadSequence;
+      try {
+        await readReceivableBlocks();
+        await readLatestHistory();
+        recordPaymentRead(true, sequence);
+      } catch {
+        recordPaymentRead(false, sequence);
+        log("Nano checkout could not verify the payment reads");
+      }
+    })().finally(() => { quoteReadInFlight = null; });
+    await quoteReadInFlight;
+    return recentPaymentRead() === true;
+  }
+
   function inspectHistory(entries, stop, floor) {
     for (const entry of entries) {
       if (entry.hash === stop || (floor !== null && isNanoHistoryHeight(entry.height) && BigInt(entry.height) <= floor)) return true;
@@ -870,9 +937,7 @@ export function createChargeGate({
    * ticks and restarts until it reaches the last completed checkpoint. */
   async function scanHistory(startedAt, fullReceivableWindow) {
     const prior = historyScan;
-    const anchor = ops.checkpoint?.()?.confirmed;
-    const anchored = isNanoHistoryHash(anchor?.hash);
-    const latest = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored, anchored ? anchor.blockCount : null);
+    const { anchored, latest } = await readLatestHistory();
     const replay = prior.backfill;
     const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
     const floor = prior.through === null ? initialHistoryFloor() : null;
@@ -907,21 +972,29 @@ export function createChargeGate({
     // already throttling us (that is why the refund is queued at all).
     if (!anyPaymentWatchable()) return;
     const startedAt = now();
-    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true", include_only_confirmed: "true" });
-    const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
-    for (const [hash, v] of blocks) {
-      const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
-      const source = typeof v === "object" && v !== null ? v.source : null;
-      matchAmount(amount, { source, hash, via: "receivable poll" });
+    const sequence = ++paymentReadSequence;
+    try {
+      const blocks = await readReceivableBlocks();
+      for (const [hash, v] of blocks) {
+        const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
+        const source = typeof v === "object" && v !== null ? v.source : null;
+        matchAmount(amount, { source, hash, via: "receivable poll" });
+      }
+      await commitDeposits();
+      // A full window means blocks beyond it are invisible — ask the wallet to
+      // pocket (queued housekeeping, never blocks a payment) so the overflow
+      // reappears in account_history, which the walk below reads exhaustively.
+      if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
+        ops.pocket().catch(() => {}); // best-effort; the next tick retries
+      }
+      if (anyPaymentWatchable()) {
+        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT);
+        recordPaymentRead(true, sequence);
+      }
+    } catch (error) {
+      recordPaymentRead(false, sequence);
+      throw error;
     }
-    await commitDeposits();
-    // A full window means blocks beyond it are invisible — ask the wallet to
-    // pocket (queued housekeeping, never blocks a payment) so the overflow
-    // reappears in account_history, which the walk below reads exhaustively.
-    if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
-      ops.pocket().catch(() => {}); // best-effort; the next tick retries
-    }
-    if (anyPaymentWatchable()) await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT);
   }
 
   /*
@@ -1407,16 +1480,24 @@ export function createChargeGate({
           }
           if (validate) await validate({ name, arguments: args });
           if (persistenceFailed && !await persist()) return errResult("Cannot issue a Nano quote while payment storage is unavailable. Try again shortly.");
-          if (await canQuote() !== true) return errResult("Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
+          if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
           const price = priceFor(name, args);
           const pair = await ratePair();
+          if (verifyPaymentReads) {
+            if (!await paymentReadsReady()) return errResult(QUOTE_READ_UNAVAILABLE);
+            if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
+            if (recentPaymentRead() !== true) return errResult(QUOTE_READ_UNAVAILABLE);
+          }
           const amountRaw = tagAmount(price, pair);
           if (amountRaw === null) {
             return errResult("This server is holding too many Nano quotes at this price right now. Try again later. Nothing was quoted or charged.");
           }
           const confirmedHeight = ops.checkpoint?.()?.confirmed?.blockCount;
+          if (verifyPaymentReads && !isNanoHistoryHeight(confirmedHeight)) {
+            return errResult(QUOTE_READ_UNAVAILABLE);
+          }
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,

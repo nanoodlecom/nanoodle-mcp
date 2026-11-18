@@ -106,7 +106,8 @@ function fakeRegistry({ author = null, onCall } = {}) {
   return registry;
 }
 
-function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch, stateFile, fundRun, maintenance } = {}) {
+function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300, pollMs = 10, usage,
+  xnoUsd = 1.0, fetch, stateFile, fundRun, canQuote, verifyPaymentReads, maintenance } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
@@ -117,10 +118,10 @@ function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10,
     pollMs,
     waitMs,
     usage,
-    now,
+    now, monotonicNow,
     fetch,
     stateFile,
-    fundRun, maintenance,
+    fundRun, canQuote, verifyPaymentReads, maintenance,
   });
   return gate;
 }
@@ -794,6 +795,85 @@ test("already-pocketed payments are found via account_history", async () => {
   chain.state.history.push({ type: "receive", account: PAYER, amount: x.amountRaw, hash: "D".repeat(64) });
   const res = await callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
   assert.ok(!res.isError, JSON.stringify(res.content));
+});
+
+test("guarded Nano quotes share a read-only proof and stay unpublished until both reads recover", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-quote-readiness-")), file = join(dir, "gate-state.json");
+  const head = "A".repeat(64), attempts = [], usage = [];
+  let monotonic = 0, historyReady = false, fundingReady = true, pauseFunding = false;
+  chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
+  chain.ops.rpc = async body => {
+    attempts.push(body.action);
+    assert.equal(body.account, GATE_ADDR);
+    if (body.action === "receivable") {
+      assert.equal(body.include_only_confirmed, "true");
+      return { blocks: "" };
+    }
+    assert.equal(body.action, "account_history");
+    assert.equal(body.head, head);
+    assert.equal(body.raw, "true");
+    if (!historyReady) return { account: GATE_ADDR, history: [] };
+    if (pauseFunding) fundingReady = false;
+    return { account: GATE_ADDR, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }] };
+  };
+  const gate = makeGate(chain, { registry, stateFile: file, pollMs: 60_000, verifyPaymentReads: true, canQuote: () => fundingReady,
+    monotonicNow: () => monotonic, usage: event => usage.push(event) });
+  t.after(async () => { await gate.stop(); await rm(dir, { recursive: true }); });
+  const { callTool } = gate.wrapRegistry(registry);
+  const request = () => callTool({ name: "poster", arguments: { Text: "payment reads" } });
+  for (const result of await Promise.all([request(), request(), request()])) {
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /payment detection is temporarily unavailable/i);
+    assert.equal(result.structuredContent?.x402, undefined);
+  }
+  assert.deepEqual(attempts, ["receivable", "account_history"]);
+  assert.equal((await request()).isError, true);
+  assert.equal(attempts.length, 2, "rapid retries do not repeat failed RPC reads");
+  assert.deepEqual(usage, []);
+  await assert.rejects(readFile(file, "utf8"), { code: "ENOENT" });
+  assert.equal(registry.callCount(), 0);
+  assert.equal(chain.state.transfers.length, 0);
+
+  monotonic += 5_000;
+  historyReady = true;
+  pauseFunding = true;
+  const fundingRefusal = await request();
+  assert.equal(fundingRefusal.isError, true);
+  assert.match(fundingRefusal.content[0].text, /funding is temporarily unavailable/i);
+  await assert.rejects(readFile(file, "utf8"), { code: "ENOENT" });
+  pauseFunding = false;
+  fundingReady = true;
+  const quote = argOf(await request());
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(saved.quotes.find(row => row.id === quote.paymentId)?.historyAfter, "1");
+  assert.equal(usage[0], "quote");
+});
+
+test("a failed Nano watcher read invalidates quote readiness while issued payments still resolve", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  const head = "A".repeat(64);
+  let historyReady = true, failed = false;
+  chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
+  const rpc = chain.ops.rpc;
+  chain.ops.rpc = body => {
+    if (body.action !== "account_history") return rpc(body);
+    if (!historyReady) throw new Error("test history unavailable");
+    return { account: body.account, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }] };
+  };
+  const gate = createChargeGate({ address: GATE_ADDR, ops: chain.ops, usd: 0.05, xnoUsd: 1, publicBase: "http://pay.test",
+    pollMs: 5, verifyPaymentReads: true, log: line => { if (line.includes("payment scan failed")) failed = true; } });
+  t.after(() => gate.stop());
+  const { callTool } = gate.wrapRegistry(registry);
+  const request = text => callTool({ name: "poster", arguments: { Text: text } });
+  const original = argOf(await request("issued before the outage"));
+  historyReady = false;
+  await until("the watcher to report its broken history RPC", () => failed);
+  assert.equal((await request("new customer")).isError, true, "a watcher failure supersedes a fresh positive quote probe");
+  assert.equal(gate.quote(original.paymentId).status, "pending");
+
+  chain.state.receivable["D".repeat(64)] = { amount: original.amountRaw, source: PAYER };
+  assert.equal(await gate.waitForPayment(original.paymentId, 1_000), "paid");
 });
 
 test("anchored history does not advance past a truncated page and then finds the pocketed payment", async t => {
