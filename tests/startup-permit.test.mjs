@@ -203,6 +203,7 @@ test('the hosted CLI recovers a recorded refund once and refuses stale Nano peer
   await chain.listen(); await nano.listen();
   w.cleanup.push(() => chain.close(), () => nano.close());
   const out = join(w.root, 'out'), graphs = join(w.root, 'graphs'); mkdirSync(out, { mode: 0o700 }); mkdirSync(graphs);
+  const marketState = join(w.root, 'market-state'); mkdirSync(marketState, { mode: 0o700 });
   const durablePath = join(out, 'nano-wallet-checkpoint.json'), healthPath = join(out, 'funding-health.json');
   cpSync(join(packageRoot, 'tests/fixtures/hello-noodle.json'), join(graphs, 'hello.json'));
   const file = join(out, 'near-state.json');
@@ -223,7 +224,7 @@ test('the hosted CLI recovers a recorded refund once and refuses stale Nano peer
       '--serve', `127.0.0.1:${port}`, '--public-url', base, '--key', 'synthetic-no-account-key', '--near-merchant', merchant,
       '--near-network', 'testnet', '--near-rpc', chain.url, '--near-usd', '3.64'],
       { env: { PATH: process.env.PATH, NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NANOODLE_STATE_POLICY: policy,
-        NANO_SEED: seed, NANO_RPC_URL: `${rpcBase}/a,${rpcBase}/b`,
+        NANO_SEED: seed, NANO_RPC_URL: `${rpcBase}/a,${rpcBase}/b`, MARKET_STATE_DIR: marketState,
         NANOODLE_WRITER_LOCK_DIR: join(w.root, 'locks'), NANOODLE_MAINTENANCE_FILE: w.file,
         NANOODLE_MAINTENANCE_STARTUP_FILE: w.startupFile, NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) }, stdio: ['ignore', 'ignore', 'pipe'] });
     let log = ''; child.stderr.on('data', chunk => { log += chunk; });
@@ -242,7 +243,11 @@ test('the hosted CLI recovers a recorded refund once and refuses stale Nano peer
       assert.equal((await fetch(base + '/out/nano-wallet-checkpoint.json')).status, 404);
       assert.ok(nanoCalls.slice(priorNanoCalls).every(call => ['account_info', 'block_info'].includes(call.action)));
       nanoHeight = 10;
-      await wait(() => funding().ok === true);
+      try { await wait(() => funding().ok === true); }
+      catch (error) {
+        const { code, checkedAt } = funding();
+        throw new Error(`Funding report ${code} at ${checkedAt}`, { cause: error });
+      }
       assert.equal(funding().process.pid, child.pid);
       assert.equal(chain.sendTxCount, 1);
       assert.equal(nano.runs(), 0);
