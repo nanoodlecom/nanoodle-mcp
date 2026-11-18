@@ -34,7 +34,8 @@ import { NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountV
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
-import { RAW_PER_XNO } from "../src/near/rates.mjs";
+import { RAW_PER_XNO, parseSpreadBps, spreadPair } from "../src/near/rates.mjs";
+import { exactUsd } from "../src/custom-workflow.mjs";
 import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -79,6 +80,25 @@ function savedPricingContent(result) {
   need(amounts.every(positiveDecimal) && Number(amounts[0]) <= Number(amounts[1])
     && Number(amounts[1]) <= Number(amounts[2]), "saved-workflow-preview-invalid");
   return content;
+}
+
+function previewDeposit(content, asset, network) {
+  const currency = content[asset], depositUsd = content.pricing.deposit.usd;
+  need(currency?.network === network, "saved-workflow-denomination-invalid");
+  if (asset === "usdc") {
+    need(currency.tokenContract === USDC_CONTRACTS[network] && currency.decimals === 6
+      && currency.usdcUsd === "1", "saved-workflow-denomination-invalid");
+    return usdToYocto(depositUsd, USDC_RATE, "ceil");
+  }
+  need(positiveDecimal(currency.rate?.nearUsd) && positiveDecimal(currency.depositNear)
+    && positiveDecimal(currency.likelyChargeNear), "saved-workflow-denomination-invalid");
+  const amount = parseNearToYocto(currency.depositNear);
+  need(amount >= parseNearToYocto(currency.likelyChargeNear), "saved-workflow-denomination-invalid");
+  const rate = spreadPair(parseUsdNano(currency.rate.nearUsd), parseSpreadBps(currency.rate.spreadBps));
+  const yocto = usdToYocto(depositUsd, rate, "ceil");
+  const base = ((yocto + DUST_STEP_YOCTO - 1n) / DUST_STEP_YOCTO) * DUST_STEP_YOCTO;
+  need(amount === base, "near-deposit-conversion-invalid");
+  return amount;
 }
 
 export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("../", import.meta.url))) {
@@ -164,6 +184,15 @@ export async function runOperationalCheck(config, deps = {}) {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
     need(!result.error && result.result, "mcp-error"); return result.result;
   };
+  const freshPriceOptions = {
+    fetch: request, baseUrl: config.nanoGptBase, allowShortLinks: false, requireFreshCatalogs: true, limits: { maxDepositUsd: 1_000_000 },
+  };
+  async function freshCharge(args) {
+    const priced = await priceWorkflow(args, freshPriceOptions);
+    const charge = priced?.pricing?.likelyChargeUsd;
+    need(priced?.safety?.ok === true && Number.isFinite(charge) && charge >= 0, "workflow-provider-pricing-unavailable");
+    return parseUsdNano(exactUsd(charge));
+  }
   async function checkSavedWorkflows(site, tools, assets, heldAmounts = null) {
     const names = assets.includes("nano") ? SHARED_SAVED_WORKFLOWS : [...SHARED_SAVED_WORKFLOWS, NEAR_WORKFLOW_TEMPLATE];
     for (const name of names) {
@@ -177,8 +206,9 @@ export async function runOperationalCheck(config, deps = {}) {
         need(Array.isArray(value?.nodes) && value.nodes.length > 0 && Array.isArray(value.links), "saved-workflow-graph-invalid");
         return value;
       })();
+      const fresh = graph.then(published => freshCharge({ graph: published }));
       await Promise.all(assets.map(asset => check(`saved-workflow-${asset}-${name}`, async () => {
-        const published = await graph;
+        const [published, charge] = await Promise.all([graph, fresh]);
         const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph: published, _pay_with: asset === "nano" ? "near" : asset } }, site);
         const content = savedPricingContent(result);
         if (asset === "nano") {
@@ -187,24 +217,15 @@ export async function runOperationalCheck(config, deps = {}) {
           const amount = typeof tool.description === "string"
             && tool.description.match(/Runs on NanoGPT — \$(\d+(?:\.\d+)?) deposit per call, paid in Nano \(XNO\) —/)?.[1];
           need(!tool.pricedPerRequest && positiveDecimal(amount), "saved-nano-deposit-unavailable");
-          need(Number(amount) >= Number(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
+          const deposit = parseUsdNano(amount);
+          need(deposit >= charge && deposit >= parseUsdNano(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
         } else {
-          const currency = content[asset];
-          need(currency?.network === config.network, "saved-workflow-denomination-invalid");
-          if (asset === "usdc") {
-            need(currency.tokenContract === USDC_CONTRACTS[config.network] && currency.decimals === 6
-              && currency.usdcUsd === "1", "saved-workflow-denomination-invalid");
-          } else {
-            need(positiveDecimal(currency.rate?.nearUsd) && positiveDecimal(currency.depositNear)
-              && positiveDecimal(currency.likelyChargeNear) && Number(currency.depositNear) >= Number(currency.likelyChargeNear),
-            "saved-workflow-denomination-invalid");
-          }
+          need(parseUsdNano(content.pricing.deposit.usd) >= charge, "saved-workflow-deposit-too-low");
+          const base = previewDeposit(content, asset, config.network);
           const held = heldAmounts?.[asset];
           if (held?.size >= Math.ceil(QUOTE_DUST_SLOTS * CAPACITY_WARNING)) {
             // The native preview gives the dust-rounded base, before a unique
             // payment amount is assigned. USDC uses whole micro-USDC units.
-            const base = asset === "near" ? parseNearToYocto(currency.depositNear)
-              : usdToYocto(content.pricing.deposit.usd, USDC_RATE, "ceil");
             const step = asset === "near" ? DUST_STEP_YOCTO : 1n;
             let occupied = 0;
             for (let dust = 1; dust <= QUOTE_DUST_SLOTS; dust++) {
@@ -534,10 +555,13 @@ export async function runOperationalCheck(config, deps = {}) {
     nanoTools && checkSavedWorkflows(config.nanoSite, nanoTools, ["nano"]),
   ]);
   await check("custom-workflow-pricing", async () => {
-    const sample = checkGraph("readonly-operational-probe", true);
+    const { graph, inputs } = checkGraph("readonly-operational-probe", true);
+    const charge = await freshCharge({ graph, inputs });
     for (const asset of ["near", "usdc"]) {
-      const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph: sample.graph, inputs: sample.inputs, _pay_with: asset } });
-      need(!result.isError && result.structuredContent?.pricing?.safety?.ok, "custom-workflow-not-priceable");
+      const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph, inputs, _pay_with: asset } });
+      const content = savedPricingContent(result);
+      need(parseUsdNano(content.pricing.deposit.usd) >= charge, "custom-workflow-deposit-too-low");
+      previewDeposit(content, asset, config.network);
     }
   }, ["near", "usdc", "market"]);
   if (near) {
@@ -722,7 +746,7 @@ export async function runOperationalCheck(config, deps = {}) {
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
       const priced = await priceWorkflow({ graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } },
-        { fetch: request, baseUrl: config.nanoGptBase, allowShortLinks: false, limits: { maxDepositUsd: 1_000_000 } });
+        freshPriceOptions);
       need(priced.safety.ok && priced.pricing, "workflow-not-priceable");
       const listing = await fetchListingPrice({ baseUrl: config.marketUrl, handle: agent.handle, fetch: request });
       need(listing.ok && listing.listingStatus === "live", "market-price-unavailable");

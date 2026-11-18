@@ -107,7 +107,7 @@ function fixture(override = () => null) {
     isWorkerAlive: () => true,
     probeStateWrite: () => {},
     unitState: unit => unit.endsWith(".timer") ? { ActiveState: "active", UnitFileState: "enabled", LastTriggerUSec: "@" + String(NOW / 1000) } : { ActiveState: "inactive", Result: "success" },
-    computePrice: async () => ({ safety: { ok: true }, pricing: { estimatedCostUsd: 0.01 } }),
+    computePrice: async () => ({ safety: { ok: true }, pricing: { estimatedCostUsd: 0.01, likelyChargeUsd: 0.012 } }),
     fetch: async (input, init = {}) => {
       const url = new URL(input), body = init.body ? JSON.parse(init.body) : null;
       const call = { url, init, body }; calls.push(call);
@@ -497,6 +497,49 @@ test("saved workflow probes flag thin Nano deposits, invalid USDC previews and m
   } finally {
     rmSync(f.config.stateDir, { recursive: true, force: true });
   }
+});
+
+test("a formerly adequate deposit fails when fresh provider pricing rises or a model disappears", async t => {
+  const f = fixture(), price = f.deps.computePrice, localCalls = [];
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.deps.computePrice = async ({ graph, inputs }, options) => {
+    assert.equal(options.requireFreshCatalogs, true);
+    assert.equal(options.allowShortLinks, false);
+    localCalls.push(graph.name);
+    if (graph.name === "sing") return { safety: { ok: true }, pricing: { likelyChargeUsd: 0.06 } };
+    if (graph.name === "photo-to-video") return { safety: { ok: false }, pricing: null };
+    if (inputs?.Marker) return { safety: { ok: true }, pricing: { likelyChargeUsd: 0.04 } };
+    return price();
+  };
+  const report = await runOperationalCheck(f.config, f.deps);
+  const outcome = stage => report.checks.find(c => c.stage === stage);
+  for (const asset of ["nano", "near", "usdc"]) {
+    assert.equal(outcome(`saved-workflow-${asset}-sing`).code,
+      asset === "nano" ? "saved-nano-deposit-too-low" : "saved-workflow-deposit-too-low");
+    assert.equal(outcome(`saved-workflow-${asset}-photo-to-video`).code, "workflow-provider-pricing-unavailable");
+    assert.deepEqual(outcome(`saved-workflow-${asset}-sing`).domains, []);
+  }
+  assert.equal(localCalls.filter(name => name === "sing").length, 2);
+  assert.equal(outcome("custom-workflow-pricing").code, "custom-workflow-deposit-too-low");
+});
+
+test("saved NEAR deposit conversion includes the quoted spread and rounds up to a microNEAR", async t => {
+  const f = fixture(({ url, body }) => {
+    const args = body?.params?.arguments;
+    if (url.hostname !== "site.example" || args?._pay_with !== "near") return null;
+    if (!["sing", "photo-to-video"].includes(args.graph.name)) return null;
+    const preview = pricePreview("near");
+    preview.near.rate.nearUsd = "7";
+    preview.near.rate.spreadBps = 149;
+    preview.near.depositNear = args.graph.name === "sing" ? "0.00435" : "0.004349";
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: { structuredContent: preview } });
+  });
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  const outcome = stage => report.checks.find(c => c.stage === stage);
+  assert.equal(outcome("saved-workflow-near-sing").ok, true);
+  assert.equal(outcome("saved-workflow-near-photo-to-video").code, "near-deposit-conversion-invalid");
+  assert.equal(outcome("saved-workflow-usdc-photo-to-video").ok, true);
 });
 
 test("the monitor warns before the shared NEAR and USDC quote queue fills and reports it full at the limit", async t => {
