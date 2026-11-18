@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { atomicJson } from "./near-check.mjs";
+import { atomicJson } from "./atomic-json.mjs";
 import { checkMarketAvailability } from "../src/market/public-availability.mjs";
 
 export { MARKET_HANDLES } from "../src/market/public-availability.mjs";

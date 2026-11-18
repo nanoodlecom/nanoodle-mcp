@@ -9,6 +9,7 @@ on:
       - .github/workflows/public-check.yml
       - scripts/public-mcp-check.mjs
       - scripts/market-check.mjs
+      - scripts/atomic-json.mjs
       - src/probe-http.mjs
       - src/public-mcp-check.mjs
       - src/market/public-availability.mjs
@@ -41,6 +42,4 @@ jobs:
         env:
           CHECK_STATE_DIR: ${{ runner.temp }}/nanoodle-market-public
         shell: bash
-        run: |
-          npm ci --ignore-scripts --omit=dev
-          node scripts/market-check.mjs | tee -a "$GITHUB_STEP_SUMMARY"
+        run: node scripts/market-check.mjs | tee -a "$GITHUB_STEP_SUMMARY"

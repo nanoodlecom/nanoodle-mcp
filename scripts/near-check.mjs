@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 // A paid production canary. Run under flock; see docs/near-monitoring.md.
-import { mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdirSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { createNearRpcPool, loadNearSigner, NEAR_NETWORKS, signTransfer, parseNearToYocto, formatYoctoAsNear } from "../src/near/index.mjs";
 import { readNearTransferFunding } from "../src/near/funding.mjs";
 import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib.mjs";
 import { callMcp, resultText } from "../src/near-site-browser.mjs";
+import { atomicJson } from "./atomic-json.mjs";
 
+export { atomicJson } from "./atomic-json.mjs";
 export const DEFAULT_CHECK_MAX_NEAR = "0.01";
 
 export function checkGraph(marker, twoSteps = false) {
@@ -34,15 +36,6 @@ function correctOutput(result, state) {
   // Validate the model output itself, not marker text in billing or metadata.
   const text = result?.content?.find(c => c.type === "text")?.text;
   return /^[a-f0-9]{16}$/.test(state.marker) && typeof text === "string" && text.trim() === state.marker;
-}
-
-// fsync before rename, including the directory: never broadcast an unrecorded tx.
-export function atomicJson(file, value) {
-  const tmp = file + ".tmp", fd = openSync(tmp, "w", 0o600);
-  try { writeFileSync(fd, JSON.stringify(value, null, 2) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, file);
-  const dir = openSync(resolve(file, ".."), "r");
-  try { fsyncSync(dir); } finally { closeSync(dir); }
 }
 
 /** Dependencies are injectable so crash recovery and payment limits run offline. */
