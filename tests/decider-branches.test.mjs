@@ -4,21 +4,37 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadTools } from "../src/tools.mjs";
+import { computePrice, loadTools } from "../src/tools.mjs";
 import { checkGraphSafety, priceGraph, pricingVocabulary } from "../src/custom-workflow.mjs";
 
 const { cases, legacy, ...graph } = JSON.parse(readFileSync(new URL("./fixtures/conditional/decider-branches.json", import.meta.url)));
 const models = Object.fromEntries(graph.nodes.filter(n => n.type === "llm").map(n => [n.fields.model, n.id]));
-const chat = Object.keys(models).concat(graph.nodes[1].fields.model).map(id => ({
+const chat = Object.keys(models).map(id => ({
   id, name: id, pricing: { prompt: 0.1, completion: 0.1 }, context_length: 32768,
 }));
 
-test("paid graph validation and reserve keep both branches priceable", () => {
+const decision = [{ id: graph.nodes[1].fields.model, pricing: { prompt: 0.02, completion: 0 }, context_length: 262144 }];
+
+test("paid graph validation and reserve keep both branches priceable", async () => {
   const checked = checkGraphSafety(graph);
   assert(checked.ok, JSON.stringify(checked.refusals));
-  const pricing = priceGraph(checked.workflowGraph, { chat });
+  const requested = new Set();
+  const { safety, pricing } = await computePrice({ graph }, {
+    baseUrl: "https://decision-catalog.test",
+    fetch: async (input) => {
+      const { pathname } = new URL(input);
+      requested.add(pathname);
+      if (pathname === "/api/v1/models") return Response.json({ data: chat });
+      if (pathname === "/api/v1/decision-models") return Response.json({ data: decision });
+      assert.fail(`unexpected catalog: ${pathname}`);
+    },
+  });
+  assert(safety.ok, JSON.stringify(safety.refusals));
+  assert.deepEqual(requested, new Set(["/api/v1/models", "/api/v1/decision-models"]));
   assert.equal(pricing.unpriced.length, 0);
   assert.equal(pricing.items.length, 6);
+  assert.equal(pricing.items.filter(item => item.type === "decide" && item.usd > 0).length, 2);
+  assert.equal(priceGraph(checked.workflowGraph, { chat: [...chat, ...decision] }).unpriced.length, 2);
   assert.match(pricingVocabulary(pricing).text, /estimate reserves for all branches/);
 
   const malformed = structuredClone(graph);
@@ -34,7 +50,7 @@ test("run_noodle executes and meters only the selected branch", async (t) => {
   let calls, answers;
   globalThis.fetch = async (url, opts = {}) => {
     const path = new URL(url).pathname;
-    if ((opts.method || "GET") === "GET") return Response.json({ data: chat });
+    if ((opts.method || "GET") === "GET") return Response.json({ data: path === "/api/v1/decision-models" ? decision : chat });
     const data = JSON.parse(opts.body);
     if (path === "/api/v1/decisions") {
       calls.push(calls.includes("n2") ? "n5" : "n2");

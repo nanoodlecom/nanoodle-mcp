@@ -1153,7 +1153,7 @@ const GUIDE_PORTS = {
   join: { text: ["a", "b"], fields: "sep (separator, default a space)" },
   comment: { text: [], fields: "text (a note; does nothing)" },
   llm: { text: ["prompt", "system"], media: "img1, img2, ... (images, for a model that can see them)", fields: `model (a chat model), maxTokens (output limit; default ${DEFAULT_CHAT_OUTPUT_TOKENS})` },
-  decide: { text: ["text", "question"], media: "img1, img2, ... (candidate images)", fields: "model (a chat model that supports decisions), mode (pick, choose, score or yesno), question, options (choose), levels (score)" },
+  decide: { text: ["text", "question"], media: "img1, img2, ... (candidate images)", fields: "model (a decision model), mode (pick, choose, score or yesno), question, options (choose), levels (score)" },
   image: { text: ["prompt"], fields: "model (an image model), size, variations" },
   edit: { text: ["prompt"], media: "image, image2, ... (source images)", fields: "model (an image model), size" },
   tvideo: { text: ["prompt"], media: "ref1, ref2, ... (reference images)", fields: "model (a video model), duration (seconds; default: the model's), resolution, aspect" },
@@ -1163,7 +1163,7 @@ const GUIDE_PORTS = {
   model3d: { text: ["prompt"], media: "image", fields: "model (a model3d model; default tripo3d/v2.5)" },
 };
 
-const MODEL_KINDS_LINE = "Model kinds: chat -> llm, decide; image -> image, edit; video -> tvideo, ivideo; audio -> music, tts; model3d -> model3d.";
+const MODEL_KINDS_LINE = "Model kinds: chat -> llm; decision -> decide, decide-branch; image -> image, edit; video -> tvideo, ivideo; audio -> music, tts; model3d -> model3d.";
 
 const WIRING_RULES = [
   "A wire into a text port (prompt, system, a join's a/b, a decide's text) replaces that field at run time. An unwired prompt, or a text node's text, becomes a caller input keyed by the node's name.",
@@ -1190,7 +1190,7 @@ const EXAMPLE_GRAPH = Object.freeze({
   ],
 });
 
-const KINDS = ["chat", "image", "video", "audio", "model3d"];
+const KINDS = ["chat", "decision", "image", "video", "audio", "model3d"];
 
 function smallestNumber(o) {
   let best = null;
@@ -1207,6 +1207,11 @@ function modelSummary(kind, m) {
     const pin = num(p.prompt), pout = num(p.completion);
     if (pin == null && pout == null) return { sort: null, unitPrice: "price varies (not quotable)" };
     return { sort: (pin || 0) + (pout || 0), unitPrice: `$${pin ?? 0} in / $${pout ?? 0} out per 1M tokens` };
+  }
+  if (kind === "decision") {
+    const input = num(p.prompt);
+    if (input == null) return { sort: null, unitPrice: "price varies (not quotable)" };
+    return { sort: input, unitPrice: `$${input} per 1M input tokens` };
   }
   if (kind === "image") {
     const per = p.per_image && typeof p.per_image === "object" ? p.per_image : {};

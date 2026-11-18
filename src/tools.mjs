@@ -39,6 +39,7 @@ export function editorShareUrl(rawText) {
 /** Public NanoGPT catalog endpoints by pricing kind — no API key, `{ data: [...] }`. */
 const CATALOG_PATH = {
   chat: "/api/v1/models?detailed=true",
+  decision: "/api/v1/decision-models",
   image: "/api/v1/image-models",
   video: "/api/v1/video-models",
   audio: "/api/v1/audio-models",
@@ -533,7 +534,7 @@ const RUN_NOODLE_NAME = "run_noodle";
 export const PRICE_NOODLE_NAME = "price_noodle";
 export const NOODLE_GUIDE_NAME = "noodle_guide";
 /** Model catalog kinds noodle_guide can list. */
-const GUIDE_KINDS = ["chat", "image", "video", "audio", "model3d"];
+const GUIDE_KINDS = ["chat", "decision", "image", "video", "audio", "model3d"];
 
 /** `url` / `graph` / `inputs`: the arguments run_noodle and price_noodle share. */
 const graphArgProperties = () => ({
