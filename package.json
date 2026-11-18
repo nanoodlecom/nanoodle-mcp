@@ -29,6 +29,7 @@
     "nanocurrency": "^2.5.0",
     "nanoodle": "file:vendor/nanoodle-0.9.0-decider-branches.tgz"
   },
+  "bundleDependencies": ["nanoodle"],
   "keywords": [
     "mcp",
     "model-context-protocol",

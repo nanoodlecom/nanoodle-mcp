@@ -1,46 +1,63 @@
 name: publish-mcp-registry
 
-# Publishes server.json to the official MCP registry
-# (registry.modelcontextprotocol.io). OIDC from this org repo grants the
-# io.github.nanoodlecom/* namespace — no interactive login, no secrets.
-#
-# Run it manually after each npm publish (PUBLISHING.md has the version-bump
-# rule: package.json + server.json version + server.json packages[0].version).
-
-on: workflow_dispatch
+on:
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   publish:
+    if: github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: mcp-registry-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
-
-      # server.json is the registry entry, package.json is what npm published.
-      # If they disagree, the registry lists metadata for a version that is not
-      # the tarball it points at. Stop before the publish, not after.
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: "24.22.1"
+          node-version: '24.22.1'
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
-
-      # The guard above is offline: every assertion in it compares repo files to
-      # each other, so it passes whenever server.json matches package.json — even
-      # if npm has never published that version. This step asks npm. The registry
-      # entry points at an npm tarball, so the tarball must exist first.
       - name: Assert the release is published on npm
         run: node scripts/assert-npm-version.mjs
-
-      - name: Install mcp-publisher
+      - name: Check the exact MCP Registry version
+        id: existing
         run: |
-          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
-
-      - name: Publish to MCP registry
+          server="$(jq -er '.name | @uri' server.json)"
+          version="$(jq -er '.version | @uri' server.json)"
+          status="$(curl --silent --show-error --retry 2 --max-time 30 \
+            --output "$RUNNER_TEMP/mcp-version.json" --write-out '%{http_code}' \
+            "https://registry.modelcontextprotocol.io/v0.1/servers/$server/versions/$version")"
+          case "$status" in
+            200)
+              jq -e --slurpfile desired server.json '
+                .server.name == $desired[0].name and .server.version == $desired[0].version and
+                any(.server.packages[]; .registryType == "npm" and .identifier == "nanoodle-mcp" and .version == $desired[0].version)
+              ' "$RUNNER_TEMP/mcp-version.json" >/dev/null
+              echo "MCP Registry already lists $(jq -r '.version' server.json)"
+              ;;
+            404) echo 'publish=true' >> "$GITHUB_OUTPUT" ;;
+            *) echo "MCP Registry version lookup returned HTTP $status" >&2; exit 1 ;;
+          esac
+      - name: Install verified MCP publisher
+        if: steps.existing.outputs.publish == 'true'
         run: |
-          ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+          archive="$RUNNER_TEMP/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSL --retry 2 --max-time 90 --output "$archive" \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.9/mcp-publisher_linux_amd64.tar.gz
+          printf '%s  %s\n' 4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8 "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" mcp-publisher
+      - name: Publish to the MCP Registry
+        if: steps.existing.outputs.publish == 'true'
+        run: |
+          "$RUNNER_TEMP"/mcp-publisher login github-oidc
+          "$RUNNER_TEMP"/mcp-publisher publish
