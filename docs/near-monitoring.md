@@ -153,6 +153,13 @@ all normal probes and alerts on failure; it never reports recovery by itself.
 These warm-up GET requests execute no workflows or payments. This avoids the
 temporary 502 alarm observed just after the planned 2026-11-17 backup drill.
 
+The readiness check reads active Market assignments, then compares each paid
+hire with the worker's local state. It flags hires still untracked after five
+minutes, remote starts without a corresponding local record, and active
+assignments past their Market deadline. It reports if the bounded five-page
+scan cannot cover the full queue. The reports and Babel alerts carry fixed
+diagnostic codes. They omit assignment IDs and buyer text.
+
 ## NEAR AI Market availability every 15 minutes
 
 `scripts/market-check.mjs` makes public GET requests to `market.near.ai`: the

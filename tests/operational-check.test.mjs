@@ -472,6 +472,56 @@ test("the read-only Market probe reports unverified active escrow without retain
   assert.equal(entry.url.searchParams.get("limit"), "100");
 });
 
+function marketIntakeRow(age, fields = {}) {
+  return { assignment: { assignmentId: ID, status: "in_progress", escrowAmount: "1.00", escrowToken: "USDC",
+    createdAt: new Date(NOW - age).toISOString(), slaDeadlineAt: new Date(NOW + 600_000).toISOString(), ...fields },
+  job: { jobKind: "instant", title: "PRIVATE_BUYER_BRIEF" } };
+}
+
+test("Market intake catches unclaimed hires, remote starts missing local state and expired SLAs", async () => {
+  const fresh = marketIntakeRow(40_000);
+  const cases = [
+    [fresh, false, null],
+    [marketIntakeRow(301_000), false, "market-intake-untracked"],
+    [marketIntakeRow(40_000, { startedAt: new Date(NOW - 1000).toISOString() }), false, "market-intake-start-without-record"],
+    [marketIntakeRow(40_000, { deliverableUrl: "/PRIVATE_REWORK_DELIVERABLE" }), false, "market-intake-start-without-record"],
+    [{ ...fresh, latestMessage: { senderSide: "worker" } }, false, "market-intake-start-without-record"],
+    [marketIntakeRow(301_000), true, null],
+    [marketIntakeRow(301_000, { slaDeadlineAt: new Date(NOW - 1).toISOString() }), true, "market-intake-sla-expired"],
+    [marketIntakeRow(40_000, { createdAt: "unavailable" }), false, "market-intake-timing-invalid"],
+    [{ ...fresh, job: { jobKind: "competition" }, assignment: {} }, false, null],
+  ];
+  for (const [row, local, code] of cases) {
+    const f = fixture(({ url }) => {
+      if (url.pathname !== "/v1/agents/me/assignments") return null;
+      if (local) f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = { phase: "starting" };
+      return Response.json({ assignments: [row] });
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const intake = report.checks.find(check => check.stage === "market-intake-nanoodle-image");
+    assert.equal(intake.code ?? null, code);
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: code === null });
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(`${ID}|PRIVATE_BUYER_BRIEF|PRIVATE_REWORK_DELIVERABLE`));
+  }
+});
+
+test("Market intake reads later pages and reports an exhausted scan budget", async () => {
+  for (const exhausted of [false, true]) {
+    const page = Array.from({ length: 100 }, () => ({ job: { jobKind: "competition" } }));
+    const f = fixture(({ url }) => {
+      if (url.pathname !== "/v1/agents/me/assignments") return null;
+      const offset = Number(url.searchParams.get("offset"));
+      return Response.json({ assignments: exhausted || offset === 0 ? page : [marketIntakeRow(301_000)] });
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.market, false);
+    assert.equal(report.checks.find(check => check.stage === "market-intake-nanoodle-image").code,
+      exhausted ? "market-intake-scan-incomplete" : "market-intake-untracked");
+    const offsets = f.calls.filter(call => call.url.pathname === "/v1/agents/me/assignments").map(call => call.url.searchParams.get("offset"));
+    assert.deepEqual(offsets, exhausted ? ["0", "100", "200", "300", "400"] : ["0", "100"]);
+  }
+});
+
 test("a changed Market fee or invalid agent token is actionable even when public listings still respond", async () => {
   for (const kind of ["fee", "token"]) {
     const f = fixture(({ url }) => {
