@@ -10,6 +10,8 @@ on:
       - scripts/public-mcp-check.mjs
       - scripts/market-check.mjs
       - src/probe-http.mjs
+      - src/public-mcp-check.mjs
+      - src/market/public-availability.mjs
       - tests/public-mcp-check.test.mjs
 
 permissions:

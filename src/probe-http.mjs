@@ -14,6 +14,6 @@ export function createProbeFetch({ fetch = globalThis.fetch, timeoutMs = 12_000,
         chunks.push(part.value);
       }
     } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
-    return new Response(Buffer.concat(chunks), { status: res.status, statusText: res.statusText, headers: res.headers });
+    return new Response(new Blob(chunks), { status: res.status, statusText: res.statusText, headers: res.headers });
   };
 }

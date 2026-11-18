@@ -299,3 +299,21 @@ VPS monitors still check wallet balances, agreement between nodes and private
 payment state. They send their alerts to Ember through Babel. A whole VPS
 outage can interrupt that route, while GitHub can still record the public
 failure. [GitHub schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+
+The same public probes can also run on Cloudflare as the
+`nanoodle-public-availability` Worker. Its configuration in
+`ops/cloudflare-public-check.jsonc` schedules the checks every 15 minutes and
+exposes no HTTP route. The Worker logs a count and fixed failure codes, and a
+failed probe marks the scheduled event failed. Check the Worker's logs or Cron
+Events in the Cloudflare dashboard for execution evidence. This deployment has
+no notification integration. [Cloudflare Cron Events](https://developers.cloudflare.com/workers/configuration/cron-triggers/#view-past-events)
+
+Run the Worker against the production public URLs from the local Workers runtime
+before deploying.
+
+```sh
+npx wrangler@4.164.0 dev --local --test-scheduled --config ops/cloudflare-public-check.jsonc
+curl -fsS 'http://127.0.0.1:8787/cdn-cgi/local/scheduled?format=json'
+npx wrangler@4.164.0 deploy --config ops/cloudflare-public-check.jsonc
+npx wrangler@4.164.0 tail nanoodle-public-availability --format json
+```
