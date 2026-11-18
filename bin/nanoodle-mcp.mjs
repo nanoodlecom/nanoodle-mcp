@@ -681,6 +681,8 @@ async function main() {
         usage: usageLog, maintenance,
       });
       fundingSources?.registerNano(gate.fundingLiabilitiesRaw, gate.nanoTransferClaims);
+      if (maintenance) await maintenance.recover(() => gate.resume());
+      else await gate.resume();
       const nanoWrapped = gate.wrapRegistry(registry);
       ({ listTools, callTool } = nanoWrapped);
       const nanoInstructions =
