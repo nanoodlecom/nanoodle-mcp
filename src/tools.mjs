@@ -759,6 +759,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
       const rec = result.nodes && result.nodes[o.nodeId];
       if (rec && rec.status === "skipped" && rec.gatedBy) {
         content.push({ type: "text", text: `${o.key}: skipped — gate "${gateName(rec.gatedBy)}" answered no` });
+      } else if (rec?.skipReason === "branch") {
+        content.push({ type: "text", text: `${o.key}: skipped — branch not selected` });
       }
       continue;
     }

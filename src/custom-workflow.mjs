@@ -17,7 +17,7 @@
 //                   XNO"), and the swap margin when non-zero; locked by a quote
 
 import {
-  Workflow, NODE_TYPES, displayName, topoSort, estimateGraphCost, graphModelKinds, decodeShareUrl,
+  Workflow, NODE_TYPES, displayName, topoSort, estimateGraphCost, graphModelKinds, decodeShareUrl, planBranches,
 } from "nanoodle";
 import { gunzipSync, constants as zlibConstants } from "node:zlib";
 import { knownUsd } from "./usd.mjs";
@@ -289,7 +289,7 @@ export function checkGraphSafety(graph, { inputs = {}, limits = DEFAULT_LIMITS }
     seen.add(n.id);
   }
   if (seen.size === g.nodes.length) {
-    try { topoSort(g); } catch (e) { refusals.push({ code: "BAD_GRAPH", message: String((e && e.message) || e) }); }
+    try { planBranches(g, topoSort(g).map(n => n.id)); } catch (e) { refusals.push({ code: "BAD_GRAPH", message: String((e && e.message) || e) }); }
   }
 
   for (const w of wf.warnings || []) {
@@ -337,7 +337,8 @@ export function checkGraphSafety(graph, { inputs = {}, limits = DEFAULT_LIMITS }
     if (!allowedNode(S) || !allowedNode(D)) continue; // the node itself is already refused
     const port = l.to.port;
     const out = (NODE_TYPES[S.type].outputs || []).find((o) => o.name === l.from.port);
-    const srcType = out ? out.type : null;
+    const routed = S.type === "decide" && S.fields.branch === true && ["yes", "no"].includes(l.from.port);
+    const srcType = routed ? "text" : out ? out.type : null;
     const base = { code: "UNSAFE_WIRING", nodeId: D.id, type: D.type };
     if (MEDIA_PORT_RE.test(port)) {
       if (D.type === "llm" && port === "audio") {
@@ -505,7 +506,7 @@ function basisFor(n, pricedNode, entry, pricingGraph) {
   if (n.type === "decide") {
     const imgs = pricingGraph.links.filter((l) => l.to.node === n.id && /^img\d+$/.test(l.to.port)).length;
     const inTok = 120 + Math.round((textLen(f.question) + textLen(f.options) + textLen(f.levels)) / 4) + 250 + imgs * 400;
-    const asks = (f.mode === "choose" || f.mode === "score" || f.mode === "yesno") ? 1 : 2;
+    const asks = (f.branch === true || f.mode === "choose" || f.mode === "score" || f.mode === "yesno") ? 1 : 2;
     return `up to ${inTok} input tokens per ask, ${asks} ask${asks === 1 ? "" : "s"} (usually less)`;
   }
   if (kind === "chat") {
@@ -645,7 +646,7 @@ function textBounds(g) {
       case "choice": b = Math.max(0, ...String(f.options || "").split("\n").map((s) => s.trim().length)); break;
       case "join": b = inBound(n.id, "a") + inBound(n.id, "b") + String(f.sep != null ? f.sep : " ").length; break;
       case "llm": b = (Number(f.maxTokens) > 0 ? Number(f.maxTokens) : DEFAULT_CHAT_OUTPUT_TOKENS) * CHARS_PER_TOKEN; break;
-      case "decide": b = DECIDE_OUT_CHARS; break;
+      case "decide": b = f.branch === true ? Math.max(DECIDE_OUT_CHARS, inBound(n.id, "text")) : DECIDE_OUT_CHARS; break;
       default: b = ((NODE_TYPES[n.type] && NODE_TYPES[n.type].outputs) || []).some((o) => o.type === "text") ? MAX_TEXT_CHARS : 0;
     }
     out.set(n.id, Math.min(MAX_TEXT_CHARS, b));
@@ -760,6 +761,7 @@ export function priceGraph(workflowGraph, catalogs, { inputs = {} } = {}) {
   const headroom = fixedPrice ? 1.25 : 2;
   return {
     estimatedCostUsd, fixedPrice, items, unpriced,
+    ...(g.nodes.some(n => n.type === "decide" && n.fields.branch === true) ? { conditional: true } : {}),
     /** Refusals found while binding (models priced only by a live quote). */
     refusals: bound.refusals,
     /** The graph to run: what was priced, with maxTokens and durations written in. */
@@ -961,6 +963,7 @@ export function pricingVocabulary(pricing, { near = null, safety = { ok: true, r
     lines.push(`This workflow cannot run on this server as written: ${refusals.length} problem${refusals.length === 1 ? "" : "s"}, listed at the end. The figures below are what it would cost once fixed.`);
   }
   lines.push(summary, depositWhySentence(p), "", ...pricingLines(p, near));
+  if (p.conditional) lines.push("", "The estimate reserves for all branches. The run settles on observed charges from the selected paths.");
   if (refusals.length) {
     lines.push("", "Problems to fix before this can run:");
     for (const r of refusals) lines.push(`- ${r.message}`);
@@ -1164,6 +1167,7 @@ const MODEL_KINDS_LINE = "Model kinds: chat -> llm, decide; image -> image, edit
 
 const WIRING_RULES = [
   "A wire into a text port (prompt, system, a join's a/b, a decide's text) replaces that field at run time. An unwired prompt, or a text node's text, becomes a caller input keyed by the node's name.",
+  "To run exactly one branch, use a node of type decide-branch with the same model and question as Decide. Wire its yes and no outputs to branch entry points. The selected port forwards its text input, or the answer when no text was supplied.",
   "A link may feed a media port (image, endframe, or a numbered img*, image*, ref* port) only from a media output (image, video, audio, model3d) of an allowed NanoGPT node, and a media output may feed only a media port.",
   "No link may target a pricing or URL field: model, size, variations, duration, resolution, maxTokens, modelOpts, loraUrl, loras, url, image, mask, audio, video. Set those in the node's fields.",
   "No node field may hold a value starting with http:, https:, data:, file: or blob:. The exception is a LoRA URL on tvideo or ivideo, which must be https:.",
