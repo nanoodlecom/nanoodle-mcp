@@ -124,6 +124,11 @@ function nanoCementationProgress(current, previous, now) {
   return { unchangedSince, peerMedianAtStart, stalled };
 }
 
+function currentNanoPaymentPeers(rows) {
+  const { current, latestConfirmed } = qualifyNanoAccountViews(rows);
+  return current.filter(row => row.paymentReads && row.view.confirmedHeight === latestConfirmed.confirmedHeight);
+}
+
 function backupVerificationProof(file, read, now, stage) {
   let record;
   try { record = read(file); }
@@ -496,12 +501,10 @@ export async function runOperationalCheck(config, deps = {}) {
     return { ...newest, peers: currentWitnesses.map(row => row.peer) };
   });
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
-  const fallbackPaymentReads = config.nanoRpcUrls.length >= 3 && await check("nano-fallback-payment-reads", async () => {
-    need(nano, "nano-fallback-payment-read-anchor-unavailable");
+  const paymentViews = nano ? (await Promise.all(nano.peers.map(async index => {
     const account = config.nanoAddress, head = nano.view.confirmedFrontier;
-    // The preferred node and quota-limited standby are excluded from this rehearsal.
-    const peers = nano.peers.filter(index => index !== 0);
-    const views = (await Promise.all(peers.map(index => check(`nano-payment-read-peer-${index}`, async () => {
+    let view;
+    const paymentReads = await check(`nano-payment-read-peer-${index}`, async () => {
       const url = config.nanoRpcUrls[index];
       const deadline = AbortSignal.timeout(config.timeoutMs || 12_000);
       const rpc = body => nanoRpc(url, body, deadline);
@@ -511,15 +514,28 @@ export async function runOperationalCheck(config, deps = {}) {
         source: "true", include_only_confirmed: "true" };
       const pending = await rpc(receivableRequest);
       const info = await rpc({ action: "account_info", account, representative: "true", include_confirmed: "true", receivable: "true" });
-      const view = nanoAccountView(info, checkAddress);
+      view = nanoAccountView(info, checkAddress);
       need(view.confirmedHeight >= nano.view.confirmedHeight
-        && (view.confirmedHeight !== nano.view.confirmedHeight || view.confirmedFrontier === head), "nano-fallback-payment-anchor-moved");
+        && (view.confirmedHeight !== nano.view.confirmedHeight || view.confirmedFrontier === head), "nano-payment-read-anchor-moved");
       checkedReceivable(pending, receivableRequest, view, checkAddress);
-      return { view, peer: index };
-    }, [])))).filter(Boolean);
-    const { current, latestConfirmed } = qualifyNanoAccountViews(views);
-    need(current.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight).length >= 2,
-      "nano-fallback-payment-read-quorum-unavailable");
+      return true;
+    }, []);
+    // A valid but newer account view still matters when its payment window
+    // failed validation. Two older windows cannot then prove current reads.
+    return view && { view, peer: index, paymentReads: paymentReads === true };
+  }))).filter(Boolean) : [];
+  await check("nano-payment-read-quorum", () => {
+    need(nano, "nano-payment-read-anchor-unavailable");
+    const ready = currentNanoPaymentPeers(paymentViews);
+    const standbyMatches = ready.length === 1 && standbyCheckpoint?.hash === ready[0].view.confirmedFrontier
+      && standbyCheckpoint.blockCount === ready[0].view.confirmedHeight.toString();
+    need(ready.length >= Math.min(2, config.nanoRpcUrls.length),
+      standbyMatches ? "nano-payment-read-standby-unverified" : "nano-payment-read-quorum-unavailable");
+  }, ["nano"]);
+  const fallbackPaymentReads = config.nanoRpcUrls.length >= 3 && await check("nano-fallback-payment-reads", () => {
+    need(nano, "nano-fallback-payment-read-anchor-unavailable");
+    // Reuse the same payment reads to check whether the first peer can be lost.
+    need(currentNanoPaymentPeers(paymentViews.filter(row => row.peer !== 0)).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
     return true;
   }, []);
   if (config.nanoStandby && !fallbackPaymentReads) await check("nano-standby-cold-scan-budget", () => {
