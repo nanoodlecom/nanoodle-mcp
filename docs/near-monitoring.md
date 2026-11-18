@@ -256,6 +256,11 @@ Coverage:
   assumption; authenticated Market token validity and actual worker lock/process.
 - Catalog pricing and Market net-price coverage for all four predefined graphs,
   plus free MCP pricing of a custom two-step graph in NEAR and USDC.
+- Free pricing for each of the five saved MCP workflows shown on both sites and
+  the paid 3D template. It checks NEAR/USDC denomination and compares the Nano
+  site's advertised fixed deposits with the current estimated charge for the
+  same published graphs. These per-workflow alerts preserve admission for other
+  workflows.
 - Disk/inode headroom and a write/fsync probe; disabled/overdue check timers and
   failed scheduled services, including the paid canary and alert-queue retry.
 

@@ -11,6 +11,7 @@ import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
+import { USDC_CONTRACTS } from "../src/near/index.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 
@@ -64,6 +65,18 @@ test("Market liveness follows the selected release and rejects a worker left beh
   assert.equal(isMarketWorkerAlive(original, next), false, "resolving argv alone would mistake the original worker for its replacement");
   assert.equal(isMarketWorkerAlive(await start(current), next), true);
   assert.throws(() => isMarketWorkerAlive({ ...original, boot: "foreign" }, next), /market-worker-lock-is-foreign/);
+});
+
+const SAVED_TOOLS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
+const toolsList = (deposit = "0.05") => [
+  ...SAVED_TOOLS.map(name => ({ name, description: `Runs on NanoGPT — $${deposit} deposit per call, paid in Nano (XNO) — settles at actual model cost + 20%` })),
+  ...["price_noodle", "run_noodle", "noodle_guide"].map(name => ({ name })),
+];
+const pricePreview = (asset) => ({
+  pricing: { currency: "USD", estimatedCost: { usd: "0.01" }, likelyCharge: { usd: "0.012" }, deposit: { usd: "0.03" },
+    safety: { ok: true }, unpriced: [] },
+  ...(asset === "usdc" ? { usdc: { network: "mainnet", tokenContract: USDC_CONTRACTS.mainnet, decimals: 6, usdcUsd: "1" } }
+    : { near: { network: "mainnet", rate: { nearUsd: "3" }, likelyChargeNear: "0.004", depositNear: "0.01" } }),
 });
 
 function fixture(override = () => null) {
@@ -125,10 +138,15 @@ function fixture(override = () => null) {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
           funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
+        if (/^\/(?:graph|examples)\//.test(url.pathname)) {
+          assert.equal(init.method || "GET", "GET");
+          const name = url.pathname.split("/")[2].slice(0, -5);
+          return json({ v: 1, name, nodes: [{ id: "input", type: "text", fields: { text: "sample" } }], links: [] });
+        }
         if (body.method === "initialize") return json({ serverInfo: { name: "nanoodle" } });
-        if (body.method === "tools/list") return json({ tools: ["sing", "price_noodle", "run_noodle", "noodle_guide"].map(name => ({ name })) });
+        if (body.method === "tools/list") return json({ tools: toolsList() });
         assert.equal(body.method, "tools/call"); assert.equal(body.params.name, "price_noodle", "never execute a paid tool or request a deposit");
-        return json({ structuredContent: { pricing: { safety: { ok: true } } } });
+        return json({ structuredContent: pricePreview(body.params.arguments._pay_with) });
       }
       if (url.hostname === "market.example") {
         assert.equal(init.method || "GET", "GET", "Market probes never mutate jobs/listings");
@@ -153,10 +171,48 @@ test("operational probes cover live readiness with no inference, signing or Mark
   assert.ok(report.checks.some(c => c.stage === "nano-liquidity")); assert.ok(report.checks.some(c => c.stage === "usdc-liquidity"));
   assert.ok(report.checks.some(c => c.stage === "workflow-price-nanoodle-image"));
   assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
-  assert.equal(f.calls.filter(c => c.url.hostname === "nano-site.example").length, 2);
+  const saved = report.checks.filter(c => c.stage.startsWith("saved-workflow-"));
+  assert.equal(saved.length, 17);
+  assert.ok(saved.every(c => c.ok));
+  assert.equal(f.calls.filter(c => c.url.hostname === "nano-site.example" && c.url.pathname.startsWith("/graph/")).length, 5);
+  assert.equal(f.calls.filter(c => c.url.hostname === "site.example" && c.url.pathname.startsWith("/graph/")).length, 5);
   const file = join(f.config.stateDir, "latest.json"), text = readFileSync(file, "utf8");
   assert.doesNotMatch(text, /SYNTHETIC|PRIVATE_BUYER|public|ed25519|assignment|account_id/);
   assert.equal(statSync(file).mode & 0o777, 0o644); assert.equal(JSON.stringify(f.states), before);
+});
+
+test("saved workflow probes flag thin Nano deposits, invalid USDC previews and missing templates independently", async () => {
+  const f = fixture(({ url, body }) => {
+    const rpc = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
+    if (url.hostname === "nano-site.example" && body?.method === "tools/list") {
+      const tools = toolsList();
+      tools.find(t => t.name === "sing").description = toolsList("0.01").find(t => t.name === "sing").description;
+      return rpc({ tools });
+    }
+    if (url.hostname === "site.example" && url.pathname === "/examples/idea-to-3d-model.json") {
+      return new Response("private-example-error", { status: 404 });
+    }
+    const args = body?.params?.arguments;
+    if (url.hostname === "site.example" && args?.graph?.name === "sing" && args._pay_with === "usdc") {
+      const preview = pricePreview("usdc");
+      delete preview.usdc;
+      return rpc({ structuredContent: preview });
+    }
+    return null;
+  });
+  try {
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(Object.fromEntries(report.checks.filter(c => !c.ok).map(c => [c.stage, c.code])), {
+      "saved-workflow-nano-sing": "saved-nano-deposit-too-low",
+      "saved-workflow-near-idea-to-3d-model": "http-404",
+      "saved-workflow-usdc-idea-to-3d-model": "http-404",
+      "saved-workflow-usdc-sing": "saved-workflow-denomination-invalid",
+    });
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-example-error/);
+  } finally {
+    rmSync(f.config.stateDir, { recursive: true, force: true });
+  }
 });
 
 test("numeric and HTTP rate limits have precise diagnostics without hiding loss of quorum", async () => {

@@ -32,6 +32,8 @@ const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
+const SHARED_SAVED_WORKFLOWS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
+const NEAR_WORKFLOW_TEMPLATE = "idea-to-3d-model";
 const REFUND_FUNDING_CODES = new Map([
   ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
   ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
@@ -41,6 +43,19 @@ class CheckError extends Error {}
 const need = (condition, code) => { if (!condition) throw new CheckError(code); };
 const readJson = file => JSON.parse(readFileSync(file, "utf8"));
 const safeCode = e => e instanceof CheckError ? e.message : /^[A-Z_]{2,60}$/.test(e?.code || "") ? e.code : /Timeout|Abort/.test(e?.name || "") ? "request-timeout" : "probe-failed";
+const positiveDecimal = value => typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value)
+  && Number.isFinite(Number(value)) && Number(value) > 0;
+
+function savedPricingContent(result) {
+  const content = result?.structuredContent, pricing = content?.pricing;
+  need(!result?.isError && pricing?.currency === "USD" && pricing.safety?.ok === true
+    && Array.isArray(pricing.unpriced) && pricing.unpriced.length === 0, "saved-workflow-not-priceable");
+  need(!content.payment && !content.quote && !content.x402, "saved-workflow-preview-invalid");
+  const amounts = [pricing.estimatedCost?.usd, pricing.likelyCharge?.usd, pricing.deposit?.usd];
+  need(amounts.every(positiveDecimal) && Number(amounts[0]) <= Number(amounts[1])
+    && Number(amounts[1]) <= Number(amounts[2]), "saved-workflow-preview-invalid");
+  return content;
+}
 
 export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("../", import.meta.url))) {
   if (!Number.isSafeInteger(lock?.pid) || lock.pid <= 0) return false;
@@ -118,6 +133,45 @@ export async function runOperationalCheck(config, deps = {}) {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
     need(!result.error && result.result, "mcp-error"); return result.result;
   };
+  async function checkSavedWorkflows(site, tools, assets) {
+    const names = assets.includes("nano") ? SHARED_SAVED_WORKFLOWS : [...SHARED_SAVED_WORKFLOWS, NEAR_WORKFLOW_TEMPLATE];
+    for (const name of names) {
+      const template = name === NEAR_WORKFLOW_TEMPLATE;
+      // Share the published graph within this site. Run the next graph's price
+      // requests after these finish so a cold catalog isn't fetched in a burst.
+      const tool = tools.find(t => t?.name === name);
+      const graph = (async () => {
+        need(template || tool, "saved-workflow-tool-missing");
+        const value = await http(site + (template ? "/examples/" : "/graph/") + name + ".json");
+        need(Array.isArray(value?.nodes) && value.nodes.length > 0 && Array.isArray(value.links), "saved-workflow-graph-invalid");
+        return value;
+      })();
+      await Promise.all(assets.map(asset => check(`saved-workflow-${asset}-${name}`, async () => {
+        const published = await graph;
+        const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph: published, _pay_with: asset === "nano" ? "near" : asset } }, site);
+        const content = savedPricingContent(result);
+        if (asset === "nano") {
+          // Fixed-deposit tools on the live Nano API publish the cold deposit
+          // in their generated MCP description, including the payment rail.
+          const amount = typeof tool.description === "string"
+            && tool.description.match(/Runs on NanoGPT — \$(\d+(?:\.\d+)?) deposit per call, paid in Nano \(XNO\) —/)?.[1];
+          need(!tool.pricedPerRequest && positiveDecimal(amount), "saved-nano-deposit-unavailable");
+          need(Number(amount) >= Number(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
+        } else {
+          const currency = content[asset];
+          need(currency?.network === config.network, "saved-workflow-denomination-invalid");
+          if (asset === "usdc") {
+            need(currency.tokenContract === USDC_CONTRACTS[config.network] && currency.decimals === 6
+              && currency.usdcUsd === "1", "saved-workflow-denomination-invalid");
+          } else {
+            need(positiveDecimal(currency.rate?.nearUsd) && positiveDecimal(currency.depositNear)
+              && positiveDecimal(currency.likelyChargeNear) && Number(currency.depositNear) >= Number(currency.likelyChargeNear),
+            "saved-workflow-denomination-invalid");
+          }
+        }
+      }, [])));
+    }
+  }
   const state = await check("payment-state", async () => {
     const nano = read(join(config.outDir, "gate-state.json")), near = read(join(config.outDir, "near-state.json"));
     need(near.network === config.network && near.merchant === config.merchant, "ledger-account-mismatch");
@@ -288,18 +342,24 @@ export async function runOperationalCheck(config, deps = {}) {
     const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
     need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
   }, []);
-  await check("mcp-discovery", async () => {
+  const nearTools = await check("mcp-discovery", async () => {
     await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } });
     const result = await mcp("tools/list", {});
     need(["price_noodle", "run_noodle", "noodle_guide"].every(name => result.tools?.some(t => t.name === name)), "mcp-tools-missing");
+    return result.tools;
   });
-  await check("nano-mcp-discovery", async () => {
+  const nanoTools = await check("nano-mcp-discovery", async () => {
     const target = config.nanoSite;
     need(typeof target === "string" && target.length > 0, "nano-site-not-configured");
     await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } }, target);
     const result = await mcp("tools/list", {}, target);
     need((config.nanoExpectedTools || ["sing"]).every(name => result.tools?.some(t => t.name === name)), "mcp-tools-missing");
+    return result.tools;
   }, ["nano"]);
+  await Promise.all([
+    nearTools && checkSavedWorkflows(config.site, nearTools, ["near", "usdc"]),
+    nanoTools && checkSavedWorkflows(config.nanoSite, nanoTools, ["nano"]),
+  ]);
   await check("custom-workflow-pricing", async () => {
     const sample = checkGraph("readonly-operational-probe", true);
     for (const asset of ["near", "usdc"]) {
