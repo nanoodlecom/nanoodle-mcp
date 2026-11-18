@@ -5,8 +5,11 @@ import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { createNearRpcPool, loadNearSigner, NEAR_NETWORKS, signTransfer, parseNearToYocto, formatYoctoAsNear } from "../src/near/index.mjs";
+import { readNearTransferFunding } from "../src/near/funding.mjs";
 import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib.mjs";
 import { callMcp, resultText } from "../src/near-site-browser.mjs";
+
+export const DEFAULT_CHECK_MAX_NEAR = "0.01";
 
 export function checkGraph(marker, twoSteps = false) {
   // This checks the payment/runtime path, not reasoning. A thinking model can
@@ -45,7 +48,7 @@ export function atomicJson(file, value) {
 /** Dependencies are injectable so crash recovery and payment limits run offline. */
 export async function runCheck(config, deps = {}) {
   const { stateDir, payer, keyFile, merchant = "nanoodle.near", network = "mainnet", twoSteps = false,
-    maxNear = "0.01", maxUsd = 0.001, url = "https://near.nanoodle.com" } = config;
+    maxNear = DEFAULT_CHECK_MAX_NEAR, maxUsd = 0.001, url = "https://near.nanoodle.com" } = config;
   const base = url.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
   const now = deps.now || Date.now, sleep = deps.sleep || (ms => new Promise(r => setTimeout(r, ms)));
   const request = deps.fetch || ((input, init = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(240_000) }));
@@ -98,28 +101,35 @@ export async function runCheck(config, deps = {}) {
       save();
     }
     stage = "quote";
-    if (!state.quote) {
+    let q = state.quote;
+    if (!q) {
       const priced = await call("price_noodle", { graph: state.args.graph, inputs: state.args.inputs });
       const pricing = priced.structuredContent?.pricing;
       require(!priced.isError && pricing?.safety?.ok && Number.isFinite(Number(pricing.estimatedCost?.usd)) && Number(pricing.estimatedCost.usd) <= Number(maxUsd), "Price exceeds the model-cost cap or cannot be estimated");
       const quoted = await call("run_noodle", state.args);
       require(!quoted.isError, "Workflow quote failed");
-      state.quote = quoted.structuredContent?.payment; save();
+      q = quoted.structuredContent?.payment;
     }
-    const q = state.quote;
     require(q?.status === "payment_required" && /^nq_[A-Za-z0-9_-]+$/.test(q.paymentId) && /^\d+$/.test(q.amountYocto), "Invalid NEAR quote");
     require(q.network === network && q.payTo === merchant && (!q.asset || q.asset === "NEAR"), "Unexpected network, asset or payment destination");
     const deposit = BigInt(q.amountYocto);
     require(deposit > 0n && deposit <= parseNearToYocto(maxNear) && Number(q.depositUsd) <= Number(maxUsd) * 10, "Deposit exceeds the spending cap");
-    stage = "payment";
     let newlySigned = false;
     if (!state.signed) {
       require(Date.parse(q.expiresAt) > now() + 60_000, "Unpaid quote expired; operator must archive this state before trying a new run");
+      stage = "payer_funding";
       const signer = await (deps.loadSigner || loadNearSigner)({ accountId: payer, keyFile, env: {} });
-      const key = await rpc.viewAccessKey({ accountId: payer, publicKey: signer.publicKey });
+      const { accessKey: key, sufficient } = await readNearTransferFunding({ rpc, network, accountId: payer,
+        publicKey: signer.publicKey, amountYocto: deposit, now });
+      require(sufficient, "Canary payer cannot cover this deposit, storage and gas");
+      stage = "payment";
+      require(Date.parse(q.expiresAt) > now() + 60_000, "Unpaid quote expired while checking payer funding");
+      state.day = new Date(now()).toISOString().slice(0, 10);
+      state.quote = q;
       state.signed = signTransfer({ signer, signerId: payer, receiverId: merchant, nonce: BigInt(key.nonce) + 1n, blockHash: key.block_hash, amountYocto: deposit });
       save(); newlySigned = true;
     }
+    stage = "payment";
     if (!state.paymentFinal) {
       // On recovery, query first; if unknown, only re-broadcast these SAME bytes.
       let tx;
@@ -185,7 +195,8 @@ if (import.meta.main) {
     const o = parseArgs(process.argv.slice(2), ["two-steps"]);
     const report = await runCheck({ stateDir: o["state-dir"] || "/var/lib/nanoodle-near-check", payer: o.payer || process.env.CHECK_PAYER,
       keyFile: o["key-file"] || process.env.CHECK_KEY_FILE, url: o.url || process.env.CHECK_URL, network: o.network || "mainnet", rpc: o.rpc,
-      merchant: o.merchant || "nanoodle.near", maxNear: o["max-near"] || "0.01", maxUsd: Number(o["max-usd"] || "0.001"), twoSteps: !!o["two-steps"] });
+      merchant: o.merchant || "nanoodle.near", maxNear: o["max-near"] || process.env.CHECK_MAX_NEAR || DEFAULT_CHECK_MAX_NEAR,
+      maxUsd: Number(o["max-usd"] || "0.001"), twoSteps: !!o["two-steps"] });
     console.log(JSON.stringify(report));
   } catch (error) { console.error(JSON.stringify(error.report || { ok: false, error: "Invalid configuration or unreadable state" })); process.exitCode = 1; }
 }

@@ -10,6 +10,7 @@ User=nanoodle-mcp
 Group=nanoodle-mcp
 WorkingDirectory=/srv/nanoodle-mcp/app
 EnvironmentFile=/etc/nanoodle-mcp/env
+EnvironmentFile=-/etc/nanoodle-near-check/env
 EnvironmentFile=/etc/255labs/system-trust.env
 StateDirectory=nanoodle-operational-check
 StateDirectoryMode=0755

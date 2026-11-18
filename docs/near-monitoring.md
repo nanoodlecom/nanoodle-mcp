@@ -15,6 +15,18 @@ charge fails the check after settlement. Only a small dedicated payer wallet is
 available to this process; it cannot access the merchant key. Funding is manual,
 so total losses are also bounded by that wallet's balance.
 
+Before signing, the canary checks the payer's balance, storage requirements,
+full-access key and gas prepayment at a single fresh finalized block. A shortfall
+leaves the graph ready for a new quote after funding. Any previously signed
+payment still follows the same-hash recovery path.
+
+The five-minute operational probe reads the dedicated payer's public balance and
+key status and warns when the payer cannot cover the maximum canary deposit,
+storage and gas. It derives an implicit account's public key from its account
+ID. For a named payer, set `CHECK_PAYER_PUBLIC_KEY` in the canary environment
+file. `CHECK_MAX_NEAR` configures the canary's default cap and the monitoring
+threshold together. The operational service's payer key file remains inaccessible.
+
 ## Installation on the production box
 
 Create a `nanoodle-check` system user. Generate a dedicated key with
