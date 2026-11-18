@@ -115,7 +115,7 @@ test('a settled payment cannot regenerate inference or refund its deposit after 
 });
 
 test('retention cannot forget a paid quote before the customer claims its run', async (t) => {
-  const quote = savedQuote({ createdAt: Date.now() - 25 * 60 * 60_000, expiresAt: Date.now() - 24 * 60 * 60_000 });
+  const quote = savedQuote({ runDeadlineAt: null, createdAt: Date.now() - 25 * 60 * 60_000, expiresAt: Date.now() - 24 * 60 * 60_000 });
   const { gate } = await savedGate(t, quote);
   assert.equal(gate.quote(quote.id)?.status, 'paid');
   assert.equal(gate.quote(quote.id)?.status, 'paid', 'repeated status reads must preserve the unpaid obligation');
@@ -127,6 +127,25 @@ test('retention cannot forget a paid quote before the customer claims its run', 
   assert.equal(gate.quote(quote.id).status, 'consumed', 'completion begins the replay retention window');
   await wrapped.callTool({ ...params, arguments: { ...params.arguments, _payment_id: quote.id } });
   assert.equal(calls, 1, 'a late claim still has a replay window after completion');
+});
+
+test('a pre-claim Nano deposit is reserved for reconciliation across restarts', async (t) => {
+  const quote = savedQuote(), { gate, stateFile } = await savedGate(t, quote);
+  let calls = 0;
+  const workflow = registry(async () => { calls++; return { content: [] }; });
+  const call = { ...params, arguments: { ...params.arguments, _payment_id: quote.id } };
+  assert.match((await gate.wrapRegistry(workflow).callTool(call)).content[0].text, /execution history.*needs reconciliation/i);
+  assert.equal(gate.fundingLiabilitiesRaw(), BigInt(quote.amountRaw));
+  await gate.stop();
+  const data = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(data.quotes[0].executionNeedsReconciliation, true);
+  assert.deepEqual(data.owed, [], 'an older ambiguous payment cannot authorize a new refund');
+
+  const restarted = createChargeGate(gateOptions({ stateFile }));
+  t.after(() => restarted.stop());
+  assert.match(restarted.quote(quote.id).next, /execution history.*needs reconciliation/i);
+  assert.equal((await restarted.wrapRegistry(workflow).callTool(call)).isError, true);
+  assert.equal(calls, 0);
 });
 
 test('abandoning a payment wait releases it immediately without changing the quote', async (t) => {

@@ -158,11 +158,13 @@ test("an exhausted Nano refund remains held across restart and is not retried or
   const held = await untilState(stateFile, "the exhausted debt to be retained", s => s.owed[0]?.held === true);
   assert.equal(held.owed[0].tries, 100);
   assert.equal(gate.fundingLiabilitiesRaw(), 100n);
+  await gate.stop();
   const restarted = makeGate(chain, { registry, stateFile, now: () => t, pollMs: 5 });
   const next = argOf(await restarted.wrapRegistry(registry).callTool({ name: "poster", arguments: { Text: "another" } }));
   t += 100_000; await restarted.waitForPayment(next.paymentId, 20);
   assert.equal(restarted.fundingLiabilitiesRaw(), 100n);
   assert.equal(attempts, 1);
+  await restarted.stop();
 });
 
 test("failed Nano settlement retries persist the debt age and attempt count across restart", async t => {
@@ -2684,6 +2686,116 @@ test("Nano payment recovery retains a signed send if the completion write fails"
   assert.equal(broadcast, 1);
 });
 
+test("a Nano workflow killed after provider dispatch refunds the original payment without rerunning", { timeout: 8_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-execution-restart-"));
+  const stateFile = join(dir, "gate-state.json"), chain = fakeChain();
+  const args = { Text: "PRIVATE-EXECUTION-FIXTURE" }, initial = fakeRegistry();
+  let gate = makeGate(chain, { stateFile, registry: initial, pollMs: 5 }), child;
+  t.after(async () => {
+    if (child && child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+    await gate?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const payment = argOf(await gate.wrapRegistry(initial).callTool({ name: "poster", arguments: args }));
+  chain.state.receivable[testHash(124)] = { amount: payment.amountRaw, source: PAYER };
+  assert.equal(await gate.waitForPayment(payment.paymentId, 1_000), "paid");
+  await gate.stop();
+
+  const script = `
+    import assert from "node:assert/strict";
+    import { readFileSync } from "node:fs";
+    import { createChargeGate } from ${JSON.stringify(new URL("../src/gate.mjs", import.meta.url).href)};
+    const [address, stateFile, id, rawArgs] = process.argv.slice(1);
+    const registry = {
+      tools: [{ name: "poster" }], listTools: () => [],
+      callTool() {
+        process.send("provider accepted the fixture request");
+        return new Promise(() => {});
+      },
+    };
+    const gate = createChargeGate({ address, usd: 0.05, xnoUsd: 1, stateFile, publicBase: "http://pay.test",
+      ops: { rpc: async () => ({ history: [], blocks: {} }) },
+      fundRun(_terms, execute) {
+        const q = JSON.parse(readFileSync(stateFile, "utf8")).quotes.find(q => q.id === id);
+        assert.equal(q.status, "consumed");
+        assert.ok(Number.isSafeInteger(q.runDeadlineAt));
+        return execute();
+      },
+    });
+    setInterval(() => {}, 1000);
+    const result = await gate.wrapRegistry(registry).callTool({ name: "poster", arguments: { ...JSON.parse(rawArgs), _payment_id: id } });
+    process.send({ unexpected: result?.content?.[0]?.text ?? "fixture workflow returned early" });
+  `;
+  child = spawn(process.execPath, ["--input-type=module", "-e", script, GATE_ADDR, stateFile, payment.paymentId, JSON.stringify(args)], {
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8").on("data", text => { stderr += text; });
+  const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+  const dispatched = new Promise((resolve, reject) => {
+    child.once("message", resolve);
+    child.once("error", reject);
+  });
+  assert.equal(await Promise.race([dispatched, exited.then(() => { throw Error(`fixture writer exited early: ${stderr}`); })]),
+    "provider accepted the fixture request");
+  assert.equal(child.kill("SIGKILL"), true);
+  assert.deepEqual(await exited, { code: null, signal: "SIGKILL" });
+
+  // Start a fresh writer without a caller and verify it durably records the
+  // refund once, even if the paying agent reconnects during recovery.
+  const registry = fakeRegistry();
+  let funding = 0;
+  const start = () => makeGate(chain, { stateFile, registry, pollMs: 5, fundRun: (_terms, run) => { funding++; return run(); } });
+  gate = start();
+  const call = { name: "poster", arguments: { ...args, _payment_id: payment.paymentId } };
+  assert.equal((await gate.wrapRegistry(registry).callTool(call)).isError, true);
+  await until("the interrupted workflow's refund to publish", () => gate.quote(payment.paymentId)?.status === "refunded");
+  const saved = await untilState(stateFile, "the interrupted refund to reach disk", s => quoteIn(payment.paymentId)(s)?.transferReceipts?.refund);
+  assert.match(quoteIn(payment.paymentId)(saved).error, /server restarted before recording/);
+  assert.doesNotMatch(JSON.stringify(saved), /PRIVATE-EXECUTION-FIXTURE/);
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: payment.amountRaw, describe: "refunded" }]);
+  assert.equal(gate.fundingLiabilitiesRaw(), 0n);
+  await gate.stop();
+
+  gate = start();
+  const replay = await gate.wrapRegistry(registry).callTool(call);
+  assert.match(replay.content[0].text, /was refunded/);
+  assert.equal(registry.callCount(), 0);
+  assert.equal(funding, 0);
+  assert.equal(chain.state.transfers.length, 1);
+});
+
+test("a failed Nano execution-claim write buys no inference and leaves the deposit usable", { timeout: 5_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-execution-claim-failed-"));
+  const stateFile = join(dir, "gate-state.json"), chain = fakeChain();
+  const registry = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "fixture" }], costUsd: 0.05 }) });
+  let funded = 0;
+  const gate = makeGate(chain, { stateFile, registry, pollMs: 5, fundRun: (_terms, run) => { funded++; return run(); } });
+  t.after(async () => {
+    await gate.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const wrapped = gate.wrapRegistry(registry), args = { Text: "fixture" };
+  const quote = argOf(await wrapped.callTool({ name: "poster", arguments: args }));
+  chain.state.receivable[testHash(125)] = { amount: quote.amountRaw, source: PAYER };
+  assert.equal(await gate.waitForPayment(quote.paymentId, 1_000), "paid");
+  await until("the original receipt to settle on disk", () => gate.persistenceStatus().pendingWrites === 0);
+  const call = { name: "poster", arguments: { ...args, _payment_id: quote.paymentId } };
+  await mkdir(stateFile + ".tmp");
+  const unavailable = await Promise.all([wrapped.callTool(call), wrapped.callTool(call)]);
+  for (const result of unavailable) assert.match(result.content[0].text, /could not record the workflow start/);
+  assert.equal(funded, 0);
+  assert.equal(registry.callCount(), 0);
+  assert.equal(chain.state.transfers.length, 0);
+  assert.equal(gate.quote(quote.paymentId).status, "paid");
+  assert.equal(gate.fundingLiabilitiesRaw(), BigInt(quote.amountRaw));
+  await rm(stateFile + ".tmp", { recursive: true });
+  const retry = await Promise.all([wrapped.callTool(call), wrapped.callTool(call)]);
+  for (const result of retry) assert.equal(result.isError, undefined);
+  assert.equal(funded, 1);
+  assert.equal(registry.callCount(), 1);
+});
+
 async function gateMaintenance(t) {
   const dir = await mkdtemp(join(tmpdir(), "nano-gate-maintenance-")), file = join(dir, "flag.json");
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -2692,6 +2804,39 @@ async function gateMaintenance(t) {
     pause: () => writeFile(file, JSON.stringify({ v: 1, token: "e".repeat(32), operation: "backup", revision: null }), { mode: 0o600 }),
     unpause: () => rm(file) };
 }
+
+test("Nano startup records an interrupted refund while admission is paused", async t => {
+  const w = await gateMaintenance(t), chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-paused-execution-recovery-"));
+  const stateFile = join(dir, "gate-state.json"), id = "pay_interrupted_fixture", now = Date.now();
+  const amountRaw = (5n * 10n ** 28n).toString();
+  let gate;
+  t.after(async () => {
+    await gate?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const args = { Text: "interrupted" };
+  await writeFile(stateFile, JSON.stringify({ v: 2, owed: [], quotes: [{ id, tool: "poster", argsHash: hashArgs("poster", args),
+    amountRaw, usd: 0.05, pair: { usdNano: "1000000000", raw: String(10n ** 30n) }, source: PAYER,
+    createdAt: now - 60_000, paidAt: now - 30_000, expiresAt: now + 900_000,
+    payHash: testHash(126), status: "consumed", runDeadlineAt: now + 1_800_000 }] }));
+  await w.maintenance.start(async () => {
+    await w.pause();
+    gate = makeGate(chain, { stateFile, maintenance: w.maintenance, registry, pollMs: 5 });
+    await w.maintenance.recover(() => gate.resume());
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.match(saved.quotes[0].error, /server restarted before recording/);
+    assert.deepEqual(saved.owed.map(o => [o.event, o.fields.reason, o.prepared]), [["refund", "interrupted", null]]);
+    assert.equal(gate.fundingLiabilitiesRaw(), BigInt(amountRaw));
+    assert.deepEqual(chain.state.transfers, []);
+    await assert.rejects(gate.wrapRegistry(registry).callTool({ name: "poster", arguments: { ...args, _payment_id: id } }),
+      { code: "SERVICE_DRAINING" });
+  });
+  await w.unpause();
+  await until("the original refund to complete after admission reopens", () => gate.quote(id)?.status === "refunded");
+  assert.equal(registry.callCount(), 0);
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw, describe: "refunded" }]);
+});
 
 test("a paused Nano tool preserves a paid quote and retries it exactly once after reopening", async t => {
   const w = await gateMaintenance(t), chain = fakeChain(), registry = fakeRegistry();
