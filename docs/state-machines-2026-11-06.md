@@ -60,22 +60,26 @@ The tests use fixture accounts, local HTTP, scripted providers and temporary fil
 
 Origin and disconnect behavior follows the [MCP 2025-06-18 transport requirements](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports): validate Origin; treat a disconnected transport independently from workflow cancellation.
 
-## Remaining financial recovery gaps — do not infer launch qualification
+## Payment recovery regression checks
 
-Run `node scripts/audit-payment-recovery.mjs`. It contains no wallet creation and prints only synthetic aggregate evidence:
+Run `node scripts/audit-payment-recovery.mjs` to check payment recovery with
+synthetic wallet and ledger fixtures. The tests exercise quote durability,
+resumable confirmed Nano history, restart recovery for signed refunds,
+customer change and creator payouts, funding checks just before publication,
+and duplicate transfer detection across the shared wallet. They neither use
+real wallet credentials nor invoke inference.
 
-```json
-{"gap":"inflight_change_not_durable","firstSends":1,"persistedOwed":0,"restoredSends":0}
-{"gap":"ambiguous_send_retried_as_new_transfer","acceptedSends":2}
-{"gap":"restart_seeds_only_first_history_page","historyEntries":150,"pages":3,"status":"pending"}
-```
+The Nano writer records outgoing intent with the payment outcome and saves
+the exact signed block before publication. Retries reconcile that block.
+A replacement requires a confirmed competing block on the same account
+and predecessor. The monitor flags unsigned debts created by the old writer
+and blocks claimed by more than one obligation. Preserve old debts as
+liabilities and reconcile them against the chain before any further transfer.
 
-- **Unjournaled effects:** successful-settlement transfers are started before an owed intent is persisted. A restart can retain `settled:true` with no send obligation even though change/author payout did not complete. Initial refunds and successful owed-send removal have analogous crash windows. Quote creation/payment acknowledgment also lacks an awaited durable write barrier. Atomic rename alone does not close these windows.
-- **Ambiguous send retry:** the wallet attempts same-block recovery, but if it cannot establish the outcome, the gate queues a fresh `ops.transfer`. The fixture accepts a send, loses its response, and observes two accepted transfers after backoff. A safe fix needs a stable logical send ID, persisted exact signed block/hash, authoritative reconciliation and a durable completion record. Never resolve this by blindly reissuing a live transfer or editing live balances.
-- **History cursor loss:** first startup walk reads only one 100-entry page; later walks stop at the newest marker. A restored pending quote pocketed below that first page remains unpaid. The 1,000-entry churn cap similarly advances the marker before all backlog is covered. A resumable durable scan cursor and payment-hash consumption record are needed together: indiscriminately scanning old amounts can falsely match a reused amount tag.
-- **Policy/recovery limits:** expired quotes are actively watched for one hour although metadata is retained longer; unresolved owed sends are dropped after the maximum tries; repeated text regeneration can repeat provider effects. There is no shared multiworker claim/settlement authority. These are existing limitations, not repaired by the targeted patch.
-
-The safe next implementation is one canonical durable payment/execution authority with operation IDs and explicit `intent → submitted → uncertain → reconciled → completed` transitions. The service must never choose a new send on an uncertain operation. Keep payer content out of durable records and retain outstanding obligations until authoritative resolution. This work needs coordinated integration with the existing protocol owners and a reviewed recovery/migration strategy; no existing live financial record was rewritten by the audit.
+The Nano gate and creator payout ledger still share one wallet writer.
+Activation and rollback require the guarded release procedure. A writer
+without signed-transfer recovery cannot safely retry a ledger that contains
+unfinished signed intents.
 
 ## Existing work and release boundary
 

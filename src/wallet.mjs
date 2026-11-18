@@ -121,7 +121,7 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, requireFunding = false, protectTransfers = false, verifyRpcReads = false, checkpointFile = null, assertWriter = () => {}, maintenance = null, now = Date.now, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, nanoTransferClaimed = () => false, requireFunding = false, protectTransfers = false, verifyRpcReads = false, checkpointFile = null, assertWriter = () => {}, maintenance = null, now = Date.now, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
@@ -545,10 +545,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    * Nano RPC block_info exposes successor (v23+) and confirmed (v19+):
    * https://docs.nano.org/commands/rpc-protocol/#block_info
    */
-  async function publishOnce(prepared) {
+  async function publishOnce(prepared, beforePublish) {
     const { hash, block } = prepared;
     let error;
-    try { await rpc({ action: "process", json_block: "true", subtype: "send", block }); }
+    try { await rpc({ action: "process", json_block: "true", subtype: "send", block }, rpcBases, { beforePublish }); }
     catch (e) { error = e; }
     chain = null; // Other jobs must read the actual frontier after this replay.
     try {
@@ -559,9 +559,13 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       if (!e.authoritative || !/block not found|unknown block/i.test(e.message)) throw e;
       // A negative lookup alone is never sufficient to sign a second payment.
       const prev = await rpc({ action: "block_info", hash: block.previous, json_block: "true" });
-      if (/^[0-9A-F]{64}$/i.test(prev.successor || "") && !/^0+$/.test(prev.successor) && prev.successor !== hash) {
+      if (/^[0-9A-F]{64}$/i.test(prev.successor || "") && !/^0+$/.test(prev.successor) && prev.successor.toUpperCase() !== hash.toUpperCase()) {
         const successor = await rpc({ action: "block_info", hash: prev.successor, json_block: "true" });
-        if (successor.confirmed === "true" || successor.confirmed === true) return null;
+        const next = typeof successor.contents === "string" ? JSON.parse(successor.contents) : successor.contents;
+        if ((successor.confirmed === "true" || successor.confirmed === true) && next?.type === "state"
+          && next.account?.replace(/^xrb_/, "nano_") === address.replace(/^xrb_/, "nano_")
+          && next.previous?.toUpperCase() === block.previous.toUpperCase()
+          && hashBlock(next).toUpperCase() === prev.successor.toUpperCase()) return null;
       }
       throw error || e;
     }
@@ -704,22 +708,42 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       }, HOUSEKEEPING, false), // read-only telemetry must not keep drain permanently nonzero
       // The journal callback MUST persist the signed block before returning.
       // Retrying after a lost response or a restart uses the same block hash.
-      transferOnce: (to, amountRaw, { prepared = null, onPrepared, liabilityRaw = 0n, fundingRunId = null } = {}) => enqueue(async () => {
+      transferOnce: (to, amountRaw, { prepared = null, onPrepared, liabilityRaw = 0n, fundingRunId = null, transferId, describe = "author payout:" } = {}) => enqueue(async () => {
         if (!checkAddress(String(to || "")) || !/^\d+$/.test(String(amountRaw)) || BigInt(amountRaw) <= 0n || typeof onPrepared !== "function") throw new Error("invalid durable Nano transfer");
+        const terms = { amountRaw, liabilityRaw: protectTransfers ? liabilityRaw : 0n, fundingRunId };
+        const assertUnclaimed = hash => {
+          if (nanoTransferClaimed(hash, transferId)) throw new FundingError("NANO_TRANSFER_ALREADY_CLAIMED", "Another obligation already claims this Nano transfer");
+        };
         if (prepared) {
-          if (prepared.block?.account !== address || prepared.block.link_as_account !== to || hashBlock(prepared.block) !== prepared.hash) throw new Error("journaled Nano transfer does not match this wallet");
-          const sent = await publishOnce(prepared);
+          const block = prepared.block;
+          if (block?.account !== address || block.link_as_account !== to ||
+              block.link?.toUpperCase() !== derivePublicKey(to).toUpperCase() || hashBlock(block) !== prepared.hash) {
+            throw new Error("journaled Nano transfer does not match this wallet or recipient");
+          }
+          assertUnclaimed(prepared.hash);
+          const snapshot = await currentState(true);
+          const sent = await publishOnce(prepared, () => {
+            if (snapshot.frontier.toUpperCase() !== block.previous.toUpperCase()) {
+              throw new Error("Journaled Nano transfer is waiting for its frontier to be reconciled");
+            }
+            if (snapshot.balance - BigInt(block.balance) !== BigInt(amountRaw)) {
+              throw new Error("journaled Nano transfer does not match its amount");
+            }
+            if (snapshot.balance < funding.requiredForTransfer(terms)) {
+              throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot send after reservations and obligations");
+            }
+          });
           if (sent) return sent;
         }
-        const terms = { amountRaw, liabilityRaw: protectTransfers ? liabilityRaw : 0n, fundingRunId };
         const state = await pocketReceivables(false, s => urgentWaiting() && funding.requiredForTransfer(terms) <= s.balance);
-        funding.authorizeTransfer(terms, state.balance);
+        const checkBalance = funding.authorizeTransfer(terms, state.balance);
         prepared = await prepareSend(state, to, BigInt(amountRaw));
+        assertUnclaimed(prepared.hash);
         await onPrepared(prepared);
         precomputeWork(prepared.hash);
-        const sent = await publishOnce(prepared);
+        const sent = await publishOnce(prepared, () => checkBalance(state.balance));
         if (!sent) throw new Error("Nano transfer was built on a stale frontier; queued for retry");
-        log(`x402: author payout: ${rawToXno(amountRaw)} XNO to ${to} (block ${sent})`);
+        log(`x402: ${describe} ${rawToXno(amountRaw)} XNO to ${to} (block ${sent})`);
         return sent;
       }),
       transfer: (to, amountRaw, describe = "sent", { liabilityRaw = 0n, fundingRunId = null } = {}) => enqueue(async () => {

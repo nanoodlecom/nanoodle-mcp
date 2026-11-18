@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { nanoFundingLiabilities, nearCreatorLiabilities, marketCreatorLiabilities } from "./funding-liabilities.mjs";
+import { creatorNanoTransferClaims, gateNanoTransferClaims, hasOtherNanoTransferClaim } from "./nano-transfer-journal.mjs";
 
 function read(file) {
   try { return JSON.parse(readFileSync(file, "utf8")); }
@@ -21,9 +22,14 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     if (value === null && requiredFiles.has(resolve(file))) throw Error("funding-state-missing");
     return value;
   }
-  let nanoLive = null, nearLive = null, payoutsLive = null;
+  let nanoLive = null, nanoTransfersLive = null, nearLive = null, payoutsLive = null;
   let quoteReady = false, storageReady = true, readyAt = null;
   const marketLive = new Map();
+  function nanoDisk() {
+    const s = readState(nanoFile);
+    if (s && ![1, 2].includes(s.v)) throw Error("invalid-funding-state");
+    return s ?? { quotes: [], owed: [] };
+  }
   function nearDisk() {
     const s = readState(nearFile);
     if (s && s.v !== 1) throw Error("invalid-funding-state");
@@ -56,20 +62,19 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     },
     setReady(value) { quoteReady = storageReady && value === true; readyAt = quoteReady ? now() : null; },
     setStorageReady(value) { storageReady = value === true; if (!storageReady) { quoteReady = false; readyAt = null; } },
-    registerNano(reader) { nanoLive = reader; },
+    registerNano(reader, transfers) { nanoLive = reader; nanoTransfersLive = transfers; },
     registerNear(reader, payouts) { nearLive = reader; payoutsLive = payouts; },
     registerMarket(file, reader) { marketLive.set(resolve(file), reader); },
+    nanoTransferClaimed(hash, id) {
+      const nano = nanoTransfersLive ? nanoTransfersLive() : gateNanoTransferClaims(nanoDisk());
+      const creators = creatorNanoTransferClaims(payoutsLive ? payoutsLive() : nearDisk().payouts);
+      return hasOtherNanoTransferClaim(nano, hash, id) || hasOtherNanoTransferClaim(creators, hash, id);
+    },
     liabilitiesRaw(context) {
       // Recovery telemetry can read debts while storage is unavailable; it
       // grants no spending authority. Actual authorizations remain paused.
       if (!storageReady && !context?.readOnly) throw Error("funding-state-unwritable");
-      let total;
-      if (nanoLive) total = nanoLive(context);
-      else {
-        const s = readState(nanoFile);
-        if (s && ![1, 2].includes(s.v)) throw Error("invalid-funding-state");
-        total = s ? nanoFundingLiabilities(s) : 0n;
-      }
+      let total = nanoLive ? nanoLive(context) : nanoFundingLiabilities(nanoDisk());
       const near = nearLive ? null : nearDisk();
       const payouts = payoutsLive ? payoutsLive() : near?.payouts ?? nearDisk().payouts;
       total += nearLive ? nearLive(context) : nearCreatorLiabilities(near, context);
