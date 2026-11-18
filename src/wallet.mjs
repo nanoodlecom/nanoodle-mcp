@@ -32,7 +32,7 @@ import {
   hashBlock,
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
-import { createRunFunding } from "./run-funding.mjs";
+import { createRunFunding, FundingError } from "./run-funding.mjs";
 import { createNanoReadPool } from "./nano-read-pool.mjs";
 import { createNanoCheckpointStore } from "./nano-checkpoint-store.mjs";
 import { rpcRetryAfterMs } from "./rpc-backoff.mjs";
@@ -158,8 +158,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
   //   neither — ambiguous (dropped connection, proxy 5xx, non-JSON). A read may
   //     safely retry; a publish must NOT (the node may have accepted it and only
   //     the response died), so that case is left to settleAfterTransportError.
-  async function rpcOnce(body, base, { headers = {}, signal } = {}) {
+  async function rpcOnce(body, base, { headers = {}, signal, beforePublish } = {}) {
     assertWriter();
+    if (body.action === "process") beforePublish?.();
     let r, text;
     try {
       r = await fetch(base, {
@@ -461,15 +462,16 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    * idempotent (same previous), so check the frontier and republish if it
    * didn't land. Returns true once the block is known to be on the account.
    */
-  async function settleAfterTransportError(hash, block) {
+  async function settleAfterTransportError(hash, block, publishOptions) {
     for (let i = 1; i <= 3; i++) {
       await new Promise((r) => setTimeout(r, 1500 * i));
       try {
         const info = await rpc({ action: "account_info", account: address });
         if (info.frontier === hash) return true; // first publish did land, only the response was lost
-        await rpc({ action: "process", json_block: "true", subtype: "send", block });
+        await rpc({ action: "process", json_block: "true", subtype: "send", block }, rpcBases, publishOptions);
         return true;
       } catch (e) {
+        if (e instanceof FundingError) throw e;
         log(`republish attempt ${i} failed (${e.message})`);
       }
     }
@@ -495,16 +497,17 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
     return prepared;
   }
 
-  async function sendFrom(state, to, amount, describe = "sent", extra = "") {
+  async function sendFrom(state, to, amount, checkBalance, describe = "sent", extra = "") {
     const insufficient = () => new Error(
       `insufficient wallet balance: send is ${rawToXno(amount)} XNO` +
       ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
     if (amount > state.balance) throw insufficient();
+    const publishOptions = { beforePublish: () => checkBalance(state.balance) };
     for (let attempt = 0; ; attempt++) {
       const { hash, block } = await prepareSend(state, to, amount);
       precomputeWork(hash); // next block's work computes while this one publishes
       try {
-        await rpc({ action: "process", json_block: "true", subtype: "send", block });
+        await rpc({ action: "process", json_block: "true", subtype: "send", block }, rpcBases, publishOptions);
       } catch (e) {
         // Lost response mid-publish — dead transport or a fronting proxy's
         // HTTP-5xx: the node may already have the block. Verify, republish
@@ -512,7 +515,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         if (e.ambiguous) {
           chain = null; // until settled, the frontier is uncertain
           log(`process transport failure (${e.message}) — verifying and republishing`);
-          if (await settleAfterTransportError(hash, block)) { /* landed */ }
+          if (await settleAfterTransportError(hash, block, publishOptions)) { /* landed */ }
           else throw e;
         }
         // Public RPC proxies (rpc.nano.to) can serve a cached account_info for a
@@ -522,6 +525,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
           log(`send bounced (${e.message}) — refetching frontier and retrying once`);
           state = await currentState(true);
           if (amount > state.balance) throw insufficient();
+          checkBalance(state.balance);
           continue;
         }
         // Anything else is ambiguous — an HTTP-5xx from a fronting proxy can
@@ -596,8 +600,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         (invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "") +
         ` but ${address} holds ${rawToXno(state.balance)} XNO — top up the wallet to continue`);
     }
-    funding.authorize(scope, invoice, state.balance);
-    await sendFrom(state, invoice.payTo, amount, "paid",
+    const checkBalance = funding.authorize(scope, invoice, state.balance);
+    await sendFrom(state, invoice.payTo, amount, checkBalance, "paid",
       invoice.amountUsd != null ? ` (~$${invoice.amountUsd.toFixed(4)})` : "");
   }
 
@@ -724,8 +728,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         // but yield to a waiting payment once this send itself is covered
         const terms = { amountRaw, liabilityRaw: protectTransfers ? liabilityRaw : 0n, fundingRunId };
         const state = await pocketReceivables(false, s => urgentWaiting() && funding.requiredForTransfer(terms) <= s.balance);
-        funding.authorizeTransfer(terms, state.balance);
-        return sendFrom(state, to, BigInt(amountRaw), describe);
+        const checkBalance = funding.authorizeTransfer(terms, state.balance);
+        return sendFrom(state, to, BigInt(amountRaw), checkBalance, describe);
       }),
       pocket: () => enqueue(() => pocketReceivables(false, urgentWaiting)),
       /**
