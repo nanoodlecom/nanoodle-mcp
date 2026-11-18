@@ -880,6 +880,35 @@ test("a stale node is reported while a fresh fallback remains usable; loss of al
   }
 });
 
+test("nearby NEAR finalized heads must agree at each endpoint's observed height", async t => {
+  for (const kind of ["fork", "agree", "wrong-height", "missing"]) {
+    const f = fixture(({ url, body }) => {
+      if (!url.hostname.startsWith("near-") || body?.method !== "block") return;
+      const header = (height, hash) => Response.json({ id: body.id,
+        result: { header: { height, hash, timestamp_nanosec: String(BigInt(NOW) * 1_000_000n) } } });
+      if (url.hostname === "near-1.example" && body.params.finality === "final") return header(99, "observed-99");
+      if (url.hostname === "near-2.example" && body.params.finality === "final") return header(98, "observed-98");
+      if (url.hostname === "near-0.example" && body.params.block_id === 98) return header(98, "observed-98");
+      if (url.hostname === "near-0.example" && body.params.block_id === 99) {
+        if (kind === "missing") return new Response("unavailable", { status: 503 });
+        return header(kind === "wrong-height" ? 98 : 99, kind === "fork" ? "private-other-fork" : "observed-99");
+      }
+    });
+    f.config.nearRpcUrls.push("https://near-2.example");
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const expected = kind === "agree" ? { stage: "near-rpc-ready", ok: true }
+      : { stage: "near-rpc-ready", ok: false, domains: ["near", "usdc"],
+        code: kind === "fork" ? "near-finalized-nodes-disagree" : "near-finalized-overlap-unverified" };
+    assert.deepEqual(report.checks.find(c => c.stage === expected.stage), expected, kind);
+    assert.deepEqual(report.admission, { nano: true, near: kind === "agree", usdc: kind === "agree", market: true });
+    assert.deepEqual(f.calls.filter(({ body }) => body?.method === "block" && typeof body.params.block_id === "number")
+      .map(({ url, body }) => [url.hostname, body.params.block_id]).sort(),
+    [["near-0.example", 98], ["near-0.example", 99]]);
+    assert.doesNotMatch(JSON.stringify(report), /observed-9[89]|private-other-fork|near-[012]\.example/);
+  }
+});
+
 test("disagreeing Nano frontiers, an underfunded pool and stale exchange rates cannot produce healthy admission", async () => {
   for (const kind of ["frontier", "funds", "rates"]) {
     const f = fixture(({ url, body }) => {

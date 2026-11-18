@@ -96,6 +96,9 @@ Before rebroadcasting, recovery verifies the saved signature and checks the
 transaction against the recorded payer, amount, asset, nonce and block.
 The read-only monitor performs the same check on saved transactions. Invalid
 evidence keeps the debt reserved and the original bytes available for review.
+The NEAR readiness monitor compares finalized hashes at each height reported
+by fresh RPC peers. The writer verifies its last accepted finalized block on a
+replacement peer before using it for payment reads or signed submissions.
 NEAR and Market creator payouts cover only the matching recipient and
 amount. Restored outbox entries that disagree with the original obligation
 stay held with their signed bytes. The payment and assignment records remain

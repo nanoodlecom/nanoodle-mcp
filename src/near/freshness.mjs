@@ -12,12 +12,20 @@ export function assertFreshTime(at, { now = Date.now(), maxHeadAgeMs = MAX_HEAD_
   return at;
 }
 
-export function assertFreshBlock(block, options) {
+export function nearBlockIdentity(block) {
   const h = block?.header;
   const height = typeof h?.height === "number" ? h.height
     : typeof h?.height === "string" && /^\d+$/.test(h.height) ? Number(h.height) : NaN;
-  if (!h || !Number.isSafeInteger(height) || height <= 0 || typeof h.hash !== "string" || !h.hash
-    || typeof h.timestamp_nanosec !== "string" || !/^\d+$/.test(h.timestamp_nanosec)) {
+  if (!h || !Number.isSafeInteger(height) || height <= 0 || typeof h.hash !== "string" || !h.hash) {
+    throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC returned an invalid block identity");
+  }
+  return { height, hash: h.hash };
+}
+
+export function assertFreshBlock(block, options) {
+  nearBlockIdentity(block);
+  const h = block.header;
+  if (typeof h.timestamp_nanosec !== "string" || !/^\d+$/.test(h.timestamp_nanosec)) {
     throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC returned an invalid finalized head");
   }
   return assertFreshTime(Number(BigInt(h.timestamp_nanosec) / 1_000_000n), options);

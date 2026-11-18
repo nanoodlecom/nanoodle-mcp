@@ -21,7 +21,7 @@
  * Those are mapped by their cause like any other JSON-RPC error.
  */
 import { NearError } from "./errors.mjs";
-import { assertFreshBlock, assertFreshStatus, assertFreshTime, MAX_CLOCK_SKEW_MS } from "./freshness.mjs";
+import { assertFreshBlock, assertFreshStatus, assertFreshTime, MAX_CLOCK_SKEW_MS, nearBlockIdentity } from "./freshness.mjs";
 
 export function parseRpcJson(text) {
   return JSON.parse(text, (key, value, ctx) => {
@@ -105,7 +105,8 @@ function methods(call) {
       return call("status", []);
     },
     block(ref) {
-      if (ref && typeof ref.blockId === "string") return call("block", { block_id: ref.blockId });
+      const id = ref?.blockId;
+      if (typeof id === "string" || (Number.isSafeInteger(id) && id >= 0)) return call("block", { block_id: id });
       if (ref && typeof ref.finality === "string") return call("block", { finality: ref.finality });
       throw new TypeError("block() needs { finality } or { blockId }");
     },
@@ -151,7 +152,9 @@ const RECOVERABLE_READS = new Set(["status", "block", "query", "gas_price", "EXP
  *    One on another network is dropped for good: a testnet node must
  *    never vouch for a mainnet payment.
  *  - Hosted callers enable `maxHeadAgeMs`: syncing/stale status or latest blocks
- *    fail over before authorizing work. Historical blocks remain readable.
+ *    fail over before authorizing work. A replacement endpoint verifies the
+ *    last accepted finalized block before it is used for reads or submission.
+ *    Historical blocks remain readable.
  *
  * Every endpoint is equally trusted for finality; list only ones you trust.
  */
@@ -162,18 +165,19 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
   if (!Number.isSafeInteger(recheckMs) || recheckMs < 0 || recheckMs > 60_000) throw new TypeError("recheckMs must be between 0 and 60000");
   if (maxHeadAgeMs !== null && (!Number.isSafeInteger(maxHeadAgeMs) || maxHeadAgeMs <= 0)) throw new TypeError("maxHeadAgeMs must be a positive integer or null");
   if (!Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs < 0) throw new TypeError("maxClockSkewMs must be a nonnegative integer");
-  const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checkedAt: null, headAt: null, checking: null, wrongChain: false, downUntil: 0 }));
+  const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checkedAt: null, headAt: null,
+    checking: null, finalAnchor: null, finalChecking: null, wrongChain: false, downUntil: 0 }));
   const host = (url) => { try { return new URL(url).host; } catch { return "rpc"; } };
   let nextStart = 0;
-  let latestFinalHeight = 0;
-  let latestFinalHash = null;
+  let latestFinal = null;
   const freshness = () => ({ now: now(), maxHeadAgeMs, maxClockSkewMs });
-  async function request(ep, method, params, opts) {
+  async function request(ep, method, params, opts, beforeDispatch) {
     if (minIntervalMs) {
       const at = Math.max(now(), nextStart), delay = at - now();
       nextStart = at + minIntervalMs; // reserve before awaiting: concurrent callers share the budget
       if (delay > 0) await pause(delay);
     }
+    beforeDispatch?.();
     return ep.client.call(method, params, opts);
   }
 
@@ -203,6 +207,39 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
     await ep.checking;
   }
 
+  async function proveFinalAnchor(ep, anchor) {
+    let actual;
+    try {
+      actual = nearBlockIdentity(await request(ep, "block", { block_id: anchor.height }));
+    } catch (error) {
+      if (TRANSPORT_CODES.has(error?.code)) throw error;
+      throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC could not prove the previous finalized block", { cause: error });
+    }
+    if (actual.height !== anchor.height || actual.hash !== anchor.hash) {
+      throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC disagrees with the previous finalized block");
+    }
+    if (!ep.finalAnchor || ep.finalAnchor.height <= anchor.height) ep.finalAnchor = anchor;
+  }
+
+  async function ensureFinalAnchor(ep) {
+    // Coalesce concurrent reads and recheck if another endpoint advanced the
+    // checkpoint while the proof was in flight.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const anchor = latestFinal;
+      if (!anchor || ep.finalAnchor === anchor) return;
+      if (ep.finalChecking?.anchor !== anchor) {
+        const pending = { anchor, promise: null };
+        pending.promise = proveFinalAnchor(ep, anchor).finally(() => {
+          if (ep.finalChecking === pending) ep.finalChecking = null;
+        });
+        ep.finalChecking = pending;
+      }
+      await ep.finalChecking.promise;
+      if (ep.finalAnchor === latestFinal) return;
+    }
+    throw new NearError("RPC_STALE", "NEAR finalized checkpoint advanced before this endpoint could verify it");
+  }
+
   async function call(method, params, opts) {
     const usable = eps.filter((ep) => !ep.wrongChain);
     if (!usable.length) throw new NearError("RPC_WRONG_NETWORK", `no NEAR RPC endpoint is on ${chainId}`);
@@ -214,20 +251,33 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
       if (ep.wrongChain) continue;
       let attempted = false;
       try {
-        if (method !== "status") await ensureChecked(ep);
-        attempted = true;
-        const result = await request(ep, method, params, opts);
+        if (method !== "status") {
+          await ensureChecked(ep);
+          if (latestFinal && ep.finalAnchor !== latestFinal) await ensureFinalAnchor(ep);
+        }
+        const result = await request(ep, method, params, opts, () => {
+          if (method !== "status" && latestFinal && ep.finalAnchor !== latestFinal) {
+            throw new NearError("RPC_STALE", "NEAR finalized checkpoint advanced before dispatch");
+          }
+          attempted = true;
+        });
         if (method === "status") checkStatus(ep, result);
         if (maxHeadAgeMs !== null && method === "block" && params?.finality) {
           assertFreshBlock(result, freshness());
           if (params.finality === "final") {
-            const height = Number(result.header.height);
-            if (height < latestFinalHeight) throw new NearError("RPC_STALE", "NEAR finalized head regressed");
-            if (height === latestFinalHeight && result.header.hash !== latestFinalHash) {
-              throw new NearError("RPC_BAD_RESPONSE", "NEAR finalized head changed hash at the same height");
+            const next = nearBlockIdentity(result);
+            if (latestFinal && ep.finalAnchor !== latestFinal) await ensureFinalAnchor(ep);
+            if (latestFinal) {
+              if (ep.finalAnchor !== latestFinal) throw new NearError("RPC_STALE", "NEAR finalized checkpoint advanced before verification");
+              if (next.height < latestFinal.height) throw new NearError("RPC_STALE", "NEAR finalized head regressed");
+              const sameHeight = next.height === latestFinal.height, sameHash = next.hash === latestFinal.hash;
+              if (sameHeight !== sameHash) {
+                ep.finalAnchor = null;
+                throw new NearError("RPC_BAD_RESPONSE", "NEAR finalized block identity changed");
+              }
             }
-            latestFinalHeight = height;
-            latestFinalHash = result.header.hash;
+            if (!latestFinal || next.height > latestFinal.height) latestFinal = next;
+            ep.finalAnchor = latestFinal;
           }
         }
         ep.downUntil = 0;
