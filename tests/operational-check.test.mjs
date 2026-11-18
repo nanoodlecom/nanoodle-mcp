@@ -254,6 +254,24 @@ test("the scheduled check detects overdue Nano execution and unverified legacy e
   assert.doesNotMatch(JSON.stringify(report), /private-exec-/);
 });
 
+test("the scheduled check reserves incomplete Nano settlements and flags their evidence without inference", async t => {
+  const f = fixture(), source = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/state/gate-state.json"].quotes.push({
+    id: "private-payment-proof", status: "paid", settled: true, runDeadlineAt: NOW,
+    amountRaw: "100", source, settleReceipt: { author: false, authorAddress: null, change: "70", take: "0" },
+    transferReceipts: { change: { to: source, amountRaw: "40", hash: "A".repeat(64) } },
+  }, {
+    id: "private-refund-proof", status: "refunded", refundExpected: true, amountRaw: "50", source,
+  });
+  const report = await runOperationalCheck(f.config, f.deps);
+  for (const stage of ["nano-settlement-intent-missing", "nano-settlement-evidence-mismatch"]) {
+    assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: false, code: stage, domains: [] });
+  }
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-payment-proof|private-refund-proof|AAAAAAA|nano_3t6k35/);
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

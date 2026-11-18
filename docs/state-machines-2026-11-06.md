@@ -82,6 +82,10 @@ A replacement requires a confirmed competing block on the same account
 and predecessor. The monitor flags unsigned debts created by the old writer
 and blocks claimed by more than one obligation. Preserve old debts as
 liabilities and reconcile them against the chain before any further transfer.
+Current settlements also retain the expected recipient and confirmation for
+each outgoing leg. Missing or incomplete evidence keeps the balance reserved
+and preserves the quote for reconciliation. The writer holds any restored
+send whose amount or recipient conflicts with its settlement.
 
 The Nano gate and creator payout ledger still share one wallet writer.
 Activation and rollback require the guarded release procedure. A writer

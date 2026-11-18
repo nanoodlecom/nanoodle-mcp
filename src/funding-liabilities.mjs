@@ -2,6 +2,7 @@
 import { fundingRaw, runFundingBudget } from "./run-funding.mjs";
 import { parseUsdNano, knownUsd } from "./usd.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
+import { isNanoHistoryHash } from "./nano-payment-history.mjs";
 
 const nanoStates = new Set(["pending", "paid", "consumed", "expired", "refunded"]);
 const nearStates = new Set(["pending", "paid", "running", "settled", "failed", "rejected", "expired"]);
@@ -22,35 +23,116 @@ function legacyMarketReserve(record) {
     { usdNano: 1_000_000_000n, yocto: 1_000_000_000n }, parseUsdNano(record.creator.xnoUsd));
 }
 
-/** Amount still owed to a Nano payer, independently of retained result text. */
+/** Unsettled payer principal and change on legacy records without a known payer. */
 export function nanoQuoteClaim(q) {
   if (!nanoStates.has(q?.status)) throw Error("invalid-nano-quote-status");
   if (!q.settled && (["paid", "consumed"].includes(q.status) || (q.status === "expired" && q.payHash))) {
     return stateRaw(q.amountRaw);
   }
-  if (q.settled && !q.source && q.settleReceipt?.change != null) return stateRaw(q.settleReceipt.change);
+  if (q.settled && !q.source && !q.refundExpected && !Number.isSafeInteger(q.runDeadlineAt)
+    && q.settleReceipt?.authorAddress === undefined && q.settleReceipt?.change != null) return stateRaw(q.settleReceipt.change);
   return 0n;
 }
 
-export function nanoFundingLiabilities({ quotes, owed, pending = [] }) {
+function nanoAccount(value) {
+  return typeof value === "string" && /^(?:nano|xrb)_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$/.test(value)
+    ? value.replace(/^xrb_/, "nano_") : null;
+}
+
+function recordedNanoAmount(value) {
+  try { return stateRaw(value); } catch { return null; }
+}
+
+/** Only newer outcomes promise matching journal or confirmation records. */
+function nanoSettlementEvidence(q, debts) {
+  const claimed = Number.isSafeInteger(q.runDeadlineAt);
+  const refund = q.refundExpected === true || (claimed && !q.settled && (q.error || q.status === "refunded"));
+  const r = q.settleReceipt;
+  if (!refund && !(q.settled && (claimed || r?.authorAddress !== undefined))) return null;
+  const deposit = stateRaw(q.amountRaw);
+  const confirmed = q.transferReceipts ?? {};
+  const expected = new Map();
+  if (refund && !q.settled) {
+    expected.set("refund", { amount: deposit, to: nanoAccount(q.source), requireRecipient: q.refundExpected === true });
+  } else {
+    const change = recordedNanoAmount(r?.change), take = recordedNanoAmount(r?.take);
+    if (refund || change === null || take === null || change + take > deposit
+      || typeof r.author !== "boolean" || (r.authorAddress !== undefined && r.author !== Boolean(nanoAccount(r.authorAddress)))) {
+      return { missing: false, mismatch: true, uncoveredRaw: deposit, unsafeDebts: debts };
+    }
+    const requireRecipient = r.authorAddress !== undefined;
+    expected.set("change", { amount: change, to: nanoAccount(q.source), requireRecipient });
+    if (r.author) expected.set("author_payout", { amount: take, to: nanoAccount(r.authorAddress), requireRecipient });
+  }
+
+  let missing = false, mismatch = false, uncoveredRaw = 0n;
+  const unsafeDebts = new Set();
+  for (const [event, { amount, to, requireRecipient }] of expected) {
+    if (amount === 0n) continue;
+    const associated = debts.filter(o => o.event === event);
+    const [debt] = associated;
+    const receipt = confirmed[event];
+    const recipientKnown = to !== null || (event === "author_payout" && !requireRecipient);
+    const correctRecipient = entry => recipientKnown && (to === null ? nanoAccount(entry.to) !== null : nanoAccount(entry.to) === to);
+    const debtRaw = debt?.journaled === true && correctRecipient(debt) ? stateRaw(debt.amountRaw) : null;
+    const receiptRaw = receipt && isNanoHistoryHash(receipt.hash) && recipientKnown
+      && (receipt.to == null && !requireRecipient || correctRecipient(receipt)) ? recordedNanoAmount(receipt.amountRaw) : null;
+    const completionInProgress = debt?.completing === true && debt.confirmedHash === receipt?.hash;
+    const completedRefund = event === "refund" && q.status === "refunded";
+    if ((!debt || completedRefund) && !receipt) missing = true;
+    if (associated.length > 1 || (debt && (completedRefund || debtRaw !== amount || (receipt && !completionInProgress)))
+      || (receipt && receiptRaw !== amount)) {
+      mismatch = true;
+      for (const o of associated) unsafeDebts.add(o);
+    }
+    // The in-flight form retains its debt until the receipt is durable. An
+    // overlapping receipt and debt can cover an obligation only once.
+    const covered = receiptRaw ?? debtRaw ?? 0n;
+    if (amount > covered) uncoveredRaw += amount - covered;
+  }
+  for (const debt of debts) {
+    if (!expected.get(debt.event)?.amount) { mismatch = true; unsafeDebts.add(debt); }
+  }
+  if (Object.keys(confirmed).some(event => !expected.get(event)?.amount)) mismatch = true;
+  return { missing, mismatch, uncoveredRaw, unsafeDebts };
+}
+
+/** Shared reserve and diagnostics for the writer and the read-only monitor. */
+export function nanoFundingCoverage({ quotes, owed, pending = [] }) {
   array(quotes); array(owed); array(pending);
-  const coveredByPayment = new Map();
-  let total = 0n;
+  const debtsByPayment = new Map(), unresolvedQuotes = new Set(), unsafeDebts = new Set();
+  let totalRaw = 0n, missing = false, mismatch = false;
   for (const debt of [...owed, ...pending]) {
     const amount = stateRaw(debt.amountRaw);
-    total += amount;
-    if (["refund", "change"].includes(debt.event) && typeof debt.fields?.paymentId === "string") {
-      const id = debt.fields.paymentId;
-      coveredByPayment.set(id, (coveredByPayment.get(id) ?? 0n) + amount);
+    totalRaw += amount;
+    const id = debt.fields?.paymentId;
+    if (typeof id === "string") {
+      if (!debtsByPayment.has(id)) debtsByPayment.set(id, []);
+      debtsByPayment.get(id).push(debt);
     }
   }
   for (const q of quotes) {
     if (typeof q.id !== "string" || !q.id) throw Error("invalid-funding-quote");
+    if (!nanoStates.has(q.status)) throw Error("invalid-nano-quote-status");
+    const debts = debtsByPayment.get(q.id) ?? [];
+    const evidence = nanoSettlementEvidence(q, debts);
+    if (evidence) {
+      totalRaw += evidence.uncoveredRaw;
+      if (evidence.missing || evidence.mismatch) unresolvedQuotes.add(q.id);
+      missing ||= evidence.missing;
+      mismatch ||= evidence.mismatch;
+      for (const debt of evidence.unsafeDebts) unsafeDebts.add(debt);
+      continue;
+    }
     const claim = nanoQuoteClaim(q);
-    const covered = coveredByPayment.get(q.id) ?? 0n;
-    if (claim > covered) total += claim - covered;
+    const covered = debts.filter(d => ["refund", "change"].includes(d.event)).reduce((sum, d) => sum + stateRaw(d.amountRaw), 0n);
+    if (claim > covered) totalRaw += claim - covered;
   }
-  return total;
+  return { totalRaw, missing, mismatch, unresolvedQuotes, unsafeDebts };
+}
+
+export function nanoFundingLiabilities(snapshot) {
+  return nanoFundingCoverage(snapshot).totalRaw;
 }
 
 function nearCreatorMaximum(q) {

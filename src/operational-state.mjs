@@ -1,7 +1,7 @@
 // Read-only accounting for probes and admission checks. Never opens a ledger,
 // signs a transaction, retries an assignment, or returns customer content.
 import { parseUsdNano } from "./usd.mjs";
-import { nanoFundingLiabilities, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
+import { nanoFundingCoverage, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
 import { NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
@@ -20,11 +20,14 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
   if (![1, 2].includes(nano?.v) || !Array.isArray(nano.quotes) || !Array.isArray(nano.owed)
     || near?.v !== 1 || !object(near.quotes) || !object(near.refunds) || !object(near.payouts ?? {})
     || !object(near.consumedTx ?? {})) throw Error("invalid-state-shape");
-  let nanoRaw = nanoFundingLiabilities({ quotes: nano.quotes, owed: nano.owed }), marketUsdNano = 0n;
+  const nanoCoverage = nanoFundingCoverage({ quotes: nano.quotes, owed: nano.owed });
+  let nanoRaw = nanoCoverage.totalRaw, marketUsdNano = 0n;
   const nearClaims = nearRefundClaims(near, { now });
   const watch = near.meta?.[PAYMENT_WATCH_META];
   const coveredThroughMs = nearPaymentWatchCoverage(watch, !!watch?.backfill);
   const issues = new Set();
+  if (nanoCoverage.missing) issues.add("nano-settlement-intent-missing");
+  if (nanoCoverage.mismatch) issues.add("nano-settlement-evidence-mismatch");
   for (const [hash, id] of Object.entries(near.consumedTx ?? {})) {
     const quote = near.quotes[id];
     // The replay index outlives intentionally pruned quotes.
