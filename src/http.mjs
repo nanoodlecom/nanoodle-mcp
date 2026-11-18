@@ -637,7 +637,7 @@ function payPageHtml(q) {
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
          Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
       </div>
-      <p class="muted" id="status" role="status">${q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "waiting for payment… settles in about a second"}</p>
+      <p class="muted" id="status" role="status">${q.checkingHistory ? "Checking Nano payment history for this quote." : q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "waiting for payment… settles in about a second"}</p>
       <p class="muted" id="expiry"${canPay ? "" : " hidden"}></p>
     </div>
     <script>
@@ -655,12 +655,12 @@ function payPageHtml(q) {
     </script>
     <script>
       var done = false;
-      function apply(status, checkingPayment){
+      function apply(status, checkingPayment, checkingHistory){
         if(done) return false;
         if(checkingPayment){
           document.getElementById("pay-instructions").hidden = true;
           document.getElementById("expiry").hidden = true;
-          document.getElementById("status").textContent = "Recording your Nano transfer. Keep this page open.";
+          document.getElementById("status").textContent = checkingHistory ? "Checking Nano payment history for this quote." : "Recording your Nano transfer. Keep this page open.";
           return false;
         }
         if(status === "paid" || status === "consumed"){
@@ -690,7 +690,7 @@ function payPageHtml(q) {
           try{
             const r = await fetch(${JSON.stringify(statusUrl)});
             const state = await r.json();
-            if(apply(state.status, state.checkingPayment)) return;
+            if(apply(state.status, state.checkingPayment, state.checkingHistory)) return;
           }catch{ await new Promise(function(r){ setTimeout(r, 1000); }); }
         }
       }
@@ -699,7 +699,7 @@ function payPageHtml(q) {
         var es;
         try{ es = new EventSource(${JSON.stringify(watchUrl)}); }catch(e){ return poll(); }
         es.addEventListener("status", function(ev){
-          try{ const state = JSON.parse(ev.data); if(apply(state.status, state.checkingPayment)){ es.close(); } }catch{}
+          try{ const state = JSON.parse(ev.data); if(apply(state.status, state.checkingPayment, state.checkingHistory)){ es.close(); } }catch{}
         });
         es.onerror = function(){ es.close(); if(!done) poll(); }; // stream dropped → poll
       }
@@ -1067,6 +1067,7 @@ export async function serveHttp({
         // Terminal quotes carry done + next (agent instructions for the result stream).
         return send(200, JSON.stringify(q
           ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.checkingPayment && { checkingPayment: true }),
+            ...(q.checkingHistory && { checkingHistory: true }),
             ...(q.done ? { done: true, next: q.next } : {}) }
           : { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." }));
       }
@@ -1106,6 +1107,7 @@ export async function serveHttp({
           if (nearWatch) return followRun ? { ...q, done: runDone(q) } : q;
           const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
           if (q.checkingPayment) f.checkingPayment = true;
+          if (q.checkingHistory) f.checkingHistory = true;
           if (q.done) { f.done = true; if (q.next) f.next = q.next; }
           return f;
         };

@@ -8,6 +8,24 @@ const balances = liabilities => ({ liabilities, nanoBalanceRaw: (10n ** 31n).toS
   storageUsage: 500, usdcBalanceAtomic: "1000000000", xnoUsd: "1", providerReserveUsd: "2",
   costs: { storagePriceYocto: 10_000_000_000_000_000_000n, nativeRefundFeeYocto: 200_000_000_000_000_000_000n, tokenRefundFeeYocto: 6_000_000_000_000_000_000_001n } });
 
+test("the monitor recognizes overdue Nano recovery windows without making an unknown late refund spendable", () => {
+  const s = snapshots(), expiresAt = NOW - 3_600_001;
+  s.nano.historyScan = { through: null, coveredAt: expiresAt, backfill: {
+    newest: "A".repeat(64), next: "B".repeat(64), startedAt: NOW - 900_001, fullReceivableWindow: false,
+  } };
+  s.nano.quotes.push(
+    { id: "old", status: "expired", amountRaw: "10", expiresAt, historyUnproven: true },
+    { id: "late", status: "expired", amountRaw: "200", expiresAt, paidAt: expiresAt + 1, payHash: "C".repeat(64) },
+  );
+  const result = paymentLiabilities(s, { now: NOW });
+  assert.equal(result.nanoRaw, 200n);
+  assert.deepEqual(result.issues, ["nano-history-backfill-delayed", "nano-history-payment-unproven", "nano-late-refund-intent-unknown", "nano-quote-history-overdue"]);
+  s.nano.historyScan = { through: "A".repeat(64), coveredAt: NOW, backfill: null };
+  s.nano.quotes[0].historyUnproven = false;
+  s.nano.owed.push({ event: "refund", amountRaw: "200", createdAt: NOW, fields: { paymentId: "late" } });
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+});
+
 test("all unsettled currencies and creator payouts are reserved without double-counting settlement intents", () => {
   const s = snapshots();
   s.nano.quotes.push({ id: "nano1", status: "paid", amountRaw: "10" }, { id: "nano2", status: "paid", settled: true, amountRaw: "999" });

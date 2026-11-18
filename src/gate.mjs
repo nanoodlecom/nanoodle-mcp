@@ -39,6 +39,7 @@ import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
 import { nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
 import { syncPrivateStateParentSync } from "./private-state.mjs";
+import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -244,6 +245,7 @@ export function createChargeGate({
 
   /** @type {Map<string, object>} paymentId → quote */
   const quotes = new Map();
+  let historyScan = readNanoPaymentHistory();
 
   /* ---------------- pricing ---------------- */
 
@@ -304,7 +306,9 @@ export function createChargeGate({
     for (const w of q.waiters.splice(0)) w();
   }
 
-  const statusOf = q => q.depositPending && q.status === "paid" ? "pending" : q.status;
+  const historyPending = q => q.status === "expired" && !q.payHash
+    && (q.historyUnproven || (historyScan.backfill !== null && (historyScan.coveredAt ?? 0) <= q.expiresAt));
+  const statusOf = q => (q.depositPending && q.status === "paid") || historyPending(q) ? "pending" : q.status;
 
   function publishDeposit(q) {
     const via = q.depositPending;
@@ -417,6 +421,7 @@ export function createChargeGate({
       try {
         const hash = await send();
         q.status = "refunded";
+        q.completedAt = now();
         usage("refund", { paymentId: q.id, tool: q.tool, ok: true, amountRaw: q.amountRaw, to: q.source, hash, reason });
         persist();
         return true;
@@ -424,7 +429,7 @@ export function createChargeGate({
         log(`refund of ${q.id} to ${q.source} failed: ${e.message}`);
         usage("refund", { paymentId: q.id, tool: q.tool, ok: false, error: e.message, reason });
         owe(q.source, q.amountRaw, "refunded", "refund",
-          { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; });
+          { paymentId: q.id, tool: q.tool, reason }, () => { q.status = "refunded"; q.completedAt = now(); });
         return false;
       }
     });
@@ -454,6 +459,7 @@ export function createChargeGate({
         // v:1 (or unversioned) file predates this and may hold user content, so
         // restore treats it as legacy: drop its results, redact its errors.
         v: 2,
+        historyScan,
         quotes: [...quotes.values()].map((q) => {
           // What we're willing to write to disk for this quote's outcome:
           //   - Media-only results persist as today (minus inline image blocks;
@@ -476,6 +482,8 @@ export function createChargeGate({
             amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
             status: q.status === "consumed" && !result && !error ? "paid" : q.status,
             source: q.source ?? null, payHash: q.payHash ?? null, paidAt: q.paidAt ?? null,
+            ...(q.historyAfter != null && { historyAfter: q.historyAfter }),
+            ...(q.historyUnproven && { historyUnproven: true }),
             completedAt: q.completedAt ?? null,
             settled: q.settled === true,
             settleReceipt: q.settleReceipt ?? null, // money figures only; no user content
@@ -526,6 +534,7 @@ export function createChargeGate({
       }
       try { syncPrivateStateParentSync(stateFile); }
       catch (cause) { throw new Error("cannot synchronize the restored Nano payment state", { cause }); }
+      historyScan = readNanoPaymentHistory(data.historyScan);
       // A pre-v2 file predates content stripping: its results may be full tool
       // output (text included) and its errors may be free-text upstream messages
       // — both can quote user content. We can't prove any legacy field is clean,
@@ -535,7 +544,9 @@ export function createChargeGate({
         if (!s || typeof s.id !== "string" || !s.id || quotes.has(s.id) ||
             !["pending", "paid", "consumed", "expired", "refunded"].includes(s.status) ||
             !/^\d+$/.test(s.amountRaw) || BigInt(s.amountRaw) <= 0n ||
-            !Number.isFinite(s.createdAt) || !Number.isFinite(s.expiresAt)) {
+            !Number.isFinite(s.createdAt) || !Number.isFinite(s.expiresAt)
+            || (s.historyAfter != null && !isNanoHistoryHeight(s.historyAfter))
+            || (s.historyUnproven != null && typeof s.historyUnproven !== "boolean")) {
           throw new Error("invalid quote in gate state");
         }
         const q = { ...s, pair: { usdNano: BigInt(s.pair.usdNano), raw: BigInt(s.pair.raw) }, waiters: [] };
@@ -586,7 +597,7 @@ export function createChargeGate({
           ...s, fields, createdAt: s.createdAt ?? now(), tries: s.tries ?? 0, held: s.held === true || s.tries >= OWED_MAX_TRIES,
           at: s.held === true || s.tries >= OWED_MAX_TRIES ? Infinity : now() + OWED_BACKOFF_MS[0],
           onOk: s.event === "refund" && s.fields && s.fields.paymentId
-            ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; persist(); } }
+            ? () => { const q = quotes.get(s.fields.paymentId); if (q) { q.status = "refunded"; q.completedAt = now(); persist(); } }
             : null,
         });
         // issue #23: q.refunding is a live-only Promise that persistence drops,
@@ -626,7 +637,8 @@ export function createChargeGate({
       // Retention may remove completed outcomes, never an unclaimed payment
       // or a run still in flight. Those records are outstanding obligations.
       const unfinished = nanoQuoteClaim(q) > 0n || q.status === "paid" || (q.status === "consumed" && !q.result && !q.error);
-      if (!unfinished && t - (q.completedAt ?? q.createdAt) > RETAIN_MS) { quotes.delete(q.id); changed = true; }
+      if (!unfinished && !q.historyUnproven && !nanoQuoteNeedsHistory(q, historyScan.coveredAt, t)
+        && t - (q.completedAt ?? q.createdAt) > RETAIN_MS) { quotes.delete(q.id); changed = true; }
     }
     if (changed) persist();
   }
@@ -644,12 +656,27 @@ export function createChargeGate({
     const bucket = BigInt(amt) / GRAIN;
     for (const q of quotes.values()) {
       if (BigInt(q.amountRaw) / GRAIN !== bucket) continue;
-      if (q.unpublished || q.depositPending || q.refunding || !["pending", "expired"].includes(q.status)) return;
+      if (q.unpublished || q.depositPending || q.payHash || q.refunding || !["pending", "expired"].includes(q.status)) return;
       const observedAt = now();
+      if (meta.history) {
+        const { height, local_timestamp: timestamp } = meta.history;
+        const stamp = /^\d{1,12}$/.test(timestamp || "") ? Number(timestamp) * 1000 : 0;
+        const recordedAt = stamp <= observedAt + 30_000 ? stamp : 0;
+        if (recordedAt && recordedAt + 999 < q.createdAt) return;
+        if (q.historyAfter != null && isNanoHistoryHeight(height) && BigInt(height) <= BigInt(q.historyAfter)) return;
+        // A local node timestamp can screen old legacy receipts. An absent
+        // timestamp requires the quote's confirmed-history height instead.
+        if ((q.historyAfter != null && !isNanoHistoryHeight(height))
+          || (q.historyAfter == null && !recordedAt && typeof ops.checkpoint === "function")) {
+          if (!q.historyUnproven) { q.historyUnproven = true; persist(); }
+          return;
+        }
+      }
       if (q.status === "pending") q.status = observedAt <= q.expiresAt ? "paid" : "expired";
       q.source = q.source || meta.source || null;
       q.payHash = q.payHash || meta.hash || null;
       q.paidAt ??= observedAt;
+      delete q.historyUnproven;
       q.depositPending = meta.via;
       if (!stateFile) publishDeposit(q);
       return;
@@ -664,12 +691,12 @@ export function createChargeGate({
   const anyPending = () => [...quotes.values()].some(q => !q.unpublished && statusOf(q) === "pending");
   // Recently expired quotes stay watched so a payment that arrives too late is
   // noticed and bounced straight back instead of silently kept.
-  const LATE_WATCH_MS = 60 * 60 * 1000;
   // Someone is waiting on money to ARRIVE — poll fast, a caller is blocked on it.
   const anyPaymentWatchable = () => {
     const t = now();
     return [...quotes.values()].some((q) =>
-      !q.unpublished && (q.depositPending || q.status === "pending" || (q.status === "expired" && t - q.expiresAt < LATE_WATCH_MS)));
+      !q.unpublished && (q.depositPending || q.status === "pending"
+        || (q.status === "expired" && (t - q.expiresAt < NANO_LATE_WATCH_MS || nanoQuoteNeedsHistory(q, historyScan.coveredAt, t)))));
   };
   // Keep ticking for the owed queue too, but that is money going OUT on its own
   // backoff (OWED_BACKOFF_MS) — it must never pull the receivable poll up to
@@ -680,50 +707,86 @@ export function createChargeGate({
   // failed refund held the loop for 34h and 5,158 calls on 2026-07-23/25.
   const anyWatchable = () => persistenceFailed || owed.length > 0 || anyPaymentWatchable();
 
-  /**
-   * Race cover for pocketed payments: the wallet (same process, other duties)
-   * pockets receivables indiscriminately — including deposits this scanner has
-   * not matched yet — after which they only exist as received history entries.
-   * A fixed history window loses them under burst churn, so this walks
-   * newest-to-oldest until the newest block the PREVIOUS walk saw: work done
-   * scales with actual chain activity and nothing scrolls out of view. The
-   * first walk (marker unset) reads one page to seed the marker — anything
-   * older and unpocketed is still in `receivable`, which scan() reads first.
-   */
-  let lastHistoryHash = null;
-  async function scanHistory() {
-    let head = null;
-    let newest = null;
-    for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
-      const h = await ops.rpc({
-        action: "account_history", account: address,
-        count: String(HISTORY_PAGE), ...(head ? { head } : {}),
-      });
-      const entries = Array.isArray(h && h.history) ? h.history : [];
-      if (!entries.length) break;
-      if (newest === null) newest = entries[0].hash || null;
-      let reachedMarker = false;
-      for (const entry of entries) {
-        if (!entry) continue;
-        if (entry.hash === lastHistoryHash) { reachedMarker = true; break; }
-        if (entry.type === "receive") {
-          matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll" });
-        }
-      }
-      if (reachedMarker || lastHistoryHash === null) break; // caught up (first walk seeds the marker from one page)
-      head = typeof (h && h.previous) === "string" ? h.previous : null;
-      if (head === null) break; // history exhausted before the marker — everything was scanned anyway
-      if (page === HISTORY_MAX_PAGES - 1) {
-        log(`history walk hit its ${HISTORY_MAX_PAGES * HISTORY_PAGE}-entry cap before the last-seen block — ` +
-          "a payment pocketed under that churn may go unmatched until its quote expires");
-      }
+  function initialHistoryFloor() {
+    let floor = null;
+    for (const q of quotes.values()) {
+      if (q.unpublished || q.payHash || !["pending", "expired"].includes(q.status)) continue;
+      if (q.historyAfter == null) return null;
+      const height = BigInt(q.historyAfter);
+      if (floor === null || height < floor) floor = height;
     }
-    // Empty history seeds an empty-string sentinel: it matches no real hash, so
-    // once the account's FIRST blocks appear the walk reads them all (bounded by
-    // the page cap) instead of treating that scan as another one-page seeding.
+    return floor;
+  }
+
+  async function readHistoryPage(head) {
+    const page = await ops.rpc({ action: "account_history", account: address, count: String(HISTORY_PAGE), ...(head && { head }) });
+    if (page?.history !== "" && !Array.isArray(page?.history)) throw new Error("Invalid Nano history page");
+    if (page.account && page.account.replace(/^xrb_/, "nano_") !== address.replace(/^xrb_/, "nano_")) throw new Error("Nano history returned the wrong account");
+    const entries = [];
+    let lastHeight = null;
+    for (const row of page.history || []) {
+      if (!isNanoHistoryHash(row?.hash)) throw new Error("Invalid Nano history block hash");
+      if (row.height !== undefined) {
+        const height = isNanoHistoryHeight(row.height) ? BigInt(row.height) : 0n;
+        if (height === 0n || (lastHeight !== null && height >= lastHeight)) throw new Error("Invalid Nano history block order");
+        lastHeight = height;
+      }
+      if (![false, "false"].includes(row.confirmed)) entries.push({ ...row, hash: row.hash.toUpperCase() });
+    }
+    if (page.previous != null && !/^0{64}$/.test(page.previous) && !isNanoHistoryHash(page.previous)) throw new Error("Invalid Nano history continuation");
+    const next = isNanoHistoryHash(page.previous) ? page.previous.toUpperCase() : null;
+    if (next && head === next) throw new Error("Nano history continuation did not advance");
+    return { entries, next };
+  }
+
+  function inspectHistory(entries, stop, floor) {
+    for (const entry of entries) {
+      if (entry.hash === stop || (floor !== null && isNanoHistoryHeight(entry.height) && BigInt(entry.height) <= floor)) return true;
+      if (entry.type === "receive") matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll", history: entry });
+    }
+    return false;
+  }
+
+  async function saveHistory(next) {
     await commitDeposits();
-    if (newest) lastHistoryHash = newest;
-    else if (lastHistoryHash === null) lastHistoryHash = "";
+    const previous = historyScan;
+    if (JSON.stringify(next) === JSON.stringify(previous)) return;
+    historyScan = next;
+    let saved = false;
+    try { saved = await persist(); }
+    finally { if (!saved) historyScan = previous; }
+    if (!saved) throw new Error("Could not save Nano payment history progress");
+    if (previous.backfill && !next.backfill) {
+      for (const q of quotes.values()) if (q.status === "expired" && !q.payHash) resolveWaiters(q);
+    }
+  }
+
+  /** Pocketed payments disappear from receivable. Inspect the latest page for
+   * quick confirmation, while a fixed backfill resumes older pages across
+   * ticks and restarts until it reaches the last completed checkpoint. */
+  async function scanHistory(startedAt, fullReceivableWindow) {
+    const prior = historyScan;
+    const anchor = ops.checkpoint?.()?.confirmed?.hash;
+    const latest = await readHistoryPage(isNanoHistoryHash(anchor) ? anchor.toUpperCase() : null);
+    const replay = prior.backfill;
+    const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
+    const floor = prior.through === null ? initialHistoryFloor() : null;
+    if (replay) inspectHistory(latest.entries, replay.newest || prior.through, floor);
+
+    for (let used = replay ? 1 : 0; used < HISTORY_MAX_PAGES; used++) {
+      const page = batch.next ? await readHistoryPage(batch.next) : latest;
+      batch.newest ??= page.entries[0]?.hash ?? null;
+      const reached = inspectHistory(page.entries, prior.through, floor);
+      if (reached || !page.next) {
+        if (!reached && prior.through) throw new Error("Nano history ended before the saved checkpoint");
+        const through = batch.newest || prior.through;
+        const refreshCoverage = prior.coveredAt === null || through !== prior.through || batch.startedAt - prior.coveredAt >= 30_000;
+        const coveredAt = !batch.fullReceivableWindow && refreshCoverage ? Math.max(prior.coveredAt ?? 0, batch.startedAt) : prior.coveredAt;
+        return saveHistory({ through, coveredAt, backfill: null });
+      }
+      batch.next = page.next;
+    }
+    await saveHistory({ ...prior, backfill: batch });
   }
 
   async function scan() {
@@ -735,6 +798,7 @@ export function createChargeGate({
     // asking the node about one is pure load on an endpoint that is usually
     // already throttling us (that is why the refund is queued at all).
     if (!anyPaymentWatchable()) return;
+    const startedAt = now();
     const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true", include_only_confirmed: "true" });
     const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
     for (const [hash, v] of blocks) {
@@ -749,7 +813,7 @@ export function createChargeGate({
     if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
       ops.pocket().catch(() => {}); // best-effort; the next tick retries
     }
-    if (anyPaymentWatchable()) await scanHistory();
+    if (anyPaymentWatchable()) await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT);
   }
 
   /*
@@ -969,6 +1033,7 @@ export function createChargeGate({
         amountRaw: q.amountRaw, amountXno: rawToXno(q.amountRaw),
         address, uri: nanoUri(q), expiresAt: new Date(q.expiresAt).toISOString(),
         ...(q.depositPending && q.status === "paid" && { checkingPayment: true }),
+        ...(historyPending(q) && { checkingPayment: true, checkingHistory: true }),
       };
       // Terminal states close the watch SSE — package the next-step so an agent
       // (or any event-loop subscriber) does not sit on a bare "paid" with no path
@@ -1270,12 +1335,14 @@ export function createChargeGate({
           if (amountRaw === null) {
             return errResult("This server is holding too many Nano quotes at this price right now. Try again later. Nothing was quoted or charged.");
           }
+          const confirmedHeight = ops.checkpoint?.()?.confirmed?.blockCount;
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,
             pair, // settle math must use the exact pair the deposit was priced at
             amountRaw,
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
+            ...(isNanoHistoryHeight(confirmedHeight) && { historyAfter: confirmedHeight }),
             status: "pending", unpublished: true, waiters: [],
             etaMs: etaOf(name),
           };
@@ -1309,7 +1376,7 @@ export function createChargeGate({
           if (q.status === "refunded") {
             return errResult(`payment ${q.id} was refunded${q.source ? ` to ${q.source}` : ""} — call again without _payment_id to retry.`);
           }
-          if (q.status === "expired") {
+          if (statusOf(q) === "expired") {
             return errResult(`payment ${q.id} expired unpaid — call again without _payment_id for a fresh quote.`);
           }
           if (q.settled === true && !q.result && !q.error) {
@@ -1335,6 +1402,7 @@ export function createChargeGate({
           const st = await gate.waitForPayment(q.id, waitMs);
           if (st === "pending") {
             if (q.depositPending) return errResult("The original Nano transfer is being recorded. Keep monitoring this payment ID.");
+            if (historyPending(q)) return errResult("Nano is checking the history for this quote. Keep monitoring the original payment ID.");
             return errResult(
               `payment ${q.id} hasn't arrived yet — this tools/call is the RESULTS stream, not the payment monitor. ` +
               `Hang it up. Open the agent-only watch SSE ${watchUrl(q)} (never show that URL to the user), ` +

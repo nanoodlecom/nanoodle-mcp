@@ -143,6 +143,8 @@ test("Nano QR, waiting, expiry, paid, refund and polling copy stay on Nano while
   assert.equal(recording.elements.get("pay-instructions").hidden, true);
   assert.equal(recording.elements.get("expiry").hidden, true);
   assert.match(recording.elements.get("status").textContent, /Recording your Nano transfer/);
+  assert.equal(recording.context.apply("pending", true, true), false);
+  assert.match(recording.elements.get("status").textContent, /Checking Nano payment history/);
   assert.equal(recording.context.apply("paid"), true);
   const p = page(); await p.context.poll();
   assert.deepEqual(p.watched, [`/x402/watch/${originalId}`]);

@@ -797,7 +797,7 @@ test("already-pocketed payments are found via account_history", async () => {
  * (paid, never run, never refunded). These tests run against a fake node that
  * honors the RPC count params, which is what exposed the caps.
  */
-const testHash = (i) => i.toString(16).padStart(64, "0").toUpperCase();
+const testHash = (i) => (i + 1).toString(16).padStart(64, "0").toUpperCase();
 
 test("burst: 120 payments pocketed by a concurrent wallet all match via the history walk", async () => {
   const chain = fakeChain();
@@ -814,6 +814,84 @@ test("burst: 120 payments pocketed by a concurrent wallet all match via the hist
   for (let i = 0; i < 40; i++) chain.state.history.unshift({ type: "send", account: PAYER, amount: "1", hash: testHash(1000 + i) });
   const statuses = await Promise.all(xs.map((x) => gate.waitForPayment(x.paymentId, 2000)));
   assert.equal(statuses.filter((s) => s === "paid").length, 120, `expected all 120 paid, got: ${JSON.stringify(statuses.filter((s) => s !== "paid"))}`);
+});
+
+test("Nano history resumes beyond the page cap after a restart and still discovers new deposits", { timeout: 8_000 }, async t => {
+  const chain = fakeChain(), registry = fakeRegistry(), dir = await mkdtemp(join(tmpdir(), "nano-history-cursor-"));
+  const file = join(dir, "gate-state.json"), instances = [];
+  const start = () => {
+    const gate = makeGate(chain, { registry, stateFile: file, now: () => 8_000_000, pollMs: 700 });
+    instances.push(gate);
+    return gate;
+  };
+  t.after(async () => { for (const gate of instances) await gate.stop(); await rm(dir, { recursive: true, force: true }); });
+  const original = start(), { callTool } = original.wrapRegistry(registry);
+  const quoted = async Text => argOf(await callTool({ name: "poster", arguments: { Text } }));
+  const old = await quoted("older pocketed transfer"), recent = await quoted("a later pocketed transfer");
+  await original.stop();
+  const deepHash = testHash(1), freshHash = testHash(1500);
+  const fillers = Array.from({ length: 1200 }, (_, i) => ({ type: "send", account: PAYER, amount: "1", hash: testHash(1300 - i) }));
+  chain.state.history.push(...fillers, { type: "receive", account: PAYER, amount: old.amountRaw, hash: deepHash });
+  const heads = [], rpc = chain.ops.rpc;
+  chain.ops.rpc = params => { if (params.action === "account_history") heads.push(params.head ?? null); return rpc(params); };
+  const firstRecovery = start();
+  const saved = await untilState(file, "the bounded history continuation", s => s.historyScan?.backfill?.next);
+  assert.equal(saved.historyScan.through, null);
+  assert.equal(saved.historyScan.backfill.next, fillers[1000].hash);
+  assert.equal(heads.length, 10);
+  assert.equal(firstRecovery.quote(old.paymentId).status, "pending");
+  await firstRecovery.stop();
+
+  chain.state.history.unshift({ type: "receive", account: PAYER, amount: recent.amountRaw, hash: freshHash, confirmed: "true" });
+  heads.length = 0;
+  const recovered = start();
+  const statuses = await Promise.all([recent, old].map(q => recovered.waitForPayment(q.paymentId, 2_000)));
+  assert.deepEqual(statuses, ["paid", "paid"]);
+  const through = await untilState(file, "the completed history checkpoint", s => s.historyScan?.through === fillers[0].hash);
+  assert.equal(through.historyScan.backfill, null);
+  assert.deepEqual(heads.slice(0, 2), [null, saved.historyScan.backfill.next]);
+  assert.equal(quoteIn(old.paymentId)(through).payHash, deepHash);
+  assert.equal(quoteIn(recent.paymentId)(through).payHash, freshHash);
+  assert.equal(registry.callCount(), 0);
+});
+
+test("Nano history screens unconfirmed and pre-quote deposits before matching a confirmed receipt", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  let highest = { blockCount: "7", hash: testHash(7) };
+  chain.ops.checkpoint = () => ({ confirmed: highest });
+  const gate = makeGate(chain, { registry, now: () => 8_000_000, pollMs: 5 });
+  t.after(() => gate.stop());
+  const { callTool } = gate.wrapRegistry(registry);
+  const p = argOf(await callTool({ name: "poster", arguments: { Text: "confirmed only" } }));
+  const old = { type: "receive", account: PAYER, amount: p.amountRaw, hash: highest.hash, height: "7", confirmed: "true" };
+  const next = { ...old, hash: testHash(8), height: "8", confirmed: "false" };
+  chain.state.history.push(next, old);
+  highest = { blockCount: "8", hash: next.hash };
+  assert.equal(await gate.waitForPayment(p.paymentId, 35), "pending");
+  next.confirmed = "true";
+  assert.equal(await gate.waitForPayment(p.paymentId, 1000), "paid");
+});
+
+test("an old unscanned Nano quote survives a long outage and refunds its discovered deposit", { timeout: 5_000 }, async t => {
+  const chain = fakeChain(), registry = fakeRegistry(), dir = await mkdtemp(join(tmpdir(), "nano-history-expired-"));
+  const file = join(dir, "gate-state.json"), instances = [];
+  let now = 8_000_000;
+  const start = () => {
+    const gate = makeGate(chain, { registry, stateFile: file, now: () => now, pollMs: 5 });
+    instances.push(gate);
+    return gate;
+  };
+  t.after(async () => { for (const gate of instances) await gate.stop(); await rm(dir, { recursive: true, force: true }); });
+  const first = start();
+  const p = argOf(await first.wrapRegistry(registry).callTool({ name: "poster", arguments: { Text: "before the outage" } }));
+  await first.stop();
+  now += 25 * 60 * 60_000;
+  chain.state.history.push({ type: "receive", account: PAYER, amount: p.amountRaw, hash: testHash(57),
+    local_timestamp: String(Math.floor(now / 1000)), confirmed: "true" });
+  const startAfterDisruption = start();
+  await until("the restarted watcher to refund an expired pocketed deposit", () => startAfterDisruption.quote(p.paymentId)?.status === "refunded", 2_000);
+  assert.deepEqual(chain.state.transfers, [{ to: PAYER, amountRaw: p.amountRaw, describe: "refunded" }]);
+  assert.equal(registry.callCount(), 0);
 });
 
 test("burst: receivables past the poll window recover via pocketing + the history walk", async () => {
@@ -2556,6 +2634,8 @@ test("a Nano payment stays pending until its original transfer is durable, even 
   };
   const [payment, another] = await Promise.all([quote(args), quote({ Text: "simultaneous quote" })]);
   assert.notEqual(payment.amountRaw, another.amountRaw);
+  await untilState(stateFile, "the initial history checkpoint", s => s.historyScan?.coveredAt != null);
+  await until("the history checkpoint sync", () => gate.persistenceStatus().pendingWrites === 0);
   await mkdir(temporary);
   const hash = "A".repeat(64);
   const callPaid = wrapped => wrapped.callTool({ name: "poster", arguments: { ...args, _payment_id: payment.paymentId } });
