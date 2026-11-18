@@ -50,6 +50,7 @@ const NEAR_WORKFLOW_TEMPLATE = "idea-to-3d-model";
 const CAPACITY_WARNING = 0.8;
 const BACKUP_VERIFICATION_AGE_MS = 2 * 3600_000;
 const BACKUP_CAPTURE_AGE_MS = 26 * 3600_000;
+const BACKUP_REPLICATION_GRACE_MS = 15 * 60_000;
 const REFUND_FUNDING_CODES = new Map([
   ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
   ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
@@ -69,9 +70,16 @@ function backupVerificationProof(file, read, now, stage) {
   const parse = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$/.test(value)
     ? Date.parse(value) : NaN;
   const verified = parse(record?.verifiedAt), captured = parse(record?.capturedAt);
+  const hasGeneration = record?.generation !== undefined;
+  const publishedAt = hasGeneration && stage === "backup-export" ? parse(record.publishedAt) : null;
   need(record?.v === 1 && Number.isFinite(verified) && Number.isFinite(captured)
     && captured <= verified + 30_000 && verified <= now + 30_000 && captured <= now + 30_000, `${stage}-proof-invalid`);
-  return { verificationAgeMs: now - verified, captureAgeMs: now - captured };
+  need(!hasGeneration || (typeof record.generation === "string" && /^[0-9a-f]{64}$/.test(record.generation)
+    && (publishedAt === null || (publishedAt >= captured - 30_000
+      && publishedAt <= verified + 30_000 && publishedAt <= now + 30_000))),
+  `${stage}-proof-invalid`);
+  return { generation: record.generation, publishedAt, capturedAt: captured,
+    verificationAgeMs: now - verified, captureAgeMs: now - captured };
 }
 
 function savedPricingContent(result) {
@@ -162,16 +170,26 @@ export async function runOperationalCheck(config, deps = {}) {
     try { const value = await fn(); checks.push({ stage, ok: true }); return value; }
     catch (e) { checks.push({ stage, ok: false, code: safeCode(e), domains }); return null; }
   };
-  if (config.backupExportReport) {
-    const backup = await check("backup-export-proof", () => backupVerificationProof(config.backupExportReport, read, now(), "backup-export"), []);
-    if (backup) {
-      await check("backup-export-freshness", () => need(backup.verificationAgeMs <= BACKUP_VERIFICATION_AGE_MS, "backup-export-overdue"), []);
-      await check("backup-capture-freshness", () => need(backup.captureAgeMs <= BACKUP_CAPTURE_AGE_MS, "backup-capture-overdue"), []);
-    }
+  const backup = config.backupExportReport &&
+    await check("backup-export-proof", () => backupVerificationProof(config.backupExportReport, read, now(), "backup-export"), []);
+  if (backup) {
+    await check("backup-export-freshness", () => need(backup.verificationAgeMs <= BACKUP_VERIFICATION_AGE_MS, "backup-export-overdue"), []);
+    await check("backup-capture-freshness", () => need(backup.captureAgeMs <= BACKUP_CAPTURE_AGE_MS, "backup-capture-overdue"), []);
   }
-  if (config.backupCopyReport) {
-    const copy = await check("backup-copy-proof", () => backupVerificationProof(config.backupCopyReport, read, now(), "backup-copy"), []);
-    if (copy) await check("backup-copy-freshness", () => need(copy.verificationAgeMs <= BACKUP_VERIFICATION_AGE_MS, "backup-copy-overdue"), []);
+  const copy = config.backupCopyReport &&
+    await check("backup-copy-proof", () => backupVerificationProof(config.backupCopyReport, read, now(), "backup-copy"), []);
+  if (copy) await check("backup-copy-freshness", () => need(copy.verificationAgeMs <= BACKUP_VERIFICATION_AGE_MS, "backup-copy-overdue"), []);
+  if (backup && copy) {
+    const pending = backup.generation && copy.generation && backup.generation !== copy.generation
+      && (now() - backup.publishedAt <= BACKUP_REPLICATION_GRACE_MS
+        // The offsite receipt can arrive between export index and health publication.
+        || (copy.capturedAt > backup.capturedAt && copy.verificationAgeMs <= 30_000));
+    if (pending) checks.push({ stage: "backup-copy-generation-pending", ok: true });
+    else await check("backup-copy-generation", () => {
+      need(backup.generation && copy.generation, "backup-copy-generation-unavailable");
+      need(backup.generation === copy.generation, "backup-copy-generation-overdue");
+      need(backup.capturedAt === copy.capturedAt, "backup-copy-generation-inconsistent");
+    }, []);
   }
   const http = async (url, init = {}) => {
     const response = await request(url, init); need(response.ok, `http-${response.status}`); return response.json();

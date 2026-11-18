@@ -461,6 +461,7 @@ test("an up-to-date VPS export cannot hide a missing or stale offsite verificati
   assert.ok(report.checks.find(c => c.stage === "backup-export-freshness")?.ok);
   assert.deepEqual(report.checks.find(c => c.stage === "backup-copy-freshness"),
     { stage: "backup-copy-freshness", ok: false, code: "backup-copy-overdue", domains: [] });
+  assert.equal(report.checks.find(c => c.stage === "backup-copy-generation")?.code, "backup-copy-generation-unavailable");
   assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
   const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: ID.replaceAll("-", ""),
     MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" },
@@ -480,6 +481,52 @@ test("an up-to-date VPS export cannot hide a missing or stale offsite verificati
   };
   assert.equal((await runOperationalCheck(f.config, f.deps)).checks.find(c => c.stage === "backup-copy-proof")?.code,
     "backup-copy-proof-unavailable");
+});
+
+test("fresh backup receipts must cover the newest published ciphertext after the replication window", async t => {
+  const f = fixture(), date = at => new Date(at).toISOString();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.backupExportReport = "/backup-export/latest.json";
+  f.config.backupCopyReport = "/backup-copy/latest.json";
+  const capturedAt = date(NOW - 3_600_000), generation = "a".repeat(64), oldGeneration = "b".repeat(64);
+  const backup = { v: 1, capturedAt, generation, verifiedAt: date(NOW - 60_000),
+    publishedAt: date(NOW - 15 * 60_000) };
+  const copy = { v: 1, capturedAt, generation: oldGeneration, verifiedAt: date(NOW - 60_000) };
+  f.states[f.config.backupExportReport] = backup;
+  f.states[f.config.backupCopyReport] = copy;
+  const get = (report, stage) => report.checks.find(c => c.stage === stage);
+
+  const pending = await runOperationalCheck(f.config, f.deps);
+  assert.ok(get(pending, "backup-copy-generation-pending")?.ok);
+  assert.equal(get(pending, "backup-copy-generation"), undefined);
+  backup.publishedAt = date(NOW - 15 * 60_000 - 1);
+  const overdue = await runOperationalCheck(f.config, f.deps);
+  assert.ok(get(overdue, "backup-export-freshness")?.ok);
+  assert.ok(get(overdue, "backup-copy-freshness")?.ok);
+  assert.deepEqual(get(overdue, "backup-copy-generation"), {
+    stage: "backup-copy-generation", ok: false, code: "backup-copy-generation-overdue", domains: [],
+  });
+  assert.deepEqual(overdue.admission, { nano: true, near: true, usdc: true, market: true });
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: ID.replaceAll("-", ""),
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" },
+    { ...overdue, invocationId: ID.replaceAll("-", "") }, NOW);
+  assert.match(alert.text, /backup-copy-generation-overdue/);
+  assert.ok(!JSON.stringify([overdue, alert]).includes(generation));
+  assert.ok(!JSON.stringify([overdue, alert]).includes(oldGeneration));
+
+  copy.capturedAt = date(NOW - 25_000);
+  copy.verifiedAt = date(NOW - 10_000);
+  assert.ok(get(await runOperationalCheck(f.config, f.deps), "backup-copy-generation-pending")?.ok);
+  copy.generation = generation;
+  assert.equal(get(await runOperationalCheck(f.config, f.deps), "backup-copy-generation")?.code,
+    "backup-copy-generation-inconsistent");
+  copy.capturedAt = capturedAt;
+  assert.ok(get(await runOperationalCheck(f.config, f.deps), "backup-copy-generation")?.ok);
+
+  delete backup.publishedAt;
+  assert.equal(get(await runOperationalCheck(f.config, f.deps), "backup-export-proof")?.code, "backup-export-proof-invalid");
+  copy.generation = "malformed";
+  assert.equal(get(await runOperationalCheck(f.config, f.deps), "backup-copy-proof")?.code, "backup-copy-proof-invalid");
 });
 
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
