@@ -1006,7 +1006,8 @@ test("owned Nano ledger telemetry distinguishes missing blocks from delayed conf
     const ledgerCalls = f.calls.filter(call => ["block_count", "telemetry"].includes(call.body?.action));
     assert.equal(ledgerCalls.length, ["disabled", "primary cooldown"].includes(scenario) ? 0 : 2);
     if (["block lag", "confirmation lag", "healthy"].includes(scenario)) {
-      assert.deepEqual(report.nanoLedgerSync, { localBlocks: local.count, localConfirmed: local.cemented, peerMedianConfirmed: "100000", peers: 4 });
+      assert.deepEqual(report.nanoLedgerSync, { localBlocks: local.count, localConfirmed: local.cemented,
+        peerMedianConfirmed: "100000", peers: 4, unchangedSince: NOW, peerMedianAtStart: "100000" });
     } else assert.equal(report.nanoLedgerSync, undefined);
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PEER|node_1{4}|nano-0\.example/);
   }
@@ -1859,4 +1860,49 @@ test("unchanged incidents retain one identity; six-hour reminders, recovery and 
   const scoped = finishOperationalReport(dir, issues, NOW + 8 * 3_600_000 + 300_000);
   const advisory = finishOperationalReport(dir, [{ ...issues[0], domains: [] }], NOW + 8 * 3_600_000 + 600_000);
   assert.notEqual(advisory.incidentId, scoped.incidentId, "an admission impact change opens a new incident");
+});
+
+test("a Nano confirmation stall opens a distinct advisory while an old backlog warning remains active", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-progress-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const existing = { stage: "nano-ledger-sync", ok: false, code: "nano-ledger-confirmations-behind", domains: [] };
+  const invocationId = "a".repeat(32);
+  const report = (minutes, peerMedianConfirmed, localConfirmed = "1000") => finishOperationalReport(dir, [existing],
+    NOW + minutes * 60_000, { invocationId, nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  const progress = value => value.checks.find(check => check.stage === "nano-ledger-confirmation-progress");
+  const initial = report(0, "9000");
+  assert.equal(progress(report(5, "9030")).ok, true);
+  assert.equal(progress(report(10, "9049")).ok, true);
+  const stalled = report(15, "9050");
+  assert.deepEqual(progress(stalled), { stage: "nano-ledger-confirmation-progress", ok: false,
+    code: "nano-ledger-confirmations-stalled", domains: [] });
+  assert.notEqual(stalled.incidentId, initial.incidentId);
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, stalled, NOW + 15 * 60_000);
+  assert.match(alert.text, /nano-ledger-confirmation-progress=nano-ledger-confirmations-stalled/);
+  assert.equal(report(20, "9060").incidentId, stalled.incidentId);
+  assert.deepEqual(stalled.admission, { nano: true, near: true, usdc: true, market: true });
+  const recovered = report(25, "9100", "1001");
+  assert.equal(progress(recovered).ok, true);
+  assert.equal(recovered.nanoLedgerSync.unchangedSince, NOW + 25 * 60_000);
+  assert.equal(recovered.nanoLedgerSync.peerMedianAtStart, "9100");
+});
+
+test("a gap or invalid prior Nano telemetry starts a new comparison", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-progress-gap-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (minutes, peerMedianConfirmed) => finishOperationalReport(dir, [], NOW + minutes * 60_000, {
+    nanoLedgerSync: { localBlocks: "5000", localConfirmed: "4400", peerMedianConfirmed, peers: 3 },
+  });
+  report(0, "4440");
+  assert.equal(report(13, "4500").nanoLedgerSync.unchangedSince, NOW + 13 * 60_000);
+  const latest = join(dir, "latest.json");
+  const saved = JSON.parse(readFileSync(latest, "utf8"));
+  delete saved.nanoLedgerSync.unchangedSince;
+  saved.nanoLedgerSync.peerMedianConfirmed = "untrusted";
+  writeFileSync(latest, JSON.stringify(saved));
+  const rebuilt = report(23, "4600");
+  assert.equal(rebuilt.ok, true);
+  assert.equal(rebuilt.nanoLedgerSync.unchangedSince, NOW + 23 * 60_000);
+  assert.equal(rebuilt.nanoLedgerSync.peerMedianAtStart, "4600");
 });
