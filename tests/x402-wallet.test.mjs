@@ -119,9 +119,14 @@ test("the hosted wallet settles saved, custom and conditional graphs on Nano, NE
   const { cases, legacy, ...branchGraph } = JSON.parse(await readFile(join(FIXTURES, "conditional", "decider-branches.json"), "utf8"));
   await writeFile(join(graphs, "conditional.json"), JSON.stringify(branchGraph));
   const branchModels = new Map(branchGraph.nodes.filter(node => node.fields.model).map(node => [node.id, node.fields.model]));
-  const extraModels = [...new Set(branchModels.values())].filter(id => !WORKED_CATALOGS.chat.some(entry => entry.id === id));
-  const catalogs = { ...WORKED_CATALOGS, chat: [...WORKED_CATALOGS.chat,
-    ...extraModels.map(id => ({ id, pricing: WORKED_CATALOGS.chat[0].pricing, context_length: 32768 }))] };
+  const chatModels = new Set(branchGraph.nodes.filter(node => node.type === "llm").map(node => node.fields.model));
+  const decisionModels = new Set(branchGraph.nodes.filter(node => node.type === "decide-branch").map(node => node.fields.model));
+  const extraChatModels = [...chatModels].filter(id => !WORKED_CATALOGS.chat.some(entry => entry.id === id));
+  const catalogs = {
+    ...WORKED_CATALOGS,
+    chat: [...WORKED_CATALOGS.chat, ...extraChatModels.map(id => ({ id, pricing: WORKED_CATALOGS.chat[0].pricing, context_length: 32768 }))],
+    decision: [...decisionModels].map(id => ({ id, pricing: { prompt: 0.02, completion: 0 }, context_length: 262144 })),
+  };
   let decisions = [];
   const nano = nanoGptMock({ catalogs, walletPayments: true, decisionAnswer: () => decisions.shift(), walletPaymentSeen(invoice) {
     let previous = BigInt(BALANCE);
@@ -228,6 +233,7 @@ test("the hosted wallet settles saved, custom and conditional graphs on Nano, NE
       const args = asset === "nano" ? {} : { graph: branchGraph, _pay_with: asset };
       const price = await client.call("price_noodle", { graph: branchGraph, _pay_with: asset === "usdc" ? "usdc" : "near" });
       assert.equal(price.structuredContent?.pricing?.safety?.ok, true, JSON.stringify(price));
+      assert.equal(price.structuredContent.pricing.estimatedCost.items.filter(item => item.type === "decide").length, 2);
       assert.match(JSON.stringify(price.content), /all branches/);
       const quote = await client.call(tool, args);
       assert.ok(!quote.isError, JSON.stringify(quote));

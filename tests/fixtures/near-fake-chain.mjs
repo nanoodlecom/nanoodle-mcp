@@ -429,6 +429,7 @@ export function nanoGptMock({ beforeChat = async () => {}, decisionAnswer, catal
       return json(402, { accepts: [{ scheme: "nano", maxAmountRequired: probe.raw, maxAmountRequiredUSD: probe.usd }] });
     }
     if (method === "GET" && p === "/api/v1/models?detailed=true") return json(200, { data: catalogs.chat });
+    if (method === "GET" && p === "/api/v1/decision-models") return json(200, { data: catalogs.decision || [] });
     if (method === "GET" && p === "/api/v1/image-models") return json(200, { data: catalogs.image });
     if (method === "GET" && /^\/api\/v1\/(video|audio|3d)-models$/.test(p)) return json(200, { data: catalogs[p.includes("3d") ? "model3d" : p.includes("video") ? "video" : "audio"] || [] });
     if (method === "POST" && p === "/api/v1/chat/completions") {
