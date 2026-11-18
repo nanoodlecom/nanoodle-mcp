@@ -267,6 +267,31 @@ test("pool: a JSON-RPC answer such as UNKNOWN_TRANSACTION is final for the call"
   assert.deepEqual(calls, ["a.test status", "a.test tx"]);
 });
 
+test("pool: unnamed RPC errors fail over on watcher and funding reads", async () => {
+  for (const method of ["status", "block", "query", "gas_price", "EXPERIMENTAL_protocol_config", "EXPERIMENTAL_changes", "EXPERIMENTAL_receipt_to_tx"]) {
+    const logs = [];
+    const { fetch, calls } = hostFetch({
+      "a.test": req => req.method === method ? { body: { error: { code: -32000, status: "UNTRUSTED_DETAIL" } } } : ok()(req),
+      "b.test": ok(),
+    });
+    const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet", fetch, log: line => logs.push(line) });
+    await rpc.call(method, []);
+    assert.ok(calls.includes(`a.test ${method}`));
+    assert.equal(calls.at(-1), `b.test ${method}`);
+    assert.match(logs[0], /a\.test failed \(RPC_ERROR\)/);
+    assert.doesNotMatch(logs.join('\n'), /UNTRUSTED_DETAIL/);
+  }
+});
+
+test("pool: an unnamed submit or transaction lookup error remains with the caller", async () => {
+  const failure = req => req.method === "status" ? ok()(req) : { body: { error: { code: -32000 } } };
+  const { fetch, calls } = hostFetch({ "a.test": failure, "b.test": ok() });
+  const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet", fetch });
+  await assert.rejects(rpc.sendTx("AAAA"), { code: "RPC_ERROR" });
+  await assert.rejects(rpc.txStatus({ txHash: "h", senderId: "s.near" }), { code: "RPC_ERROR" });
+  assert.deepEqual(calls, ["a.test status", "a.test send_tx", "a.test tx"]);
+});
+
 test("pool: an endpoint on another network is never used; all wrong is RPC_WRONG_NETWORK", async () => {
   const logs = [];
   const { fetch, calls } = hostFetch({ "a.test": ok("testnet"), "b.test": ok("mainnet") });

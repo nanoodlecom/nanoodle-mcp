@@ -67,6 +67,8 @@ test("read-only funding views bind account, authorized key and token balance to 
   assert.equal(frame.usdcAtomic, 1_000_000_000n); assert.equal(frame.balanceYocto, 10n ** 25n);
   const queries = w.chain.log.filter(row => row.method === "query");
   assert.ok(queries.every(row => row.params.block_id === queries[0].params.block_id && !row.params.finality));
+  const gas = w.chain.log.find(row => row.method === "gas_price");
+  assert.deepEqual(gas.params, [queries[0].params.block_id]);
   const changed = { ...w.rpc, call: async (method, params) => {
     const r = await w.rpc.call(method, params);
     return params?.request_type === "view_account" ? { ...r, block_hash: "another-block" } : r;

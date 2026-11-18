@@ -173,6 +173,27 @@ test("periodic readiness verifies fresh enforced refund funding and each asset's
   }
 });
 
+test("scheduled readiness separates watcher failure from refund proof, shortfall and stale funding", async () => {
+  for (const [code, expected] of [
+    ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
+    ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
+    ["NEAR_FUNDING_STALE", "near-refund-funding-stale"],
+    ["PRIVATE_UPSTREAM_DETAIL", "near-refund-funding-unhealthy"],
+  ]) {
+    const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({
+      active: true, network: "mainnet", merchant: "nanoodle.near",
+      watcher: { listening: false, lastScanAt: new Date(NOW).toISOString(), height: 100 },
+      funding: { enforced: true, ok: false, checkedAt: NOW, code },
+    }) : null);
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.near, false);
+    assert.equal(report.admission.usdc, false);
+    assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.code === "near-watcher-stale"));
+    assert.ok(report.checks.some(c => c.stage === "near-refund-funding" && c.code === expected));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_UPSTREAM_DETAIL/);
+  }
+});
+
 test("a stale node is reported while a fresh fallback remains usable; loss of all fresh NEAR nodes blocks that rail", async () => {
   for (const both of [false, true]) {
     const f = fixture(({ url, body }) => {

@@ -24,6 +24,11 @@ import { readNearFunding } from "../src/near/funding.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
+const REFUND_FUNDING_CODES = new Map([
+  ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
+  ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
+  ["NEAR_FUNDING_STALE", "near-refund-funding-stale"],
+]);
 class CheckError extends Error {}
 const need = (condition, code) => { if (!condition) throw new CheckError(code); };
 const readJson = file => JSON.parse(readFileSync(file, "utf8"));
@@ -166,20 +171,26 @@ export async function runOperationalCheck(config, deps = {}) {
       && (Number(n.block.header.height) !== Number(highest.block.header.height) || n.block.header.hash === highest.block.header.hash)), "near-finalized-nodes-disagree");
     return highest;
   }, ["near", "usdc"]);
-  const site = await check("near-payment-watcher", async () => {
+  let refundHealth = null;
+  await check("near-payment-watcher", async () => {
     const health = await http(config.site + "/near/health");
     need(health.active && health.merchant === config.merchant && health.network === config.network, "near-listener-not-active");
+    refundHealth = health;
     const age = now() - Date.parse(health.watcher?.lastScanAt);
     need(health.watcher?.listening && Number.isFinite(age) && age < 120_000 && age >= -30_000, "near-watcher-stale");
-    need(health.funding?.enforced === true, "near-refund-funding-not-enforced");
-    need(health.funding.ok === true && Number.isSafeInteger(health.funding.checkedAt)
-      && now() - health.funding.checkedAt <= 60_000 && now() - health.funding.checkedAt >= -30_000, "near-refund-funding-unhealthy");
     if (near) need(Number(near.block.header.height) - Number(health.watcher.height) <= 120, "near-watcher-behind");
-    return health;
   }, ["near", "usdc"]);
-  if (site) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
+  const fundingHealth = refundHealth && await check("near-refund-funding", async () => {
+    const funding = refundHealth.funding;
+    need(funding?.enforced === true, "near-refund-funding-not-enforced");
+    const age = now() - funding.checkedAt;
+    need(Number.isSafeInteger(funding.checkedAt) && age <= 60_000 && age >= -30_000, "near-refund-funding-stale");
+    need(funding.ok === true, REFUND_FUNDING_CODES.get(funding.code) || "near-refund-funding-unhealthy");
+    return funding;
+  }, ["near", "usdc"]);
+  if (fundingHealth) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
     await check(`${asset}-refund-admission`, async () => {
-      need(site.funding[key] === true, "near-refund-capacity-exhausted");
+      need(fundingHealth[key] === true, "near-refund-capacity-exhausted");
     }, [asset]);
   }
   const rates = await check("exchange-rates", async () => {

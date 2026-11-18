@@ -128,6 +128,8 @@ export function parseRpcUrls(value) {
 }
 
 const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE", "RPC_STALE", "RPC_SYNCING"]);
+const RECOVERABLE_READS = new Set(["status", "block", "query", "gas_price", "EXPERIMENTAL_protocol_config",
+  "EXPERIMENTAL_changes", "EXPERIMENTAL_receipt_to_tx"]);
 
 /**
  * The same client over several endpoints, tried in order with failover.
@@ -136,9 +138,9 @@ const TRANSPORT_CODES = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE", 
  * No node or external indexer is required. An additional endpoint covers the
  * first being down or rate limiting.
  *
- *  - A call moves to the next endpoint on transport or node-health failures
- *    (RPC_HTTP, RPC_TIMEOUT, RPC_BAD_RESPONSE, RPC_STALE, RPC_SYNCING). An answer, including
- *    "unknown transaction", is final for that call.
+ *  - A call moves to the next endpoint on transport or node-health failures.
+ *    Unnamed server errors also allow failover on watcher and funding reads.
+ *    A named answer, including "unknown transaction", is final for that call.
  *  - Once attempted, `send_tx` moves on only for RPC_HTTP. Preflight health
  *    failures may move on before any bytes are broadcast. Signed bytes are identical on
  *    every endpoint, so a second submission is the same transaction, never a
@@ -232,12 +234,15 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
         return result;
       } catch (e) {
         if (e?.code === "RPC_WRONG_NETWORK" && ep.wrongChain) continue;
-        const transport = TRANSPORT_CODES.has(e?.code);
-        if (!transport || (method === "send_tx" && attempted && e.code !== "RPC_HTTP")) throw e;
+        const retry = TRANSPORT_CODES.has(e?.code)
+          || (e?.code === "RPC_ERROR" && (!attempted || RECOVERABLE_READS.has(method)));
+        if (!retry || (method === "send_tx" && attempted && e.code !== "RPC_HTTP")) throw e;
         lastErr = e;
         ep.checkedAt = null;
         ep.headAt = null;
-        if (ep.downUntil <= now() && eps.length > 1) log(`NEAR RPC ${host(ep.url)} failed (${e.code}${e?.data?.status ? " " + e.data.status : ""}); trying the next endpoint`);
+        const status = e?.data?.status;
+        const httpStatus = Number.isInteger(status) && status >= 100 && status <= 599 ? ` ${status}` : "";
+        if (ep.downUntil <= now() && eps.length > 1) log(`NEAR RPC ${host(ep.url)} failed (${e.code}${httpStatus}); trying the next endpoint`);
         ep.downUntil = now() + cooldownMs;
       }
     }

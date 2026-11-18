@@ -22,7 +22,8 @@ temporary error as its final result. Finished receipts remain accessible.
 ## Fee and account proof
 
 Account, access-key and token views are pinned to one fresh finalized block and
-must return its matching hash and height. Network identity, storage price,
+must return its matching hash and height. Protocol fees and gas price use that
+same block hash. Network identity, storage price,
 FullAccess permission and an available nonce are required. The balance must cover
 native customer principal, storage, conservative fees for every actual refund,
 and the existing 0.05 NEAR operating float before admitting model work. Quotes
@@ -68,8 +69,10 @@ The controller refreshes every 30 seconds and expires its public health after
 60 seconds. `/near/health` exposes only enforcement, time, fixed error codes and
 coverage/capacity booleans. The five-minute no-inference monitor verifies those
 fields and independently reads the actual account, fee floor, obligations and
-balances. Two per-asset capacity probes extend healthy readiness from 42 to
-44 checks. They never sign, generate work, run inference or retry a refund.
+balances. Its reports show watcher health, unverified or stale refund funding,
+confirmed shortfalls and per-asset capacity separately. Unnamed RPC errors can
+fall back to the other qualified endpoint on watcher and funding reads. The
+monitor never signs, generates work, runs inference or retries a refund.
 
 Offline fixtures cover simultaneous payments, gas/price changes, unavailable
 funding, refund priority, exhausted nonces, same-payment resume, false/nonfinal
