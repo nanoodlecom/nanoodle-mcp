@@ -960,6 +960,58 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
   }
 });
 
+test("owned Nano ledger telemetry distinguishes missing blocks from delayed confirmations without pausing admission", async t => {
+  const sample = (id, height, extra = {}) => ({ genesis_block: NANO_GENESIS_HASH, timestamp: String(NOW - 5_000),
+    node_id: "node_" + "1".repeat(59) + id, signature: "a".repeat(128),
+    block_count: String(height + 5), cemented_count: String(height), address: "PRIVATE_PEER", ...extra });
+  const healthy = [sample("3", 99_998), sample("4", 100_000), sample("5", 100_002), sample("6", 1_000_000)];
+  const filtered = [sample("7", 1, { timestamp: String(NOW - 90_001) }), sample("8", 1, { timestamp: String(NOW + 30_001) }),
+    sample("9", 1, { genesis_block: "b".repeat(64) }), sample("a", 1, { signature: "invalid" }),
+    sample("b", 1, { cemented_count: "10" }), sample("4", 1, { timestamp: String(NOW - 10_000) })];
+  for (const [scenario, local, metrics, expected] of [
+    ["disabled", { count: "1", cemented: "1" }, [], undefined],
+    ["healthy", { count: "100005", cemented: "99001" }, [...healthy, ...filtered], null],
+    ["confirmation lag", { count: "100005", cemented: "99000" }, healthy, "nano-ledger-confirmations-behind"],
+    ["block lag", { count: "99000", cemented: "98995" }, healthy, "nano-ledger-blocks-behind"],
+    ["invalid local", { count: "100005", cemented: "100006" }, healthy, "nano-ledger-local-counters-invalid"],
+    ["missing peers", { count: "100005", cemented: "100000" }, [healthy[1], ...filtered, healthy[1], healthy[2]], "nano-ledger-peer-telemetry-insufficient"],
+    ["primary cooldown", {}, [], "nano-ledger-primary-unavailable"],
+  ]) {
+    const f = fixture(({ url, body }) => {
+      if (body?.action === "block_count") {
+        assert.equal(url.hostname, "nano-0.example");
+        assert.equal(body.include_cemented, "true");
+        return Response.json(local);
+      }
+      if (body?.action === "telemetry") {
+        assert.equal(url.hostname, "nano-0.example");
+        assert.equal(body.raw, "true");
+        return Response.json({ metrics });
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.nanoLedgerTelemetry = scenario !== "disabled";
+    if (scenario === "primary cooldown") {
+      f.config.nanoRpcUrls.push("https://nano-2.example");
+      Object.assign(f.states["/state/funding-health.json"].nanoRpc, { configuredPeers: 3, configuration: rpcPeerSetId(f.config.nanoRpcUrls),
+        cooldowns: [{ peer: 0, until: NOW + 60_000 }] });
+    }
+    const report = await runOperationalCheck(f.config, f.deps);
+    const sync = report.checks.find(check => check.stage === "nano-ledger-sync");
+    if (expected === undefined) assert.equal(sync, undefined);
+    else if (expected === null) assert.equal(sync?.ok, true);
+    else assert.deepEqual(sync, { stage: "nano-ledger-sync", ok: false, code: expected, domains: [] });
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, scenario);
+    const ledgerCalls = f.calls.filter(call => ["block_count", "telemetry"].includes(call.body?.action));
+    assert.equal(ledgerCalls.length, ["disabled", "primary cooldown"].includes(scenario) ? 0 : 2);
+    if (["block lag", "confirmation lag", "healthy"].includes(scenario)) {
+      assert.deepEqual(report.nanoLedgerSync, { localBlocks: local.count, localConfirmed: local.cemented, peerMedianConfirmed: "100000", peers: 4 });
+    } else assert.equal(report.nanoLedgerSync, undefined);
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PEER|node_1{4}|nano-0\.example/);
+  }
+});
+
 test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
   for (const failure of [null, "matching-with-lagging-peer", "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
     const f = fixture(({ url, body }) => {
