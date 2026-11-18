@@ -1,4 +1,3 @@
-import { deriveAddress, hashBlock } from "nanocurrency";
 import { isNanoHistoryHash, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 
 export const NANO_SCAN_GRACE_MS = 120_000;
@@ -21,7 +20,7 @@ export function nanoWatchDemand(ledger, now) {
 /** The legacy writer has no coverage cursor. Sample confirmed deposits from
  * both sides of pocketing. Check the original send time, since a receive
  * block can be written long after the payment was sent. */
-export async function findUnrecordedNanoPayments({ rpc, account, head, ledger, waiting, now }) {
+export async function findUnrecordedNanoPayments({ rpc, matchesSend, account, head, ledger, waiting, now }) {
   const [history, receivable] = await Promise.all([
     rpc({ action: "account_history", account, head, count: String(HISTORY_LIMIT), raw: "true" }),
     rpc({ action: "receivable", account, count: String(RECEIVABLE_LIMIT), threshold: "1",
@@ -65,8 +64,7 @@ export async function findUnrecordedNanoPayments({ rpc, account, head, ledger, w
       || sentAt > quote.expiresAt + NANO_LATE_WATCH_MS || now - sentAt < NANO_SCAN_GRACE_MS
       || bucket(hit.amount) !== bucket(quote.amountRaw)) return null;
     const block = typeof hit.contents === "string" ? JSON.parse(hit.contents) : hit.contents;
-    if (block?.type !== "state" || hashBlock(block).toUpperCase() !== hash
-      || deriveAddress(block.link, { useNanoPrefix: true }) !== account) return null;
+    if (block?.type !== "state" || !matchesSend(block, hash)) return null;
     return { id: quote.id, hash, receipt };
   }))).filter(Boolean);
 }

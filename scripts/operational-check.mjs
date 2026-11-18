@@ -375,10 +375,12 @@ export async function runOperationalCheck(config, deps = {}) {
     }
     need(nano, "nano-payment-observation-unavailable");
     const observed = await check("nano-legacy-payment-observation", async () => {
+      const matchesSend = (block, hash) => hashBlock(block).toUpperCase() === hash
+        && deriveAddress(block.link, { useNanoPrefix: true }) === config.nanoAddress;
       let failure;
       for (const index of nano.peers) {
         try {
-          return await findUnrecordedNanoPayments({ rpc: body => nanoRpc(config.nanoRpcUrls[index], body),
+          return await findUnrecordedNanoPayments({ rpc: body => nanoRpc(config.nanoRpcUrls[index], body), matchesSend,
             account: config.nanoAddress, head: nano.view.confirmedFrontier, ledger, waiting, now: at });
         } catch (error) {
           if (error.code === "NANO_PAYMENT_OBSERVATION_LIMIT") throw error;
