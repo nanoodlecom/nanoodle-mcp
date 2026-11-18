@@ -689,6 +689,42 @@ test("live Nano reservations can exhaust working capital while disk and runtime 
   }
 });
 
+test("paid NEAR and USDC workflows must fit together at their locked Nano rates", async t => {
+  const raw = 10n ** 30n, required = 54n * raw / 10n;
+  for (const scenario of ["exact", "live-short", "chain-short", "missing-locked-rate"]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const quotes = f.states["/state/near-state.json"].quotes;
+    quotes.native = { id: "private-near-payment", status: "paid", asset: "near", depositUsd: "1.2",
+      paidYocto: "400000000000000000000000", paidAtBlockMs: NOW, rate: { xnoUsd: "0.5" } };
+    quotes.stable = { id: "private-usdc-payment", status: "paid", asset: "usdc", depositUsd: "0.6",
+      paidYocto: "600000", paidAtBlockMs: NOW, rate: { xnoUsd: scenario === "missing-locked-rate" ? undefined : "0.2" } };
+    quotes.running = { id: "private-reserved-payment", status: "running", depositUsd: "50",
+      paidYocto: "1", paidAtBlockMs: NOW, rate: { xnoUsd: "0.1" } };
+    const report = f.states["/state/funding-health.json"];
+    report.liabilitiesRaw = "0";
+    report.reservedRaw = String(10n * raw - required + (scenario === "live-short" ? 1n : 0n));
+    Object.assign(report, { activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (scenario === "chain-short") {
+      f.states["/state/gate-state.json"].owed.push({ amountRaw: String(10n * raw - required + 1n),
+        journaled: true, tries: 0, createdAt: NOW });
+    }
+    const result = await runOperationalCheck(f.config, f.deps);
+    for (const stage of ["runtime-funding", "nano-liquidity", "nano-unreserved-liquidity"]) {
+      assert.equal(result.checks.find(c => c.stage === stage)?.ok, true, scenario + " " + stage);
+    }
+    const finding = result.checks.find(c => c.stage === "near-paid-run-funding");
+    assert.equal(finding?.ok, scenario === "exact", scenario);
+    if (scenario !== "exact") {
+      assert.equal(finding.code, scenario === "missing-locked-rate"
+        ? "near-paid-run-funding-unverified" : "near-paid-run-funding-insufficient", scenario);
+      assert.deepEqual(finding.domains, []);
+    }
+    assert.deepEqual(result.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(result), /private-.*-payment|availableRaw|depositUsd/);
+  }
+});
+
 test("a low canary payer is visible without closing customer payment lanes", async t => {
   const payer = "dedicated-canary.testnet";
   const f = fixture(({ body }) => body?.params?.request_type === "view_account" && body.params.account_id === payer
