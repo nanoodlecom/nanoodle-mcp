@@ -5,8 +5,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createNearRpc, createNearRpcPool, parseRpcUrls, parseRpcJson } from "../src/near/rpc.mjs";
+import { base58Encode } from "../src/near/base58.mjs";
 
 const URL_ = "https://rpc.example.test";
+const BLOCK_HASH = base58Encode(Buffer.alloc(32, 9));
+const RECEIPT_HASH = base58Encode(Buffer.alloc(32, 10));
+const TX_HASH = base58Encode(Buffer.alloc(32, 11));
+const accountChanges = { changes_type: "account_changes", account_ids: ["mcp.near"], block_id: BLOCK_HASH };
+const receiptLookup = { receipt_id: RECEIPT_HASH, block_height: 100 };
 
 /** A mock fetch: `answer(req)` returns {status, body} or {status, text}; the request id is echoed. */
 function mockFetch(answer) {
@@ -272,14 +278,37 @@ test("pool: unnamed RPC errors fail over on watcher and funding reads", async ()
     const logs = [];
     const { fetch, calls } = hostFetch({
       "a.test": req => req.method === method ? { body: { error: { code: -32000, status: "UNTRUSTED_DETAIL" } } } : ok()(req),
-      "b.test": ok(),
+      "b.test": req => req.method === "EXPERIMENTAL_changes" ? { body: { result: { block_hash: BLOCK_HASH, changes: [] } } }
+        : req.method === "EXPERIMENTAL_receipt_to_tx" ? { body: { result: { transaction_hash: TX_HASH, sender_account_id: "s.near" } } }
+          : ok()(req),
     });
     const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet", fetch, log: line => logs.push(line) });
-    await rpc.call(method, []);
+    await rpc.call(method, method === "EXPERIMENTAL_changes" ? accountChanges
+      : method === "EXPERIMENTAL_receipt_to_tx" ? receiptLookup : []);
     assert.ok(calls.includes(`a.test ${method}`));
     assert.equal(calls.at(-1), `b.test ${method}`);
     assert.match(logs[0], /a\.test failed \(RPC_ERROR\)/);
     assert.doesNotMatch(logs.join('\n'), /UNTRUSTED_DETAIL/);
+  }
+});
+
+test("pool: node-local discovery errors fail over while a skipped height remains definitive", async () => {
+  const cases = [
+    ["EXPERIMENTAL_changes", accountChanges, { code: -32000, cause: { name: "SHARD_NOT_APPLIED" } }, { block_hash: BLOCK_HASH, changes: [] }, true],
+    ["EXPERIMENTAL_receipt_to_tx", receiptLookup, { code: -32601, name: "REQUEST_VALIDATION_ERROR" },
+      { transaction_hash: TX_HASH, sender_account_id: "s.near" }, true],
+    ["block", { block_id: BLOCK_HASH }, { code: -32000, cause: { name: "UNKNOWN_BLOCK" } }, { header: { height: 90, hash: BLOCK_HASH } }, true],
+    ["block", { block_id: 90 }, { code: -32000, cause: { name: "UNKNOWN_BLOCK" } }, { header: { height: 90, hash: BLOCK_HASH } }, false],
+  ];
+  for (const [method, params, error, result, recoverable] of cases) {
+    const { fetch, calls } = hostFetch({
+      "a.test": req => req.method === method ? { body: { error } } : ok()(req),
+      "b.test": req => req.method === method ? { body: { result } } : ok()(req),
+    });
+    const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], chainId: "mainnet", fetch });
+    if (recoverable) assert.deepEqual(await rpc.call(method, params), result);
+    else await assert.rejects(rpc.call(method, params), { code: "UNKNOWN_BLOCK" });
+    assert.equal(calls.includes(`b.test ${method}`), recoverable);
   }
 });
 

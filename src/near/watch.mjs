@@ -8,6 +8,7 @@
 import { NearError } from "./errors.mjs";
 import { assertFreshBlock, MAX_HEAD_AGE_MS, MAX_CLOCK_SKEW_MS } from "./freshness.mjs";
 import { PAYMENT_WATCH_META } from "./quote-capacity.mjs";
+import { requireNearAccountChanges, requireNearReceiptTransaction } from "./rpc.mjs";
 
 function historicalTime(block) {
   const ns = block?.header?.timestamp_nanosec;
@@ -17,23 +18,18 @@ function historicalTime(block) {
 }
 
 export async function readNearPaymentReceipts(rpc, blockHash, accounts) {
-  const changes = await rpc.call("EXPERIMENTAL_changes", {
+  const result = await rpc.call("EXPERIMENTAL_changes", {
     changes_type: "account_changes", account_ids: accounts, block_id: blockHash,
   });
-  if (changes.block_hash !== blockHash || !Array.isArray(changes.changes)) {
-    throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received changes for a different block");
-  }
+  const changes = requireNearAccountChanges(result, blockHash, accounts);
   return new Set(changes.changes
-    .filter((row) => accounts.includes(row.change?.account_id) && row.cause?.type === "receipt_processing")
-    .map((row) => row.cause.receipt_hash).filter((id) => typeof id === "string"));
+    .filter((row) => accounts.includes(row.change.account_id) && row.cause.type === "receipt_processing")
+    .map((row) => row.cause.receipt_hash));
 }
 
 export async function readNearReceiptTransaction(rpc, receiptId, blockHeight) {
   const tx = await rpc.call("EXPERIMENTAL_receipt_to_tx", { receipt_id: receiptId, block_height: blockHeight });
-  if (typeof tx.transaction_hash !== "string" || typeof tx.sender_account_id !== "string") {
-    throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher could not resolve a receipt's transaction");
-  }
-  return tx;
+  return requireNearReceiptTransaction(tx);
 }
 
 export function createNearWatcher({
