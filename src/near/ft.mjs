@@ -69,8 +69,11 @@ export function hasFtTransfer(result, { tokenContract, from, to, amount }) {
   return matches === 1;
 }
 
-export function signFtTransfer({ signer, signerId, tokenContract, to, amount, nonce, blockHash }) {
+export function ftTransferCall({ tokenContract, to, amount }) {
   if (typeof amount !== "bigint" || amount <= 0n || amount >= 1n << 128n) throw new NearError("BAD_AMOUNT", "USDC transfer amount must be a positive u128");
-  return signFunctionCall({ signer, signerId, receiverId: tokenContract, nonce, blockHash,
-    methodName: "ft_transfer", args: { receiver_id: to, amount: amount.toString() }, depositYocto: 1n });
+  return { receiverId: tokenContract, methodName: "ft_transfer", args: { receiver_id: to, amount: amount.toString() }, depositYocto: 1n };
+}
+
+export function signFtTransfer({ signer, signerId, tokenContract, to, amount, nonce, blockHash }) {
+  return signFunctionCall({ signer, signerId, nonce, blockHash, ...ftTransferCall({ tokenContract, to, amount }) });
 }
