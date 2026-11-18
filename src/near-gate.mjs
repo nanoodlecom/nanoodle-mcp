@@ -1021,7 +1021,7 @@ export function createNearGate({
         }));
       } catch (e) {
         if (e instanceof GraphRefusedError) return refusedResult(e.refusals);
-        if (e.code === "STATE_DURABILITY_UNCERTAIN") {
+        if (e?.code === "STATE_DURABILITY_UNCERTAIN") {
           return errResult("NEAR checkout is paused while the ledger is recovered. Keep your original payment ID and transaction details.");
         }
         throw e;
