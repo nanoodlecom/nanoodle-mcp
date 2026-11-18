@@ -7,12 +7,31 @@ const BABEL = "https://babel.255bits.com";
 const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
+const DECIDER_MODEL = "perplexity/pplx-decider-v1.2";
+const CONDITIONAL_GRAPH = {
+  v: 1,
+  nodes: [
+    { id: "input", type: "text", fields: { text: "The budget was approved." } },
+    { id: "decision", type: "decide-branch", fields: { model: DECIDER_MODEL, question: "Was the budget approved?" } },
+    { id: "yes-answer", type: "llm", fields: { model: "openai/gpt-4.1-nano", maxTokens: 64 } },
+    { id: "no-answer", type: "llm", fields: { model: "openai/gpt-4.1-nano", maxTokens: 64 } },
+  ],
+  links: [
+    { id: "input-text", from: { node: "input", port: "text" }, to: { node: "decision", port: "text" } },
+    { id: "yes-route", from: { node: "decision", port: "yes" }, to: { node: "yes-answer", port: "prompt" } },
+    { id: "no-route", from: { node: "decision", port: "no" }, to: { node: "no-answer", port: "prompt" } },
+  ],
+};
 
 class ProbeError extends Error {}
 function need(condition, code) { if (!condition) throw new ProbeError(code); }
 
 function fresh(age, maxAge) {
   return Number.isFinite(age) && age >= -30_000 && age <= maxAge;
+}
+
+function positiveUsd(value) {
+  return typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value)) && Number(value) > 0;
 }
 
 export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 } = {}) {
@@ -29,7 +48,7 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     return result;
   }
 
-  // Public smoke testing can discover tools but cannot call them or make a quote.
+  // Discovery and free pricing only. A paid tool is never called by a probe.
   function rpc(method, params) { return { jsonrpc: "2.0", id: 1, method, params }; }
   async function discover(site) {
     const hello = await json(site + "/mcp", { body: rpc("initialize", INIT) });
@@ -39,6 +58,26 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     const tools = list.result?.tools;
     need(list.jsonrpc === "2.0" && list.id === 1 && !list.error && Array.isArray(tools)
       && REQUIRED_TOOLS.every(name => tools.some(tool => tool?.name === name)), "mcp-tools-missing");
+  }
+
+  async function conditionalPrice(asset) {
+    const response = await json(NEAR + "/mcp", { body: rpc("tools/call", {
+      name: "price_noodle", arguments: { graph: CONDITIONAL_GRAPH, _pay_with: asset },
+    }) });
+    const result = response.result, content = result?.structuredContent, pricing = content?.pricing;
+    need(response.jsonrpc === "2.0" && response.id === 1 && !response.error && !result?.isError
+      && pricing?.currency === "USD" && pricing.safety?.ok === true && Array.isArray(pricing.unpriced)
+      && pricing.unpriced.length === 0, "conditional-price-unavailable");
+    need(!content.payment && !content.quote && !content.x402 && content[asset]?.network === "mainnet",
+      "conditional-price-response-invalid");
+    const estimate = pricing.estimatedCost, likely = pricing.likelyCharge?.usd, deposit = pricing.deposit?.usd;
+    const items = estimate?.items;
+    need(Array.isArray(items) && items.length === 3
+      && items.some(item => item?.nodeId === "decision" && item.model === DECIDER_MODEL && positiveUsd(item.usd))
+      && ["yes-answer", "no-answer"].every(id => items.some(item => item?.nodeId === id && positiveUsd(item.usd))),
+      "conditional-price-branch-missing");
+    need([estimate.usd, likely, deposit].every(positiveUsd) && Number(estimate.usd) <= Number(likely)
+      && Number(likely) <= Number(deposit), "conditional-price-deposit-invalid");
   }
 
   const probes = {
@@ -73,7 +112,7 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     },
   };
   const checkedAt = new Date(now()).toISOString();
-  const checks = await Promise.all(Object.entries(probes).map(async ([stage, probe]) => {
+  async function check(stage, probe) {
     for (let attempt = 1; ; attempt++) {
       try { await probe(); return { stage, ok: true, attempts: attempt }; }
       catch (error) {
@@ -84,6 +123,8 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
         await new Promise(resolve => setTimeout(resolve, retryMs));
       }
     }
-  }));
+  }
+  const checks = await Promise.all(Object.entries(probes).map(([stage, probe]) => check(stage, probe)));
+  checks.push(...await Promise.all(["near", "usdc"].map(asset => check(`${asset}-conditional-pricing`, () => conditionalPrice(asset)))));
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }

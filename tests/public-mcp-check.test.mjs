@@ -5,12 +5,13 @@ import { runPublicMcpCheck } from "../scripts/public-mcp-check.mjs";
 const NOW = Date.parse("2026-11-18T04:30:00Z");
 const stamp = new Date(NOW).toISOString();
 
-function fixture({ missingTool = false, scanAt = stamp, funded = true, lostHost, transientRates = false } = {}) {
+function fixture({ missingTool = false, scanAt = stamp, funded = true, lostHost, transientRates = false,
+  missingDecision = false, invalidDeposit = false } = {}) {
   const calls = [];
   async function fetch(url, init) {
     const { hostname, pathname } = new URL(url);
     const body = init.body ? JSON.parse(init.body) : null;
-    calls.push({ hostname, pathname, method: body?.method });
+    calls.push({ hostname, pathname, method: body?.method, tool: body?.params?.name });
     if (hostname === lostHost) throw Error("private transport details");
     if (hostname === "babel.255bits.com" && pathname === "/mcp/v1") {
       return Response.json({ error: "private challenge details" }, { status: 401 });
@@ -33,19 +34,44 @@ function fixture({ missingTool = false, scanAt = stamp, funded = true, lostHost,
       if (!missingTool || hostname !== "mcp-near.nanoodle.com") names.push("run_noodle");
       return Response.json({ jsonrpc: "2.0", id: 1, result: { tools: names.map(name => ({ name })) } });
     }
+    if (pathname === "/mcp" && body?.method === "tools/call") {
+      assert.equal(hostname, "near.nanoodle.com");
+      assert.equal(body.params.name, "price_noodle");
+      const { graph, _pay_with: asset } = body.params.arguments;
+      assert.ok(graph.nodes.some(node => node.type === "decide-branch"));
+      assert.deepEqual(graph.links.filter(link => link.from.node === "decision").map(link => link.from.port), ["yes", "no"]);
+      const items = graph.nodes.filter(node => node.fields.model && !(missingDecision && asset === "near" && node.id === "decision"))
+        .map(node => ({ nodeId: node.id, model: node.fields.model, usd: "0.0001" }));
+      return Response.json({ jsonrpc: "2.0", id: 1, result: { structuredContent: {
+        [asset]: { network: "mainnet" }, pricing: { currency: "USD", safety: { ok: true }, unpriced: [],
+          estimatedCost: { usd: "0.0003", items }, likelyCharge: { usd: "0.00036" },
+          deposit: { usd: invalidDeposit && asset === "usdc" ? "0.0003" : "0.01" } },
+      } } });
+    }
     return new Response(null, { status: 405 });
   }
   return { calls, run: () => runPublicMcpCheck({ fetch, now: () => NOW, retryMs: 0 }) };
 }
 
-test("public availability uses discovery and status only, and retries a transient failure", async () => {
+test("public availability uses discovery, status and free pricing, and retries a transient failure", async () => {
   const { calls, run } = fixture({ transientRates: true });
   const report = await run();
   assert.equal(report.ok, true);
-  assert.equal(report.checks.length, 7);
+  assert.equal(report.checks.length, 9);
   assert.equal(report.checks.find(check => check.stage === "nano-rates").attempts, 2);
-  assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["initialize", "tools/list"]);
+  assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["initialize", "tools/call", "tools/list"]);
+  assert.equal(calls.filter(call => call.tool === "price_noodle").length, 2);
   assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/mcp", "/mcp/v1", "/near/health", "/rates"]);
+});
+
+test("conditional pricing verifies the decision model and both branches fit the deposit", async () => {
+  const { run } = fixture({ missingDecision: true, invalidDeposit: true });
+  const report = await run();
+  assert.equal(report.ok, false);
+  assert.deepEqual(report.checks.filter(check => !check.ok).map(({ stage, code }) => [stage, code]), [
+    ["near-conditional-pricing", "conditional-price-branch-missing"],
+    ["usdc-conditional-pricing", "conditional-price-deposit-invalid"],
+  ]);
 });
 
 test("public availability distinguishes missing tools, a stale watcher, a funding shortfall and failed Babel ingress", async () => {

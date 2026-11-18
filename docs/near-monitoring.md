@@ -287,9 +287,10 @@ The [public availability workflow](../.github/workflows/public-check.yml) runs
 on a GitHub-hosted runner every 15 minutes. It checks MCP discovery on the Nano
 and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund funding,
 the Babel authentication challenge, and NEAR AI Market's public site, API and
-Nanoodle listings. It uses public discovery and status requests with bounded
-retries and records only the check results. The workflow uses no wallet keys,
-payment quotes, transfers or inference.
+Nanoodle listings. The free `price_noodle` probes check that the decision model
+and both branches are priced in NEAR and USDC, and the estimated charge fits
+the deposit. All probes use bounded retries and record only check results.
+The workflow uses no wallet keys, payment quotes, transfers or inference.
 
 Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
 or use **Run workflow** to check from a separate network. GitHub routes scheduled
