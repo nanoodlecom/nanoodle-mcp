@@ -235,7 +235,7 @@ export function createRefunder({
       }
     }
     if (rec.status !== "signed") return view(rec);
-    if (ledger.refundHashConflict(rec.id)) return hold(rec);
+    if (ledger.refundHashConflict(rec.id) || ledger.invalidRefundProof(rec.id)) return hold(rec);
     if (rec.supersededTxHashes?.length && rec.replacementNonce !== rec.nonce) {
       // Older replacements used a new nonce. Until their outcome is known,
       // even rebroadcasting the latest already-signed bytes may pay again.
@@ -286,6 +286,7 @@ export function createRefunder({
       if (existing) {
         const duplicate = ledger.refunds().some(other => other.id !== existing.id && other.paymentId === paymentId);
         return !duplicate && !ledger.refundHashConflict(existing.id)
+          && !ledger.invalidRefundProof(existing.id)
           && sameNearRefund({ paymentId, to, amountYocto: amountYocto.toString(), asset, tokenContract }, existing)
           ? view(existing) : hold(existing);
       }
@@ -320,7 +321,7 @@ export function createRefunder({
       }
       for (const rec of records) {
         if (rec.reconciliationRequired) continue;
-        if (conflictingHashes.has(rec.id)) { hold(rec); continue; }
+        if (conflictingHashes.has(rec.id) || ledger.invalidRefundProof(rec.id)) { hold(rec); continue; }
         if (rec.status !== "queued" && rec.status !== "signed") continue;
         if (duplicates.has(rec.paymentId)) { hold(rec); continue; }
         if (!force && rec.nextAttemptAt != null && rec.nextAttemptAt > t) continue;

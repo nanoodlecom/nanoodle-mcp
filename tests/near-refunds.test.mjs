@@ -16,7 +16,8 @@ import { openNearLedger } from "../src/near/ledger.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createRefunder } from "../src/near/refunds.mjs";
 import { parseNearSecretKey } from "../src/near/keys.mjs";
-import { USDC_CONTRACTS } from "../src/near/ft.mjs";
+import { signFtTransfer, USDC_CONTRACTS } from "../src/near/ft.mjs";
+import { signTransfer } from "../src/near/tx.mjs";
 import { base58Encode, base58Decode } from "../src/near/base58.mjs";
 
 const SIGNER = parseNearSecretKey(`ed25519:${base58Encode(Buffer.alloc(32, 7))}`); // test-only seed
@@ -198,6 +199,60 @@ test("restored NEAR refund evidence that conflicts with the quote is held before
     const original = await refunder.refund({ paymentId: "signed", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" });
     assert.deepEqual(original, { refundId: "refund_signed", status: "failed_permanent", txHash: null });
     assert.equal(ledger.getRefund("refund_signed").signedTxBase64, "fixture-signed-bytes");
+  });
+});
+
+test("restored signed refunds with incorrect payer, amount, contract or signature never reach a node", async () => {
+  const tokenContract = USDC_CONTRACTS.testnet, to = "payer.testnet";
+  const base = { signer: SIGNER, signerId: MERCHANT, blockHash: BLOCK_A };
+  const native = (nonce, terms = {}) => signTransfer({ ...base, nonce, receiverId: to, amountYocto: AMOUNT, ...terms });
+  const token = (nonce, terms = {}) => signFtTransfer({ ...base, nonce, tokenContract, to, amount: 100n, ...terms });
+  const authentic = native(4n), brokenSignature = Buffer.from(authentic.signedTxBase64, "base64");
+  brokenSignature[brokenSignature.length - 1] ^= 1;
+  const misplaced = [
+    ["near", native(1n, { receiverId: "other.testnet" })],
+    ["usdc", token(2n, { amount: 500n })],
+    ["usdc", token(3n, { tokenContract: "wrong.testnet" })],
+    ["near", { ...authentic, signedTxBase64: brokenSignature.toString("base64") }],
+    ["near", { ...native(5n), txHash: BLOCK_B }],
+    ["near", { ...native(6n), signedTxBase64: null }],
+    ["near", native(7n, { signerId: "other.testnet" })],
+  ];
+  await withLedger(async ({ open }) => {
+    const initial = open();
+    for (const [i, [asset, proof]] of misplaced.entries()) {
+      const id = `rf_${i}`, paymentId = `payment_${i}`;
+      const amountYocto = asset === "usdc" ? "100" : AMOUNT.toString();
+      const fields = { asset, ...(asset === "usdc" && { tokenContract }) };
+      initial.putQuote({ id: paymentId, status: "settled", refundId: id, payer: to, ...fields,
+        settlement: { refundYocto: amountYocto } });
+      initial.putRefund({ id, paymentId, to, status: "signed", amountYocto, ...fields, ...proof });
+    }
+    const ledger = open(), { rpc, log } = mockChain();
+    const { refunder } = make(rpc, ledger, { usdcToken: tokenContract });
+    await refunder.resume();
+    await refunder.tick();
+    assert.deepEqual(log, { sends: [], txs: [], keys: 0 });
+    for (const [i, [, proof]] of misplaced.entries()) {
+      const record = open().getRefund(`rf_${i}`);
+      assert.equal(record.status, "signed");
+      assert.equal(record.reconciliationRequired, true);
+      assert.equal(record.signedTxBase64, proof.signedTxBase64);
+    }
+  });
+});
+
+test("a valid restored NEAR refund can rebroadcast its original bytes after key rotation", async () => {
+  const previousSigner = parseNearSecretKey(`ed25519:${base58Encode(Buffer.alloc(32, 22))}`);
+  const to = "payer.testnet";
+  const proof = signTransfer({ signer: previousSigner, signerId: MERCHANT, nonce: 101n,
+    receiverId: to, blockHash: BLOCK_A, amountYocto: AMOUNT });
+  await withLedger(async ({ open }) => {
+    const ledger = open(), { rpc, log } = mockChain({ onSend: () => ({ result: DONE }) });
+    ledger.putRefund({ id: "rf_rotated", paymentId: "old-payment", to, amountYocto: AMOUNT.toString(), status: "signed", ...proof });
+    await make(rpc, ledger).refunder.resume();
+    assert.deepEqual(log, { sends: [proof.signedTxBase64], txs: [], keys: 0 });
+    assert.equal(ledger.getRefund("rf_rotated").status, "sent");
   });
 });
 

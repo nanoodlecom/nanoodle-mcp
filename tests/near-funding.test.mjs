@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { nearRefundClaims, nearRefundCosts, nearFundingNeed, readNearFunding, createNearFunding, NEAR_OPERATING_RESERVE } from "../src/near/funding.mjs";
 import { createNearRpc, openNearLedger, createRefunder, parseNearSecretKey, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { base58Encode } from "../src/near/base58.mjs";
+import { signTransfer } from "../src/near/tx.mjs";
 import { createFakeChain } from "./fixtures/near-fake-chain.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 
@@ -95,6 +96,19 @@ test("a NEAR refund transaction shared across records cannot release either rese
   const unrelated = nearRefundClaims({ quotes, refunds });
   assert.equal(unrelated.nearYocto + unrelated.usdcAtomic, 0n);
   assert.deepEqual(unrelated.issues, []);
+});
+
+test("a sent refund whose signed terms disagree keeps its funds reserved in the live writer", async () => {
+  const w = world(), to = "payer.testnet", amount = 10n ** 24n;
+  const terms = { signer: SIGNER, signerId: MERCHANT, nonce: 101n, amountYocto: amount,
+    blockHash: base58Encode(Buffer.alloc(32, 44)) };
+  w.ledger.putRefund({ id: "rf_wire", paymentId: "pruned-job", status: "sent", to, amountYocto: amount.toString(), sentAt: 1,
+    ...signTransfer({ ...terms, receiverId: "wrong.testnet" }) });
+  w.setNear(w.storage + NEAR_OPERATING_RESERVE + w.costs.nativeRefundFeeYocto);
+  await assert.rejects(w.funding.run("near"), { code: "NEAR_FUNDING_INSUFFICIENT" });
+  w.ledger.updateRefund("rf_wire", signTransfer({ ...terms, receiverId: to }));
+  await w.funding.run("near");
+  assert.equal(w.chain.sendTxCount, 0);
 });
 
 test("unscanned quote windows count as potential refunds until coverage advances", () => {

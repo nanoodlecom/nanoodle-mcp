@@ -3,6 +3,7 @@ import { assertFreshBlock } from "./freshness.mjs";
 import { DEFAULT_FUNCTION_CALL_GAS } from "./tx.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./quote-capacity.mjs";
 import { conflictingNearRefunds, nearRefundTerms, sameNearRefundDestination } from "./refund-terms.mjs";
+import { hasInvalidNearRefundProof } from "./refund-proof.mjs";
 
 const U128 = (1n << 128n) - 1n;
 export const NEAR_OPERATING_RESERVE = 50_000_000_000_000_000_000_000n;
@@ -30,8 +31,9 @@ const rows = value => {
 
 /** One future refund per obligation, including the gap before its outbox entry.
  * Unpaid quotes are counted separately and cannot tie up gas with free requests. */
-export function nearRefundClaims({ quotes, refunds, meta }, {
+export function nearRefundClaims({ quotes, refunds, meta, merchant }, {
   now = Date.now(), unpaidRetainMs = RETAIN_NEAR_QUOTE_MS, coveredThroughMs = nearPaymentWatchCoverage(meta?.[PAYMENT_WATCH_META]),
+  invalidRefundProof = record => typeof merchant === "string" && hasInvalidNearRefundProof(record, merchant),
 } = {}) {
   let nearYocto = 0n, usdcAtomic = 0n, nativeRefunds = 0, tokenRefunds = 0, pendingNativeRefunds = 0, pendingTokenRefunds = 0;
   const issues = new Set(), refundsByPayment = new Map();
@@ -46,9 +48,11 @@ export function nearRefundClaims({ quotes, refunds, meta }, {
   };
   for (const r of refundRows) {
     if (!["queued", "signed", "sent", "failed_permanent"].includes(r.status)) throw bad();
-    if (r.status !== "sent" || conflicts.has(r.id) || r.reconciliationRequired || r.outcomeUnverified) {
+    const invalidProof = invalidRefundProof(r);
+    if (r.status !== "sent" || conflicts.has(r.id) || r.reconciliationRequired || r.outcomeUnverified || invalidProof) {
       add(r.asset, r.amountYocto);
     }
+    if (invalidProof) issues.add("near-refund-signed-terms-mismatch");
     if (r.reconciliationRequired) issues.add("near-refund-evidence-mismatch");
     if (r.status === "sent" && r.outcomeUnverified) issues.add("near-refund-outcome-unverified");
     if (typeof r.paymentId === "string") {
@@ -194,6 +198,7 @@ export function createNearFunding({ rpc, ledger, network, accountId, publicKey, 
   }
   const claims = () => nearRefundClaims({ quotes: ledger.quotes(), refunds: ledger.refunds() }, {
     now: now(), unpaidRetainMs, coveredThroughMs: ledger.paymentWatchCoverage(),
+    invalidRefundProof: record => ledger.invalidRefundProof(record.id),
   });
   const sufficient = (frame, value, options = {}) => frame.balanceYocto >= nearFundingNeed({ claims: value, costs: frame.costs, storageUsage: frame.storageUsage, ...options })
     && (value.usdcAtomic === 0n || frame.usdcAtomic != null && frame.usdcAtomic >= value.usdcAtomic);

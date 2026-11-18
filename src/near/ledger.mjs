@@ -15,6 +15,7 @@ import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateSt
 import { NearError } from "./errors.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META } from "./quote-capacity.mjs";
 import { conflictingNearRefunds, nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
+import { hasInvalidNearRefundProof } from "./refund-proof.mjs";
 import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
@@ -81,6 +82,11 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
   }
   let persisted = JSON.stringify(state), persistenceFailed = false, uncertainCommit = null;
   let refundConflicts;
+  const refundProofs = new WeakMap();
+  function invalidRefundProof(record) {
+    if (!refundProofs.has(record)) refundProofs.set(record, hasInvalidNearRefundProof(record, merchant));
+    return refundProofs.get(record);
+  }
   // Earlier releases could persist the claim before attaching it to its quote.
   // Index those exceptions once so watching blocks does not scan the tx history.
   const unattachedPayments = new Set();
@@ -203,6 +209,9 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       refundConflicts ??= conflictingNearRefunds(Object.values(state.refunds));
       return refundConflicts.has(id);
     },
+    invalidRefundProof(id) {
+      return invalidRefundProof(state.refunds[id]);
+    },
 
     // Creator payouts are in Nano, independently of the customer's payment asset.
     // Keep this outbox after quote pruning, like refunds and consumed hashes.
@@ -260,7 +269,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
         if (expected && expected.amountYocto !== "0") {
           const [refund] = associated;
           if (associated.length !== 1 || refund.reconciliationRequired || refund.outcomeUnverified
-            || refund.status === "failed_permanent" || !sameNearRefund(expected, refund)) continue;
+            || refund.status === "failed_permanent" || !sameNearRefund(expected, refund) || invalidRefundProof(refund)) continue;
         }
         const creator = q.settlement?.authorPayout, payout = state.payouts[id];
         if (creator && (!payout || payout.reconciliationRequired || !sameCreatorPayout(creator, payout))) continue;

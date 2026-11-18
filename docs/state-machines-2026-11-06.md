@@ -92,6 +92,10 @@ ledger preserves every uncovered remainder and the gas needed to send it.
 A transaction hash belongs to one refund, including hashes retained from
 nonce renewal. If two refunds claim one hash, both balances stay reserved
 and their retries stay on hold until the records are reconciled.
+Before rebroadcasting, recovery verifies the saved signature and checks the
+transaction against the recorded payer, amount, asset, nonce and block.
+The read-only monitor performs the same check on saved transactions. Invalid
+evidence keeps the debt reserved and the original bytes available for review.
 NEAR and Market creator payouts cover only the matching recipient and
 amount. Restored outbox entries that disagree with the original obligation
 stay held with their signed bytes. The payment and assignment records remain

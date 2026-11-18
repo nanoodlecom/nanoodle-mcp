@@ -15,7 +15,7 @@
  * The transaction hash is sha256(borsh(Transaction)); that digest is what gets
  * signed and, in base58, is the hash explorers and RPC show.
  */
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify } from "node:crypto";
 import { assertNearAccountId } from "./account.mjs";
 import { base58Decode, base58Encode } from "./base58.mjs";
 import { NearError } from "./errors.mjs";
@@ -66,6 +66,21 @@ export function matchesSignedNonce({ signedTxBase64, txHash, signerId, publicKey
     && base58Encode(createHash("sha256").update(payload).digest()) === txHash;
 }
 
+/** Re-encode the expected transaction with its original public key, then verify its signature. */
+export function matchesSignedTransaction({ signedTxBase64, txHash, signerId }, serialize) {
+  if (typeof signedTxBase64 !== "string" || signedTxBase64.length > 32_768) return false;
+  const signed = Buffer.from(signedTxBase64, "base64");
+  const publicKeyAt = str(signerId).length + 1;
+  if (signed.length <= publicKeyAt + 32 + 65 || signed.at(-65) !== 0 || signed.toString("base64") !== signedTxBase64) return false;
+  const originalKey = signed.subarray(publicKeyAt, publicKeyAt + 32);
+  const payload = signed.subarray(0, -65);
+  if (!payload.equals(serialize(originalKey))) return false;
+  const digest = createHash("sha256").update(payload).digest();
+  if (base58Encode(digest) !== txHash) return false;
+  const key = createPublicKey({ format: "jwk", key: { kty: "OKP", crv: "Ed25519", x: originalKey.toString("base64url") } });
+  return verify(null, digest, key, signed.subarray(-64));
+}
+
 export function serializeTransferTx({ signerId, publicKeyBytes, nonce, receiverId, blockHash, amountYocto }) {
   assertNearAccountId(signerId);
   assertNearAccountId(receiverId);
@@ -94,19 +109,23 @@ export function signTransfer({ signer, signerId, receiverId, nonce, blockHash, a
   return signBytes(signer, txBytes, nonce, blockHash);
 }
 
-/** One NEAR FunctionCall, used for NEP-141 transfers and storage registration. */
-export function signFunctionCall({ signer, signerId, receiverId, nonce, blockHash, methodName, args, gas = DEFAULT_FUNCTION_CALL_GAS, depositYocto = 1n }) {
+export function serializeFunctionCallTx({ signerId, publicKeyBytes, receiverId, nonce, blockHash, methodName, args,
+  gas = DEFAULT_FUNCTION_CALL_GAS, depositYocto = 1n }) {
   assertNearAccountId(signerId);
   assertNearAccountId(receiverId);
   if (typeof methodName !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(methodName)) throw new TypeError("invalid FunctionCall method");
   const argBytes = Buffer.from(JSON.stringify(args));
   if (argBytes.length > 16_384) throw new RangeError("FunctionCall arguments too large");
-  const txBytes = Buffer.concat([
-    str(signerId), Buffer.from([0]), bytes32(signer.publicKeyBytes, "publicKeyBytes"), u64(nonce), str(receiverId),
+  return Buffer.concat([
+    str(signerId), Buffer.from([0]), bytes32(publicKeyBytes, "publicKeyBytes"), u64(nonce), str(receiverId),
     bytes32(base58Decode(blockHash, 32), "blockHash"), u32(1), Buffer.from([2]), str(methodName),
     u32(argBytes.length), argBytes, u64(gas), u128(depositYocto),
   ]);
-  return signBytes(signer, txBytes, nonce, blockHash);
+}
+
+/** One NEAR FunctionCall, used for NEP-141 transfers and storage registration. */
+export function signFunctionCall({ signer, ...fields }) {
+  return signBytes(signer, serializeFunctionCallTx({ ...fields, publicKeyBytes: signer.publicKeyBytes }), fields.nonce, fields.blockHash);
 }
 
 function signBytes(signer, txBytes, nonce, blockHash) {

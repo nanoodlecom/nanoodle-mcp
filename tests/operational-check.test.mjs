@@ -11,7 +11,9 @@ import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
-import { USDC_CONTRACTS } from "../src/near/index.mjs";
+import { parseNearSecretKey, USDC_CONTRACTS } from "../src/near/index.mjs";
+import { signTransfer } from "../src/near/tx.mjs";
+import { base58Encode } from "../src/near/base58.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundCosts } from "../src/near/funding.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
@@ -283,17 +285,26 @@ test("the scheduled check detects NEAR, USDC and Market settlement mismatches wi
     asset: "near", amountYocto: "10", to: "private.testnet", txHash: "private-transaction" },
     previous: { id: "private-previous-refund", paymentId: "private-old-job", status: "sent",
       amountYocto: "10", supersededTxHashes: ["private-transaction"] } };
+  const signer = parseNearSecretKey(`ed25519:${base58Encode(Buffer.alloc(32, 38))}`);
+  const proof = signTransfer({ signer, signerId: f.config.merchant, receiverId: "private-actual.testnet", nonce: 17n,
+    blockHash: base58Encode(Buffer.alloc(32, 39)), amountYocto: 20n });
+  state.refunds.invalidProof = { id: "private-proof", paymentId: "private-old-proof", status: "sent",
+    amountYocto: "20", to: "private-recorded.testnet", ...proof };
   state.payouts = { near: { paymentId: "private-near-job", status: "sent", amountRaw: "15", to: "private-author" },
     market: { paymentId: "market_private-market-job", status: "sent", amountRaw: "15", to: "wrong-author" } };
   const marketFile = Object.keys(f.states).find(path => path.endsWith("/market-state.json"));
   f.states[marketFile].assignments = { job: { id: "private-market-job", phase: "submitted",
     creator: { status: "queued", author: "private-author", amountRaw: "30" } } };
   const report = await runOperationalCheck(f.config, f.deps);
-  for (const stage of ["near-refund-evidence-mismatch", "creator-payout-evidence-mismatch", "near-refund-duplicate-transaction"]) {
+  for (const stage of ["near-refund-evidence-mismatch", "creator-payout-evidence-mismatch", "near-refund-duplicate-transaction",
+    "near-refund-signed-terms-mismatch"]) {
     assert.deepEqual(report.checks.find(c => c.stage === stage), { stage, ok: false, code: stage, domains: [] });
   }
   assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
   assert.doesNotMatch(JSON.stringify(report), /private-near-job|private-refund|private-market-job|private\.testnet|private-author|wrong-author|private-transaction/);
+  assert.doesNotMatch(JSON.stringify(report), /private-actual|private-recorded|private-proof/);
+  assert.ok(!JSON.stringify(report).includes(proof.signedTxBase64));
+  assert.ok(!JSON.stringify(report).includes(proof.txHash));
 });
 
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
