@@ -29,6 +29,7 @@ const checks = [
   "the scheduled check detects NEAR, USDC and Market settlement mismatches",
   "a NEAR refund transaction shared across records",
   "a restored NEAR refund sharing a transaction candidate",
+  "a fresh NEAR refund that signs a previously claimed transaction",
   "NEAR retention preserves a quote if its refund hash",
   "a replayed USDC receipt with a shared refund hash",
   "a durable Nano send preserves new liabilities",

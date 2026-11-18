@@ -233,6 +233,25 @@ test("a restored NEAR refund sharing a transaction candidate is held across repe
   });
 });
 
+test("a fresh NEAR refund that signs a previously claimed transaction stops before broadcast", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), { rpc, log } = mockChain({ onSend: () => ({ result: DONE }) });
+    const { refunder } = make(rpc, ledger);
+    const terms = { to: "payer.testnet", amountYocto: AMOUNT, reason: "change" };
+    const first = await refunder.refund({ ...terms, paymentId: "first" });
+    assert.equal(first.status, "sent");
+    // Simulate a restored nonce watermark and a node whose key view has not caught up.
+    ledger.setMeta("lastNonce", "100");
+    const second = await refunder.refund({ ...terms, paymentId: "second" });
+    assert.equal(second.status, "failed_permanent");
+    assert.equal(second.txHash, null);
+    const reserved = ledger.getRefund(second.refundId);
+    assert.equal(reserved.txHash, first.txHash);
+    assert.equal(reserved.reconciliationRequired, true);
+    assert.equal(log.sends.length, 1);
+  });
+});
+
 test("transient failure -> pending; a later tick rebroadcasts identical bytes", async () => {
   await withLedger(async ({ open }) => {
     const ledger = open();
