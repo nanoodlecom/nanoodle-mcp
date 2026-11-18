@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { pathToFileURL } from "node:url";
 import { createProbeFetch } from "../src/probe-http.mjs";
 
 const NANO = "https://mcp.nanoodle.com";
@@ -90,7 +89,7 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   const report = await runPublicMcpCheck();
   console.log(JSON.stringify(report));
   if (!report.ok) process.exitCode = 1;

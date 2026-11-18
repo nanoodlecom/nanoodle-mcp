@@ -2,7 +2,6 @@
 // Public availability only: no credentials, hires, inference or payments.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { atomicJson } from "./near-check.mjs";
 
 // The custom-workflow profile is still unpublished. Add it after it goes live.
@@ -79,7 +78,7 @@ export async function runMarketCheck({ stateDir, url = "https://market.near.ai",
   return report;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   try {
     const report = await runMarketCheck({ stateDir: process.env.CHECK_STATE_DIR || "/var/lib/nanoodle-near-check" });
     console.log(JSON.stringify(report)); if (!report.ok) process.exitCode = 1;

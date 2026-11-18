@@ -3,7 +3,6 @@
 import { mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
-import { pathToFileURL } from "node:url";
 import { createNearRpcPool, loadNearSigner, NEAR_NETWORKS, signTransfer, parseNearToYocto, formatYoctoAsNear } from "../src/near/index.mjs";
 import { checkTransferOnChain, parseArgs, tokensBurnt } from "./near-testnet-lib.mjs";
 import { callMcp, resultText } from "../src/near-site-browser.mjs";
@@ -166,7 +165,7 @@ export async function runCheck(config, deps = {}) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   try {
     const o = parseArgs(process.argv.slice(2), ["two-steps"]);
     const report = await runCheck({ stateDir: o["state-dir"] || "/var/lib/nanoodle-near-check", payer: o.payer || process.env.CHECK_PAYER,
