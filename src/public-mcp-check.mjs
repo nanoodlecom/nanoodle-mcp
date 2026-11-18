@@ -104,6 +104,7 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       need(Number.isSafeInteger(funding.checkedAt) && fresh(now() - funding.checkedAt, 60_000), "near-refund-funding-stale");
       if (funding.ok === false && funding.code === "NEAR_FUNDING_INSUFFICIENT") throw new ProbeError("near-refund-funding-insufficient");
       need(funding.ok === true, "near-refund-funding-unavailable");
+      if (funding.canQuoteUsdc === false && funding.usdcCode === "USDC_FUNDING_UNAVAILABLE") throw new ProbeError("usdc-refund-funding-unavailable");
       need(funding.canQuoteNear === true && funding.canQuoteUsdc === true, "near-refund-funding-exhausted");
     },
     "babel-ingress": async () => {

@@ -5,7 +5,7 @@ import { runPublicMcpCheck } from "../scripts/public-mcp-check.mjs";
 const NOW = Date.parse("2026-11-18T04:30:00Z");
 const stamp = new Date(NOW).toISOString();
 
-function fixture({ missingTool = false, scanAt = stamp, funded = true, lostHost, transientRates = false,
+function fixture({ missingTool = false, scanAt = stamp, funded = true, usdcUnavailable = false, lostHost, transientRates = false,
   missingDecision = false, invalidDeposit = false } = {}) {
   const calls = [];
   async function fetch(url, init) {
@@ -23,7 +23,8 @@ function fixture({ missingTool = false, scanAt = stamp, funded = true, lostHost,
     if (pathname === "/near/health") {
       return Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
         watcher: { listening: true, lastScanAt: scanAt, backfilling: false },
-        funding: { enforced: true, checkedAt: NOW, ok: funded, canQuoteNear: funded, canQuoteUsdc: funded,
+        funding: { enforced: true, checkedAt: NOW, ok: funded, canQuoteNear: funded, canQuoteUsdc: funded && !usdcUnavailable,
+          ...(usdcUnavailable ? { usdcCode: "USDC_FUNDING_UNAVAILABLE" } : {}),
           ...(funded ? {} : { code: "NEAR_FUNDING_INSUFFICIENT" }) } });
     }
     if (pathname === "/mcp" && body?.method === "initialize") {
@@ -62,6 +63,14 @@ test("public availability uses discovery, status and free pricing, and retries a
   assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["initialize", "tools/call", "tools/list"]);
   assert.equal(calls.filter(call => call.tool === "price_noodle").length, 2);
   assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/mcp", "/mcp/v1", "/near/health", "/rates"]);
+});
+
+test("public readiness reports missing USDC proof as a token-specific check failure", async () => {
+  const { run } = fixture({ usdcUnavailable: true });
+  const report = await run();
+  assert.deepEqual(report.checks.filter(check => !check.ok), [
+    { stage: "near-refund-funding", ok: false, attempts: 2, code: "usdc-refund-funding-unavailable" },
+  ]);
 });
 
 test("conditional pricing verifies the decision model and both branches fit the deposit", async () => {

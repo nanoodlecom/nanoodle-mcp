@@ -65,6 +65,7 @@ test("read-only funding views bind account, authorized key and token balance to 
   const w = world();
   const frame = await readNearFunding({ ...w.options, tokenContract: TOKEN });
   assert.equal(frame.usdcAtomic, 1_000_000_000n); assert.equal(frame.balanceYocto, 10n ** 25n);
+  assert.equal(frame.usdcRegistered, true);
   const queries = w.chain.log.filter(row => row.method === "query");
   assert.ok(queries.every(row => row.params.block_id === queries[0].params.block_id && !row.params.finality));
   const gas = w.chain.log.find(row => row.method === "gas_price");
@@ -74,6 +75,51 @@ test("read-only funding views bind account, authorized key and token balance to 
     return params?.request_type === "view_account" ? { ...r, block_hash: "another-block" } : r;
   } };
   await assert.rejects(readNearFunding({ ...w.options, rpc: changed }), { code: "NEAR_FUNDING_INVALID" });
+  assert.equal(w.chain.sendTxCount, 0);
+});
+
+test("an unverifiable token balance or missing registration stops USDC quotes while native NEAR stays ready", async () => {
+  for (const failedView of ["ft_balance_of", "storage_balance_of"]) {
+    const w = world();
+    let failing = true;
+    const rpc = { ...w.rpc, call: async (method, params) => {
+      if (failing && params?.method_name === failedView) {
+        if (failedView === "ft_balance_of") throw Error("token view unavailable");
+        return { ...await w.rpc.call(method, params), result: [...Buffer.from("null")] };
+      }
+      return w.rpc.call(method, params);
+    } };
+    const funding = createNearFunding({ ...w.options, rpc });
+    const status = await funding.refresh();
+    assert.equal(status.ok, true);
+    assert.equal(status.canQuoteNear, true);
+    assert.equal(status.canQuoteUsdc, false);
+    assert.equal(status.usdcCode, "USDC_FUNDING_UNAVAILABLE");
+    await assert.rejects(funding.quote("usdc", () => assert.fail("unverified USDC quote committed")), { code: "NEAR_FUNDING_UNAVAILABLE" });
+    assert.equal(funding.status().canQuoteNear, true);
+    assert.equal(await funding.quote("near", () => "native quote"), "native quote");
+    failing = false;
+    assert.equal((await funding.refresh()).canQuoteUsdc, true);
+    assert.equal(await funding.quote("usdc", () => "token quote"), "token quote");
+    assert.equal(w.chain.sendTxCount, 0);
+  }
+});
+
+test("native proofs do not extend USDC proof validity and disabling quotes retains paid token obligations", async () => {
+  const w = world();
+  assert.equal((await w.funding.refresh()).canQuoteUsdc, true);
+  w.tick(60_001);
+  assert.equal(await w.funding.quote("near", () => "native quote"), "native quote");
+  assert.equal(w.funding.status().canQuoteNear, true);
+  assert.equal(w.funding.status().canQuoteUsdc, false);
+  assert.equal((await w.funding.refresh()).canQuoteUsdc, true);
+
+  const nativeOnly = createNearFunding({ ...w.options, usdcQuotesEnabled: false });
+  assert.equal((await nativeOnly.refresh()).canQuoteUsdc, false);
+  await assert.rejects(nativeOnly.quote("usdc", () => assert.fail("USDC is disabled")), { code: "NEAR_FUNDING_UNAVAILABLE" });
+  w.putQuote("prior-token-payment", { status: "paid", asset: "usdc", paidYocto: "17" });
+  await nativeOnly.run("usdc");
+  assert.equal(nativeOnly.status().canQuoteUsdc, false);
   assert.equal(w.chain.sendTxCount, 0);
 });
 

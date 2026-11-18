@@ -382,7 +382,8 @@ test("loss of the separate Nano ingress is visible without executing tools or di
 });
 
 test("periodic readiness verifies fresh enforced refund funding and each asset's admission capacity", async () => {
-  for (const change of [{ enforced: false }, { checkedAt: NOW - 60_001 }, { ok: false }, { canQuoteUsdc: false }]) {
+  for (const change of [{ enforced: false }, { checkedAt: NOW - 60_001 }, { ok: false }, { canQuoteUsdc: false },
+    { canQuoteUsdc: false, usdcCode: "USDC_FUNDING_UNAVAILABLE" }]) {
     const f = fixture(({ url }) => url.pathname === "/near/health" ? Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near",
       watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false },
       funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true, ...change } }) : null);
@@ -390,6 +391,21 @@ test("periodic readiness verifies fresh enforced refund funding and each asset's
     assert.equal(result.ok, false); assert.equal(result.admission.usdc, false);
     if (change.canQuoteUsdc === false) assert.equal(result.admission.near, true);
     else assert.equal(result.admission.near, false);
+    if (change.usdcCode) assert.ok(result.checks.some(check => check.stage === "usdc-refund-admission"
+      && check.code === "usdc-refund-funding-unavailable"));
+  }
+});
+
+test("independent token reads preserve native readiness unless a paid USDC claim needs the missing balance", async () => {
+  for (const paid of [false, true]) {
+    const f = fixture(({ body }) => body?.params?.method_name === "ft_balance_of" ? new Response(null, { status: 503 }) : null);
+    if (paid) f.states["/state/near-state.json"].quotes.paid = { id: "paid", asset: "usdc", status: "paid", paidYocto: "17" };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.equal(report.admission.near, !paid);
+    assert.equal(report.admission.usdc, false);
+    assert.ok(report.checks.some(c => c.stage === "near-fee-and-balance-reads" && c.ok));
+    assert.ok(report.checks.some(c => c.stage === "usdc-funding-reads" && c.code === "usdc-refund-funding-unavailable"));
+    assert.equal(report.checks.some(c => c.stage === "usdc-liquidity"), false);
   }
 });
 

@@ -979,7 +979,8 @@ async function startNearMode({
     catch (e) { log(`USDC payments are off (${e.code || "unavailable"}): ${e.message}. Native NEAR continues.`); }
   }
   const usdc = { enabled: usdcEnabled, tokenContract: usdcToken, decimals: 6 };
-  const refundFunding = near.createNearFunding({ rpc, ledger, network, accountId: merchant, publicKey: signer.publicKey, usdcToken });
+  const refundFunding = near.createNearFunding({ rpc, ledger, network, accountId: merchant, publicKey: signer.publicKey,
+    usdcToken, usdcQuotesEnabled: usdcEnabled });
   await refundFunding.refresh();
   const fundingTimer = setInterval(() => { refundFunding.refresh().catch(() => {}); }, 30_000);
   fundingTimer.unref();

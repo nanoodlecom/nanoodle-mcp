@@ -29,6 +29,13 @@ native customer principal, storage, conservative fees for every actual refund,
 and the existing 0.05 NEAR operating float before admitting model work. Quotes
 also check capacity for one new refund in their chosen asset.
 
+USDC refreshes and new quotes verify the merchant's token balance and
+storage registration at the same finalized block. The public USDC proof
+expires independently after 60 seconds. With zero outstanding USDC debt,
+a missing token view or registration closes USDC quotes while native NEAR
+remains eligible. If a paid USDC obligation needs an unavailable token
+balance, the shared funding check pauses admission until it can verify coverage.
+
 Fee prepayment uses the greater of the block gas price and the protocol's
 minimum gas purchase price. It includes receipt/action fees, implicit-account
 creation and a full-access key for a native refund, and the FT function-call and
