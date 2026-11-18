@@ -25,6 +25,20 @@ recorded height. A previously pending head must have confirmed before it can
 qualify the handoff. These checks use wallet reads and seed the replacement
 process's existing monotonic read guard.
 
+Hosted wallets with a required state policy and startup permit path also keep
+`out/nano-wallet-checkpoint.json`. A verified version 2 startup permit seeds
+this file under the existing writer locks. The wallet syncs each newly
+confirmed checkpoint to disk before using that account view, after two
+independent peers confirm the same block. Keep this file with the rest of the
+output directory in backups.
+
+After an unplanned restart, the wallet verifies the saved checkpoint before
+using the pool. Reads retry while peers catch up, and the periodic funding
+check reports the refusal. Once quorum returns at or above the saved checkpoint,
+the same process can use the pool again. A missing or invalid checkpoint needs
+operator reconciliation. During normal operation, a healthy configured standby
+can corroborate the owned node while another primary is behind.
+
 Hosted paid tools and Market workers enable the shared wallet's read guard.
 `NANO_RPC_URL` / `--nano-rpc` accepts one to eight distinct, comma-separated
 endpoints. Configure independently operated mainnet nodes: with multiple endpoints,
