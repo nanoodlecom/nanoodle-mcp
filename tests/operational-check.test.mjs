@@ -1045,7 +1045,9 @@ test("owned Nano ledger telemetry distinguishes missing blocks from delayed conf
 });
 
 test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
-  for (const failure of [null, "matching-with-lagging-peer", "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+  for (const failure of [null, "matching-with-lagging-peer", "reused-funding", "expired-funding", "expired-during-check",
+    "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+    let checkedAt = NOW;
     const f = fixture(({ url, body }) => {
       assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
       if (url.hostname === "nano-0.example") {
@@ -1055,8 +1057,10 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
         return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
       }
+      if (failure === "expired-during-check" && body?.action === "account_history") checkedAt = NOW + 5_000;
       return null;
     });
+    f.deps.now = () => checkedAt;
     const url = "https://standby.example/rpc?api_key=PRIVATE_STANDBY";
     f.config.nanoStandby = { url, requestsPerMinute: 10 };
     const rpc = f.states["/state/funding-health.json"].nanoRpc;
@@ -1064,14 +1068,21 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       configuration: failure === "digest" ? "a".repeat(64) : rpcPeerSetId([...f.config.nanoRpcUrls, url]),
       standby: { inUse: failure !== "inactive", requestsPerMinute: failure === "quota" ? 11 : 10 },
       cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      ...(["reused-funding", "expired-funding", "expired-during-check"].includes(failure) && { lastReadAt: NOW - 25_000,
+        fundingEvidenceExpiresAt: NOW + (failure === "expired-funding" ? 0 : 5_000) }),
       ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
     const report = await runOperationalCheck(f.config, f.deps);
-    const ready = failure === null || failure === "matching-with-lagging-peer";
+    const ready = [null, "matching-with-lagging-peer", "reused-funding"].includes(failure);
     assert.equal(report.admission.nano, false);
     assert.equal(report.admission.near, ready);
     if (ready) {
       assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
       assert.ok(report.checks.some(c => c.stage === "nano-payment-read-quorum" && c.code === "nano-payment-read-standby-unverified"));
+    }
+    if (failure === "expired-funding") assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "nano-read-guard-stale"));
+    if (failure === "expired-during-check") {
+      assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+      assert.ok(report.checks.some(c => c.stage === "nano-funding-evidence-freshness" && c.code === "nano-read-guard-stale"));
     }
     if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);

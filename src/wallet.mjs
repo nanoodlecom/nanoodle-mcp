@@ -245,7 +245,6 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       if (isPublish) checkpointStore.assertCurrent();
     }
     if (readPool && base === rpcBases) {
-      if (body.action === "account_info" && opts.fundingRefresh) return readPool.readFundingInfo();
       if (["account_info", "receivable", "account_history"].includes(body.action)) return readPool.read(body);
       if (body.action === "block_info") return readPool.block(body);
     }
@@ -266,8 +265,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
     throw lastErr;
   }
 
-  async function accountState({ fundingRefresh = false } = {}) {
-    const info = await rpc({ action: "account_info", account: address, representative: "true" }, rpcBases, { fundingRefresh }).catch((e) => {
+  async function accountState() {
+    const info = await rpc({ action: "account_info", account: address, representative: "true" }).catch((e) => {
       if (/Account not found/i.test(e.message)) {
         throw new Error(
           `wallet ${address} is empty or unopened — fund it with a little XNO first ` +
@@ -275,6 +274,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       }
       throw e;
     });
+    return parsedAccountState(info);
+  }
+
+  function parsedAccountState(info) {
     if (!/^[a-f0-9]{64}$/i.test(info.frontier || "") || !/^\d{1,39}$/.test(String(info.balance)) || !checkAddress(info.representative)) {
       throw new Error("Nano RPC account_info returned invalid wallet state");
     }
@@ -292,18 +295,30 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    */
   let chain = null;
   let checkedAt = null;
-  async function currentState(fresh = false, readOptions) {
+  async function currentState(fresh = false, { forFundingReport = false } = {}) {
     if (checkpointStore) {
       await qualifyRestartFloor();
       checkpointStore.assertCurrent();
     }
     const health = readPool?.status();
-    if (!fresh && chain && (!readPool || (checkedAt != null && now() >= checkedAt && now() - checkedAt < 30_000
-        && health.networkPeers >= health.minimumPeers && health.readablePeers >= health.minimumPeers))) return chain;
+    if (!fresh && chain && (!forFundingReport || !health?.standby?.inUse)
+        && (!readPool || (checkedAt != null && now() >= checkedAt && now() - checkedAt < 30_000
+          && health.networkPeers >= health.minimumPeers && health.readablePeers >= health.minimumPeers))) {
+      return forFundingReport ? { state: chain, nanoRpc: health } : chain;
+    }
+    const priorChain = forFundingReport ? chain : null;
     chain = null; // a failed refetch must not leave the suspect cache behind
-    chain = await accountState(readOptions);
+    if (forFundingReport && readPool) {
+      const { info, nanoRpc, reused } = await readPool.readFundingInfo();
+      const state = parsedAccountState(info);
+      if (!reused) { chain = state; checkedAt = now(); }
+      else if (priorChain?.frontier === state.frontier && priorChain.blockCount === state.blockCount
+        && priorChain.balance === state.balance && priorChain.representative === state.representative) chain = priorChain;
+      return { state, nanoRpc };
+    }
+    chain = await accountState();
     checkedAt = now();
-    return chain;
+    return forFundingReport ? { state: chain } : chain;
   }
 
   function advanced(state, hash, balance) {
@@ -714,9 +729,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         await readPool.verifyCheckpoint(checkpoint);
       }, HOUSEKEEPING, false),
       fundingReport: () => enqueue(async () => {
-        const state = await currentState(false, { fundingRefresh: true });
+        const { state, nanoRpc } = await currentState(false, { forFundingReport: true });
         return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers,
-          ...(readPool ? { nanoRpc: readPool.status() } : {}) };
+          ...(nanoRpc && { nanoRpc }) };
       }, HOUSEKEEPING, false), // read-only telemetry must not keep drain permanently nonzero
       // The journal callback MUST persist the signed block before returning.
       // Retrying after a lost response or a restart uses the same block hash.

@@ -216,6 +216,39 @@ test("funding refreshes and quote preflights leave the next standby window for a
   assert.equal(standbyRequests(), 10, "a complete scan releases priority");
 });
 
+test("funding can reuse a matching payment account proof only through its original expiry", async () => {
+  for (const invalidation of ["primary-moved", "expired", "clock-rewound", "local-send"]) {
+    const w = world(2, 4), [owned, spare, standby] = w.peers;
+    const head = owned.info.confirmed_frontier;
+    owned.history = standby.history = { account: ACCOUNT, previous: OTHER, history: [
+      { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+    ] };
+    spare.down = true;
+    await w.pool.readPaymentWindow({ existingPayments: true });
+    w.tick(1_000);
+    await assert.rejects(w.pool.readPaymentWindow({ existingPayments: true }), { code: "NANO_RPC_STANDBY_BUDGET" });
+    const view = await w.pool.readFundingInfo();
+    assert.equal(view.reused, true);
+    assert.equal(view.nanoRpc.readablePeers, 2);
+    assert.equal(view.nanoRpc.lastReadAt, 1_000);
+    assert.equal(view.nanoRpc.fundingEvidenceExpiresAt, 31_000);
+    assert.equal(w.pool.status().readablePeers, 0, "reusing telemetry does not establish a new publishing quorum");
+    await assert.rejects(w.pool.publishBases(), { code: "NANO_RPC_NETWORK_QUORUM" });
+    if (invalidation === "primary-moved") owned.info = nanoAccountInfo({ pending: "1" });
+    if (invalidation === "expired") w.tick(29_000);
+    if (invalidation === "clock-rewound") { w.tick(29_000); w.jumpWall(-29_000); }
+    if (invalidation === "local-send") {
+      w.pool.observe({ frontier: OTHER, balance: "99", blockCount: "11", representative: ACCOUNT });
+    }
+    await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" }, invalidation);
+    if (invalidation === "primary-moved") {
+      owned.info = nanoAccountInfo();
+      await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" }, "a reverted primary reply cannot restore the discarded proof");
+    }
+    assert.equal(w.calls.filter(call => call.base === standby.base).length, 4);
+  }
+});
+
 test("unproven standby history leaves only the independently verified receivable window", async () => {
   for (const rateLimited of [false, true]) {
     const w = world(2, 4), [owned, spare, standby] = w.peers;

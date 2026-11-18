@@ -345,6 +345,13 @@ test("guarded funded payments use the corroborated primary and leave the standby
     } });
   let state = await wallet.ops.fundingReport();
   assert.equal(state.nanoRpc.standby.inUse, true);
+  const beforeReuse = calls.filter(call => call.url === standby).length;
+  at += 5_000;
+  state = await wallet.ops.fundingReport();
+  assert.equal(state.nanoRpc.lastReadAt, 1_000);
+  assert.equal(state.nanoRpc.fundingEvidenceExpiresAt, 31_000);
+  assert.equal(state.balanceRaw, mock.state.balance);
+  assert.equal(calls.filter(call => call.url === standby).length, beforeReuse);
   assert.equal(mock.state.processed.length, 0);
   await wallet.ops.withFunding({ id: "standby-payment", maxUsd: 0.01, maxRaw: BigInt(AMOUNT) }, () => wallet.payment(invoice()));
   assert.deepEqual(calls.filter(call => call.action === "process"), [{ action: "process", url: primary }]);

@@ -123,6 +123,30 @@ test("funding telemetry cannot call degraded read coverage healthy", async t => 
   assert.equal(w.sources.ready(), false);
 });
 
+test("a reused standby proof cannot renew funding admission past its original deadline", async t => {
+  let wall = 20_000, elapsed = 0;
+  const w = await setup(t, { now: () => elapsed });
+  const head = { hash: "A".repeat(64), blockCount: "10" };
+  const nanoRpc = { enforced: true, configuredPeers: 3, minimumPeers: 2, networkPeers: 2, readablePeers: 2,
+    lastReadAt: 1_000, fundingEvidenceExpiresAt: 31_000,
+    standby: { inUse: true, requestsPerMinute: 4, coldPaymentScanRequests: 4 },
+    checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: NANO_GENESIS_REPLY.contents.account, head, confirmed: head } };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => wall, intervalMs: 1_000_000,
+    snapshot: async () => ({ ...value, nanoRpc }) });
+  t.after(report.stop);
+  const saved = async () => JSON.parse(await readFile(w.file, "utf8"));
+  assert.equal((await saved()).nanoRpc.fundingEvidenceExpiresAt, 31_000);
+  elapsed = 5_000;
+  assert.equal(w.sources.ready(), true);
+  wall = 10_000;
+  elapsed = 11_000;
+  assert.equal(w.sources.ready(), false, "a wall-clock rewind cannot extend the published lease");
+  wall = 31_000;
+  await report.refresh();
+  assert.equal((await saved()).ok, false);
+  assert.equal(w.sources.ready(), false);
+});
+
 test("lost writer protection pauses quotes and its private error is not published", async t => {
   const w = await setup(t); let lost = false;
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, snapshot: async () => value,

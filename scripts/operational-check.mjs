@@ -32,7 +32,7 @@ import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
+import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
@@ -384,6 +384,12 @@ export async function runOperationalCheck(config, deps = {}) {
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
+    if (rpc.fundingEvidenceExpiresAt !== undefined) {
+      const expiresAt = rpc.fundingEvidenceExpiresAt;
+      need(config.nanoStandby && rpc.standby?.inUse === true && Number.isSafeInteger(expiresAt)
+        && expiresAt > now() && expiresAt > rpc.lastReadAt && expiresAt - rpc.lastReadAt <= NANO_FUNDING_EVIDENCE_MS,
+      "nano-read-guard-stale");
+    }
     let checkpoint;
     try { checkpoint = selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
@@ -402,7 +408,8 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingPause: pause?.recoveredAt != null ? pause : null };
+    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingEvidenceExpiresAt: rpc.fundingEvidenceExpiresAt,
+      fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -1018,7 +1025,11 @@ export async function runOperationalCheck(config, deps = {}) {
       await checkMarketRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
   }));
-  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
+  const finishedAt = now();
+  if (runtimeFunding?.fundingEvidenceExpiresAt !== undefined) await check("nano-funding-evidence-freshness", () => {
+    need(runtimeFunding.fundingEvidenceExpiresAt > finishedAt, "nano-read-guard-stale");
+  });
+  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), finishedAt,
     { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync, invocationId: config.invocationId });
 }
 
