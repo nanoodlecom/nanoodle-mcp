@@ -6,6 +6,7 @@ const U128 = (1n << 128n) - 1n;
 export const NEAR_OPERATING_RESERVE = 50_000_000_000_000_000_000_000n;
 export const FT_REFUND_GAS = DEFAULT_FUNCTION_CALL_GAS;
 const bad = () => new NearError("NEAR_FUNDING_INVALID", "NEAR refund funding cannot be verified");
+const unavailable = () => new NearError("NEAR_FUNDING_UNAVAILABLE", "NEAR refund funding cannot be verified right now");
 function raw(value) {
   if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128) throw bad();
   return BigInt(value);
@@ -95,7 +96,7 @@ export function nearFundingNeed({ claims, costs, storageUsage, reserveYocto = NE
 }
 
 /** All account/key/token views are pinned to the same finalized block. */
-export async function readNearFunding({ rpc, network, accountId, publicKey, tokenContract = null, now = Date.now }) {
+export async function readNearFunding({ rpc, network, accountId, publicKey, tokenContract = null, optionalTokenBalance = false, now = Date.now }) {
   const block = await rpc.block({ finality: "final" }), head = block?.header;
   assertFreshBlock(block, { now: now(), maxHeadAgeMs: 90_000, maxClockSkewMs: 30_000 });
   if (typeof head?.hash !== "string" || !Number.isSafeInteger(Number(head.height))) throw bad();
@@ -104,22 +105,29 @@ export async function readNearFunding({ rpc, network, accountId, publicKey, toke
     if (value.block_hash !== head.hash || Number(value.block_height) !== Number(head.height)) throw bad();
     return value;
   };
-  const [account, key, protocol, gas, token] = await Promise.all([
+  const tokenView = async method => {
+    const token = await query({ request_type: "call_function", account_id: tokenContract, method_name: method,
+      args_base64: Buffer.from(JSON.stringify({ account_id: accountId })).toString("base64") });
+    if (!Array.isArray(token.result) || token.result.some(n => !Number.isInteger(n) || n < 0 || n > 255)) throw bad();
+    return JSON.parse(Buffer.from(token.result).toString("utf8"));
+  };
+  const tokenBalance = tokenContract ? tokenView("ft_balance_of").then(raw) : null;
+  // Registration gates new quotes. A verified balance may still cover an
+  // existing refund when the separate registration query is unavailable.
+  const registration = tokenContract
+    ? tokenView("storage_balance_of").then(storage => storage != null && raw(storage.total) > 0n).catch(() => false)
+    : false;
+  const [account, key, protocol, gas, usdcAtomic, usdcRegistered] = await Promise.all([
     query({ request_type: "view_account", account_id: accountId }),
     query({ request_type: "view_access_key", account_id: accountId, public_key: publicKey }),
     rpc.call("EXPERIMENTAL_protocol_config", { block_id: head.hash }),
     rpc.call("gas_price", [head.hash]),
-    tokenContract ? query({ request_type: "call_function", account_id: tokenContract, method_name: "ft_balance_of",
-      args_base64: Buffer.from(JSON.stringify({ account_id: accountId })).toString("base64") }) : null,
+    optionalTokenBalance ? tokenBalance?.catch(() => null) ?? null : tokenBalance,
+    registration,
   ]);
   if (protocol.chain_id !== network || key.permission !== "FullAccess") throw bad();
   if (integer(key.nonce) >= (1n << 64n) - 1n) throw bad();
-  let usdcAtomic = null;
-  if (token) {
-    if (!Array.isArray(token.result) || token.result.some(n => !Number.isInteger(n) || n < 0 || n > 255)) throw bad();
-    usdcAtomic = raw(JSON.parse(Buffer.from(token.result).toString("utf8")));
-  }
-  return { balanceYocto: raw(account.amount), storageUsage: account.storage_usage, usdcAtomic,
+  return { balanceYocto: raw(account.amount), storageUsage: account.storage_usage, usdcAtomic, usdcRegistered,
     costs: nearRefundCosts(protocol, gas.gas_price), blockHeight: Number(head.height), accessKey: key };
 }
 
@@ -133,8 +141,10 @@ export async function readNearTransferFunding({ amountYocto, ...options }) {
 
 /** Serial admission/quote commit; financial debts remain in the existing ledger.
  * No model work, signing, publication or refund retry is performed here. */
-export function createNearFunding({ rpc, ledger, network, accountId, publicKey, usdcToken = null, now = Date.now, unpaidRetainMs = 3_600_000 }) {
+export function createNearFunding({ rpc, ledger, network, accountId, publicKey, usdcToken = null, usdcQuotesEnabled = usdcToken != null,
+  now = Date.now, unpaidRetainMs = 3_600_000 }) {
   let latest = { enforced: true, ok: false, checkedAt: null, canQuoteNear: false, canQuoteUsdc: false, code: "NEAR_FUNDING_UNAVAILABLE" };
+  let usdcProvenAt = null;
   const queue = []; let draining = false, refreshing = null;
   function serial(execute, priority = 2) {
     if (priority === 3 && queue.filter(t => t.priority === 3).length >= 16) return Promise.reject(new NearError("NEAR_FUNDING_BUSY", "Quote admission is busy"));
@@ -197,15 +207,16 @@ export function createNearFunding({ rpc, ledger, network, accountId, publicKey, 
     }
     ledger.setMeta("refundFundingV", 1);
   }
-  async function inspect(asset) {
+  async function inspect(asset, { refreshUsdc = false } = {}) {
+    let frame, value, checkedToken = false;
     try {
       if (!["near", "usdc"].includes(asset) || asset === "usdc" && !usdcToken) throw bad();
       await bootstrap();
-      let frame, value;
       for (let attempt = 0; attempt < 3; attempt++) {
         const before = claims();
+        checkedToken = asset === "usdc" || before.usdcAtomic > 0n || refreshUsdc;
         frame = await readNearFunding({ rpc, network, accountId, publicKey, now,
-          tokenContract: asset === "usdc" || before.usdcAtomic > 0n ? usdcToken : null });
+          tokenContract: checkedToken ? usdcToken : null, optionalTokenBalance: true });
         if (integer(ledger.getMeta("lastNonce") ?? "0") >= (1n << 64n) - 1n) throw bad();
         const floor = ledger.getMeta("refundFinalHeight") ?? 0;
         if (!Number.isSafeInteger(floor) || floor < 0) throw bad();
@@ -222,23 +233,40 @@ export function createNearFunding({ rpc, ledger, network, accountId, publicKey, 
       }
       latest = { enforced: true, checkedAt: now(), ok: sufficient(frame, value),
         canQuoteNear: sufficient(frame, value, { extraAsset: "near" }),
-        canQuoteUsdc: usdcToken != null && sufficient(frame, value, { extraAsset: "usdc" }) };
+        canQuoteUsdc: usdcQuotesEnabled && sufficient(frame, value, { extraAsset: "usdc" }) };
+      if (checkedToken) usdcProvenAt = frame.usdcAtomic != null && frame.usdcRegistered ? latest.checkedAt : null;
       if (!latest.ok) latest.code = "NEAR_FUNDING_INSUFFICIENT";
-      return { frame, value };
     } catch {
+      if (checkedToken) usdcProvenAt = null;
       latest = { enforced: true, checkedAt: now(), ok: false, canQuoteNear: false, canQuoteUsdc: false, code: "NEAR_FUNDING_UNAVAILABLE" };
-      throw new NearError(latest.code, "NEAR refund funding cannot be verified right now");
+      throw unavailable();
     }
+    if (asset === "usdc" && frame.usdcAtomic == null) throw unavailable();
+    return { frame, value };
   }
   function assert(frame, value, options) {
     if (!sufficient(frame, value, options)) throw new NearError("NEAR_FUNDING_INSUFFICIENT", "NEAR funds are reserved for storage and customer refunds");
+  }
+  function status() {
+    const at = now(), fresh = stamp => stamp != null && at >= stamp && at - stamp <= 60_000;
+    if (!fresh(latest.checkedAt)) {
+      return { ...latest, ok: false, canQuoteNear: false, canQuoteUsdc: false, code: "NEAR_FUNDING_STALE" };
+    }
+    if (latest.ok && usdcQuotesEnabled && !fresh(usdcProvenAt)) {
+      return { ...latest, canQuoteUsdc: false, usdcCode: "USDC_FUNDING_UNAVAILABLE" };
+    }
+    return { ...latest };
   }
   return {
     quote: (asset, commit, prepare = () => {}) => serial(async () => {
       // Recheck caller-owned rates/watcher readiness after queueing, then make
       // the final financial read before the synchronous quote commit.
+      if (asset === "usdc" && !usdcQuotesEnabled) throw unavailable();
       await prepare();
-      const { frame, value } = await inspect(asset); assert(frame, value, { extraAsset: asset }); return commit();
+      const { frame, value } = await inspect(asset);
+      if (asset === "usdc" && !frame.usdcRegistered) throw unavailable();
+      assert(frame, value, { extraAsset: asset });
+      return commit();
     }, 3),
     run: asset => serial(async () => { const { frame, value } = await inspect(asset); assert(frame, value); }, 1),
     beforeSign: rec => serial(async () => {
@@ -251,8 +279,10 @@ export function createNearFunding({ rpc, ledger, network, accountId, publicKey, 
       return { accessKey: frame.accessKey }; // sign immediately from this same verified frame
     }, 0),
     beforeComplete: (rec, result) => serial(() => checkpoint(rec, result), 0),
-    refresh: () => refreshing ||= serial(async () => { try { await inspect("near"); } catch {} return { ...latest }; }).finally(() => { refreshing = null; }),
-    status: () => latest.checkedAt != null && now() >= latest.checkedAt && now() - latest.checkedAt <= 60_000 ? { ...latest }
-      : { ...latest, ok: false, canQuoteNear: false, canQuoteUsdc: false, code: "NEAR_FUNDING_STALE" },
+    refresh: () => refreshing ||= serial(async () => {
+      try { await inspect("near", { refreshUsdc: usdcQuotesEnabled }); } catch {}
+      return status();
+    }).finally(() => { refreshing = null; }),
+    status,
   };
 }

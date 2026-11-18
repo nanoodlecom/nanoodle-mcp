@@ -11,7 +11,7 @@ import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
-import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto } from "../src/near/index.mjs";
+import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
@@ -259,7 +259,9 @@ export async function runOperationalCheck(config, deps = {}) {
   }, ["near", "usdc"]);
   if (fundingHealth) for (const [asset, key] of [["near", "canQuoteNear"], ["usdc", "canQuoteUsdc"]]) {
     await check(`${asset}-refund-admission`, async () => {
-      need(fundingHealth[key] === true, "near-refund-capacity-exhausted");
+      const code = asset === "usdc" && fundingHealth.usdcCode === "USDC_FUNDING_UNAVAILABLE"
+        ? "usdc-refund-funding-unavailable" : "near-refund-capacity-exhausted";
+      need(fundingHealth[key] === true, code);
     }, [asset]);
   }
   const rates = await check("exchange-rates", async () => {
@@ -318,23 +320,34 @@ export async function runOperationalCheck(config, deps = {}) {
       const key = await near.rpc.viewAccessKey({ accountId: config.merchant, publicKey: config.nearPublicKey });
       need(key.permission === "FullAccess", "near-refund-key-not-authorized");
     }, ["near", "usdc"]);
-    const token = await check("usdc-receive-registration", () => checkUsdcMerchant({ rpc: near.rpc, network: config.network, merchantId: config.merchant }), ["usdc"]);
+    const tokenContract = USDC_CONTRACTS[config.network];
+    await check("usdc-receive-registration", () => checkUsdcMerchant({ rpc: near.rpc, network: config.network, merchantId: config.merchant }), ["usdc"]);
     const funding = await check("near-fee-and-balance-reads", async () => {
-      let last;
+      let last, nativeFrame;
       for (const node of [near, ...nearNodes.filter(n => n !== near)]) {
         try {
           const frame = await readNearFunding({ rpc: node.rpc, network: config.network, accountId: config.merchant,
-            publicKey: config.nearPublicKey, tokenContract: token?.tokenContract, now });
-          return { nearBalanceYocto: frame.balanceYocto.toString(), storageUsage: frame.storageUsage, costs: frame.costs,
-            usdcBalanceAtomic: frame.usdcAtomic?.toString() ?? null };
+            publicKey: config.nearPublicKey, tokenContract, optionalTokenBalance: true, now });
+          if (!tokenContract || frame.usdcAtomic != null && frame.usdcRegistered) return frame;
+          nativeFrame ??= frame;
         } catch (e) { last = e; }
       }
+      if (nativeFrame) return nativeFrame;
       throw last;
     }, ["near", "usdc"]);
+    if (funding && tokenContract) {
+      const sharedDebtUnverified = funding.usdcAtomic == null && state?.liabilities.usdcAtomic > 0n;
+      await check("usdc-funding-reads", () => {
+        need(funding.usdcAtomic != null && funding.usdcRegistered, "usdc-refund-funding-unavailable");
+      }, sharedDebtUnverified ? ["near", "usdc"] : ["usdc"]);
+    }
     if (funding && state && rates) await check("refund-liquidity-accounting", async () => {
-      const results = liquidityChecks({ ...funding, usdcBalanceAtomic: funding.usdcBalanceAtomic ?? "0", liabilities: state.liabilities, nanoBalanceRaw: nano?.confirmed_balance || "0",
-        xnoUsd: rates.xnoUsd, providerReserveUsd });
-      for (const result of results.filter(r => r.stage !== "nano-liquidity")) checks.push({ ...result, ...(result.ok ? {} : { domains: result.stage === "usdc-liquidity" ? ["usdc"] : ["near", "usdc"] }) });
+      const results = liquidityChecks({ nearBalanceYocto: funding.balanceYocto.toString(), storageUsage: funding.storageUsage,
+        costs: funding.costs, usdcBalanceAtomic: funding.usdcAtomic?.toString() ?? "0", liabilities: state.liabilities,
+        nanoBalanceRaw: nano?.confirmed_balance || "0", xnoUsd: rates.xnoUsd, providerReserveUsd });
+      for (const result of results.filter(r => r.stage === "near-liquidity" || r.stage === "usdc-liquidity" && funding.usdcAtomic != null)) {
+        checks.push({ ...result, ...(result.ok ? {} : { domains: result.stage === "usdc-liquidity" ? ["usdc"] : ["near", "usdc"] }) });
+      }
     }, ["near", "usdc"]);
   }
   const platform = await check("market-platform-fee", async () => {
