@@ -865,7 +865,7 @@ export function createChargeGate({
   async function readPaymentWindow({ existingPayments = false } = {}) {
     if (verifyPaymentReads && ops.readPaymentWindow) {
       try {
-        const { receivable, history } = await ops.readPaymentWindow();
+        const { receivable, history } = await ops.readPaymentWindow({ existingPayments });
         return { blocks: receivableBlocks(receivable), history: history && {
           anchored: true, latest: { entries: history.history, next: history.previous },
         } };

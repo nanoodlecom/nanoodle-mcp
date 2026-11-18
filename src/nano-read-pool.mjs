@@ -11,9 +11,11 @@ const GENESIS_KEY = "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65
 const GENESIS_ACCOUNT = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3";
 const HASH = /^[A-F0-9]{64}$/i, U128 = (1n << 128n) - 1n;
 const MAX_CONFIRMED_HEIGHT_LAG = 2n;
+const STANDBY_BUDGET_MS = 60_000;
 const fail = (code, message = "Nano RPC peers cannot provide a consistent current account view") => Object.assign(Error(message), { code });
 const unprovenCheckpoint = () => fail("NANO_RPC_CHECKPOINT_UNPROVEN", "Nano startup checkpoint lacks two confirmed peer views");
 const conflictingCheckpoint = () => fail("NANO_RPC_CHECKPOINT_CONFLICT", "Nano peers disagree with the startup checkpoint or latest confirmed head");
+const standbyBudgetExhausted = () => fail("NANO_RPC_STANDBY_BUDGET", "Nano standby read budget exhausted");
 const hash = value => typeof value === "string" && HASH.test(value) && !/^0+$/.test(value);
 const raw = value => { if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128) throw fail("NANO_RPC_BAD_VIEW"); return BigInt(value); };
 const yes = value => value === true || value === "true";
@@ -140,19 +142,20 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   const configuration = rpcPeerSetId(allBases);
   let high = null, final = null, blocked = false, lastReadAt = null, readPeers = 0, preferred = [], inflightNetwork = null;
   let standbyInUse = false, standbyTail = Promise.resolve();
+  let paymentWindowPriorityUntil = -Infinity;
   const standbyAttempts = [];
   const expired = (at, ttl) => now() < at || now() - at >= ttl;
   const cooling = base => (cooldowns.get(base)?.until ?? 0) > now();
   const hasProof = base => !cooling(base) && networks.get(base)?.ok && !expired(networks.get(base).at, networkTtlMs);
   const hasStandbyQuorum = () => readPeers >= minimum && hasProof(standbyUrl) && preferred.some(hasProof);
   function standbyBudgetAvailable(at, requests) {
-    while (standbyAttempts.length && at - standbyAttempts[0] >= 60_000) standbyAttempts.shift();
+    while (standbyAttempts.length && at - standbyAttempts[0] >= STANDBY_BUDGET_MS) standbyAttempts.shift();
     return standbyAttempts.length + requests <= standby.requestsPerMinute;
   }
   function readRpc(body, base) {
     if (base === standbyUrl) {
       const at = monotonicNow();
-      if (!standbyBudgetAvailable(at, 1)) throw fail("NANO_RPC_STANDBY_BUDGET", "Nano standby read budget exhausted");
+      if (!standbyBudgetAvailable(at, 1)) throw standbyBudgetExhausted();
       standbyAttempts.push(at); // Charge attempts before I/O, including refusals.
     }
     return rpc(body, base);
@@ -180,14 +183,21 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     })().finally(() => { inflightNetwork = null; });
     return inflightNetwork;
   }
-  function withStandbyReads(requests, read) {
+  function withStandbyReads(requests, read, { existingPayments = false, background = false } = {}) {
     // A concurrent checkpoint or block lookup must not spend the account_info
     // request needed to validate a receivable or history page already in flight.
     const attempt = standbyTail.then(async () => {
       if (cooling(standbyUrl)) return null;
       const proved = hasProof(standbyUrl);
-      if (!standbyBudgetAvailable(monotonicNow(), requests + Number(!proved))) {
-        throw fail("NANO_RPC_STANDBY_BUDGET", "Nano standby read budget exhausted");
+      const at = monotonicNow(), required = requests + Number(!proved);
+      if (background && at < paymentWindowPriorityUntil) throw standbyBudgetExhausted();
+      if (!standbyBudgetAvailable(at, required)) {
+        // A periodic account check can otherwise consume fresh quota just
+        // before every payment poll. Reserve it across the watcher's backoff.
+        if (existingPayments && standby.requestsPerMinute >= NANO_COLD_STANDBY_SCAN_REQUESTS) {
+          paymentWindowPriorityUntil = at + 2 * STANDBY_BUDGET_MS;
+        }
+        throw standbyBudgetExhausted();
       }
       if (!proved) await proveNetwork(standbyUrl);
       return hasProof(standbyUrl) ? read() : null;
@@ -250,7 +260,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     if (witnesses.length < 2) throw unprovenCheckpoint();
     return witnesses;
   }
-  async function read(body, anchor = null, paymentWindow = null) {
+  async function read(body, anchor = null, { paymentWindow = null, background = false } = {}) {
     if (!["account_info", "receivable", "account_history"].includes(body.action)) throw fail("NANO_RPC_READ_ACTION");
     if (body.account !== account) throw fail("NANO_RPC_ACCOUNT_SCOPE");
     const eligible = await networkBases(), errors = [], primaryViews = [];
@@ -334,7 +344,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
           readPeers = 0; throw fail("NANO_RPC_STANDBY_DISAGREES");
         }
         return finish([...rows, other]);
-      });
+      }, { existingPayments: paymentWindow?.existingPayments, background });
       if (confirmed) return confirmed;
     }
     return finish(rows);
@@ -350,11 +360,14 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   }
   return {
     read: (body, anchor) => read(body, anchor),
-    async readPaymentWindow() {
+    readFundingInfo: () => read(infoRequest(), null, { background: true }),
+    async readPaymentWindow({ existingPayments = false } = {}) {
       const historyRefusals = [];
       try {
-        return await read({ action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
-          source: "true" }, null, { historyRefusals });
+        const window = await read({ action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
+          source: "true" }, null, { paymentWindow: { existingPayments, historyRefusals }, background: !existingPayments });
+        if (existingPayments && window.history) paymentWindowPriorityUntil = -Infinity;
+        return window;
       } finally {
         // A refusal of the later history request cools the endpoint for
         // future reads without discarding its already verified receivables.

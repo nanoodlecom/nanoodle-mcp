@@ -245,6 +245,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       if (isPublish) checkpointStore.assertCurrent();
     }
     if (readPool && base === rpcBases) {
+      if (body.action === "account_info" && opts.fundingRefresh) return readPool.readFundingInfo();
       if (["account_info", "receivable", "account_history"].includes(body.action)) return readPool.read(body);
       if (body.action === "block_info") return readPool.block(body);
     }
@@ -265,8 +266,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
     throw lastErr;
   }
 
-  async function accountState() {
-    const info = await rpc({ action: "account_info", account: address, representative: "true" }).catch((e) => {
+  async function accountState({ fundingRefresh = false } = {}) {
+    const info = await rpc({ action: "account_info", account: address, representative: "true" }, rpcBases, { fundingRefresh }).catch((e) => {
       if (/Account not found/i.test(e.message)) {
         throw new Error(
           `wallet ${address} is empty or unopened — fund it with a little XNO first ` +
@@ -291,7 +292,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    */
   let chain = null;
   let checkedAt = null;
-  async function currentState(fresh = false) {
+  async function currentState(fresh = false, readOptions) {
     if (checkpointStore) {
       await qualifyRestartFloor();
       checkpointStore.assertCurrent();
@@ -300,7 +301,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
     if (!fresh && chain && (!readPool || (checkedAt != null && now() >= checkedAt && now() - checkedAt < 30_000
         && health.networkPeers >= health.minimumPeers && health.readablePeers >= health.minimumPeers))) return chain;
     chain = null; // a failed refetch must not leave the suspect cache behind
-    chain = await accountState();
+    chain = await accountState(readOptions);
     checkedAt = now();
     return chain;
   }
@@ -691,9 +692,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
      */
     ops: {
       rpc,
-      ...(readPool && { readPaymentWindow: async () => {
+      ...(readPool && { readPaymentWindow: async options => {
         if (checkpointStore) await qualifyRestartFloor();
-        return readPool.readPaymentWindow();
+        return readPool.readPaymentWindow(options);
       } }),
       withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
       fundingStatus: funding.snapshot,
@@ -713,7 +714,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         await readPool.verifyCheckpoint(checkpoint);
       }, HOUSEKEEPING, false),
       fundingReport: () => enqueue(async () => {
-        const state = await currentState();
+        const state = await currentState(false, { fundingRefresh: true });
         return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers,
           ...(readPool ? { nanoRpc: readPool.status() } : {}) };
       }, HOUSEKEEPING, false), // read-only telemetry must not keep drain permanently nonzero

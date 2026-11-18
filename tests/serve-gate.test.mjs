@@ -853,11 +853,12 @@ test("guarded Nano quotes share a read-only proof and stay unpublished until bot
 test("a failed Nano watcher read invalidates quote readiness while issued payments still resolve", async t => {
   const chain = fakeChain(), registry = fakeRegistry();
   const head = "A".repeat(64);
-  let historyReady = true, failed = false, combinedReads = 0, fallbackReads = 0;
+  const existingPaymentReads = [];
+  let historyReady = true, failed = false, fallbackReads = 0;
   chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
   const rpc = chain.ops.rpc;
-  chain.ops.readPaymentWindow = async () => {
-    combinedReads++;
+  chain.ops.readPaymentWindow = async ({ existingPayments }) => {
+    existingPaymentReads.push(existingPayments);
     if (!historyReady) throw Object.assign(new Error("test combined budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
     return { receivable: await rpc({ action: "receivable", count: "500" }), history: {
       account: GATE_ADDR, previous: null, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }],
@@ -878,7 +879,7 @@ test("a failed Nano watcher read invalidates quote readiness while issued paymen
   const { callTool } = gate.wrapRegistry(registry);
   const request = text => callTool({ name: "poster", arguments: { Text: text } });
   const original = argOf(await request("issued before the outage"));
-  assert.ok(combinedReads > 0);
+  assert.equal(existingPaymentReads[0], false);
   historyReady = false;
   await until("the watcher to report its broken history RPC", () => failed);
   assert.equal((await request("new customer")).isError, true, "a watcher failure supersedes a fresh positive quote probe");
@@ -886,6 +887,7 @@ test("a failed Nano watcher read invalidates quote readiness while issued paymen
 
   chain.state.receivable["D".repeat(64)] = { amount: original.amountRaw, source: PAYER };
   assert.equal(await gate.waitForPayment(original.paymentId, 1_000), "paid");
+  assert.ok(existingPaymentReads.includes(true), "only the watcher requests priority");
   assert.ok(fallbackReads > 0, "the watcher still looks for receivables for existing quotes");
 });
 

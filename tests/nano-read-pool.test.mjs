@@ -191,6 +191,31 @@ test("a cold standby can prove a payment window in four requests with its own ac
   }
 });
 
+test("funding refreshes and quote preflights leave the next standby window for an outstanding payment", async () => {
+  const w = world(2, 4), [owned, spare, standby] = w.peers;
+  const head = owned.info.confirmed_frontier;
+  owned.history = standby.history = { account: ACCOUNT, previous: OTHER, history: [
+    { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+  ] };
+  spare.down = true;
+  await w.pool.readFundingInfo();
+  w.tick(1_000);
+  await assert.rejects(w.pool.readPaymentWindow({ existingPayments: true }), { code: "NANO_RPC_STANDBY_BUDGET" });
+  await w.pool.read(receivable);
+  w.tick(59_000);
+  const standbyRequests = () => w.calls.filter(call => call.base === standby.base).length;
+  assert.equal(standbyRequests(), 4);
+  await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" });
+  await assert.rejects(w.pool.readPaymentWindow(), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.equal(standbyRequests(), 4, "deferred reads leave the restored quota untouched");
+  w.tick(3_000);
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true })).history, owned.history);
+  assert.equal(standbyRequests(), 8);
+  w.tick(60_000);
+  await w.pool.readFundingInfo();
+  assert.equal(standbyRequests(), 10, "a complete scan releases priority");
+});
+
 test("unproven standby history leaves only the independently verified receivable window", async () => {
   for (const rateLimited of [false, true]) {
     const w = world(2, 4), [owned, spare, standby] = w.peers;
