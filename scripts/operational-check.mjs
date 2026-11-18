@@ -23,7 +23,7 @@ import {
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
-import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms } from "../src/market/catalog.mjs";
+import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
@@ -764,8 +764,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
-      const priced = await priceWorkflow({ graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } },
-        freshPriceOptions);
+      const priced = await priceWorkflow(listingWorkflowPriceSample(agent.defaultWorkflow), freshPriceOptions);
       need(priced.safety.ok && priced.pricing, "workflow-not-priceable");
       const listing = await fetchListingPrice({ baseUrl: config.marketUrl, handle: agent.handle, fetch: request });
       need(listing.ok && listing.listingStatus === "live", "market-price-unavailable");

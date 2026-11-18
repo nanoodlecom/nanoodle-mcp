@@ -12,7 +12,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { createMarketMock, MOCK_TOKEN, validate } from "./fixtures/market-mock.mjs";
-import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
+import { nanoGptMock, WORKED_GRAPH, WORKED_CATALOGS } from "./fixtures/near-fake-chain.mjs";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
@@ -22,7 +22,7 @@ import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { readConfig, startMarketService, MarketConfigError, NOTIFY_LINES, createNotifier } from "../src/market/service.mjs";
 import {
   recommendPrice, budgetFromPrice, priceVerdict, usdMicros, fmtUsd, readCatalog, fetchListingPrice, patchListingPrice,
-  PROBE_BRIEF, REPO_ROOT,
+  PROBE_BRIEF, REPO_ROOT, listingWorkflowPriceSample,
 } from "../src/market/catalog.mjs";
 import { plan } from "../scripts/market-catalog.mjs";
 
@@ -88,6 +88,36 @@ const noSecrets = (logs) => {
 const count = (logs, re) => logs.filter((l) => re.test(l)).length;
 
 /* ------------------------------ money ------------------------------ */
+
+test("listing samples normalize the longest duration within the shared input limit", () => {
+  const sample = listingWorkflowPriceSample({ graph: WORKED_GRAPH, inputName: "Idea",
+    fieldNames: ["Duration", "Style", "References", "Another optional field"],
+    fieldSpecs: { Duration: { seconds: { min: 30, max: 240, defaultMin: 120, defaultMax: 180 } } } });
+  assert.equal(sample.graph, WORKED_GRAPH);
+  assert.equal(sample.inputs.Duration, "240 seconds");
+  assert.equal(sample.inputs.Idea.length, 20_000);
+  assert.equal(sample.inputs.Style.length, 20_000);
+  assert.equal(Object.values(sample.inputs).reduce((sum, value) => sum + value.length, 0), 50_000);
+  assert.ok(!Object.hasOwn(sample.inputs, "Another optional field"));
+});
+
+test("Market pricing stops when an expired model catalog cannot be refreshed", async t => {
+  let time = Date.now(), live = true;
+  t.mock.method(Date, "now", () => time);
+  const fetch = async (url, options) => {
+    assert.equal(options.method ?? "GET", "GET");
+    if (!live) return new Response(null, { status: 503 });
+    return Response.json({ data: new URL(url).pathname.endsWith("/image-models") ? WORKED_CATALOGS.image : WORKED_CATALOGS.chat });
+  };
+  const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 5, baseUrl: "https://market-catalog-freshness.example", fetch });
+  const args = { graph: WORKED_GRAPH, inputs: { Idea: "A lighthouse at dawn" } };
+  assert.equal((await runner.price(args)).ok, true);
+  live = false;
+  time += 5 * 60_000 + 1;
+  const refused = await runner.price(args);
+  assert.equal(refused.ok, false);
+  assert.ok(refused.refusals.some(r => r.code === "CATALOG_UNAVAILABLE"));
+});
 
 test("recommendPrice: the smallest whole-cent price whose 95% covers the need, at least $0.02, in integer arithmetic", () => {
   const cases = [
