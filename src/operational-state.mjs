@@ -4,6 +4,7 @@ import { parseUsdNano } from "./usd.mjs";
 import { nanoFundingLiabilities, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
+import { NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const U128_MAX = (1n << 128n) - 1n;
@@ -29,6 +30,8 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
   }
   const old = (stamp, ms) => Number.isFinite(stamp) && now - stamp > ms;
   const nanoRefundIds = new Set(nano.owed.filter(d => d.event === "refund").map(d => d.fields?.paymentId));
+  const nanoHistory = readNanoPaymentHistory(nano.historyScan);
+  const delayedNanoBackfill = old(nanoHistory.backfill?.startedAt, debtMs);
   for (const q of nano.quotes) {
     if (!["pending", "paid", "consumed", "expired", "refunded"].includes(q.status)) throw Error("invalid-nano-quote-status");
     // Text-only results can persist as paid + settled after restart. They are
@@ -37,6 +40,16 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
       if (old(q.paidAt ?? q.createdAt, stuckMs)) issues.add("nano-paid-work-stuck");
     }
     if (nanoQuoteClaim(q) > 0n && ((q.error && !nanoRefundIds.has(q.id)) || q.settled)) issues.add("nano-refund-unresolved");
+    if (q.historyUnproven === true) issues.add("nano-history-payment-unproven");
+    if (delayedNanoBackfill && !q.payHash && (q.status === "pending" || nanoQuoteNeedsHistory(q, nanoHistory.coveredAt, now))) {
+      issues.add("nano-history-backfill-delayed");
+    }
+    if (nano.historyScan && old(q.expiresAt, NANO_LATE_WATCH_MS) && nanoQuoteNeedsHistory(q, nanoHistory.coveredAt, now)) {
+      issues.add("nano-quote-history-overdue");
+    }
+    if (q.status === "expired" && q.payHash && old(q.paidAt ?? q.expiresAt, debtMs) && !nanoRefundIds.has(q.id)) {
+      issues.add("nano-late-refund-intent-unknown");
+    }
   }
   for (const debt of nano.owed) {
     if (debt.held || debt.tries >= 5 || old(debt.createdAt ?? debt.at, debtMs)) issues.add("nano-settlement-stuck");

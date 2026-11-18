@@ -209,6 +209,18 @@ test("the scheduled check alerts when the payment stream stops returning a termi
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_BODY/);
 });
 
+test("the scheduled check flags a late Nano deposit that lacks a refund record on a legacy writer", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/state/gate-state.json"].quotes.push({ id: "private-nano-quote", status: "expired", payHash: "private-nano-hash",
+    expiresAt: NOW - 1_000_001, paidAt: NOW - 1_000_000, amountRaw: "2000" });
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === "nano-late-refund-intent-unknown"), { stage: "nano-late-refund-intent-unknown",
+    ok: false, code: "nano-late-refund-intent-unknown", domains: [] });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-nano-/);
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
