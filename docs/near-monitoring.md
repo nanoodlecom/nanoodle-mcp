@@ -261,6 +261,10 @@ Coverage:
   for payment reconciliation. See [hosted deadlines](hosted-execution.md).
 - Live exchange-rate freshness; platform fee still matching the worker's 5%
   assumption; authenticated Market token validity and actual worker lock/process.
+- Active Market assignments have a delivery-window check. It warns when
+  delivery is due within ten minutes or the last quarter of a shorter SLA,
+  a worker's retry would miss its cutoff, or model work has reached its
+  execution cutoff. The report identifies the listing and the fixed outcome.
 - Catalog pricing and Market net-price coverage for all four predefined graphs,
   plus free MCP pricing of a custom two-step graph in NEAR and USDC.
 - Free pricing for each of the five saved MCP workflows shown on both sites and

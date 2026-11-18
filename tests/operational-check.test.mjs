@@ -1658,6 +1658,40 @@ test("Market intake catches unclaimed hires, remote starts missing local state a
   }
 });
 
+test("Market delivery windows warn before expiry without changing payment readiness", async t => {
+  const cases = [
+    ["started", 30_000, 3600, {}, "market-sla-start-window-ended"],
+    ["running", 30_000, 3600, {}, "market-sla-execution-overdue"],
+    ["running", 700_000, 3600, { executionDeadlineAt: NOW - 1 }, "market-sla-execution-overdue"],
+    ["started", 700_000, 3600, { nextAttemptAt: NOW + 650_000 }, "market-sla-retry-after-cutoff"],
+    ["delivering", 700_000, 3600, { nextAttemptAt: NOW + 650_000 }, null],
+    ["submitting", 700_000, 3600, { nextAttemptAt: NOW + 700_000 }, "market-sla-retry-after-cutoff"],
+    ["delivering", 600_000, 3600, {}, "market-sla-delivery-due"],
+    ["running", 30_000, 60, {}, null],
+  ];
+  for (const [phase, left, slaSeconds, record, warning] of cases) {
+    const row = marketIntakeRow(slaSeconds * 1000 - left, { slaSeconds, slaDeadlineAt: new Date(NOW + left).toISOString() });
+    const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments"
+      ? Response.json({ assignments: [row] }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = { phase, pricing: { depositUsd: 0.03 }, ...record };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.find(c => c.stage === "market-intake-nanoodle-image")?.ok);
+    const finding = report.checks.find(c => c.stage === "market-sla-nanoodle-image");
+    assert.equal(finding.ok, warning === null);
+    assert.equal(finding.code ?? null, warning);
+    if (warning) assert.deepEqual(finding.domains, []);
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_BUYER_BRIEF|executionDeadlineAt|nextAttemptAt/);
+    if (warning === "market-sla-delivery-due") {
+      const invocationId = ID.replaceAll("-", "");
+      const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+        MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, { ...report, invocationId }, NOW);
+      assert.match(alert.text, /market-sla-delivery-due/);
+    }
+  }
+});
+
 test("a Market listing can cover the demo brief and still be underpriced for its supported fields", async t => {
   const f = fixture(), originalPrice = f.deps.computePrice;
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
