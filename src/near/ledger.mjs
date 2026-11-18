@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../private-state.mjs";
 import { NearError } from "./errors.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META } from "./quote-capacity.mjs";
-import { nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
+import { conflictingNearRefunds, nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
 import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
@@ -80,6 +80,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     catch (cause) { throw new NearError("STATE_DURABILITY_UNCERTAIN", "The NEAR ledger could not be made durable on open", { cause }); }
   }
   let persisted = JSON.stringify(state), persistenceFailed = false, uncertainCommit = null;
+  let refundConflicts;
   // Earlier releases could persist the claim before attaching it to its quote.
   // Index those exceptions once so watching blocks does not scan the tx history.
   const unattachedPayments = new Set();
@@ -177,12 +178,14 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       }
       assertJsonSafe(refund, "refund");
       if (Object.hasOwn(state.refunds, refund.id)) throw new NearError("DUPLICATE_ID", `refund ${refund.id} already exists`);
+      refundConflicts = undefined;
       mutate(() => { state.refunds[refund.id] = copy(refund); });
     },
     updateRefund(id, patch) {
       if (!Object.hasOwn(state.refunds, id)) throw new NearError("NOT_FOUND", `no refund ${id}`);
       if (!isPlainObject(patch)) throw new TypeError("patch must be an object");
       assertJsonSafe(patch, "patch");
+      refundConflicts = undefined;
       mutate(() => { state.refunds[id] = { ...state.refunds[id], ...copy(patch), id }; });
       return copy(state.refunds[id]);
     },
@@ -195,6 +198,10 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     },
     refunds() {
       return Object.values(state.refunds).map(copy);
+    },
+    refundHashConflict(id) {
+      refundConflicts ??= conflictingNearRefunds(Object.values(state.refunds));
+      return refundConflicts.has(id);
     },
 
     // Creator payouts are in Nano, independently of the customer's payment asset.
@@ -236,7 +243,8 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
       const coveredThroughMs = ledger.paymentWatchCoverage();
       const doomed = [];
       const refundsByPayment = new Map();
-      for (const refund of Object.values(state.refunds)) {
+      const refundRows = Object.values(state.refunds), conflicts = conflictingNearRefunds(refundRows);
+      for (const refund of refundRows) {
         if (!refundsByPayment.has(refund.paymentId)) refundsByPayment.set(refund.paymentId, []);
         refundsByPayment.get(refund.paymentId).push(refund);
       }
@@ -248,6 +256,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
         }
         if (!FINAL_QUOTE.has(q.status)) continue;
         const expected = nearRefundTerms(q), associated = refundsByPayment.get(id) ?? [];
+        if (associated.some(refund => conflicts.has(refund.id))) continue;
         if (expected && expected.amountYocto !== "0") {
           const [refund] = associated;
           if (associated.length !== 1 || refund.reconciliationRequired || refund.outcomeUnverified

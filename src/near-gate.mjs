@@ -279,7 +279,8 @@ export function createNearGate({
     const due = expected && ["settled", "failed", "rejected"].includes(q.status) && BigInt(expected.amountYocto) > 0n;
     if (!q.refundId && !due) return { status: "none", txHash: null };
     const r = q.refundId ? ledger.getRefund(q.refundId) : ledger.refundForPayment(q.id);
-    if (!r || r.paymentId !== q.id || r.reconciliationRequired || r.outcomeUnverified || (expected && !sameNearRefund(expected, r))) {
+    if (!r || r.paymentId !== q.id || r.reconciliationRequired || r.outcomeUnverified
+      || ledger.refundHashConflict(r.id) || (expected && !sameNearRefund(expected, r))) {
       return { status: "failed_permanent", txHash: null, amountYocto: expected?.amountYocto, to: q.payer };
     }
     const status = r.status === "sent" ? "sent" : r.status === "failed_permanent" ? "failed_permanent" : "pending";

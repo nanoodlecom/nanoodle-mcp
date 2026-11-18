@@ -24,7 +24,7 @@ import { MIN_REFUND_YOCTO, formatYoctoAsNear } from "./amount.mjs";
 import { matchesSignedNonce, signTransfer } from "./tx.mjs";
 import { signFtTransfer, hasFtTransfer, formatUsdc } from "./ft.mjs";
 import { NearError } from "./errors.mjs";
-import { nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
+import { conflictingNearRefunds, nearRefundHashes, nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
 
 const REASONS = new Set(["change", "run_failed", "wrong_amount", "late_payment", "interrupted"]);
 
@@ -186,7 +186,7 @@ export function createRefunder({
     try { await beforeComplete({ ...rec, txHash: hash }, result); }
     catch (e) { return retryLater(rec, e); }
     const resolved = hash === rec.txHash ? {} : { txHash: hash, signedTxBase64: null, nonce: null, blockHash: null,
-      supersededTxHashes: refundHashes(rec).filter(candidate => candidate !== hash) };
+      supersededTxHashes: nearRefundHashes(rec).filter(candidate => candidate !== hash) };
     if (failedOutcome(result)) {
       const done = ledger.updateRefund(rec.id, { ...resolved, status: "failed_permanent", nextAttemptAt: null,
         lastError: "TX_FAILED", outcomeUnverified: false, finishedAt: now() });
@@ -198,14 +198,10 @@ export function createRefunder({
       outcomeUnverified: false, sentAt: now() }));
   }
 
-  function refundHashes(rec) {
-    return [...new Set([rec.txHash, ...(rec.supersededTxHashes || [])])];
-  }
-
   /** Search every candidate. Nonfinal or unavailable lookups keep renewal pending. */
   async function observe(rec, { successOnly = false } = {}) {
     let error;
-    for (const hash of refundHashes(rec)) {
+    for (const hash of nearRefundHashes(rec)) {
       try {
         const result = await rpc.txStatus({ txHash: hash, senderId: accountId, waitUntil: "FINAL" });
         if (executed(result) && (!successOnly || !failedOutcome(result) && transferObserved(rec, result))) return { hash, result };
@@ -239,6 +235,7 @@ export function createRefunder({
       }
     }
     if (rec.status !== "signed") return view(rec);
+    if (ledger.refundHashConflict(rec.id)) return hold(rec);
     if (rec.supersededTxHashes?.length && rec.replacementNonce !== rec.nonce) {
       // Older replacements used a new nonce. Until their outcome is known,
       // even rebroadcasting the latest already-signed bytes may pay again.
@@ -288,7 +285,8 @@ export function createRefunder({
       const existing = ledger.refundForPayment(paymentId);
       if (existing) {
         const duplicate = ledger.refunds().some(other => other.id !== existing.id && other.paymentId === paymentId);
-        return !duplicate && sameNearRefund({ paymentId, to, amountYocto: amountYocto.toString(), asset, tokenContract }, existing)
+        return !duplicate && !ledger.refundHashConflict(existing.id)
+          && sameNearRefund({ paymentId, to, amountYocto: amountYocto.toString(), asset, tokenContract }, existing)
           ? view(existing) : hold(existing);
       }
       const rec = {
@@ -315,12 +313,15 @@ export function createRefunder({
   function retry({ force }) {
     return serialized(async () => {
       const t = now(), records = ledger.refunds(), seen = new Set(), duplicates = new Set();
+      const conflictingHashes = conflictingNearRefunds(records);
       for (const rec of records) {
         if (seen.has(rec.paymentId)) duplicates.add(rec.paymentId);
         seen.add(rec.paymentId);
       }
       for (const rec of records) {
-        if (rec.reconciliationRequired || (rec.status !== "queued" && rec.status !== "signed")) continue;
+        if (rec.reconciliationRequired) continue;
+        if (conflictingHashes.has(rec.id)) { hold(rec); continue; }
+        if (rec.status !== "queued" && rec.status !== "signed") continue;
         if (duplicates.has(rec.paymentId)) { hold(rec); continue; }
         if (!force && rec.nextAttemptAt != null && rec.nextAttemptAt > t) continue;
         await drive(rec);

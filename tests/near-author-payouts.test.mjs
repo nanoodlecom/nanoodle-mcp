@@ -103,6 +103,22 @@ test("a replayed USDC receipt cannot show a wrong-asset refund or mismatched cre
   assert.equal(w.chain.sendTxCount, transfers);
 });
 
+test("a replayed USDC receipt with a shared refund hash reports reconciliation before any retry", async () => {
+  const w = await world(), { p, pay } = await quoteAndPay(w, "usdc");
+  await pay();
+  const q = w.ledger.getQuote(p.paymentId), refund = w.ledger.getRefund(q.refundId);
+  const runs = mock.runs(), transfers = w.chain.sendTxCount;
+  assert.equal(refund.status, "sent");
+  assert.equal((await pay()).structuredContent.receipt.refund.status, "sent");
+  w.ledger.putRefund({ ...refund, id: "restored-duplicate", paymentId: "another-payment" });
+  const replay = (await pay()).structuredContent.receipt;
+  assert.equal(replay.refund.status, "failed_permanent");
+  assert.equal(replay.refund.txHash, null);
+  assert.equal(mock.runs(), runs);
+  assert.equal(w.chain.sendTxCount, transfers);
+  assert.equal(w.ledger.getRefund(q.refundId).reconciliationRequired, undefined, "reading the receipt leaves the ledger unchanged");
+});
+
 for (const asset of ["near", "usdc"]) for (const name of ["poster", "run_noodle"]) {
   test(`${asset}: ${name} pays its author in Nano at the locked rate and replays without another send`, async () => {
     const w = await world(), args = name === "poster" ? INPUTS : { graph: GRAPH, inputs: INPUTS };

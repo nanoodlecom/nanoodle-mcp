@@ -72,6 +72,31 @@ test("NEAR and USDC refund evidence cannot release another asset or payer's rese
   assert.deepEqual(nearRefundClaims({ quotes: [{ id: "dust", status: "rejected", paidYocto: "5", refundWaived: true }], refunds: [] }).issues, []);
 });
 
+test("a NEAR refund transaction shared across records cannot release either reserve", () => {
+  const shared = base58Encode(Buffer.alloc(32, 31));
+  const refunds = [
+    { id: "rf1", paymentId: "one", to: "payer.testnet", status: "sent", txHash: shared, amountYocto: "70" },
+    { id: "rf2", paymentId: "two", to: "payer.testnet", status: "sent", txHash: base58Encode(Buffer.alloc(32, 32)),
+      supersededTxHashes: [shared], asset: "usdc", tokenContract: TOKEN, amountYocto: "50" },
+    { id: "rf3", paymentId: "three", to: "payer.testnet", status: "sent", txHash: base58Encode(Buffer.alloc(32, 33)),
+      amountYocto: "18" },
+  ];
+  const quotes = refunds.slice(0, 2).map(r => ({ id: r.paymentId, refundId: r.id, status: "settled", payer: r.to,
+    asset: r.asset, tokenContract: r.tokenContract, settlement: { refundYocto: r.amountYocto } }));
+  for (const retained of [quotes, quotes.slice(0, 1), []]) {
+    const result = nearRefundClaims({ quotes: retained, refunds });
+    assert.equal(result.nearYocto, 70n);
+    assert.equal(result.usdcAtomic, 50n);
+    assert.equal(result.nativeRefunds, 1);
+    assert.equal(result.tokenRefunds, 1);
+    assert.deepEqual(result.issues, ["near-refund-duplicate-transaction"]);
+  }
+  refunds[1].supersededTxHashes = [refunds[1].txHash, refunds[1].txHash];
+  const unrelated = nearRefundClaims({ quotes, refunds });
+  assert.equal(unrelated.nearYocto + unrelated.usdcAtomic, 0n);
+  assert.deepEqual(unrelated.issues, []);
+});
+
 test("unscanned quote windows count as potential refunds until coverage advances", () => {
   const deadline = 1_000, now = deadline + 60_000;
   const state = { quotes: [{ id: "old", status: "expired", asset: "usdc", expiresAt: deadline - 10 }], refunds: [],

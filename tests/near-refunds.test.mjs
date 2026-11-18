@@ -201,6 +201,57 @@ test("restored NEAR refund evidence that conflicts with the quote is held before
   });
 });
 
+test("a restored NEAR refund sharing a transaction candidate is held across repeated restarts", async () => {
+  await withLedger(async ({ open }) => {
+    const initial = open(), firstChain = mockChain({ onSend: () => ({ result: DONE }) });
+    const original = { paymentId: "first", to: "payer.testnet", amountYocto: AMOUNT, reason: "change" };
+    const first = await make(firstChain.rpc, initial).refunder.refund(original);
+    const saved = initial.getRefund(first.refundId);
+    initial.putRefund({ ...saved, id: "rf_copy", paymentId: "copy", status: "signed" });
+    initial.putRefund({ ...saved, id: "rf_renewed", paymentId: "renewed", status: "signed",
+      txHash: BLOCK_B, supersededTxHashes: [saved.txHash] });
+    initial.putRefund({ id: "rf_unrelated", paymentId: "unrelated", status: "queued", amountYocto: AMOUNT.toString(),
+      to: original.to, reason: original.reason, createdAt: 1_000_000 });
+
+    const restarted = open(), { rpc, log } = mockChain({ onSend: () => ({ result: DONE }) });
+    await make(rpc, restarted).refunder.resume();
+    assert.equal(log.sends.length, 1, "an unrelated refund can still complete");
+    assert.notEqual(log.sends[0], saved.signedTxBase64);
+    assert.equal(log.txs.length, 0);
+    assert.equal(restarted.getRefund("rf_unrelated").status, "sent");
+    assert.equal(restarted.getRefund(first.refundId).status, "sent");
+    for (const id of [first.refundId, "rf_copy", "rf_renewed"]) {
+      const record = restarted.getRefund(id);
+      assert.equal(record.reconciliationRequired, true);
+      assert.equal(record.signedTxBase64, saved.signedTxBase64);
+    }
+
+    const after = make(rpc, open()).refunder;
+    await after.resume();
+    assert.deepEqual(await after.refund(original), { refundId: first.refundId, status: "failed_permanent", txHash: null });
+    assert.equal(log.sends.length, 1);
+  });
+});
+
+test("a fresh NEAR refund that signs a previously claimed transaction stops before broadcast", async () => {
+  await withLedger(async ({ open }) => {
+    const ledger = open(), { rpc, log } = mockChain({ onSend: () => ({ result: DONE }) });
+    const { refunder } = make(rpc, ledger);
+    const terms = { to: "payer.testnet", amountYocto: AMOUNT, reason: "change" };
+    const first = await refunder.refund({ ...terms, paymentId: "first" });
+    assert.equal(first.status, "sent");
+    // Simulate a restored nonce watermark and a node whose key view has not caught up.
+    ledger.setMeta("lastNonce", "100");
+    const second = await refunder.refund({ ...terms, paymentId: "second" });
+    assert.equal(second.status, "failed_permanent");
+    assert.equal(second.txHash, null);
+    const reserved = ledger.getRefund(second.refundId);
+    assert.equal(reserved.txHash, first.txHash);
+    assert.equal(reserved.reconciliationRequired, true);
+    assert.equal(log.sends.length, 1);
+  });
+});
+
 test("transient failure -> pending; a later tick rebroadcasts identical bytes", async () => {
   await withLedger(async ({ open }) => {
     const ledger = open();

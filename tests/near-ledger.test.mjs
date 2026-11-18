@@ -191,6 +191,21 @@ test("NEAR retention keeps quotes with a short creator payout or a wrong-asset r
   });
 });
 
+test("NEAR retention preserves a quote if its refund hash also belongs to a pruned payment", async () => {
+  await withDir(async dir => {
+    const l = openNearLedger({ file: join(dir, "state.json"), ...OPTS, now: () => 90_000_000 });
+    const row = { id: "refund", paymentId: "payment", status: "sent", to: "payer.testnet", amountYocto: "70", txHash: "shared" };
+    l.putQuote({ id: row.paymentId, status: "settled", finishedAt: 1, payer: row.to, refundId: row.id,
+      settlement: { refundYocto: row.amountYocto } });
+    l.putRefund(row);
+    l.putRefund({ ...row, id: "old-refund", paymentId: "old-payment", txHash: "replacement", supersededTxHashes: ["shared"] });
+    assert.equal(l.prune(), 0);
+    assert.ok(l.getQuote(row.paymentId));
+    l.updateRefund("old-refund", { supersededTxHashes: ["unrelated"] });
+    assert.equal(l.prune(), 1);
+  });
+});
+
 test("a bigint is rejected and nothing changes", async () => {
   await withDir(async (dir) => {
     const file = join(dir, "s.json");
