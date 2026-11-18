@@ -1,7 +1,8 @@
-import { isNanoHistoryHash, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
+import { isNanoHistoryHash, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN, nanoQuoteNeedsHistory, readNanoPaymentHistory,
+  NANO_RECEIVABLE_COUNT as RECEIVABLE_LIMIT, NANO_HISTORY_PAGE as HISTORY_LIMIT } from "./nano-payment-history.mjs";
 
 export const NANO_SCAN_GRACE_MS = 120_000;
-const HISTORY_LIMIT = 100, RECEIVABLE_LIMIT = 500, DEPOSIT_PROOF_LIMIT = 8;
+const DEPOSIT_PROOF_LIMIT = 8;
 const confirmed = value => value === true || value === "true";
 const bucket = amount => typeof amount === "string" && /^\d{1,39}$/.test(amount) && BigInt(amount) < 2n ** 128n
   ? BigInt(amount) / NANO_PAYMENT_GRAIN : null;

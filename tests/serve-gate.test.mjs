@@ -3002,11 +3002,19 @@ test("a failed Nano state flush remains unhealthy after drain until a later snap
 });
 
 test("a Nano payment stays pending until its original transfer is durable, even after it leaves the RPC window", { timeout: 5000 }, async t => {
+  const { maintenance } = await gateMaintenance(t);
   const chain = fakeChain(), registry = fakeRegistry(), dir = await mkdtemp(join(tmpdir(), "nano-pending-deposit-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  const gates = [];
+  t.after(async () => {
+    maintenance.close();
+    for (const gate of gates) await gate.stop();
+    // Successful replay can return while the wallet is durably recording change.
+    await maintenance.waitForIdle();
+    await rm(dir, { recursive: true, force: true });
+  });
   const stateFile = join(dir, "state.json"), temporary = stateFile + ".tmp";
-  const gate = makeGate(chain, { registry, stateFile, waitMs: 25, pollMs: 5 });
-  t.after(() => gate.stop());
+  const gate = makeGate(chain, { registry, stateFile, maintenance, waitMs: 25, pollMs: 5 });
+  gates.push(gate);
   const wrapped = gate.wrapRegistry(registry), args = { Text: "original payment" };
   const quote = async args => {
     const payment = argOf(await wrapped.callTool({ name: "poster", arguments: args }));
@@ -3040,8 +3048,8 @@ test("a Nano payment stays pending until its original transfer is durable, even 
   assert.equal(written.status, "paid");
   await gate.stop();
 
-  const reopened = makeGate(chain, { registry, stateFile });
-  t.after(() => reopened.stop());
+  const reopened = makeGate(chain, { registry, stateFile, maintenance });
+  gates.push(reopened);
   const running = reopened.wrapRegistry(registry);
   assert.equal((await callPaid(running)).isError, undefined);
   assert.equal((await callPaid(running)).isError, undefined);

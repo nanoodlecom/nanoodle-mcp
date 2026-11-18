@@ -13,6 +13,7 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
+import { NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
@@ -30,7 +31,7 @@ import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
-  qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
+  qualifyNanoAccountViews, checkedHistory, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
@@ -173,9 +174,9 @@ export async function runOperationalCheck(config, deps = {}) {
   const http = async (url, init = {}) => {
     const response = await request(url, init); need(response.ok, `http-${response.status}`); return response.json();
   };
-  const nanoRpc = async (url, body) => {
+  const nanoRpc = async (url, body, signal) => {
     need(["account_info", "account_history", "receivable", "block_count", "version", "block_info"].includes(body.action), "probe-action-forbidden");
-    const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal });
     need(response.status !== 429, "nano-rpc-rate-limited");
     need(response.ok, `http-${response.status}`);
     const result = await response.json();
@@ -389,6 +390,34 @@ export async function runOperationalCheck(config, deps = {}) {
     return { ...newest, peers: currentWitnesses.map(row => row.peer) };
   });
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
+  if (config.nanoRpcUrls.length >= 3) await check("nano-fallback-payment-reads", async () => {
+    need(nano, "nano-fallback-payment-read-anchor-unavailable");
+    const account = config.nanoAddress, head = nano.view.confirmedFrontier;
+    // The preferred node and quota-limited standby are excluded from this rehearsal.
+    const peers = nano.peers.filter(index => index !== 0);
+    const views = (await Promise.all(peers.map(index => check(`nano-payment-read-peer-${index}`, async () => {
+      const url = config.nanoRpcUrls[index];
+      const deadline = AbortSignal.timeout(config.timeoutMs || 12_000);
+      const rpc = body => nanoRpc(url, body, deadline);
+      const page = await rpc({ action: "account_history", account, head, count: String(NANO_HISTORY_PAGE) });
+      const history = checkedHistory(page, checkAddress);
+      need(typeof page.account === "string" && page.account.replace(/^xrb_/, "nano_") === account && page.history.length <= NANO_HISTORY_PAGE
+        && page.history[0]?.hash.toUpperCase() === head && history.history[0]?.hash.toUpperCase() === head,
+      "nano-fallback-payment-history-unproven");
+      const receivableRequest = { action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
+        source: "true", include_only_confirmed: "true" };
+      const pending = await rpc(receivableRequest);
+      const info = await rpc({ action: "account_info", account, representative: "true", include_confirmed: "true", receivable: "true" });
+      const view = nanoAccountView(info, checkAddress);
+      need(view.confirmedHeight >= nano.view.confirmedHeight
+        && (view.confirmedHeight !== nano.view.confirmedHeight || view.confirmedFrontier === head), "nano-fallback-payment-anchor-moved");
+      checkedReceivable(pending, receivableRequest, view, checkAddress);
+      return { view, peer: index };
+    }, [])))).filter(Boolean);
+    const { current, latestConfirmed } = qualifyNanoAccountViews(views);
+    need(current.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight).length >= 2,
+      "nano-fallback-payment-read-quorum-unavailable");
+  }, []);
   if (state) await check("nano-payment-scan-progress", async () => {
     const at = now(), ledger = readNanoLedger();
     const { history, waiting } = nanoWatchDemand(ledger, at);
