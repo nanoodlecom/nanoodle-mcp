@@ -12,6 +12,9 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, liquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
+import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
+import { USDC_RATE } from "../src/near/ft.mjs";
+import { countOpenNearQuotes, heldNearQuoteAmounts, MAX_OPEN_NEAR_QUOTES, RETAIN_NEAR_QUOTE_MS } from "../src/near/quote-capacity.mjs";
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
@@ -34,6 +37,7 @@ const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
 const SHARED_SAVED_WORKFLOWS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
 const NEAR_WORKFLOW_TEMPLATE = "idea-to-3d-model";
+const CAPACITY_WARNING = 0.8;
 const REFUND_FUNDING_CODES = new Map([
   ["NEAR_FUNDING_INSUFFICIENT", "near-refund-funding-insufficient"],
   ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
@@ -133,7 +137,7 @@ export async function runOperationalCheck(config, deps = {}) {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
     need(!result.error && result.result, "mcp-error"); return result.result;
   };
-  async function checkSavedWorkflows(site, tools, assets) {
+  async function checkSavedWorkflows(site, tools, assets, heldAmounts = null) {
     const names = assets.includes("nano") ? SHARED_SAVED_WORKFLOWS : [...SHARED_SAVED_WORKFLOWS, NEAR_WORKFLOW_TEMPLATE];
     for (const name of names) {
       const template = name === NEAR_WORKFLOW_TEMPLATE;
@@ -168,6 +172,20 @@ export async function runOperationalCheck(config, deps = {}) {
               && positiveDecimal(currency.likelyChargeNear) && Number(currency.depositNear) >= Number(currency.likelyChargeNear),
             "saved-workflow-denomination-invalid");
           }
+          const held = heldAmounts?.[asset];
+          if (held?.size >= Math.ceil(QUOTE_DUST_SLOTS * CAPACITY_WARNING)) {
+            // The native preview gives the dust-rounded base, before a unique
+            // payment amount is assigned. USDC uses whole micro-USDC units.
+            const base = asset === "near" ? parseNearToYocto(currency.depositNear)
+              : usdToYocto(content.pricing.deposit.usd, USDC_RATE, "ceil");
+            const step = asset === "near" ? DUST_STEP_YOCTO : 1n;
+            let occupied = 0;
+            for (let dust = 1; dust <= QUOTE_DUST_SLOTS; dust++) {
+              if (held.has((base + BigInt(dust) * step).toString())) occupied++;
+            }
+            need(occupied < QUOTE_DUST_SLOTS, "saved-workflow-quote-amounts-exhausted");
+            need(occupied < Math.ceil(QUOTE_DUST_SLOTS * CAPACITY_WARNING), "saved-workflow-quote-amounts-low");
+          }
         }
       }, [])));
     }
@@ -180,6 +198,15 @@ export async function runOperationalCheck(config, deps = {}) {
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
   });
+  const heldNearAmounts = state && await check("near-open-quote-capacity", () => {
+    const quotes = Object.values(state.near.quotes), checkedAt = now();
+    const open = countOpenNearQuotes(quotes, checkedAt);
+    need(open < MAX_OPEN_NEAR_QUOTES, "near-open-quote-capacity-exhausted");
+    if (open >= Math.ceil(MAX_OPEN_NEAR_QUOTES * CAPACITY_WARNING)) {
+      checks.push({ stage: "near-open-quote-headroom", ok: false, code: "near-open-quote-capacity-low", domains: [] });
+    }
+    return Object.fromEntries(["near", "usdc"].map(asset => [asset, heldNearQuoteAmounts(quotes, asset, checkedAt, RETAIN_NEAR_QUOTE_MS)]));
+  }, ["near", "usdc"]);
   const runtimeFunding = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
@@ -357,7 +384,7 @@ export async function runOperationalCheck(config, deps = {}) {
     return result.tools;
   }, ["nano"]);
   await Promise.all([
-    nearTools && checkSavedWorkflows(config.site, nearTools, ["near", "usdc"]),
+    nearTools && checkSavedWorkflows(config.site, nearTools, ["near", "usdc"], heldNearAmounts),
     nanoTools && checkSavedWorkflows(config.nanoSite, nanoTools, ["nano"]),
   ]);
   await check("custom-workflow-pricing", async () => {

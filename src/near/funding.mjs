@@ -1,6 +1,7 @@
 import { NearError } from "./errors.mjs";
 import { assertFreshBlock } from "./freshness.mjs";
 import { DEFAULT_FUNCTION_CALL_GAS } from "./tx.mjs";
+import { holdsNearQuoteAmount, RETAIN_NEAR_QUOTE_MS } from "./quote-capacity.mjs";
 
 const U128 = (1n << 128n) - 1n;
 export const NEAR_OPERATING_RESERVE = 50_000_000_000_000_000_000_000n;
@@ -23,7 +24,7 @@ const rows = value => {
 
 /** One future refund per obligation, including the gap before its outbox entry.
  * Unpaid quotes are counted separately and cannot tie up gas with free requests. */
-export function nearRefundClaims({ quotes, refunds }, { now = Date.now(), unpaidRetainMs = 3_600_000 } = {}) {
+export function nearRefundClaims({ quotes, refunds }, { now = Date.now(), unpaidRetainMs = RETAIN_NEAR_QUOTE_MS } = {}) {
   let nearYocto = 0n, usdcAtomic = 0n, nativeRefunds = 0, tokenRefunds = 0, pendingNativeRefunds = 0, pendingTokenRefunds = 0;
   const issues = new Set(), paid = new Set(rows(refunds).map(r => r.paymentId).filter(Boolean));
   const add = (asset, value) => {
@@ -49,7 +50,7 @@ export function nearRefundClaims({ quotes, refunds }, { now = Date.now(), unpaid
       if (raw(q.paidYocto) > 0n) issues.add("near-refund-intent-missing");
     } else if (["pending", "expired"].includes(q.status)) {
       if (!Number.isSafeInteger(q.expiresAt)) throw bad();
-      if (now <= q.expiresAt + unpaidRetainMs) {
+      if (holdsNearQuoteAmount(q, now, unpaidRetainMs)) {
         if (q.asset === "usdc") pendingTokenRefunds++;
         else if (q.asset == null || q.asset === "near") pendingNativeRefunds++;
         else throw bad();

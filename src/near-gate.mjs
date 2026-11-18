@@ -40,6 +40,9 @@ import {
 } from "./near/index.mjs";
 import { knownUsd } from "./usd.mjs";
 import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
+import {
+  countOpenNearQuotes, heldNearQuoteAmounts, holdsNearQuoteAmount, MAX_OPEN_NEAR_QUOTES, RETAIN_NEAR_QUOTE_MS,
+} from "./near/quote-capacity.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { nearCreatorLiabilities, nearRunFundingBudget } from "./funding-liabilities.mjs";
@@ -123,8 +126,8 @@ export function createNearGate({
   fetch = globalThis.fetch,
   txTimeoutMs,
   randomInt,
-  maxOpenQuotes = 1000,
-  expiredRetainMs = 3_600_000,
+  maxOpenQuotes = MAX_OPEN_NEAR_QUOTES,
+  expiredRetainMs = RETAIN_NEAR_QUOTE_MS,
   publicBase = null,
   usdcToken = null,
   usdcEnabled = false,
@@ -385,19 +388,11 @@ export function createNearGate({
 
   /** Deposit amounts of unpaid quotes still held (open, or expired within expiredRetainMs). */
   function openAmounts(asset = "near") {
-    const t = now();
-    const taken = new Set();
-    for (const q of ledger.quotes()) {
-      if (assetOf(q) === asset && (q.status === "pending" || q.status === "expired") && t <= q.expiresAt + expiredRetainMs) taken.add(q.amountYocto);
-    }
-    return taken;
+    return heldNearQuoteAmounts(ledger.quotes(), asset, now(), expiredRetainMs);
   }
 
   function openQuoteCount() {
-    const t = now();
-    let n = 0;
-    for (const q of ledger.quotes()) if (q.status === "pending" && t <= q.expiresAt) n++;
-    return n;
+    return countOpenNearQuotes(ledger.quotes(), now());
   }
 
   /** Drop unpaid quotes past retention and finished ones past a day, at most once a minute. */
@@ -707,7 +702,7 @@ export function createNearGate({
 
   function pendingQuotes() {
     const t = now();
-    return ledger.quotes().filter((q) => ["pending", "expired"].includes(q.status) && t <= q.expiresAt + expiredRetainMs);
+    return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs));
   }
 
   /** Discovered receipts are only hints: verify FINAL, then match an exact quote. */
