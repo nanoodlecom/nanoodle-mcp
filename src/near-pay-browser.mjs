@@ -3,6 +3,7 @@
 import { NearConnector } from "@hot-labs/near-connect";
 import { createRunView } from "./run-view.mjs";
 import { monitorPaymentRun } from "./payment-run.mjs";
+import { isExpiredPayment } from "./near/payment-view.mjs";
 
 const root = document.querySelector("#near-payment");
 const quote = JSON.parse(root.dataset.payment);
@@ -13,6 +14,7 @@ const form = document.querySelector("#near-confirm");
 const key = `nanoodle-near:${quote.paymentId}`;
 let current = quote;
 let paidResult = null;
+let paymentMonitor;
 const runView = createRunView("pay");
 let busy = false;
 let saved = null;
@@ -28,6 +30,7 @@ const remember = (value) => {
 function render(state) {
   current = state;
   const asset = quote.asset === "USDC" ? "USDC" : "NEAR";
+  const canPay = state.status === "pending", checking = state.checkingPayment === true;
   const messages = {
     pending: `Ready to pay. Approve the ${asset} deposit in your wallet.`,
     paid: "Payment confirmed. Your agent is continuing — no further payment needed.",
@@ -35,15 +38,19 @@ function render(state) {
     settled: `Complete. Unused ${asset} is returned to the wallet that paid.`,
     failed: "The run failed. Your deposit is being refunded to the wallet that paid.",
     rejected: `This payment could not buy the run. Received ${asset} is being refunded.`,
-    expired: `This quote expired. Ask your agent for a fresh ${asset} quote.`,
+    expired: `This ${asset} quote expired. If you sent a transfer, confirm it below.`,
     unknown: `Unknown payment. Ask your agent for a fresh ${asset} quote.`,
   };
-  status.textContent = messages[state.status] || state.status;
+  status.textContent = checking ? state.next || "Checking for your original transfer…" : messages[state.status] || state.status;
   const final = ["settled", "failed", "rejected"].includes(state.status);
-  document.querySelector("#near-title").textContent = state.status === "pending" ? `Pay in ${asset}` : final ? state.receipt?.outcome === "succeeded" ? "Your result" : "Run finished" : "Your workflow";
-  document.querySelector("#near-deposit").open = state.status === "pending";
-  document.querySelector("#near-manual").hidden = state.status !== "pending";
-  document.querySelector("#near-note").textContent = state.status === "pending"
+  document.querySelector("#near-title").textContent = canPay ? `Pay in ${asset}` : checking ? "Checking payment"
+    : final ? state.receipt?.outcome === "succeeded" ? "Your result" : "Run finished" : "Your workflow";
+  document.querySelector("#near-deposit").open = canPay;
+  document.querySelector("#near-manual").hidden = !canPay && state.status !== "expired";
+  document.querySelector("#near-transfer-instructions").hidden = !canPay || !!saved;
+  document.querySelector("#near-note").textContent = checking
+    ? "This page will show your workflow as soon as your original payment is confirmed."
+    : canPay
     ? "Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment."
     : state.status === "paid" ? "Waiting for your agent to start this paid workflow. No further payment is needed."
     : state.status === "running" ? "Follow each step here. Your result appears on this page when it is ready."
@@ -51,9 +58,15 @@ function render(state) {
   runView.render({ payment: quote, workflow: state.workflow, receipt: state.receipt, result: paidResult });
   if (state.receipt?.refund?.status === "pending") status.textContent += " The refund is pending; it will retry automatically.";
   if (state.receipt?.refund?.status === "failed_permanent") status.textContent += ` Contact the operator with payment id ${quote.paymentId} about the refund.`;
-  button.disabled = busy || state.status !== "pending" || !!saved;
+  button.hidden = !canPay;
+  button.disabled = busy || !canPay || !!saved;
   button.textContent = saved ? "Payment submitted — confirm below if needed" : "Connect wallet & pay";
-  if (saved && state.status === "pending") status.textContent = "A wallet payment was already requested. Confirm that transfer below; do not send it twice.";
+  if (saved && (canPay || isExpiredPayment(state))) status.textContent = "A wallet payment was already requested. Confirm the original transaction below.";
+}
+
+function track(state) {
+  paymentMonitor?.stop();
+  paymentMonitor = monitorPaymentRun({ initial: state, update(next, result) { paidResult = result; render(next); } });
 }
 
 async function confirm(txHash, senderId) {
@@ -65,7 +78,8 @@ async function confirm(txHash, senderId) {
       body: JSON.stringify({ txHash, senderId }),
     });
     const state = await response.json();
-    if (state.status) render(state);
+    if (isExpiredPayment(current) && state.txHash) track(state);
+    else if (state.status) render(state);
     if (response.ok) return;
     if (state.error && /not found as final|not final|could not be reached/.test(state.error) && attempt < 9) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -116,7 +130,7 @@ button.addEventListener("click", async () => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (busy) return;
+  if (busy || !["pending", "expired"].includes(current.status)) return;
   busy = true;
   const senderId = form.elements.senderId.value.trim();
   const txHash = form.elements.txHash.value.trim();
@@ -131,7 +145,7 @@ render(current);
 if (saved?.senderId) form.elements.senderId.value = saved.senderId;
 if (saved?.txHash) {
   form.elements.txHash.value = saved.txHash;
-  if (current.status === "pending") confirm(saved.txHash, saved.senderId).catch((e) => { error.textContent = e.message; });
+  if (["pending", "expired"].includes(current.status)) confirm(saved.txHash, saved.senderId).catch((e) => { error.textContent = e.message; });
 }
-monitorPaymentRun({ initial: quote, update(state, result) { paidResult = result; render(state); } });
+track(quote);
 setInterval(() => { if (current.workflow && !current.workflow.finishedAt) runView.elapsed(current.workflow); }, 1000);

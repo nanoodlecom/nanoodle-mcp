@@ -337,6 +337,34 @@ export async function runOperationalCheck(config, deps = {}) {
     }
     return health.watcher;
   }, ["near", "usdc"]);
+  // Real checkout IDs use 12 characters after nq_. These GETs exercise
+  // public routing and the terminal watch reply without accessing a quote.
+  const missingQuote = "nq_operational_probe_unissued";
+  await Promise.all([
+    check("near-payment-page", async () => {
+      const response = await request(`${config.site}/pay/${missingQuote}`);
+      need(response.status === 404 && /^text\/html\b/.test(response.headers.get("content-type") || "")
+        && /Unknown or expired payment/.test(await response.text()), "near-payment-page-response-invalid");
+    }, ["near", "usdc"]),
+    check("near-payment-status-route", async () => {
+      const response = await request(`${config.site}/near/status/${missingQuote}?wait=1`);
+      need(response.status === 404, "near-payment-status-response-invalid");
+      const value = await response.json();
+      need(value?.status === "unknown" && value.done === true, "near-payment-status-response-invalid");
+    }, ["near", "usdc"]),
+    check("near-payment-event-stream", async () => {
+      const response = await request(`${config.site}/near/watch/${missingQuote}?run=1`, { headers: { accept: "text/event-stream" } });
+      need(response.ok && /^text\/event-stream\b/.test(response.headers.get("content-type") || ""), "near-payment-stream-response-invalid");
+      const frame = /^event: status\r?\ndata: (.+)\r?\n\r?\n/m.exec(await response.text());
+      need(frame, "near-payment-stream-response-invalid");
+      const value = JSON.parse(frame[1]);
+      need(value?.status === "unknown" && value.done === true, "near-payment-stream-response-invalid");
+    }, ["near", "usdc"]),
+    check("near-payment-result-route", async () => {
+      const response = await request(`${config.site}/near/result/${missingQuote}`);
+      need(response.status === 404 && (await response.json())?.error === "Unknown or expired payment", "near-payment-result-response-invalid");
+    }, ["near", "usdc"]),
+  ]);
   const fundingHealth = refundHealth && await check("near-refund-funding", async () => {
     const funding = refundHealth.funding;
     need(funding?.enforced === true, "near-refund-funding-not-enforced");

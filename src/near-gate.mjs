@@ -670,16 +670,22 @@ export function createNearGate({
     if (!q) return null;
     const status = q.status === "pending" && now() > q.expiresAt ? "expired" : q.status;
     const paid = status === "paid" || status === "running" || status === "settled";
+    const checkingPayment = status === "expired" && !q.payTx
+      && (ledger.paymentWatchCoverage() <= q.expiresAt || ledger.hasUnattachedPayment(id));
+    let next = "Review this payment's receipt for its outcome and refund status.";
+    if (status === "expired") next = checkingPayment
+      ? "The quote expired while the watcher was checking for payments. Keep monitoring this quote or confirm the original transfer if you already paid."
+      : "If you already paid, confirm the original transaction on this quote. Otherwise ask for a fresh quote.";
+    else if (status === "pending") next = "Pay this deposit in your wallet; keep monitoring until payment is confirmed.";
+    else if (paid) next = `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`;
     return {
       paymentId: q.id, tool: q.resumeTool || q.tool, network, payTo: merchantId,
       ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
-      done: status !== "pending",
+      done: status !== "pending" && !checkingPayment,
+      ...(checkingPayment && { checkingPayment: true }),
       ...(workflows.has(id) ? { workflow: workflows.get(id) } : {}),
-      next: paid
-        ? `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`
-        : status === "pending" ? "Pay this deposit in your wallet; keep monitoring until payment is confirmed."
-        : "Ask your agent for a fresh quote. Do not pay this quote again.",
+      next,
       ...(q.payTx ? { txHash: q.payTx } : {}),
       ...(FINAL.has(status) ? { receipt: receiptFor(q).structured.receipt } : {}),
     };
@@ -742,9 +748,10 @@ export function createNearGate({
     if (q && !ledger.hasUnattachedPayment(q.id)) await confirmDiscoveredPayment(q.id, txHash, senderId);
   }
 
-  function waitForPayment(id, timeoutMs = 25_000, { signal } = {}) {
-    if (signal?.aborted || paymentView(id)?.status !== "pending") return Promise.resolve();
-    return waitForUpdate(id, timeoutMs, { signal });
+  function waitForPayment(id, timeoutMs = 25_000, { signal, previous } = {}) {
+    const view = paymentView(id);
+    if (signal?.aborted || !view || view.done) return Promise.resolve();
+    return waitForUpdate(id, timeoutMs, { signal, previous });
   }
 
   function waitForUpdate(id, timeoutMs = 25_000, { signal, previous } = {}) {
@@ -776,6 +783,10 @@ export function createNearGate({
     if (FINAL.has(q0.status)) return replay(q0);
     if (q0.status === "running") {
       return errResult(`payment ${q0.id} is still being processed — call again in a moment with the same arguments.`);
+    }
+    if (!tx && !sender && now() > q0.expiresAt) {
+      const view = paymentView(q0.id);
+      if (view.checkingPayment) return errResult(view.next, { payment: view });
     }
 
     const refused = await acceptPayment(q0, tx, sender, ctx);

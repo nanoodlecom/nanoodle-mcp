@@ -1,5 +1,6 @@
 import { WORKFLOW_META_KEY } from "./workflow-progress.mjs";
 import { createRunView, resultText } from "./run-view.mjs";
+import { isExpiredPayment } from "./near/payment-view.mjs";
 export { resultText } from "./run-view.mjs";
 let rpcId = 0;
 export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch, endpoint = "/mcp" } = {}) {
@@ -57,7 +58,7 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
           session.view = view;
           if (view.workflow) session.workflow = view.workflow;
           if (view.receipt) session.receipt = view.receipt;
-          if (view.status === "expired") { session.phase = "finished"; changed(session); break; }
+          if (isExpiredPayment(view) || view.status === "unknown") { session.phase = "finished"; changed(session); break; }
           if (["paid", "settled", "rejected", "failed"].includes(view.status) && !session.result) {
             session.phase = "running"; changed(session);
             const result = await request(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); },
@@ -67,7 +68,8 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
           }
           const receipt = view.receipt || session.result?.structuredContent?.receipt;
           if (session.result && receipt && receipt.refund?.status !== "pending") { session.phase = "finished"; session.receipt = receipt; changed(session); break; }
-          session.phase = view.status === "pending" ? "waiting" : "running"; changed(session);
+          session.phase = view.checkingPayment ? "checking" : view.status === "pending" ? "waiting" : "running";
+          changed(session);
         } catch (error) { session.message = error.message; changed(session); }
         await pause(session.phase === "waiting" ? 100 : 2000);
       }
@@ -137,7 +139,8 @@ function mount(root) {
     const p = session.payment, receipt = session.receipt || session.result?.structuredContent?.receipt;
     const title = session.title || (session.name === "run_noodle" ? "Your workflow" : config.tools.find(t => t.name === session.name)?.title || session.name.replace(/[-_]/g, " "));
     node("studio-quoted-tool").textContent = title;
-    const stage = receipt ? receipt.outcome === "succeeded" ? "Complete" : "Run failed" : session.phase === "waiting" ? "Awaiting payment" : session.phase === "running" ? "Running workflow" : "Quote expired";
+    const stage = receipt ? receipt.outcome === "succeeded" ? "Complete" : "Run failed"
+      : ({ waiting: "Awaiting payment", checking: "Checking payment", running: "Running workflow" })[session.phase] || "Quote expired";
     node("studio-stage").textContent = stage;
     node("studio-stage").dataset.phase = receipt ? receipt.outcome === "succeeded" ? "done" : "error" : session.phase;
     node("studio-amount").textContent = `${p.amount ?? p.amountNear} ${p.asset || "NEAR"}`;
@@ -148,6 +151,7 @@ function mount(root) {
     const refundMessage = refundStatus === "sent" ? "Change returned to your wallet." : refundStatus === "pending" ? "Returning your unused deposit…" : refundStatus === "skipped" ? "No change is due." : `Refund status: ${refundStatus}.`;
     node("studio-status").textContent = receipt
       ? `${receipt.outcome === "succeeded" ? "Your result is ready." : "This run did not complete."} ${refundMessage}`
+      : session.phase === "checking" ? session.view.next || "Checking for your original transfer…"
       : session.message || (session.phase === "waiting" ? "Pay the exact deposit in your wallet to start." : session.phase === "running" ? "Payment confirmed. Preparing your workflow…" : `Quote ${session.view?.status || "finished"}.`);
     node("studio-payment-note").hidden = session.phase !== "waiting";
     runView.render({ ...session, receipt });
