@@ -55,6 +55,17 @@ function bytes32(b, what) {
   return Buffer.from(b);
 }
 
+/** Check the signed V0 transaction's hash and access-key nonce before renewal. */
+export function matchesSignedNonce({ signedTxBase64, txHash, signerId, publicKeyBytes, nonce }) {
+  if (typeof signedTxBase64 !== "string" || signedTxBase64.length > 32_768) return false;
+  const signed = Buffer.from(signedTxBase64, "base64");
+  const prefix = Buffer.concat([str(signerId), Buffer.from([0]), bytes32(publicKeyBytes, "publicKeyBytes"), u64(nonce)]);
+  if (signed.length <= prefix.length + 65 || signed.at(-65) !== 0) return false;
+  const payload = signed.subarray(0, -65);
+  return payload.subarray(0, prefix.length).equals(prefix)
+    && base58Encode(createHash("sha256").update(payload).digest()) === txHash;
+}
+
 export function serializeTransferTx({ signerId, publicKeyBytes, nonce, receiverId, blockHash, amountYocto }) {
   assertNearAccountId(signerId);
   assertNearAccountId(receiverId);

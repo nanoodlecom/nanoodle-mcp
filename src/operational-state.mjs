@@ -36,7 +36,10 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
   for (const refund of refunds) {
     if (refund.status === "sent") continue;
     if (!["queued", "signed", "failed_permanent"].includes(refund.status)) throw Error("invalid-refund-status");
-    if (refund.status === "failed_permanent") issues.add("near-refund-failed");
+    const unknownLineage = refund.status === "signed" && refund.supersededTxHashes?.length && refund.replacementNonce !== refund.nonce;
+    if (refund.outcomeUnverified === true || refund.lastError === "UNPROVABLE" || unknownLineage) {
+      issues.add("near-refund-outcome-unverified");
+    } else if (refund.status === "failed_permanent") issues.add("near-refund-failed");
     else if (old(refund.createdAt, debtMs)) issues.add("near-refund-stuck");
   }
   const payouts = values(near.payouts ?? {}), payoutPayments = new Set(payouts.map(p => p.paymentId));
