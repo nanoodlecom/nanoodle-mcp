@@ -22,8 +22,17 @@ async function fixture() {
   const change = {}, seen = [];
   const response = body => Response.json(body);
   const deps = { rpc, sleep: async () => {}, now: () => day, fetch: async (url, init) => {
-    if (String(url).includes("/near/status/")) return response({ status: "paid" });
-    if (String(url).includes("/near/result/")) return response(result);
+    if (String(url).includes("/near/status/")) {
+      if (!result) return response({ status: "paid" });
+      return response({ status: "settled", paymentId: new URL(url).pathname.split("/").at(-1),
+        receipt: change.staleStatus ? { outcome: "succeeded", refund: { status: "pending" } } : result.structuredContent.receipt });
+    }
+    if (String(url).includes("/near/result/")) {
+      if (change.unreadyPage) return Response.json({ status: "settled" }, { status: 202 });
+      if (change.markerOnlyInPageMetadata) return response({ ...result, content: [], hidden: result.content[0].text });
+      if (change.wrongPageReceipt) return response({ ...result, structuredContent: { receipt: { outcome: "succeeded" } } });
+      return response(result);
+    }
     const req = JSON.parse(init.body); seen.push(req);
     const ok = value => response({ jsonrpc: "2.0", id: req.id, result: value });
     if (req.method === "initialize") return ok({ protocolVersion: "2025-06-18" });
@@ -90,6 +99,26 @@ test("an unfinished retained graph keeps its original model and payment after a 
   assert.equal(report.model, "z-ai/glm-5.3-flash");
   assert.equal(report.paymentTx, state.signed.txHash);
   assert.equal(f.chain.sendTxCount, 2); assert.equal(f.runs(), 1); assert.equal(f.quotes(), 1);
+});
+
+test("same-day canary reuse requires the live payment-page result and refund without paying or running again", async t => {
+  for (const fault of ["unreadyPage", "markerOnlyInPageMetadata", "wrongPageReceipt", "staleStatus"]) await t.test(fault, async () => {
+    const f = await fixture();
+    await runCheck(f.config, f.deps);
+    const file = join(f.config.stateDir, "state.json");
+    const completed = readFileSync(file, "utf8");
+    f.change[fault] = true;
+    const start = f.seen.length;
+    await assert.rejects(runCheck(f.config, f.deps), error => error.report?.stage === "payment_page");
+    assert.equal(f.chain.sendTxCount, 2);
+    assert.equal(f.runs(), 1); assert.equal(f.quotes(), 1);
+    assert.ok(f.seen.slice(start).every(req => req.params?.name !== "run_noodle"));
+    assert.equal(readFileSync(file, "utf8"), completed, "the verified prior payment is retained on a page failure");
+    assert.equal(JSON.parse(readFileSync(join(f.config.stateDir, "latest.json"))).ok, false);
+    f.change[fault] = false;
+    assert.equal((await runCheck(f.config, f.deps)).reused, true);
+    assert.equal(f.chain.sendTxCount, 2);
+  });
 });
 
 test("version-one canary checkpoints retain their original expected output and graph", async () => {
