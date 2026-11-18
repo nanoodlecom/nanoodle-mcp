@@ -625,8 +625,10 @@ function nearPayPageHtml(q) {
 function payPageHtml(q) {
   const statusUrl = `/x402/status/${encodeURIComponent(q.id)}?wait=1`;
   const watchUrl = `/x402/watch/${encodeURIComponent(q.id)}`;
+  const canPay = q.status === "pending" && !q.checkingPayment;
   return htmlPage(`Pay ${q.amountXno} XNO`, `
     <div class="card center" id="paybox">
+      <div id="pay-instructions"${canPay ? "" : " hidden"}>
       <h1>Pay ${esc(q.amountXno)} XNO <span class="muted">(≈$${esc(q.usd.toFixed(q.usd < 0.01 ? 4 : 2))})</span></h1>
       <p class="muted">for one run of <code>${esc(q.tool)}</code> — scan with any Nano wallet</p>
       <a class="qr" href="${esc(q.uri)}">${qrSvg(q.uri)}</a>
@@ -634,14 +636,15 @@ function payPageHtml(q) {
          <button onclick="navigator.clipboard.writeText('${esc(q.amountXno)}')">copy amount</button></p>
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
          Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
-      <p class="muted" id="status">waiting for payment… settles in about a second</p>
-      <p class="muted" id="expiry"></p>
+      </div>
+      <p class="muted" id="status" role="status">${q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "waiting for payment… settles in about a second"}</p>
+      <p class="muted" id="expiry"${canPay ? "" : " hidden"}></p>
     </div>
     <script>
       const EXP = Date.parse(${JSON.stringify(q.expiresAt)});
       function tickExpiry(){
         const el = document.getElementById("expiry");
-        if(!el) return; // paybox was replaced by the paid check
+        if(!el || el.hidden) return;
         const s = Math.max(0, Math.floor((EXP - Date.now())/1000));
         el.textContent = s > 0
           ? "quote expires in " + Math.floor(s/60) + ":" + String(s%60).padStart(2,"0")
@@ -652,8 +655,14 @@ function payPageHtml(q) {
     </script>
     <script>
       var done = false;
-      function apply(status){
+      function apply(status, checkingPayment){
         if(done) return false;
+        if(checkingPayment){
+          document.getElementById("pay-instructions").hidden = true;
+          document.getElementById("expiry").hidden = true;
+          document.getElementById("status").textContent = "Recording your Nano transfer. Keep this page open.";
+          return false;
+        }
         if(status === "paid" || status === "consumed"){
           done = true;
           document.getElementById("paybox").innerHTML =
@@ -662,6 +671,7 @@ function payPageHtml(q) {
         }
         if(status === "expired" || status === "unknown"){
           done = true;
+          document.getElementById("pay-instructions").hidden = true;
           document.getElementById("status").textContent = "this quote expired — ask your agent for a fresh one";
           return true;
         }
@@ -679,7 +689,8 @@ function payPageHtml(q) {
         while(!done){
           try{
             const r = await fetch(${JSON.stringify(statusUrl)});
-            if(apply((await r.json()).status)) return;
+            const state = await r.json();
+            if(apply(state.status, state.checkingPayment)) return;
           }catch{ await new Promise(function(r){ setTimeout(r, 1000); }); }
         }
       }
@@ -688,7 +699,7 @@ function payPageHtml(q) {
         var es;
         try{ es = new EventSource(${JSON.stringify(watchUrl)}); }catch(e){ return poll(); }
         es.addEventListener("status", function(ev){
-          try{ if(apply(JSON.parse(ev.data).status)){ es.close(); } }catch{}
+          try{ const state = JSON.parse(ev.data); if(apply(state.status, state.checkingPayment)){ es.close(); } }catch{}
         });
         es.onerror = function(){ es.close(); if(!done) poll(); }; // stream dropped → poll
       }
@@ -1055,7 +1066,8 @@ export async function serveHttp({
         if (statusMatch[1] === "near") return send(q ? 200 : 404, JSON.stringify(q || { status: "unknown", done: true, next: "Ask your agent for a fresh quote." }));
         // Terminal quotes carry done + next (agent instructions for the result stream).
         return send(200, JSON.stringify(q
-          ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.done ? { done: true, next: q.next } : {}) }
+          ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.checkingPayment && { checkingPayment: true }),
+            ...(q.done ? { done: true, next: q.next } : {}) }
           : { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." }));
       }
 
@@ -1093,6 +1105,7 @@ export async function serveHttp({
           if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
           if (nearWatch) return followRun ? { ...q, done: runDone(q) } : q;
           const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
+          if (q.checkingPayment) f.checkingPayment = true;
           if (q.done) { f.done = true; if (q.next) f.next = q.next; }
           return f;
         };
