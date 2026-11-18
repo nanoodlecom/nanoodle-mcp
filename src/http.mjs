@@ -41,6 +41,7 @@ import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
 import { isExpiredPayment } from "./near/payment-view.mjs";
+import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_WORDMARK, NANO_SURFACE_CSS, NANO_PORT_CSS } from "./brand.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { creatorPage, hostedWorkflowPage } from "./creator-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
@@ -73,7 +74,6 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const ASSET_DIR = fileURLToPath(new URL("../assets/", import.meta.url));
 const scriptUrls = Object.fromEntries(["near-site.js", "near-wallet.js", "creator-site.js"].map(file => [file,
   `/${file}?v=${createHash("sha256").update(readFileSync(join(ASSET_DIR, file))).digest("hex").slice(0, 12)}`]));
-const NANOODLE_BRAND = "/brand/nanoodle-v1.0.0";
 const ASSETS = {
   "/favicon.ico": "image/x-icon",
   "/favicon.png": "image/png",
@@ -154,8 +154,7 @@ const PAGE_CSS = `
 `;
 
 /*
- * The landing page commits to a dark look (the pay pages stay theme-following):
- * its job is a first impression, and the hero is one copyable command.
+ * Shared dark landing styles for the Nano and NEAR workflow cards and setup commands.
  */
 const LANDING_CSS = `
   /* Brand: nanoodle's own tokens (nanoodle.com :root) — same bg/panel/ink/line,
@@ -259,22 +258,12 @@ const LANDING_CSS = `
   ${RECEIPTS_CSS}
 `;
 
-// The Nano landing page consumes the pinned Nanoodle brand kit. NEAR shares the
-// card structure but retains its own page stylesheet and payment presentation.
+// Nano has its own presentation on top of the shared workflow card structure.
 const NANO_LANDING_CSS = `
-  :root {
-    --fg:var(--nano-color-ink); --bg:var(--nano-color-canvas); --muted:var(--nano-color-muted);
-    --card:var(--nano-color-panel); --card2:var(--nano-color-raised); --edge:var(--nano-color-line);
-    --accent:var(--nano-color-accent); --accent-ink:var(--nano-color-accent-ink);
-  }
-  body{font-family:var(--nano-font-body)}
-  h1,h2{font-family:var(--nano-font-display)}
   h1{font-size:clamp(2.1rem,6.6vw,4rem);line-height:1.07;letter-spacing:-.025em}
   h1 span{color:var(--accent-ink)}
   h2{font-size:clamp(1.4rem,4vw,2rem)}
-  code,pre,.eyebrow,.step .n,.flow,.chip,.tool .cost,.labs .ltag{font-family:var(--nano-font-mono)}
-  a:hover{color:var(--fg)}
-  :focus-visible{outline:var(--nano-control-focus-width) solid var(--accent-ink);outline-offset:3px}
+  .eyebrow,.step .n,.flow,.chip,.tool .cost,.labs .ltag{font-family:var(--nano-font-mono)}
   .top{align-items:center}
   .top .brand img{width:26px;height:26px}
   .top .brand .product-wordmark{width:108px;height:auto;border-radius:0}
@@ -286,15 +275,24 @@ const NANO_LANDING_CSS = `
   .hero-links a:first-child:hover{filter:brightness(1.1)}
   .tools{grid-template-columns:repeat(auto-fill,minmax(min(19rem,100%),1fr))}
   .tool .links{white-space:normal}
-  .chip.k-text,.chip.k-llm{--port:var(--nano-color-text-port)}
-  .chip.k-image{--port:var(--nano-color-image-port)}
-  .chip.k-video{--port:var(--nano-color-video-port)}
-  .chip.k-audio{--port:var(--nano-color-audio-port)}
-  .chip.k-model3d{--port:var(--nano-color-model3d-port)}
-  .chip[class*="k-"]{background:color-mix(in srgb,var(--port,var(--muted)) 14%,var(--card));color:var(--port,var(--muted))}
   .tool .sample summary{display:list-item;min-height:var(--nano-control-height);align-content:center}
   @media(max-width:440px){.top nav{width:100%;gap:.85rem}.connect{gap:.55rem;padding:.7rem}.connect pre{font-size:.76rem}.connect button{padding-inline:.65rem}}
 `;
+
+const NANO_CHECKOUT_CSS = `
+  .pay-header{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem}
+  .pay-header img{display:block;width:112px;height:auto}
+  .pay-header span{font:400 .8rem/1.5 var(--nano-font-mono);color:var(--muted)}
+  h1{font-size:clamp(1.5rem,5vw,2rem);line-height:1.2}
+  .card{border-radius:var(--nano-radius-card)}
+  button{min-height:var(--nano-control-height);border-radius:var(--nano-radius-control);border-color:var(--nano-color-control-line);background:var(--card2)}
+  button:hover{border-color:var(--accent)}
+  .qr{width:min(280px,100%)}
+  .qr svg{display:block;width:100%;height:auto}
+`;
+const nanoCheckoutPage = (title, body) => htmlPage(title,
+  `<header class="pay-header"><a href="/">${NANO_WORDMARK}</a><span>Nano payment</span></header>${body}`,
+  PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS, NANO_BRAND_HEAD);
 
 const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
@@ -400,7 +398,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     const page = nearSitePage({ version, publicBase, merchant, network, tools: templates, usdc, hosting, scriptUrl: scriptUrls["near-site.js"],
       cards: templates.map(t => cardHtml(t, nearWorkflowCopy[t.name], true).replace(/last run \$/g, "last model cost $")).join(""),
       notes: receiptsHtml({ toolNames: templates.map(t => t.name), compact: true }) });
-    return htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head);
+    return htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head);
   }
   const tagline = near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}` : charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
   const desc = near
@@ -409,8 +407,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     ? "Give your agents new abilities with x402. Run or build AI workflows over MCP, pay per call in Nano, and earn as a workflow author. Open source."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
   const isNanoodle = name === "nanoodle-mcp";
-  const ogHead =
-    `<link rel="stylesheet" href="${NANOODLE_BRAND}/tokens/tokens.css"><link rel="stylesheet" href="${NANOODLE_BRAND}/fonts/fonts.css">` +
+  const ogHead = NANO_BRAND_HEAD +
     `<meta name="theme-color" content="#0b0d12">` +
     `<link rel="preload" href="${NANOODLE_BRAND}/fonts/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
     `<meta name="description" content="${esc(desc)}">` +
@@ -428,7 +425,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
     <header class="top">
-      <a class="brand" href="/"><img src="/favicon.png" alt="">${isNanoodle ? `<img class="product-wordmark" src="${NANOODLE_BRAND}/assets/wordmark-gradient.svg" alt="nanoodle">` : `<span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
+      <a class="brand" href="/"><img src="/favicon.png" alt="">${isNanoodle ? NANO_WORDMARK : `<span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
       <nav aria-label="Product"><a href="https://nanoodle.com/">Editor</a><a href="https://nanoodle.com/guide/examples/">Examples</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source</a></nav>
     </header>
     <p class="eyebrow">${charged ? "Open source · MCP + x402 · Nano" : "public MCP server"}</p>
@@ -541,7 +538,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         });
       }
     </script>
-  `, LANDING_CSS + NANO_LANDING_CSS, ogHead);
+  `, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + NANO_LANDING_CSS, ogHead);
 }
 
 /** The landing page's story as plain text — the version an agent should read. */
@@ -667,19 +664,19 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted" id="near-note">Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="${scriptUrls["near-wallet.js"]}"></script>
-  `, PAGE_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--brand-font-sans),system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--brand-font-mono),monospace;margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;background:linear-gradient(105deg,#99a5ff,#e7a4d3);color:#0b0d12;font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:2px solid #d7ff3f;outline-offset:3px}`, `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">`);
+  `, PAGE_CSS + NANO_SURFACE_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--nano-font-body);background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--nano-font-mono);margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;border-radius:var(--nano-radius-control);background:var(--nano-color-accent);color:var(--nano-color-on-accent);font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:var(--nano-control-focus-width) solid var(--nano-color-accent-ink);outline-offset:3px}`, NANO_BRAND_HEAD);
 }
 
 function payPageHtml(q) {
   const statusUrl = `/x402/status/${encodeURIComponent(q.id)}?wait=1`;
   const watchUrl = `/x402/watch/${encodeURIComponent(q.id)}`;
   const canPay = q.status === "pending" && !q.checkingPayment;
-  return htmlPage(`Pay ${q.amountXno} XNO`, `
+  return nanoCheckoutPage(`Pay ${q.amountXno} XNO`, `
     <div class="card center" id="paybox">
       <div id="pay-instructions"${canPay ? "" : " hidden"}>
       <h1>Pay ${esc(q.amountXno)} XNO <span class="muted">(≈$${esc(q.usd.toFixed(q.usd < 0.01 ? 4 : 2))})</span></h1>
       <p class="muted">for one run of <code>${esc(q.tool)}</code> — scan with any Nano wallet</p>
-      <a class="qr" href="${esc(q.uri)}">${qrSvg(q.uri)}</a>
+      <a class="qr" href="${esc(q.uri)}" aria-label="Open this quote in your Nano wallet">${qrSvg(q.uri)}</a>
       <p><button onclick="navigator.clipboard.writeText('${esc(q.address)}')">copy address</button>
          <button onclick="navigator.clipboard.writeText('${esc(q.amountXno)}')">copy amount</button></p>
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
@@ -1010,7 +1007,7 @@ export async function serveHttp({
           scriptUrl: scriptUrls["near-site.js"], creatorScriptUrl: scriptUrls["creator-site.js"] };
         const page = hosted ? hostedWorkflowPage(hosted, opts) : creatorPage(opts);
         res.setHeader("Cache-Control", "no-cache");
-        return send(200, htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head), "text/html; charset=utf-8");
+        return send(200, htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/") {
@@ -1080,7 +1077,7 @@ export async function serveHttp({
       if (payMatch && (gate || nearGate)) {
         const id = decodeURIComponent(payMatch[1]);
         const q = id.startsWith("nq_") ? nearGate?.quote(id) : gate?.quote(id);
-        if (!q) return send(404, htmlPage("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
+        if (!q) return send(404, (id.startsWith("nq_") ? htmlPage : nanoCheckoutPage)("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
         res.setHeader("X-Robots-Tag", "noindex, nofollow");
