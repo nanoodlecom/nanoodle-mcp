@@ -39,7 +39,8 @@ import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
 import { nanoFundingCoverage, nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
 import { syncPrivateStateParentSync } from "./private-state.mjs";
-import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
+import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN as GRAIN,
+  nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
@@ -65,14 +66,6 @@ const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund
 const RECEIVABLE_COUNT = 500;
 const HISTORY_PAGE = 100; // account_history entries per RPC while walking
 const HISTORY_MAX_PAGES = 10; // churn cap per scan — far above real block throughput per poll
-/**
- * 1e-8 XNO in raw — the resolution wallets actually display and let a human
- * type. Quote amounts are whole multiples of this, so the friendly "0.13647256
- * XNO" figure IS the exact payable amount; payments are matched at this
- * resolution too, so a wallet that pads or truncates deeper digits can't
- * orphan a payment.
- */
-const GRAIN = 10n ** 22n;
 const NANO_TAG_SPAN = 1_000_000;
 
 /** Choose a free displayed grain within the quote's bounded amount range. */

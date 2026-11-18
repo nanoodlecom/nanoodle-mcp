@@ -265,6 +265,82 @@ test("the scheduled check detects legacy send debt and a Nano block claimed by t
   assert.doesNotMatch(JSON.stringify(report), /private-fixture-|AAAAAAA/);
 });
 
+test("Nano checkout detects stale coverage only while a quote has been waiting", async t => {
+  for (const [scenario, coveredAt, waiting, createdAt, code] of [
+    ["current", NOW - 120_000, true, NOW - 180_000, undefined],
+    ["stale", NOW - 120_001, true, NOW - 180_000, "nano-payment-coverage-stale"],
+    ["missing", null, true, NOW - 180_000, "nano-payment-coverage-stale"],
+    ["future", NOW + 31_000, true, NOW - 180_000, "nano-payment-coverage-invalid"],
+    ["idle", NOW - 600_000, false, NOW - 180_000, undefined],
+    ["recent quote", null, true, NOW - 119_999, undefined],
+  ]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"];
+    ledger.historyScan = { through: null, coveredAt, backfill: null };
+    if (waiting) ledger.quotes.push({ id: "private-watched-quote", status: "pending", amountRaw: "50000000000000000000000",
+      createdAt, expiresAt: NOW + 600_000 });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
+    assert.equal(probe?.ok, code === undefined, scenario);
+    assert.equal(probe?.code, code, scenario);
+    assert.deepEqual(report.admission, { nano: code === undefined, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-watched-quote|coveredAt/);
+  }
+});
+
+test("a legacy Nano writer alerts on an aged confirmed matching transfer missing from its ledger", async t => {
+  const account = NANO_GENESIS_REPLY.contents.account;
+  const sender = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
+  const amount = "50000000000000000000123";
+  const block = { type: "state", account: sender, representative: sender, balance: "10000000000000000000000000000000",
+    previous: "C".repeat(64), link: NANO_GENESIS_REPLY.contents.source };
+  const hash = hashBlock(block), receiveHash = "D".repeat(64);
+  for (const scenario of ["receivable", "already-pocketed", "fresh", "old", "unconfirmed", "fallback",
+    "recorded-during-read", "known-receive-alias", "observation-unavailable"]) {
+    const f = fixture(({ url, body }, _config, states) => {
+      if (!/^nano-\d/.test(url.hostname) || !["receivable", "account_history", "block_info"].includes(body?.action)) return null;
+      if (body.action !== "block_info") assert.equal(body.account, account);
+      if (body.action === "receivable") {
+        assert.equal(body.include_only_confirmed, "true");
+        return Response.json({ blocks: scenario === "already-pocketed" ? {} : { [hash]: { amount, source: sender } } });
+      }
+      if (body.action === "account_history") {
+        assert.equal(body.raw, "true");
+        if (scenario === "observation-unavailable" || (scenario === "fallback" && url.hostname === "nano-0.example")) {
+          return new Response(null, { status: 503 });
+        }
+        const history = ["already-pocketed", "known-receive-alias"].includes(scenario) ? [{ type: "state", subtype: "receive", hash: receiveHash,
+          link: hash, amount, confirmed: "true" }] : [];
+        return Response.json({ account, history });
+      }
+      if (body.hash !== hash) return null;
+      if (scenario === "recorded-during-read") Object.assign(states["/state/gate-state.json"].quotes[0], { status: "paid", payHash: hash });
+      const at = NOW - (scenario === "fresh" ? 60_000 : scenario === "old" ? 600_000 : 180_000);
+      return Response.json({ confirmed: scenario !== "unconfirmed", subtype: "send", amount,
+        local_timestamp: String(at / 1000), contents: block });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const expired = scenario === "already-pocketed";
+    const ledger = f.states["/state/gate-state.json"];
+    ledger.quotes.push({ id: "private-watched-quote", status: expired ? "expired" : "pending",
+      amountRaw: "50000000000000000000000", createdAt: NOW - 300_000, expiresAt: NOW + (expired ? -60_000 : 600_000) });
+    if (scenario === "known-receive-alias") ledger.quotes.push({ id: "recorded", status: "paid", settled: true,
+      amountRaw: "40000000000000000000000", payHash: receiveHash });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const missed = ["receivable", "already-pocketed", "fallback"].includes(scenario);
+    const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
+    assert.equal(probe?.ok, !missed, scenario);
+    assert.equal(probe?.code, missed ? "nano-confirmed-payment-unrecorded" : undefined, scenario);
+    assert.deepEqual(report.admission, { nano: !missed, near: true, usdc: true, market: true }, scenario);
+    if (scenario === "observation-unavailable") assert.deepEqual(report.checks.find(c => c.stage === "nano-legacy-payment-observation"),
+      { stage: "nano-legacy-payment-observation", ok: false, code: "http-503", domains: [] });
+    assert.doesNotMatch(JSON.stringify(report), /private-watched-quote|50000000000000000000123/);
+    assert.ok(!JSON.stringify(report).includes(hash));
+    if (scenario === "known-receive-alias") assert.ok(!f.calls.some(c => c.body?.hash === hash));
+  }
+});
+
 test("the scheduled check detects overdue Nano execution and unverified legacy execution without inference", async t => {
   const f = fixture();
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

@@ -1,4 +1,6 @@
 export const NANO_LATE_WATCH_MS = 60 * 60_000;
+// Match quotes at the 1e-8 XNO precision displayed by wallets.
+export const NANO_PAYMENT_GRAIN = 10n ** 22n;
 export const isNanoHistoryHash = value => typeof value === "string" && /^[a-fA-F0-9]{64}$/.test(value) && !/^0+$/.test(value);
 export const isNanoHistoryHeight = value => typeof value === "string" && /^\d{1,20}$/.test(value);
 const stamp = value => Number.isSafeInteger(value) && value >= 0;

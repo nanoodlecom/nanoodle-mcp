@@ -12,6 +12,7 @@ import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocur
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
+import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
@@ -149,7 +150,7 @@ export async function runOperationalCheck(config, deps = {}) {
     const response = await request(url, init); need(response.ok, `http-${response.status}`); return response.json();
   };
   const nanoRpc = async (url, body) => {
-    need(["account_info", "block_count", "version", "block_info"].includes(body.action), "probe-action-forbidden");
+    need(["account_info", "account_history", "receivable", "block_count", "version", "block_info"].includes(body.action), "probe-action-forbidden");
     const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     need(response.status !== 429, "nano-rpc-rate-limited");
     need(response.ok, `http-${response.status}`);
@@ -221,8 +222,9 @@ export async function runOperationalCheck(config, deps = {}) {
     need(ledger?.v === 1 && ledger.network === config.network && ledger.merchant === config.merchant, "ledger-account-mismatch");
     return ledger;
   };
+  const readNanoLedger = () => read(join(config.outDir, "gate-state.json"));
   const state = await check("payment-state", async () => {
-    const nano = read(join(config.outDir, "gate-state.json")), near = readNearLedger();
+    const nano = readNanoLedger(), near = readNearLedger();
     const market = config.agents.map(a => read(join(config.marketStateDir, a.handle, "market-state.json")));
     const liabilities = paymentLiabilities({ nano, near, market }, { now: now() });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
@@ -356,11 +358,45 @@ export async function runOperationalCheck(config, deps = {}) {
         "nano-confirmed-checkpoint-disagrees");
     }
     const witnesses = current.filter(row => row.witnessed);
-    const newest = witnesses.find(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight);
+    const currentWitnesses = witnesses.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight);
+    const [newest] = currentWitnesses;
     need(newest && witnesses.length + Number(Boolean(standbyMatches)) >= minimum, "nano-confirmed-checkpoint-unverified");
-    return newest.info;
+    return { ...newest, peers: currentWitnesses.map(row => row.peer) };
   });
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
+  if (state) await check("nano-payment-scan-progress", async () => {
+    const at = now(), ledger = readNanoLedger();
+    const { history, waiting } = nanoWatchDemand(ledger, at);
+    if (!waiting.length) return;
+    if (ledger.historyScan !== undefined) {
+      need(history.coveredAt === null || history.coveredAt <= at + 30_000, "nano-payment-coverage-invalid");
+      need(history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS, "nano-payment-coverage-stale");
+      return;
+    }
+    need(nano, "nano-payment-observation-unavailable");
+    const observed = await check("nano-legacy-payment-observation", async () => {
+      const matchesSend = (block, hash) => hashBlock(block).toUpperCase() === hash
+        && deriveAddress(block.link, { useNanoPrefix: true }) === config.nanoAddress;
+      let failure;
+      for (const index of nano.peers) {
+        try {
+          return await findUnrecordedNanoPayments({ rpc: body => nanoRpc(config.nanoRpcUrls[index], body), matchesSend,
+            account: config.nanoAddress, head: nano.view.confirmedFrontier, ledger, waiting, now: at });
+        } catch (error) {
+          if (error.code === "NANO_PAYMENT_OBSERVATION_LIMIT") throw error;
+          failure = error;
+        }
+      }
+      throw failure;
+    }, []);
+    if (!observed?.length) return;
+    // A normal scan may have recorded the payment while the probe was reading.
+    const latest = readNanoLedger();
+    const unpaid = new Set(nanoWatchDemand(latest, now()).waiting.map(q => q.id));
+    const recorded = new Set(latest.quotes.filter(q => typeof q.payHash === "string").map(q => q.payHash.toUpperCase()));
+    need(!observed.some(({ id, hash, receipt }) => unpaid.has(id) && !recorded.has(hash) && !recorded.has(receipt)),
+      "nano-confirmed-payment-unrecorded");
+  }, ["nano"]);
   const nearNodes = (await Promise.all(config.nearRpcUrls.map((url, index) => check(`near-node-${index}`, async () => {
     const rpc = createNearRpc({ url, fetch: request, timeoutMs: config.timeoutMs || 12_000 });
     const status = await rpc.status();
@@ -469,7 +505,7 @@ export async function runOperationalCheck(config, deps = {}) {
     return result;
   });
   if (state && nano && rates) await check("nano-liquidity", async () => {
-    const result = nanoLiquidityCheck({ liabilities: state.liabilities, nanoBalanceRaw: nano.confirmed_balance,
+    const result = nanoLiquidityCheck({ liabilities: state.liabilities, nanoBalanceRaw: nano.info.confirmed_balance,
       xnoUsd: rates.xnoUsd, providerReserveUsd });
     need(result.ok, result.code);
   });
