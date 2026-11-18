@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
-import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
+import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
@@ -303,7 +303,7 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, checkpoint, fundingPause: pause?.recoveredAt != null ? pause : null };
+    return { availableRaw, checkedAt, checkpoint, fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -539,6 +539,21 @@ export async function runOperationalCheck(config, deps = {}) {
     // on-disk accounting above remains independent so neither counts them twice.
     const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
     need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
+  }, []);
+  if (state) await check("near-paid-run-funding", () => {
+    // The runtime sample came first. Re-read the ledger so a quote that has
+    // since acquired a live reservation is not counted again as unstarted.
+    let requiredRaw;
+    try { requiredRaw = paidNearRunFundingRaw(readNearLedger().quotes); }
+    catch { throw new CheckError("near-paid-run-funding-unverified"); }
+    if (requiredRaw === 0n) return;
+    need(nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000, "near-paid-run-funding-unverified");
+    need(runtimeFunding.availableRaw >= requiredRaw, "near-paid-run-funding-insufficient");
+    // Cross-check the durable obligations and independently confirmed balance.
+    // No extra reserve for a hypothetical new run is needed for this check.
+    const result = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
+      nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
+    need(result.ok, "near-paid-run-funding-insufficient");
   }, []);
   const nearTools = await check("mcp-discovery", async () => {
     await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } });
