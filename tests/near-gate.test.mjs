@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadTools } from "../src/tools.mjs";
+import { fetchCatalogs, loadTools } from "../src/tools.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
 import {
@@ -19,7 +19,8 @@ import {
 } from "../src/near/index.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 import { createNearFunding } from "../src/near/funding.mjs";
-import { createFakeChain, throwawayNearKey, GAS_YOCTO, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
+import { USDC_CONTRACTS } from "../src/near/ft.mjs";
+import { createFakeChain, throwawayNearKey, GAS_YOCTO, WORKED_CATALOGS, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
 
 const MERCHANT = "merchant.testnet";
 const PAYER = "payer.testnet";
@@ -40,13 +41,15 @@ before(async () => {
 });
 after(() => { globalThis.fetch = realFetch; });
 
-async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false, merchantBalance = parseNearToYocto("10"), maintenance } = {}) {
+async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false,
+  merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
   chain.addAccount(MERCHANT, merchantBalance, key.publicKey);
   chain.addAccount(PAYER, parseNearToYocto("5"));
-  const registry = await loadTools({ dirs: [graphsDir], apiKey: "test-key", outDir: out, publicBase: "http://127.0.0.1:1", log: () => {} });
+  if (usdcToken) chain.addFt(usdcToken, { [MERCHANT]: 0n, [PAYER]: 1_000_000n });
+  const registry = await loadTools({ dirs: [graphsDir], apiKey: "test-key", baseUrl, outDir: out, publicBase: "http://127.0.0.1:1", log: () => {} });
   const file = join(out, "near-state.json");
   const events = [];
   const make = () => {
@@ -55,12 +58,13 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
     const signer = parseNearSecretKey(key.secretKey);
     const refundFunding = guardRefunds ? createNearFunding({ rpc, ledger, accountId: MERCHANT, publicKey: signer.publicKey, network: "testnet" }) : null;
     const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null,
-      beforeSign: refundFunding?.beforeSign, beforeComplete: refundFunding?.beforeComplete, maintenance });
+      beforeSign: refundFunding?.beforeSign, beforeComplete: refundFunding?.beforeComplete, maintenance, usdcToken });
     const gate = createNearGate({
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
       rate: rate || createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase, canQuote, fundRun, refundFunding, maintenance,
+      limits, fetch: catalogFetch, randomInt: () => dust++, publicBase, canQuote, fundRun, refundFunding, maintenance,
+      baseUrl, ...(usdcToken && { usdcEnabled: true, usdcToken }),
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -108,6 +112,64 @@ test("funding refusal refunds a NEAR deposit without starting a model", async ()
   assert.equal(result.structuredContent.receipt.outcome, "run_failed");
   assert.equal(result.structuredContent.receipt.refund.status, "sent");
   assert.equal(mock.runs(), before);
+});
+
+test("an increased model price beyond the locked quote refunds NEAR and USDC before reserving or running", async () => {
+  for (const [asset, name, inputs] of [["near", "idea-poster", INPUTS], ["usdc", "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }]]) {
+    const usdcToken = asset === "usdc" ? USDC_CONTRACTS.testnet : undefined;
+    const baseUrl = `https://repriced-${asset}.example`;
+    const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+    const w = await world({ rate, baseUrl, usdcToken, fundRun: () => assert.fail("No run reservation is needed if the quote cannot cover it") });
+    const args = { ...inputs, _pay_with: asset };
+    const quote = await call(w, name, args);
+    assert.ok(!quote.isError, text(quote));
+    const payment = quote.structuredContent.payment;
+    const amount = BigInt(payment.amountAtomic ?? payment.amountYocto);
+    const tx = usdcToken ? w.chain.ftTransfer(usdcToken, PAYER, MERCHANT, amount) : w.chain.transfer(PAYER, MERCHANT, amount);
+
+    const costlyImage = { ...WORKED_CATALOGS.image[0], pricing: { per_image: { "1024x1024": 0.08 }, currency: "USD" } };
+    const refreshed = nanoGptMock({ catalogs: { ...WORKED_CATALOGS, image: [costlyImage] } });
+    await fetchCatalogs(["image"], { baseUrl, fetch: refreshed.fetch, maxAgeMs: 0 });
+    const before = mock.runs();
+    const paidArgs = { ...args, _payment_id: payment.paymentId, _payment_tx: tx, _payment_sender: PAYER };
+    const result = await call(w, name, paidArgs);
+    assert.equal(result.isError, true);
+    assert.match(text(result), /estimate exceeds this quote's budget. No model work started/);
+    const { charged, refund, outcome } = result.structuredContent.receipt;
+    assert.equal(outcome, "run_failed");
+    assert.equal(charged.amountAtomic ?? charged.yocto, "0");
+    assert.equal(refund.amountAtomic ?? refund.yocto, amount.toString());
+    assert.equal(refund.status, "sent");
+    assert.deepEqual((await call(w, name, paidArgs)).structuredContent, result.structuredContent);
+    assert.equal(w.chain.sendTxCount, 1);
+    assert.equal(mock.runs(), before);
+  }
+});
+
+test("an expired catalog cannot make the pricing probe or a new quote look ready during an outage", async t => {
+  let now = Date.now(), requests = 0;
+  const baseUrl = "https://stale-catalog.example";
+  t.mock.method(Date, "now", () => now);
+  const catalogFetch = async () => {
+    requests++;
+    return new Response("Catalog unavailable", { status: 503 });
+  };
+  await fetchCatalogs(["chat", "image"], { baseUrl, fetch: mock.fetch });
+  const w = await world({ baseUrl, catalogFetch });
+  const args = { graph: WORKED_GRAPH, inputs: INPUTS };
+  const fresh = await call(w, "price_noodle", args);
+  assert.equal(fresh.structuredContent.pricing.safety.ok, true);
+  assert.equal(requests, 0);
+
+  now += 5 * 60_000;
+  const stale = await call(w, "price_noodle", args);
+  const safety = stale.structuredContent.pricing.safety;
+  assert.equal(safety.ok, false);
+  assert.ok(safety.refusals.some(item => item.code === "CATALOG_UNAVAILABLE"));
+  const refused = await call(w, "idea-poster", INPUTS);
+  assert.equal(refused.isError, true);
+  assert.equal(w.ledger.quotes().length, 0);
+  assert.equal(requests, 2, "one attempt per catalog during the refresh cooldown");
 });
 
 test("refund gas is checked before quoting and inference; a paid call resumes without another payment", async () => {

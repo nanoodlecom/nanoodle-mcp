@@ -410,6 +410,12 @@ This formula is the same one the Nano charge mode uses for saved graphs (`priceF
 the operator's configured maximum (`--near-max-deposit-usd`, default $2.00), the call is
 refused before a quote exists.
 
+The NEAR and USDC gates check prices again before starting a paid run. They use
+catalog data cached for up to five minutes. If a refresh is required and fails,
+affected models are treated as unpriceable. If the new model estimate exceeds
+the wallet funding budget locked by the original quote, the service refunds
+the whole deposit before starting any model work.
+
 The deposit in NEAR is `ceil(deposit USD / rate)`, rounded up to a whole 0.000001 NEAR.
 Dust of 1 to 999 steps of 0.000001 NEAR is then added, chosen so the amount differs from
 every other open quote. The amount therefore has at most six decimals and can be typed into

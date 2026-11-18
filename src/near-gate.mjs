@@ -43,6 +43,7 @@ import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { nearCreatorLiabilities, nearRunFundingBudget } from "./funding-liabilities.mjs";
+import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const RUN_NOODLE = "run_noodle";
@@ -409,7 +410,8 @@ export function createNearGate({
   }
 
   async function catalogsFor(graph) {
-    return fetchCatalogs(graphModelKinds(graph), { baseUrl: baseUrl || undefined, fetch, log, consequence: ", so graphs using it cannot be quoted" });
+    return fetchCatalogs(graphModelKinds(graph), { baseUrl: baseUrl || undefined, fetch, log, requireFresh: true,
+      consequence: ", so graphs using it cannot be quoted" });
   }
 
   /**
@@ -423,7 +425,7 @@ export function createNearGate({
     if (name === RUN_NOODLE) {
       const read = await readGraphArgs(args, { allowShortLinks: false, fetch, limits: L });
       assertGraphSafe(read.graph, { inputs: read.inputs, limits: L });
-      const prep = await registry.prepareRunNoodle(args, { read, allowShortLinks: false });
+      const prep = await registry.prepareRunNoodle(args, { read, allowShortLinks: false, requireFreshCatalogs: true });
       graph = prep.workflowGraph;
       inputs = read.inputs;
       catalogs = prep.catalogs;
@@ -550,7 +552,7 @@ export function createNearGate({
     if (!["near", "usdc"].includes(_pay_with)) throw new GraphArgsError("_pay_with must be near or usdc");
     if (_pay_with === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server");
     // computePrice also reports what stops a quote: live-priced or unpriced models, a deposit over the cap.
-    const computed = await computePrice(priceArgs, { baseUrl, fetch, log, allowShortLinks: false, limits: L });
+    const computed = await computePrice(priceArgs, { baseUrl, fetch, log, allowShortLinks: false, limits: L, requireFreshCatalogs: true });
     if (_pay_with === "usdc") {
       const result = priceNoodleResult(computed, { note: "Request a USDC quote with _pay_with: usdc. Amounts use six decimal places; unused USDC returns to the paying account." });
       result.structuredContent.usdc = { network, tokenContract: usdcToken, decimals: 6, usdcUsd: "1", pricingBasis: "USDC denomination" };
@@ -775,15 +777,25 @@ export function createNearGate({
     if (FINAL.has(q.status)) return replay(q);
     // The payment page accepts the deposit without executing or retaining inputs.
     // The bound MCP call is still checked before any model work can begin.
-    let prepared = null, prepError = null;
-    try { prepared = await prepare(registry, name, args, tool); } catch (e) { prepError = e; }
+    let prepared = null, budget = null, prepError = null;
+    try {
+      prepared = await prepare(registry, name, args, tool);
+      if (fundRun) {
+        budget = nearRunFundingBudget(q);
+        if (parseUsdNano(prepared.pricing.estimatedCostUsd, { roundUp: true }) > parseUsdNano(budget.maxUsd)) {
+          throw new FundingError("QUOTE_BUDGET_EXCEEDED", "The current model estimate exceeds the budget of this quote.");
+        }
+      }
+    } catch (e) { prepError = e; }
     if (!prepError && refundFunding) {
       try { await refundFunding.run(assetOf(q)); }
       catch { return errResult("Your payment is verified. The run is paused while the operator restores NEAR refund funding. Retry this same payment id; no model work was started and no new payment is needed.",
         { payment: { paymentId: q.id, status: "paid", retryable: true, code: "NEAR_FUNDING_UNAVAILABLE" } }); }
     }
-    q = ledger.updateQuote(q.id, { status: "running" });
-    if (ctx?.announce) ctx.announce(`payment verified — running ${name}`);
+    if (!prepError) {
+      q = ledger.updateQuote(q.id, { status: "running" });
+      if (ctx?.announce) ctx.announce(`payment verified — running ${name}`);
+    }
 
     let res;
     try {
@@ -798,10 +810,12 @@ export function createNearGate({
         if (fundRun) q = ledger.updateQuote(q.id, { fundingOutcomeReady: true });
         return result;
       };
-      res = await withHostedRun(() => fundRun ? fundRun(nearRunFundingBudget(q), execute) : execute(), executionLimit);
+      res = await withHostedRun(() => budget ? fundRun(budget, execute) : execute(), executionLimit);
     } catch (e) {
       const msg = String((e && e.message) || e);
-      const error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
+      const error = prepError?.code === "QUOTE_BUDGET_EXCEEDED"
+        ? "The current model estimate exceeds this quote's budget. No model work started. The full deposit is being returned. Request a new quote to try again."
+        : "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
       // Persist the failure before the refund goes out, so a restart never re-runs it.
       q = ledger.updateQuote(q.id, { status: "failed", outcome: "run_failed", error, finishedAt: now() });
       results.set(q.id, { details: `Details: ${msg}` });
