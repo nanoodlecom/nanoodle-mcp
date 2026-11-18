@@ -3,6 +3,9 @@ import { ftTransferCall } from "./ft.mjs";
 import { matchesSignedTransaction, serializeFunctionCallTx, serializeTransferTx } from "./tx.mjs";
 
 export function hasInvalidNearRefundProof(record, merchant) {
+  // Queueing and signing are separate durable states. If a queued record
+  // still has transaction evidence, a fresh signature could pay twice.
+  if (record.status === "queued") return record.txHash != null || record.signedTxBase64 != null || Boolean(record.supersededTxHashes?.length);
   // Recovered older candidates may be confirmed after their signed bytes were
   // superseded. A pending signed refund must always have its original proof.
   if (record.status !== "signed" && record.signedTxBase64 == null) return false;

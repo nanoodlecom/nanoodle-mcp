@@ -217,6 +217,7 @@ test("restored signed refunds with incorrect payer, amount, contract or signatur
     ["near", { ...native(5n), txHash: BLOCK_B }],
     ["near", { ...native(6n), signedTxBase64: null }],
     ["near", native(7n, { signerId: "other.testnet" })],
+    ["near", { ...native(8n), status: "queued" }],
   ];
   await withLedger(async ({ open }) => {
     const initial = open();
@@ -235,7 +236,7 @@ test("restored signed refunds with incorrect payer, amount, contract or signatur
     assert.deepEqual(log, { sends: [], txs: [], keys: 0 });
     for (const [i, [, proof]] of misplaced.entries()) {
       const record = open().getRefund(`rf_${i}`);
-      assert.equal(record.status, "signed");
+      assert.equal(record.status, proof.status ?? "signed");
       assert.equal(record.reconciliationRequired, true);
       assert.equal(record.signedTxBase64, proof.signedTxBase64);
     }
