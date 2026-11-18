@@ -24,6 +24,7 @@ import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qua
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { readNearFunding } from "../src/near/funding.mjs";
+import { RAW_PER_XNO } from "../src/near/rates.mjs";
 import { atomicJson, checkGraph } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
@@ -86,6 +87,7 @@ export async function runOperationalCheck(config, deps = {}) {
   const now = deps.now || Date.now, read = deps.readJson || readJson;
   const request = createProbeFetch({ fetch: deps.fetch || globalThis.fetch, timeoutMs: config.timeoutMs || 12_000 });
   const priceWorkflow = deps.computePrice || computePrice;
+  const providerReserveUsd = config.providerReserveUsd || "2";
   const checks = [];
   const peerUrls = config.nanoStandby ? [...config.nanoRpcUrls, config.nanoStandby.url] : config.nanoRpcUrls;
   let nanoCooldowns = [];
@@ -120,7 +122,7 @@ export async function runOperationalCheck(config, deps = {}) {
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
   });
-  const fundingPause = await check("runtime-funding", async () => {
+  const runtimeFunding = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
     const checkedAt = Date.parse(value.checkedAt), age = now() - checkedAt;
@@ -130,7 +132,8 @@ export async function runOperationalCheck(config, deps = {}) {
     need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
     need(value.writerProtection.requiredState === true, "required-state-policy-not-enforced");
     need([value.balanceRaw, value.liabilitiesRaw, value.reservedRaw].every(v => typeof v === "string" && /^\d{1,39}$/.test(v)), "funding-report-invalid");
-    need(value.ok === true && BigInt(value.balanceRaw) >= BigInt(value.liabilitiesRaw) + BigInt(value.reservedRaw), "funding-underfunded");
+    const availableRaw = BigInt(value.balanceRaw) - BigInt(value.liabilitiesRaw) - BigInt(value.reservedRaw);
+    need(value.ok === true && availableRaw >= 0n, "funding-underfunded");
     need(Number.isSafeInteger(value.activeRuns) && value.activeRuns >= 0, "funding-report-invalid");
     const limit = Object.hasOwn(value, "runTimeoutMs") ? value.runTimeoutMs : DEFAULT_HOSTED_RUN_MS;
     need(Number.isSafeInteger(limit) && limit > 0 && limit <= 24 * 3_600_000, "funding-report-invalid");
@@ -157,7 +160,7 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return pause?.recoveredAt != null ? pause : null;
+    return { availableRaw, fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -270,9 +273,15 @@ export async function runOperationalCheck(config, deps = {}) {
   });
   if (state && nano && rates) await check("nano-liquidity", async () => {
     const result = nanoLiquidityCheck({ liabilities: state.liabilities, nanoBalanceRaw: nano.confirmed_balance,
-      xnoUsd: rates.xnoUsd, providerReserveUsd: config.providerReserveUsd || "2" });
+      xnoUsd: rates.xnoUsd, providerReserveUsd });
     need(result.ok, result.code);
   });
+  if (runtimeFunding && rates) await check("nano-unreserved-liquidity", () => {
+    // The runtime already accounts for live reservations and liabilities. The
+    // on-disk accounting above remains independent so neither counts them twice.
+    const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
+    need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
+  }, []);
   await check("mcp-discovery", async () => {
     await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "nanoodle-operational-check", version: "1" } });
     const result = await mcp("tools/list", {});
@@ -312,7 +321,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["near", "usdc"]);
     if (funding && state && rates) await check("refund-liquidity-accounting", async () => {
       const results = liquidityChecks({ ...funding, usdcBalanceAtomic: funding.usdcBalanceAtomic ?? "0", liabilities: state.liabilities, nanoBalanceRaw: nano?.confirmed_balance || "0",
-        xnoUsd: rates.xnoUsd, providerReserveUsd: config.providerReserveUsd || "2" });
+        xnoUsd: rates.xnoUsd, providerReserveUsd });
       for (const result of results.filter(r => r.stage !== "nano-liquidity")) checks.push({ ...result, ...(result.ok ? {} : { domains: result.stage === "usdc-liquidity" ? ["usdc"] : ["near", "usdc"] }) });
     }, ["near", "usdc"]);
   }
@@ -353,7 +362,7 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
   }));
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
-    { fundingPause, nearBackfilling: watcherHealth?.backfilling });
+    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling });
 }
 
 async function productionConfig(env = process.env) {
