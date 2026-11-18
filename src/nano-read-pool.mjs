@@ -43,6 +43,18 @@ export function checkNanoGenesis(value) {
   }
 }
 
+export function matchesNanoConfirmedBlock(value, { account, anchor, hashBlock }) {
+  const height = BigInt(anchor.blockCount);
+  if (!yes(value?.confirmed) || raw(value.height) !== height) return false;
+  const block = typeof value.contents === "string" ? JSON.parse(value.contents) : value.contents;
+  if (canonical(block?.account) !== account) return false;
+  if (anchor.hash === NANO_GENESIS && height === 1n) {
+    checkNanoGenesis(value);
+    return true;
+  }
+  return block.type === "state" && hashBlock(block).toUpperCase() === anchor.hash;
+}
+
 export function nanoAccountView(value, checkAddress) {
   if (!hash(value?.frontier) || !hash(value?.confirmed_frontier) || !checkAddress(canonical(value?.representative))
       || !checkAddress(canonical(value?.confirmed_representative))) throw fail("NANO_RPC_BAD_VIEW");
@@ -219,12 +231,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     const witnesses = (await Promise.all(current.map(async row => {
       try {
         const historic = await readRpc({ action: "block_info", hash: anchor.hash, json_block: "true" }, row.base);
-        if (!yes(historic.confirmed) || raw(historic.height) !== height) return null;
-        const block = typeof historic.contents === "string" ? JSON.parse(historic.contents) : historic.contents;
-        if (canonical(block?.account) !== account) return null;
-        if (anchor.hash === NANO_GENESIS && height === 1n) checkNanoGenesis(historic);
-        else if (block.type !== "state" || hashBlock(block).toUpperCase() !== anchor.hash) return null;
-        return row;
+        return matchesNanoConfirmedBlock(historic, { account, anchor, hashBlock }) ? row : null;
       } catch (error) { rateLimit(row.base, error); return null; }
     }))).filter(row => row && hasProof(row.base));
     if (witnesses.length < 2) throw unprovenCheckpoint();

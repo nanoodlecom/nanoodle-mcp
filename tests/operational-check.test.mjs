@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { hashBlock } from "nanocurrency";
 import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
 import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
@@ -538,10 +539,13 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
 });
 
 test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
-  for (const failure of [null, "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+  for (const failure of [null, "matching-with-lagging-peer", "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
     const f = fixture(({ url, body }) => {
       assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
-      if (url.hostname === "nano-0.example") return new Response("", { status: 503 });
+      if (url.hostname === "nano-0.example") {
+        if (failure !== "matching-with-lagging-peer") return new Response("", { status: 503 });
+        if (body.action === "account_info") return Response.json(nanoAccountInfo({ height: 9 }));
+      }
       if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
         return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
       }
@@ -556,11 +560,57 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
       ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
     const report = await runOperationalCheck(f.config, f.deps);
-    assert.equal(report.admission.nano, failure === null);
-    assert.equal(report.admission.near, failure === null);
-    if (!failure) assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
+    const ready = failure === null || failure === "matching-with-lagging-peer";
+    assert.equal(report.admission.nano, ready);
+    assert.equal(report.admission.near, ready);
+    if (ready) assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
     if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
+  }
+});
+
+test("independent Nano peers must corroborate the runtime's confirmed checkpoint", async t => {
+  const account = NANO_GENESIS_REPLY.contents.account;
+  const block = { type: "state", account, representative: account, balance: "10000000000000000000000000000000",
+    previous: "B".repeat(64), link: "C".repeat(64) };
+  const anchor = { hash: hashBlock(block), blockCount: "10" };
+  for (const [scenario, height, frontier, expected] of [
+    ["agree", 10, anchor.hash, undefined],
+    ["behind", 9, "B".repeat(64), "nano-confirmed-checkpoint-regressed"],
+    ["conflict", 10, "C".repeat(64), "nano-confirmed-checkpoint-disagrees"],
+    ["one-peer-behind", 10, anchor.hash, "nano-confirmed-checkpoint-unverified"],
+    ["newer", 11, "D".repeat(64), undefined],
+    ["newer-with-unconfirmed-history", 11, "D".repeat(64), "nano-confirmed-checkpoint-unverified"],
+    ["newer-with-wrong-history", 11, "D".repeat(64), "nano-confirmed-checkpoint-unverified"],
+  ]) {
+    const f = fixture(({ url, body }) => {
+      if (!url.hostname.startsWith("nano-")) return null;
+      if (body.action === "account_info") {
+        const behind = scenario === "one-peer-behind" && url.hostname === "nano-1.example";
+        return Response.json(nanoAccountInfo({ height: behind ? 9 : height, frontier: behind ? "B".repeat(64) : frontier,
+          balance: block.balance }));
+      }
+      if (body.action !== "block_info" || body.hash !== anchor.hash) return null;
+      const secondary = url.hostname === "nano-1.example";
+      return Response.json({
+        height: anchor.blockCount,
+        confirmed: !secondary || scenario !== "newer-with-unconfirmed-history",
+        contents: secondary && scenario === "newer-with-wrong-history" ? { ...block, link: "E".repeat(64) } : block,
+      });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const checkpoint = f.states["/state/funding-health.json"].nanoRpc.checkpoint;
+    checkpoint.confirmed = anchor;
+    // A locally published head can be ahead of the last confirmed block.
+    checkpoint.head = { hash: "A".repeat(64), blockCount: "11" };
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = report.checks.find(c => c.stage === "nano-frontier-agreement");
+    assert.equal(check.code, expected, scenario);
+    assert.equal(check.ok, expected === undefined, scenario);
+    assert.ok(Object.values(report.admission).every(ready => ready === (expected === undefined)), scenario);
+    const history = f.calls.filter(c => c.body?.action === "block_info" && c.body.hash === anchor.hash);
+    assert.equal(history.length, height > 10 ? 2 : 0, scenario);
+    assert.ok(!JSON.stringify(report).includes(anchor.hash), scenario);
   }
 });
 

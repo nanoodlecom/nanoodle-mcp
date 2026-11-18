@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../src/private-state.mjs";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
-import { deriveAddress, derivePublicKey, checkAddress } from "nanocurrency";
+import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck } from "../src/operational-state.mjs";
@@ -28,7 +28,8 @@ import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_GENESIS, checkNanoGenesis, nanoAccountView, nanoStandbyConfig, qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
+import { NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
+  qualifyNanoAccountViews } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
@@ -275,7 +276,7 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, fundingPause: pause?.recoveredAt != null ? pause : null };
+    return { availableRaw, checkpoint, fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -323,10 +324,28 @@ export async function runOperationalCheck(config, deps = {}) {
   const nano = await check("nano-frontier-agreement", async () => {
     const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(nanoNodes);
     for (const { peer } of lagging) checks.push({ stage: `nano-node-${peer}-lag`, ok: false, code: "nano-rpc-peer-lagging", domains: [] });
-    if (current.length < Math.min(2, config.nanoRpcUrls.length)) {
+    const minimum = Math.min(2, config.nanoRpcUrls.length);
+    const standbyMatches = standbyCheckpoint && latestConfirmed?.confirmedHeight === BigInt(standbyCheckpoint.blockCount)
+      && latestConfirmed.confirmedFrontier === standbyCheckpoint.hash;
+    if (current.length < minimum) {
       need(current.length === 1 && standbyCheckpoint, lagging.length ? "nano-rpc-lagging-peers" : "nano-read-quorum-unavailable");
-      need(latestConfirmed.confirmedHeight === BigInt(standbyCheckpoint.blockCount)
-        && latestConfirmed.confirmedFrontier === standbyCheckpoint.hash, "nano-standby-checkpoint-disagrees");
+      need(standbyMatches, "nano-standby-checkpoint-disagrees");
+    }
+    const anchor = runtimeFunding?.checkpoint.confirmed;
+    if (anchor) {
+      const height = BigInt(anchor.blockCount);
+      need(latestConfirmed.confirmedHeight >= height, "nano-confirmed-checkpoint-regressed");
+      need(nanoNodes.every(({ view }) => view.confirmedHeight !== height || view.confirmedFrontier === anchor.hash),
+        "nano-confirmed-checkpoint-disagrees");
+      const witnesses = await Promise.all(current.map(async ({ peer, view }) => {
+        if (view.confirmedHeight <= height) return view.confirmedHeight === height;
+        try {
+          const block = await nanoRpc(config.nanoRpcUrls[peer], { action: "block_info", hash: anchor.hash, json_block: "true" });
+          return matchesNanoConfirmedBlock(block, { account: config.nanoAddress, anchor, hashBlock });
+        } catch { return false; }
+      }));
+      need(witnesses.filter(Boolean).length + Number(Boolean(standbyMatches)) >= minimum,
+        "nano-confirmed-checkpoint-unverified");
     }
     return current.find(row => row.view === latestConfirmed).info;
   });
