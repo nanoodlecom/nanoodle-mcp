@@ -48,6 +48,9 @@ const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 const NEAR_DISCOVERY_MAX_PROOF_AGE_MS = 27 * 3600_000;
 const NANO_TELEMETRY_AGE_MS = 90_000;
 const NANO_LEDGER_LAG_BLOCKS = 1_000n;
+const NANO_CEMENTATION_STALL_MS = 10 * 60_000;
+const NANO_CEMENTATION_SAMPLE_MAX_AGE_MS = 12 * 60_000;
+const NANO_PEER_ADVANCE_BLOCKS = 50n;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
 const MARKET_SLA_WARNINGS = ["market-sla-execution-overdue", "market-sla-start-window-ended",
@@ -70,10 +73,15 @@ const safeCode = e => e instanceof CheckError ? e.message : /^[A-Z_]{2,60}$/.tes
 const positiveDecimal = value => typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value)
   && Number.isFinite(Number(value)) && Number(value) > 0;
 
+function nanoLedgerCount(value) {
+  if (typeof value !== "string" || !/^[1-9]\d{0,19}$/.test(value)) return null;
+  const count = BigInt(value);
+  return count < (1n << 64n) ? count : null;
+}
+
 function nanoLedgerCounters(count, cemented) {
-  if (![count, cemented].every(value => typeof value === "string" && /^[1-9]\d{0,19}$/.test(value))) return null;
-  const blocks = BigInt(count), confirmed = BigInt(cemented);
-  if (confirmed > blocks || blocks >= (1n << 64n)) return null;
+  const blocks = nanoLedgerCount(count), confirmed = nanoLedgerCount(cemented);
+  if (blocks === null || confirmed === null || confirmed > blocks) return null;
   return { blocks, confirmed };
 }
 
@@ -94,6 +102,26 @@ function nanoPeerLedgerBaseline(metrics, now) {
   need(peers.size >= 3, "nano-ledger-peer-telemetry-insufficient");
   const counts = Array.from(peers.values(), peer => peer.confirmed).sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   return { median: counts[Math.floor((counts.length - 1) / 2)], peers: counts.length };
+}
+
+function nanoCementationProgress(current, previous, now) {
+  const prior = previous?.nanoLedgerSync;
+  const checkedAt = Date.parse(previous?.checkedAt);
+  const continuous = checkedAt <= now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
+  let unchangedSince = now, peerMedianAtStart = current.peerMedianConfirmed;
+  if (continuous && prior?.localConfirmed === current.localConfirmed) {
+    const since = prior.unchangedSince;
+    if (Number.isSafeInteger(since) && since > 0 && since <= checkedAt && nanoLedgerCount(prior.peerMedianAtStart) !== null) {
+      unchangedSince = since;
+      peerMedianAtStart = prior.peerMedianAtStart;
+    } else if (nanoLedgerCount(prior.peerMedianConfirmed) !== null) {
+      unchangedSince = checkedAt;
+      peerMedianAtStart = prior.peerMedianConfirmed;
+    }
+  }
+  const stalled = now - unchangedSince >= NANO_CEMENTATION_STALL_MS
+    && BigInt(current.peerMedianConfirmed) - BigInt(peerMedianAtStart) >= NANO_PEER_ADVANCE_BLOCKS;
+  return { unchangedSince, peerMedianAtStart, stalled };
 }
 
 function backupVerificationProof(file, read, now, stage) {
@@ -172,6 +200,14 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), { fu
     if (now - nearBackfillSince >= NEAR_BACKFILL_ALERT_MS) {
       checks = [...checks, { stage: "near-watcher-backfill", ok: false, code: "near-watcher-backfill-delayed", domains: [] }];
     }
+  }
+  if (nanoLedgerSync) {
+    const { stalled, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
+    nanoLedgerSync = { ...nanoLedgerSync, ...progress };
+    const check = stalled
+      ? { stage: "nano-ledger-confirmation-progress", ok: false, code: "nano-ledger-confirmations-stalled", domains: [] }
+      : { stage: "nano-ledger-confirmation-progress", ok: true };
+    checks = [...checks, check].sort((a, b) => a.stage.localeCompare(b.stage));
   }
   const failed = checks.filter(c => !c.ok);
   const admission = Object.fromEntries(ALL.map(asset => [asset, !failed.some(c => c.domains?.includes(asset))]));
