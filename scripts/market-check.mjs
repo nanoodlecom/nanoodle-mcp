@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { atomicJson } from "./near-check.mjs";
 import { checkMarketAvailability } from "../src/market/public-availability.mjs";
 
@@ -14,7 +13,7 @@ export async function runMarketCheck({ stateDir, ...options }, deps = {}) {
   return report;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   try {
     const report = await runMarketCheck({ stateDir: process.env.CHECK_STATE_DIR || "/var/lib/nanoodle-near-check" });
     console.log(JSON.stringify(report)); if (!report.ok) process.exitCode = 1;

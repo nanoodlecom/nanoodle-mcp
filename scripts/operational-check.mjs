@@ -3,7 +3,7 @@
 // signing, receive sweep, assignment start, bid, submission or price mutation.
 import { readFileSync, mkdirSync, chmodSync, statfsSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -371,7 +371,7 @@ async function productionConfig(env = process.env) {
     nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   let report;
   try {
     const config = await productionConfig();

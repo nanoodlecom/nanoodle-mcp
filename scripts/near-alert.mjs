@@ -3,7 +3,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
 import { request as httpRequest } from "node:http";
 import { selectFundingPause } from "../src/funding-report.mjs";
 import { atomicJson } from "./near-check.mjs";
@@ -134,7 +133,7 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
   return result;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   const config = { stateDir: process.env.CHECK_STATE_DIR || "/var/lib/nanoodle-near-check", url: process.env.BABEL_URL,
     host: process.env.BABEL_HOST, tokenFile: process.env.BABEL_TOKEN_FILE, conversation: process.env.BABEL_CONVERSATION, sender: process.env.BABEL_SENDER };
   try {

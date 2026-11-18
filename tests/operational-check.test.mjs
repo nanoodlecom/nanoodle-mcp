@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
 import { deliverAlerts, EMBER, failureEvent } from "../scripts/near-alert.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
@@ -12,6 +13,22 @@ import { nearProtocol } from "./fixtures/near-fees.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
+
+test("the readiness CLI reports preflight failure when run through a release symlink", t => {
+  const root = mkdtempSync(join(tmpdir(), "operational-check-entry-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const selected = join(root, "current"), stateDir = join(root, "state");
+  symlinkSync(fileURLToPath(new URL("..", import.meta.url)), selected, "junction");
+  // No wallet configuration or inherited runtime flags. Preflight stops before networking.
+  const child = spawnSync(process.execPath, [join(selected, "scripts/operational-check.mjs")], {
+    env: { OPERATIONAL_CHECK_STATE_DIR: stateDir }, encoding: "utf8", timeout: 10_000,
+  });
+  assert.ifError(child.error);
+  assert.equal(child.status, 1, child.stderr);
+  const report = JSON.parse(readFileSync(join(stateDir, "latest.json"), "utf8"));
+  assert.equal(report.ok, false);
+  assert.equal(report.checks[0].code, "check-could-not-finish");
+});
 
 test("Market liveness follows the selected release and rejects a worker left behind by a switched symlink", async t => {
   const root = mkdtempSync(join(tmpdir(), "operational-market-release-")), children = [];
