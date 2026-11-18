@@ -50,6 +50,7 @@ const QUOTE_TTL_MS = 15 * 60 * 1000;
 const QUOTE_READ_PROOF_TTL_MS = 30_000;
 const QUOTE_READ_RETRY_MS = 5_000;
 const QUOTE_READ_UNAVAILABLE = "Nano payment detection is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
+const QUOTE_FUNDING_UNAVAILABLE = "Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
 /**
  * The ONLY refund reasons the payments ledger may record — fixed categories,
  * never free text. A ledger line must never carry an upstream error string
@@ -1479,12 +1480,16 @@ export function createChargeGate({
           }
           if (validate) await validate({ name, arguments: args });
           if (persistenceFailed && !await persist()) return errResult("Cannot issue a Nano quote while payment storage is unavailable. Try again shortly.");
-          if (await canQuote() !== true) return errResult("Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
+          if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
           const price = priceFor(name, args);
           const pair = await ratePair();
-          if (verifyPaymentReads && !await paymentReadsReady()) return errResult(QUOTE_READ_UNAVAILABLE);
+          if (verifyPaymentReads) {
+            if (!await paymentReadsReady()) return errResult(QUOTE_READ_UNAVAILABLE);
+            if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
+            if (recentPaymentRead() !== true) return errResult(QUOTE_READ_UNAVAILABLE);
+          }
           const amountRaw = tagAmount(price, pair);
           if (amountRaw === null) {
             return errResult("This server is holding too many Nano quotes at this price right now. Try again later. Nothing was quoted or charged.");

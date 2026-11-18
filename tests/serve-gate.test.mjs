@@ -107,7 +107,7 @@ function fakeRegistry({ author = null, onCall } = {}) {
 }
 
 function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300, pollMs = 10, usage,
-  xnoUsd = 1.0, fetch, stateFile, fundRun, verifyPaymentReads, maintenance } = {}) {
+  xnoUsd = 1.0, fetch, stateFile, fundRun, canQuote, verifyPaymentReads, maintenance } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
@@ -121,7 +121,7 @@ function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300
     now, monotonicNow,
     fetch,
     stateFile,
-    fundRun, verifyPaymentReads, maintenance,
+    fundRun, canQuote, verifyPaymentReads, maintenance,
   });
   return gate;
 }
@@ -801,7 +801,7 @@ test("guarded Nano quotes share a read-only proof and stay unpublished until bot
   const chain = fakeChain(), registry = fakeRegistry();
   const dir = await mkdtemp(join(tmpdir(), "nano-quote-readiness-")), file = join(dir, "gate-state.json");
   const head = "A".repeat(64), attempts = [], usage = [];
-  let monotonic = 0, historyReady = false;
+  let monotonic = 0, historyReady = false, fundingReady = true, pauseFunding = false;
   chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
   chain.ops.rpc = async body => {
     attempts.push(body.action);
@@ -814,9 +814,10 @@ test("guarded Nano quotes share a read-only proof and stay unpublished until bot
     assert.equal(body.head, head);
     assert.equal(body.raw, "true");
     if (!historyReady) return { account: GATE_ADDR, history: [] };
+    if (pauseFunding) fundingReady = false;
     return { account: GATE_ADDR, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }] };
   };
-  const gate = makeGate(chain, { registry, stateFile: file, pollMs: 60_000, verifyPaymentReads: true,
+  const gate = makeGate(chain, { registry, stateFile: file, pollMs: 60_000, verifyPaymentReads: true, canQuote: () => fundingReady,
     monotonicNow: () => monotonic, usage: event => usage.push(event) });
   t.after(async () => { await gate.stop(); await rm(dir, { recursive: true }); });
   const { callTool } = gate.wrapRegistry(registry);
@@ -836,6 +837,13 @@ test("guarded Nano quotes share a read-only proof and stay unpublished until bot
 
   monotonic += 5_000;
   historyReady = true;
+  pauseFunding = true;
+  const fundingRefusal = await request();
+  assert.equal(fundingRefusal.isError, true);
+  assert.match(fundingRefusal.content[0].text, /funding is temporarily unavailable/i);
+  await assert.rejects(readFile(file, "utf8"), { code: "ENOENT" });
+  pauseFunding = false;
+  fundingReady = true;
   const quote = argOf(await request());
   const saved = JSON.parse(await readFile(file, "utf8"));
   assert.equal(saved.quotes.find(row => row.id === quote.paymentId)?.historyAfter, "1");
