@@ -861,8 +861,11 @@ node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
 
 A direct hire can spend up to its configured budget and the net USD or USDC
 escrow on its assignment, whichever is less. The worker rounds the amount left
-after the fee down to the cent. It checks escrow before starting the assignment
-and before running models. A temporary failure to verify escrow is retried.
+after the fee down to the cent. Before running models, the worker reads the
+assignment again to confirm it is still active, within its delivery deadline,
+and funded. A temporary failure to verify the assignment or its escrow is
+retried. The read-only monitor also checks whether a pending priced run still
+fits its escrow.
 
 A listing has one flat price (the market accepts only `per_call` plans). A workflow that
 costs more than the listing covers is declined, and one that costs far less still pays the

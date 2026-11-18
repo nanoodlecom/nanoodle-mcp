@@ -15,9 +15,10 @@
  *                                                  └── run failed / found "running" after a restart ──> declining (failed)
  *                                                                                    request changes ──> reworking ──> submitting
  *
- * - The paid workflow runs only after `start` answered 200, and only from the
- *   "started" phase. "running" is written (fsync) before the first NanoGPT
- *   call. A record found in "running" when the worker starts was interrupted:
+ * - The paid workflow runs only after `start` answered 200 and a fresh read
+ *   confirms the assignment is still active and funded. "running" is written
+ *   (fsync) before the first NanoGPT call. A record found in "running" when
+ *   the worker starts was interrupted:
  *   it is handed back with a full buyer refund (decline, reason "failed"), and
  *   never run again.
  * - `start` is idempotent on the market, so an uncertain start is retried.
@@ -139,6 +140,15 @@ export function createMarketWorker({
     if (!terms.code) return { terms };
     if (terms.code === "MARKET_ESCROW_UNAVAILABLE") return { stop: backoff(rec, new Error("Market assignment escrow could not be verified")) };
     return { stop: declineEscrow(rec, reason, terms.code) };
+  }
+  function finishGone(rec, reason) {
+    prepared.delete(rec.id);
+    log(`assignment ${short(rec.id)}: skipping workflow (${reason}); nothing was run`);
+    return set(rec.id, ok({ phase: "gone", finishedAt: now() }));
+  }
+  function declineExpired(rec) {
+    return set(rec.id, ok({ phase: "declining", decline: { reason: "failed", code: "MARKET_SLA_EXPIRED",
+      detail: "The assignment's delivery deadline passed before inference could start. No model was run. Your payment will be refunded in full." } }));
   }
   async function feeRefusal(rec, reason) {
     if (!checkFee) return null;
@@ -286,10 +296,21 @@ export function createMarketWorker({
     }
   }
 
-  async function phaseStarted(rec, row) {
+  async function phaseStarted(rec) {
+    // Start is idempotent and its response only carries a timestamp. Read back
+    // the assignment to catch cancellation or changed funding after the poll.
+    const row = await lookup(rec.id);
+    const assignment = row?.assignment;
+    if (!assignment?.status) return backoff(rec, new Error("Market assignment status could not be verified"));
+    if (assignment.status !== "in_progress") return finishGone(rec, assignment.status);
+    if (assignment.submittedAt || assignment.deliverableUrl) return finishGone(rec, "already delivered");
+    const deadline = Date.parse(assignment.slaDeadlineAt);
+    if (!Number.isFinite(Date.parse(assignment.startedAt)) || !Number.isFinite(deadline)) {
+      return backoff(rec, new Error("Market assignment start or delivery deadline could not be verified"));
+    }
+    if (deadline <= now()) return declineExpired(rec);
     const { terms, stop } = checkEscrow(rec, row, "failed");
     if (stop) return stop;
-    const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
     const jobBudget = Math.min(budgetOf(rec), terms.budgetUsd);
     let prep = prepared.get(rec.id);
     if (!prep) {
@@ -301,14 +322,16 @@ export function createMarketWorker({
       prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
     }
     if (prep.pricing.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
-    prepared.delete(rec.id);
+    const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
     await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null, fields: prep.usedDefault ? prep.usedFields || [] : [], notes: prep.usedDefault ? prep.fieldNotes || [] : [] }), `nanoodle-start-${rec.id}`);
+    await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
+    if (deadline <= now()) return declineExpired(rec);
+    prepared.delete(rec.id);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),
       budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd,
       ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), jobBudget) } }),
     }));
-    await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
     try {
@@ -483,7 +506,7 @@ export function createMarketWorker({
         case "new": rec = await phaseNew(rec, row); break;
         case "declining": rec = await phaseDeclining(rec); break;
         case "starting": rec = await phaseStarting(rec, row); break;
-        case "started": rec = await phaseStarted(rec, row); break;
+        case "started": rec = await phaseStarted(rec); break;
         case "running": rec = phaseInterrupted(rec); break;
         case "delivering": rec = await phaseDelivering(rec); break;
         case "submitting": rec = await phaseSubmitting(rec); break;
@@ -585,8 +608,7 @@ export function createMarketWorker({
         let found;
         try { found = await lookup(rec.id); } catch (e) { backoff(rec, e); continue; }
         if (found && found.assignment.status === "in_progress") { launch(rec.id, found); continue; }
-        log(`assignment ${short(rec.id)}: no longer in progress (${found ? found.assignment.status : "not listed"}); nothing was run`);
-        store.update(rec.id, ok({ phase: "gone", finishedAt: now() }));
+        finishGone(rec, found?.assignment.status ?? "not listed");
         continue;
       }
       launch(rec.id, row);
