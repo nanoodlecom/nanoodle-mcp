@@ -761,6 +761,87 @@ test("independent funding rejects a balance before a refund finalized during the
   }
 });
 
+test("same-block funding disagreement is scoped to the assets that depend on the read", async t => {
+  for (const [caseName, request, value, debt, nativeReady, tokenReady] of [
+    ["native balance", "view_account", { amount: "900000000000000000000000", storage_usage: 500 }, false, false, false],
+    ["native storage", "view_account", { amount: "1000000000000000000000000", storage_usage: 501 }, false, false, false],
+    ["signing nonce", "view_access_key", { permission: "FullAccess", nonce: 101 }, false, false, false],
+    ["gas cost", "gas_price", { gas_price: "1000000000000" }, false, false, false],
+    ["token balance", "ft_balance_of", "900000", false, true, false],
+    ["token refund debt", "ft_balance_of", "900000", true, false, false],
+    ["token registration", "storage_balance_of", null, false, true, false],
+  ]) {
+    const f = fixture(({ url, body }) => {
+      const params = body?.params;
+      if (url.hostname !== "near-1.example") return null;
+      if (body.method === "gas_price" && request === "gas_price" && params[0] === "same-block") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: value });
+      }
+      if (params?.block_id !== "same-block" || (params.method_name ?? params.request_type) !== request) return null;
+      const view = params.method_name ? { result: [...Buffer.from(JSON.stringify(value))] } : value;
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { block_hash: "same-block", block_height: 100, ...view } });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    if (debt) f.states["/state/near-state.json"].quotes.paid = { id: "paid", asset: "usdc", status: "paid", paidYocto: "17" };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(report.admission, { nano: true, near: nativeReady, usdc: tokenReady, market: true }, caseName);
+    const token = request.startsWith("ft_") || request.startsWith("storage_");
+    const asset = token ? "usdc" : "near";
+    assert.ok(report.checks.some(c => c.code === `${asset}-funding-peers-disagree`
+      && c.stage === `${asset}-funding-peer-1`), caseName);
+    assert.doesNotMatch(JSON.stringify(report), /same-block|900000|near-1\.example/);
+  }
+});
+
+test("unavailable corroboration reports an advisory and keeps the proven funding source usable", async t => {
+  for (const request of ["view_account", "ft_balance_of"]) {
+    const f = fixture(({ url, body }) => url.hostname === "near-1.example" && body?.params?.block_id === "same-block"
+      && (body.params.method_name ?? body.params.request_type) === request ? new Response(null, { status: 503 }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const asset = request === "view_account" ? "near" : "usdc";
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.deepEqual(report.checks.find(c => c.stage === `${asset}-funding-peer-1`),
+      { stage: `${asset}-funding-peer-1`, ok: false, code: `${asset}-funding-peer-proof-unavailable`, domains: [] });
+  }
+});
+
+test("a slightly lagging funding peer corroborates the common block without replacing the balance used for refunds", async t => {
+  const f = fixture(({ body, url }) => {
+    const params = body?.params;
+    const lagging = url.hostname === "near-1.example";
+    const reply = result => Response.json({ id: body.id, result });
+    if (body?.method === "block" && (params.block_id === 99 || lagging)) {
+      return reply({ header: { height: 99, hash: "overlap", timestamp_nanosec: String(BigInt(NOW) * 1_000_000n) } });
+    }
+    if (body?.method !== "query" || params.block_id !== "overlap") return null;
+    const at = { block_hash: "overlap", block_height: 99 };
+    if (params.request_type === "view_account") return reply({ ...at, amount: "1", storage_usage: 500 });
+    if (params.request_type === "view_access_key") return reply({ ...at, permission: "FullAccess", nonce: 99 });
+    const token = params.method_name === "ft_balance_of" ? "1000000" : { total: "1" };
+    return reply({ ...at, result: [...Buffer.from(JSON.stringify(token))] });
+  });
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  for (const asset of ["near", "usdc"]) assert.ok(report.checks.some(c => c.stage === `${asset}-funding-peer-1` && c.ok));
+  assert.deepEqual(f.calls.filter(({ body }) => body?.params?.request_type === "view_account")
+    .map(({ url, body }) => [url.hostname, body.params.block_id]).sort(),
+  [["near-0.example", "overlap"], ["near-0.example", "same-block"], ["near-1.example", "overlap"]]);
+});
+
+test("a refund finalized during the corroboration also advances the minimum funding block", async t => {
+  const f = fixture(({ url, body }, _config, states) => {
+    if (url.hostname === "near-1.example" && body?.params?.block_id === "same-block"
+      && body.params.request_type === "view_account") states["/state/near-state.json"].meta = { refundFinalHeight: 101 };
+    return null;
+  });
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+  assert.ok(report.checks.some(c => c.stage === "refund-liquidity-accounting" && c.code === "near-refund-balance-before-checkpoint"));
+});
+
 test("independent refund headroom distinguishes paid liabilities from the next quote fee", async t => {
   const costs = nearRefundCosts(nearProtocol({ chainId: "mainnet" }), "100000000");
   const claims = nearRefundClaims({ quotes: {}, refunds: {} });
