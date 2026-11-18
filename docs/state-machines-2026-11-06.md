@@ -89,6 +89,9 @@ send whose amount or recipient conflicts with its settlement.
 
 NEAR and USDC refunds also match the payer, asset and token contract. The
 ledger preserves every uncovered remainder and the gas needed to send it.
+A transaction hash belongs to one refund, including hashes retained from
+nonce renewal. If two refunds claim one hash, both balances stay reserved
+and their retries stay on hold until the records are reconciled.
 NEAR and Market creator payouts cover only the matching recipient and
 amount. Restored outbox entries that disagree with the original obligation
 stay held with their signed bytes. The payment and assignment records remain

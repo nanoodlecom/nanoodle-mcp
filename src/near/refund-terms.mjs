@@ -21,3 +21,23 @@ export function sameNearRefundDestination(expected, record) {
 export function sameNearRefund(expected, record) {
   return sameNearRefundDestination(expected, record) && expected.amountYocto === record.amountYocto;
 }
+
+export function nearRefundHashes(record) {
+  return [...new Set([record.txHash, ...(record.supersededTxHashes ?? [])])]
+    .filter(hash => typeof hash === "string" && hash.length > 0);
+}
+
+/** A finalized transfer or any candidate from a renewal belongs to one refund. */
+export function conflictingNearRefunds(refunds) {
+  const owners = new Map(), conflicts = new Set();
+  for (const refund of refunds) {
+    for (const hash of nearRefundHashes(refund)) {
+      if (!owners.has(hash)) owners.set(hash, refund.id);
+      else {
+        conflicts.add(owners.get(hash));
+        conflicts.add(refund.id);
+      }
+    }
+  }
+  return conflicts;
+}

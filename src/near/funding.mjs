@@ -2,7 +2,7 @@ import { NearError } from "./errors.mjs";
 import { assertFreshBlock } from "./freshness.mjs";
 import { DEFAULT_FUNCTION_CALL_GAS } from "./tx.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./quote-capacity.mjs";
-import { nearRefundTerms, sameNearRefundDestination } from "./refund-terms.mjs";
+import { conflictingNearRefunds, nearRefundTerms, sameNearRefundDestination } from "./refund-terms.mjs";
 
 const U128 = (1n << 128n) - 1n;
 export const NEAR_OPERATING_RESERVE = 50_000_000_000_000_000_000_000n;
@@ -35,6 +35,8 @@ export function nearRefundClaims({ quotes, refunds, meta }, {
 } = {}) {
   let nearYocto = 0n, usdcAtomic = 0n, nativeRefunds = 0, tokenRefunds = 0, pendingNativeRefunds = 0, pendingTokenRefunds = 0;
   const issues = new Set(), refundsByPayment = new Map();
+  const refundRows = rows(refunds), conflicts = conflictingNearRefunds(refundRows);
+  if (conflicts.size) issues.add("near-refund-duplicate-transaction");
   const add = (asset, value) => {
     const n = typeof value === "bigint" ? value : raw(value);
     if (asset != null && !["near", "usdc"].includes(asset)) throw bad();
@@ -42,9 +44,11 @@ export function nearRefundClaims({ quotes, refunds, meta }, {
     if (asset === "usdc") { usdcAtomic += n; tokenRefunds++; }
     else { nearYocto += n; nativeRefunds++; }
   };
-  for (const r of rows(refunds)) {
+  for (const r of refundRows) {
     if (!["queued", "signed", "sent", "failed_permanent"].includes(r.status)) throw bad();
-    if (r.status !== "sent") add(r.asset, r.amountYocto);
+    if (r.status !== "sent" || conflicts.has(r.id) || r.reconciliationRequired || r.outcomeUnverified) {
+      add(r.asset, r.amountYocto);
+    }
     if (r.reconciliationRequired) issues.add("near-refund-evidence-mismatch");
     if (r.status === "sent" && r.outcomeUnverified) issues.add("near-refund-outcome-unverified");
     if (typeof r.paymentId === "string") {
@@ -63,9 +67,9 @@ export function nearRefundClaims({ quotes, refunds, meta }, {
         const recorded = raw(r.amountYocto);
         const matches = sameNearRefundDestination(expected, r);
         if (!matches || recorded !== amount) issues.add("near-refund-evidence-mismatch");
-        // A pending outbox amount is included above. A confirmed amount can
-        // also cover this obligation, but neither can erase another asset's debt.
-        if (matches && recorded > covered && !(r.status === "sent" && r.outcomeUnverified)) covered = recorded;
+        // Outbox principal was reserved above unless a unique transfer settled
+        // it. A matching record only covers the amount on its own rail.
+        if (matches && recorded > covered) covered = recorded;
       }
       if (amount > covered) {
         add(expected.asset, amount - covered);
