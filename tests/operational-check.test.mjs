@@ -691,7 +691,7 @@ test("live Nano reservations can exhaust working capital while disk and runtime 
 
 test("paid NEAR and USDC workflows must fit together at their locked Nano rates", async t => {
   const raw = 10n ** 30n, required = 54n * raw / 10n;
-  for (const scenario of ["exact", "live-short", "chain-short", "missing-locked-rate"]) {
+  for (const scenario of ["exact", "live-short", "chain-short", "missing-locked-rate", "started-during-sample"]) {
     const f = fixture();
     t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
     const quotes = f.states["/state/near-state.json"].quotes;
@@ -703,19 +703,28 @@ test("paid NEAR and USDC workflows must fit together at their locked Nano rates"
       paidYocto: "1", paidAtBlockMs: NOW, rate: { xnoUsd: "0.1" } };
     const report = f.states["/state/funding-health.json"];
     report.liabilitiesRaw = "0";
-    report.reservedRaw = String(10n * raw - required + (scenario === "live-short" ? 1n : 0n));
+    const belowBothBudgets = ["live-short", "started-during-sample"].includes(scenario);
+    report.reservedRaw = String(10n * raw - required + (belowBothBudgets ? 1n : 0n));
     Object.assign(report, { activeRuns: 1, oldestStartedAt: NOW - 1000 });
     if (scenario === "chain-short") {
       f.states["/state/gate-state.json"].owed.push({ amountRaw: String(10n * raw - required + 1n),
         journaled: true, tries: 0, createdAt: NOW });
+    }
+    if (scenario === "started-during-sample") {
+      const read = f.deps.readJson;
+      f.deps.readJson = path => {
+        if (path === "/state/funding-health.json") quotes.stable.status = "running";
+        return structuredClone(read(path));
+      };
     }
     const result = await runOperationalCheck(f.config, f.deps);
     for (const stage of ["runtime-funding", "nano-liquidity", "nano-unreserved-liquidity"]) {
       assert.equal(result.checks.find(c => c.stage === stage)?.ok, true, scenario + " " + stage);
     }
     const finding = result.checks.find(c => c.stage === "near-paid-run-funding");
-    assert.equal(finding?.ok, scenario === "exact", scenario);
-    if (scenario !== "exact") {
+    const covered = ["exact", "started-during-sample"].includes(scenario);
+    assert.equal(finding?.ok, covered, scenario);
+    if (!covered) {
       assert.equal(finding.code, scenario === "missing-locked-rate"
         ? "near-paid-run-funding-unverified" : "near-paid-run-funding-insufficient", scenario);
       assert.deepEqual(finding.domains, []);
