@@ -232,6 +232,9 @@ Coverage:
   buffer and 0.05 NEAR native reserve are checked in addition to recorded debts.
 - Stuck paid runs, missing refund/payout intents, pending/permanently failed
   refunds, creator payouts and Market work requiring an operator.
+  Nano settlement alerts use the age of the debt and the persisted failed
+  attempt count. A restored debt without a creation time starts aging from
+  the time it is loaded.
 - Fresh private runtime funding telemetry, enforced spend/transfer protection,
   and active scopes older than the configured execution limit plus 15 minutes
   for payment reconciliation. See [hosted deadlines](hosted-execution.md).
