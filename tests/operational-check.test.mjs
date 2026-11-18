@@ -445,6 +445,40 @@ test("the VPS monitor reports backup capture and export age without closing paym
   assert.equal(missing.checks.find(c => c.stage === "backup-export-proof").code, "backup-export-proof-unavailable");
 });
 
+test("an up-to-date VPS export cannot hide a missing or stale offsite verification", async t => {
+  const f = fixture(), date = at => new Date(at).toISOString();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.backupExportReport = "/backup-export/latest.json";
+  f.config.backupCopyReport = "/backup-copy/latest.json";
+  const local = { v: 1, capturedAt: date(NOW - 4 * 3600_000), verifiedAt: date(NOW - 60_000) };
+  const copy = { ...local, verifiedAt: date(NOW - 2 * 3600_000 - 1), archive: "private-offsite-path" };
+  f.states[f.config.backupExportReport] = local;
+  f.states[f.config.backupCopyReport] = copy;
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.ok(report.checks.find(c => c.stage === "backup-export-freshness")?.ok);
+  assert.deepEqual(report.checks.find(c => c.stage === "backup-copy-freshness"),
+    { stage: "backup-copy-freshness", ok: false, code: "backup-copy-overdue", domains: [] });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: ID.replaceAll("-", ""),
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" },
+  { ...report, invocationId: ID.replaceAll("-", "") }, NOW);
+  assert.match(alert.text, /backup-copy-overdue/);
+  assert.doesNotMatch(JSON.stringify([report, alert]), /private-offsite-path|\/backup-copy/);
+
+  copy.verifiedAt = date(NOW - 2 * 3600_000);
+  assert.ok((await runOperationalCheck(f.config, f.deps)).checks.find(c => c.stage === "backup-copy-freshness")?.ok);
+  copy.capturedAt = date(NOW);
+  assert.equal((await runOperationalCheck(f.config, f.deps)).checks.find(c => c.stage === "backup-copy-proof")?.code,
+    "backup-copy-proof-invalid");
+  const read = f.deps.readJson;
+  f.deps.readJson = path => {
+    if (path === f.config.backupCopyReport) throw Error("backup copy receipt missing");
+    return read(path);
+  };
+  assert.equal((await runOperationalCheck(f.config, f.deps)).checks.find(c => c.stage === "backup-copy-proof")?.code,
+    "backup-copy-proof-unavailable");
+});
+
 test("the scheduled disk probe verifies a complete commit and refuses a state directory it cannot synchronize", async t => {
   const f = fixture(), tmp = mkdtempSync(join(tmpdir(), "operational-durable-write-"));
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
