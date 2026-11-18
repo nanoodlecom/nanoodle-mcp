@@ -1,6 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { MAX_RPC_RETRY_MS, rpcPeerSetId } from "./rpc-backoff.mjs";
 import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
+import { checkedAnchoredNanoHistory } from "./nano-payment-history.mjs";
 
 export { NANO_GENESIS } from "./nano-checkpoint.mjs";
 const GENESIS_KEY = "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65093BA";
@@ -253,7 +254,11 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         const row = { base, info, view };
         if (base !== standbyUrl) primaryViews.push(row);
         if (body.action === "receivable") data = checkedReceivable(data, body, view, checkAddress);
-        if (body.action === "account_history") data = checkedHistory(data, checkAddress);
+        if (body.action === "account_history") {
+          data = body.head && yes(body.raw)
+            ? checkedAnchoredNanoHistory(data, body, view.confirmedFrontier === body.head.toUpperCase() ? view.confirmedHeight : null)
+            : checkedHistory(data, checkAddress);
+        }
         // An older in-flight success cannot erase a newer concurrent refusal.
         if (cooldowns.get(base) === priorCooldown) cooldowns.delete(base);
         return { ...row, data };

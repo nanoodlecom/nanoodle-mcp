@@ -1,4 +1,5 @@
-import { isNanoHistoryHash, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN, nanoQuoteNeedsHistory, readNanoPaymentHistory,
+import { checkedAnchoredNanoHistory, isNanoHistoryHash, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN, nanoHistoryKind,
+  nanoQuoteNeedsHistory, readNanoPaymentHistory,
   NANO_RECEIVABLE_COUNT as RECEIVABLE_LIMIT, NANO_HISTORY_PAGE as HISTORY_LIMIT } from "./nano-payment-history.mjs";
 
 export const NANO_SCAN_GRACE_MS = 120_000;
@@ -21,16 +22,15 @@ export function nanoWatchDemand(ledger, now) {
 /** The legacy writer has no coverage cursor. Sample confirmed deposits from
  * both sides of pocketing. Check the original send time, since a receive
  * block can be written long after the payment was sent. */
-export async function findUnrecordedNanoPayments({ rpc, matchesSend, account, head, ledger, waiting, now }) {
+export async function findUnrecordedNanoPayments({ rpc, matchesSend, account, head, height, ledger, waiting, now }) {
+  const historyRequest = { action: "account_history", account, head, count: String(HISTORY_LIMIT), raw: "true" };
   const [history, receivable] = await Promise.all([
-    rpc({ action: "account_history", account, head, count: String(HISTORY_LIMIT), raw: "true" }),
+    rpc(historyRequest).then(value => checkedAnchoredNanoHistory(value, historyRequest, height)),
     rpc({ action: "receivable", account, count: String(RECEIVABLE_LIMIT), threshold: "1",
       source: "true", include_only_confirmed: "true" }),
   ]);
-  if (typeof history.account !== "string" || history.account.replace(/^xrb_/, "nano_") !== account
-    || (history.history !== "" && !Array.isArray(history.history))
-    || history.history.length > HISTORY_LIMIT || (receivable.blocks !== "" && (!receivable.blocks
-      || typeof receivable.blocks !== "object" || Array.isArray(receivable.blocks)))) throw invalid();
+  if (receivable.blocks !== "" && (!receivable.blocks
+    || typeof receivable.blocks !== "object" || Array.isArray(receivable.blocks))) throw invalid();
   const blocks = Object.entries(receivable.blocks || {});
   if (blocks.length > RECEIVABLE_LIMIT) throw invalid();
 
@@ -49,10 +49,9 @@ export async function findUnrecordedNanoPayments({ rpc, matchesSend, account, he
     if (quote) staged.set(hash, { quote, hash, receipt });
   };
   for (const [sendHash, value] of blocks) collect({ sendHash, amount: value?.amount });
-  for (const row of history.history || []) {
-    if (!confirmed(row.confirmed)) continue;
-    if (row.type === "state" && ["receive", "open"].includes(row.subtype)) collect({ sendHash: row.link, receiveHash: row.hash, amount: row.amount });
-    if (["receive", "open"].includes(row.type)) collect({ sendHash: row.source, receiveHash: row.hash, amount: row.amount });
+  for (const row of history.history) {
+    if (["receive", "open"].includes(nanoHistoryKind(row))) collect({ sendHash: row.type === "state" ? row.link : row.source,
+      receiveHash: row.hash, amount: row.amount });
   }
   if (staged.size > DEPOSIT_PROOF_LIMIT) {
     throw Object.assign(Error("Nano payment observation exceeded its bound"), { code: "NANO_PAYMENT_OBSERVATION_LIMIT" });

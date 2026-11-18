@@ -41,7 +41,7 @@ import { nanoFundingCoverage, nanoFundingLiabilities, nanoQuoteClaim } from "./f
 import { syncPrivateStateParentSync } from "./private-state.mjs";
 import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN as GRAIN,
   NANO_RECEIVABLE_COUNT as RECEIVABLE_COUNT, NANO_HISTORY_PAGE as HISTORY_PAGE,
-  nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
+  checkedAnchoredNanoHistory, nanoHistoryKind, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
@@ -814,8 +814,14 @@ export function createChargeGate({
     return floor;
   }
 
-  async function readHistoryPage(head) {
-    const page = await ops.rpc({ action: "account_history", account: address, count: String(HISTORY_PAGE), ...(head && { head }) });
+  async function readHistoryPage(head, raw, height = null) {
+    const request = { action: "account_history", account: address, count: String(HISTORY_PAGE),
+      ...(head && { head }), ...(raw && { raw: "true" }) };
+    const page = await ops.rpc(request);
+    if (raw) {
+      const proved = checkedAnchoredNanoHistory(page, request, height);
+      return { entries: proved.history, next: proved.previous };
+    }
     if (page?.history !== "" && !Array.isArray(page?.history)) throw new Error("Invalid Nano history page");
     if (page.account && page.account.replace(/^xrb_/, "nano_") !== address.replace(/^xrb_/, "nano_")) throw new Error("Nano history returned the wrong account");
     const entries = [];
@@ -838,7 +844,9 @@ export function createChargeGate({
   function inspectHistory(entries, stop, floor) {
     for (const entry of entries) {
       if (entry.hash === stop || (floor !== null && isNanoHistoryHeight(entry.height) && BigInt(entry.height) <= floor)) return true;
-      if (entry.type === "receive") matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll", history: entry });
+      if (["receive", "open"].includes(nanoHistoryKind(entry))) {
+        matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll", history: entry });
+      }
     }
     return false;
   }
@@ -862,16 +870,19 @@ export function createChargeGate({
    * ticks and restarts until it reaches the last completed checkpoint. */
   async function scanHistory(startedAt, fullReceivableWindow) {
     const prior = historyScan;
-    const anchor = ops.checkpoint?.()?.confirmed?.hash;
-    const latest = await readHistoryPage(isNanoHistoryHash(anchor) ? anchor.toUpperCase() : null);
+    const anchor = ops.checkpoint?.()?.confirmed;
+    const anchored = isNanoHistoryHash(anchor?.hash);
+    const latest = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored, anchored ? anchor.blockCount : null);
     const replay = prior.backfill;
     const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
     const floor = prior.through === null ? initialHistoryFloor() : null;
     if (replay) inspectHistory(latest.entries, replay.newest || prior.through, floor);
 
     for (let used = replay ? 1 : 0; used < HISTORY_MAX_PAGES; used++) {
-      const page = batch.next ? await readHistoryPage(batch.next) : latest;
-      batch.newest ??= page.entries[0]?.hash ?? null;
+      const page = batch.next ? await readHistoryPage(batch.next, anchored) : latest;
+      // A completed cursor must still be visible if an older release resumes
+      // with the default history mode, which skips change and epoch blocks.
+      batch.newest ??= page.entries.find(entry => ["send", "receive", "open"].includes(nanoHistoryKind(entry)))?.hash ?? null;
       const reached = inspectHistory(page.entries, prior.through, floor);
       if (reached || !page.next) {
         if (!reached && prior.through) throw new Error("Nano history ended before the saved checkpoint");

@@ -373,6 +373,38 @@ test("history omits unconfirmed entries so the payment cursor cannot skip them f
   assert.equal(result.history.length, 1); assert.equal(result.previous, null);
 });
 
+test("anchored raw history falls back when a peer cannot prove continuous confirmed pages", async () => {
+  const w = world(), head = "B".repeat(64), tail = "D".repeat(64);
+  const request = { action: "account_history", account: ACCOUNT, head, raw: "true", count: "2" };
+  const page = { account: ACCOUNT, previous: tail, history: [
+    { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: SEND },
+    { hash: SEND, type: "state", subtype: "receive", confirmed: "true", height: "9", previous: tail, amount: "7", account: PAYER },
+  ] };
+  w.peers[1].history = w.peers[2].history = page;
+  const corruptions = [
+    value => { value.account = PAYER; },
+    value => { value.history = []; },
+    value => { value.history[0].hash = OTHER; },
+    value => { value.history[1].height = "8"; },
+    value => { value.history[0].previous = OTHER; },
+    value => { value.history[0].confirmed = "false"; },
+    value => { value.history[0].height = "11"; value.history[1].height = "10"; },
+    value => { value.history[1].previous = head; value.previous = head; },
+    value => { value.history[1].type = "unknown"; },
+    value => { delete value.history[1].account; },
+    value => { delete value.previous; },
+  ];
+  for (const corrupt of corruptions) {
+    const unusable = structuredClone(page);
+    corrupt(unusable);
+    w.peers[0].history = unusable;
+    assert.deepEqual(await w.pool.read(request), page);
+  }
+  w.peers[1].history = { ...page, history: [] };
+  await assert.rejects(w.pool.read(request), { code: "NANO_RPC_READ_QUORUM" });
+  assert.equal(w.pool.status().readablePeers, 0);
+});
+
 test("a stale negative block lookup cannot hide a positive confirmation", async () => {
   const w = world(), prepared = createBlock("0".repeat(64), { work: "0".repeat(16), previous: "B".repeat(64), representative: ACCOUNT, balance: "93", link: PAYER });
   for (const p of w.peers.slice(1)) p.blocks[prepared.hash] = { confirmed: "true", contents: prepared.block };

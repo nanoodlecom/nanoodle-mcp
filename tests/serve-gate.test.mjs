@@ -796,6 +796,41 @@ test("already-pocketed payments are found via account_history", async () => {
   assert.ok(!res.isError, JSON.stringify(res.content));
 });
 
+test("anchored history does not advance past a truncated page and then finds the pocketed payment", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-anchored-history-")), file = join(dir, "gate-state.json");
+  const open = { hash: "A".repeat(64), type: "open", height: "1", confirmed: "true", account: PAYER, amount: "1" };
+  const change = { hash: "C".repeat(64), type: "state", subtype: "change", height: "3", confirmed: "true", previous: "D".repeat(64) };
+  let anchor = open, paid = null, truncate = true, malformedReads = 0;
+  chain.ops.checkpoint = () => ({ confirmed: { hash: anchor.hash, blockCount: anchor.height } });
+  const rpc = chain.ops.rpc;
+  chain.ops.rpc = body => {
+    if (body.action !== "account_history") return rpc(body);
+    assert.equal(body.raw, "true");
+    const start = { account: body.account };
+    if (body.head === open.hash) return { ...start, history: [open] };
+    assert.equal(body.head, change.hash);
+    if (truncate) { malformedReads++; return { ...start, history: [change, paid] }; }
+    return { ...start, history: [change, paid, open] };
+  };
+  const gate = makeGate(chain, { registry, stateFile: file, pollMs: 5, now: () => 8_000_000 });
+  t.after(async () => { await gate.stop(); await rm(dir, { recursive: true }); });
+  const { callTool } = gate.wrapRegistry(registry);
+  const quote = argOf(await callTool({ name: "poster", arguments: { Text: "raw history" } }));
+  const first = await untilState(file, "opening checkpoint", state => state.historyScan?.through === open.hash);
+  paid = { hash: change.previous, type: "state", subtype: "receive", height: "2", confirmed: "true",
+    previous: open.hash, account: PAYER, amount: quote.amountRaw, local_timestamp: "8000" };
+  anchor = change;
+  await until("truncated history attempts", () => malformedReads >= 2);
+  const waiting = JSON.parse(await readFile(file, "utf8"));
+  assert.deepEqual(waiting.historyScan, first.historyScan);
+  assert.equal(gate.quote(quote.paymentId).status, "pending");
+  truncate = false;
+  assert.equal(await gate.waitForPayment(quote.paymentId, 2000), "paid");
+  const saved = await untilState(file, "rollback-compatible history checkpoint", state => state.historyScan?.through === paid.hash);
+  assert.equal(saved.quotes.find(value => value.id === quote.paymentId).payHash, paid.hash);
+});
+
 /*
  * Burst regression: pre-fix, `receivable` was polled with count 50 and history
  * with a fixed 25-entry window every 5th tick, so a burst of simultaneous
@@ -866,12 +901,18 @@ test("Nano history screens unconfirmed and pre-quote deposits before matching a 
   const chain = fakeChain(), registry = fakeRegistry();
   let highest = { blockCount: "7", hash: testHash(7) };
   chain.ops.checkpoint = () => ({ confirmed: highest });
+  const rpc = chain.ops.rpc;
+  chain.ops.rpc = async body => {
+    const result = await rpc(body);
+    if (body.action !== "account_history") return result;
+    return { ...result, account: body.account, previous: result.history.at(-1)?.previous };
+  };
   const gate = makeGate(chain, { registry, now: () => 8_000_000, pollMs: 5 });
   t.after(() => gate.stop());
   const { callTool } = gate.wrapRegistry(registry);
   const p = argOf(await callTool({ name: "poster", arguments: { Text: "confirmed only" } }));
-  const old = { type: "receive", account: PAYER, amount: p.amountRaw, hash: highest.hash, height: "7", confirmed: "true" };
-  const next = { ...old, hash: testHash(8), height: "8", confirmed: "false" };
+  const old = { type: "receive", account: PAYER, amount: p.amountRaw, hash: highest.hash, height: "7", previous: testHash(6), confirmed: "true" };
+  const next = { ...old, hash: testHash(8), height: "8", previous: old.hash, confirmed: "false" };
   chain.state.history.push(next, old);
   highest = { blockCount: "8", hash: next.hash };
   assert.equal(await gate.waitForPayment(p.paymentId, 35), "pending");

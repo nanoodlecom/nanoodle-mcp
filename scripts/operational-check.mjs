@@ -13,7 +13,7 @@ import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
-import { NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
+import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { readNearPaymentReceipts, readNearReceiptTransaction } from "../src/near/watch.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
@@ -32,7 +32,7 @@ import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
-  qualifyNanoAccountViews, checkedHistory, checkedReceivable } from "../src/nano-read-pool.mjs";
+  qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
@@ -419,11 +419,8 @@ export async function runOperationalCheck(config, deps = {}) {
       const url = config.nanoRpcUrls[index];
       const deadline = AbortSignal.timeout(config.timeoutMs || 12_000);
       const rpc = body => nanoRpc(url, body, deadline);
-      const page = await rpc({ action: "account_history", account, head, count: String(NANO_HISTORY_PAGE) });
-      const history = checkedHistory(page, checkAddress);
-      need(typeof page.account === "string" && page.account.replace(/^xrb_/, "nano_") === account && page.history.length <= NANO_HISTORY_PAGE
-        && page.history[0]?.hash.toUpperCase() === head && history.history[0]?.hash.toUpperCase() === head,
-      "nano-fallback-payment-history-unproven");
+      const historyRequest = { action: "account_history", account, head, count: String(NANO_HISTORY_PAGE), raw: "true" };
+      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, nano.view.confirmedHeight);
       const receivableRequest = { action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
         source: "true", include_only_confirmed: "true" };
       const pending = await rpc(receivableRequest);
@@ -455,7 +452,7 @@ export async function runOperationalCheck(config, deps = {}) {
       for (const index of nano.peers) {
         try {
           return await findUnrecordedNanoPayments({ rpc: body => nanoRpc(config.nanoRpcUrls[index], body), matchesSend,
-            account: config.nanoAddress, head: nano.view.confirmedFrontier, ledger, waiting, now: at });
+            account: config.nanoAddress, head: nano.view.confirmedFrontier, height: nano.view.confirmedHeight, ledger, waiting, now: at });
         } catch (error) {
           if (error.code === "NANO_PAYMENT_OBSERVATION_LIMIT") throw error;
           failure = error;
