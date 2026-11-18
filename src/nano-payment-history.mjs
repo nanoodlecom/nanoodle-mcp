@@ -1,4 +1,7 @@
 export const NANO_LATE_WATCH_MS = 60 * 60_000;
+// Keep enough room for a payment burst and bound each history page.
+export const NANO_RECEIVABLE_COUNT = 500;
+export const NANO_HISTORY_PAGE = 100;
 // Match quotes at the 1e-8 XNO precision displayed by wallets.
 export const NANO_PAYMENT_GRAIN = 10n ** 22n;
 export const isNanoHistoryHash = value => typeof value === "string" && /^[a-fA-F0-9]{64}$/.test(value) && !/^0+$/.test(value);

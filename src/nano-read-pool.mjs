@@ -89,7 +89,7 @@ export function qualifyNanoAccountViews(rows) {
   return { current, lagging, latestConfirmed };
 }
 
-function checkedReceivable(value, body, view, checkAddress) {
+export function checkedReceivable(value, body, view, checkAddress) {
   const blocks = value?.blocks;
   if (blocks !== "" && (!blocks || typeof blocks !== "object" || Array.isArray(blocks))) throw fail("NANO_RPC_BAD_RECEIVABLE");
   const entries = Object.entries(blocks || {}), normalized = {}, seen = new Set(); let sum = 0n;
@@ -110,7 +110,7 @@ function checkedReceivable(value, body, view, checkAddress) {
   return { ...value, blocks: entries.length ? normalized : "" };
 }
 
-function checkedHistory(value, checkAddress) {
+export function checkedHistory(value, checkAddress) {
   if (value?.history !== "" && !Array.isArray(value?.history)) throw fail("NANO_RPC_BAD_HISTORY");
   const history = [];
   for (const row of value.history || []) {
