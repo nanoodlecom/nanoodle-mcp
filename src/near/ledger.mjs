@@ -13,6 +13,7 @@
 import { readFileSync } from "node:fs";
 import { writePrivateStateSync } from "../private-state.mjs";
 import { NearError } from "./errors.mjs";
+import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META } from "./quote-capacity.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
 
@@ -37,8 +38,9 @@ function copy(v) {
   return v === undefined ? undefined : structuredClone(v);
 }
 
-export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false }) {
+export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false, watchPaymentHistory = false }) {
   if (typeof requireExisting !== "boolean") throw TypeError("requireExisting must be a boolean");
+  if (typeof watchPaymentHistory !== "boolean") throw TypeError("watchPaymentHistory must be a boolean");
   if (typeof file !== "string" || !file) throw new TypeError("openNearLedger needs a file path");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof merchant !== "string" || !merchant) throw new TypeError("openNearLedger needs a merchant account");
@@ -100,6 +102,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
   const ledger = {
     file,
     persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0 }),
+    paymentWatchCoverage: () => nearPaymentWatchCoverage(state.meta[PAYMENT_WATCH_META], watchPaymentHistory),
 
     getQuote(id) {
       return Object.hasOwn(state.quotes, id) ? copy(state.quotes[id]) : null;
@@ -208,16 +211,18 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     },
 
     /**
-     * Delete old finished quotes and unpaid quotes past retention. Preserve
-     * unpaid quotes that still need to be reconciled with a recorded tx claim.
+     * Delete old finished quotes. Release unpaid quotes after retention once
+     * the watcher has covered the window and any recorded claim is attached.
      * Consumed hashes and refunds are never pruned.
      */
     prune({ retainMs = 86_400_000, unpaidRetainMs = 86_400_000 } = {}) {
       const t = now();
+      const coveredThroughMs = ledger.paymentWatchCoverage();
       const doomed = [];
       for (const [id, q] of Object.entries(state.quotes)) {
         if (awaitingPayment(q)) {
-          if (!unattachedPayments.has(id) && typeof q.expiresAt === "number" && t - q.expiresAt > unpaidRetainMs) doomed.push(id);
+          if (!unattachedPayments.has(id) && Number.isFinite(q.expiresAt)
+            && !holdsNearQuoteAmount(q, t, unpaidRetainMs, coveredThroughMs)) doomed.push(id);
           continue;
         }
         if (!FINAL_QUOTE.has(q.status)) continue;

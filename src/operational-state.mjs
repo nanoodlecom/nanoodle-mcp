@@ -3,6 +3,7 @@
 import { parseUsdNano } from "./usd.mjs";
 import { nanoFundingLiabilities, nanoQuoteClaim, marketCreatorLiabilities } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
+import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
 
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const U128_MAX = (1n << 128n) - 1n;
@@ -18,6 +19,8 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     || !object(near.consumedTx ?? {})) throw Error("invalid-state-shape");
   let nanoRaw = nanoFundingLiabilities({ quotes: nano.quotes, owed: nano.owed }), marketUsdNano = 0n;
   const nearClaims = nearRefundClaims(near, { now });
+  const watch = near.meta?.[PAYMENT_WATCH_META];
+  const coveredThroughMs = nearPaymentWatchCoverage(watch, !!watch?.backfill);
   const issues = new Set();
   for (const [hash, id] of Object.entries(near.consumedTx ?? {})) {
     const quote = near.quotes[id];
@@ -57,6 +60,9 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
   }
   for (const q of values(near.quotes)) {
     if (!["pending", "paid", "running", "settled", "failed", "rejected", "expired"].includes(q.status)) throw Error("invalid-near-quote-status");
+    if (q.expiresAt + RETAIN_NEAR_QUOTE_MS < now && holdsNearQuoteAmount(q, now, RETAIN_NEAR_QUOTE_MS, coveredThroughMs)) {
+      issues.add("near-quote-payment-scan-overdue");
+    }
     if (["paid", "running"].includes(q.status)) {
       if (old(q.paidAtBlockMs ?? q.createdAt, stuckMs)) issues.add("near-paid-work-stuck");
     } else if (q.settlement && !refundPayments.has(q.id)) {

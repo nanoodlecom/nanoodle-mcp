@@ -44,12 +44,13 @@ test("a failed receipt lookup or gate confirmation retries the same block, witho
     if (reject) throw new NearError("RPC_UNAVAILABLE", "temporary failure");
     w.observed.push({ hash, sender });
   } });
-  await watcher.start(); const before = w.ledger.getMeta("paymentWatch").height;
+  await watcher.start(); const before = w.ledger.getMeta("paymentWatch");
   w.quote(); const tx = w.pay(); await watcher.tick();
-  assert.equal(w.ledger.getMeta("paymentWatch").height, before);
+  assert.deepEqual(w.ledger.getMeta("paymentWatch"), before);
   assert.equal(watcher.status().listening, false);
   reject = false; await watcher.tick();
   assert.equal(watcher.status().listening, true);
+  assert.ok(w.ledger.getMeta("paymentWatch").coveredThroughMs > before.coveredThroughMs);
   assert.equal(w.observed[0].hash, tx); watcher.stop();
 });
 

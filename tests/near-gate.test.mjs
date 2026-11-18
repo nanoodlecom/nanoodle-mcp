@@ -15,11 +15,12 @@ import { fetchCatalogs, loadTools } from "../src/tools.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
 import {
-  createNearRpc, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
+  createNearRpc, createNearWatcher, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
 } from "../src/near/index.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 import { createNearFunding } from "../src/near/funding.mjs";
 import { USDC_CONTRACTS } from "../src/near/ft.mjs";
+import { RETAIN_NEAR_QUOTE_MS } from "../src/near/quote-capacity.mjs";
 import { createFakeChain, throwawayNearKey, GAS_YOCTO, WORKED_CATALOGS, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
 
 const MERCHANT = "merchant.testnet";
@@ -42,10 +43,11 @@ before(async () => {
 after(() => { globalThis.fetch = realFetch; });
 
 async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false,
-  merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch, now = Date.now } = {}) {
+  merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch, now = Date.now,
+  watchPaymentHistory = false, randomInt = () => dust++ } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
-  const chain = createFakeChain();
+  const chain = createFakeChain({ now });
   chain.addAccount(MERCHANT, merchantBalance, key.publicKey);
   chain.addAccount(PAYER, parseNearToYocto("5"));
   if (usdcToken) chain.addFt(usdcToken, { [MERCHANT]: 0n, [PAYER]: 1_000_000n });
@@ -54,7 +56,7 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
   const events = [];
   const make = () => {
     const rpc = createNearRpc({ url: "https://rpc.fake", fetch: chain.fetch });
-    const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT, now });
+    const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT, now, watchPaymentHistory });
     const signer = parseNearSecretKey(key.secretKey);
     const refundFunding = guardRefunds ? createNearFunding({ rpc, ledger, accountId: MERCHANT, publicKey: signer.publicKey, network: "testnet" }) : null;
     const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null,
@@ -63,12 +65,12 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
       rate: rate || createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: catalogFetch, randomInt: () => dust++, publicBase, canQuote, fundRun, refundFunding, maintenance,
+      limits, fetch: catalogFetch, randomInt, publicBase, canQuote, fundRun, refundFunding, maintenance,
       baseUrl, now, ...(usdcToken && { usdcEnabled: true, usdcToken }),
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
-    return { gate, ledger, refunder, listTools, callTool };
+    return { gate, ledger, rpc, refunder, listTools, callTool };
   };
   const g = make();
   return { ...g, chain, registry, file, out, events, restart: async () => { const n = make(); await n.gate.resume(); return n; } };
@@ -292,6 +294,52 @@ test("watcher replay repairs an expired quote with an old unattached claim after
   assert.equal(restarted.ledger.getQuote(p.paymentId).payer, PAYER);
   assert.equal(restarted.ledger.hasUnattachedPayment(p.paymentId), false);
   assert.equal(w.events.filter(event => event.event === "paid").length, 1);
+  assert.equal(mock.runs(), runs);
+});
+
+test("a restart beyond retention backfills on-time NEAR and USDC checkout deposits from a legacy cursor", async t => {
+  let clock = Date.now();
+  const now = () => clock, token = USDC_CONTRACTS.testnet;
+  const rate = createNearRates({ nearUsd: "3.64", now });
+  const w = await world({ now, rate, usdcToken: token, watchPaymentHistory: true, randomInt: () => 137 });
+  clock += 1_000;
+  const quote = async (server, asset) => (await call(server, "idea-poster", { ...INPUTS, _pay_with: asset })).structuredContent.payment;
+  const unpaid = await quote(w, "near"), near = await quote(w, "near"), usdc = await quote(w, "usdc");
+  const nearTx = w.chain.transfer(PAYER, MERCHANT, BigInt(near.amountYocto), { blockTimeMs: ++clock });
+  const usdcTx = w.chain.ftTransfer(token, PAYER, MERCHANT, BigInt(usdc.amountAtomic), { blockTimeMs: ++clock });
+  const { header } = await w.rpc.block({ finality: "final" });
+  w.ledger.setMeta("paymentWatch", { height: header.height, hash: header.hash, backfill: null });
+
+  clock = Date.parse(unpaid.expiresAt) + RETAIN_NEAR_QUOTE_MS + 1;
+  const unrelated = w.chain.transfer(PAYER, MERCHANT, BigInt(unpaid.amountYocto));
+  const restarted = await w.restart();
+  const watcher = createNearWatcher({ rpc: restarted.rpc, ledger: restarted.ledger, merchantId: MERCHANT,
+    pendingQuotes: restarted.gate.pendingQuotes, observeTransfer: restarted.gate.observeTransfer,
+    tokenContracts: [token], maxBlocksPerTick: 1, now, schedule: () => null });
+  t.after(() => watcher.stop());
+  const runs = mock.runs();
+  await watcher.start();
+  assert.equal(restarted.ledger.getMeta("paymentWatch").coveredThroughMs, null);
+  assert.equal(watcher.status().backfilling, true);
+  assert.equal(restarted.ledger.consumedBy(unrelated), null);
+  const newQuote = await quote(restarted, "near");
+  assert.notEqual(newQuote.amountYocto, unpaid.amountYocto, "the earlier amount is still reserved");
+  assert.equal(restarted.ledger.prune({ unpaidRetainMs: RETAIN_NEAR_QUOTE_MS }), 0);
+
+  await watcher.tick();
+  assert.equal(restarted.gate.quote(usdc.paymentId).txHash, usdcTx);
+  assert.equal(restarted.gate.quote(near.paymentId).status, "expired");
+  assert.equal(restarted.ledger.getMeta("paymentWatch").coveredThroughMs, null);
+  await watcher.tick();
+  assert.equal(restarted.gate.quote(near.paymentId).txHash, nearTx);
+  assert.equal(restarted.gate.quote(near.paymentId).status, "paid");
+  assert.equal(restarted.gate.quote(usdc.paymentId).status, "paid");
+  await watcher.tick();
+  assert.equal(watcher.status().backfilling, false);
+  assert.equal(restarted.ledger.getMeta("paymentWatch").coveredThroughMs, clock);
+  assert.equal(restarted.ledger.prune({ unpaidRetainMs: RETAIN_NEAR_QUOTE_MS }), 1);
+  assert.equal(restarted.gate.quote(unpaid.paymentId), null);
+  assert.equal((await quote(restarted, "near")).amountYocto, unpaid.amountYocto);
   assert.equal(mock.runs(), runs);
 });
 

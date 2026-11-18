@@ -7,9 +7,14 @@
  */
 import { NearError } from "./errors.mjs";
 import { assertFreshBlock, MAX_HEAD_AGE_MS, MAX_CLOCK_SKEW_MS } from "./freshness.mjs";
+import { PAYMENT_WATCH_META } from "./quote-capacity.mjs";
 
-const META = "paymentWatch";
-const timeMs = (block) => Number(BigInt(block.header.timestamp_nanosec) / 1_000_000n);
+function historicalTime(block) {
+  const ns = block?.header?.timestamp_nanosec;
+  const ms = typeof ns === "string" && /^\d+$/.test(ns) ? Number(BigInt(ns) / 1_000_000n) : NaN;
+  if (!Number.isSafeInteger(ms)) throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received an invalid historical block timestamp");
+  return ms;
+}
 
 export function createNearWatcher({
   rpc, ledger, merchantId, pendingQuotes, observeTransfer,
@@ -20,17 +25,20 @@ export function createNearWatcher({
   cancel = clearTimeout,
 }) {
   if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.accepting !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
-  let state = ledger.getMeta(META) || null;
+  let state = ledger.getMeta(PAYMENT_WATCH_META) || null;
   if (state && (!Number.isSafeInteger(state.height) || state.height < 0 || typeof state.hash !== "string"
+    || (state.coveredThroughMs != null && (!Number.isSafeInteger(state.coveredThroughMs) || state.coveredThroughMs < 0))
+    || (state.coveredThroughMs === null && !state.backfill)
     || (state.backfill && (typeof state.backfill.nextHash !== "string" || !Number.isFinite(state.backfill.cutoffMs))))) {
     throw new NearError("STATE_UNREADABLE", "The NEAR payment watcher cursor is malformed");
   }
   let timer = null, stopped = true, inflight = null, failures = 0, lastError = null, lastScanAt = null, lastHeadAt = null;
-  function save(next) { ledger.setMeta(META, next); state = next; }
+  function save(next) { ledger.setMeta(PAYMENT_WATCH_META, next); state = next; }
 
   async function inspect(block) {
-    if (!pendingQuotes().length) return;
-    const accounts = [merchantId, ...tokenContracts.filter((token) => pendingQuotes().some((q) => q.asset === "usdc" && q.tokenContract === token))];
+    const pending = pendingQuotes();
+    if (!pending.length) return;
+    const accounts = [merchantId, ...tokenContracts.filter((token) => pending.some((q) => q.asset === "usdc" && q.tokenContract === token))];
     const changes = await rpc.call("EXPERIMENTAL_changes", {
       changes_type: "account_changes", account_ids: accounts, block_id: block.header.hash,
     });
@@ -55,21 +63,26 @@ export function createNearWatcher({
   async function scan() {
     const latest = await rpc.block({ finality: "final" });
     const headAt = assertFreshBlock(latest, { now: now(), maxHeadAgeMs, maxClockSkewMs });
-    const height = Number(latest?.header?.height);
-    if (!Number.isSafeInteger(height) || typeof latest.header.hash !== "string") {
-      throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received no finalized block height");
+    const height = Number(latest.header.height), hash = latest.header.hash;
+    if (state && (height < state.height || (height === state.height && hash !== state.hash)
+      || (state.coveredThroughMs != null && headAt < state.coveredThroughMs))) {
+      throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher RPC disagrees with its finalized cursor");
     }
-    if (!state) {
+    // Older cursors did not prove which quote windows were fully inspected.
+    if (!state || state.coveredThroughMs === undefined) {
       const pending = pendingQuotes();
-      save({ height, hash: latest.header.hash, backfill: pending.length
-        ? { nextHash: latest.header.hash, cutoffMs: Math.min(...pending.map((q) => q.createdAt)) }
-        : null });
+      save({ height, hash, coveredThroughMs: pending.length ? null : headAt, backfill: pending.length
+        ? { nextHash: hash, cutoffMs: Math.min(...pending.map((q) => q.createdAt)) } : null });
     }
-    if (height < state.height) throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher RPC fell behind its persisted cursor");
+    // Advance coverage only when the current finalized head and any older gap
+    // have both been inspected. Each checkpoint is persisted after inspection.
+    const saveProgress = next => save(next.height === height && !next.backfill ? { ...next, coveredThroughMs: headAt } : next);
     let remaining = maxBlocksPerTick;
     // With no quotes there is nothing to buy. Top-ups are never interpreted as jobs.
     if (!pendingQuotes().length) {
-      if (state.height !== height || state.backfill) save({ height, hash: latest.header.hash, backfill: null });
+      if (state.height !== height || state.backfill || state.coveredThroughMs !== headAt) {
+        save({ height, hash, backfill: null, coveredThroughMs: headAt });
+      }
     } else {
       // After a long outage, keep new payments live while recovering older
       // quotes newest-first. Rewalking a range is safe: the gate durably
@@ -78,7 +91,7 @@ export function createNearWatcher({
         const cutoffMs = Math.min(...pendingQuotes().map(q => q.createdAt), state.backfill?.cutoffMs ?? Infinity);
         await inspect(latest);
         remaining--;
-        save({ height, hash: latest.header.hash, backfill: {
+        save({ ...state, height, hash, backfill: {
           nextHash: latest.header.prev_hash,
           cutoffMs,
         } });
@@ -96,7 +109,7 @@ export function createNearWatcher({
           throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received a discontinuous finalized chain");
         }
         await inspect(block);
-        save({ ...state, height: Number(block.header.height), hash: block.header.hash });
+        saveProgress({ ...state, height: nextHeight, hash: block.header.hash });
         nextHeight++;
       }
       // Backfill runs newest-first without delaying live transfers at the tip.
@@ -104,7 +117,7 @@ export function createNearWatcher({
       while (state.backfill && budget-- > 0) {
         const block = await rpc.block({ blockId: state.backfill.nextHash });
         if (block.header.hash !== state.backfill.nextHash) throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher backfill block mismatch");
-        if (timeMs(block) < state.backfill.cutoffMs) { save({ ...state, backfill: null }); break; }
+        if (historicalTime(block) < state.backfill.cutoffMs) { saveProgress({ ...state, backfill: null }); break; }
         await inspect(block);
         save({ ...state, backfill: { ...state.backfill, nextHash: block.header.prev_hash } });
       }

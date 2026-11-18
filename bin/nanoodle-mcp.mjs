@@ -935,7 +935,8 @@ async function startNearMode({
 
   let ledger;
   try {
-    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant, requireExisting: requireExistingState });
+    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant,
+      requireExisting: requireExistingState, watchPaymentHistory: true });
   } catch (e) { fail(e.message); }
   // NEAR/USD, XNO/USD and the swap rate derived from them. When runs are paid
   // from the Nano wallet, XNO/USD is required to quote; with an API key it is informational.
