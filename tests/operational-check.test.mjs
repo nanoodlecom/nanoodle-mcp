@@ -1293,6 +1293,59 @@ test("watcher readiness rejects malformed heights, impossible leads and unknown 
   }
 });
 
+test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a real receipt", async t => {
+  const payer = "private-canary.near", paymentTx = base58Encode(Buffer.alloc(32, 3));
+  const receiptId = base58Encode(Buffer.alloc(32, 4)), receiptBlock = base58Encode(Buffer.alloc(32, 5));
+  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof"]) {
+    const f = fixture(({ url, body }, config) => {
+      if (!url.hostname.startsWith("near-") || !body) return null;
+      const json = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
+      const merchant = config.merchant;
+      if (body.method === "tx") {
+        assert.deepEqual(body.params, { tx_hash: paymentTx, sender_account_id: payer, wait_until: "FINAL" });
+        return json({ final_execution_status: "FINAL", status: { SuccessValue: "" },
+          transaction: { hash: paymentTx, signer_id: payer, receiver_id: merchant, actions: [{ Transfer: { deposit: "1" } }] },
+          receipts_outcome: [{ id: receiptId, block_hash: receiptBlock, outcome: { executor_id: merchant, status: { SuccessValue: "" } } }] });
+      }
+      if (body.method === "block" && body.params.block_id === receiptBlock) {
+        return json({ header: { height: 80, hash: receiptBlock } });
+      }
+      if (body.method === "EXPERIMENTAL_changes") {
+        assert.deepEqual(body.params, { changes_type: "account_changes", account_ids: [merchant, USDC_CONTRACTS.mainnet],
+          block_id: receiptBlock });
+        return json({ block_hash: receiptBlock, changes: scenario === "empty-changes" ? []
+          : [{ cause: { type: "receipt_processing", receipt_hash: receiptId }, change: { account_id: merchant } }] });
+      }
+      if (body.method === "EXPERIMENTAL_receipt_to_tx") {
+        assert.deepEqual(body.params, { receipt_id: receiptId, block_height: 80 });
+        return json({ transaction_hash: scenario === "wrong-transaction" && url.hostname === "near-1.example" ? receiptId : paymentTx,
+          sender_account_id: payer });
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.canaryPayer = { accountId: payer, maxNear: "0.01", publicKey: "ed25519:private-canary-key" };
+    f.config.nearDiscoveryReport = "/discovery/latest.json";
+    f.states[f.config.nearDiscoveryReport] = { v: 1, paymentTx, checkedAt: new Date(NOW - (scenario === "stale-proof"
+      ? 27 * 3600_000 + 1 : 60_000)).toISOString() };
+    const report = await runOperationalCheck(f.config, f.deps);
+    const find = stage => report.checks.find(c => c.stage === stage);
+    assert.equal(find("near-payment-watcher")?.ok, true);
+    assert.equal(find("near-canary-discovery-proof")?.ok, scenario !== "stale-proof");
+    if (scenario === "stale-proof") {
+      assert.equal(find("near-canary-discovery-proof").code, "near-discovery-canary-proof-stale");
+      assert.ok(f.calls.every(call => call.body?.method !== "tx"));
+    } else {
+      assert.equal(find("near-payment-discovery")?.ok, scenario !== "empty-changes");
+      assert.equal(find("near-discovery-peer-1")?.ok, scenario === "complete");
+      if (scenario !== "complete") assert.deepEqual(find("near-discovery-peer-1").domains, []);
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.ok(!JSON.stringify(report).includes(paymentTx));
+    assert.ok(!JSON.stringify(report).includes(payer));
+  }
+});
+
 test("scheduled readiness separates watcher failure from refund proof, shortfall and stale funding", async t => {
   for (const [code, expected] of [
     ["NEAR_FUNDING_UNAVAILABLE", "near-refund-funding-unavailable"],
