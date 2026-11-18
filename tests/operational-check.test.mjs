@@ -237,6 +237,23 @@ test("the monitor warns before the shared NEAR and USDC quote queue fills and re
   }
 });
 
+test("the monitor reports an unattached NEAR payment claim without exposing its quote or tx hash", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const near = f.states["/state/near-state.json"];
+  near.consumedTx = { "private-payment-hash": "private-payment-id", "pruned-payment-hash": "pruned-payment-id" };
+  const quote = near.quotes["private-payment-id"] = { status: "expired", expiresAt: NOW - 1, amountYocto: "1" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === "near-payment-claim-unattached"), {
+    stage: "near-payment-claim-unattached", ok: false, code: "near-payment-claim-unattached", domains: [],
+  });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /private-payment-|pruned-payment-/);
+  quote.payTx = "private-payment-hash";
+  const recovered = await runOperationalCheck(f.config, f.deps);
+  assert.ok(!recovered.checks.some(c => c.stage === "near-payment-claim-unattached"));
+});
+
 test("expired but refundable quotes can exhaust a single price without closing the rail", async t => {
   for (const [asset, retained] of [["usdc", 800], ["usdc", 999], ["near", 999]]) {
     const f = fixture();

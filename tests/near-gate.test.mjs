@@ -42,7 +42,7 @@ before(async () => {
 after(() => { globalThis.fetch = realFetch; });
 
 async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false,
-  merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch } = {}) {
+  merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch, now = Date.now } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain();
@@ -54,7 +54,7 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
   const events = [];
   const make = () => {
     const rpc = createNearRpc({ url: "https://rpc.fake", fetch: chain.fetch });
-    const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT });
+    const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT, now });
     const signer = parseNearSecretKey(key.secretKey);
     const refundFunding = guardRefunds ? createNearFunding({ rpc, ledger, accountId: MERCHANT, publicKey: signer.publicKey, network: "testnet" }) : null;
     const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null,
@@ -64,7 +64,7 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
       rate: rate || createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
       limits, fetch: catalogFetch, randomInt: () => dust++, publicBase, canQuote, fundRun, refundFunding, maintenance,
-      baseUrl, ...(usdcToken && { usdcEnabled: true, usdcToken }),
+      baseUrl, now, ...(usdcToken && { usdcEnabled: true, usdcToken }),
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -266,6 +266,33 @@ test("a discovered exact transfer is accepted automatically; top-ups and older t
   assert.equal(w.gate.quote(p.paymentId).status, "paid");
   const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
   assert.equal(result.structuredContent.receipt.refund.status, "sent");
+});
+
+test("watcher replay repairs an expired quote with an old unattached claim after final proof", async () => {
+  let clock = Date.now();
+  const w = await world({ now: () => clock });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS, { blockTimeMs: clock + 1 });
+  assert.equal(w.ledger.consumeTx(tx, p.paymentId), true);
+  clock = Date.parse(p.expiresAt) + 3_600_001;
+  const restarted = await w.restart();
+  assert.deepEqual(restarted.gate.pendingQuotes().map(q => q.id), [p.paymentId]);
+  assert.equal(restarted.gate.quote(p.paymentId).status, "expired");
+  const otherTx = w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto), { blockTimeMs: clock });
+  const other = await restarted.gate.confirmPayment(p.paymentId, otherTx, PAYER);
+  assert.match(other.error, /Confirm that original transaction/);
+  assert.equal(restarted.ledger.consumedBy(otherTx), null);
+  w.chain.hideTx = 1;
+  await assert.rejects(restarted.gate.observeTransfer(tx, PAYER), { code: "WATCH_CONFIRM_FAILED" });
+  assert.equal(restarted.ledger.getQuote(p.paymentId).payTx, null);
+  const runs = mock.runs();
+  await restarted.gate.observeTransfer(tx, PAYER);
+  await restarted.gate.observeTransfer(tx, PAYER);
+  assert.equal(restarted.gate.quote(p.paymentId).status, "paid");
+  assert.equal(restarted.gate.quote(p.paymentId).txHash, tx);
+  assert.equal(restarted.ledger.getQuote(p.paymentId).payer, PAYER);
+  assert.equal(restarted.ledger.hasUnattachedPayment(p.paymentId), false);
+  assert.equal(w.events.filter(event => event.event === "paid").length, 1);
+  assert.equal(mock.runs(), runs);
 });
 
 test("wallet confirmation refunds wrong and late transfers without running a model", async () => {
