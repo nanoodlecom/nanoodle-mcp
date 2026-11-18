@@ -381,6 +381,8 @@ async function main() {
       ...(marketEnabled ? [marketService?.persistenceStatus()] : []),
     ], { requireAll: true });
     const guardedFunding = paidFunding || marketEnabled;
+    const checkpointFile = guardedFunding && process.env.NANOODLE_STATE_POLICY && process.env.NANOODLE_MAINTENANCE_STARTUP_FILE
+      ? join(canonicalStatePath(resolvedOut), "nano-wallet-checkpoint.json") : null;
     let fundingSources = null;
     let writerLocks = null;
     // The wallet exists for two independent jobs: paying NanoGPT x402 invoices when
@@ -412,6 +414,7 @@ async function main() {
           requireFunding: paidFunding && !apiKey,
           protectTransfers: guardedFunding,
           verifyRpcReads: guardedFunding,
+          checkpointFile,
           assertWriter: () => {
             if (!writerLocks) throw Error("Payment writer protection not acquired");
             writerLocks.assertHeld();
@@ -468,7 +471,8 @@ async function main() {
       fundingSources?.requireFiles(requiredState.files);
       console.error(`nanoodle-mcp: required payment state verified (${requiredState.files.length} files)`);
     }
-    if (nanoCheckpoint) {
+    if (checkpointFile && wallet) await wallet.ops.loadRestartCheckpoint(nanoCheckpoint);
+    else if (nanoCheckpoint) {
       if (!wallet || !guardedFunding) throw Error("Startup permit requires an active guarded Nano wallet");
       await wallet.ops.verifyCheckpoint(nanoCheckpoint);
     }

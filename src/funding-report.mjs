@@ -17,6 +17,10 @@ const readFailureCodes = new Map([
   ["NANO_RPC_UNCONFIRMED_FRONTIER", "nano-rpc-unconfirmed-frontier"],
   ["NANO_RPC_STANDBY_DISAGREES", "nano-rpc-standby-disagrees"],
   ["NANO_RPC_STANDBY_BUDGET", "nano-rpc-standby-budget"],
+  ["NANO_RPC_CHECKPOINT_UNPROVEN", "nano-checkpoint-unproven"],
+  ["NANO_RPC_CHECKPOINT_CONFLICT", "nano-checkpoint-conflict"],
+  ["NANO_CHECKPOINT_INVALID", "nano-checkpoint-invalid"],
+  ["NANO_CHECKPOINT_STORAGE", "nano-checkpoint-storage-unavailable"],
 ]);
 const reportFailureCodes = new Set([
   "funding-state-unavailable", "funding-underfunded", "funding-durable-state-unavailable",

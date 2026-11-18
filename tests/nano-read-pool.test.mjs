@@ -8,7 +8,7 @@ const ACCOUNT = NANO_GENESIS_REPLY.contents.account, PAYER = "nano_3i1aq1cchnmbn
 const SEND = "A".repeat(64), OTHER = "C".repeat(64);
 const absent = () => Object.assign(Error("Block not found"), { authoritative: true });
 const pending = amount => ({ blocks: { [SEND]: { amount: String(amount), source: PAYER } } });
-function world(count = 3, requestsPerMinute = 0, account = ACCOUNT) {
+function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfirmed = null) {
   let at = 1_000, elapsed = 0;
   const peers = Array.from({ length: count + Number(requestsPerMinute > 0) }, (_, index) => ({
     base: requestsPerMinute ? `https://peer-${index}.example` : String(index),
@@ -16,7 +16,7 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT) {
   }));
   const calls = [];
   const standby = requestsPerMinute ? { url: peers[count].base, requestsPerMinute } : undefined;
-  const pool = createNanoReadPool({ bases: peers.slice(0, count).map(p => p.base), account, checkAddress, hashBlock, standby,
+  const pool = createNanoReadPool({ bases: peers.slice(0, count).map(p => p.base), account, checkAddress, hashBlock, standby, persistConfirmed,
     now: () => at, monotonicNow: () => elapsed,
     rpc: async (body, base) => {
       calls.push({ action: body.action, base });
@@ -75,6 +75,23 @@ test("the Nano standby stays idle at quorum and only corroborates an eligible pr
   assert.equal(standbyCalls().length, before, "the standby cannot act as the only peer");
   assert.equal(w.pool.status().readablePeers, 0);
   await assert.rejects(w.pool.publishBases(), { code: "NANO_RPC_NETWORK_QUORUM" });
+});
+
+test("a standby can corroborate the owned node when the other primary is one block behind", async () => {
+  const saved = [];
+  const { pool, peers, calls } = world(2, 10, ACCOUNT, value => saved.push(value));
+  const [owned, lagging, standby] = peers;
+  await pool.read(info);
+  assert.equal(saved.at(-1).head.blockCount, "10");
+  assert.ok(calls.every(call => call.base !== standby.base));
+  owned.info = standby.info = nanoAccountInfo({ height: 11, frontier: OTHER });
+  assert.equal((await pool.read(info)).block_count, "11");
+  assert.equal(saved.at(-1).head.blockCount, "11");
+  assert.equal(pool.status().standby.inUse, true);
+  assert.deepEqual(await pool.publishBases(), [owned.base]);
+  lagging.info = owned.info;
+  await pool.read(info);
+  assert.equal(pool.status().standby.inUse, false);
 });
 
 test("the standby cannot hide primary disagreement or contribute a different view", async () => {

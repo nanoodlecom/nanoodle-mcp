@@ -114,7 +114,7 @@ function checkedHistory(value, checkAddress) {
 /** Read-only account ordering, shared by hosted wallet paths. No PoW, signing,
  * publication, inference or balance aggregation across different snapshots. */
 export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBlock, standby: standbyOptions,
-  now = Date.now, monotonicNow = () => performance.now(), networkTtlMs = 30_000 }) {
+  persistConfirmed = null, now = Date.now, monotonicNow = () => performance.now(), networkTtlMs = 30_000 }) {
   if (!Array.isArray(bases) || !bases.length || bases.length > 8 || bases.some(b => typeof b !== "string" || !b)) throw new TypeError("Nano read pool needs between one and eight endpoint identifiers");
   if (new Set(bases).size !== bases.length) throw new TypeError("Duplicate Nano RPC endpoints are not independent peers");
   if (typeof checkAddress !== "function" || typeof hashBlock !== "function") throw new TypeError("Nano read pool needs wallet-owned address and hash validators");
@@ -186,6 +186,13 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     if (v.height > latestConfirmed.confirmedHeight && !knownLocal) throw fail("NANO_RPC_UNCONFIRMED_FRONTIER", "Nano account has an unknown unconfirmed head; new spending is paused");
     if (high && (v.height < high.height || (v.height === high.height && (v.frontier !== high.frontier || v.balance !== high.balance
         || (high.pending != null && v.pending < high.pending))))) throw fail("NANO_RPC_REGRESSION");
+    if (persistConfirmed) {
+      // A merely readable peer can lag. A frontier that survives restarts
+      // must have two witnesses for the same confirmed block.
+      if (rows.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight).length < 2) throw unprovenCheckpoint();
+      const head = { hash: latestConfirmed.confirmedFrontier, blockCount: latestConfirmed.confirmedHeight.toString() };
+      persistConfirmed({ v: 1, networkGenesis: NANO_GENESIS, account, head, confirmed: head });
+    }
     high = { ...v, local: knownLocal }; final = { ...latestConfirmed }; lastReadAt = now(); readPeers = rows.length;
     standbyInUse = rows.some(r => r.base === standbyUrl);
     preferred = rows.filter(r => r.base !== standbyUrl && r.view.height === v.height && r.view.pending === v.pending).map(r => r.base);
@@ -256,14 +263,18 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     // An older, overlapping read cannot requalify a peer behind the last
     // confirmed observation, even if its own responses agreed with each other.
     if (final && latestConfirmed && latestConfirmed.confirmedHeight < final.confirmedHeight) throw fail("NANO_RPC_REGRESSION");
-    for (const { base } of current) laggingPeers.delete(base);
+    const confirmedNow = row => !persistConfirmed || row.view.confirmedHeight === latestConfirmed.confirmedHeight;
+    for (const row of current) {
+      if (confirmedNow(row)) laggingPeers.delete(row.base);
+      else laggingPeers.add(row.base);
+    }
     for (const { base } of lagging) laggingPeers.add(base);
     const rows = replies.filter(row => !laggingPeers.has(row.base));
     if (rows.length === 1 && standby && !blocked) {
       const primary = rows[0].view;
       // An invalid history or receivable response does not erase a valid,
       // competing account view the primary returned during that request.
-      if (current.some(({ view }) => !sameAccountView(primary, view))) {
+      if (current.some(row => confirmedNow(row) && !sameAccountView(primary, row.view))) {
         readPeers = 0; throw fail("NANO_RPC_CONFLICT");
       }
       const other = await qualifyStandby() ? await readPeer(standbyUrl) : null;
@@ -278,7 +289,10 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       }
     }
     const valid = rows.filter(row => hasProof(row.base));
-    if (!anchor && valid.length < minimum && lagging.length) throw fail("NANO_RPC_LAGGING_PEERS", "Not enough Nano peers have a current confirmed account view");
+    if (!anchor && valid.length < minimum) {
+      if (persistConfirmed && current.some(row => !confirmedNow(row))) throw unprovenCheckpoint();
+      if (lagging.length) throw fail("NANO_RPC_LAGGING_PEERS", "Not enough Nano peers have a current confirmed account view");
+    }
     const best = select(anchor ? await anchoredRows(valid, anchor) : valid);
     return body.action === "account_info" ? best.info : best.data;
   }

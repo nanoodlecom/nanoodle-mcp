@@ -175,12 +175,14 @@ test('real CLI waits before any provider request, initializes while paused and a
 });
 
 
-test('real paused NEAR startup proves the Nano checkpoint before recovering a recorded refund once', { timeout: 20000 }, async t => {
+test('the hosted CLI recovers a recorded refund once and refuses stale Nano peers after a crash', { timeout: 30000 }, async t => {
   const w = fixture(t), packageRoot = copyRelease(w), key = await throwawayNearKey();
   const chain = createFakeChain(), nano = nanoGptMock();
   const merchant = 'startup-shop.testnet', payer = 'startup-payer.testnet', deposit = 10n ** 22n;
   const seed = '0'.repeat(64), account = deriveAddress(derivePublicKey(deriveSecretKey(seed, 0)), { useNanoPrefix: true });
   const oldHead = { hash: 'B'.repeat(64), blockCount: '10' };
+  const floor = { v: 1, networkGenesis: NANO_GENESIS_HASH, account, head: oldHead, confirmed: oldHead };
+  let nanoHeight = 10;
   const nanoCalls = [];
   const nanoRpc = createServer(async (req, res) => {
     const chunks = [];
@@ -188,7 +190,8 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
     const body = JSON.parse(Buffer.concat(chunks));
     nanoCalls.push({ peer: req.url, action: body.action });
     const result = body.action === 'block_info' && body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY
-      : body.action === 'account_info' ? nanoAccountInfo({ representative: account, balance: String(10n ** 31n) })
+      : body.action === 'account_info' ? nanoAccountInfo({ height: nanoHeight, frontier: (nanoHeight === 10 ? 'B' : 'A').repeat(64),
+        representative: account, balance: String(10n ** 31n) })
       : { error: 'Unexpected mock RPC action' };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
@@ -200,6 +203,8 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
   await chain.listen(); await nano.listen();
   w.cleanup.push(() => chain.close(), () => nano.close());
   const out = join(w.root, 'out'), graphs = join(w.root, 'graphs'); mkdirSync(out, { mode: 0o700 }); mkdirSync(graphs);
+  const marketState = join(w.root, 'market-state'); mkdirSync(marketState, { mode: 0o700 });
+  const durablePath = join(out, 'nano-wallet-checkpoint.json'), healthPath = join(out, 'funding-health.json');
   cpSync(join(packageRoot, 'tests/fixtures/hello-noodle.json'), join(graphs, 'hello.json'));
   const file = join(out, 'near-state.json');
   const ledger = openNearLedger({ file, network: 'testnet', merchant });
@@ -208,7 +213,9 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
   const policy = join(w.root, 'state-policy.json');
   json(policy, { v: 1, outDir: out, nanoAddress: account, chargeNano: false, near: { network: 'testnet', merchant }, marketRoot: null, marketHandles: [] });
   const initialBalance = chain.balance(payer);
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt === 3) nanoHeight = 9;
+    const priorNanoCalls = nanoCalls.length;
     rmSync(w.startupFile, { force: true });
     const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
     const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
@@ -217,7 +224,7 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
       '--serve', `127.0.0.1:${port}`, '--public-url', base, '--key', 'synthetic-no-account-key', '--near-merchant', merchant,
       '--near-network', 'testnet', '--near-rpc', chain.url, '--near-usd', '3.64'],
       { env: { PATH: process.env.PATH, NANOGPT_BASE_URL: nano.url, NEAR_PRIVATE_KEY: key.secretKey, NANOODLE_STATE_POLICY: policy,
-        NANO_SEED: seed, NANO_RPC_URL: `${rpcBase}/a,${rpcBase}/b`,
+        NANO_SEED: seed, NANO_RPC_URL: `${rpcBase}/a,${rpcBase}/b`, MARKET_STATE_DIR: marketState,
         NANOODLE_WRITER_LOCK_DIR: join(w.root, 'locks'), NANOODLE_MAINTENANCE_FILE: w.file,
         NANOODLE_MAINTENANCE_STARTUP_FILE: w.startupFile, NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) }, stdio: ['ignore', 'ignore', 'pipe'] });
     let log = ''; child.stderr.on('data', chunk => { log += chunk; });
@@ -225,9 +232,31 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
     const wait = async predicate => { const deadline = Date.now() + 8000; while (!predicate()) {
       assert.equal(child.exitCode, null, log); assert.ok(Date.now() < deadline, log); await delay(10);
     } };
+    const exit = once(child, 'exit');
+    if (attempt === 3) {
+      const funding = () => JSON.parse(readFileSync(healthPath));
+      await wait(() => funding().process?.pid === child.pid);
+      assert.equal(funding().ok, false);
+      assert.equal(funding().code, 'nano-checkpoint-unproven');
+      assert.deepEqual(JSON.parse(readFileSync(durablePath)), floor);
+      await wait(() => log.includes('MCP over HTTP'));
+      assert.equal((await fetch(base + '/out/nano-wallet-checkpoint.json')).status, 404);
+      assert.ok(nanoCalls.slice(priorNanoCalls).every(call => ['account_info', 'block_info'].includes(call.action)));
+      nanoHeight = 10;
+      try { await wait(() => funding().ok === true); }
+      catch (error) {
+        const { code, checkedAt } = funding();
+        throw new Error(`Funding report ${code} at ${checkedAt}`, { cause: error });
+      }
+      assert.equal(funding().process.pid, child.pid);
+      assert.equal(chain.sendTxCount, 1);
+      assert.equal(nano.runs(), 0);
+      assert.ok(nanoCalls.every(call => call.action !== 'process'));
+      child.kill('SIGTERM'); const [code] = await exit; assert.equal(code, 0, log);
+      continue;
+    }
     await wait(() => log.includes('waiting for a process-bound operator permit'));
     assert.equal(chain.sendTxCount, attempt === 2 ? 1 : 0);
-    const exit = once(child, 'exit');
     const head = attempt === 0 ? { hash: 'C'.repeat(64), blockCount: '11' } : oldHead;
     const identity = processIdentity(child.pid);
     w.put({ ...w.grant(), v: 2, process: identity,
@@ -238,6 +267,7 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
       assert.equal(chain.sendTxCount, 0);
       assert.equal(JSON.parse(readFileSync(file)).quotes.nq_startup.status, 'running');
       assert.throws(() => readFileSync(join(out, 'nano-handoff.json')), { code: 'ENOENT' });
+      assert.throws(() => readFileSync(durablePath), { code: 'ENOENT' });
       assert.deepEqual(new Set(nanoCalls.filter(call => call.action === 'account_info').map(call => call.peer)), new Set(['/a', '/b']));
       assert.ok(nanoCalls.every(call => ['account_info', 'block_info'].includes(call.action)));
       continue;
@@ -256,10 +286,16 @@ test('real paused NEAR startup proves the Nano checkpoint before recovering a re
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'run_noodle', arguments: {} } }) });
     assert.equal(response.status, 503);
     assert.equal((await fetch(base + '/out/nano-handoff.json')).status, 404);
+    assert.equal(lstatSync(durablePath).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(durablePath)), floor);
+    if (attempt === 2) {
+      rmSync(w.startupFile); rmSync(w.file);
+      child.kill('SIGKILL'); const [, signal] = await exit; assert.equal(signal, 'SIGKILL', log);
+      continue;
+    }
     child.kill('SIGTERM'); const [code] = await exit; assert.equal(code, 0, log);
     const handoff = join(out, 'nano-handoff.json');
     assert.equal(lstatSync(handoff).mode & 0o777, 0o600);
-    assert.deepEqual(JSON.parse(readFileSync(handoff)), { v: 1, request, process: identity,
-      checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account, head: oldHead, confirmed: oldHead } });
+    assert.deepEqual(JSON.parse(readFileSync(handoff)), { v: 1, request, process: identity, checkpoint: floor });
   }
 });

@@ -35,6 +35,39 @@ const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
 
+test("a hosted wallet persists only a corroborated advance and stops spending if its checkpoint disappears", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-checkpoint-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const checkpointFile = join(dir, "nano-wallet-checkpoint.json"), readCheckpoint = async () => JSON.parse(await readFile(checkpointFile));
+  const point = { hash: FRONTIER, blockCount: "10" };
+  const initial = { v: 1, account: ADDRESS, networkGenesis: NANO_GENESIS_HASH, head: point, confirmed: point };
+  const peers = new Map([["https://owned.example", 10], ["https://witness.example", 10]]), actions = [];
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: [...peers.keys()].join(","), verifyRpcReads: true, checkpointFile,
+    fetch: async (url, options) => {
+      const { action, hash } = JSON.parse(options.body); actions.push(action);
+      if (action === "block_info" && hash === NANO_GENESIS_HASH) return Response.json(NANO_GENESIS_REPLY);
+      assert.equal(action, "account_info");
+      const height = peers.get(url);
+      return Response.json(nanoAccountInfo({ height, frontier: height === 10 ? FRONTIER : "C".repeat(64), balance: BALANCE, representative: ADDRESS }));
+    } });
+  await assert.rejects(wallet.ops.loadRestartCheckpoint(null), { code: "NANO_CHECKPOINT_STORAGE" });
+  assert.deepEqual(actions, []);
+  await wallet.ops.loadRestartCheckpoint(initial);
+  assert.deepEqual(await readCheckpoint(), initial);
+  const info = () => wallet.ops.rpc({ action: "account_info", account: ADDRESS });
+  peers.set("https://owned.example", 11);
+  await assert.rejects(info(), { code: "NANO_RPC_CHECKPOINT_UNPROVEN" });
+  assert.deepEqual(await readCheckpoint(), initial);
+  peers.set("https://witness.example", 11);
+  assert.equal((await info()).block_count, "11");
+  assert.deepEqual((await readCheckpoint()).head, { hash: "C".repeat(64), blockCount: "11" });
+  await wallet.ops.fundingReport(); // Establish a fresh balance cache.
+  await rm(checkpointFile);
+  await assert.rejects(wallet.ops.fundingReport(), { code: "NANO_CHECKPOINT_STORAGE" });
+  await assert.rejects(wallet.payment({ amountRaw: AMOUNT, payTo: PAY_TO }), { code: "NANO_CHECKPOINT_STORAGE" });
+  assert.ok(actions.every(action => ["account_info", "block_info"].includes(action)));
+});
+
 test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-funding-"));
   const graphs = join(dir, "graphs"), out = join(dir, "out");
