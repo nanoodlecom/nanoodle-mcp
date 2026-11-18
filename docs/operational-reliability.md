@@ -48,6 +48,11 @@ its serial queue. Provider maximum prepayments and their eventual refunds remain
 distinct from final model cost. Bound token defaults and creator fee handoffs
 are tested across saved/custom workflows and deferred Market settlement.
 
+The operational check also compares the balance left after live reservations
+and liabilities against the existing $2 working-capital threshold at the
+current Nano/USD rate. Crossing this threshold raises an early warning. Each
+new run still goes through the wallet's exact budget and balance checks.
+
 Read-only upstream quotes on 2026-11-17 returned 402 (unpaid) for GLM 5.3 Flash:
 256 output tokens quoted $0.00008657; 4096 quoted $0.00135377. These are evidence
 of that request shape only, not permanent prices or a general reserve policy.

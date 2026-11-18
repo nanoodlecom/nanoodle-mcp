@@ -74,7 +74,7 @@ function fixture(override = () => null) {
     "/state/gate-state.json": { v: 2, quotes: [], owed: [] },
     "/state/funding-health.json": { v: 1, checkedAt: new Date(NOW).toISOString(), ok: true, enforced: true, protectTransfers: true,
       writerProtection: { enforced: true, requiredState: true },
-      balanceRaw: "1000", liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
+      balanceRaw: String(10n * 10n ** 30n), liabilitiesRaw: "100", reservedRaw: "200", activeRuns: 0, oldestStartedAt: null,
       nanoRpc: { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: NOW,
         checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: config.nanoAddress,
           head: { hash: "A".repeat(64), blockCount: "10" }, confirmed: { hash: "A".repeat(64), blockCount: "10" } } } },
@@ -165,6 +165,27 @@ test("numeric and HTTP rate limits have precise diagnostics without hiding loss 
     assert.ok(report.checks.some(check => check.stage === "nano-node-0" && check.code === "nano-rpc-rate-limited"));
     assert.equal(report.admission.nano, false, "two configured peers still require two readable peers");
     assert.doesNotMatch(JSON.stringify(report), /private rate limit/);
+  }
+});
+
+test("live Nano reservations can exhaust working capital while disk and runtime coverage still pass", async t => {
+  const raw = 10n ** 30n;
+  for (const shortfall of [0n, 1n]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    Object.assign(f.states["/state/funding-health.json"], {
+      balanceRaw: String(10n * raw), liabilitiesRaw: String(raw),
+      reservedRaw: String(7n * raw + shortfall), activeRuns: 1, oldestStartedAt: NOW - 1000,
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(report.checks.some(c => c.stage === "nano-liquidity" && c.ok));
+    assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+    const headroom = report.checks.find(c => c.stage === "nano-unreserved-liquidity");
+    assert.equal(headroom.ok, shortfall === 0n);
+    assert.equal(report.ok, headroom.ok);
+    if (shortfall) assert.equal(headroom.code, "nano-pool-insufficient-after-reservations");
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /balanceRaw|liabilitiesRaw|reservedRaw|availableRaw/);
   }
 });
 
