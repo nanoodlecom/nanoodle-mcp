@@ -1,4 +1,4 @@
-import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_WORDMARK } from "./brand.mjs";
+import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_CONNECTOR, NANO_WORDMARK } from "./brand.mjs";
 import { runViewHtml, RUN_VIEW_CSS } from "./run-view.mjs";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 export const BRAND_BASE = "/brand/255labs-v1.1.0";
@@ -34,7 +34,7 @@ export function nearSitePage({ version, publicBase, merchant, network, tools, ca
       `<link rel="canonical" href="${esc(publicBase)}/"><meta property="og:type" content="website"><meta property="og:site_name" content="nanoodle">` +
       `<meta property="og:title" content="${esc(title)}"><meta property="og:description" content="${esc(description)}"><meta property="og:url" content="${esc(publicBase)}/">`,
     body: `
-      <header class="top"><a class="brand" href="/"><img src="/favicon.png" alt="">${NANO_WORDMARK}</a><span class="network-label">on NEAR</span>
+      <header class="top"><a class="brand" href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a><span class="network-label">on NEAR</span>
         <nav><a href="#workflows">Abilities</a><a href="#build">Build</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source ↗</a></nav></header>
       <section class="near-intro" aria-labelledby="intro-title"><p class="eyebrow">Open-source workflows for agents</p>
         <h1 id="intro-title">Give your agents<br><span>new abilities.</span></h1>

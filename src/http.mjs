@@ -41,7 +41,7 @@ import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
 import { nearAgentGuide } from "./near/agent-guide.mjs";
 import { isExpiredPayment } from "./near/payment-view.mjs";
-import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_WORDMARK, NANO_SURFACE_CSS, NANO_PORT_CSS } from "./brand.mjs";
+import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_CONNECTOR, NANO_WORDMARK, NANO_SURFACE_CSS, NANO_PORT_CSS } from "./brand.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { creatorPage, hostedWorkflowPage } from "./creator-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
@@ -102,6 +102,7 @@ const ASSETS = {
   [`${NANOODLE_BRAND}/fonts/Manrope-OFL.txt`]: "text/plain; charset=utf-8",
   [`${NANOODLE_BRAND}/fonts/IBM-Plex-Mono-OFL.txt`]: "text/plain; charset=utf-8",
   [`${NANOODLE_BRAND}/assets/wordmark-gradient.svg`]: "image/svg+xml",
+  [`${NANOODLE_BRAND}/assets/connector.png`]: "image/png",
   [`${BRAND_BASE}/255labs-tokens.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-ui.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-lockup-paper.svg`]: "image/svg+xml",
@@ -281,7 +282,8 @@ const NANO_LANDING_CSS = `
 
 const NANO_CHECKOUT_CSS = `
   .pay-header{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem}
-  .pay-header img{display:block;width:112px;height:auto}
+  .pay-header a,.pay-brand{display:inline-flex;align-items:center;gap:.5rem}
+  .pay-header .product-wordmark,.pay-brand .product-wordmark{display:block;width:112px;height:auto}
   .pay-header span{font:400 .8rem/1.5 var(--nano-font-mono);color:var(--muted)}
   h1{font-size:clamp(1.5rem,5vw,2rem);line-height:1.2}
   .card{border-radius:var(--nano-radius-card)}
@@ -291,7 +293,7 @@ const NANO_CHECKOUT_CSS = `
   .qr svg{display:block;width:100%;height:auto}
 `;
 const nanoCheckoutPage = (title, body) => htmlPage(title,
-  `<header class="pay-header"><a href="/">${NANO_WORDMARK}</a><span>Nano payment</span></header>${body}`,
+  `<header class="pay-header"><a href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a><span>Nano payment</span></header>${body}`,
   PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS, NANO_BRAND_HEAD);
 
 const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
@@ -425,7 +427,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
     <header class="top">
-      <a class="brand" href="/"><img src="/favicon.png" alt="">${isNanoodle ? NANO_WORDMARK : `<span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
+      <a class="brand" href="/">${isNanoodle ? NANO_CONNECTOR + NANO_WORDMARK : `<img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
       <nav aria-label="Product"><a href="https://nanoodle.com/">Editor</a><a href="https://nanoodle.com/guide/examples/">Examples</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source</a></nav>
     </header>
     <p class="eyebrow">${charged ? "Open source · MCP + x402 · Nano" : "public MCP server"}</p>
@@ -640,7 +642,7 @@ function nearPayPageHtml(q) {
   const canPay = q.status === "pending", canConfirm = canPay || q.status === "expired";
   const title = canPay ? `Pay in ${asset}` : q.checkingPayment ? "Checking payment" : "Your workflow";
   return htmlPage(`${title} · nanoodle`, `
-    <a class="pay-brand" href="/">nanoodle</a>
+    <a class="pay-brand" href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
       <h1 id="near-title">${title}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
       <p id="near-status" role="status" aria-live="polite">${q.checkingPayment ? esc(q.next) : "Checking payment…"}</p>
@@ -664,7 +666,7 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted" id="near-note">Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="${scriptUrls["near-wallet.js"]}"></script>
-  `, PAGE_CSS + NANO_SURFACE_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--nano-font-body);background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--nano-font-mono);margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;border-radius:var(--nano-radius-control);background:var(--nano-color-accent);color:var(--nano-color-on-accent);font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:var(--nano-control-focus-width) solid var(--nano-color-accent-ink);outline-offset:3px}`, NANO_BRAND_HEAD);
+  `, PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--nano-font-body);background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--nano-font-mono);margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;border-radius:var(--nano-radius-control);background:var(--nano-color-accent);color:var(--nano-color-on-accent);font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:var(--nano-control-focus-width) solid var(--nano-color-accent-ink);outline-offset:3px}`, NANO_BRAND_HEAD);
 }
 
 function payPageHtml(q) {
@@ -682,7 +684,7 @@ function payPageHtml(q) {
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
          Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
       </div>
-      <p class="muted" id="status" role="status">${q.checkingHistory ? "Checking Nano payment history for this quote." : q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "waiting for payment… settles in about a second"}</p>
+      <p class="muted" id="status" role="status">${q.checkingHistory ? "Checking Nano payment history for this quote." : q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "Waiting for payment. Keep this page open while your transfer is confirmed."}</p>
       <p class="muted" id="expiry"${canPay ? "" : " hidden"}></p>
     </div>
     <script>
