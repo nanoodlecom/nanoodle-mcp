@@ -14,7 +14,9 @@ import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck } from "../
 import { base58Encode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
 import { USDC_RATE } from "../src/near/ft.mjs";
-import { countOpenNearQuotes, heldNearQuoteAmounts, MAX_OPEN_NEAR_QUOTES, RETAIN_NEAR_QUOTE_MS } from "../src/near/quote-capacity.mjs";
+import {
+  countOpenNearQuotes, heldNearQuoteAmounts, nearPaymentWatchCoverage, MAX_OPEN_NEAR_QUOTES, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS,
+} from "../src/near/quote-capacity.mjs";
 import { resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
@@ -209,7 +211,8 @@ export async function runOperationalCheck(config, deps = {}) {
     if (open >= Math.ceil(MAX_OPEN_NEAR_QUOTES * CAPACITY_WARNING)) {
       checks.push({ stage: "near-open-quote-headroom", ok: false, code: "near-open-quote-capacity-low", domains: [] });
     }
-    return Object.fromEntries(["near", "usdc"].map(asset => [asset, heldNearQuoteAmounts(quotes, asset, checkedAt, RETAIN_NEAR_QUOTE_MS)]));
+    const coveredThroughMs = nearPaymentWatchCoverage(state.near.meta?.[PAYMENT_WATCH_META]);
+    return Object.fromEntries(["near", "usdc"].map(asset => [asset, heldNearQuoteAmounts(quotes, asset, checkedAt, RETAIN_NEAR_QUOTE_MS, { coveredThroughMs })]));
   }, ["near", "usdc"]);
   const runtimeFunding = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));

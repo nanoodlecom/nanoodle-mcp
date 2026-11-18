@@ -254,6 +254,26 @@ test("the monitor reports an unattached NEAR payment claim without exposing its 
   assert.ok(!recovered.checks.some(c => c.stage === "near-payment-claim-unattached"));
 });
 
+test("scheduled checks catch expired quote windows that finalized backfill has not covered", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const near = f.states["/state/near-state.json"], retentionEnd = NOW - 120_000;
+  near.quotes["private-pending-quote"] = { status: "expired", expiresAt: retentionEnd - 3_600_000, amountYocto: "1" };
+  const watch = { height: 100, hash: "private-block-hash", backfill: { nextHash: "private-child-hash", cutoffMs: NOW - 4_000_000 } };
+  near.meta = { paymentWatch: watch };
+  const hasIssue = report => report.checks.some(c => c.stage === "near-quote-payment-scan-overdue" && !c.ok);
+  const legacyReport = await runOperationalCheck(f.config, f.deps);
+  assert.ok(hasIssue(legacyReport));
+  assert.deepEqual(legacyReport.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(legacyReport), /private-(pending|block|child)/);
+
+  watch.backfill = null;
+  watch.coveredThroughMs = retentionEnd;
+  assert.ok(hasIssue(await runOperationalCheck(f.config, f.deps)), "coverage must advance past the inclusive window");
+  watch.coveredThroughMs++;
+  assert.ok(!hasIssue(await runOperationalCheck(f.config, f.deps)));
+});
+
 test("expired but refundable quotes can exhaust a single price without closing the rail", async t => {
   for (const [asset, retained] of [["usdc", 800], ["usdc", 999], ["near", 999]]) {
     const f = fixture();

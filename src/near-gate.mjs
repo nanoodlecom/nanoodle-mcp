@@ -386,9 +386,11 @@ export function createNearGate({
 
   /* ---------------- quote ---------------- */
 
-  /** Deposit amounts of unpaid quotes still held (open, or expired within expiredRetainMs). */
+  /** Keep an unpaid quote's amount reserved until its payment window is covered. */
   function openAmounts(asset = "near") {
-    return heldNearQuoteAmounts(ledger.quotes(), asset, now(), expiredRetainMs, ledger.hasUnattachedPayment);
+    return heldNearQuoteAmounts(ledger.quotes(), asset, now(), expiredRetainMs, {
+      coveredThroughMs: ledger.paymentWatchCoverage(), additionallyHeld: ledger.hasUnattachedPayment,
+    });
   }
 
   function openQuoteCount() {
@@ -703,7 +705,8 @@ export function createNearGate({
 
   function pendingQuotes() {
     const t = now();
-    return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs) || ledger.hasUnattachedPayment(q.id));
+    const coverage = ledger.paymentWatchCoverage();
+    return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs, coverage) || ledger.hasUnattachedPayment(q.id));
   }
 
   async function confirmDiscoveredPayment(id, txHash, senderId) {
@@ -735,7 +738,7 @@ export function createNearGate({
       else throw e;
     }
     const q = pendingQuotes().find((q) => assetOf(q) === (transfer.asset || "near") && q.amountYocto === transfer.amountYocto.toString()
-      && transfer.blockTimeMs >= q.createdAt);
+      && transfer.blockTimeMs >= q.createdAt && transfer.blockTimeMs <= q.expiresAt + expiredRetainMs);
     if (q && !ledger.hasUnattachedPayment(q.id)) await confirmDiscoveredPayment(q.id, txHash, senderId);
   }
 

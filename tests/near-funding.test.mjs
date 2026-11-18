@@ -48,6 +48,18 @@ test("refund claims cover paid/running work, failed handoffs and pending quotes 
   assert.throws(() => nearRefundClaims({ quotes: [], refunds: null }));
 });
 
+test("unscanned quote windows count as potential refunds until coverage advances", () => {
+  const deadline = 1_000, now = deadline + 60_000;
+  const state = { quotes: [{ id: "old", status: "expired", asset: "usdc", expiresAt: deadline - 10 }], refunds: [],
+    meta: { paymentWatch: { coveredThroughMs: deadline } } };
+  const claims = () => nearRefundClaims(state, { now, unpaidRetainMs: 10 });
+  assert.equal(claims().usdcAtomic, 0n);
+  assert.equal(claims().tokenRefunds, 0);
+  assert.equal(claims().pendingTokenRefunds, 1);
+  state.meta.paymentWatch.coveredThroughMs++;
+  assert.equal(claims().pendingTokenRefunds, 0);
+});
+
 test("fee reserves include the gas-purchase floor, implicit-account creation and FT action/argument costs", () => {
   const protocol = nearProtocol({ floor: "10", feeGas: 100 });
   const costs = nearRefundCosts(protocol, "1");
