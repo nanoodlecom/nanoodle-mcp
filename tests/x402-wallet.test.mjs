@@ -624,6 +624,7 @@ test("two identical obligations cannot claim the same signed Nano transfer", asy
   const first = "nano:quote:change", second = "creator:job";
   await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, options(first)), /HTTP 503/);
   await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, options(second)), { code: "NANO_TRANSFER_ALREADY_CLAIMED" });
+  await assert.rejects(make().payment({ payTo: PAY_TO, amountRaw: AMOUNT }), { code: "NANO_TRANSFER_ALREADY_CLAIMED" });
   assert.equal(signed.size, 1);
   unavailable = false;
   assert.equal(await make().ops.transferOnce(PAY_TO, AMOUNT, options(first)), signed.get(first).hash);

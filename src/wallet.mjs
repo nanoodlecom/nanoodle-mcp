@@ -497,6 +497,12 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
     return prepared;
   }
 
+  function assertTransferUnclaimed(hash, transferId) {
+    if (nanoTransferClaimed(hash, transferId)) {
+      throw new FundingError("NANO_TRANSFER_ALREADY_CLAIMED", "Another obligation already claims this Nano transfer");
+    }
+  }
+
   async function sendFrom(state, to, amount, checkBalance, describe = "sent", extra = "") {
     const insufficient = () => new Error(
       `insufficient wallet balance: send is ${rawToXno(amount)} XNO` +
@@ -505,6 +511,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
     const publishOptions = { beforePublish: () => checkBalance(state.balance) };
     for (let attempt = 0; ; attempt++) {
       const { hash, block } = await prepareSend(state, to, amount);
+      assertTransferUnclaimed(hash);
       precomputeWork(hash); // next block's work computes while this one publishes
       try {
         await rpc({ action: "process", json_block: "true", subtype: "send", block }, rpcBases, publishOptions);
@@ -711,16 +718,13 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       transferOnce: (to, amountRaw, { prepared = null, onPrepared, liabilityRaw = 0n, fundingRunId = null, transferId, describe = "author payout:" } = {}) => enqueue(async () => {
         if (!checkAddress(String(to || "")) || !/^\d+$/.test(String(amountRaw)) || BigInt(amountRaw) <= 0n || typeof onPrepared !== "function") throw new Error("invalid durable Nano transfer");
         const terms = { amountRaw, liabilityRaw: protectTransfers ? liabilityRaw : 0n, fundingRunId };
-        const assertUnclaimed = hash => {
-          if (nanoTransferClaimed(hash, transferId)) throw new FundingError("NANO_TRANSFER_ALREADY_CLAIMED", "Another obligation already claims this Nano transfer");
-        };
         if (prepared) {
           const block = prepared.block;
           if (block?.account !== address || block.link_as_account !== to ||
               block.link?.toUpperCase() !== derivePublicKey(to).toUpperCase() || hashBlock(block) !== prepared.hash) {
             throw new Error("journaled Nano transfer does not match this wallet or recipient");
           }
-          assertUnclaimed(prepared.hash);
+          assertTransferUnclaimed(prepared.hash, transferId);
           const snapshot = await currentState(true);
           const sent = await publishOnce(prepared, () => {
             if (snapshot.frontier.toUpperCase() !== block.previous.toUpperCase()) {
@@ -738,7 +742,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         const state = await pocketReceivables(false, s => urgentWaiting() && funding.requiredForTransfer(terms) <= s.balance);
         const checkBalance = funding.authorizeTransfer(terms, state.balance);
         prepared = await prepareSend(state, to, BigInt(amountRaw));
-        assertUnclaimed(prepared.hash);
+        assertTransferUnclaimed(prepared.hash, transferId);
         await onPrepared(prepared);
         precomputeWork(prepared.hash);
         const sent = await publishOnce(prepared, () => checkBalance(state.balance));
