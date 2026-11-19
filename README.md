@@ -81,7 +81,7 @@ transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md
 - NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version` shows
   0.7.0 or later, run it from a clone as below.
 
-**Try it: do X, see Y.** Node 22.23.4+, 24.22.1+ or 26.12.1+. Steps 1–3 need no network
+**Try it: do X, see Y.** Node 22.23.5+, 24.22.3+ or 26.13.1+. Steps 1–3 need no network
 after `npm ci`, and no keys or funds.
 
 ```bash
@@ -163,14 +163,14 @@ For the published graph, the generation step is:
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"character-sprites","arguments":{"Character":"A compact furnace knight with an ivory helmet, amber visor, navy armor and brass gauntlets. Outlined 2D platformer art. No weapon or wings."}}}
 ```
 
-Install the skill for local extraction and animation (Node 22.23.4+, 24.22.1+, or 26.12.1+ and ffmpeg/ffprobe
+Install the skill for local extraction and animation (Node 22.23.5+, 24.22.3+, or 26.13.1+ and ffmpeg/ffprobe
 required). A useful agent request is: “Use character-sprites to make an animated
 fighter from my description, inspect the joints and alpha edges, then build a
 small playable arena with heavy gravity and impactful combat.”
 
 ## Install
 
-You need: **Node 22.23.4+, 24.22.1+, or 26.12.1+**, a folder of saved graphs (say `~/noodles` — see
+You need: **Node 22.23.5+, 24.22.3+, or 26.13.1+**, a folder of saved graphs (say `~/noodles` — see
 [Making graphs](#making-graphs)), and a [nano-gpt.com](https://nano-gpt.com)
 API key in `NANOGPT_API_KEY` (or passed via `--key` / `--env-file`) — or no
 key at all with a Nano wallet, see
@@ -518,7 +518,7 @@ sized from that request: `maxChars`, or the draft's length when `maxChars` is
 omitted, plus a small slack. The decider also reserves tokens for its ranking JSON and for GLM reasoning, which shares that max_tokens budget. Tokens are estimated at about 3.5 bytes each; the draft, context, and guidance the decider reads are priced at 2.5 bytes per token, so its estimate grows with context length. Until the decider starts, a hosted run admits a writer, fallback, or re-ask only if it fits the deposit with the decider's estimated cost still counted. That estimate is admission headroom, not money set aside, so it makes a skipped decider less likely but does not rule it out. The
 priced worst case is every writer once, one extra retry, the decider, and a second decider pass when
 a protected span can be repaired or the call can ask the decider to confirm one fitting rewrite (a title, a length cap, or a required ending).
-When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
+When a writer's fallback model runs, both calls are charged.
 On a hosted payment the quote caps what the customer pays. A step whose estimate or invoice would push the spend past
 the quote is skipped. A skipped writer step ends as a partial result, or with nothing
 owed when nothing was sent. A skipped or unusable decider is an error, not the original draft returned as a successful comment. The deposit is 12% above that priced charge, at least $0.001,
@@ -674,6 +674,53 @@ jq 'select(.event=="paid") | .settleMs' usage.jsonl                             
 jq 'select(.event=="paid") | .usd' usage.jsonl | jq -s add                      # gross deposits taken
 jq -r 'select(.event=="refund") | .reason' usage.jsonl | sort | uniq -c         # refunds by category
 ```
+
+### TLS trust prerequisite
+
+The [eMudhra intermediate-key compromise](https://emudhra.we-have-a-problem.com/)
+affects outbound HTTPS and WSS from this Node process: NanoGPT requests, Nano
+RPC/work services, authenticated wallet websocket connections, media downloads,
+and share links. Both hosted and local MCP clients need patched certificate
+trust. Updating a browser does not update Node's bundled roots.
+
+On Debian 13, install `ca-certificates >= 20250419+deb13u1`; on Ubuntu 24.04,
+install `>= 20260816ubuntu0.24.04.1`. Before **npm/npx installs and server startup**,
+select only the patched OpenSSL store on those Linux hosts:
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export SSL_CERT_DIR=/etc/ssl/certs
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--use-openssl-ca"
+export npm_config_cafile="$SSL_CERT_FILE"
+export npm_config_strict_ssl=true
+# Now run npm ci, npx, or your normal server command in this environment.
+```
+
+Preserve unrelated Node flags, remove conflicting `--use-bundled-ca` or
+`--use-system-ca`, and remove `NODE_EXTRA_CA_CERTS` while applying this policy.
+Those additive options do not remove compromised roots. Keep certificate
+verification enabled. For macOS/Windows, update OS trust and the Node runtime,
+then verify the actual runtime's trust policy; these Linux paths are not portable.
+Use a supported runtime meeting the
+[November 2026 Node security floors](https://nodejs.org/en/blog/vulnerability/november-2026-security-releases/):
+22.23.5, 24.22.3, or 26.13.1. Restart any long-running MCP process after
+changing its runtime or trust policy and verify the binary it actually loads.
+
+The Netcup deployment uses a separate Node binary and trust wrapper. Follow
+the [Netcup runtime instructions](https://github.com/255BITS/deploy/tree/master/255labs/apps/nanoodle-mcp)
+and verify the launcher before activating a release. CI tests and release jobs
+use the Node version pinned in their workflows and select Ubuntu's patched
+OpenSSL trust store before software downloads.
+
+Verify ordinary HTTPS succeeds and **all twelve** incident probe handshakes fail
+with certificate errors, including AAA cross-sign variants. Use the shared
+`tools/check-tls-trust.py` in the deploy repository with `--client node --node
+/opt/node22/bin/node` through `with-system-trust` on Netcup. Repeat with the
+Node executable actually used by each local `npx`/editor MCP installation.
+Test authenticated WSS and read-only RPC connectivity separately; avoid a paid
+run or wallet transfer as a health check. Review unexpected spend or wallet/API
+activity and rotate exposed credentials if misuse or interception is suspected.
+Merging this source is not evidence that external clients are patched.
 
 ### Hosting checklist
 
