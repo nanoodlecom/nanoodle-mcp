@@ -42,7 +42,15 @@ export const HUMANIZE_MODEL_PRICES = Object.freeze({
   "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15],
   "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
   "qwen/qwen3.8-27b-antislop": [0.1, 0.6],
+  // Replaced as Writer E on 2026-11-19 (humanize-opt cycle 1: Mercury 3 was
+  // already answering 503s ahead of its 2026-12-28 shutdown); row retained so
+  // a stale mounted graph still prices instead of failing every quote.
   "inception/mercury-3": [0.1, 0.35],
+  // Catalog price is $0/$0 today; rate() needs positive rates to price a
+  // deposit at all, so this row carries the writer-class floor (Starry
+  // Ocean's rates) as a conservative bound. Settlement meters the actual
+  // reported cost, and a positive catalog rate overrides this row.
+  "kitani/clover-2": [0.05, 0.25],
   "z-ai/glm-5.3": [0.6, 1.1],
 });
 
