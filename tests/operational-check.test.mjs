@@ -2191,3 +2191,42 @@ test("a gap or invalid prior Nano telemetry starts a new comparison", t => {
   assert.equal(rebuilt.nanoLedgerSync.unchangedSince, NOW + 23 * 60_000);
   assert.equal(rebuilt.nanoLedgerSync.peerMedianAtStart, "4600");
 });
+
+test("the monitor reports a widening Nano confirmation gap even while the owned node advances", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-slowdown-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const backlog = { stage: "nano-ledger-sync", ok: false, code: "nano-ledger-confirmations-behind", domains: [] };
+  const invocationId = "a".repeat(32);
+  const report = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [backlog],
+    NOW + minutes * 60_000, { invocationId, nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  const progress = value => value.checks.find(check => check.stage === "nano-ledger-confirmation-progress");
+  const initial = report(0, "1000", "9000");
+  assert.equal(progress(report(5, "1010", "9040")).ok, true, "one interval is not sustained lag");
+  const slowing = report(10, "1020", "9080");
+  assert.deepEqual(progress(slowing), { stage: "nano-ledger-confirmation-progress", ok: false,
+    code: "nano-ledger-confirmations-falling-behind", domains: [] });
+  assert.notEqual(slowing.incidentId, initial.incidentId);
+  assert.deepEqual(slowing.admission, { nano: true, near: true, usdc: true, market: true });
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, slowing, NOW + 10 * 60_000);
+  assert.match(alert.text, /nano-ledger-confirmations-falling-behind/);
+  assert.equal(report(15, "1030", "9100").incidentId, slowing.incidentId);
+  const catchingUp = report(20, "1080", "9110");
+  assert.equal(progress(catchingUp).ok, true);
+  assert.equal(catchingUp.ok, false, "the old absolute backlog remains visible");
+});
+
+test("Nano remote counter variation, missing samples and local regression are distinguished", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-regression-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [],
+    NOW + minutes * 60_000, { nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  report(0, "1000", "9000");
+  assert.equal(report(5, "1010", "9080").ok, true, "a single jump in the peer median is not sufficient");
+  assert.equal(report(10, "1020", "9085").ok, true, "a shrinking gap resets the trend");
+  assert.equal(report(25, "1030", "9210").ok, true, "a missing interval invalidates the prior baseline");
+  const regressed = report(30, "1029", "9200");
+  assert.equal(regressed.checks[0].code, "nano-ledger-local-confirmations-regressed");
+  assert.deepEqual(regressed.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.equal(report(35, "1029", "9205").ok, true, "the next sample starts from the new local counter");
+});
