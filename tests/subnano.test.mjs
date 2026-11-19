@@ -75,13 +75,13 @@ test("humanize portion of the ceiling matches the published v2.7 charge, and the
     });
     // A 240-byte draft. The four-byte ceiling uses humanize v2.8's Guidance cap
     // (600 characters). It is a real max-size request, above Maxi's ~$0.016 cap.
-    assert.equal(typicalCharge.toFixed(8), "0.00522607");
-    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.00585321");
-    assert.equal(full.toFixed(8), "0.02173866");
-    assert.equal(deposit.toFixed(8), "0.02434730");
+    assert.equal(typicalCharge.toFixed(8), "0.00501328");
+    assert.equal(depositFromCharge(typicalCharge).toFixed(8), "0.00561487");
+    assert.equal(full.toFixed(8), "0.02063576");
+    assert.equal(deposit.toFixed(8), "0.02311206");
     assert.equal(registry.quoteDeposit("subnano_comment", {
       Draft: "a".repeat(240), Context: "b".repeat(480),
-    }).toFixed(8), "0.00585321");
+    }).toFixed(8), "0.00561487");
     assert.ok(depositFromCharge(typicalCharge) <= 0.013, "a typical comment deposits about $0.013 or less");
     assert.ok(typicalCharge < full);
     assert.ok(depositFromCharge(typicalCharge) < deposit);

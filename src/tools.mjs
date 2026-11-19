@@ -17,7 +17,7 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
-import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
+import { HUMANIZE_TOOL, HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
 import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
@@ -1057,7 +1057,7 @@ export class HumanizeUnpriceableError extends Error {
   constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
 }
 
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
   const executionLimit = hosted || remote ? hostedRunTimeout(runTimeoutMs ?? undefined) : null;
   const runtimeFetch = hostedRunFetch();
   // Wallet mode (payment callback, no key) changes only where money comes from.
@@ -1130,7 +1130,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]), name }),
         inputSchema: buildInputSchema(wf),
         // humanize-comment: input caps + writer record + exact ranked texts (src/humanize.mjs)
-        humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph) : null,
+        humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph, humanizeFallbacks === null ? HUMANIZE_FALLBACKS : humanizeFallbacks) : null,
         // Quoted per request from length and maxChars. The gate reads quoteDeposit.
         pricedPerRequest: name === HUMANIZE_TOOL,
       });

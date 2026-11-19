@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { createChargeGate } from "../src/gate.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { humanizeFetch, failureMessage, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
+import { humanizeWriterRecord, humanizeFetch, failureMessage, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
 import {
   humanizeChargeUsd, humanizeDepositUsd, humanizeCeilingDepositUsd, humanizePriceTable, humanizeStageBudget,
   depositFromCharge, settledChargeUsd, HUMANIZE_DEPOSIT_FLOOR_USD, HUMANIZE_DEPOSIT_MARGIN, HUMANIZE_MODEL_PRICES,
@@ -39,6 +39,23 @@ function covers(args) {
   assert.ok(deposit + 1e-12 >= charge * (1 + HUMANIZE_DEPOSIT_MARGIN) || deposit === HUMANIZE_DEPOSIT_FLOOR_USD);
   return deposit;
 }
+
+test("the catalog and a legacy mounted graph keep their respective writer C price reserves", () => {
+  const starryOcean = "gemma-4-12b-it-starry-ocean";
+  const cydonia = "TheDrummer/Cydonia-24B-v4.3";
+  const currentWriter = humanizeWriterRecord(graph).C;
+  assert.equal(currentWriter.model, starryOcean);
+  assert.equal(currentWriter.fallbackModel, null);
+
+  const legacy = structuredClone(graph);
+  legacy.nodes.find((node) => node.id === currentWriter.nodeId).fields.model = cydonia;
+  const writerLabel = legacy.nodes.find((node) => node.fields?.sep?.includes(`[C] ${starryOcean}`));
+  writerLabel.fields.sep = writerLabel.fields.sep.replace(starryOcean, cydonia);
+  const legacyWriter = humanizeWriterRecord(legacy).C;
+  assert.equal(legacyWriter.model, cydonia);
+  assert.equal(legacyWriter.fallbackModel, starryOcean);
+  assert.equal(humanizeCeilingDepositUsd(legacy).toFixed(8), "0.05433870");
+});
 
 test("known USD amounts accept an exponent and a leading dot, and reject garbage", () => {
   assert.equal(knownUsd("1e-3"), 0.001);
@@ -92,11 +109,11 @@ test("short, typical, and maximum-length deposits cover their own worst case and
   assert.ok(short < typical, `${short} should be under the 1,500-character draft`);
   assert.ok(typical < maximum, `${typical} should be under the capped request`);
   assert.ok(typical <= 0.012, `typical deposit ${typical} is above $0.012`);
-  assert.equal(typical.toFixed(8), "0.00844368");
-  assert.equal(maximum.toFixed(8), "0.02775871");
+  assert.equal(typical.toFixed(8), "0.00837937");
+  assert.equal(maximum.toFixed(8), "0.02771544");
   const ceiling = humanizeCeilingDepositUsd(graph);
   assert.ok(maximum <= ceiling + 1e-12);
-  assert.equal(ceiling.toFixed(8), "0.05433870");
+  assert.equal(ceiling.toFixed(8), "0.05387485");
   assert.equal(ceiling.toFixed(8), graph.x402.usd.toFixed(8));
 });
 
@@ -167,7 +184,7 @@ test("the quote shown to the caller is the deposit that is collected", async () 
     const listed = listTools().find((t) => t.name === "humanize-comment");
     assert.match(listed.description, /a deposit is quoted for each request from its length and maxChars and caps what the customer pays/);
     assert.match(listed.description, /the operator absorbs any overrun/);
-    assert.match(listed.description, /When Cydonia fails and the Starry Ocean fallback runs, both calls are charged/);
+    assert.match(listed.description, /When a writer's fallback model runs, both calls are charged/);
     assert.match(listed.description, /This refund and cap apply to hosted payments/);
     assert.match(listed.description, /Direct-wallet spending has no cap/);
     assert.doesNotMatch(listed.description, /paid in Nano|x402|0\.0196|proven|only one is billed|not both/);
@@ -254,7 +271,7 @@ test("the quote is at least the max charge, including a restore that grows 1732 
   const emberDeposit = humanizeDepositUsd(graph, ember);
   assert.ok(emberDeposit >= emberCharge);
   const ceiling = humanizeCeilingDepositUsd(graph);
-  assert.equal(ceiling.toFixed(8), "0.05433870");
+  assert.equal(ceiling.toFixed(8), "0.05387485");
   assert.ok(emberDeposit <= ceiling);
   assert.ok(grewDeposit <= ceiling);
   assert.equal(graph.x402.usd, ceiling);
@@ -402,7 +419,7 @@ test("copy says both fallback calls are charged, and the refund and cap are host
     assert.doesNotMatch(text, /only one is billed/i);
     assert.doesNotMatch(text, /One of the two is billed/);
     assert.doesNotMatch(text, /not both/);
-    assert.match(text, /When Cydonia fails and the Starry Ocean fallback runs,[\s*]*both calls are charged/);
+    assert.match(text, /When a writer's fallback model runs,[\s*]*both calls are charged/);
     assert.match(text, /Direct-wallet spending has no cap/);
   }
   assert.match(readme, /This refund and cap apply to hosted payments/);

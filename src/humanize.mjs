@@ -17,12 +17,12 @@
  * 4. Writer calls (v2.7), via a fetch wrapper handed to the per-run Workflow
  *    (humanizeFetch): the engine still makes one call per writer node, and the
  *    wrapper only touches chat calls whose model is a writer's.
- *    - Fallback: a writer with a fallback model (C: Cydonia → Starry Ocean) is
+ *    - Fallback: a writer with a fallback model in HUMANIZE_FALLBACKS is
  *      retried once on the fallback when the primary answers 429 or 5xx, the
  *      request errors, or it has not answered within PRIMARY_TIMEOUT_MS, as long
- *      as nothing was paid for the primary. When Cydonia fails and the Starry
- *      Ocean fallback runs, both calls are charged. The model that actually
- *      answered is credited in ranked[]; if the fallback fails too, the note says so.
+ *      as nothing was paid for the primary. When a fallback runs, both calls
+ *      are charged. The model that actually answered is credited in ranked[];
+ *      if the fallback fails too, the note says so.
  *    - Dashes: " — ", " – " and " - " become ", " and any other em/en dash
  *      becomes ", " in every writer output, before the decider sees it.
  *    - Near-copy: if the share of the rewrite's word trigrams that also occur in
@@ -121,8 +121,14 @@ export const MAX_CHARS_LIMIT = 5000;
 const ENDINGS = new Set(["question", "keep_last", "any"]);
 const COMMENT_TAG = /<\s*\/?\s*comment\b/i;
 const LETTERS = ["A", "B", "C", "D", "E"];
-/** Writer fallbacks by primary model (mcp only; the graph itself has no fallback). */
-export const HUMANIZE_FALLBACKS = Object.freeze({ "TheDrummer/Cydonia-24B-v4.3": "gemma-4-12b-it-starry-ocean" });
+/**
+ * Writer fallbacks by primary model (mcp only; the graph itself has no fallback).
+ * Retain Cydonia's fallback for older mounted graphs. The current catalog
+ * names Starry Ocean directly, so that graph has no fallback to reserve.
+ */
+export const HUMANIZE_FALLBACKS = Object.freeze({
+  "TheDrummer/Cydonia-24B-v4.3": "gemma-4-12b-it-starry-ocean",
+});
 export const NEAR_COPY_RATIO = 0.6;
 export const PRIMARY_TIMEOUT_MS = 30000;
 export const REASK_DEADLINE_MS = 35000;
@@ -2226,8 +2232,8 @@ export function humanizeRunNotes(state) {
   return notes;
 }
 
-/** Fixed writer-id → model record from graph config, or null if the graph isn't shaped like humanize-comment. */
-export function humanizeWriterRecord(graph) {
+/** Fixed writer-id → model record from graph config, or null if the graph isn't shaped like humanize-comment. `fallbacks` defaults to HUMANIZE_FALLBACKS; tests may inject a synthetic pair to exercise the fallback path. */
+export function humanizeWriterRecord(graph, fallbacks = HUMANIZE_FALLBACKS) {
   const nodes = new Map((graph.nodes || []).map((n) => [n.id, n]));
   const record = {};
   for (const n of graph.nodes || []) {
@@ -2238,7 +2244,7 @@ export function humanizeWriterRecord(graph) {
     const w = link && nodes.get(link.from.node);
     if (!w || w.type !== "llm") return null;
     if (w.fields.model !== m[2]) throw new Error(`humanize-comment: join ${n.id} labels [${m[1]}] ${m[2]} but its writer ${w.id} runs ${w.fields.model}`);
-    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, maxTokens: Number(w.fields.maxTokens) || 600, fallbackModel: HUMANIZE_FALLBACKS[w.fields.model] || null });
+    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, maxTokens: Number(w.fields.maxTokens) || 600, fallbackModel: fallbacks[w.fields.model] || null });
   }
   return LETTERS.every((l) => record[l]) && nodes.has("judge") && nodes.has("draft") ? Object.freeze(record) : null;
 }
