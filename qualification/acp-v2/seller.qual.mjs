@@ -24,6 +24,22 @@ test('inactive by default; live mode, unknown platform fees and negative economi
   assert.throws(() => validateEconomics({ ...economics, priceAtomic: '100' }), /MARGIN_BELOW_FLOOR/);
 });
 
+test('economics boundaries: fee rounds up, exact margin passes, oversize and non-integer amounts fail', () => {
+  const base = { priceAtomic: '10000', platformFeeBps: 9999, maxDownstreamUsdAtomic: '0',
+    maxConversionUsdAtomic: '0', maxNetworkUsdAtomic: '0', minMarginUsdAtomic: '0' };
+  assert.equal(validateEconomics(base).platformFeeEstimateAtomic, '9999');
+  assert.equal(validateEconomics({ ...base, priceAtomic: '1', platformFeeBps: 1 }).platformFeeEstimateAtomic, '1');
+  const exact = { priceAtomic: '1000000', platformFeeBps: 500, maxDownstreamUsdAtomic: '400000',
+    maxConversionUsdAtomic: '50000', maxNetworkUsdAtomic: '100000', minMarginUsdAtomic: '400000' };
+  assert.equal(validateEconomics(exact).platformFeeEstimateAtomic, '50000');
+  assert.throws(() => validateEconomics({ ...exact, minMarginUsdAtomic: '400001' }), /MARGIN_BELOW_FLOOR/);
+  assert.throws(() => validateEconomics({ ...exact, priceAtomic: '9007199254740992' }), /ECONOMICS_CONFIG_REQUIRED/);
+  assert.throws(() => validateEconomics({ ...exact, priceAtomic: '1.5' }), /ECONOMICS_CONFIG_REQUIRED/);
+  assert.throws(() => validateEconomics({ ...exact, priceAtomic: '-5' }), /ECONOMICS_CONFIG_REQUIRED/);
+  assert.throws(() => validateEconomics({ ...exact, priceAtomic: '0' }), /ECONOMICS_CONFIG_REQUIRED/);
+  assert.throws(() => validateEconomics({ ...exact, maxDownstreamUsdAtomic: 400000 }), /ECONOMICS_CONFIG_REQUIRED/);
+});
+
 test('real SDK session + real dispatcher: quote, exact funding, one result receipt, evaluator revenue', async t => {
   const f = await fixture(); t.after(() => f.close());
   const quoted = await f.request(); assert.equal(quoted.state, 'awaiting_funding');
