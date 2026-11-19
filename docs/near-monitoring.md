@@ -127,6 +127,9 @@ delivery. Each systemd invocation has a stable message ID; network failures and
 lost responses retry that ID. `nanoodle-near-alert-retry.timer` drains pending
 messages every five minutes. Babel then owns durable delivery and recipient wakes.
 Queue acceptance is distinct from Ember's authenticated receipt.
+Alerts list admission failures before advisories. The outbox attempts new
+blocking alerts first and keeps unreadable records for inspection. An unreadable
+record counts as a delivery fault while other messages can still be sent.
 
 Provision a dedicated persistent sender through the Babel operator's approved
 process, scoped to a conversation with Ember. Do not copy a native worker's
