@@ -259,8 +259,10 @@ Coverage:
 - Fresh private runtime funding telemetry, enforced spend/transfer protection,
   and active scopes older than the configured execution limit plus 15 minutes
   for payment reconciliation. See [hosted deadlines](hosted-execution.md).
-- Live exchange-rate freshness; platform fee still matching the worker's 5%
-  assumption; authenticated Market token validity and actual worker lock/process.
+- Live exchange-rate freshness, authenticated Market token validity and worker
+  liveness. The fee probe uses the worker's 5% ceiling and reports an
+  unavailable fee separately from a fee above the ceiling. Listing price and
+  Nano funding checks still run at the 5% allowance in either case.
 - Active Market assignments have a delivery-window check. It warns when
   delivery is due within ten minutes or the last quarter of a shorter SLA,
   a worker's retry would miss its cutoff, or model work has reached its
