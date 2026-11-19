@@ -1713,11 +1713,13 @@ test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async ()
   assert.ok(Math.abs(events[0][1].xnoUsd - 0.25) < 1e-9);
 });
 
-test("rate oracle: stale cache survives a probe outage; no cache at all is a clean error", async () => {
+test("rate oracle: cached prices expire during an outage and recover with a fresh probe", async () => {
   const chain = fakeChain();
   const registry = fakeRegistry();
   let t = 1_000_000, probeOk = true, probes = 0;
-  const fetch = async () => {
+  const signals = [];
+  const fetch = async (_url, { signal }) => {
+    signals.push(signal);
     probes++;
     if (!probeOk) return { status: 500, json: async () => ({}) };
     return {
@@ -1726,17 +1728,26 @@ test("rate oracle: stale cache survives a probe outage; no cache at all is a cle
         { scheme: "nano", payTo: GATE_ADDR, amount: "100000000000000000000000000000", amountUsd: "0.05" }] } }),
     };
   };
-  const { callTool } = makeGate(chain, { registry, xnoUsd: null, fetch, now: () => t }).wrapRegistry(registry);
+  const gate = makeGate(chain, { registry, xnoUsd: null, fetch, now: () => t, monotonicNow: () => t });
+  const { callTool } = gate.wrapRegistry(registry);
   const a = argOf(await callTool({ name: "poster", arguments: { Text: "a" } }));
   t += 61_000; // cache expired, oracle down → stale rate keeps quoting
   probeOk = false;
   const b = argOf(await callTool({ name: "poster", arguments: { Text: "b" } }));
   assert.equal(BigInt(a.amountRaw) / 10n ** 26n, BigInt(b.amountRaw) / 10n ** 26n); // same rate, different tag
   assert.equal(probes, 2);
+  t += 239_000;
+  await assert.rejects(gate.fundingPair(), /rate probe failed/);
+  await assert.rejects(() => callTool({ name: "poster", arguments: { Text: "c" } }), /rate probe failed/);
+  assert.equal(registry.callCount(), 0);
+  probeOk = true;
+  assert.deepEqual(await gate.fundingPair(), { usdNano: 50_000_000n, raw: 10n ** 29n });
 
   // a gate that never got a rate refuses to quote, readably
+  probeOk = false;
   const cold = makeGate(fakeChain(), { registry, xnoUsd: null, fetch }).wrapRegistry(fakeRegistry());
   await assert.rejects(() => cold.callTool({ name: "poster", arguments: { Text: "a" } }), /rate probe failed/);
+  assert.ok(signals.every(signal => signal instanceof AbortSignal), "the quote oracle has a request deadline");
 });
 
 test("hashArgs is order-insensitive and value-sensitive", () => {

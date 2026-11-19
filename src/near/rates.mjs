@@ -27,7 +27,7 @@
  * fraction: the locked pair is { usdNano, yocto: 10^24 * (10000 + bps) / 10000 },
  * exact in BigInt. With 0 the pair is exactly { usdNano, 10^24 }, as before.
  */
-import { parseUsdNano, probeX402Pair, x402ProbeUrl } from "../gate.mjs";
+import { LIVE_RATE_MAX_AGE_MS, parseUsdNano, probeX402Pair, x402ProbeUrl } from "../gate.mjs";
 import { YOCTO_PER_NEAR } from "./amount.mjs";
 import { NearError } from "./errors.mjs";
 
@@ -35,6 +35,7 @@ export const COINGECKO_RATES_URL = "https://api.coingecko.com/api/v3/simple/pric
 export const RAW_PER_XNO = 10n ** 30n;
 export const MAX_SPREAD_BPS = 2000;
 const NANO_PER_USD = 1_000_000_000n;
+const MAX_RATE_CLOCK_SKEW_MS = 30_000;
 
 /** num/den as a decimal string, rounded half-up to `decimals`, trailing zeros trimmed. */
 export function ratioDecimal(num, den, decimals = 9) {
@@ -104,7 +105,7 @@ export function createNearRates({
   fetch = globalThis.fetch,
   now = Date.now,
   ttlMs = 60_000,
-  maxStaleMs = 300_000,
+  maxStaleMs = LIVE_RATE_MAX_AGE_MS,
   refreshMs = 60_000,
   forceMinIntervalMs = 15_000,
   timeoutMs = 8_000,
@@ -155,6 +156,16 @@ export function createNearRates({
   const nearLive = () => cfg.nearStatic == null;
   const xnoLive = () => cfg.xnoStatic == null;
   const anyLive = () => nearLive() || xnoLive();
+  const freshAt = (at, t) => t - at >= -MAX_RATE_CLOCK_SKEW_MS && t - at < maxStaleMs;
+  const usable = (rec, t) => !!rec && (rec.fetchedAt === Infinity || freshAt(rec.fetchedAt, t) && freshAt(rec.observedAt, t));
+
+  function coinGeckoRate(value, t) {
+    if (!value) return null;
+    const { usd, usdNano, updatedMs } = value;
+    const observedAt = updatedMs ?? t;
+    if (!freshAt(observedAt, t)) return null;
+    return { usd, usdNano, source: "coingecko", at: iso(observedAt), observedAt, fetchedAt: t };
+  }
 
   async function fetchCoinGecko() {
     const res = await fetch(coingeckoUrl, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(timeoutMs), redirect: "error" });
@@ -177,27 +188,28 @@ export function createNearRates({
     lastRefreshAt = t;
     // The configuration may have changed while the fetches ran (SIGHUP): only fill sides still live.
     if (wantNear && nearLive()) {
-      const v = cg.status === "fulfilled" ? cg.value.near : null;
+      const v = cg.status === "fulfilled" ? coinGeckoRate(cg.value.near, t) : null;
       if (v) {
-        near = { usd: v.usd, usdNano: v.usdNano, source: "coingecko", at: iso(v.updatedMs ?? t), fetchedAt: t };
+        near = v;
         nearError = null;
       } else {
-        nearError = cg.status === "rejected" ? errText(cg.reason) : "CoinGecko returned no NEAR/USD price";
+        nearError = cg.status === "rejected" ? errText(cg.reason) : "CoinGecko returned no fresh NEAR/USD price";
       }
     }
     if (wantXno && xnoLive()) {
       if (probe.status === "fulfilled" && probe.value) {
         const pair = probe.value;
-        xno = { usd: ratioDecimal(pair.usdNano * RAW_PER_XNO, pair.raw * NANO_PER_USD, 9), pair, source: "nanogpt-x402", at: iso(t), fetchedAt: t };
+        xno = { usd: ratioDecimal(pair.usdNano * RAW_PER_XNO, pair.raw * NANO_PER_USD, 9), pair,
+          source: "nanogpt-x402", at: iso(t), observedAt: t, fetchedAt: t };
         xnoError = null;
       } else {
-        const v = cg.status === "fulfilled" ? cg.value.nano : null;
+        const v = cg.status === "fulfilled" ? coinGeckoRate(cg.value.nano, t) : null;
         const why = `NanoGPT x402 probe: ${probe.status === "rejected" ? errText(probe.reason) : "no answer"}`;
         if (v) {
-          xno = { usd: v.usd, pair: { usdNano: v.usdNano, raw: RAW_PER_XNO }, source: "coingecko", at: iso(v.updatedMs ?? t), fetchedAt: t };
+          xno = { ...v, pair: { usdNano: v.usdNano, raw: RAW_PER_XNO } };
           xnoError = `${why}; using CoinGecko`;
         } else {
-          xnoError = `${why}; CoinGecko: ${cg.status === "rejected" ? errText(cg.reason) : "no XNO/USD price"}`;
+          xnoError = `${why}; CoinGecko: ${cg.status === "rejected" ? errText(cg.reason) : "no fresh XNO/USD price"}`;
         }
       }
     }
@@ -214,7 +226,6 @@ export function createNearRates({
     return inflight;
   }
 
-  const usable = (rec, t) => !!rec && t - rec.fetchedAt < maxStaleMs;
   const due = (rec, t) => !rec || t - rec.fetchedAt >= ttlMs;
 
   function build(n, x) {

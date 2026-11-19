@@ -765,6 +765,9 @@ quote refetches a live rate older than 60 s, and a forced refresh refetches now:
   answers from cache and says so in `refresh.note`.
 
 **Fail closed.** Without a NEAR/USD rate younger than 5 minutes there is no NEAR quote.
+When CoinGecko provides an observation time, the five-minute limit uses that
+time even if repeated fetches succeed. A timestamp more than 30 seconds in the
+future is ignored.
 On a server that pays NanoGPT from its Nano wallet the same holds for XNO/USD (the swap
 rate is unknown). On an API-key server XNO/USD is informational: its absence never blocks
 a quote and the rate line says "XNO/USD unavailable".
