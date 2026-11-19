@@ -209,6 +209,21 @@ function bindFixturePayments(ledger, ...ids) {
   }
 }
 
+test("the scheduled check refuses equivalent Nano endpoints before probing them", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.nanoRpcUrls = ["https://nano-0.example/rpc", "https://NANO-0.example.:443/v1/../rpc#ignored"];
+
+  const report = await runOperationalCheck(f.config, f.deps);
+  const configuration = report.checks.find(row => row.stage === "nano-rpc-peers");
+  assert.equal(configuration.ok, false);
+  assert.equal(configuration.code, "NANO_RPC_DUPLICATE_PEER");
+  assert.equal(report.admission.nano, false);
+  assert.equal(report.nanoPaymentReadPeers, undefined);
+  assert.ok(f.calls.every(({ url }) => !url.hostname.startsWith("nano-0.example")));
+  assert.ok(report.checks.some(row => row.stage === "near-payment-watcher" && row.ok));
+});
+
 test("operational probes cover live readiness with no inference, signing or Market mutation and a redacted report", async () => {
   const f = fixture(), before = JSON.stringify(f.states);
   const report = await runOperationalCheck(f.config, f.deps);

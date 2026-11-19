@@ -52,6 +52,18 @@ test("the optional standby requires two primaries, an independent hostname and a
     error instanceof TypeError && !error.message.includes("PRIVATE"));
 });
 
+test("equivalent Nano RPC URLs cannot supply two wallet peer votes", () => {
+  const opts = { account: ACCOUNT, checkAddress, hashBlock, rpc: () => assert.fail("unexpected RPC") };
+  for (const bases of [
+    ["https://peer.example/rpc?token=fixture", "https://PEER.example.:443/api/../rpc?token=fixture#ignored"],
+    ["http://127.0.0.1:7077", "http://127.1:7077/"],
+  ]) {
+    assert.throws(() => createNanoReadPool({ ...opts, bases }), { code: "NANO_RPC_DUPLICATE_PEER" });
+  }
+  const pool = createNanoReadPool({ ...opts, bases: ["http://127.0.0.1:7077/a", "http://127.0.0.1:7077/b"] });
+  assert.equal(pool.status().configuredPeers, 2);
+});
+
 test("the Nano standby stays idle at quorum and only corroborates an eligible primary", async () => {
   const w = world(2, 10), [primary, spare, standby] = w.peers;
   const standbyCalls = () => w.calls.filter(call => call.base === standby.base);
