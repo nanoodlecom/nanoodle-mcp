@@ -518,8 +518,6 @@ export async function runOperationalCheck(config, deps = {}) {
       const url = config.nanoRpcUrls[index];
       const deadline = AbortSignal.timeout(config.timeoutMs || 12_000);
       const rpc = body => nanoRpc(url, body, deadline);
-      const historyRequest = { action: "account_history", account, head, count: String(NANO_HISTORY_PAGE), raw: "true" };
-      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, nano.view.confirmedHeight);
       const receivableRequest = { action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
         source: "true", include_only_confirmed: "true" };
       const pending = await rpc(receivableRequest);
@@ -528,24 +526,28 @@ export async function runOperationalCheck(config, deps = {}) {
       need(view.confirmedHeight >= nano.view.confirmedHeight
         && (view.confirmedHeight !== nano.view.confirmedHeight || view.confirmedFrontier === head), "nano-payment-read-anchor-moved");
       checkedReceivable(pending, receivableRequest, view, checkAddress);
+      const historyRequest = { action: "account_history", account, head: view.confirmedFrontier, count: String(NANO_HISTORY_PAGE), raw: "true" };
+      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, view.confirmedHeight);
       return true;
     }, []);
     // A valid but newer account view still matters when its payment window
     // failed validation. Two older windows cannot then prove current reads.
     return view && { view, peer: index, paymentReads: paymentReads === true };
   }))).filter(Boolean) : [];
-  await check("nano-payment-read-quorum", () => {
+  const activePaymentPeers = await check("nano-payment-read-quorum", () => {
     need(nano, "nano-payment-read-anchor-unavailable");
     const ready = currentNanoPaymentPeers(paymentViews);
     const standbyMatches = ready.length === 1 && standbyCheckpoint?.hash === ready[0].view.confirmedFrontier
       && standbyCheckpoint.blockCount === ready[0].view.confirmedHeight.toString();
     need(ready.length >= Math.min(2, config.nanoRpcUrls.length),
       standbyMatches ? "nano-payment-read-standby-unverified" : "nano-payment-read-quorum-unavailable");
+    return ready;
   }, ["nano"]);
   const fallbackPaymentReads = config.nanoRpcUrls.length >= 3 && await check("nano-fallback-payment-reads", () => {
     need(nano, "nano-fallback-payment-read-anchor-unavailable");
-    // Reuse the same payment reads to check whether the first peer can be lost.
-    need(currentNanoPaymentPeers(paymentViews.filter(row => row.peer !== 0)).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
+    // A fallback pair must cover the newest observed confirmed head, even
+    // when only the first peer reported it or its own history read failed.
+    need(activePaymentPeers?.filter(row => row.peer !== 0).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
     return true;
   }, []);
   if (config.nanoStandby && !fallbackPaymentReads) await check("nano-standby-cold-scan-budget", () => {

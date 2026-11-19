@@ -997,7 +997,7 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
 });
 
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
-  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "moved-after-history", "inconsistent-newer-view"]) {
+  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "stale-history", "inconsistent-newer-view"]) {
     const f = fixture(({ url, body }) => {
       if (url.hostname !== "nano-2.example") return null;
       if (body.action === "account_history" && failure === "history-http") return new Response("PRIVATE_RPC_DETAIL", { status: 503 });
@@ -1012,7 +1012,7 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
       if (body.action === "receivable" && ["inconsistent-receivable", "inconsistent-newer-view"].includes(failure)) {
         return Response.json({ blocks: { ["B".repeat(64)]: { amount: "1", source: body.account } } });
       }
-      if (body.action === "account_info" && ["moved-after-history", "inconsistent-newer-view"].includes(failure)
+      if (body.action === "account_info" && ["stale-history", "inconsistent-newer-view"].includes(failure)
         && f.calls.some(c => c.url.hostname === url.hostname && c.body.action === "receivable")) {
         return Response.json(nanoAccountInfo({ height: 11, frontier: "B".repeat(64) }));
       }
@@ -1032,12 +1032,47 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
     }
     const calls = f.calls.filter(c => ["account_history", "receivable"].includes(c.body?.action));
     assert.ok(calls.every(c => ["nano-0.example", "nano-1.example", "nano-2.example"].includes(c.url.hostname)));
-    assert.equal(calls.filter(c => c.body.action === "account_history").length, 3, "share peer reads between both checks");
+    const receivableRejected = ["inconsistent-receivable", "inconsistent-newer-view"].includes(failure);
+    assert.equal(calls.filter(c => c.body.action === "account_history").length, receivableRejected ? 2 : 3,
+      "share peer reads and skip history when a receivable check already failed");
     assert.ok(calls.some(c => c.body.action === "account_history" && c.body.count === "100" && c.body.raw === "true"));
     assert.ok(calls.some(c => c.body.action === "receivable" && c.body.count === "500" && c.body.include_only_confirmed === "true"));
-    assert.deepEqual(report.admission, { nano: !["moved-after-history", "inconsistent-newer-view"].includes(failure),
+    assert.deepEqual(report.admission, { nano: !["stale-history", "inconsistent-newer-view"].includes(failure),
       near: true, usdc: true, market: true });
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_RPC_DETAIL|nano-2\.example|BBBBBBBB/);
+  }
+});
+
+test("Nano failover must prove the newest observed head even if it advances during the probe", async t => {
+  const nextHead = "B".repeat(64);
+  for (const mode of ["all-advance", "primary-advances", "newest-history-invalid", "primary-history-invalid"]) {
+    const advances = host => mode !== "primary-advances" || host === "nano-0.example";
+    const f = fixture(({ url, body }) => {
+      if (!/^nano-\d/.test(url.hostname)) return null;
+      const newer = advances(url.hostname);
+      if (body.action === "account_info" && newer
+        && f.calls.some(call => call.url.hostname === url.hostname && call.body?.action === "receivable")) {
+        return Response.json(nanoAccountInfo({ height: 11, frontier: nextHead }));
+      }
+      if (body.action === "account_history") {
+        assert.equal(body.head, newer ? nextHead : "A".repeat(64));
+        const stale = mode === "newest-history-invalid" || (mode === "primary-history-invalid" && url.hostname === "nano-0.example");
+        return Response.json(rawHistory(body, null, newer && !stale ? 11 : 10));
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.nanoRpcUrls.push("https://nano-2.example");
+    f.states["/state/funding-health.json"].nanoRpc.configuredPeers = 3;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    const healthy = ["all-advance", "primary-history-invalid"].includes(mode);
+    assert.equal(check("nano-frontier-agreement")?.ok, true, mode);
+    assert.equal(check("nano-payment-read-quorum")?.ok, healthy, mode);
+    assert.equal(check("nano-fallback-payment-reads")?.ok, healthy, mode);
+    assert.deepEqual(report.admission, { nano: healthy, near: true, usdc: true, market: true }, mode);
+    assert.equal(f.calls.filter(call => call.body?.action === "account_history").length, 3);
+    assert.doesNotMatch(JSON.stringify(report), /BBBBBBBB|nano-[012]\.example/);
   }
 });
 
