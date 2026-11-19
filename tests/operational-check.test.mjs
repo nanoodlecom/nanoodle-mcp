@@ -1046,6 +1046,57 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
   }
 });
 
+test("API-funded NEAR and USDC combine pending creator payouts at their locked rates", async t => {
+  const raw = 10n ** 30n;
+  for (const shortfall of [0n, 1n]) {
+    const f = fixture(), author = f.config.nanoAddress;
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.providerUsesWallet = false;
+    const nearState = f.states["/state/near-state.json"];
+    nearState.quotes = {
+      near: { status: "paid", asset: "near", author, depositUsd: "1.2", paidYocto: "400000000000000000000000",
+        paidAtBlockMs: NOW, rate: { usdNano: "3000000000", yocto: "1000000000000000000000000", xnoUsd: "0.5" } },
+      usdc: { status: "paid", asset: "usdc", author, depositUsd: "0.6", paidYocto: "600000",
+        paidAtBlockMs: NOW, rate: { usdNano: "1000000000", yocto: "1000000", xnoUsd: "0.2" } },
+      unauthored: { status: "paid", asset: "usdc", depositUsd: "0.1", paidYocto: "100000", paidAtBlockMs: NOW },
+    };
+    bindFixturePayments(nearState, "near", "usdc", "unauthored");
+    // The two creators need 0.4 and 0.5 XNO. The API key pays the model costs.
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: "0",
+      reservedRaw: String(10n * raw - 9n * raw / 10n + shortfall), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const funding = report.checks.find(row => row.stage === "near-paid-run-funding");
+    assert.equal(funding?.ok, shortfall === 0n);
+    if (shortfall) assert.equal(funding.code, "near-paid-run-funding-insufficient");
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  }
+});
+
+test("API-funded authored previews check creator Nano against the runtime and on-chain balances", async t => {
+  const raw = 10n ** 30n;
+  for (const mode of ["healthy", "runtime-short", "chain-short"]) {
+    const f = fixture(({ url }) => url.href === "https://site.example/graph/sing.json" ? Response.json({
+      v: 1, name: "sing", nodes: [{ id: "input", type: "text", fields: { text: "sample" } }], links: [],
+      x402: { author: NANO_GENESIS_REPLY.contents.account },
+    }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.providerUsesWallet = false;
+    const low = raw / 1000n, enough = raw / 100n;
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: "0",
+      reservedRaw: String(10n * raw - (mode === "runtime-short" ? low : enough)), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "chain-short") f.states["/state/gate-state.json"].owed.push({
+      amountRaw: String(10n * raw - low), journaled: true, tries: 0, createdAt: NOW,
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    for (const asset of ["near", "usdc"]) {
+      const forecast = report.checks.find(row => row.stage === `workflow-nano-capital-${asset}-sing`);
+      assert.equal(forecast?.ok, mode === "healthy", `${mode} ${asset}`);
+      if (mode !== "healthy") assert.equal(forecast.code, "workflow-nano-capital-insufficient");
+      assert.ok(!report.checks.some(row => row.stage === `workflow-nano-capital-${asset}-custom`));
+    }
+  }
+});
+
 test("waiting Nano, NEAR and USDC work must fit the same available pool", async t => {
   const raw = 10n ** 30n, nanoDeposit = 9n * raw / 4n, combined = 5n * raw;
   for (const mode of ["exact", "live-short", "chain-short", "missing-rate", "started-during-sample", "provider-key"]) {
