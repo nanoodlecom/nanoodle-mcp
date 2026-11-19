@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { createBlock, checkAddress, hashBlock } from "nanocurrency";
 import { createNanoReadPool, nanoStandbyConfig, NANO_COLD_STANDBY_SCAN_REQUESTS } from "../src/nano-read-pool.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
@@ -334,6 +335,42 @@ test("unproven standby history leaves only the independently verified receivable
       await assert.rejects(w.pool.publishBases(), { code: "NANO_RPC_NETWORK_QUORUM" });
     }
   }
+});
+
+test("a history refusal suppresses new RPCs while another peer is still finishing the window", async () => {
+  const w = world(2), [owned, metered] = w.peers;
+  for (const peer of w.peers) {
+    peer.info = nanoAccountInfo({ pending: "7" });
+    peer.receivable = pending(7);
+  }
+  const heldHistory = Promise.withResolvers(), refusal = Promise.withResolvers();
+  const head = owned.info.confirmed_frontier;
+  owned.historyRead = () => heldHistory.promise;
+  metered.historyRead = () => {
+    refusal.resolve();
+    throw Object.assign(new Error("RPC refused"), { rateLimited: true, retryAfterMs: 60_000 });
+  };
+  const window = w.pool.readPaymentWindow({ existingPayments: true });
+  await refusal.promise;
+  await nextTurn();
+  const before = w.calls.filter(call => call.base === metered.base).length;
+  try {
+    assert.equal(w.pool.isCooling(metered.base), true);
+    assert.ok(!(await w.pool.publishBases()).includes(metered.base));
+    await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_NETWORK_QUORUM" });
+    assert.equal(w.calls.filter(call => call.base === metered.base).length, before);
+  } finally {
+    heldHistory.resolve({ account: ACCOUNT, previous: OTHER, history: [
+      { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+    ] });
+    assert.deepEqual(await window, { receivable: pending(7), history: null });
+  }
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 1, until: 61_000 }]);
+  w.tick(59_999);
+  await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_NETWORK_QUORUM" });
+  w.tick(1);
+  await w.pool.readFundingInfo();
+  assert.equal(w.pool.isCooling(metered.base), false);
 });
 
 test("a standby rate limit remains private and prevents attempts until its retry time", async () => {
