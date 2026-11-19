@@ -506,7 +506,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
       t("n2", "Style guide"),
       { id: "n3", type: "join", x: 0, y: 0, fields: {} },
       { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
-      { id: "n5", type: "image", x: 0, y: 0, name: "Mockup", fields: { model: "openai/nano-banana-2-lite", size: "1024x1024" } },
+      { id: "n5", type: "image", x: 0, y: 0, name: "Mockup", fields: { model: "openai/nano-banana-2-fast", size: "1024x1024" } },
     ],
     [
       link("l1", ["n1", "text"], ["n3", "a"]),
@@ -533,7 +533,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
 
   assert.equal(desc.named,
     "text:Feature -> text:Style guide -> join -> llm -> image:Mockup; " +
-    "returns image (nano-banana-2-lite, 1024×1024) saved to disk (file path in result). " +
+    "returns image (nano-banana-2-fast, 1024×1024) saved to disk (file path in result). " +
     "Runs on NanoGPT — every call spends real credit from your API key's balance.");
   assert.equal(desc.collapse,
     "text×2 -> join -> llm; returns text. " +
