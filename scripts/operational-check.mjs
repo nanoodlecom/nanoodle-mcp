@@ -27,7 +27,7 @@ import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
-import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
+import { createMarketFeeGuard } from "../src/market/fee-guard.mjs";
 import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
@@ -932,9 +932,12 @@ export async function runOperationalCheck(config, deps = {}) {
       }
     }, ["near", "usdc"]);
   }
-  const platform = await check("market-platform-fee", async () => {
-    const result = await http(config.marketUrl + "/v1/platform/config");
-    need(result.platform_fee_bps === MARKET_PLATFORM_FEE_BPS, "market-fee-assumption-changed"); return result;
+  const fees = createMarketFeeGuard({ baseUrl: config.marketUrl, fetch: deps.fetch, timeoutMs: config.timeoutMs });
+  await check("market-platform-fee", async () => {
+    try { await fees.check(); }
+    catch (error) {
+      throw new CheckError(error.code === "MARKET_FEE_CHANGED" ? "market-fee-assumption-changed" : "market-fee-unavailable");
+    }
   }, ["market"]);
   await Promise.all(config.agents.map(async agent => {
     await check(`market-process-${agent.handle}`, async () => {
@@ -1008,7 +1011,7 @@ export async function runOperationalCheck(config, deps = {}) {
       const risk = MARKET_SLA_WARNINGS.find(code => intake.has(code));
       need(!risk, risk);
     }, []);
-    if (agent.bids && platform) {
+    if (agent.bids) {
       await checkMarketRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
     }
     if (!agent.defaultWorkflow) return;
@@ -1018,7 +1021,7 @@ export async function runOperationalCheck(config, deps = {}) {
       const listing = await fetchListingPrice({ baseUrl: config.marketUrl, handle: agent.handle, fetch: request });
       need(listing.ok && listing.listingStatus === "live", "market-price-unavailable");
       const needUsd = marketNeedUsd(priced.pricing.estimatedCostUsd);
-      need(platform && budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
+      need(budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
       const remote = await mcp("tools/call", { name: "price_noodle", arguments: { graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } } });
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
       await checkMarketRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));

@@ -1943,6 +1943,25 @@ test("a changed Market fee or invalid agent token is actionable even when public
   }
 });
 
+test("the scheduled Market fee check uses the worker's upper limit and separates fee and price failures", async t => {
+  for (const [fee, code] of [[0, null], [499, null], [500, null], [501, "market-fee-assumption-changed"],
+    ["500", "market-fee-unavailable"], [-1, "market-fee-unavailable"], [10_001, "market-fee-unavailable"]]) {
+    const f = fixture(({ url, init }) => {
+      if (url.pathname !== "/v1/platform/config") return null;
+      assert.equal(new Headers(init.headers).has("authorization"), false);
+      return Response.json({ platform_fee_bps: fee });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const marketFee = report.checks.find(check => check.stage === "market-platform-fee");
+    assert.equal(marketFee?.ok, code === null, String(fee));
+    assert.equal(marketFee?.code, code ?? undefined, String(fee));
+    assert.equal(report.admission.market, code === null, String(fee));
+    assert.ok(report.checks.find(check => check.stage === "workflow-price-nanoodle-image")?.ok, String(fee));
+    assert.ok(report.checks.find(check => check.stage === "workflow-nano-capital-market-nanoodle-image")?.ok, String(fee));
+  }
+});
+
 test("dead workers, a stale payment watcher and low disk space are reported independently of public availability", async () => {
   const f = fixture(({ url }) => {
     if (url.pathname === "/near/health") return Response.json({ active: true, network: "mainnet", merchant: "nanoodle.near", watcher: { listening: true, height: 100, lastScanAt: new Date(NOW - 300_000).toISOString() } });
