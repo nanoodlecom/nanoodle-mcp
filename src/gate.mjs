@@ -31,6 +31,7 @@ import { randomBytes, randomInt, createHash } from "node:crypto";
 import { readFileSync, constants } from "node:fs";
 import { open, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { performance } from "node:perf_hooks";
 import { checkAddress } from "nanocurrency";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { knownUsd, parseUsdNano } from "./usd.mjs";
@@ -39,11 +40,17 @@ import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
 import { nanoFundingCoverage, nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
 import { syncPrivateStateParentSync } from "./private-state.mjs";
-import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
+import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, NANO_PAYMENT_GRAIN as GRAIN,
+  NANO_RECEIVABLE_COUNT as RECEIVABLE_COUNT, NANO_HISTORY_PAGE as HISTORY_PAGE,
+  checkedAnchoredNanoHistory, nanoHistoryKind, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
+const QUOTE_READ_PROOF_TTL_MS = 30_000;
+const QUOTE_READ_RETRY_MS = 5_000;
+const QUOTE_READ_UNAVAILABLE = "Nano payment detection is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
+const QUOTE_FUNDING_UNAVAILABLE = "Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
 /**
  * The ONLY refund reasons the payments ledger may record — fixed categories,
  * never free text. A ledger line must never carry an upstream error string
@@ -62,17 +69,7 @@ const RETAIN_MS = 24 * 60 * 60 * 1000; // keep dead quotes around to auto-refund
  * account_history, which is walked exhaustively (see scanHistory), so overflow
  * recovers instead of stranding.
  */
-const RECEIVABLE_COUNT = 500;
-const HISTORY_PAGE = 100; // account_history entries per RPC while walking
 const HISTORY_MAX_PAGES = 10; // churn cap per scan — far above real block throughput per poll
-/**
- * 1e-8 XNO in raw — the resolution wallets actually display and let a human
- * type. Quote amounts are whole multiples of this, so the friendly "0.13647256
- * XNO" figure IS the exact payable amount; payments are matched at this
- * resolution too, so a wallet that pads or truncates deeper digits can't
- * orphan a payment.
- */
-const GRAIN = 10n ** 22n;
 const NANO_TAG_SPAN = 1_000_000;
 
 /** Choose a free displayed grain within the quote's bounded amount range. */
@@ -233,8 +230,10 @@ export function createChargeGate({
   log = () => {},
   usage = () => {},
   now = () => Date.now(),
+  monotonicNow = () => performance.now(),
   fundRun = null,
   canQuote = () => true,
+  verifyPaymentReads = false,
   maintenance = null,
   runTimeoutMs = undefined,
 }) {
@@ -244,6 +243,9 @@ export function createChargeGate({
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (typeof verifyPaymentReads !== "boolean" || (verifyPaymentReads && typeof ops.checkpoint !== "function")) {
+    throw new TypeError("verifying Nano payment reads requires a wallet checkpoint");
+  }
   if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.accepting !== "function" || typeof maintenance.assertAdmitted !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
 
   /** @type {Map<string, object>} paymentId → quote */
@@ -253,6 +255,9 @@ export function createChargeGate({
   let restoredStateNeedsWrite = false;
   let recordingRestoredState = null;
   let historyScan = readNanoPaymentHistory();
+  let paymentReadSequence = 0;
+  let lastPaymentRead = null;
+  let quoteReadInFlight = null;
 
   /* ---------------- pricing ---------------- */
 
@@ -822,8 +827,14 @@ export function createChargeGate({
     return floor;
   }
 
-  async function readHistoryPage(head) {
-    const page = await ops.rpc({ action: "account_history", account: address, count: String(HISTORY_PAGE), ...(head && { head }) });
+  async function readHistoryPage(head, raw, height = null) {
+    const request = { action: "account_history", account: address, count: String(HISTORY_PAGE),
+      ...(head && { head }), ...(raw && { raw: "true" }) };
+    const page = await ops.rpc(request);
+    if (raw) {
+      const proved = checkedAnchoredNanoHistory(page, request, checkAddress, height);
+      return { entries: proved.history, next: proved.previous };
+    }
     if (page?.history !== "" && !Array.isArray(page?.history)) throw new Error("Invalid Nano history page");
     if (page.account && page.account.replace(/^xrb_/, "nano_") !== address.replace(/^xrb_/, "nano_")) throw new Error("Nano history returned the wrong account");
     const entries = [];
@@ -843,10 +854,82 @@ export function createChargeGate({
     return { entries, next };
   }
 
+  function receivableBlocks(reply) {
+    const blocks = reply?.blocks;
+    if (verifyPaymentReads && blocks !== "" && (!blocks || typeof blocks !== "object" || Array.isArray(blocks))) {
+      throw new Error("Invalid Nano receivable window");
+    }
+    return blocks && typeof blocks === "object" ? Object.entries(blocks) : [];
+  }
+
+  async function readPaymentWindow({ existingPayments = false } = {}) {
+    if (verifyPaymentReads && ops.readPaymentWindow) {
+      try {
+        const { receivable, history } = await ops.readPaymentWindow();
+        return { blocks: receivableBlocks(receivable), history: history && {
+          anchored: true, latest: { entries: history.history, next: history.previous },
+        } };
+      } catch (error) {
+        // Keep finding already-issued payments when the standby has enough
+        // budget to corroborate receivables but cannot also read history.
+        if (!existingPayments || error?.code !== "NANO_RPC_STANDBY_BUDGET") throw error;
+      }
+    }
+    const receivable = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1",
+      source: "true", include_only_confirmed: "true" });
+    return { blocks: receivableBlocks(receivable), history: null };
+  }
+
+  async function readLatestHistory() {
+    const anchor = ops.checkpoint?.()?.confirmed;
+    const anchored = isNanoHistoryHash(anchor?.hash);
+    if (verifyPaymentReads && (!anchored || !isNanoHistoryHeight(anchor.blockCount))) {
+      throw new Error("Nano payment history lacks a confirmed checkpoint");
+    }
+    const latest = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored, anchored ? anchor.blockCount : null);
+    return { anchored, latest };
+  }
+
+  function recordPaymentRead(ready, sequence) {
+    // A response from an older overlapping read must not erase newer evidence.
+    if (verifyPaymentReads && (!lastPaymentRead || sequence >= lastPaymentRead.sequence)) {
+      lastPaymentRead = { ready, sequence, at: monotonicNow() };
+    }
+  }
+
+  function recentPaymentRead() {
+    if (!lastPaymentRead) return null;
+    const age = monotonicNow() - lastPaymentRead.at;
+    const interval = lastPaymentRead.ready ? QUOTE_READ_PROOF_TTL_MS : QUOTE_READ_RETRY_MS;
+    return age >= 0 && age < interval ? lastPaymentRead.ready : null;
+  }
+
+  async function paymentReadsReady() {
+    const recent = recentPaymentRead();
+    if (recent !== null) return recent;
+    // Idle wallets have no regular incoming scan. Concurrent quoters share
+    // this read-only probe without waiting for outgoing transfers or for PoW.
+    quoteReadInFlight ||= (async () => {
+      const sequence = ++paymentReadSequence;
+      try {
+        const { history } = await readPaymentWindow();
+        if (!history) await readLatestHistory();
+        recordPaymentRead(true, sequence);
+      } catch {
+        recordPaymentRead(false, sequence);
+        log("Nano checkout could not verify the payment reads");
+      }
+    })().finally(() => { quoteReadInFlight = null; });
+    await quoteReadInFlight;
+    return recentPaymentRead() === true;
+  }
+
   function inspectHistory(entries, stop, floor) {
     for (const entry of entries) {
       if (entry.hash === stop || (floor !== null && isNanoHistoryHeight(entry.height) && BigInt(entry.height) <= floor)) return true;
-      if (entry.type === "receive") matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll", history: entry });
+      if (["receive", "open"].includes(nanoHistoryKind(entry))) {
+        matchAmount(entry.amount, { source: entry.account, hash: entry.hash, via: "history poll", history: entry });
+      }
     }
     return false;
   }
@@ -868,18 +951,19 @@ export function createChargeGate({
   /** Pocketed payments disappear from receivable. Inspect the latest page for
    * quick confirmation, while a fixed backfill resumes older pages across
    * ticks and restarts until it reaches the last completed checkpoint. */
-  async function scanHistory(startedAt, fullReceivableWindow) {
+  async function scanHistory(startedAt, fullReceivableWindow, history) {
     const prior = historyScan;
-    const anchor = ops.checkpoint?.()?.confirmed?.hash;
-    const latest = await readHistoryPage(isNanoHistoryHash(anchor) ? anchor.toUpperCase() : null);
+    const { anchored, latest } = history ?? await readLatestHistory();
     const replay = prior.backfill;
     const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
     const floor = prior.through === null ? initialHistoryFloor() : null;
     if (replay) inspectHistory(latest.entries, replay.newest || prior.through, floor);
 
     for (let used = replay ? 1 : 0; used < HISTORY_MAX_PAGES; used++) {
-      const page = batch.next ? await readHistoryPage(batch.next) : latest;
-      batch.newest ??= page.entries[0]?.hash ?? null;
+      const page = batch.next ? await readHistoryPage(batch.next, anchored) : latest;
+      // A completed cursor must still be visible if an older release resumes
+      // with the default history mode, which skips change and epoch blocks.
+      batch.newest ??= page.entries.find(entry => ["send", "receive", "open"].includes(nanoHistoryKind(entry)))?.hash ?? null;
       const reached = inspectHistory(page.entries, prior.through, floor);
       if (reached || !page.next) {
         if (!reached && prior.through) throw new Error("Nano history ended before the saved checkpoint");
@@ -904,21 +988,29 @@ export function createChargeGate({
     // already throttling us (that is why the refund is queued at all).
     if (!anyPaymentWatchable()) return;
     const startedAt = now();
-    const r = await ops.rpc({ action: "receivable", account: address, count: String(RECEIVABLE_COUNT), threshold: "1", source: "true", include_only_confirmed: "true" });
-    const blocks = r && r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
-    for (const [hash, v] of blocks) {
-      const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
-      const source = typeof v === "object" && v !== null ? v.source : null;
-      matchAmount(amount, { source, hash, via: "receivable poll" });
+    const sequence = ++paymentReadSequence;
+    try {
+      const { blocks, history } = await readPaymentWindow({ existingPayments: true });
+      for (const [hash, v] of blocks) {
+        const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
+        const source = typeof v === "object" && v !== null ? v.source : null;
+        matchAmount(amount, { source, hash, via: "receivable poll" });
+      }
+      await commitDeposits();
+      // A full window means blocks beyond it are invisible — ask the wallet to
+      // pocket (queued housekeeping, never blocks a payment) so the overflow
+      // reappears in account_history, which the walk below reads exhaustively.
+      if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
+        ops.pocket().catch(() => {}); // best-effort; the next tick retries
+      }
+      if (anyPaymentWatchable()) {
+        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT, history);
+        recordPaymentRead(true, sequence);
+      }
+    } catch (error) {
+      recordPaymentRead(false, sequence);
+      throw error;
     }
-    await commitDeposits();
-    // A full window means blocks beyond it are invisible — ask the wallet to
-    // pocket (queued housekeeping, never blocks a payment) so the overflow
-    // reappears in account_history, which the walk below reads exhaustively.
-    if (blocks.length >= RECEIVABLE_COUNT && ops.pocket) {
-      ops.pocket().catch(() => {}); // best-effort; the next tick retries
-    }
-    if (anyPaymentWatchable()) await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT);
   }
 
   /*
@@ -1404,16 +1496,24 @@ export function createChargeGate({
           }
           if (validate) await validate({ name, arguments: args });
           if (persistenceFailed && !await persist()) return errResult("Cannot issue a Nano quote while payment storage is unavailable. Try again shortly.");
-          if (await canQuote() !== true) return errResult("Cannot accept a new payment right now: funding is temporarily unavailable. Try again shortly. Nothing was quoted or charged.");
+          if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
           const price = priceFor(name, args);
           const pair = await ratePair();
+          if (verifyPaymentReads) {
+            if (!await paymentReadsReady()) return errResult(QUOTE_READ_UNAVAILABLE);
+            if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
+            if (recentPaymentRead() !== true) return errResult(QUOTE_READ_UNAVAILABLE);
+          }
           const amountRaw = tagAmount(price, pair);
           if (amountRaw === null) {
             return errResult("This server is holding too many Nano quotes at this price right now. Try again later. Nothing was quoted or charged.");
           }
           const confirmedHeight = ops.checkpoint?.()?.confirmed?.blockCount;
+          if (verifyPaymentReads && !isNanoHistoryHeight(confirmedHeight)) {
+            return errResult(QUOTE_READ_UNAVAILABLE);
+          }
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,

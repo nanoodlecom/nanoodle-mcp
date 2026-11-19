@@ -151,6 +151,30 @@ test("saved, custom and Market execution use the same hosted timeout", async t =
   await assert.rejects(runner.run({ pricing: priced.pricing, inputs: priced.inputs, outDir: dir }), /hosted execution limit/);
 });
 
+test("the Market assignment can shorten the actual hosted run deadline", { timeout: 5_000 }, async t => {
+  const started = deferred();
+  const nano = nanoGptMock({ beforeChat: () => started.resolve() });
+  await nano.listen();
+  t.after(() => nano.close());
+  const dir = await mkdtemp(join(tmpdir(), "market-sla-timeout-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const graph = { v: 1, nodes: [{ id: "l", type: "llm", fields: { model: "z-ai/glm-5.3-flash", prompt: "HOLD", maxTokens: 32 } }], links: [] };
+  const runner = createWorkflowRunner({ apiKey: "fixture", baseUrl: nano.url, budgetUsd: 1, runTimeoutMs: 30_000 });
+  const priced = await runner.price({ graph });
+  assert.equal(priced.ok, true);
+  const args = { pricing: priced.pricing, inputs: priced.inputs, outDir: dir };
+  const before = nano.runs();
+  await assert.rejects(runner.run({ ...args, executionDeadlineAt: Date.now() - 1 }), { code: "MARKET_SLA_TOO_CLOSE" });
+  assert.equal(nano.runs(), before);
+
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const run = runner.run({ ...args, executionDeadlineAt: Date.now() + 2_000 });
+  const cancelled = assert.rejects(run, /hosted execution limit/);
+  await started.promise;
+  t.mock.timers.tick(2_000);
+  await cancelled;
+});
+
 test("the deadline includes output downloads after the model has completed", async t => {
   let models = 0, downloads = 0, base;
   base = await server(t, (req, res) => {

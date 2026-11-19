@@ -35,6 +35,19 @@ const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
 
+function hostedWalletHistory(body, state, deposits) {
+  const open = { type: "open", hash: FRONTIER, height: "1", amount: BALANCE, account: PAY_TO, confirmed: "true" };
+  const rows = state.processed.map(({ block, subtype }, index) => ({
+    type: "state", subtype, hash: hashBlock(block), previous: block.previous, height: String(index + 2), confirmed: "true",
+    ...(subtype === "receive" && { account: PAY_TO, amount: deposits.get(block.link.toUpperCase()).amount }),
+  })).reverse();
+  rows.push(open);
+  const start = body.head ? rows.findIndex(row => row.hash === body.head) : 0;
+  if (start < 0) return { error: "Block not found" };
+  const end = start + Number(body.count);
+  return { account: ADDRESS, history: rows.slice(start, end), ...(rows[end] && { previous: rows[end].hash }) };
+}
+
 test("a hosted wallet persists only a corroborated advance and stops spending if its checkpoint disappears", async t => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-checkpoint-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -88,9 +101,7 @@ test("the hosted wallet settles saved, custom and conditional graphs on Nano, NE
       const received = new Set(state.processed.filter(p => p.subtype === "receive").map(p => p.block.link.toUpperCase()));
       return reply({ blocks: Object.fromEntries([...deposits].filter(([hash]) => !received.has(hash))) });
     },
-    account_history: (_b, state, reply) => reply({ history: state.processed.filter(p => p.subtype === "receive").map(p => ({
-      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount, confirmed: "true",
-    })) }),
+    account_history: (body, state, reply) => reply(hostedWalletHistory(body, state, deposits)),
     block_info: (body, state, reply) => {
       const p = state.processed.find(p => hashBlock(p.block) === body.hash);
       return p ? reply({ confirmed: "true", contents: p.block, height: String(state.processed.indexOf(p) + 2) }) : reply({ error: "Block not found" });
@@ -1520,8 +1531,7 @@ async function hostedShutdownWorld(t, withMarket, { operatorControl = false, req
     account_info: (_body, state, reply) => reply(nanoAccountInfo({ frontier: state.frontier, balance: state.balance, representative: ADDRESS,
       height: state.processed.length + 1, pending: pending(state).reduce((sum, [, value]) => sum + BigInt(value.amount), 0n).toString() })),
     receivable: (_body, state, reply) => reply({ blocks: Object.fromEntries(pending(state)) }),
-    account_history: (_body, state, reply) => reply({ history: state.processed.filter(p => p.subtype === "receive").map(p => ({
-      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount, confirmed: "true" })) }),
+    account_history: (body, state, reply) => reply(hostedWalletHistory(body, state, deposits)),
     block_info: (body, state, reply) => {
       const index = state.processed.findIndex(p => hashBlock(p.block) === body.hash);
       return reply(index < 0 ? { error: "Block not found" } : { confirmed: "true", contents: state.processed[index].block, height: String(index + 2) });

@@ -1,20 +1,32 @@
 // Read-only accounting for probes and admission checks. Never opens a ledger,
 // signs a transaction, retries an assignment, or returns customer content.
-import { parseUsdNano } from "./usd.mjs";
-import { nanoFundingCoverage, nanoQuoteClaim, nearCreatorCoverage, marketCreatorCoverage } from "./funding-liabilities.mjs";
+import { knownUsd, parseUsdNano } from "./usd.mjs";
+import { nanoFundingCoverage, nanoQuoteClaim, nearCreatorCoverage, marketCreatorCoverage, nearRunFundingBudget } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
 import { NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { creatorNanoTransferClaims, gateNanoTransferClaims, hasConflictingNanoTransferClaims } from "./nano-transfer-journal.mjs";
+import { runFundingBudget } from "./run-funding.mjs";
 
 const object = value => value && typeof value === "object" && !Array.isArray(value);
 const U128_MAX = (1n << 128n) - 1n;
+const RAW_PER_XNO = 10n ** 30n;
 const NANO_EXECUTION_GRACE_MS = 5 * 60_000;
 function amount(value) {
   if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128_MAX) throw Error("invalid-state-amount");
   return BigInt(value);
 }
 function values(value) { if (!object(value)) throw Error("invalid-state-shape"); return Object.values(value); }
+function marketAssignments(ledger) {
+  if (ledger?.v !== 1 || !object(ledger.assignments)) throw Error("invalid-market-state");
+  return values(ledger.assignments);
+}
+function marketReservationUsd(record) {
+  if (!["running", "started", "starting"].includes(record.phase)) return 0;
+  const usd = record.pricing?.depositUsd ?? record.budgetUsd;
+  if (!(typeof usd === "number" && Number.isFinite(usd) && usd >= 0)) throw Error("invalid-market-reservation");
+  return usd;
+}
 
 export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now(), stuckMs = 3_600_000, debtMs = 900_000 } = {}) {
   if (![1, 2].includes(nano?.v) || !Array.isArray(nano.quotes) || !Array.isArray(nano.owed)
@@ -97,30 +109,75 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     }
   }
   for (const state of market) {
-    if (state?.v !== 1 || !object(state.assignments)) throw Error("invalid-market-state");
-    addCreatorCoverage(marketCreatorCoverage(values(state.assignments), { payouts }));
-    for (const rec of values(state.assignments)) {
+    const assignments = marketAssignments(state);
+    addCreatorCoverage(marketCreatorCoverage(assignments, { payouts }));
+    for (const rec of assignments) {
       if (rec.phase === "stuck") issues.add("market-assignment-stuck");
       if (["new", "reworking", "running", "submitting", "delivering", "started", "starting", "pricing", "declining"].includes(rec.phase)
         && old(rec.runStartedAt ?? rec.updatedAt ?? rec.createdAt, stuckMs)) issues.add("market-work-stuck");
-      if (["running", "started", "starting"].includes(rec.phase)) {
-        const usd = rec.pricing?.depositUsd ?? rec.budgetUsd;
-        if (!(typeof usd === "number" && Number.isFinite(usd) && usd >= 0)) throw Error("invalid-market-reservation");
-        marketUsdNano += parseUsdNano(String(usd));
-      }
+      const budgetUsd = marketReservationUsd(rec);
+      if (budgetUsd > 0) marketUsdNano += parseUsdNano(budgetUsd);
     }
   }
   for (const issue of nearClaims.issues) issues.add(issue);
   return { ...nearClaims, nanoRaw, marketUsdNano, issues: [...issues].sort() };
 }
 
-export function nanoLiquidityCheck({ liabilities, nanoBalanceRaw, xnoUsd, providerReserveUsd = "2" }) {
+/** Accepted NEAR and USDC payments waiting to acquire a Nano run reservation. */
+export function paidNearRunFundingRaw(quotes) {
+  let requiredRaw = 0n;
+  for (const quote of values(quotes)) {
+    if (quote.status !== "paid" || quote.settlement || quote.fundingOutcomeReady === true) continue;
+    if (amount(quote.paidYocto) === 0n) throw Error("invalid-paid-near-amount");
+    const { maxRaw, overheadRaw } = nearRunFundingBudget(quote);
+    requiredRaw += maxRaw + overheadRaw;
+  }
+  return requiredRaw;
+}
+
+/** Accepted Nano payments waiting to acquire a Nano run reservation. */
+export function paidNanoRunFundingRaw(quotes) {
+  if (!Array.isArray(quotes)) throw Error("invalid-state-shape");
+  let requiredRaw = 0n;
+  for (const quote of quotes) {
+    if (quote.status !== "paid" || quote.settled || quote.result || quote.error
+      || quote.refundExpected || quote.executionNeedsReconciliation) continue;
+    if (nanoQuoteClaim(quote) === 0n || !(knownUsd(quote.usd) > 0)) throw Error("invalid-paid-nano-amount");
+    const rateUsd = amount(quote.pair?.usdNano), rateRaw = amount(quote.pair?.raw);
+    const depositUsd = parseUsdNano(quote.usd);
+    if (rateUsd === 0n || rateRaw === 0n || depositUsd === 0n) throw Error("invalid-paid-nano-rate");
+    // Creator configuration is resolved at execution. The ceiling covers
+    // the possible combination of rounded-down model funds and rounded-up overhead.
+    requiredRaw += (depositUsd * rateRaw + rateUsd - 1n) / rateUsd;
+  }
+  return requiredRaw;
+}
+
+/** Accepted Market launches and running work, priced at the sampled Nano rate. */
+export function marketRunFunding(market, xnoUsd) {
+  const pair = { usdNano: xnoUsd == null ? null : parseUsdNano(xnoUsd), raw: RAW_PER_XNO };
+  let waitingRaw = 0n, totalRaw = 0n;
+  for (const state of market) {
+    for (const rec of marketAssignments(state)) {
+      const budgetUsd = marketReservationUsd(rec);
+      if (budgetUsd === 0) continue;
+      const { maxRaw, overheadRaw } = runFundingBudget({ id: rec.id, budgetUsd, pair, creator: !!rec.creator });
+      const requiredRaw = maxRaw + overheadRaw;
+      totalRaw += requiredRaw;
+      if (rec.phase !== "running") waitingRaw += requiredRaw;
+    }
+  }
+  return { waitingRaw, totalRaw };
+}
+
+export function nanoLiquidityCheck({ liabilities, nanoBalanceRaw, xnoUsd, providerReserveUsd = "2", marketFundingRaw = 0n }) {
   const xnoUsdNano = parseUsdNano(xnoUsd);
   if (xnoUsdNano <= 0n) throw Error("invalid-funding-rate");
-  const requiredUsd = parseUsdNano(providerReserveUsd) + liabilities.marketUsdNano;
+  const bufferUsd = parseUsdNano(providerReserveUsd), requiredUsd = bufferUsd + liabilities.marketUsdNano;
   if (requiredUsd < 0n) throw Error("invalid-provider-reserve");
-  const raw = 10n ** 30n;
-  const providerRaw = (requiredUsd * raw + xnoUsdNano - 1n) / xnoUsdNano;
+  const toRaw = usd => (usd * RAW_PER_XNO + xnoUsdNano - 1n) / xnoUsdNano;
+  const baseline = toRaw(requiredUsd), recent = marketFundingRaw + toRaw(bufferUsd);
+  const providerRaw = recent > baseline ? recent : baseline;
   return amount(nanoBalanceRaw) >= liabilities.nanoRaw + providerRaw
     ? { stage: "nano-liquidity", ok: true }
     : { stage: "nano-liquidity", ok: false, code: "nano-pool-insufficient-after-obligations" };

@@ -691,6 +691,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
      */
     ops: {
       rpc,
+      ...(readPool && { readPaymentWindow: async () => {
+        if (checkpointStore) await qualifyRestartFloor();
+        return readPool.readPaymentWindow();
+      } }),
       withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
       fundingStatus: funding.snapshot,
       checkpoint: () => readPool?.status().checkpoint ?? null,

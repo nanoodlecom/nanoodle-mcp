@@ -130,8 +130,9 @@ export function nearFundingNeed({ claims, costs, storageUsage, reserveYocto = NE
 }
 
 /** All account/key/token views are pinned to the same finalized block. */
-export async function readNearFunding({ rpc, network, accountId, publicKey, tokenContract = null, optionalTokenBalance = false, now = Date.now }) {
-  const block = await rpc.block({ finality: "final" }), head = block?.header;
+export async function readNearFunding({ rpc, network, accountId, publicKey, tokenContract = null, optionalTokenBalance = false,
+  finalizedBlock, now = Date.now }) {
+  const block = finalizedBlock ?? await rpc.block({ finality: "final" }), head = block?.header;
   assertFreshBlock(block, { now: now(), maxHeadAgeMs: 90_000, maxClockSkewMs: 30_000 });
   if (typeof head?.hash !== "string" || !Number.isSafeInteger(Number(head.height))) throw bad();
   const query = async params => {
@@ -149,9 +150,9 @@ export async function readNearFunding({ rpc, network, accountId, publicKey, toke
   // Registration gates new quotes. A verified balance may still cover an
   // existing refund when the separate registration query is unavailable.
   const registration = tokenContract
-    ? tokenView("storage_balance_of").then(storage => storage != null && raw(storage.total) > 0n).catch(() => false)
-    : false;
-  const [account, key, protocol, gas, usdcAtomic, usdcRegistered] = await Promise.all([
+    ? tokenView("storage_balance_of").then(storage => storage !== null && raw(storage.total) > 0n).catch(() => null)
+    : null;
+  const [account, key, protocol, gas, usdcAtomic, tokenRegistration] = await Promise.all([
     query({ request_type: "view_account", account_id: accountId }),
     query({ request_type: "view_access_key", account_id: accountId, public_key: publicKey }),
     rpc.call("EXPERIMENTAL_protocol_config", { block_id: head.hash }),
@@ -159,9 +160,11 @@ export async function readNearFunding({ rpc, network, accountId, publicKey, toke
     optionalTokenBalance ? tokenBalance?.catch(() => null) ?? null : tokenBalance,
     registration,
   ]);
-  if (protocol.chain_id !== network || key.permission !== "FullAccess") throw bad();
+  if (protocol.chain_id !== network || key.permission !== "FullAccess"
+    || !Number.isSafeInteger(account.storage_usage) || account.storage_usage < 0) throw bad();
   if (integer(key.nonce) >= (1n << 64n) - 1n) throw bad();
-  return { balanceYocto: raw(account.amount), storageUsage: account.storage_usage, usdcAtomic, usdcRegistered,
+  return { balanceYocto: raw(account.amount), storageUsage: account.storage_usage, usdcAtomic,
+    usdcRegistered: tokenRegistration === true, usdcRegistrationVerified: tokenRegistration !== null,
     costs: nearRefundCosts(protocol, gas.gas_price), blockHeight: Number(head.height), accessKey: key };
 }
 

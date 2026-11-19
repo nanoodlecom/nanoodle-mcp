@@ -8,12 +8,28 @@
 import { NearError } from "./errors.mjs";
 import { assertFreshBlock, MAX_HEAD_AGE_MS, MAX_CLOCK_SKEW_MS } from "./freshness.mjs";
 import { PAYMENT_WATCH_META } from "./quote-capacity.mjs";
+import { requireNearAccountChanges, requireNearReceiptTransaction } from "./rpc.mjs";
 
 function historicalTime(block) {
   const ns = block?.header?.timestamp_nanosec;
   const ms = typeof ns === "string" && /^\d+$/.test(ns) ? Number(BigInt(ns) / 1_000_000n) : NaN;
   if (!Number.isSafeInteger(ms)) throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received an invalid historical block timestamp");
   return ms;
+}
+
+export async function readNearPaymentReceipts(rpc, blockHash, accounts) {
+  const result = await rpc.call("EXPERIMENTAL_changes", {
+    changes_type: "account_changes", account_ids: accounts, block_id: blockHash,
+  });
+  const changes = requireNearAccountChanges(result, blockHash, accounts);
+  return new Set(changes.changes
+    .filter((row) => accounts.includes(row.change.account_id) && row.cause.type === "receipt_processing")
+    .map((row) => row.cause.receipt_hash));
+}
+
+export async function readNearReceiptTransaction(rpc, receiptId, blockHeight) {
+  const tx = await rpc.call("EXPERIMENTAL_receipt_to_tx", { receipt_id: receiptId, block_height: blockHeight });
+  return requireNearReceiptTransaction(tx);
 }
 
 export function createNearWatcher({
@@ -39,21 +55,10 @@ export function createNearWatcher({
     const pending = pendingQuotes();
     if (!pending.length) return;
     const accounts = [merchantId, ...tokenContracts.filter((token) => pending.some((q) => q.asset === "usdc" && q.tokenContract === token))];
-    const changes = await rpc.call("EXPERIMENTAL_changes", {
-      changes_type: "account_changes", account_ids: accounts, block_id: block.header.hash,
-    });
-    if (changes.block_hash !== block.header.hash || !Array.isArray(changes.changes)) {
-      throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher received changes for a different block");
-    }
-    const receipts = new Set(changes.changes
-      .filter((c) => accounts.includes(c.change?.account_id) && c.cause?.type === "receipt_processing")
-      .map((c) => c.cause.receipt_hash).filter((id) => typeof id === "string"));
+    const receipts = await readNearPaymentReceipts(rpc, block.header.hash, accounts);
     const transactions = new Set();
     for (const receiptId of receipts) {
-      const tx = await rpc.call("EXPERIMENTAL_receipt_to_tx", { receipt_id: receiptId, block_height: Number(block.header.height) });
-      if (typeof tx.transaction_hash !== "string" || typeof tx.sender_account_id !== "string") {
-        throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher could not resolve a receipt's transaction");
-      }
+      const tx = await readNearReceiptTransaction(rpc, receiptId, Number(block.header.height));
       if (transactions.has(tx.transaction_hash)) continue;
       transactions.add(tx.transaction_hash);
       await observeTransfer(tx.transaction_hash, tx.sender_account_id);

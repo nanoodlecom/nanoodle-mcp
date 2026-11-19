@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
@@ -110,6 +110,56 @@ test("a peer advisory cannot stand in for an operational monitor crash or missin
     assert.match(failure.text, /Stage: service/);
     assert.doesNotMatch(failure.text, /nano-node-1|readiness advisory|passed their admission/);
   }
+});
+
+test("admission failures lead an alert when older advisories exceed its issue limit", () => {
+  const now = Date.now(), env = { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT };
+  const report = { v: 1, ok: false, checkedAt: new Date(now).toISOString(), stage: "backup-capture-freshness",
+    invocationId: env.MONITOR_INVOCATION_ID, admission: { nano: true, near: false, usdc: false, market: true },
+    checks: [...Array.from({ length: 15 }, (_, index) => ({
+      stage: `advisory-${index}`, code: "warning", ok: false, domains: [],
+    })), { stage: "near-payment-watcher", code: "near-watcher-stale", ok: false, domains: ["near", "usdc"] }] };
+  const event = failureEvent(env, report, now);
+  assert.equal(event.priority, "failure");
+  assert.match(event.text, /admission checks failed for NEAR, USDC/);
+  assert.match(event.text, /Stage: near-payment-watcher/);
+  assert.match(event.text, /Issues: near-payment-watcher=near-watcher-stale, advisory-0=warning/);
+  assert.doesNotMatch(event.text, /advisory-11=/);
+});
+
+test("a blocking alert can pass older advisories and unreadable outbox records", async t => {
+  const config = setup(), now = Date.now(), requests = [];
+  t.after(() => rmSync(config.stateDir, { recursive: true, force: true }));
+  config.operationalReportFile = join(config.stateDir, "operational.json");
+  const writeReport = (env, near, incidentId) => writeFileSync(config.operationalReportFile, JSON.stringify({
+    v: 1, checkedAt: new Date(now).toISOString(), ok: false, invocationId: env.MONITOR_INVOCATION_ID, incidentId,
+    stage: near ? "backup-capture-freshness" : "near-payment-watcher",
+    admission: { nano: true, near, usdc: near, market: true },
+    checks: [{ stage: near ? "backup-capture-freshness" : "near-payment-watcher", code: "failed", ok: false,
+      domains: near ? [] : ["near", "usdc"] }],
+  }));
+  const advisoryEnv = { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT };
+  writeReport(advisoryEnv, true, "a".repeat(32));
+  const advisory = await deliverAlerts(config, { env: advisoryEnv, enqueueOnly: true });
+  const alerts = join(config.stateDir, "alerts"), badPath = join(alerts, `near_check_${"0".repeat(40)}.json`);
+  writeFileSync(badPath, "{ unreadable");
+  const mismatch = join(alerts, `near_check_${"1".repeat(40)}.json`);
+  writeFileSync(mismatch, JSON.stringify({ messageId: advisory.messageId, status: "pending", text: "mismatched record" }));
+  const env = { ...advisoryEnv, MONITOR_INVOCATION_ID: "b".repeat(32) };
+  writeReport(env, false, "b".repeat(32));
+  const call = async (_name, args) => {
+    requests.push(args);
+    if (requests.length === 1) throw Error("temporary bridge failure");
+    return { message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } };
+  };
+  const first = await deliverAlerts(config, { env, call });
+  assert.deepEqual(requests.map(args => args.message_id), [first.messageId, advisory.messageId]);
+  assert.deepEqual([first.ok, first.queued, first.pending, first.invalid], [false, 1, 1, 2]);
+  assert.equal(readFileSync(badPath, "utf8"), "{ unreadable");
+  assert.match(readFileSync(mismatch, "utf8"), /mismatched record/);
+  const retry = await deliverAlerts(config, { env: {}, call });
+  assert.deepEqual(requests[2], requests[0], "a retry keeps the same ID and text");
+  assert.deepEqual([retry.ok, retry.queued, retry.pending, retry.invalid], [false, 1, 0, 2]);
 });
 
 test("drafts and incorrect recipient responses remain pending, without bypassing bridge approval", async () => {

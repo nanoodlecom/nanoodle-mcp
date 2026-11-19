@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw, marketRunFunding } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
@@ -52,6 +52,32 @@ test("a crash before refund/payout intent creation cannot erase those liabilitie
   const done = paymentLiabilities(s); assert.equal(done.nanoRaw, 0n); assert.equal(done.usdcAtomic, 0n); assert.deepEqual(done.issues, []);
 });
 
+test("the paid workflow funding check keeps creator overhead and the last unit of USDC deposit dust", () => {
+  const raw = 10n ** 30n;
+  const paid = { id: "authored", status: "paid", asset: "usdc", author: "nano_author",
+    depositUsd: "0.6", paidYocto: "600001", rate: { xnoUsd: "0.2", usdNano: "1000000000", yocto: "1000000" } };
+  const total = paidNearRunFundingRaw({ paid, reserved: { ...paid, status: "running" }, unpaid: { ...paid, status: "pending" },
+    completed: { ...paid, fundingOutcomeReady: true } });
+  const modelCap = 5n * raw / 2n;
+  const creatorCap = (600001n * raw + 1199999n) / 1200000n;
+  assert.equal(total, modelCap + creatorCap);
+  assert.throws(() => paidNearRunFundingRaw({ paid: { ...paid, paidYocto: "0" } }), /invalid-paid-near-amount/);
+});
+
+test("only unstarted Nano payments consume additional capital at their locked rates", () => {
+  const raw = 10n ** 30n;
+  const paid = { status: "paid", amountRaw: String(raw), usd: "0.5", pair: { usdNano: "500000000", raw: String(raw) } };
+  const rounding = { ...paid, usd: "0.3", pair: { usdNano: "700000000", raw: String(raw) } };
+  const total = paidNanoRunFundingRaw([paid, rounding, { status: "pending" }, { status: "consumed" },
+    { status: "paid", settled: true }, { status: "paid", error: "redacted" },
+    { status: "paid", result: {} }, { status: "paid", refundExpected: true },
+    { status: "paid", executionNeedsReconciliation: true }, { status: "refunded" }]);
+  assert.equal(total, raw + (3n * raw + 6n) / 7n);
+  assert.throws(() => paidNanoRunFundingRaw([{ ...paid, pair: null }]), /invalid-state-amount/);
+  assert.throws(() => paidNanoRunFundingRaw([{ ...paid, usd: null }]), /invalid-paid-nano-amount/);
+  assert.throws(() => paidNanoRunFundingRaw([{ ...paid, pair: { ...paid.pair, raw: "0" } }]), /invalid-paid-nano-rate/);
+});
+
 test("stuck work, permanently failed refunds and long-pending creator payouts remain visible and reserved", () => {
   const s = snapshots();
   s.nano.quotes.push({ id: "nano1", status: "paid", amountRaw: "10", paidAt: 1 });
@@ -98,6 +124,17 @@ test("deferred Market income is not spendable and concurrent accepted work reser
 test("a workflow without paid model steps requires no Market model-cost reservation", () => {
   const s = snapshots(); s.market.push({ v: 1, assignments: { free: { phase: "running", pricing: { depositUsd: 0 } } } });
   assert.equal(paymentLiabilities(s).marketUsdNano, 0n);
+});
+
+test("the live Market waiting budget excludes running work and preserves creator overhead", () => {
+  const raw = 10n ** 30n;
+  const market = [{ v: 1, assignments: { active: { phase: "running", pricing: { depositUsd: 0.7 } },
+    starting: { phase: "starting", pricing: { depositUsd: 0.3 }, budgetUsd: 40, creator: { status: "awaiting_acceptance" } },
+    legacy: { phase: "started", budgetUsd: 0.7 }, free: { phase: "started", pricing: { depositUsd: 0 } },
+    settled: { phase: "submitted", budgetUsd: 40 } } }];
+  const creatorBudget = 25n * raw / 70n + (5n * raw + 69n) / 70n;
+  assert.deepEqual(marketRunFunding(market, "0.7"), { waitingRaw: raw + creatorBudget, totalRaw: 2n * raw + creatorBudget });
+  assert.throws(() => marketRunFunding(market, "0"), { code: "FUNDING_INVALID" });
 });
 
 test("USDC funds do not cover NEAR gas or storage, and gas price increases are included", () => {

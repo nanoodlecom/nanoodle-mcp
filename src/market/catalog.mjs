@@ -18,6 +18,8 @@
 import { readFileSync, existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_LIMITS } from "../custom-workflow.mjs";
+import { resolveFields } from "./brief.mjs";
 import { MarketConfigError, readDefaultWorkflow } from "./service.mjs";
 import { MARKET_PLATFORM_FEE_BPS } from "./fee-guard.mjs";
 
@@ -30,8 +32,24 @@ export const HANDLE_RE = /^[a-z][a-z0-9-]{2,29}$/;
 const MIN_PRICE_CENTS = 2; // at $0.01 nothing is left after the market's 5% fee
 /** The default refresh of the market price. */
 export const PRICE_REFRESH_SECONDS = 600;
-/** The brief used to price a listing's own workflow: as long as a brief may be (the input cap), so the estimate is for the longest brief. */
-export const PROBE_BRIEF = "a lighthouse at dawn, ".repeat(1000).slice(0, 20_000);
+const PROBE_TEXT = "a lighthouse at dawn, ";
+export const PROBE_BRIEF = PROBE_TEXT.repeat(Math.ceil(DEFAULT_LIMITS.maxInputChars / PROBE_TEXT.length)).slice(0, DEFAULT_LIMITS.maxInputChars);
+
+/** Exercise a full main brief and the listing's optional inputs within the worker's limits. */
+export function listingWorkflowPriceSample({ graph, inputName, fieldNames = [], fieldSpecs = {} }) {
+  const requested = Object.fromEntries(Object.entries(fieldSpecs).map(([name, spec]) => [name, `${spec.seconds.max} seconds`]));
+  const { inputs: typed } = resolveFields(requested, fieldSpecs);
+  const inputs = new Map(Object.entries(typed));
+  let remaining = Math.max(0, DEFAULT_LIMITS.maxTotalInputChars - Object.values(typed).reduce((sum, value) => sum + value.length, 0));
+  for (const name of [inputName, ...fieldNames]) {
+    if (inputs.has(name)) continue;
+    if (name !== inputName && (inputs.size >= DEFAULT_LIMITS.maxInputKeys || remaining === 0)) break;
+    const value = PROBE_BRIEF.slice(0, remaining);
+    inputs.set(name, value);
+    remaining -= value.length;
+  }
+  return { graph, inputs: Object.fromEntries(inputs) };
+}
 
 const AGENT_KEYS = new Set(["handle", "tokenFile", "webhookSecretFile", "graph", "input", "custom", "priceUsd", "fields", "bids", "maxBidUsd"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

@@ -14,7 +14,7 @@ import { parseArgs } from "node:util";
 import { join } from "node:path";
 import { MarketConfigError } from "../src/market/service.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
-import { readCatalog, fetchListingPrice, priceVerdict, recommendPrice, budgetFromPrice, fmtUsd, REPO_ROOT, PROBE_BRIEF } from "../src/market/catalog.mjs";
+import { readCatalog, fetchListingPrice, priceVerdict, recommendPrice, budgetFromPrice, fmtUsd, REPO_ROOT, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 
 const USAGE = `Usage: node scripts/market-catalog.mjs plan|check [--agents-file <file>] [--base-url <url>] [--nanogpt-base <url>]
 
@@ -46,7 +46,7 @@ export async function plan({ file, baseUrl, nanogptBase, out = (l) => process.st
       continue;
     }
     const wf = a.defaultWorkflow;
-    const r = await runner.price({ graph: wf.graph, inputs: { [wf.inputName]: PROBE_BRIEF } });
+    const r = await runner.price(listingWorkflowPriceSample(wf));
     if (!r.ok) {
       out(`  REFUSED: this workflow cannot run on a paid worker:`);
       for (const x of r.refusals) out(`    - ${x.message}`);
