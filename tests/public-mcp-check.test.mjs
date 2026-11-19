@@ -6,7 +6,7 @@ const NOW = Date.parse("2026-11-18T04:30:00Z");
 const stamp = new Date(NOW).toISOString();
 
 function fixture({ missingTool = false, scanAt = stamp, funded = true, usdcUnavailable = false, lostHost, transientRates = false,
-  missingDecision = false, invalidDeposit = false } = {}) {
+  missingDecision = false, missingNanoBranch = false, invalidDeposit = false } = {}) {
   const calls = [];
   async function fetch(url, init) {
     const { hostname, pathname } = new URL(url);
@@ -36,15 +36,21 @@ function fixture({ missingTool = false, scanAt = stamp, funded = true, usdcUnava
       return Response.json({ jsonrpc: "2.0", id: 1, result: { tools: names.map(name => ({ name })) } });
     }
     if (pathname === "/mcp" && body?.method === "tools/call") {
-      assert.equal(hostname, "near.nanoodle.com");
       assert.equal(body.params.name, "price_noodle");
       const { graph, _pay_with: asset } = body.params.arguments;
+      if (hostname === "near.nanoodle.com") assert.ok(["near", "usdc"].includes(asset));
+      else {
+        assert.ok(["mcp.nanoodle.com", "nano.nanoodle.com"].includes(hostname));
+        assert.equal(asset, undefined);
+      }
       assert.ok(graph.nodes.some(node => node.type === "decide-branch"));
       assert.deepEqual(graph.links.filter(link => link.from.node === "decision").map(link => link.from.port), ["yes", "no"]);
-      const items = graph.nodes.filter(node => node.fields.model && !(missingDecision && asset === "near" && node.id === "decision"))
+      const missingNode = missingDecision && asset === "near" ? "decision"
+        : missingNanoBranch && hostname === "nano.nanoodle.com" ? "no-answer" : null;
+      const items = graph.nodes.filter(node => node.fields.model && node.id !== missingNode)
         .map(node => ({ nodeId: node.id, model: node.fields.model, usd: "0.0001" }));
       return Response.json({ jsonrpc: "2.0", id: 1, result: { structuredContent: {
-        [asset]: { network: "mainnet" }, pricing: { currency: "USD", safety: { ok: true }, unpriced: [],
+        ...(asset ? { [asset]: { network: "mainnet" } } : {}), pricing: { currency: "USD", safety: { ok: true }, unpriced: [],
           estimatedCost: { usd: "0.0003", items }, likelyCharge: { usd: "0.00036" },
           deposit: { usd: invalidDeposit && asset === "usdc" ? "0.0003" : "0.01" } },
       } } });
@@ -58,10 +64,12 @@ test("public availability uses discovery, status and free pricing, and retries a
   const { calls, run } = fixture({ transientRates: true });
   const report = await run();
   assert.equal(report.ok, true);
-  assert.equal(report.checks.length, 9);
+  assert.equal(report.checks.length, 12);
   assert.equal(report.checks.find(check => check.stage === "nano-rates").attempts, 2);
   assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["initialize", "tools/call", "tools/list"]);
-  assert.equal(calls.filter(call => call.tool === "price_noodle").length, 2);
+  assert.deepEqual(calls.filter(call => call.tool === "price_noodle").map(call => call.hostname), [
+    "mcp.nanoodle.com", "nano.nanoodle.com", "near.nanoodle.com", "near.nanoodle.com",
+  ]);
   assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/mcp", "/mcp/v1", "/near/health", "/rates"]);
 });
 
@@ -74,10 +82,11 @@ test("public readiness reports missing USDC proof as a token-specific check fail
 });
 
 test("conditional pricing verifies the decision model and both branches fit the deposit", async () => {
-  const { run } = fixture({ missingDecision: true, invalidDeposit: true });
+  const { run } = fixture({ missingDecision: true, missingNanoBranch: true, invalidDeposit: true });
   const report = await run();
   assert.equal(report.ok, false);
   assert.deepEqual(report.checks.filter(check => !check.ok).map(({ stage, code }) => [stage, code]), [
+    ["nano-alias-conditional-graph-pricing", "conditional-price-branch-missing"],
     ["near-conditional-pricing", "conditional-price-branch-missing"],
     ["usdc-conditional-pricing", "conditional-price-deposit-invalid"],
   ]);

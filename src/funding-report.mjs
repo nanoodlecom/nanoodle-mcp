@@ -31,6 +31,7 @@ const reportFailureCodes = new Set([
   ...readFailureCodes.values(),
 ]);
 export const fundingReportFailure = code => reportFailureCodes.has(code) ? code : "funding-state-unavailable";
+export const FUNDING_REPORT_MAX_AGE_MS = 60_000;
 
 export function selectFundingPause(pause, now) {
   const { lastFailedAt, recoveredAt, code } = pause ?? {};
@@ -43,7 +44,8 @@ export function selectFundingPause(pause, now) {
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
-export async function startFundingReport({ outDir, snapshot, sources, rpcStatus = null, writerProtection = null, durableState = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
+export async function startFundingReport({ outDir, snapshot, sources, rpcStatus = null, writerProtection = null, durableState = null,
+  intervalMs = 5_000, now = Date.now, monotonicNow = () => performance.now(), log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
   const identity = maintenanceProcessIdentity();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
@@ -55,7 +57,7 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
   function refresh() {
     if (pending) return pending;
     pending = (async () => {
-      let report, evidenceDeadline = null, availableRaw = null;
+      let report, readExpiresAt = Infinity, availableRaw = null;
       try {
         const value = await snapshot();
         const balance = fundingRaw(value.balanceRaw), liabilities = fundingRaw(value.liabilitiesRaw), reserved = fundingRaw(value.reservedRaw);
@@ -93,13 +95,14 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
             if (report.nanoRpc.standby?.inUse !== true || !Number.isSafeInteger(expiresAt)
               || expiresAt <= n.lastReadAt || expiresAt - n.lastReadAt > NANO_FUNDING_EVIDENCE_MS) throw Error("invalid funding evidence expiry");
             report.nanoRpc.fundingEvidenceExpiresAt = expiresAt;
-            evidenceDeadline = performance.now() + expiresAt - now();
           }
-          const age = now() - n.lastReadAt;
+          const observedAt = now();
+          const age = observedAt - n.lastReadAt;
+          readExpiresAt = Math.min(n.lastReadAt + FUNDING_REPORT_MAX_AGE_MS, expiresAt ?? Infinity);
           const rpcHealthy = report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
             && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
-            && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers && age <= 60_000 && age >= -30_000
-            && (expiresAt === undefined || expiresAt > now());
+            && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers
+            && age >= -30_000 && observedAt < readExpiresAt;
           if (!rpcHealthy) { report.ok = false; report.code = "nano-read-guard-unhealthy"; }
         }
         if (durableState) {
@@ -129,6 +132,8 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
         } catch { /* Preserve the funding failure even if advisory data cannot be read. */ }
       }
       const checkedAt = now();
+      const expiresAt = Math.min(checkedAt + FUNDING_REPORT_MAX_AGE_MS, readExpiresAt);
+      const monotonicDeadline = monotonicNow() + expiresAt - checkedAt;
       pause = selectFundingPause(pause, checkedAt);
       if (!report.ok) pause = { lastFailedAt: checkedAt, recoveredAt: null, code: report.code };
       else if (lastWriteHealthy && !sources.ready()) {
@@ -140,8 +145,9 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }
         finally { await handle.close(); }
         await rename(temporary, file);
-        const readyForMs = evidenceDeadline === null || !report.ok ? undefined
-          : Math.min(evidenceDeadline - performance.now(), report.nanoRpc.fundingEvidenceExpiresAt - now());
+        // Publishing can take time. A clock adjustment or delayed write
+        // cannot give the original chain read a new checkout lease.
+        const readyForMs = Math.min(expiresAt - now(), monotonicDeadline - monotonicNow());
         sources.setStorageReady(true); sources.setReady(report.ok, readyForMs, availableRaw);
         lastWriteHealthy = report.ok;
       } catch (error) {
