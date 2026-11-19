@@ -128,3 +128,23 @@ test("a discovery failure after settlement cannot block replay of paid work", as
   assert.equal(replay.status, 200, JSON.stringify(replay));
   assert.equal(h.counts.settle, 1); assert.equal(h.counts.execute, 1);
 });
+test("concurrent duplicate payments on the durable boundary settle and execute exactly once", async t => {
+  const h = await harness(t);
+  const { paymentSignature } = await h.payment();
+  const results = await Promise.all(Array.from({ length: 12 }, () =>
+    createX402ExactIngress(h.settings).handle({ params, paymentSignature })));
+  assert.ok(results.some(r => r.status === 200), JSON.stringify(results));
+  assert.ok(results.every(r => [200, 202].includes(r.status)), JSON.stringify(results));
+  assert.equal(h.counts.settle, 1); assert.equal(h.counts.execute, 1);
+});
+
+test("Solana payment end to end on the durable boundary, with bazaar discovery", async t => {
+  const h = await harness(t);
+  const { quote, paymentSignature } = await h.payment(SOLANA);
+  assert.equal(quote.body.extensions?.bazaar?.info?.input?.toolName, "hello-noodle");
+  const result = await h.app.handle({ params, paymentSignature });
+  assert.equal(result.status, 200, JSON.stringify(result));
+  assert.equal(result.receipt.network, SOLANA);
+  assert.equal(h.settleSeen[0].extensions?.bazaar?.info?.input?.toolName, "hello-noodle");
+  assert.equal(h.counts.settle, 1); assert.equal(h.counts.execute, 1);
+});
