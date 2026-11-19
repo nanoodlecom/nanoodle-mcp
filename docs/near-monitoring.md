@@ -254,8 +254,10 @@ Coverage:
   confirmed count and a gap that keeps growing. A widening gap of at least
   50 blocks over at least ten minutes warns even while both counts advance.
   The warning needs two increases and tolerates short plateaus between
-  them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
-  clear the trend. The elapsed time comes from the counter observations.
+  them. A missing sample still warns about unavailable telemetry. Trend
+  comparisons can resume from the last valid sample for up to 12 minutes.
+  Shrinking lag or a plateau longer than 12 minutes clears the trend. The
+  elapsed time comes from the counter observations.
   Wallet read quorum determines Nano payment readiness.
 - Recent paid workflow execution failures from the Nano, NEAR/USDC and
   Market ledgers. Two or more failed runs in 30 minutes across these sources

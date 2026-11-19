@@ -111,12 +111,19 @@ function nanoPeerLedgerBaseline(metrics, now) {
   return { median: counts[Math.floor((counts.length - 1) / 2)], peers: counts.length };
 }
 
-function nanoCementationProgress(current, previous, now) {
-  const prior = previous?.nanoLedgerSync;
-  const checkedAt = prior?.observedAt ?? Date.parse(previous?.checkedAt);
-  const continuous = Number.isSafeInteger(checkedAt) && checkedAt < now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
+function recentNanoLedgerBaseline(previous, now) {
+  const prior = previous?.nanoLedgerSync ?? previous?.nanoLedgerBaseline;
+  const observedAt = prior?.observedAt ?? (previous?.nanoLedgerSync ? Date.parse(previous.checkedAt) : NaN);
+  if (!Number.isSafeInteger(observedAt) || observedAt <= 0 || observedAt >= now
+    || now - observedAt > NANO_CEMENTATION_SAMPLE_MAX_AGE_MS) return null;
+  const { localConfirmed, peerMedianConfirmed, unchangedSince, peerMedianAtStart, wideningGap } = prior;
+  return { observedAt, localConfirmed, peerMedianConfirmed, unchangedSince, peerMedianAtStart, wideningGap };
+}
+
+function nanoCementationProgress(current, prior, now) {
+  const checkedAt = prior?.observedAt;
   let unchangedSince = now, peerMedianAtStart = current.peerMedianConfirmed;
-  if (continuous && prior?.localConfirmed === current.localConfirmed) {
+  if (prior && prior.localConfirmed === current.localConfirmed) {
     const since = prior.unchangedSince;
     if (Number.isSafeInteger(since) && since > 0 && since <= checkedAt && nanoLedgerCount(prior.peerMedianAtStart) !== null) {
       unchangedSince = since;
@@ -127,7 +134,7 @@ function nanoCementationProgress(current, previous, now) {
     }
   }
   const progress = { unchangedSince, peerMedianAtStart };
-  const priorLocal = continuous ? nanoLedgerCount(prior?.localConfirmed) : null;
+  const priorLocal = nanoLedgerCount(prior?.localConfirmed);
   const local = BigInt(current.localConfirmed), peer = BigInt(current.peerMedianConfirmed);
   if (priorLocal !== null && local < priorLocal) {
     return { ...progress, code: "nano-ledger-local-confirmations-regressed" };
@@ -259,8 +266,10 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), {
       checks = [...checks, { stage: "near-watcher-backfill", ok: false, code: "near-watcher-backfill-delayed", domains: [] }];
     }
   }
+  const nanoObservedAt = nanoLedgerSync?.observedAt ?? now;
+  const nanoLedgerBaseline = recentNanoLedgerBaseline(previous, nanoObservedAt);
   if (nanoLedgerSync) {
-    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, nanoLedgerSync.observedAt ?? now);
+    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, nanoLedgerBaseline, nanoObservedAt);
     nanoLedgerSync = { ...nanoLedgerSync, ...progress };
     const check = code
       ? { stage: "nano-ledger-confirmation-progress", ok: false, code, domains: [] }
@@ -277,6 +286,7 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), {
     admission, checks, ...(/^[a-f0-9]{32}$/.test(invocationId || "") && { invocationId }),
     ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
     ...(nearBackfillSince !== null && { nearBackfillSince }), ...(nanoLedgerSync && { nanoLedgerSync }),
+    ...(!nanoLedgerSync && nanoLedgerBaseline && { nanoLedgerBaseline }),
     ...(nanoPaymentReadPeers !== null && { nanoPaymentReadPeers }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
