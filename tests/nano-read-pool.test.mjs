@@ -29,7 +29,7 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
       if (body.action === "account_info" && p.accountRead) return p.accountRead();
       if (body.action === "account_info") return p.info;
       if (body.action === "receivable") { assert.equal(body.include_only_confirmed, "true"); return p.receivable; }
-      if (body.action === "account_history") return p.history;
+      if (body.action === "account_history") return p.historyRead ? p.historyRead(body) : p.history;
       if (body.action === "block_info") { const value = p.blocks[body.hash]; if (value instanceof Error) throw value; if (!value) throw absent(); return value; }
       assert.fail("not a read-only request");
     } });
@@ -188,6 +188,98 @@ test("a cold standby can prove a payment window in four requests with its own ac
       assert.equal(standbyActions().length, NANO_COLD_STANDBY_SCAN_REQUESTS);
       assert.deepEqual(await w.pool.publishBases(), [owned.base]);
     }
+  }
+});
+
+test("funding refreshes and quote preflights leave the next standby window for an outstanding payment", async () => {
+  const w = world(2, 4), [owned, spare, standby] = w.peers;
+  const head = owned.info.confirmed_frontier;
+  owned.history = standby.history = { account: ACCOUNT, previous: OTHER, history: [
+    { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+  ] };
+  spare.down = true;
+  await w.pool.readFundingInfo();
+  w.tick(1_000);
+  await assert.rejects(w.pool.readPaymentWindow({ existingPayments: true }), { code: "NANO_RPC_STANDBY_BUDGET" });
+  await w.pool.read(receivable);
+  w.tick(59_000);
+  const standbyRequests = () => w.calls.filter(call => call.base === standby.base).length;
+  assert.equal(standbyRequests(), 4);
+  await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" });
+  await assert.rejects(w.pool.readPaymentWindow(), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.equal(standbyRequests(), 4, "deferred reads leave the restored quota untouched");
+  w.tick(3_000);
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true })).history, owned.history);
+  assert.equal(standbyRequests(), 8);
+  w.tick(60_000);
+  await w.pool.readFundingInfo();
+  assert.equal(standbyRequests(), 10, "a complete scan releases priority");
+});
+
+test("a deferred history continuation reserves the next budget window and is proved by both peers", async () => {
+  const w = world(2, 4), [owned, spare, standby] = w.peers;
+  const head = owned.info.confirmed_frontier;
+  const earlier = "D".repeat(64);
+  const newest = { account: ACCOUNT, previous: OTHER, history: [
+    { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+  ] };
+  const continuation = { account: ACCOUNT, previous: earlier, history: [
+    { hash: OTHER, type: "state", subtype: "change", confirmed: "true", height: "9", previous: earlier },
+  ] };
+  const historyRequests = [];
+  for (const peer of [owned, standby]) {
+    peer.historyRead = body => {
+      assert.equal(body.raw, "true");
+      historyRequests.push({ base: peer.base, head: body.head });
+      return body.head === head ? newest : continuation;
+    };
+  }
+  spare.down = true;
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true })).history, newest);
+  await assert.rejects(w.pool.readPaymentHistory({ action: "account_history", account: ACCOUNT, head: OTHER, raw: "true", count: "100" }),
+    { code: "NANO_RPC_STANDBY_BUDGET" });
+  w.tick(60_000);
+  await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true, historyHead: OTHER, historyHeight: "9" })).history, continuation);
+  assert.deepEqual(historyRequests.filter(call => call.base === standby.base).map(call => call.head), [head, OTHER]);
+  assert.deepEqual(w.calls.filter(call => call.base === standby.base).map(call => call.action),
+    ["block_info", "receivable", "account_info", "account_history", "block_info", "receivable", "account_info", "account_history"]);
+  await assert.rejects(w.pool.readPaymentWindow({ historyHead: OTHER }), { code: "NANO_RPC_UNPROVEN_HISTORY" });
+  w.tick(60_000);
+  const wrongHeight = await w.pool.readPaymentWindow({ existingPayments: true, historyHead: OTHER, historyHeight: "8" });
+  assert.equal(wrongHeight.history, null, "an internally valid page at the wrong continuation height is unproved");
+});
+
+test("funding can reuse a matching payment account proof only through its original expiry", async () => {
+  for (const invalidation of ["primary-moved", "expired", "clock-rewound", "local-send"]) {
+    const w = world(2, 4), [owned, spare, standby] = w.peers;
+    const head = owned.info.confirmed_frontier;
+    owned.history = standby.history = { account: ACCOUNT, previous: OTHER, history: [
+      { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+    ] };
+    spare.down = true;
+    await w.pool.readPaymentWindow({ existingPayments: true });
+    w.tick(1_000);
+    await assert.rejects(w.pool.readPaymentWindow({ existingPayments: true }), { code: "NANO_RPC_STANDBY_BUDGET" });
+    const view = await w.pool.readFundingInfo();
+    assert.equal(view.reused, true);
+    assert.equal(view.nanoRpc.readablePeers, 2);
+    assert.equal(view.nanoRpc.lastReadAt, 1_000);
+    assert.equal(view.nanoRpc.fundingEvidenceExpiresAt, 31_000);
+    assert.equal(w.pool.status().readablePeers, 0, "reusing telemetry does not establish a new publishing quorum");
+    await assert.rejects(w.pool.publishBases(), { code: "NANO_RPC_NETWORK_QUORUM" });
+    if (invalidation === "primary-moved") owned.info = nanoAccountInfo({ pending: "1" });
+    if (invalidation === "expired") w.tick(29_000);
+    if (invalidation === "clock-rewound") { w.tick(29_000); w.jumpWall(-29_000); }
+    if (invalidation === "local-send") {
+      w.pool.observe({ frontier: OTHER, balance: "99", blockCount: "11", representative: ACCOUNT });
+    }
+    await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" }, invalidation);
+    if (invalidation === "primary-moved") {
+      owned.info = nanoAccountInfo();
+      await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" }, "a reverted primary reply cannot restore the discarded proof");
+    }
+    assert.equal(w.calls.filter(call => call.base === standby.base).length, 4);
   }
 });
 
@@ -489,6 +581,21 @@ test("a stale negative block lookup cannot hide a positive confirmation", async 
   await assert.rejects(w.pool.block({ action: "block_info", hash: prepared.hash }), e => e.authoritative === true);
   w.peers[0].blocks[prepared.hash] = Error("offline");
   await assert.rejects(w.pool.block({ action: "block_info", hash: prepared.hash }), { code: "NANO_RPC_BLOCK_UNCERTAIN" });
+});
+
+test("an exact primary confirmation can settle a block at the standby limit but a negative cannot", async () => {
+  const w = world(2, 4), [owned, spare, standby] = w.peers;
+  spare.network = false;
+  await w.pool.read(info);
+  await w.pool.read(receivable);
+  const prepared = createBlock("0".repeat(64), { work: "0".repeat(16), previous: "B".repeat(64), representative: ACCOUNT,
+    balance: "93", link: PAYER });
+  owned.blocks[prepared.hash] = { confirmed: "true", contents: prepared.block, height: "11" };
+  const found = await w.pool.block({ action: "block_info", hash: prepared.hash });
+  assert.equal(found.confirmed, "true");
+  owned.blocks[SEND] = absent();
+  await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.equal(w.calls.filter(call => call.base === standby.base).length, 4);
 });
 
 test("an unconfirmed or mismatched block is never permission to sign a replacement", async () => {

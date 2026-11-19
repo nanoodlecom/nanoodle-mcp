@@ -197,6 +197,39 @@ test("failed Nano settlement retries persist the debt age and attempt count acro
   assert.equal(chain.state.transfers.length, 0);
 });
 
+test("a Nano refund at the retry limit remains queued after a standby quota deferral", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "gate-standby-debt-")), file = join(dir, "gate-state.json");
+  const chain = fakeChain(), gates = [];
+  t.after(async () => { for (const gate of gates) await gate.stop(); await rm(dir, { recursive: true }); });
+  let now = 1_000_000, quotaAvailable = false, attempts = 0;
+  const signed = { hash: "A".repeat(64), block: { account: GATE_ADDR, link_as_account: PAYER } };
+  await writeFile(file, JSON.stringify({ v: 2, quotes: [], owed: [{ event: "refund", to: PAYER, amountRaw: "100",
+    fields: { paymentId: "awaiting-quota" }, journaled: true, prepared: signed, tries: 99,
+    createdAt: now - 900_001, nextAttemptAt: now }] }));
+  chain.ops.transferOnce = async (_to, _raw, { prepared }) => {
+    attempts++;
+    assert.deepEqual(prepared, signed);
+    if (!quotaAvailable) throw Object.assign(Error("fixture standby budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+    return prepared.hash;
+  };
+  const start = () => {
+    const gate = makeGate(chain, { stateFile: file, now: () => now, pollMs: 5 });
+    gates.push(gate);
+    return gate;
+  };
+  const gate = start();
+  const deferred = await untilState(file, "the deferred refund to reach disk", state => state.owed[0]?.nextAttemptAt === now + 60_000);
+  assert.equal(deferred.owed[0].tries, 99);
+  assert.notEqual(deferred.owed[0].held, true);
+  assert.equal(gate.fundingLiabilitiesRaw(), 100n);
+  await gate.stop();
+  now += 60_000;
+  quotaAvailable = true;
+  start();
+  await untilState(file, "the original refund to settle", state => state.owed.length === 0);
+  assert.equal(attempts, 2);
+});
+
 test("Nano funding handoff uses the paid quote's locked pair and refuses before inference", async () => {
   for (const allowed of [true, false]) {
     const chain = fakeChain(), policies = [];
@@ -853,11 +886,12 @@ test("guarded Nano quotes share a read-only proof and stay unpublished until bot
 test("a failed Nano watcher read invalidates quote readiness while issued payments still resolve", async t => {
   const chain = fakeChain(), registry = fakeRegistry();
   const head = "A".repeat(64);
-  let historyReady = true, failed = false, combinedReads = 0, fallbackReads = 0;
+  const existingPaymentReads = [];
+  let historyReady = true, failed = false, fallbackReads = 0;
   chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
   const rpc = chain.ops.rpc;
-  chain.ops.readPaymentWindow = async () => {
-    combinedReads++;
+  chain.ops.readPaymentWindow = async ({ existingPayments }) => {
+    existingPaymentReads.push(existingPayments);
     if (!historyReady) throw Object.assign(new Error("test combined budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
     return { receivable: await rpc({ action: "receivable", count: "500" }), history: {
       account: GATE_ADDR, previous: null, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }],
@@ -878,7 +912,7 @@ test("a failed Nano watcher read invalidates quote readiness while issued paymen
   const { callTool } = gate.wrapRegistry(registry);
   const request = text => callTool({ name: "poster", arguments: { Text: text } });
   const original = argOf(await request("issued before the outage"));
-  assert.ok(combinedReads > 0);
+  assert.equal(existingPaymentReads[0], false);
   historyReady = false;
   await until("the watcher to report its broken history RPC", () => failed);
   assert.equal((await request("new customer")).isError, true, "a watcher failure supersedes a fresh positive quote probe");
@@ -886,6 +920,7 @@ test("a failed Nano watcher read invalidates quote readiness while issued paymen
 
   chain.state.receivable["D".repeat(64)] = { amount: original.amountRaw, source: PAYER };
   assert.equal(await gate.waitForPayment(original.paymentId, 1_000), "paid");
+  assert.ok(existingPaymentReads.includes(true), "only the watcher requests priority");
   assert.ok(fallbackReads > 0, "the watcher still looks for receivables for existing quotes");
 });
 
@@ -987,6 +1022,105 @@ test("Nano history resumes beyond the page cap after a restart and still discove
   assert.deepEqual(heads.slice(0, 2), [null, saved.historyScan.backfill.next]);
   assert.equal(quoteIn(old.paymentId)(through).payHash, deepHash);
   assert.equal(quoteIn(recent.paymentId)(through).payHash, freshHash);
+  assert.equal(registry.callCount(), 0);
+});
+
+test("Nano standby quota saves the next history page and resumes it across restarts", { timeout: 8_000 }, async t => {
+  const chain = fakeChain(), registry = fakeRegistry(), gates = [];
+  const dir = await mkdtemp(join(tmpdir(), "nano-quota-cursor-")), file = join(dir, "gate-state.json");
+  t.after(async () => { for (const gate of gates) await gate.stop(); await rm(dir, { recursive: true }); });
+  const firstAt = 8_000_000;
+  let now = firstAt, latest, mode = "opening";
+  const block = (height, type, terms = {}) => ({ hash: testHash(height), height: String(height), type,
+    confirmed: "true", previous: height === 1 ? "0".repeat(64) : testHash(height - 1), ...terms });
+  const open = block(1, "open", { account: PAYER, amount: "1" });
+  const page = (...history) => ({ account: GATE_ADDR,
+    previous: history.at(-1).height === "1" ? null : history.at(-1).previous, history });
+  const [middle, head] = [block(3, "send"), block(4, "send")];
+  const lookups = [], refused = [], savedPages = new Map();
+  latest = page(open);
+  chain.ops.checkpoint = () => ({ confirmed: { hash: latest.history[0].hash, blockCount: latest.history[0].height } });
+  const budgetError = () => Object.assign(Error("fixture standby window exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+  chain.ops.readPaymentWindow = async ({ existingPayments, historyHead, historyHeight }) => {
+    if (existingPayments) lookups.push(historyHead);
+    if (mode === "refusing") throw budgetError();
+    const history = historyHead === null ? latest : savedPages.get(historyHead);
+    assert.ok(history, "the combined scan must request the saved continuation");
+    assert.equal(historyHeight, historyHead === null ? null : history.history[0].height);
+    return { receivable: { blocks: chain.state.receivable }, history };
+  };
+  chain.ops.rpc = async (body, _base, options) => {
+    if (body.action === "receivable") return { blocks: chain.state.receivable };
+    assert.equal(body.action, "account_history");
+    assert.equal(options?.existingPaymentHistory, true);
+    assert.ok(["limited", "refusing"].includes(mode));
+    refused.push(body.head);
+    throw budgetError();
+  };
+  const start = () => {
+    const gate = makeGate(chain, { registry, stateFile: file, now: () => now, pollMs: 1_000, verifyPaymentReads: true });
+    gates.push(gate);
+    return gate;
+  };
+  const original = start(), { callTool } = original.wrapRegistry(registry);
+  const quote = async Text => argOf(await callTool({ name: "poster", arguments: { Text } }));
+  const old = await quote("pocketed before failover");
+  const incoming = await quote("receivable during replay");
+  const recent = await quote("pocketed during replay");
+  const initial = await untilState(file, "the first completed history checkpoint", s => s.historyScan?.through === open.hash);
+  await original.stop();
+
+  now += 1_000;
+  latest = page(head);
+  mode = "limited";
+  lookups.length = 0;
+  const firstRecovery = start();
+  const waiting = await untilState(file, "a quota-deferred continuation", s => s.historyScan?.backfill?.quotaDeferred);
+  await firstRecovery.stop();
+  assert.deepEqual(lookups, [null]);
+  assert.equal(refused[0], middle.hash);
+  assert.equal(waiting.historyScan.through, open.hash);
+  assert.equal(waiting.historyScan.coveredAt, initial.historyScan.coveredAt);
+  assert.deepEqual(waiting.historyScan.backfill, { newest: head.hash, next: middle.hash, startedAt: now,
+    fullReceivableWindow: false, quotaDeferred: true, nextHeight: middle.height, advancedAt: now });
+
+  now += 1_000;
+  mode = "refusing";
+  const noQuota = start();
+  await until("another standby refusal on the same page", () => refused.length === 2);
+  await noQuota.stop();
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")).historyScan, waiting.historyScan, "a refusal cannot renew progress");
+
+  const paid = block(2, "receive", { account: PAYER, amount: old.amountRaw });
+  const fresh = block(5, "receive", { account: PAYER, amount: recent.amountRaw });
+  now += 60_000;
+  latest = page(fresh, head);
+  mode = "limited";
+  savedPages.set(middle.hash, page(middle));
+  savedPages.set(paid.hash, page(paid, open));
+  const incomingHash = testHash(20);
+  chain.state.receivable[incomingHash] = { source: PAYER, amount: incoming.amountRaw };
+  lookups.length = 0;
+  const secondRecovery = start();
+  const advanced = await untilState(file, "the next saved page after another quota refusal", s => s.historyScan?.backfill?.next === paid.hash);
+  await secondRecovery.stop();
+  assert.deepEqual(lookups, [middle.hash]);
+  assert.equal(refused[2], paid.hash);
+  assert.equal(advanced.historyScan.backfill.nextHeight, paid.height);
+  assert.equal(advanced.historyScan.backfill.advancedAt, now);
+  assert.equal(advanced.historyScan.coveredAt, initial.historyScan.coveredAt);
+  assert.equal(quoteIn(incoming.paymentId)(advanced).payHash, incomingHash);
+  assert.equal(secondRecovery.quote(recent.paymentId).status, "pending");
+
+  now += 60_000;
+  lookups.length = 0;
+  const lastRecovery = start();
+  const completed = await untilState(file, "the resumed batch to reach the old checkpoint", s => s.historyScan?.through === head.hash);
+  assert.equal(completed.historyScan.backfill, null);
+  assert.equal(completed.historyScan.coveredAt, waiting.historyScan.backfill.startedAt);
+  assert.equal(quoteIn(old.paymentId)(completed).payHash, paid.hash);
+  assert.equal(await lastRecovery.waitForPayment(recent.paymentId, 2_500), "paid");
+  assert.deepEqual(lookups.slice(0, 2), [paid.hash, null], "the normal latest scan resumes after the backfill");
   assert.equal(registry.callCount(), 0);
 });
 
@@ -1889,7 +2023,7 @@ test("no graph names an author: the page says the markup stays with the server, 
     // Says where the money actually goes today.
     assert.match(html, /None of the workflows here name one yet, so for now the markup stays with this server\./);
     assert.match(html, /No workflow here claims it yet/);
-    assert.match(txt, /No workflow on this server carries that field, so the markup stays with the operator\./);
+    assert.match(txt, /otherwise the operator keeps the markup/);
 
     // Never the unconditional claim, in either place.
     for (const [where, body] of [["landing page", html], ["/llms.txt", txt]]) {
@@ -1903,7 +2037,7 @@ test("no graph names an author: the page says the markup stays with the server, 
 
     // The genuine feature survives: a graph CAN claim it, and the page says how.
     assert.match(html, /"x402": \{"author": "nano_…"\}/);
-    assert.match(txt, /x402": \{"author": "nano_…"\}/);
+    assert.match(txt, /A graph can assign the available markup to its author/);
   } finally {
     server.close();
   }
@@ -2104,14 +2238,14 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
     const res = await fetch(`${base}/llms.txt`);
     assert.match(res.headers.get("content-type"), /text\/plain/);
     const txt = await res.text();
-    assert.match(txt, /endpoint: http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /MCP endpoint: http:\/\/pay\.test\/mcp/);
     assert.match(txt, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
     assert.match(txt, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
-    assert.match(txt, /## Payment \(x402, Nano\/XNO\)/);
-    assert.match(txt, /settles at metered model cost \+ 20%/);
-    assert.match(txt, /- poster: /);
-    assert.match(txt, /graph: http:\/\/pay\.test\/graph\/poster\.json/);
-    assert.match(txt, /npx nanoodle-mcp --graphs/);
+    assert.match(txt, /Nano \(XNO\) is the default/);
+    assert.match(txt, /settle at metered model cost plus a 20% markup/);
+    assert.match(txt, /- `poster`: /);
+    assert.match(txt, /\[graph JSON\]\(http:\/\/pay\.test\/graph\/poster\.json\)/);
+    assert.match(txt, /nanoodle-mcp --graphs/);
   } finally {
     server.close();
   }
@@ -2125,8 +2259,9 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
   const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
   try {
     const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
-    assert.doesNotMatch(txt, /Payment/);
-    assert.match(txt, /- poster: /);
+    assert.doesNotMatch(txt, /quote is not permission|payment guide/);
+    assert.match(txt, /operator’s balance/);
+    assert.match(txt, /- `poster`: /);
   } finally {
     freeServer.close();
   }
@@ -2210,12 +2345,12 @@ test("llms.txt carries a Privacy section; free mode drops the charge-specific li
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const txt = await (await fetch(`${base}/llms.txt`)).text();
-    assert.match(txt, /## Privacy/);
-    assert.match(txt, /No accounts, no API keys, no sign-ins/);
-    assert.match(txt, /Prompts and inputs are never written to disk or logs/);
-    assert.match(txt, /short hash binding a payment to its call/); // charge-only
-    assert.match(txt, /auto-deletes after 24h/);
-    assert.match(txt, /payments ledger \(usage\.jsonl\)/); // charge-only
+    assert.match(txt, /## Costs and data/);
+    assert.match(txt, /do not require a Nanoodle login or a NanoGPT API key/);
+    assert.match(txt, /ordinary invocations the server does not persist prompts or input media/);
+    assert.match(txt, /quote is not permission to spend/); // charge-only
+    assert.match(txt, /retention is 24 hours by default/);
+    assert.match(txt, /payment and receipt records/);
     assert.match(txt, /nano-gpt\.com\/privacy/);
   } finally {
     server.close();
@@ -2230,9 +2365,9 @@ test("llms.txt carries a Privacy section; free mode drops the charge-specific li
   const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
   try {
     const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
-    assert.match(txt, /## Privacy/);
-    assert.doesNotMatch(txt, /short hash binding a payment/);
-    assert.doesNotMatch(txt, /payments ledger \(usage\.jsonl\)/);
+    assert.match(txt, /## Costs and data/);
+    assert.doesNotMatch(txt, /quote is not permission to spend/);
+    assert.doesNotMatch(txt, /Nano payment guide/);
   } finally {
     freeServer.close();
   }

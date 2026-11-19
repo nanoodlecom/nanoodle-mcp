@@ -13,10 +13,8 @@
  *    back on every startup path. These tests walk the STATIC import graph from
  *    the bin and fail if it can reach `nanocurrency`.
  *
- * 2. WHAT WE TELL PEOPLE. Three places disclose the licence split: the README,
- *    the landing-page card, and /llms.txt. Each is asserted on its own. A test
- *    that only looks for "GPL-3.0" somewhere in src/http.mjs is satisfied by
- *    either one of the two pages, so the other can be deleted in silence.
+ * 2. WHAT WE TELL PEOPLE. The README and landing-page card disclose the
+ *    licence split. Agent discovery links to the canonical disclosure.
  *
  * The runtime behaviour was checked by hand with a module resolve hook:
  * BYOK startup resolves `nanocurrency` zero times, wallet startup resolves it once.
@@ -156,8 +154,7 @@ test("README does not claim other people's graphs are MIT", () => {
 });
 
 test("the landing-page licence card discloses the GPL dependency on its own", () => {
-  // Asserted on the card alone. /llms.txt carries the same 2 words, so a file-wide
-  // search keeps passing after this card is deleted.
+  // Assert the human-facing disclosure on the card itself.
   const http = readFileSync(join(root, "src", "http.mjs"), "utf8");
   const card = section(http, "Open source — host your own", "</div>", "landing-page licence card");
   assert.match(card, /nanocurrency/, "the landing card must name the GPL-3.0 dependency");
@@ -170,17 +167,11 @@ test("the landing-page licence card discloses the GPL dependency on its own", ()
   );
 });
 
-test("/llms.txt discloses the GPL dependency on its own", () => {
-  const http = readFileSync(join(root, "src", "http.mjs"), "utf8");
-  const source = section(http, "`## Source`", "`Self-host:", "/llms.txt Source section");
-  assert.match(source, /nanocurrency/, "/llms.txt must name the GPL-3.0 dependency");
-  assert.match(source, /GPL-3\.0/, "/llms.txt must name the GPL-3.0 licence");
-  assert.doesNotMatch(source, /MIT-licensed end to end/i);
-  assert.doesNotMatch(
-    source,
-    /workflow library https:\/\/github\.com\/nanoodlecom\/awesome-noodles/,
-    "a self-hosted server serves the operator's graphs, not awesome-noodles",
-  );
+test("/llms.txt points to canonical licensing without repeating a dependency notice", () => {
+  const discovery = readFileSync(join(root, "src", "discovery.mjs"), "utf8");
+  assert.match(discovery, /Server source and licensing/);
+  assert.match(discovery, /#licensing/);
+  assert.doesNotMatch(discovery, /nanocurrency|GPL-3\.0|MIT-licensed end to end/i);
 });
 
 test("neither served page claims the whole stack is MIT", () => {

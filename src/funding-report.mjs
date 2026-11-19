@@ -1,10 +1,11 @@
 import { open, rename } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fundingRaw } from "./run-funding.mjs";
 import { hostedRunTimeout } from "./hosted-run.mjs";
 import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
-import { NANO_COLD_STANDBY_SCAN_REQUESTS } from "./nano-read-pool.mjs";
+import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS } from "./nano-read-pool.mjs";
 import { selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { maintenanceProcessIdentity } from "./maintenance-report.mjs";
 import { readOperatorJson } from "./operator-file.mjs";
@@ -54,7 +55,7 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
   function refresh() {
     if (pending) return pending;
     pending = (async () => {
-      let report;
+      let report, evidenceDeadline = null;
       try {
         const value = await snapshot();
         const balance = fundingRaw(value.balanceRaw), liabilities = fundingRaw(value.liabilitiesRaw), reserved = fundingRaw(value.reservedRaw);
@@ -86,10 +87,18 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
             report.nanoRpc.configuration = n.configuration;
             report.nanoRpc.cooldowns = selectRpcCooldowns(n.cooldowns, n.configuredPeers, now());
           }
+          const expiresAt = n.fundingEvidenceExpiresAt;
+          if (expiresAt !== undefined) {
+            if (report.nanoRpc.standby?.inUse !== true || !Number.isSafeInteger(expiresAt)
+              || expiresAt <= n.lastReadAt || expiresAt - n.lastReadAt > NANO_FUNDING_EVIDENCE_MS) throw Error("invalid funding evidence expiry");
+            report.nanoRpc.fundingEvidenceExpiresAt = expiresAt;
+            evidenceDeadline = performance.now() + expiresAt - now();
+          }
           const age = now() - n.lastReadAt;
           const rpcHealthy = report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
             && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
-            && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers && age <= 60_000 && age >= -30_000;
+            && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers && age <= 60_000 && age >= -30_000
+            && (expiresAt === undefined || expiresAt > now());
           if (!rpcHealthy) { report.ok = false; report.code = "nano-read-guard-unhealthy"; }
         }
         if (durableState) {
@@ -123,7 +132,9 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }
         finally { await handle.close(); }
         await rename(temporary, file);
-        sources.setStorageReady(true); sources.setReady(report.ok);
+        const readyForMs = evidenceDeadline === null || !report.ok ? undefined
+          : Math.min(evidenceDeadline - performance.now(), report.nanoRpc.fundingEvidenceExpiresAt - now());
+        sources.setStorageReady(true); sources.setReady(report.ok, readyForMs);
         lastWriteHealthy = report.ok;
       } catch (error) {
         lastWriteHealthy = false;

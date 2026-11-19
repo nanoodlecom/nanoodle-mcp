@@ -302,6 +302,31 @@ test("Nano checkout detects stale coverage only while a quote has been waiting",
   }
 });
 
+test("stale Nano coverage distinguishes a moving history cursor from a stalled one while keeping admission closed", async t => {
+  for (const [scenario, advancedAt, expected] of [
+    ["advancing", NOW - 63_000, "nano-history-backfill-in-progress"],
+    ["at the grace limit", NOW - 120_000, "nano-history-backfill-in-progress"],
+    ["stalled", NOW - 120_001, "nano-history-backfill-stalled"],
+    ["impossible future progress", NOW + 30_001, "nano-payment-coverage-invalid"],
+    ["legacy cursor", undefined, "nano-payment-coverage-stale"],
+  ]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"];
+    ledger.historyScan = { through: "C".repeat(64), coveredAt: NOW - 600_000, backfill: {
+      newest: "A".repeat(64), next: "B".repeat(64), startedAt: NOW - 500_000, fullReceivableWindow: false, quotaDeferred: true,
+      ...(advancedAt !== undefined && { advancedAt, nextHeight: "100" }),
+    } };
+    ledger.quotes.push({ id: "private-backfill-quote", status: "pending", createdAt: NOW - 500_000,
+      expiresAt: NOW + 600_000, amountRaw: "50000000000000000000000" });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
+    assert.deepEqual(probe, { stage: "nano-payment-scan-progress", ok: false, code: expected, domains: ["nano"] }, scenario);
+    assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-backfill-quote|advancedAt|nextHeight|BBBBBBBB/);
+  }
+});
+
 test("a legacy Nano writer alerts on an aged confirmed matching transfer missing from its ledger", async t => {
   const account = NANO_GENESIS_REPLY.contents.account;
   const sender = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
@@ -663,7 +688,50 @@ test("a formerly adequate deposit fails when fresh provider pricing rises or a m
     assert.deepEqual(outcome(`saved-workflow-${asset}-sing`).domains, []);
   }
   assert.equal(localCalls.filter(name => name === "sing").length, 2);
-  assert.equal(outcome("custom-workflow-pricing").code, "custom-workflow-deposit-too-low");
+  for (const asset of ["near", "usdc"]) {
+    assert.equal(outcome(`custom-workflow-pricing-${asset}`).code, "custom-workflow-deposit-too-low");
+  }
+});
+
+test("one custom workflow preview can fail without hiding the other asset or reporting a Market outage", async t => {
+  for (const failedAsset of ["near", "usdc"]) {
+    const otherAsset = failedAsset === "near" ? "usdc" : "near";
+    const f = fixture(({ url, body }) => {
+      const args = body?.params?.arguments;
+      if (url.hostname === "site.example" && args?.inputs?.Marker && args._pay_with === failedAsset) {
+        return new Response("PRIVATE_PRICE_ERROR", { status: 503 });
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(report.admission, { nano: true, near: failedAsset !== "near", usdc: failedAsset !== "usdc", market: true });
+    assert.deepEqual(report.checks.filter(c => !c.ok), [
+      { stage: `custom-workflow-pricing-${failedAsset}`, ok: false, code: "http-503", domains: [failedAsset] },
+    ]);
+    for (const stage of [`custom-workflow-pricing-${otherAsset}`, `workflow-nano-capital-${otherAsset}-custom`, "workflow-price-nanoodle-image"]) {
+      assert.ok(report.checks.find(c => c.stage === stage)?.ok, stage);
+    }
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PRICE_ERROR/);
+  }
+});
+
+test("missing provider pricing for the custom graph invalidates both previews without affecting Market", async t => {
+  const f = fixture(), price = f.deps.computePrice;
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  let providerSamples = 0;
+  f.deps.computePrice = async (args, options) => {
+    if (!args.inputs?.Marker) return price(args, options);
+    providerSamples++;
+    return { safety: { ok: false }, pricing: null };
+  };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(providerSamples, 1);
+  assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+  assert.deepEqual(report.checks.filter(c => !c.ok), [
+    { stage: "custom-workflow-pricing", ok: false, code: "workflow-provider-pricing-unavailable", domains: ["near", "usdc"] },
+  ]);
+  assert.equal(f.calls.some(({ body }) => body?.params?.arguments?.inputs?.Marker), false);
 });
 
 test("saved NEAR deposit conversion includes the quoted spread and rounds up to a microNEAR", async t => {
@@ -1238,7 +1306,9 @@ test("owned Nano ledger telemetry distinguishes missing blocks from delayed conf
 });
 
 test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
-  for (const failure of [null, "matching-with-lagging-peer", "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+  for (const failure of [null, "matching-with-lagging-peer", "reused-funding", "expired-funding", "expired-during-check",
+    "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+    let checkedAt = NOW;
     const f = fixture(({ url, body }) => {
       assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
       if (url.hostname === "nano-0.example") {
@@ -1248,8 +1318,10 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
         return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
       }
+      if (failure === "expired-during-check" && body?.action === "account_history") checkedAt = NOW + 5_000;
       return null;
     });
+    f.deps.now = () => checkedAt;
     const url = "https://standby.example/rpc?api_key=PRIVATE_STANDBY";
     f.config.nanoStandby = { url, requestsPerMinute: 10 };
     const rpc = f.states["/state/funding-health.json"].nanoRpc;
@@ -1257,14 +1329,21 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       configuration: failure === "digest" ? "a".repeat(64) : rpcPeerSetId([...f.config.nanoRpcUrls, url]),
       standby: { inUse: failure !== "inactive", requestsPerMinute: failure === "quota" ? 11 : 10 },
       cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      ...(["reused-funding", "expired-funding", "expired-during-check"].includes(failure) && { lastReadAt: NOW - 25_000,
+        fundingEvidenceExpiresAt: NOW + (failure === "expired-funding" ? 0 : 5_000) }),
       ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
     const report = await runOperationalCheck(f.config, f.deps);
-    const ready = failure === null || failure === "matching-with-lagging-peer";
+    const ready = [null, "matching-with-lagging-peer", "reused-funding"].includes(failure);
     assert.equal(report.admission.nano, false);
     assert.equal(report.admission.near, ready);
     if (ready) {
       assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
       assert.ok(report.checks.some(c => c.stage === "nano-payment-read-quorum" && c.code === "nano-payment-read-standby-unverified"));
+    }
+    if (failure === "expired-funding") assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "nano-read-guard-stale"));
+    if (failure === "expired-during-check") {
+      assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+      assert.ok(report.checks.some(c => c.stage === "nano-funding-evidence-freshness" && c.code === "nano-read-guard-stale"));
     }
     if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
@@ -1763,11 +1842,17 @@ test("watcher readiness rejects malformed heights, impossible leads and unknown 
 test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a real receipt", async t => {
   const payer = "private-canary.near", paymentTx = base58Encode(Buffer.alloc(32, 3));
   const receiptId = base58Encode(Buffer.alloc(32, 4)), receiptBlock = base58Encode(Buffer.alloc(32, 5));
-  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof"]) {
+  const timeoutMethods = { transaction: "tx", block: "block", "account-changes": "EXPERIMENTAL_changes",
+    "receipt-lookup": "EXPERIMENTAL_receipt_to_tx" };
+  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof", ...Object.keys(timeoutMethods)]) {
     const f = fixture(({ url, body }, config) => {
       if (!url.hostname.startsWith("near-") || !body) return null;
       const json = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
       const merchant = config.merchant;
+      if (url.hostname === "near-1.example" && body.method === timeoutMethods[scenario]
+        && (body.method !== "block" || body.params.block_id === receiptBlock)) {
+        throw new DOMException("PRIVATE_TIMEOUT_DETAIL", "TimeoutError");
+      }
       if (body.method === "tx") {
         assert.deepEqual(body.params, { tx_hash: paymentTx, sender_account_id: payer, wait_until: "FINAL" });
         return json({ final_execution_status: "FINAL", status: { SuccessValue: "" },
@@ -1806,10 +1891,12 @@ test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a
       assert.equal(find("near-payment-discovery")?.ok, scenario !== "empty-changes");
       assert.equal(find("near-discovery-peer-1")?.ok, scenario === "complete");
       if (scenario !== "complete") assert.deepEqual(find("near-discovery-peer-1").domains, []);
+      if (timeoutMethods[scenario]) assert.equal(find("near-discovery-peer-1").code, `near-discovery-${scenario}-timeout`);
     }
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
     assert.ok(!JSON.stringify(report).includes(paymentTx));
     assert.ok(!JSON.stringify(report).includes(payer));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_TIMEOUT_DETAIL/);
   }
 });
 
