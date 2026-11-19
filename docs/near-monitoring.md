@@ -390,9 +390,11 @@ Nanoodle listings. The free `price_noodle` probes check that the decision model
 and both branches are priced in NEAR and USDC, and the estimated charge fits
 the deposit. All probes use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
-during an npm outage. The archival NEAR check looks up a published historical
-transaction and its block through both public archives. It records each peer's
-result, and raises a failure when neither archive can verify that transaction.
+during an npm outage. The archival NEAR checks read a published historical
+transaction and its block, then check for a known receipt in its account
+changes and resolve that receipt to the original transaction and signer.
+Each check records both archive results and fails when neither peer can
+verify it.
 The probes use public discovery, status, pricing and historical reads.
 [FastNEAR public transaction fixture](https://docs.fastnear.com/rpc/transaction/tx)
 

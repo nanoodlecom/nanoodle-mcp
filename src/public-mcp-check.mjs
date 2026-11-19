@@ -1,4 +1,6 @@
 import { createProbeFetch } from "./probe-http.mjs";
+import { createNearRpc } from "./near/rpc.mjs";
+import { readNearPaymentReceipts, readNearReceiptTransaction } from "./near/watch.mjs";
 
 const NANO = "https://mcp.nanoodle.com";
 const NEAR = "https://near.nanoodle.com";
@@ -7,7 +9,10 @@ const BABEL = "https://babel.255bits.com";
 const NEAR_ARCHIVES = ["https://archival-rpc.mainnet.fastnear.com", "https://archival-rpc.mainnet.near.org"];
 // Published mainnet fixture from https://docs.fastnear.com/rpc/transaction/tx.
 const ARCHIVE_SAMPLE = { tx: "34E7weKCDqXh3xPKdBgSWRqo44yTWjbka9deMK8JbAxx", signer: "escrow.ai.near",
-  block: "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL", height: 194263441 };
+  block: "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL", height: 194263441,
+  // The same transaction's successful refund receipt changes the signer's balance.
+  receipt: { id: "EmdtjzQtQWvmbkeZrgSQwqbyAuevicEYTVUxLhAmUEe4",
+    block: "3bssBpNw6rN4sbthUgELgdT4xpkWL2ZDUnrt9yddDB8q", height: 194263443 } };
 const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
@@ -65,6 +70,14 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     const block = await json(site, { body: rpc("block", { block_id: fixture.block }) });
     need(block.jsonrpc === "2.0" && block.id === 1 && !block.error && block.result?.header?.hash === fixture.block
       && block.result.header.height === fixture.height, "near-history-block-unverified");
+  }
+  async function readArchiveDiscovery(site) {
+    const { signer, tx, receipt } = ARCHIVE_SAMPLE;
+    const client = createNearRpc({ url: site, fetch: request, timeoutMs: 6000 });
+    const changes = await readNearPaymentReceipts(client, receipt.block, [signer]).catch(() => null);
+    need(changes?.has(receipt.id), "near-history-account-change-unverified");
+    const origin = await readNearReceiptTransaction(client, receipt.id, receipt.height).catch(() => null);
+    need(origin?.transaction_hash === tx && origin.sender_account_id === signer, "near-history-receipt-origin-unverified");
   }
   async function discover(site) {
     const hello = await json(site + "/mcp", { body: rpc("initialize", INIT) });
@@ -141,16 +154,20 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       }
     }
   }
+  async function archiveCheck(stage, probe, unavailable) {
+    const results = await Promise.all(NEAR_ARCHIVES.map(site => check(new URL(site).hostname, () => probe(site))));
+    const peers = results.map(({ stage, ...result }) => ({ host: stage, ...result }));
+    const ok = peers.some(peer => peer.ok);
+    return { stage, ok, peers, ...(!ok && { code: unavailable }) };
+  }
   const checks = await Promise.all(Object.entries(probes).map(([stage, probe]) => check(stage, probe)));
   // The first batch uses the shared fetch pool. The second keeps four
-  // concurrent requests even when all archive peers need verification.
-  const [pricing, archiveReads] = await Promise.all([
+  // concurrent requests. The receipt checks reuse the slots after it drains.
+  const [pricing, archiveHistory] = await Promise.all([
     Promise.all(["near", "usdc"].map(asset => check(`${asset}-conditional-pricing`, () => conditionalPrice(asset)))),
-    Promise.all(NEAR_ARCHIVES.map(site => check(new URL(site).hostname, () => readArchive(site)))),
+    archiveCheck("near-archival-history", readArchive, "near-no-readable-archive"),
   ]);
-  const peers = archiveReads.map(({ stage, ...result }) => ({ host: stage, ...result }));
-  const archived = peers.some(peer => peer.ok);
-  checks.push(...pricing, { stage: "near-archival-history", ok: archived, peers,
-    ...(!archived && { code: "near-no-readable-archive" }) });
+  const archiveDiscovery = await archiveCheck("near-archival-payment-discovery", readArchiveDiscovery, "near-no-archive-payment-discovery");
+  checks.push(...pricing, archiveHistory, archiveDiscovery);
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }
