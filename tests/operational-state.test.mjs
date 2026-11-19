@@ -124,6 +124,39 @@ test("stuck work, permanently failed refunds and long-pending creator payouts re
   assert.deepEqual(l.issues, ["creator-payout-stuck", "market-assignment-stuck", "market-work-stuck", "nano-paid-work-stuck", "nano-settlement-stuck", "near-paid-work-stuck", "near-refund-failed"]);
 });
 
+test("Market retries preserve the age of an undelivered hire or a pending decline", () => {
+  const s = snapshots(), hour = 3_600_000;
+  const record = { phase: "new", budgetUsd: 0.09, createdAt: NOW - hour - 1, updatedAt: NOW - 1, attempts: 10 };
+  s.market.push({ v: 1, assignments: { hire: record } });
+  for (const phase of ["new", "starting", "started", "declining", "submitted", "declined"]) {
+    record.phase = phase;
+    const expected = ["submitted", "declined"].includes(phase) ? [] : ["market-work-stuck"];
+    assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, expected, phase);
+  }
+  record.phase = "running";
+  record.runStartedAt = NOW - 2000;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, ["market-work-stuck"]);
+  record.createdAt++;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+});
+
+test("a Market change request gets its own waiting window through delivery retries", () => {
+  const s = snapshots();
+  const record = { phase: "reworking", createdAt: NOW - 8_000_000, runStartedAt: NOW - 7_000_000,
+    updatedAt: NOW - 1, reworkStartedAt: NOW - 20_000, reworkEpoch: new Date(NOW + 300_000).toISOString() };
+  s.market.push({ v: 1, assignments: { hire: record } });
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+  record.phase = "submitting";
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+  record.reworkStartedAt = NOW - 3_600_001;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, ["market-work-stuck"]);
+
+  delete record.reworkStartedAt;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, [], "legacy rework is still within its saved delivery window");
+  record.reworkEpoch = new Date(NOW).toISOString();
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, ["market-work-stuck"], "legacy rework reached its saved deadline");
+});
+
 test("the Nano debt alert uses the original age when the next retry is in the future", () => {
   const s = snapshots();
   const debt = { amountRaw: "20", journaled: true, createdAt: NOW - 900_001, nextAttemptAt: NOW + 60_000, tries: 1 };

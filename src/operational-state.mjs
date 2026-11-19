@@ -29,6 +29,22 @@ function marketReservationUsd(record) {
   return usd;
 }
 
+function overdueMarketWork(record, now, timeoutMs) {
+  const rework = record.phase === "reworking" || (record.phase === "submitting" && record.reworkEpoch);
+  if (rework) {
+    // Older records only saved the rework's due date. Neither their original
+    // hire time nor the previous paid run describes this delivery window.
+    const deadline = Date.parse(record.reworkEpoch);
+    if (deadline <= now) return true;
+    const startedAt = record.reworkStartedAt ?? record.updatedAt;
+    return Number.isFinite(startedAt) && now - startedAt > timeoutMs;
+  }
+  // A retry updates updatedAt even when the buyer is still waiting on the
+  // first delivery or a refund. Use the immutable hire record when available.
+  const startedAt = record.createdAt ?? record.runStartedAt ?? record.updatedAt;
+  return Number.isFinite(startedAt) && now - startedAt > timeoutMs;
+}
+
 export function recentPaidWorkflowFailures({ nano, near, market = [] }, now = Date.now()) {
   const failures = { nano: 0, near: 0, usdc: 0, market: 0 };
   const recent = at => Number.isSafeInteger(at) && at <= now && now - at < PAID_FAILURE_WINDOW_MS;
@@ -143,7 +159,7 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     for (const rec of assignments) {
       if (rec.phase === "stuck") issues.add("market-assignment-stuck");
       if (["new", "reworking", "running", "submitting", "delivering", "started", "starting", "pricing", "declining"].includes(rec.phase)
-        && old(rec.runStartedAt ?? rec.updatedAt ?? rec.createdAt, stuckMs)) issues.add("market-work-stuck");
+        && overdueMarketWork(rec, now, stuckMs)) issues.add("market-work-stuck");
       const budgetUsd = marketReservationUsd(rec);
       if (budgetUsd > 0) marketUsdNano += parseUsdNano(budgetUsd);
     }

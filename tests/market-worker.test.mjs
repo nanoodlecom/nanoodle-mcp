@@ -643,14 +643,17 @@ test("a run that fails is handed back as failed (full refund) and never retried"
 });
 
 test("a change request is answered on the thread and the same result resubmitted, without a second run", async () => {
-  const { m, store, once } = await rig();
+  let clock = Date.now();
+  const { m, store, once } = await rig({ now: () => clock });
   const runs0 = nano.runs();
   const id = m.hire({ description: WORKED() });
   await once();
+  clock += 60_000;
   m.requestChanges(id, "Can you make it brighter?");
   await once();
   const r = m.rows.get(id);
   assert.equal(r.assignment.status, "submitted");
+  assert.equal(store.get(id).reworkStartedAt, clock);
   assert.equal(r.versions.length, 2);
   assert.deepEqual(r.versions[1].files, r.versions[0].files, "the new version re-lists the same files");
   assert.match(r.versions[1].markdown, /Submitted again unchanged after a change request/);
