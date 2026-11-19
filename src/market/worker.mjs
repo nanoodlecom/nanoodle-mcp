@@ -314,11 +314,12 @@ export function createMarketWorker({
     if (prep.transient) return backoff(rec, prep.transient);
     if (prep.decline) return set(rec.id, ok({ phase: "declining", decline: prep.decline }));
     if (prep.pricing.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
+    const afterPricing = deadlineRefusal(rec, timing); if (afterPricing) return afterPricing;
+    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: request.usedDefault ? defaultWorkflow.label : null, fields: request.usedFields, notes: request.fieldNotes }), `nanoodle-start-${rec.id}`);
+    await progress(rec.id, `Preparing the workflow (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
+    const afterProgress = deadlineRefusal(rec, timing); if (afterProgress) return afterProgress;
     const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
     const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
-    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: request.usedDefault ? defaultWorkflow.label : null, fields: request.usedFields, notes: request.fieldNotes }), `nanoodle-start-${rec.id}`);
-    await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
-    const afterProgress = deadlineRefusal(rec, timing); if (afterProgress) return afterProgress;
     prepared.delete(rec.id);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),

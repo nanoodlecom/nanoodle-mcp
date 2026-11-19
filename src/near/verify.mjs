@@ -11,6 +11,7 @@ import { assertNearAccountId } from "./account.mjs";
 import { base58Decode } from "./base58.mjs";
 import { NearError } from "./errors.mjs";
 import { hasFtTransfer } from "./ft.mjs";
+import { nearBlockTime } from "./freshness.mjs";
 
 const TRANSPORT = new Set(["RPC_HTTP", "RPC_TIMEOUT", "RPC_BAD_RESPONSE"]);
 const NOT_FOUND = new Set(["UNKNOWN_TRANSACTION", "TIMEOUT_ERROR"]);
@@ -79,15 +80,15 @@ export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, t
   }
 
   const blockHash = r.transaction_outcome?.block_hash;
-  if (typeof blockHash !== "string") throw new NearError("RPC_UNAVAILABLE", "the RPC returned no block for the transaction");
-  let block;
+  if (typeof blockHash !== "string" || !blockHash) throw new NearError("RPC_UNAVAILABLE", "the RPC returned no block for the transaction");
+  let blockTimeMs;
   try {
-    block = await rpc.block({ blockId: blockHash });
+    const block = await rpc.block({ blockId: blockHash });
+    if (block?.header?.hash !== blockHash) throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC returned a different transaction block");
+    blockTimeMs = nearBlockTime(block);
   } catch (e) {
     throw new NearError("RPC_UNAVAILABLE", "could not read the transaction's block; try again", { cause: e });
   }
-  const ns = block?.header?.timestamp_nanosec;
-  if (typeof ns !== "string" || !/^\d+$/.test(ns)) throw new NearError("RPC_UNAVAILABLE", "the transaction's block has no timestamp");
 
   return {
     txHash,
@@ -96,6 +97,6 @@ export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, t
     amountYocto: BigInt(deposit),
     ...(tokenContract ? { asset: "usdc", tokenContract } : {}),
     blockHash,
-    blockTimeMs: Number(BigInt(ns) / 1_000_000n),
+    blockTimeMs,
   };
 }

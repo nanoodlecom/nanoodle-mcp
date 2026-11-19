@@ -123,6 +123,9 @@ export function createNearRpc({ url, fetch = globalThis.fetch, timeoutMs = 10_00
     if (method === "query" && typeof result.error === "string") {
       throw new NearError("QUERY_ERROR", result.error, { data: result });
     }
+    if (method === "block" && typeof params?.block_id === "string" && result?.header?.hash !== params.block_id) {
+      throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC returned a different historical block");
+    }
     if (isAnchoredAccountChanges(method, params)) requireNearAccountChanges(result, params.block_id, params.account_ids);
     if (method === "EXPERIMENTAL_receipt_to_tx") requireNearReceiptTransaction(result);
     return result;
