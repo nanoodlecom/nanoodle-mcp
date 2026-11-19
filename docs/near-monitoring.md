@@ -270,6 +270,11 @@ Coverage:
   delivery is due within ten minutes or the last quarter of a shorter SLA,
   a worker's retry would miss its cutoff, or model work has reached its
   execution cutoff. The report identifies the listing and the fixed outcome.
+- For Market jobs waiting to run, the monitor prices the current brief locally
+  and checks whether the model cost plus 20% still fits the accepted budget
+  and net escrow. It reports unpriceable or underfunded jobs by listing,
+  without including buyer text or changing readiness for other jobs. The scan
+  reports incomplete coverage when a listing has more than 20 pending jobs.
 - Catalog pricing and Market net-price coverage for all four predefined graphs.
   The free MCP check prices a custom two-step graph separately in NEAR and USDC
   against one fresh provider estimate, so a preview failure identifies the

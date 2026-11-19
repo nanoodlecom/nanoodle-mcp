@@ -103,6 +103,58 @@ test("an older pending start cannot spend against a listing price above its escr
   } finally { r.store.close(); await r.m.close(); }
 });
 
+test("a model price increase after Market start is refused before any inference", async () => {
+  const r = await rig();
+  try {
+    const idea = "the accepted idea";
+    const id = r.m.hire({ description: WORKED(idea) }), before = nano.runs();
+    const price = r.runner.price;
+    const start = r.client.start;
+    let prices = 0, started = false;
+    r.runner.price = async (args, options) => {
+      ++prices;
+      assert.equal(args.inputs.Idea, idea);
+      assert.equal(options.budgetUsd, 0.5);
+      if (!started) return price(args, options);
+      return { ok: false, refusals: [{ code: "OVER_BUDGET", message: "The updated model price exceeds the accepted budget." }] };
+    };
+    r.client.start = async (id) => {
+      const result = await start(id);
+      started = true;
+      r.m.rows.get(id).job.description = WORKED("an edited brief");
+      return result;
+    };
+    await r.once();
+    assert.equal(prices, 2);
+    assert.equal(nano.runs(), before);
+    assert.equal(r.store.get(id).phase, "declined");
+    assert.equal(r.store.get(id).decline.code, "OVER_BUDGET");
+    assert.equal(r.m.rows.get(id).assignment.cancelReason, "failed");
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("an unavailable catalog after Market start delays inference until pricing recovers", async () => {
+  let timestamp = Date.now();
+  const r = await rig({ now: () => timestamp, backoffMs: 1000 });
+  try {
+    const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+    const price = r.runner.price;
+    let prices = 0;
+    r.runner.price = async (args, options) => {
+      if (++prices === 2) return { ok: false, refusals: [{ code: "CATALOG_UNAVAILABLE" }] };
+      return price(args, options);
+    };
+    await r.once();
+    assert.equal(r.store.get(id).phase, "started");
+    assert.equal(nano.runs(), before);
+    timestamp += 1001;
+    await r.once();
+    assert.equal(r.store.get(id).phase, "submitted");
+    assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+    assert.equal(nano.runs(), before + 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
 test("the worker rechecks the paid assignment after Market confirms start", async t => {
   const cases = [
     ["cancelled", (m, id) => m.cancel(id), "gone", undefined],

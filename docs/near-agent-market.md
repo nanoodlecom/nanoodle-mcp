@@ -245,6 +245,11 @@ over, but video and music steps priced "at catalog price (varies)" can. The
 changes in the catalog's prices; they do not cover a single run that costs more than its
 estimate.
 
+Before starting any model calls, the worker prices the request again using the
+provider catalog, which is cached for up to five minutes. If the new estimate
+with the 20% margin exceeds the job's accepted budget or verified net escrow,
+the worker hands the job back for a full refund.
+
 Outcomes for the operator, per hire:
 
 | Outcome | Operator receives | Operator pays NanoGPT |

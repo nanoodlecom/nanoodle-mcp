@@ -198,3 +198,24 @@ export function parseBrief(description) {
   for (const k of BRIEF_KEYS) if (req[k] !== undefined) args[k] = req[k];
   return args;
 }
+
+/** Interpret a buyer's brief using the listing's workflow and input rules. */
+export function resolveJobBrief(job, assignmentId, { defaultWorkflow, customWorkflows }) {
+  try {
+    const args = parseBrief(job?.description);
+    if (!customWorkflows) return { code: "CUSTOM_NOT_OFFERED" };
+    return { args, usedDefault: false, usedFields: [], fieldNotes: [] };
+  } catch (error) {
+    if (!(error instanceof BriefError)) throw error;
+    if (!customWorkflows && error.code !== "NO_REQUEST") return { code: "CUSTOM_NOT_OFFERED" };
+    if (!defaultWorkflow || error.code !== "NO_REQUEST") return { code: error.code, detail: error.message };
+
+    const split = splitPlainBrief(job?.description || "", defaultWorkflow.fieldNames || []);
+    const plain = split.main || String(job?.title || "").trim();
+    if (!plain) return { code: error.code, detail: error.message };
+    // Typed field defaults use the same seed in the worker and read-only monitor.
+    const resolved = resolveFields(split.fields, defaultWorkflow.fieldSpecs || {}, assignmentId);
+    const args = { graph: defaultWorkflow.graph, inputs: { ...resolved.inputs, [defaultWorkflow.inputName]: plain } };
+    return { args, usedDefault: true, usedFields: resolved.set, fieldNotes: resolved.notes, briefLength: plain.length };
+  }
+}
