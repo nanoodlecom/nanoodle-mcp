@@ -633,6 +633,30 @@ test("saved workflow probes flag thin Nano deposits, invalid USDC previews and m
   }
 });
 
+test("fixed Nano workflows discovered outside the showcase are watched for underpricing", async t => {
+  const f = fixture(({ url, body }) => {
+    if (url.hostname !== "nano-site.example" || url.pathname !== "/mcp" || body?.method !== "tools/list") return null;
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [
+      ...toolsList().map(tool => tool.name === "run_noodle" ? { ...tool, inputSchema: { properties: { _payment_id: {} } } } : tool),
+      { name: "extra-fixed", description: "Runs on NanoGPT — $0.005 deposit per call, paid in Nano (XNO) — settle later." },
+      { name: "variable", pricedPerRequest: true, inputSchema: { properties: { _payment_id: {} } } },
+    ] } });
+  });
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.deps.priceSavedWorkflow = async graph => {
+    assert.equal(graph.name, "extra-fixed");
+    return { pricing: { likelyChargeUsd: 0.012, unpriced: [], refusals: [] } };
+  };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(report.checks.find(c => c.stage === "saved-workflow-nano-extra-fixed"), {
+    stage: "saved-workflow-nano-extra-fixed", ok: false, code: "saved-nano-deposit-too-low", domains: [],
+  });
+  assert.equal(report.admission.nano, true);
+  assert.ok(f.calls.some(call => call.url.pathname === "/graph/extra-fixed.json"));
+  assert.ok(f.calls.every(call => call.body?.params?.arguments?.graph?.name !== "extra-fixed"));
+  assert.ok(f.calls.every(call => !["/graph/variable.json", "/graph/run_noodle.json"].includes(call.url.pathname)));
+});
+
 test("fixed Nano workflows need working capital at their advertised deposit and the sampled rate", async t => {
   const raw = 10n ** 30n, required = 3n * raw / 2n;
   for (const mode of ["exact", "runtime-short", "confirmed-short", "market-waiting", "provider-key"]) {
