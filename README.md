@@ -81,7 +81,7 @@ transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md
 - NEAR mode first ships in npm version 0.7.0. Until `npm view nanoodle-mcp version` shows
   0.7.0 or later, run it from a clone as below.
 
-**Try it: do X, see Y.** Node 22.23.4+, 24.22.1+ or 26.12.1+. Steps 1–3 need no network
+**Try it: do X, see Y.** Node 22.23.5+, 24.22.3+ or 26.13.1+. Steps 1–3 need no network
 after `npm ci`, and no keys or funds.
 
 ```bash
@@ -163,14 +163,14 @@ For the published graph, the generation step is:
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"character-sprites","arguments":{"Character":"A compact furnace knight with an ivory helmet, amber visor, navy armor and brass gauntlets. Outlined 2D platformer art. No weapon or wings."}}}
 ```
 
-Install the skill for local extraction and animation (Node 22.23.4+, 24.22.1+, or 26.12.1+ and ffmpeg/ffprobe
+Install the skill for local extraction and animation (Node 22.23.5+, 24.22.3+, or 26.13.1+ and ffmpeg/ffprobe
 required). A useful agent request is: “Use character-sprites to make an animated
 fighter from my description, inspect the joints and alpha edges, then build a
 small playable arena with heavy gravity and impactful combat.”
 
 ## Install
 
-You need: **Node 22.23.4+, 24.22.1+, or 26.12.1+**, a folder of saved graphs (say `~/noodles` — see
+You need: **Node 22.23.5+, 24.22.3+, or 26.13.1+**, a folder of saved graphs (say `~/noodles` — see
 [Making graphs](#making-graphs)), and a [nano-gpt.com](https://nano-gpt.com)
 API key in `NANOGPT_API_KEY` (or passed via `--key` / `--env-file`) — or no
 key at all with a Nano wallet, see
@@ -885,6 +885,15 @@ From version 0.7.0, `run_noodle` also takes a workflow you composed yourself: pa
 `graph` instead of `url`. Two free helpers sit next to it: `noodle_guide` explains
 the graph format, node types and priced models, and `price_noodle` returns the
 itemized estimated cost of a `graph` or `url` without running it.
+
+For agent-authored graphs, call `noodle_guide` first. For example,
+`{"node_type":"ivideo","limit":5}` returns model candidates for an
+image-to-video node, and `{"format_only":true}` returns the graph contract and
+a minimal example without looking up model catalogs. The guide filters for
+the hosted node policy, provider-advertised capabilities and a priceable
+baseline. It does not create a quote, run inference or list the editor's full
+inventory. Before quoting a run, pass the actual graph, settings and inputs to
+`price_noodle`.
 
 ## Pay with NEAR / run custom workflows
 

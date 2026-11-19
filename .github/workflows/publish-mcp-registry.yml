@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.3'
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
       - name: Assert the release is published on npm

@@ -240,7 +240,7 @@ test("receipt USD figures reconcile: deposit.usd - charged.usd = refund.usd (to 
 
 test("authoringGuide: node types, rules, example, and filtered priced models", () => {
   const g = authoringGuide({ catalogs: CATS });
-  assert.deepEqual(Object.keys(g.structured), ["nodeTypes", "wiringRules", "example", "models"]);
+  assert.deepEqual(Object.keys(g.structured), ["nodeTypes", "wiringRules", "example", "models", "graphFormat", "minimalExample"]);
   assert.equal(g.structured.nodeTypes.length, 31);
   const llm = g.structured.nodeTypes.find((t) => t.type === "llm");
   assert.deepEqual(Object.keys(llm), ["type", "title", "allowed", "why", "inputs", "textPorts", "mediaPorts", "outputs", "keyFields", "fields"]);
@@ -256,6 +256,12 @@ test("authoringGuide: node types, rules, example, and filtered priced models", (
   assert.equal(g.structured.example.nodes.length, 3);
   // the example graph is itself safe
   assert.equal(checkGraphSafety(g.structured.example).ok, true);
+  const { graph, inputs } = g.structured.minimalExample;
+  assert.equal(g.structured.graphFormat.version, 1);
+  const baseline = priceGraph(assertGraphSafe(graph, { inputs }), CATS, { inputs });
+  assert.equal(baseline.items.length, 1);
+  assert.equal(baseline.unpriced.length, 0);
+  assert.match(g.text, /not the full editor inventory/);
   // all kinds, sorted by their smallest unit price (image $0.008, video $0.35, chat $0.1+$0.3, chat $1.25+$2.25)
   assert.deepEqual(g.structured.models.map((m) => m.id), [
     "blackforestlabs/flux-3/klein/text-to-image", "kling-v26-pro", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-uncensored"]);
@@ -276,4 +282,27 @@ test("authoringGuide: kind, search and limit filters", () => {
   const long = { video: [{ id: "v", pricing: { note: "x".repeat(300), per_second: 0.1 } }] };
   assert.ok(authoringGuide({ catalogs: long }).structured.models[0].unitPrice.length <= 120);
   assert.deepEqual(authoringGuide({}).structured.models, []);
+});
+
+
+test("authoringGuide: only priceable models for advertised hosted operations", () => {
+  const catalogs = {
+    image: [
+      { id: "still", capabilities: { image_generation: true, image_to_image: false }, pricing: { per_image: { square: 0.01 } } },
+      { id: "editor", architecture: { input_modalities: ["image"] }, capabilities: { image_generation: true, image_to_image: true }, pricing: { per_image: { square: 0.02 } } },
+      { id: "live-priced", capabilities: { image_to_image: true }, pricing: { per_image: { square: 0.01 }, note: "price set by a live quote" } },
+      { id: "unpriced", capabilities: { image_to_image: true }, pricing: { unknown_shape: 0.01 } },
+    ],
+    video: [
+      { id: "video-only-edit", capabilities: { video_generation: true, video_to_video: true, text_to_video: false, image_to_video: false }, pricing: { per_second: 0.1 } },
+      { id: "extend", architecture: { input_modalities: ["text", "video"] }, capabilities: { text_to_video: true }, pricing: { per_second: 0.1, input_video_per_second: 0.02 } },
+      { id: "video-from-text", capabilities: { text_to_video: true, image_to_video: false }, pricing: { per_second: 0.1 } },
+    ],
+  };
+  const selected = authoringGuide({ catalogs, nodeType: "edit" }).structured.models;
+  assert.deepEqual(selected.map(m => [m.id, m.nodeTypes]), [["editor", ["edit"]]]);
+  assert.deepEqual(authoringGuide({ catalogs, nodeType: "image" }).structured.models.map(m => m.id), ["still"]);
+  assert.deepEqual(authoringGuide({ catalogs, kind: "video" }).structured.models.map(m => [m.id, m.nodeTypes]),
+    [["video-from-text", ["tvideo"]]]);
+  assert.deepEqual(authoringGuide({ catalogs, formatOnly: true }).structured.models, []);
 });

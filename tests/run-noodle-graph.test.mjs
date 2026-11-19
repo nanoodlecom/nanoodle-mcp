@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadTools, editorShareUrl } from "../src/tools.mjs";
+import { loadTools, editorShareUrl, noodleGuide } from "../src/tools.mjs";
 import { createChargeGate } from "../src/gate.mjs";
 import { WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
 
@@ -102,6 +102,26 @@ test("noodle_guide lists the allowed node types, the wiring rules, an example an
   assert.deepEqual(g.models.map((m) => m.id), ["z-ai/glm-5.3-flash"]);
   assert.match(text(r), /price_noodle/);
   await assert.rejects(registry.callTool({ name: "noodle_guide", arguments: { kind: "nope" } }), (e) => e.mcpCode === -32602);
+});
+
+test("noodle_guide format-only reads no model catalog; node type fetches only its catalog", async () => {
+  const requests = [];
+  const fetch = async (url, options) => {
+    requests.push(url);
+    return mock.fetch(url, options);
+  };
+  const options = { fetch, baseUrl: "https://guide-fixture.example" };
+  const format = await noodleGuide({ format_only: true }, options);
+  assert.deepEqual(requests, []);
+  assert.deepEqual(format.structuredContent.models, []);
+  assert.ok(format.structuredContent.minimalExample.graph.links.length);
+  assert.match(text(format), /Models omitted by request/);
+  const chat = await noodleGuide({ node_type: "llm", limit: 1 }, options);
+  assert.deepEqual(requests, ["https://guide-fixture.example/api/v1/models?detailed=true"]);
+  assert.deepEqual(chat.structuredContent.models.map(m => m.nodeTypes), [["llm"]]);
+  await assert.rejects(noodleGuide({ node_type: "endpoint" }, options), (e) => e.mcpCode === -32602);
+  await assert.rejects(noodleGuide({ node_type: "llm", kind: "image" }, options), (e) => e.mcpCode === -32602);
+  await assert.rejects(noodleGuide({ format_only: "true" }, options), (e) => e.mcpCode === -32602);
 });
 
 test("every mode lists price_noodle and noodle_guide next to run_noodle; a graph file cannot take their names", async () => {
