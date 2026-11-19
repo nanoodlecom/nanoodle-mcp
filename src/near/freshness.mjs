@@ -22,13 +22,16 @@ export function nearBlockIdentity(block) {
   return { height, hash: h.hash };
 }
 
+export function nearBlockTime(block) {
+  const ns = block?.header?.timestamp_nanosec;
+  const ms = typeof ns === "string" && /^\d+$/.test(ns) ? Number(BigInt(ns) / 1_000_000n) : NaN;
+  if (!Number.isSafeInteger(ms)) throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC returned an invalid block timestamp");
+  return ms;
+}
+
 export function assertFreshBlock(block, options) {
   nearBlockIdentity(block);
-  const h = block.header;
-  if (typeof h.timestamp_nanosec !== "string" || !/^\d+$/.test(h.timestamp_nanosec)) {
-    throw new NearError("RPC_BAD_RESPONSE", "NEAR RPC returned an invalid finalized head");
-  }
-  return assertFreshTime(Number(BigInt(h.timestamp_nanosec) / 1_000_000n), options);
+  return assertFreshTime(nearBlockTime(block), options);
 }
 
 export function assertFreshStatus(status, options) {

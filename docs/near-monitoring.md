@@ -243,6 +243,9 @@ Coverage:
   If the watcher is still scanning historical blocks five minutes after the
   first observation, the same alert route reports delayed payment detection.
   The report distinguishes this from a failure to follow the live chain tip.
+  Historical blocks must match the requested hash, and recovery records a
+  decreasing height bound across restarts. An invalid predecessor leaves
+  coverage at the last verified block and marks the watcher unready.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
 - Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
   separate NEAR/USDC quote capacity. Fee calculations include the protocol's
