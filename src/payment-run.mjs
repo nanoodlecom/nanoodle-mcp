@@ -1,12 +1,15 @@
 /** Read-only browser subscription: payment → graph → result → refund.
  * Never calls a tool, requests a signature, or starts another paid execution.
  */
+import { isExpiredPayment } from "./near/payment-view.mjs";
+
 export function monitorPaymentRun({ initial, update, fetch: request = globalThis.fetch,
   EventSource: Events = globalThis.EventSource, pause = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const id = encodeURIComponent(initial.paymentId);
   let current = initial, result = null, reading = null, polling = false, stopped = false, watch;
   const final = state => ["settled", "failed", "rejected"].includes(state?.status);
-  const finished = () => ["unknown", "expired"].includes(current?.status) || final(current) && current.receipt?.refund?.status !== "pending" && result;
+  const finished = () => current?.status === "unknown" || isExpiredPayment(current)
+    || final(current) && current.receipt?.refund?.status !== "pending" && result;
   const stop = () => { stopped = true; watch?.close(); };
   async function apply(state) {
     if (stopped) return;

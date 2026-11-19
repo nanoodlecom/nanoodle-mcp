@@ -15,9 +15,10 @@
  *                                                  └── run failed / found "running" after a restart ──> declining (failed)
  *                                                                                    request changes ──> reworking ──> submitting
  *
- * - The paid workflow runs only after `start` answered 200, and only from the
- *   "started" phase. "running" is written (fsync) before the first NanoGPT
- *   call. A record found in "running" when the worker starts was interrupted:
+ * - The paid workflow runs only after `start` answered 200 and a fresh read
+ *   confirms the assignment is still active and funded. "running" is written
+ *   (fsync) before the first NanoGPT call. A record found in "running" when
+ *   the worker starts was interrupted:
  *   it is handed back with a full buyer refund (decline, reason "failed"), and
  *   never run again.
  * - `start` is idempotent on the market, so an uncertain start is retried.
@@ -41,6 +42,8 @@ import { join } from "node:path";
 import { splitPlainBrief, resolveFields, parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
 import { marketEscrowTerms } from "./catalog.mjs";
+import { marketDeliveryWindow } from "./deadline.mjs";
+import { marketCreatorPayoutTerms, sameCreatorPayout } from "../creator-payout-evidence.mjs";
 import {
   pricingSummary, buildDeliverable, textOutputsFile, briefDeclineDetail, refusalDeclineDetail, failureDeclineDetail, customNotOfferedDetail,
   startedMessage, REWORK_MESSAGE, MAX_INLINE_TEXT_BYTES, MAX_DELIVERABLE_BYTES, MAX_LISTED_FILES,
@@ -139,6 +142,22 @@ export function createMarketWorker({
     if (!terms.code) return { terms };
     if (terms.code === "MARKET_ESCROW_UNAVAILABLE") return { stop: backoff(rec, new Error("Market assignment escrow could not be verified")) };
     return { stop: declineEscrow(rec, reason, terms.code) };
+  }
+  function finishGone(rec, reason) {
+    prepared.delete(rec.id);
+    log(`assignment ${short(rec.id)}: skipping workflow (${reason}); nothing was run`);
+    return set(rec.id, ok({ phase: "gone", finishedAt: now() }));
+  }
+  function deadlineRefusal(rec, timing) {
+    const at = now();
+    if (!timing || timing.hiredAt > at + 30_000) return backoff(rec, new Error("Market assignment delivery deadline could not be verified"));
+    if (at < timing.executionDeadlineAt) return null;
+    const expired = at >= timing.deadline;
+    const reason = expired ? "The assignment's delivery deadline passed before inference could start."
+      : "Too little time remained to run the workflow and submit its result.";
+    return set(rec.id, ok({ phase: "declining", decline: { reason: "failed",
+      code: expired ? "MARKET_SLA_EXPIRED" : "MARKET_SLA_TOO_CLOSE",
+      detail: `${reason} No model was run. Your payment will be refunded in full.` } }));
   }
   async function feeRefusal(rec, reason) {
     if (!checkFee) return null;
@@ -270,7 +289,10 @@ export function createMarketWorker({
     const { terms, stop } = checkEscrow(rec, row, "rejected");
     if (stop) return stop;
     if (rec.pricing?.depositUsd > terms.budgetUsd) return declineEscrow(rec, "rejected", "MARKET_ESCROW_TOO_LOW");
+    const timing = marketDeliveryWindow(row?.assignment);
+    const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
     const refused = await feeRefusal(rec, "rejected"); if (refused) return refused;
+    const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
     try {
       const r = await client.start(rec.id);
       return set(rec.id, ok({ phase: "started", startedAt: (r && r.startedAt) || new Date(now()).toISOString() }));
@@ -286,10 +308,21 @@ export function createMarketWorker({
     }
   }
 
-  async function phaseStarted(rec, row) {
+  async function phaseStarted(rec) {
+    // Start is idempotent and its response only carries a timestamp. Read back
+    // the assignment to catch cancellation or changed funding after the poll.
+    const row = await lookup(rec.id);
+    const assignment = row?.assignment;
+    if (!assignment?.status) return backoff(rec, new Error("Market assignment status could not be verified"));
+    if (assignment.status !== "in_progress") return finishGone(rec, assignment.status);
+    if (assignment.submittedAt || assignment.deliverableUrl) return finishGone(rec, "already delivered");
+    if (!Number.isFinite(Date.parse(assignment.startedAt))) {
+      return backoff(rec, new Error("Market assignment start could not be verified"));
+    }
+    const timing = marketDeliveryWindow(assignment);
+    const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
     const { terms, stop } = checkEscrow(rec, row, "failed");
     if (stop) return stop;
-    const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
     const jobBudget = Math.min(budgetOf(rec), terms.budgetUsd);
     let prep = prepared.get(rec.id);
     if (!prep) {
@@ -301,19 +334,23 @@ export function createMarketWorker({
       prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
     }
     if (prep.pricing.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
-    prepared.delete(rec.id);
+    const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
+    const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
     await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null, fields: prep.usedDefault ? prep.usedFields || [] : [], notes: prep.usedDefault ? prep.fieldNotes || [] : [] }), `nanoodle-start-${rec.id}`);
+    await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
+    const afterProgress = deadlineRefusal(rec, timing); if (afterProgress) return afterProgress;
+    prepared.delete(rec.id);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),
+      executionDeadlineAt: timing.executionDeadlineAt,
       budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd,
       ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), jobBudget) } }),
     }));
-    await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
     try {
       run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
-        fundingId: `market:${rec.id}`, creator: !!rec.creator,
+        fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt: timing.executionDeadlineAt,
         onRunComplete(result) {
           if (!rec.creator || !creatorPayments) return;
           const empty = result.outputs.length > 0 && result.outputs.every(o => o.kind === "text" && !String(o.text || "").trim());
@@ -483,7 +520,7 @@ export function createMarketWorker({
         case "new": rec = await phaseNew(rec, row); break;
         case "declining": rec = await phaseDeclining(rec); break;
         case "starting": rec = await phaseStarting(rec, row); break;
-        case "started": rec = await phaseStarted(rec, row); break;
+        case "started": rec = await phaseStarted(rec); break;
         case "running": rec = phaseInterrupted(rec); break;
         case "delivering": rec = await phaseDelivering(rec); break;
         case "submitting": rec = await phaseSubmitting(rec); break;
@@ -585,8 +622,7 @@ export function createMarketWorker({
         let found;
         try { found = await lookup(rec.id); } catch (e) { backoff(rec, e); continue; }
         if (found && found.assignment.status === "in_progress") { launch(rec.id, found); continue; }
-        log(`assignment ${short(rec.id)}: no longer in progress (${found ? found.assignment.status : "not listed"}); nothing was run`);
-        store.update(rec.id, ok({ phase: "gone", finishedAt: now() }));
+        finishGone(rec, found?.assignment.status ?? "not listed");
         continue;
       }
       launch(rec.id, row);
@@ -594,8 +630,15 @@ export function createMarketWorker({
     for (const rec of store.all()) {
       try { await reconcileCreator(rec); } catch { log(`assignment ${short(rec.id)}: creator settlement is pending; will retry`); }
     }
-    try { store.prune(now() - retainMs, (r) => ["declined", "gone", "ignored", "submitted"].includes(r.phase)
-      && (!r.creator || ["queued", "none", "cancelled"].includes(r.creator.status))); } catch { /* next time */ }
+    try {
+      const payouts = new Map((creatorPayments?.payoutRecords?.() ?? []).map(p => [p.paymentId, p]));
+      store.prune(now() - retainMs, r => {
+        if (!["declined", "gone", "ignored", "submitted"].includes(r.phase)) return false;
+        const payout = payouts.get(`market_${r.id}`), expected = marketCreatorPayoutTerms(r);
+        if (expected) return r.creator.status === "queued" && payout && !payout.reconciliationRequired && sameCreatorPayout(expected, payout);
+        return !payout && (!r.creator || ["none", "cancelled"].includes(r.creator.status));
+      });
+    } catch { /* next time */ }
   }
 
   /** Wait for every assignment being advanced right now. */

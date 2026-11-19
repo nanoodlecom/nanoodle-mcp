@@ -90,14 +90,13 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
   // Called only inside `serial`, before signing/publishing a provider invoice.
   function authorize(scope, invoice, balanceRaw) {
     const amount = raw(invoice?.amountRaw, true);
-    if (scope) open(scope);
-    else if (requireScope) throw new FundingError("FUNDING_REQUIRED", "Provider payment requires an approved run budget");
-    const available = raw(balanceRaw);
-    const liability = obligations(), reserved = held();
-    if (available < liability + reserved + (scope ? 0n : amount)) {
-      throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot pay this invoice after reservations and obligations");
-    }
-    if (!scope) return;
+    const checkBalance = (balance, drawn = 0n) => {
+      if (raw(balance) < requiredForPayment(scope, amount) + drawn) {
+        throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot pay this invoice after reservations and obligations");
+      }
+    };
+    checkBalance(balanceRaw);
+    if (!scope) return checkBalance;
     const invoiceUsd = usd(invoice.amountUsd, true);
     if (typeof invoice.paymentId !== "string" || !invoice.paymentId || invoice.paymentId.length > 256) {
       throw new FundingError("FUNDING_INVALID", "Provider invoice needs a payment identity");
@@ -111,6 +110,9 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     scope.invoices.add(invoice.paymentId);
     scope.drawnUsd += invoiceUsd;
     scope.drawnRaw += amount;
+    // The draw is no longer in held() but remains in the account until its
+    // block publishes. Check it alongside fresh liabilities on every attempt.
+    return balance => checkBalance(balance, amount);
   }
 
   function requiredForPayment(scope, amountRaw) {
@@ -127,15 +129,19 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
   // `liabilityRaw` is supplied by the trusted ledger owners only, never by
   // workflow JSON. Refund/payout callers record that debt before calling us.
   function authorizeTransfer(terms, balanceRaw) {
-    if (raw(balanceRaw) < requiredForTransfer(terms)) {
-      throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot send after reservations and obligations");
-    }
+    const checkBalance = balance => {
+      if (raw(balance) < requiredForTransfer(terms)) {
+        throw new FundingError("FUNDING_INSUFFICIENT", "Shared Nano pool cannot send after reservations and obligations");
+      }
+    };
+    checkBalance(balanceRaw);
     const scope = active.get(terms.fundingRunId);
     if (scope) {
       const claim = raw(terms.liabilityRaw ?? 0n);
       const remaining = scope.overheadRaw - scope.overheadDrawnRaw;
       scope.overheadDrawnRaw += claim < remaining ? claim : remaining;
     }
+    return checkBalance;
   }
 
   return {

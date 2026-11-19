@@ -384,7 +384,7 @@ export const XNO_PROBE = Object.freeze({ raw: "10000000000000000000000000000", u
 const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 /**
- * NanoGPT stand-in: public catalogs, chat and image generation. The LLM call
+ * NanoGPT stand-in: public catalogs, chat, image generation, and scripted decisions. The LLM call
  * reports $0.00041 and the image $0.009, so the worked example's actual model
  * cost is $0.00941. A prompt containing "FAIL" gets a 400 (the run fails); one
  * containing "HOLD" never answers (a run in flight when the server dies).
@@ -392,7 +392,7 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
-export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CATALOGS, walletPayments = false, walletPaymentSeen = null } = {}) {
+export function nanoGptMock({ beforeChat = async () => {}, decisionAnswer, catalogs = WORKED_CATALOGS, walletPayments = false, walletPaymentSeen = null } = {}) {
   let chatRuns = 0;
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
@@ -410,17 +410,18 @@ export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CAT
       invoice.response ||= handle(invoice.method, invoice.path, invoice.body, {});
       return invoice.response;
     }
-    if (walletPayments && method === "POST" && ["/api/v1/chat/completions", "/v1/images/generations"].includes(p)) {
+    const decision = method === "POST" && p === "/api/v1/decisions" && typeof decisionAnswer === "function";
+    if (walletPayments && method === "POST" && (decision || ["/api/v1/chat/completions", "/v1/images/generations"].includes(p))) {
       if (headers.authorization || headers["x-api-key"]) throw new Error("wallet fixture received an unexpected API key");
       if (String(headers["x-x402"] || "") === "true") {
         const paymentId = `fixture-invoice-${++invoiceSequence}`;
-        const chat = p.includes("chat/completions");
-        const amountRaw = chat ? "820000000000000000000000000" : "18000000000000000000000000000";
+        const text = decision || p.includes("chat/completions");
+        const amountRaw = text ? "820000000000000000000000000" : "18000000000000000000000000000";
         invoices.set(paymentId, { paymentId, amountRaw, method, path, body, paid: false, response: null });
         return json(402, { accepts: [{ scheme: "nano", paymentId,
           payTo: "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet",
           maxAmountRequired: amountRaw,
-          maxAmountRequiredUSD: chat ? "0.00041" : "0.009" }] });
+          maxAmountRequiredUSD: text ? "0.00041" : "0.009" }] });
       }
     }
     if (method === "POST" && p === "/api/v1/chat/completions" && String(headers["x-x402"] || "") === "true") {
@@ -428,6 +429,7 @@ export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CAT
       return json(402, { accepts: [{ scheme: "nano", maxAmountRequired: probe.raw, maxAmountRequiredUSD: probe.usd }] });
     }
     if (method === "GET" && p === "/api/v1/models?detailed=true") return json(200, { data: catalogs.chat });
+    if (method === "GET" && p === "/api/v1/decision-models") return json(200, { data: catalogs.decision || [] });
     if (method === "GET" && p === "/api/v1/image-models") return json(200, { data: catalogs.image });
     if (method === "GET" && /^\/api\/v1\/(video|audio|3d)-models$/.test(p)) return json(200, { data: catalogs[p.includes("3d") ? "model3d" : p.includes("video") ? "video" : "audio"] || [] });
     if (method === "POST" && p === "/api/v1/chat/completions") {
@@ -441,6 +443,9 @@ export function nanoGptMock({ beforeChat = async () => {}, catalogs = WORKED_CAT
       return json(200, { choices: [{ message: { content: REPLY } }], x_nanogpt_pricing: { costUsd: 0.00041 } });
     }
     if (method === "POST" && p === "/v1/images/generations") return json(200, { data: [{ b64_json: PNG_B64 }], cost: 0.009 });
+    if (decision) return json(200, {
+      answers: { answer: { type: "noul", noul: decisionAnswer(body) } }, usage: { cost: 0.00041 },
+    });
     return json(404, { error: `stub: no route for ${method} ${p}` });
   }
   return {

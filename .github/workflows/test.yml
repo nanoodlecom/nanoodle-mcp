@@ -9,6 +9,57 @@ on:
   pull_request:
 
 jobs:
+  # Only a tested version change on main creates a GitHub source release.
+  qualify-github-source:
+    name: Qualify GitHub source release
+    if: github.event_name == 'pull_request' || (github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main')
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.qualify.outputs.source_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.1'
+      - name: Compare the packaged version with the prior main commit
+        id: qualify
+        env:
+          BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+        run: |
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/source-pack.json"
+          node .github/scripts/publish_source.mjs qualify "$RUNNER_TEMP/source-pack.json" >> "$GITHUB_OUTPUT"
+
+  publish-github-source:
+    name: Publish tested GitHub source release
+    if: ${{ github.repository == 'nanoodlecom/nanoodle-mcp' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.qualify-github-source.outputs.version != '' }}
+    needs: qualify-github-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: github-source-${{ needs.qualify-github-source.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.1'
+      - name: Tag and release the tested source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_VERSION: ${{ needs.qualify-github-source.outputs.version }}
+        run: node .github/scripts/publish_source.mjs publish "$SOURCE_VERSION"
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10

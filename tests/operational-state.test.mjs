@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
@@ -8,10 +8,28 @@ const balances = liabilities => ({ liabilities, nanoBalanceRaw: (10n ** 31n).toS
   storageUsage: 500, usdcBalanceAtomic: "1000000000", xnoUsd: "1", providerReserveUsd: "2",
   costs: { storagePriceYocto: 10_000_000_000_000_000_000n, nativeRefundFeeYocto: 200_000_000_000_000_000_000n, tokenRefundFeeYocto: 6_000_000_000_000_000_000_001n } });
 
+test("the monitor recognizes overdue Nano recovery windows without making an unknown late refund spendable", () => {
+  const s = snapshots(), expiresAt = NOW - 3_600_001;
+  s.nano.historyScan = { through: null, coveredAt: expiresAt, backfill: {
+    newest: "A".repeat(64), next: "B".repeat(64), startedAt: NOW - 900_001, fullReceivableWindow: false,
+  } };
+  s.nano.quotes.push(
+    { id: "old", status: "expired", amountRaw: "10", expiresAt, historyUnproven: true },
+    { id: "late", status: "expired", amountRaw: "200", expiresAt, paidAt: expiresAt + 1, payHash: "C".repeat(64) },
+  );
+  const result = paymentLiabilities(s, { now: NOW });
+  assert.equal(result.nanoRaw, 200n);
+  assert.deepEqual(result.issues, ["nano-history-backfill-delayed", "nano-history-payment-unproven", "nano-late-refund-intent-unknown", "nano-quote-history-overdue"]);
+  s.nano.historyScan = { through: "A".repeat(64), coveredAt: NOW, backfill: null };
+  s.nano.quotes[0].historyUnproven = false;
+  s.nano.owed.push({ event: "refund", amountRaw: "200", journaled: true, createdAt: NOW, fields: { paymentId: "late" } });
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+});
+
 test("all unsettled currencies and creator payouts are reserved without double-counting settlement intents", () => {
   const s = snapshots();
   s.nano.quotes.push({ id: "nano1", status: "paid", amountRaw: "10" }, { id: "nano2", status: "paid", settled: true, amountRaw: "999" });
-  s.nano.owed.push({ amountRaw: "20", tries: 0 });
+  s.nano.owed.push({ amountRaw: "20", journaled: true, tries: 0 });
   s.near.quotes.q1 = { id: "q1", status: "settled", settlement: { refundYocto: "100", authorPayout: { amountRaw: "200" } } };
   s.near.refunds.r1 = { paymentId: "q1", amountYocto: "100", status: "signed" };
   s.near.payouts.q1 = { paymentId: "q1", amountRaw: "200", status: "signed" };
@@ -34,17 +52,49 @@ test("a crash before refund/payout intent creation cannot erase those liabilitie
   const done = paymentLiabilities(s); assert.equal(done.nanoRaw, 0n); assert.equal(done.usdcAtomic, 0n); assert.deepEqual(done.issues, []);
 });
 
+test("the paid workflow funding check keeps creator overhead and the last unit of USDC deposit dust", () => {
+  const raw = 10n ** 30n;
+  const paid = { id: "authored", status: "paid", asset: "usdc", author: "nano_author",
+    depositUsd: "0.6", paidYocto: "600001", rate: { xnoUsd: "0.2", usdNano: "1000000000", yocto: "1000000" } };
+  const total = paidNearRunFundingRaw({ paid, reserved: { ...paid, status: "running" }, unpaid: { ...paid, status: "pending" },
+    completed: { ...paid, fundingOutcomeReady: true } });
+  const modelCap = 5n * raw / 2n;
+  const creatorCap = (600001n * raw + 1199999n) / 1200000n;
+  assert.equal(total, modelCap + creatorCap);
+  assert.throws(() => paidNearRunFundingRaw({ paid: { ...paid, paidYocto: "0" } }), /invalid-paid-near-amount/);
+});
+
 test("stuck work, permanently failed refunds and long-pending creator payouts remain visible and reserved", () => {
   const s = snapshots();
   s.nano.quotes.push({ id: "nano1", status: "paid", amountRaw: "10", paidAt: 1 });
-  s.nano.owed.push({ amountRaw: "20", tries: 5, at: NOW + 60_000 });
+  s.nano.owed.push({ amountRaw: "20", journaled: true, tries: 5, at: NOW + 60_000 });
   s.near.quotes.q = { status: "running", paidYocto: "30", paidAtBlockMs: 1 };
   s.near.refunds.r = { amountYocto: "40", status: "failed_permanent" };
-  s.near.payouts.p = { amountRaw: "50", status: "signed", createdAt: 1 };
+  s.near.payouts.p = { paymentId: "p", amountRaw: "50", status: "signed", createdAt: 1 };
   s.market.push({ v: 1, assignments: { a: { phase: "stuck" }, b: { phase: "delivering", updatedAt: 1 } } });
   const l = paymentLiabilities(s, { now: NOW });
   assert.equal(l.nanoRaw, 80n); assert.equal(l.nearYocto, 70n);
   assert.deepEqual(l.issues, ["creator-payout-stuck", "market-assignment-stuck", "market-work-stuck", "nano-paid-work-stuck", "nano-settlement-stuck", "near-paid-work-stuck", "near-refund-failed"]);
+});
+
+test("the Nano debt alert uses the original age when the next retry is in the future", () => {
+  const s = snapshots();
+  const debt = { amountRaw: "20", journaled: true, createdAt: NOW - 900_001, nextAttemptAt: NOW + 60_000, tries: 1 };
+  s.nano.owed.push(debt);
+  let result = paymentLiabilities(s, { now: NOW });
+  assert.deepEqual(result.issues, ["nano-settlement-stuck"]);
+  assert.equal(result.nanoRaw, 20n);
+  debt.createdAt++;
+  result = paymentLiabilities(s, { now: NOW });
+  assert.deepEqual(result.issues, []);
+});
+
+test("the read-only monitor flags and reserves a legacy Nano debt from its first observation", () => {
+  const s = snapshots();
+  s.nano.owed.push({ event: "change", amountRaw: "37", createdAt: NOW, tries: 0 });
+  const result = paymentLiabilities(s, { now: NOW });
+  assert.deepEqual(result.issues, ["nano-settlement-legacy-unverified"]);
+  assert.equal(result.nanoRaw, 37n);
 });
 
 test("deferred Market income is not spendable and concurrent accepted work reserves the shared pool", () => {

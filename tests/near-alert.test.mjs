@@ -70,16 +70,46 @@ test("Market failures use their own report and reach Ember through the existing 
 test("operational incidents deduplicate across timer invocations and disclose only selected safe issue codes", async () => {
   const config = setup(), requests = [];
   config.operationalReportFile = join(config.stateDir, "operational.json");
-  writeFileSync(config.operationalReportFile, JSON.stringify({ ok: false, checkedAt: new Date().toISOString(), stage: "nano-liquidity", incidentId: "c".repeat(32),
-    checks: [{ stage: "nano-liquidity", ok: false, code: "insufficient", token: "PRIVATE_CREDENTIAL", message: "PRIVATE_CUSTOMER_TEXT" }] }));
+  const report = { v: 1, ok: false, checkedAt: new Date().toISOString(), stage: "nano-liquidity", incidentId: "c".repeat(32),
+    admission: { nano: false, near: true, usdc: true, market: false },
+    checks: [{ stage: "nano-liquidity", ok: false, code: "insufficient", token: "PRIVATE_CREDENTIAL", message: "PRIVATE_CUSTOMER_TEXT" }] };
+  writeFileSync(config.operationalReportFile, JSON.stringify({ ...report, invocationId: invocation.MONITOR_INVOCATION_ID }));
   const call = async (name, args) => { requests.push(args); return { message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } }; };
   const first = await deliverAlerts(config, { env: { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT }, call });
-  const second = await deliverAlerts(config, { env: { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT, MONITOR_INVOCATION_ID: "d".repeat(32) }, call });
+  const next = { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT, MONITOR_INVOCATION_ID: "d".repeat(32) };
+  writeFileSync(config.operationalReportFile, JSON.stringify({ ...report, invocationId: next.MONITOR_INVOCATION_ID }));
+  const second = await deliverAlerts(config, { env: next, call });
   assert.equal(first.messageId, second.messageId); assert.equal(requests.length, 1);
   assert.match(requests[0].text, /every five minutes/); assert.match(requests[0].text, /nano-liquidity=insufficient/);
+  assert.match(requests[0].text, /admission checks failed for Nano, Market/);
   assert.doesNotMatch(requests[0].text, /PRIVATE_|token|CUSTOMER/);
   const drill = failureEvent({ ...invocation, MONITOR_UNIT: OPERATIONAL_TEST_UNIT }, { checks: "malformed" });
   assert.match(drill.text, /TEST ALERT.*operational readiness/); assert.match(drill.text, /not a production outage/);
+});
+
+test("a peer advisory cannot stand in for an operational monitor crash or missing report", () => {
+  const now = Date.now();
+  const env = { ...invocation, MONITOR_UNIT: OPERATIONAL_UNIT };
+  const report = { v: 1, ok: false, checkedAt: new Date(now).toISOString(), stage: "nano-node-1",
+    invocationId: env.MONITOR_INVOCATION_ID, incidentId: "c".repeat(32), admission: { nano: true, near: true, usdc: true, market: true },
+    checks: [{ stage: "nano-node-1", ok: false, code: "nano-rpc-rate-limited", domains: [] }] };
+  const advisory = failureEvent(env, report, now);
+  assert.match(advisory.text, /readiness advisory.*passed their admission checks/);
+  assert.match(advisory.text, /nano-node-1=nano-rpc-rate-limited/);
+  assert.doesNotMatch(advisory.text, /recovery/);
+  const next = { ...env, MONITOR_INVOCATION_ID: "b".repeat(32) };
+  for (const [current, stale] of [
+    [next, report],
+    [env, { ...report, invocationId: undefined }],
+    [{ ...env, MONITOR_SERVICE_RESULT: "timeout", MONITOR_EXIT_CODE: "killed", MONITOR_EXIT_STATUS: "TERM" }, report],
+    [env, { ...report, checkedAt: new Date(now - 3_600_000).toISOString() }],
+  ]) {
+    const failure = failureEvent(current, stale, now);
+    assert.notEqual(failure.messageId, advisory.messageId);
+    assert.match(failure.text, /readiness could not be verified/);
+    assert.match(failure.text, /Stage: service/);
+    assert.doesNotMatch(failure.text, /nano-node-1|readiness advisory|passed their admission/);
+  }
 });
 
 test("drafts and incorrect recipient responses remain pending, without bypassing bridge approval", async () => {

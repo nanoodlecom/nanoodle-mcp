@@ -14,7 +14,7 @@
  *                        with _payment_id is the RESULTS stream only.
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
  *                        flows, daily run write-ups, tool list w/ per-workflow editor links, self-hosting + author-payout story
- *   GET  /llms.txt       the same story as plain text, written for agents
+ *   GET  /llms.txt       endpoint discovery, written for agents
  *   GET  /version        { name, version, commit } — short git sha, so a deploy can be matched to main
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
@@ -39,7 +39,9 @@ import http from "node:http";
 import { MaintenanceError } from "./maintenance.mjs";
 import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
-import { nearAgentGuide } from "./near/agent-guide.mjs";
+import { creatorDiscovery, endpointDiscovery } from "./discovery.mjs";
+import { isExpiredPayment } from "./near/payment-view.mjs";
+import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_CONNECTOR, NANO_WORDMARK, NANO_SURFACE_CSS, NANO_PORT_CSS } from "./brand.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
 import { creatorPage, hostedWorkflowPage } from "./creator-site.mjs";
 import { constants, createReadStream, existsSync, readFileSync, statSync } from "node:fs";
@@ -52,7 +54,7 @@ import { fileURLToPath } from "node:url";
 import { qrModules } from "nanoodle";
 import { createDispatcher, gitShortSha } from "./server.mjs";
 import { renderCost } from "./tools.mjs";
-import { receiptsHtml, receiptsLines, RECEIPTS_CSS } from "./receipts.mjs";
+import { receiptsHtml, RECEIPTS_CSS } from "./receipts.mjs";
 import { workflowExample } from "./workflow-examples.mjs";
 import { MEDIA_EXTS } from "./sweep.mjs";
 
@@ -90,6 +92,17 @@ const ASSETS = {
   "/near-site.js": "text/javascript; charset=utf-8",
   "/creator-site.js": "text/javascript; charset=utf-8",
   "/near-wallet.LICENSE.txt": "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/tokens/tokens.css`]: "text/css; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/fonts.css`]: "text/css; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/righteous-latin.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/righteous-latin-ext.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/manrope-latin-variable.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/ibm-plex-mono-latin-400.woff2`]: "font/woff2",
+  [`${NANOODLE_BRAND}/fonts/Righteous-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/Manrope-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/fonts/IBM-Plex-Mono-OFL.txt`]: "text/plain; charset=utf-8",
+  [`${NANOODLE_BRAND}/assets/wordmark-gradient.svg`]: "image/svg+xml",
+  [`${NANOODLE_BRAND}/assets/connector.png`]: "image/png",
   [`${BRAND_BASE}/255labs-tokens.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-ui.css`]: "text/css; charset=utf-8",
   [`${BRAND_BASE}/255labs-lockup-paper.svg`]: "image/svg+xml",
@@ -142,8 +155,7 @@ const PAGE_CSS = `
 `;
 
 /*
- * The landing page commits to a dark look (the pay pages stay theme-following):
- * its job is a first impression, and the hero is one copyable command.
+ * Shared dark landing styles for the Nano and NEAR workflow cards and setup commands.
  */
 const LANDING_CSS = `
   /* Brand: nanoodle's own tokens (nanoodle.com :root) — same bg/panel/ink/line,
@@ -246,6 +258,43 @@ const LANDING_CSS = `
   .labs .ltag{font:.78rem/1 ui-monospace,monospace;color:var(--muted)}
   ${RECEIPTS_CSS}
 `;
+
+// Nano has its own presentation on top of the shared workflow card structure.
+const NANO_LANDING_CSS = `
+  h1{font-size:clamp(2.1rem,6.6vw,4rem);line-height:1.07;letter-spacing:-.025em}
+  h1 span{color:var(--accent-ink)}
+  h2{font-size:clamp(1.4rem,4vw,2rem)}
+  .eyebrow,.step .n,.flow,.chip,.tool .cost,.labs .ltag{font-family:var(--nano-font-mono)}
+  .top{align-items:center}
+  .top .brand img{width:26px;height:26px}
+  .top .brand .product-wordmark{width:108px;height:auto;border-radius:0}
+  .top .v{font-family:var(--nano-font-mono);font-size:.73rem}
+  .hero-links a,.tabs .tab,.connect button,.tool>button{min-height:var(--nano-control-height);border-radius:var(--nano-radius-control)}
+  .hero-links a,.tool>button{border-color:var(--nano-color-control-line)}
+  .connect,.card,.tool,.step,.flow{border-radius:var(--nano-radius-card)}
+  .hero-links a:first-child,.connect button{background:var(--accent);color:var(--nano-color-on-accent);font-weight:750}
+  .hero-links a:first-child:hover{filter:brightness(1.1)}
+  .tools{grid-template-columns:repeat(auto-fill,minmax(min(19rem,100%),1fr))}
+  .tool .links{white-space:normal}
+  .tool .sample summary{display:list-item;min-height:var(--nano-control-height);align-content:center}
+  @media(max-width:440px){.top nav{width:100%;gap:.85rem}.connect{gap:.55rem;padding:.7rem}.connect pre{font-size:.76rem}.connect button{padding-inline:.65rem}}
+`;
+
+const NANO_CHECKOUT_CSS = `
+  .pay-header{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem}
+  .pay-header a,.pay-brand{display:inline-flex;align-items:center;gap:.5rem}
+  .pay-header .product-wordmark,.pay-brand .product-wordmark{display:block;width:112px;height:auto}
+  .pay-header span{font:400 .8rem/1.5 var(--nano-font-mono);color:var(--muted)}
+  h1{font-size:clamp(1.5rem,5vw,2rem);line-height:1.2}
+  .card{border-radius:var(--nano-radius-card)}
+  button{min-height:var(--nano-control-height);border-radius:var(--nano-radius-control);border-color:var(--nano-color-control-line);background:var(--card2)}
+  button:hover{border-color:var(--accent)}
+  .qr{width:min(280px,100%)}
+  .qr svg{display:block;width:100%;height:auto}
+`;
+const nanoCheckoutPage = (title, body) => htmlPage(title,
+  `<header class="pay-header"><a href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a><span>Nano payment</span></header>${body}`,
+  PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS, NANO_BRAND_HEAD);
 
 const htmlPage = (title, body, css = PAGE_CSS, head = "") =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
@@ -351,7 +400,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     const page = nearSitePage({ version, publicBase, merchant, network, tools: templates, usdc, hosting, scriptUrl: scriptUrls["near-site.js"],
       cards: templates.map(t => cardHtml(t, nearWorkflowCopy[t.name], true).replace(/last run \$/g, "last model cost $")).join(""),
       notes: receiptsHtml({ toolNames: templates.map(t => t.name), compact: true }) });
-    return htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head);
+    return htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head);
   }
   const tagline = near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}` : charged ? "AI workflows, paid in Nano over x402" : "AI media workflows over MCP";
   const desc = near
@@ -359,10 +408,10 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     : charged
     ? "Give your agents new abilities with x402. Run or build AI workflows over MCP, pay per call in Nano, and earn as a workflow author. Open source."
     : "AI media workflows — image, video, audio, and text — behind one MCP endpoint. No account, no API key.";
-  const ogHead =
-    `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">` +
+  const isNanoodle = name === "nanoodle-mcp";
+  const ogHead = NANO_BRAND_HEAD +
     `<meta name="theme-color" content="#0b0d12">` +
-    `<link rel="preload" href="/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
+    `<link rel="preload" href="${NANOODLE_BRAND}/fonts/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
     `<meta name="description" content="${esc(desc)}">` +
     `<meta property="og:type" content="website">` +
     `<meta property="og:site_name" content="${esc(name)}">` +
@@ -378,13 +427,13 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">`;
   return htmlPage(name, `
     <header class="top">
-      <a class="brand" href="/"><img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span></a><span class="v">v${esc(version)}</span>
-      <nav><a href="https://nanoodle.com">editor</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">github</a><a href="/llms.txt">llms.txt</a></nav>
+      <a class="brand" href="/">${isNanoodle ? NANO_CONNECTOR + NANO_WORDMARK : `<img src="/favicon.png" alt=""><span class="bname">${esc(name)}</span>`}</a>${isNanoodle && charged ? '<span class="v">on Nano</span>' : ""}<span class="v">v${esc(version)}</span>
+      <nav aria-label="Product"><a href="https://nanoodle.com/">Editor</a><a href="https://nanoodle.com/guide/examples/">Examples</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source</a></nav>
     </header>
     <p class="eyebrow">${charged ? "Open source · MCP + x402 · Nano" : "public MCP server"}</p>
-    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents new abilities." : "AI media workflows over MCP."}</h1>
-    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect Nanoodle over MCP, then let your agent discover workflows and pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
-      ${charged || near ? "No account, no API key — paying is the whole handshake." : "No account, no API key."}
+    <h1>${near ? `AI workflows, paid in ${charged ? "Nano or NEAR" : "NEAR"}.` : charged ? "Give your agents <span>new abilities.</span>" : "AI media workflows over MCP."}</h1>
+    <p class="sub">${charged ? "Make images, video, music and 3D models. Connect over MCP to discover and run nanoodle workflows. Get a quote first, then pay per run in Nano with x402." : "Image, video, audio, and text pipelines behind one MCP endpoint."}
+      ${charged || near ? "You can connect without an account or an API key." : "No account, no API key."}
       Built with <a href="https://nanoodle.com">nanoodle</a>.</p>
     ${charged ? `<p class="hero-links"><a href="#connect">Connect your agent ↓</a><a href="https://nanoodle.com">Build a workflow ↗</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">View source ↗</a></p>` : ""}
     <div id="connect" class="connect-wrap">
@@ -407,8 +456,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
     </div>
     ${near && !charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>deposit quote</span><span class="arr">→</span><span>pay in your NEAR wallet</span><span class="arr">→</span><span>result + automatic NEAR change</span></div>` : ""}
     ${charged ? `<div class="flow"><span>agent calls tool</span><span class="arr">→</span><span>402 payment quote</span>
-      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>
-    <p class="tagline">No tab, no tip, no signup.</p>` : ""}
+      <span class="arr">→</span><span>wallet pays XNO · feeless · ~1s</span><span class="arr">→</span><span>result streams back</span></div>` : ""}
     ${receiptsHtml()}
     ${paymentNote ? `<div class="card"><h2>${charged ? "Or pay in NEAR" : "What a call costs"}</h2><p class="muted">${esc(paymentNote)}</p></div>` : ""}
     ${charged ? `<div class="card"><h2>What a call costs</h2>
@@ -470,7 +518,7 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
       <p class="muted">Add <code>--charge-usd 0.05 --public-url https://your-host</code> and a Nano wallet to
       charge per call — see the <a href="https://github.com/nanoodlecom/nanoodle-mcp#serve-mode--host-your-noodles-as-a-service---serve">README</a>.</p>
     </div>
-    <footer>agents: this page as plain text at <a href="/llms.txt">/llms.txt</a>
+    <footer><a href="/llms.txt">Agent instructions</a> · <a href="https://branding.nanoodle.com/">Brand guidelines</a>
       <div class="labs"><a href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" height="36" alt="255labs"></a><span class="ltag">Full signal. Zero noise. · 0xFF</span></div>
     </footer>
     <script>
@@ -492,121 +540,31 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
         });
       }
     </script>
-  `, LANDING_CSS, ogHead);
-}
-
-/** The landing page's story as plain text — the version an agent should read. */
-function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null, near = false, usdc = null, network = "mainnet" }) {
-  if (charged) { near = false; paymentNote = null; }
-  const authored = authorCount(toolInfo);
-  const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
-  const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
-  const lines = [
-    `# ${name} v${version}`,
-    ``,
-    near && !charged
-      ? `Public MCP server: AI workflows paid per call in ${usdc?.enabled ? "NEAR or Circle-issued USDC on NEAR" : "native NEAR"}, with automatic same-asset refunds — built with nanoodle (https://nanoodle.com).`
-      : charged
-      ? `Public MCP server: AI workflows (image, video, audio, text) paid per call in Nano over x402 — built with nanoodle (https://nanoodle.com).`
-      : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
-    ``,
-    `endpoint: ${publicBase}/mcp (MCP streamable HTTP — POST JSON-RPC, SSE progress on tools/call)`,
-    `connect (Claude): claude mcp add --transport http noodles ${publicBase}/mcp`,
-    `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
-    ``,
-  ];
-  if (near) {
-    lines.push(nearAgentGuide({ publicBase, usdc: !!usdc?.enabled, network }));
-    const custom = nearShowcase(tools, toolInfo).tools.find(t => t.graph);
-    if (custom) lines.push(`Featured ready-made template: ${custom.name}. GET ${publicBase}/examples/${custom.name}.json, then pass that JSON as graph to price_noodle and run_noodle, with inputs and your selected _pay_with. The template uses priced provider defaults.`, ``);
-  }
-  if (charged) {
-    lines.push(
-      `## Payment (x402, Nano/XNO)`,
-      ``,
-      `- No accounts, no API keys. On each PAYMENT REQUIRED quote (this call hangs up):`,
-      `  1. Show the user ONLY the payUrl (${publicBase}/pay/<id>).`,
-      `  2. IMMEDIATELY open the agent-only payment-monitor SSE at structuredContent.x402.watchUrl (${publicBase}/x402/watch/<id>) — never show that URL to the user. Wait until it CLOSES with status "paid", done:true, and next. (Or poll ${publicBase}/x402/status/<id>?wait=1.)`,
-      `  3. ONLY THEN tools/call again with _payment_id — that is the RESULTS stream. Do not open it while still watching for payment.`,
-      `- Paying is the consent; do not wait for a human "go". The quote carries payUrl, watchUrl, and a next imperative that says: on this payment link, show payUrl and open watchUrl now (blocking:false).`,
-      `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
-      `- The 20% is the author's cut, but only when the graph asks for it: a workflow carrying "x402": {"author": "nano_…"} is paid the markup on-chain, capped by what the deposit has left after cost. ` +
-        (authored === 0
-          ? `No workflow on this server carries that field, so the markup stays with the operator.`
-          : authored === tools.length
-          ? `Every workflow on this server carries that field.`
-          : `${authored} of the ${tools.length} workflows here carry it; on the rest the markup stays with the operator.`),
-      ``,
-    );
-  }
-  if (paymentNote) lines.push(charged ? `## Payment in NEAR` : `## Payment`, ``, paymentNote, ``);
-  lines.push(...receiptsLines(), ``);
-  lines.push(`## Tools`, ``);
-  for (const t of tools) {
-    lines.push(`- ${t.name}: ${t.description}`);
-    const info = infoByName.get(t.name);
-    if (info && info.rawText) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
-    const sample = infoByName.get(t.name)?.card?.sample;
-    if (sample) lines.push(
-      `  included sample (${sample.label}): ${sample.text.replace(/\s+/g, " ")}`,
-      `  example MCP call (uses saved inputs; requests paid generation): ${JSON.stringify(sampleCall(t.name))}`,
-    );
-    const example = workflowExample(t.name);
-    if (example) lines.push(
-      `  outcome example: ${example.title} — ${example.play}`,
-      ...(example.skill ? [`  agent skill: ${example.skill}`] : []),
-      `  ${example.description}`,
-    );
-  }
-  lines.push(
-    ``,
-    `## Privacy`,
-    ``,
-    `Relay this to anyone deciding whether to pay — every line is verifiable in the published source.`,
-    `- No accounts, no API keys, no sign-ins${charged ? " — paying is the only thing that authorizes a call" : ""}.`,
-    `- Prompts and inputs are never written to disk or logs.`,
-  );
-  if (charged) lines.push(`- The server keeps only a short hash binding a payment to its call, never the arguments themselves.`);
-  lines.push(
-    `- Input media is held in memory only, never stored.`,
-    `- Generated media auto-deletes after 24h (the --out-ttl default in serve mode), served at unguessable URLs until then.`,
-    `- Results are held in memory for delivery, not stored.`,
-    `- No analytics, trackers, IP logs, or access logs — the server keeps no request logs.`,
-  );
-  if (charged) lines.push(`- The only log is a payments ledger (usage.jsonl): money-lifecycle events that mirror the public Nano ledger — no run telemetry, no error text.`);
-  lines.push(
-    `- Caveat: generation runs on NanoGPT's API (https://nano-gpt.com), so prompt content in flight is governed by their privacy policy (https://nano-gpt.com/privacy).`,
-    ``,
-    `## Source`,
-    ``,
-    `MIT-licensed: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, executor https://github.com/nanoodlecom/nanoodle-js.`,
-    `The workflows this server exposes are not covered by that — each graph belongs to whoever wrote it and carries whatever licence they give it.`,
-    `One runtime dependency is GPL-3.0: nanocurrency (https://github.com/marvinroger/nanocurrency-js), which signs the Nano blocks for the optional x402 wallet. Details: https://github.com/nanoodlecom/nanoodle-mcp#licensing`,
-    `Self-host: npx nanoodle-mcp --graphs ./noodles --serve 8402`,
-    ``,
-  );
-  return lines.join("\n");
+  `, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + NANO_LANDING_CSS, ogHead);
 }
 
 function nearPayPageHtml(q) {
   const asset = q.asset === "USDC" ? "USDC" : "NEAR";
   const amount = q.amount ?? q.amountNear;
-  return htmlPage(`Pay in ${asset} · nanoodle`, `
-    <a class="pay-brand" href="/">nanoodle</a>
+  const canPay = q.status === "pending", canConfirm = canPay || q.status === "expired";
+  const title = canPay ? `Pay in ${asset}` : q.checkingPayment ? "Checking payment" : "Your workflow";
+  return htmlPage(`${title} · nanoodle`, `
+    <a class="pay-brand" href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a>
     <div id="near-payment" data-payment="${esc(JSON.stringify(q))}">
-      <h1 id="near-title">Pay in ${asset}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
-      <p id="near-status" role="status" aria-live="polite">Checking payment…</p>
-      <details class="card" id="near-deposit" open>
+      <h1 id="near-title">${title}</h1><p class="muted">${esc(q.tool)} · ${esc(q.network)}</p>
+      <p id="near-status" role="status" aria-live="polite">${q.checkingPayment ? esc(q.next) : "Checking payment…"}</p>
+      <details class="card" id="near-deposit"${canPay ? " open" : ""}>
         <summary>Maximum deposit <strong>${esc(amount)} ${asset}</strong></summary>
         <p>You pay the model cost + 20%. Unused ${asset} returns to the wallet that pays. A failed run refunds the whole deposit.</p>
         <p class="muted">Send on <strong>${esc(q.network)}</strong> to:</p><code>${esc(q.payTo)}</code>
         ${asset === "USDC" ? `<p class="muted">Circle-issued USDC · six decimals. Use the NEAR network. Network gas is paid separately.</p>` : ""}
-        <p><button id="near-pay" type="button">Connect wallet &amp; pay</button></p>
-        <p id="near-error" role="alert"></p>
+        <p><button id="near-pay" type="button"${canPay ? "" : " hidden disabled"}>Connect wallet &amp; pay</button></p>
       </details>
+      <p id="near-error" role="alert"></p>
       ${runViewHtml("pay")}
-      <details id="near-manual"><summary>Already paid with another wallet?</summary>
-        <p>Send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The server detects the payment automatically. You can also confirm its transaction here.</p>
+      <details id="near-manual"${canConfirm ? "" : " hidden"}><summary>Confirm a transfer you already sent</summary>
+        <p id="near-transfer-instructions"${canPay ? "" : " hidden"}>For manual payment, send exactly <code>${esc(amount)}</code> ${asset} ${asset === "USDC" ? `using <code>ft_transfer</code> on <code>${esc(q.tokenContract)}</code>` : "in one native transfer"}. The watcher can detect it automatically.</p>
+        <p>Enter the original transaction hash and the account that paid.</p>
         <form id="near-confirm">
           <p><label>Your paying account <input name="senderId" required autocomplete="off" placeholder="you.near"></label></p>
           <p><label>Transaction hash <input name="txHash" required autocomplete="off"></label></p>
@@ -615,29 +573,32 @@ function nearPayPageHtml(q) {
       </details>
       <p class="muted" id="near-note">Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment. Quote expires ${esc(q.expiresAt)}.</p>
     </div><script type="module" src="${scriptUrls["near-wallet.js"]}"></script>
-  `, PAGE_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--brand-font-sans),system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--brand-font-mono),monospace;margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;background:linear-gradient(105deg,#99a5ff,#e7a4d3);color:#0b0d12;font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:2px solid #d7ff3f;outline-offset:3px}`, `<link rel="stylesheet" href="${BRAND_BASE}/255labs-tokens.css">`);
+  `, PAGE_CSS + NANO_SURFACE_CSS + NANO_CHECKOUT_CSS + `${RUN_VIEW_CSS}[hidden]{display:none!important}.card>summary{cursor:pointer;font-size:.95rem}.card>summary strong{display:block;font-size:1.5rem;margin:.4rem 0}.run-view{margin-top:1.5rem}#near-status{color:#c3c9d6}.form-help{font-size:.8rem;color:var(--muted)}@font-face{font-family:Righteous;src:url(/righteous-latin.woff2) format("woff2");font-display:swap}:root{color-scheme:dark;--bg:#0b0d12;--fg:#eef1f7;--card:#12151d;--edge:#30394c;--muted:#c3c9d6;--ok:#a9dfb7}body{font-family:var(--nano-font-body);background:var(--bg);color:var(--fg);line-height:1.75}a{color:#a9b6ff}.pay-brand{font:1.6rem Righteous,system-ui,sans-serif;text-decoration:none}.pay-brand span{font:.8rem var(--nano-font-mono);margin-left:.5rem}#near-payment h1{font:2rem Righteous,system-ui,sans-serif;margin-top:1.5rem}.card h2{font-size:1.6rem}button{min-height:44px;border-radius:var(--nano-radius-control);background:var(--nano-color-accent);color:var(--nano-color-on-accent);font-weight:650}button:disabled{opacity:.5}input{min-height:44px;background:#0b0e16;color:#eef1f7;border:1px solid #626b83;border-radius:6px;padding:.5rem;width:100%;margin-top:.3rem}:focus-visible{outline:var(--nano-control-focus-width) solid var(--nano-color-accent-ink);outline-offset:3px}`, NANO_BRAND_HEAD);
 }
 
 function payPageHtml(q) {
   const statusUrl = `/x402/status/${encodeURIComponent(q.id)}?wait=1`;
   const watchUrl = `/x402/watch/${encodeURIComponent(q.id)}`;
-  return htmlPage(`Pay ${q.amountXno} XNO`, `
+  const canPay = q.status === "pending" && !q.checkingPayment;
+  return nanoCheckoutPage(`Pay ${q.amountXno} XNO`, `
     <div class="card center" id="paybox">
+      <div id="pay-instructions"${canPay ? "" : " hidden"}>
       <h1>Pay ${esc(q.amountXno)} XNO <span class="muted">(≈$${esc(q.usd.toFixed(q.usd < 0.01 ? 4 : 2))})</span></h1>
       <p class="muted">for one run of <code>${esc(q.tool)}</code> — scan with any Nano wallet</p>
-      <a class="qr" href="${esc(q.uri)}">${qrSvg(q.uri)}</a>
+      <a class="qr" href="${esc(q.uri)}" aria-label="Open this quote in your Nano wallet">${qrSvg(q.uri)}</a>
       <p><button onclick="navigator.clipboard.writeText('${esc(q.address)}')">copy address</button>
          <button onclick="navigator.clipboard.writeText('${esc(q.amountXno)}')">copy amount</button></p>
       <p class="muted">Send <strong>exactly ${esc(q.amountXno)} XNO</strong> — the exact amount identifies your payment.<br>
          Address: <code>${esc(q.address)}</code><br>Amount: <code>${esc(q.amountXno)}</code> XNO (<code>${esc(q.amountRaw)}</code> raw)</p>
-      <p class="muted" id="status">waiting for payment… settles in about a second</p>
-      <p class="muted" id="expiry"></p>
+      </div>
+      <p class="muted" id="status" role="status">${q.checkingHistory ? "Checking Nano payment history for this quote." : q.checkingPayment ? "Recording your Nano transfer. Keep this page open." : "Waiting for payment. Keep this page open while your transfer is confirmed."}</p>
+      <p class="muted" id="expiry"${canPay ? "" : " hidden"}></p>
     </div>
     <script>
       const EXP = Date.parse(${JSON.stringify(q.expiresAt)});
       function tickExpiry(){
         const el = document.getElementById("expiry");
-        if(!el) return; // paybox was replaced by the paid check
+        if(!el || el.hidden) return;
         const s = Math.max(0, Math.floor((EXP - Date.now())/1000));
         el.textContent = s > 0
           ? "quote expires in " + Math.floor(s/60) + ":" + String(s%60).padStart(2,"0")
@@ -648,8 +609,14 @@ function payPageHtml(q) {
     </script>
     <script>
       var done = false;
-      function apply(status){
+      function apply(status, checkingPayment, checkingHistory){
         if(done) return false;
+        if(checkingPayment){
+          document.getElementById("pay-instructions").hidden = true;
+          document.getElementById("expiry").hidden = true;
+          document.getElementById("status").textContent = checkingHistory ? "Checking Nano payment history for this quote." : "Recording your Nano transfer. Keep this page open.";
+          return false;
+        }
         if(status === "paid" || status === "consumed"){
           done = true;
           document.getElementById("paybox").innerHTML =
@@ -658,6 +625,7 @@ function payPageHtml(q) {
         }
         if(status === "expired" || status === "unknown"){
           done = true;
+          document.getElementById("pay-instructions").hidden = true;
           document.getElementById("status").textContent = "this quote expired — ask your agent for a fresh one";
           return true;
         }
@@ -675,7 +643,8 @@ function payPageHtml(q) {
         while(!done){
           try{
             const r = await fetch(${JSON.stringify(statusUrl)});
-            if(apply((await r.json()).status)) return;
+            const state = await r.json();
+            if(apply(state.status, state.checkingPayment, state.checkingHistory)) return;
           }catch{ await new Promise(function(r){ setTimeout(r, 1000); }); }
         }
       }
@@ -684,7 +653,7 @@ function payPageHtml(q) {
         var es;
         try{ es = new EventSource(${JSON.stringify(watchUrl)}); }catch(e){ return poll(); }
         es.addEventListener("status", function(ev){
-          try{ if(apply(JSON.parse(ev.data).status)){ es.close(); } }catch{}
+          try{ const state = JSON.parse(ev.data); if(apply(state.status, state.checkingPayment, state.checkingHistory)){ es.close(); } }catch{}
         });
         es.onerror = function(){ es.close(); if(!done) poll(); }; // stream dropped → poll
       }
@@ -745,8 +714,8 @@ export async function serveHttp({
 }) {
   if (maintenance !== null && typeof maintenance.run !== "function") throw new TypeError("maintenance must provide request admission and accounting");
   const sha = commit === undefined ? gitShortSha() : (commit || null);
-  // Each public page describes its own payment experience. Routing and stored
-  // payments still share the original backend, including compatibility calls.
+  // The marketing page emphasizes its default payment rail. Discovery below
+  // uses the actual endpoint registry, exactly as tools/list does.
   const publicTools = () => gate ? listTools().filter(t => !["run_noodle", "price_noodle", "noodle_guide"].includes(t.name)).map(t => ({
     ...t, description: toolInfo.find(info => info.name === t.name)?.description || t.description?.split(" It can also be paid in NEAR:")[0],
   })) : listTools();
@@ -942,12 +911,12 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (creators && (url.pathname === "/creators" || hosted)) {
-        if (hosted && hostedMatch[2] === "llms.txt") return send(200, `${hosted.name}\n${hosted.description}\nMCP endpoint: ${hosted.mcpUrl}\n${creators.instructions(hosted.id)}\n\n${JSON.stringify(creators.listTools(hosted.id), null, 2)}`, "text/plain; charset=utf-8");
+        if (hosted && hostedMatch[2] === "llms.txt") return send(200, creatorDiscovery(hosted, creators.listTools(hosted.id)), "text/plain; charset=utf-8");
         const opts = { version, publicBase, merchant: nearHealth?.merchant, network: nearHealth?.network, usdc,
           scriptUrl: scriptUrls["near-site.js"], creatorScriptUrl: scriptUrls["creator-site.js"] };
         const page = hosted ? hostedWorkflowPage(hosted, opts) : creatorPage(opts);
         res.setHeader("Cache-Control", "no-cache");
-        return send(200, htmlPage(page.title, page.body, LANDING_CSS + page.css, page.head), "text/html; charset=utf-8");
+        return send(200, htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head), "text/html; charset=utf-8");
       }
 
       if (url.pathname === "/") {
@@ -955,7 +924,11 @@ export async function serveHttp({
       }
 
       if (url.pathname === "/llms.txt") {
-        return send(200, llmsTxt({ name, version, listTools: publicTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate, usdc, network: nearHealth?.network }), "text/plain; charset=utf-8");
+        const tools = listTools();
+        const template = nearGate && !gate ? nearShowcase(tools, toolInfo).tools.find(t => t.graph)?.name : null;
+        const guide = endpointDiscovery({ name, tools, publicBase: publicBase || publicOrigin, charged: !!gate, toolInfo, near: !!nearGate,
+          usdc: !!usdc?.enabled, network: nearHealth?.network, creatorHosting: !!creators, template });
+        return send(200, guide, "text/plain; charset=utf-8");
       }
 
       if (url.pathname === "/rates" && rates) {
@@ -1017,7 +990,7 @@ export async function serveHttp({
       if (payMatch && (gate || nearGate)) {
         const id = decodeURIComponent(payMatch[1]);
         const q = id.startsWith("nq_") ? nearGate?.quote(id) : gate?.quote(id);
-        if (!q) return send(404, htmlPage("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
+        if (!q) return send(404, (id.startsWith("nq_") ? htmlPage : nanoCheckoutPage)("Not found", "<h1>Unknown or expired payment</h1><p class=\"muted\">Ask your agent for a fresh quote.</p>"), "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
         res.setHeader("X-Robots-Tag", "noindex, nofollow");
@@ -1051,7 +1024,9 @@ export async function serveHttp({
         if (statusMatch[1] === "near") return send(q ? 200 : 404, JSON.stringify(q || { status: "unknown", done: true, next: "Ask your agent for a fresh quote." }));
         // Terminal quotes carry done + next (agent instructions for the result stream).
         return send(200, JSON.stringify(q
-          ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.done ? { done: true, next: q.next } : {}) }
+          ? { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt, ...(q.checkingPayment && { checkingPayment: true }),
+            ...(q.checkingHistory && { checkingHistory: true }),
+            ...(q.done ? { done: true, next: q.next } : {}) }
           : { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." }));
       }
 
@@ -1061,17 +1036,19 @@ export async function serveHttp({
        * `next` imperative telling the agent how to open the result stream
        * (tools/call with _payment_id) — then the connection closes. Without that,
        * a subscriber sees bare "paid" and a loading gap with no path forward.
-       * The pay page only reads `.status` (extra fields are harmless). Rides the
-       * gate's shared waiter list; at the held-connection cap it 503s so the
-       * caller falls back to polling.
+       * An expired NEAR quote can still be checking finalized payments. Keep
+       * the stream open while checking, with the same quote and disabled pay UI.
+       * At the held-connection cap it 503s so callers can fall back to polling.
        */
       const watchMatch = url.pathname.match(/^\/(x402|near)\/watch\/([^/]+)$/);
       const watchGate = watchMatch?.[1] === "near" ? nearGate : gate;
       if (watchMatch && watchGate) {
-        const followRun = watchMatch[1] === "near" && url.searchParams.get("run") === "1";
-        const runDone = q => ["settled", "failed", "rejected", "expired", "unknown"].includes(q?.status) && q?.receipt?.refund?.status !== "pending";
+        const nearWatch = watchMatch[1] === "near";
+        const followRun = nearWatch && url.searchParams.get("run") === "1";
+        const runDone = q => (isExpiredPayment(q) || ["settled", "failed", "rejected", "unknown"].includes(q?.status))
+          && q?.receipt?.refund?.status !== "pending";
         const id = decodeURIComponent(watchMatch[2]);
-        if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: "too many open streams — poll /x402/status instead" }));
+        if (activeStreams >= maxStreams) return send(503, JSON.stringify({ error: `too many open streams — poll /${watchMatch[1]}/status instead` }));
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -1085,8 +1062,10 @@ export async function serveHttp({
         // done + next so the agent knows how to access the result stream after close.
         const frame = (q) => {
           if (!q) return { status: "unknown", done: true, next: "Unknown payment id — call the tool again without _payment_id for a fresh quote." };
-          if (watchMatch[1] === "near") return followRun ? { ...q, done: runDone(q) } : q;
+          if (nearWatch) return followRun ? { ...q, done: runDone(q) } : q;
           const f = { status: q.status, amountRaw: q.amountRaw, expiresAt: q.expiresAt };
+          if (q.checkingPayment) f.checkingPayment = true;
+          if (q.checkingHistory) f.checkingHistory = true;
           if (q.done) { f.done = true; if (q.next) f.next = q.next; }
           return f;
         };
@@ -1108,13 +1087,15 @@ export async function serveHttp({
           // the client leaves. Each wait resolves on the shared watcher firing
           // (paid/expired) or its own 25s ceiling — a re-poll that also lets a
           // dropped connection be noticed and cleaned up.
-          const deadline = followRun ? Date.now() + 20 * 60 * 1000 : watchMatch[1] === "near" ? Date.parse(q?.expiresAt) : Date.now() + 20 * 60 * 1000;
-          while (alive && q && (followRun ? !runDone(q) : q.status === "pending") && Date.now() < deadline) {
+          const watchFrom = nearWatch && !followRun ? Math.max(Date.now(), Date.parse(q?.expiresAt) || 0) : Date.now();
+          const deadline = watchFrom + 20 * 60 * 1000;
+          const waiting = q => followRun ? !runDone(q) : nearWatch ? !q.done : q.status === "pending";
+          while (alive && q && waiting(q) && Date.now() < deadline) {
             if (followRun) await watchGate.waitForUpdate(id, q.receipt ? 2000 : 25_000, { signal: stop.signal, previous: JSON.stringify(q) });
-            else await watchGate.waitForPayment(id, 25_000, { signal: stop.signal });
+            else await watchGate.waitForPayment(id, 25_000, { signal: stop.signal, ...(nearWatch && { previous: JSON.stringify(q) }) });
             if (!alive) break;
             q = watchGate.quote(id);
-            if (q) sse("status", frame(q));
+            sse("status", frame(q));
             // On settle the final frame already carried done+next; the loop exits
             // and finally{} closes the stream — that close IS the acknowledgment.
           }

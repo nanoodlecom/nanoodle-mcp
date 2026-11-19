@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { nearRefundClaims, nearRefundCosts, nearFundingNeed, readNearFunding, createNearFunding, NEAR_OPERATING_RESERVE } from "../src/near/funding.mjs";
 import { createNearRpc, openNearLedger, createRefunder, parseNearSecretKey, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { base58Encode } from "../src/near/base58.mjs";
+import { signTransfer } from "../src/near/tx.mjs";
 import { createFakeChain } from "./fixtures/near-fake-chain.mjs";
 import { nearProtocol } from "./fixtures/near-fees.mjs";
 
@@ -48,6 +49,80 @@ test("refund claims cover paid/running work, failed handoffs and pending quotes 
   assert.throws(() => nearRefundClaims({ quotes: [], refunds: null }));
 });
 
+test("NEAR and USDC refund evidence cannot release another asset or payer's reserve", () => {
+  const q = { id: "payment", status: "settled", payer: "payer.testnet", asset: "usdc", tokenContract: TOKEN,
+    refundId: "refund", settlement: { refundYocto: "70" } };
+  const original = { id: "refund", paymentId: q.id, status: "sent", asset: "usdc", tokenContract: TOKEN,
+    amountYocto: "70", to: q.payer };
+  const inspect = record => nearRefundClaims({ quotes: [q], refunds: [record] });
+  for (const patch of [{ asset: "near" }, { tokenContract: "wrong.testnet" }, { to: "other.testnet" }, { id: "wrong-refund" }]) {
+    const result = inspect({ ...original, ...patch });
+    assert.equal(result.usdcAtomic, 70n);
+    assert.equal(result.tokenRefunds, 1);
+    assert.deepEqual(result.issues, ["near-refund-evidence-mismatch"]);
+  }
+  const partial = inspect({ ...original, amountYocto: "20" });
+  assert.equal(partial.usdcAtomic, 50n);
+  assert.equal(partial.tokenRefunds, 1);
+  const wrongPending = inspect({ ...original, status: "signed", asset: "near" });
+  assert.equal(wrongPending.nearYocto, 70n);
+  assert.equal(wrongPending.usdcAtomic, 70n);
+  assert.equal(wrongPending.nativeRefunds, 1);
+  assert.equal(inspect(original).usdcAtomic, 0n);
+  assert.deepEqual(inspect(original).issues, []);
+  assert.deepEqual(nearRefundClaims({ quotes: [{ id: "dust", status: "rejected", paidYocto: "5", refundWaived: true }], refunds: [] }).issues, []);
+});
+
+test("a NEAR refund transaction shared across records cannot release either reserve", () => {
+  const shared = base58Encode(Buffer.alloc(32, 31));
+  const refunds = [
+    { id: "rf1", paymentId: "one", to: "payer.testnet", status: "sent", txHash: shared, amountYocto: "70" },
+    { id: "rf2", paymentId: "two", to: "payer.testnet", status: "sent", txHash: base58Encode(Buffer.alloc(32, 32)),
+      supersededTxHashes: [shared], asset: "usdc", tokenContract: TOKEN, amountYocto: "50" },
+    { id: "rf3", paymentId: "three", to: "payer.testnet", status: "sent", txHash: base58Encode(Buffer.alloc(32, 33)),
+      amountYocto: "18" },
+  ];
+  const quotes = refunds.slice(0, 2).map(r => ({ id: r.paymentId, refundId: r.id, status: "settled", payer: r.to,
+    asset: r.asset, tokenContract: r.tokenContract, settlement: { refundYocto: r.amountYocto } }));
+  for (const retained of [quotes, quotes.slice(0, 1), []]) {
+    const result = nearRefundClaims({ quotes: retained, refunds });
+    assert.equal(result.nearYocto, 70n);
+    assert.equal(result.usdcAtomic, 50n);
+    assert.equal(result.nativeRefunds, 1);
+    assert.equal(result.tokenRefunds, 1);
+    assert.deepEqual(result.issues, ["near-refund-duplicate-transaction"]);
+  }
+  refunds[1].supersededTxHashes = [refunds[1].txHash, refunds[1].txHash];
+  const unrelated = nearRefundClaims({ quotes, refunds });
+  assert.equal(unrelated.nearYocto + unrelated.usdcAtomic, 0n);
+  assert.deepEqual(unrelated.issues, []);
+});
+
+test("a sent refund whose signed terms disagree keeps its funds reserved in the live writer", async () => {
+  const w = world(), to = "payer.testnet", amount = 10n ** 24n;
+  const terms = { signer: SIGNER, signerId: MERCHANT, nonce: 101n, amountYocto: amount,
+    blockHash: base58Encode(Buffer.alloc(32, 44)) };
+  w.ledger.putRefund({ id: "rf_wire", paymentId: "pruned-job", status: "sent", to, amountYocto: amount.toString(), sentAt: 1,
+    ...signTransfer({ ...terms, receiverId: "wrong.testnet" }) });
+  w.setNear(w.storage + NEAR_OPERATING_RESERVE + w.costs.nativeRefundFeeYocto);
+  await assert.rejects(w.funding.run("near"), { code: "NEAR_FUNDING_INSUFFICIENT" });
+  w.ledger.updateRefund("rf_wire", signTransfer({ ...terms, receiverId: to }));
+  await w.funding.run("near");
+  assert.equal(w.chain.sendTxCount, 0);
+});
+
+test("unscanned quote windows count as potential refunds until coverage advances", () => {
+  const deadline = 1_000, now = deadline + 60_000;
+  const state = { quotes: [{ id: "old", status: "expired", asset: "usdc", expiresAt: deadline - 10 }], refunds: [],
+    meta: { paymentWatch: { coveredThroughMs: deadline } } };
+  const claims = () => nearRefundClaims(state, { now, unpaidRetainMs: 10 });
+  assert.equal(claims().usdcAtomic, 0n);
+  assert.equal(claims().tokenRefunds, 0);
+  assert.equal(claims().pendingTokenRefunds, 1);
+  state.meta.paymentWatch.coveredThroughMs++;
+  assert.equal(claims().pendingTokenRefunds, 0);
+});
+
 test("fee reserves include the gas-purchase floor, implicit-account creation and FT action/argument costs", () => {
   const protocol = nearProtocol({ floor: "10", feeGas: 100 });
   const costs = nearRefundCosts(protocol, "1");
@@ -65,6 +140,7 @@ test("read-only funding views bind account, authorized key and token balance to 
   const w = world();
   const frame = await readNearFunding({ ...w.options, tokenContract: TOKEN });
   assert.equal(frame.usdcAtomic, 1_000_000_000n); assert.equal(frame.balanceYocto, 10n ** 25n);
+  assert.equal(frame.usdcRegistered, true);
   const queries = w.chain.log.filter(row => row.method === "query");
   assert.ok(queries.every(row => row.params.block_id === queries[0].params.block_id && !row.params.finality));
   const gas = w.chain.log.find(row => row.method === "gas_price");
@@ -74,6 +150,51 @@ test("read-only funding views bind account, authorized key and token balance to 
     return params?.request_type === "view_account" ? { ...r, block_hash: "another-block" } : r;
   } };
   await assert.rejects(readNearFunding({ ...w.options, rpc: changed }), { code: "NEAR_FUNDING_INVALID" });
+  assert.equal(w.chain.sendTxCount, 0);
+});
+
+test("an unverifiable token balance or missing registration stops USDC quotes while native NEAR stays ready", async () => {
+  for (const failedView of ["ft_balance_of", "storage_balance_of"]) {
+    const w = world();
+    let failing = true;
+    const rpc = { ...w.rpc, call: async (method, params) => {
+      if (failing && params?.method_name === failedView) {
+        if (failedView === "ft_balance_of") throw Error("token view unavailable");
+        return { ...await w.rpc.call(method, params), result: [...Buffer.from("null")] };
+      }
+      return w.rpc.call(method, params);
+    } };
+    const funding = createNearFunding({ ...w.options, rpc });
+    const status = await funding.refresh();
+    assert.equal(status.ok, true);
+    assert.equal(status.canQuoteNear, true);
+    assert.equal(status.canQuoteUsdc, false);
+    assert.equal(status.usdcCode, "USDC_FUNDING_UNAVAILABLE");
+    await assert.rejects(funding.quote("usdc", () => assert.fail("unverified USDC quote committed")), { code: "NEAR_FUNDING_UNAVAILABLE" });
+    assert.equal(funding.status().canQuoteNear, true);
+    assert.equal(await funding.quote("near", () => "native quote"), "native quote");
+    failing = false;
+    assert.equal((await funding.refresh()).canQuoteUsdc, true);
+    assert.equal(await funding.quote("usdc", () => "token quote"), "token quote");
+    assert.equal(w.chain.sendTxCount, 0);
+  }
+});
+
+test("native proofs do not extend USDC proof validity and disabling quotes retains paid token obligations", async () => {
+  const w = world();
+  assert.equal((await w.funding.refresh()).canQuoteUsdc, true);
+  w.tick(60_001);
+  assert.equal(await w.funding.quote("near", () => "native quote"), "native quote");
+  assert.equal(w.funding.status().canQuoteNear, true);
+  assert.equal(w.funding.status().canQuoteUsdc, false);
+  assert.equal((await w.funding.refresh()).canQuoteUsdc, true);
+
+  const nativeOnly = createNearFunding({ ...w.options, usdcQuotesEnabled: false });
+  assert.equal((await nativeOnly.refresh()).canQuoteUsdc, false);
+  await assert.rejects(nativeOnly.quote("usdc", () => assert.fail("USDC is disabled")), { code: "NEAR_FUNDING_UNAVAILABLE" });
+  w.putQuote("prior-token-payment", { status: "paid", asset: "usdc", paidYocto: "17" });
+  await nativeOnly.run("usdc");
+  assert.equal(nativeOnly.status().canQuoteUsdc, false);
   assert.equal(w.chain.sendTxCount, 0);
 });
 

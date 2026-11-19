@@ -16,6 +16,7 @@ import { NearError } from "./errors.mjs";
 export const YOCTO_PER_NEAR = 10n ** 24n;
 /** 0.000001 NEAR: deposits are whole multiples of this, so they are typeable. */
 export const DUST_STEP_YOCTO = 10n ** 18n;
+export const QUOTE_DUST_SLOTS = 999;
 /** 0.00001 NEAR: refunds below this are not sent (gas would exceed them). */
 export const MIN_REFUND_YOCTO = 10n ** 19n;
 
@@ -96,11 +97,11 @@ export function depositYocto(depositUsd, rate, isTaken, randomInt = cryptoRandom
   const base = roundUpToStep(usdToYocto(depositUsd, rate, "ceil"), DUST_STEP_YOCTO);
   // Dust stays within 1-999 steps (at most 0.000999 NEAR), always.
   for (let tries = 0; tries < 200; tries++) {
-    const amount = base + BigInt(randomInt(1, 1000)) * DUST_STEP_YOCTO;
+    const amount = base + BigInt(randomInt(1, QUOTE_DUST_SLOTS + 1)) * DUST_STEP_YOCTO;
     if (!isTaken(amount)) return amount;
   }
-  for (let k = 1n; k < 1000n; k++) {
-    const amount = base + k * DUST_STEP_YOCTO;
+  for (let k = 1; k <= QUOTE_DUST_SLOTS; k++) {
+    const amount = base + BigInt(k) * DUST_STEP_YOCTO;
     if (!isTaken(amount)) return amount;
   }
   throw new NearError("NO_UNIQUE_AMOUNT", "every deposit amount at this price is held by an open quote; try again later");

@@ -35,6 +35,7 @@ const CATALOGS = {
     { id: "z-ai/glm-5.3-uncensored", pricing: { prompt: 1.25, completion: 2.25, currency: "USD", unit: "per_million_tokens" } },
     { id: "qwen/qwen3.5-omni-flash", pricing: { currency: "USD", unit: "per_million_tokens", note: "varies_by_modality" } },
   ],
+  decision: [{ id: "perplexity/pplx-decider-v1.2", pricing: { prompt: 0.02, completion: 0 } }],
   image: [
     { id: "blackforestlabs/flux-3/klein/text-to-image", pricing: { per_image: { "768x768": 0.008, "1024x1024": 0.009, "1536x1536": 0.011, "2048x2048": 0.014, "4096x4096": 0.036 }, currency: "USD" }, supported_parameters: { max_output_images: 4 } },
     { id: "blackforestlabs/flux-3/klein/edit-image", pricing: { per_image: { "768x768": 0.008, "1024x1024": 0.009, "1536x1536": 0.011, "2048x2048": 0.014, "4096x4096": 0.036 }, currency: "USD" }, supported_parameters: { max_output_images: 4 } },
@@ -165,7 +166,7 @@ test("reconciles: chat only, image only, video, audio chain, 3D, decide, and a m
     decide: { nodes: [
       { id: "i1", type: "image", fields: { model: "blackforestlabs/flux-3/klein/text-to-image", size: "1024x1024", prompt: "a" } },
       { id: "i2", type: "image", fields: { model: "blackforestlabs/flux-3/klein/text-to-image", size: "1024x1024", prompt: "b" } },
-      { id: "d", type: "decide", fields: { model: "z-ai/glm-5.3-flash", question: "Which is better?" } },
+      { id: "d", type: "decide", fields: { model: "perplexity/pplx-decider-v1.2", question: "Which is better?" } },
     ], links: [link("1", "i1", "image", "d", "img1"), link("2", "i2", "image", "d", "img2")] },
     mixed: { nodes: [
       { id: "t", type: "text", name: "Topic", fields: { text: "" } },
@@ -285,13 +286,13 @@ test("wired text is priced at its longest: tts fed by a join of two inputs, capp
 });
 
 test("decide is priced on the text it judges, not only its question", () => {
-  const chat = [{ id: "anthropic/claude-opus-4.1", context_length: 200000, pricing: { prompt: 15, completion: 75 } }];
+  const decision = [{ id: "anthropic/claude-opus-4.1", context_length: 200000, pricing: { prompt: 15, completion: 75 } }];
   const g = assertGraphSafe({ nodes: [
     { id: "t", type: "text", name: "Doc", fields: { text: "" } },
     { id: "d", type: "decide", fields: { model: "anthropic/claude-opus-4.1", mode: "yesno", question: "Is it good?" } },
   ], links: [link("l", "t", "text", "d", "text")] });
-  const a = priceGraph(g, { chat }, { inputs: { Doc: "x".repeat(10) } });
-  const b = priceGraph(g, { chat }, { inputs: { Doc: "x".repeat(20000) } });
+  const a = priceGraph(g, { decision }, { inputs: { Doc: "x".repeat(10) } });
+  const b = priceGraph(g, { decision }, { inputs: { Doc: "x".repeat(20000) } });
   assert.ok(b.estimatedCostUsd - a.estimatedCostUsd >= (4997 * 15) / 1e6 - 1e-9, `${a.estimatedCostUsd} -> ${b.estimatedCostUsd}`);
 });
 

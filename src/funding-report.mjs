@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fundingRaw } from "./run-funding.mjs";
 import { hostedRunTimeout } from "./hosted-run.mjs";
 import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
+import { NANO_COLD_STANDBY_SCAN_REQUESTS } from "./nano-read-pool.mjs";
 import { selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { maintenanceProcessIdentity } from "./maintenance-report.mjs";
 import { readOperatorJson } from "./operator-file.mjs";
@@ -24,6 +25,7 @@ const readFailureCodes = new Map([
 ]);
 const reportFailureCodes = new Set([
   "funding-state-unavailable", "funding-underfunded", "funding-durable-state-unavailable",
+  "funding-state-durability-uncertain",
   "funding-storage-unavailable", "funding-report-stale", "nano-read-guard-unhealthy",
   ...readFailureCodes.values(),
 ]);
@@ -72,10 +74,12 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
             readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt,
             checkpoint: selectNanoCheckpoint(n.checkpoint) };
           if (n.standby !== undefined) {
-            const { inUse, requestsPerMinute } = n.standby;
+            const { inUse, requestsPerMinute, coldPaymentScanRequests } = n.standby;
             if (typeof inUse !== "boolean" || !Number.isSafeInteger(requestsPerMinute) || requestsPerMinute < 3 || requestsPerMinute > 120
+                || (coldPaymentScanRequests !== undefined && coldPaymentScanRequests !== NANO_COLD_STANDBY_SCAN_REQUESTS)
                 || n.configuredPeers < 3 || (inUse && (n.minimumPeers !== 2 || n.readablePeers !== 2))) throw Error("invalid standby observation");
-            report.nanoRpc.standby = { inUse, requestsPerMinute };
+            report.nanoRpc.standby = { inUse, requestsPerMinute,
+              ...(coldPaymentScanRequests !== undefined && { coldPaymentScanRequests }) };
           }
           if (n.cooldowns !== undefined || n.configuration !== undefined) {
             if (typeof n.configuration !== "string" || !/^[a-f0-9]{64}$/.test(n.configuration)) throw Error("invalid RPC configuration observation");
@@ -91,9 +95,13 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         if (durableState) {
           const state = durableState();
           if (typeof state?.ok !== "boolean" || !Number.isSafeInteger(state.pendingWrites) || state.pendingWrites < 0) throw Error("durable write health unavailable");
-          report.durableState = { ok: state.ok, pendingWrites: state.pendingWrites };
+          const durabilityUncertain = state.durabilityUncertain === true;
+          report.durableState = { ok: state.ok && !durabilityUncertain, pendingWrites: state.pendingWrites, ...(durabilityUncertain && { durabilityUncertain: true }) };
           // Normal queued writes do not indicate a failed snapshot.
-          if (!state.ok) { report.ok = false; report.code = "funding-durable-state-unavailable"; }
+          if (!report.durableState.ok) {
+            report.ok = false;
+            report.code = durabilityUncertain ? "funding-state-durability-uncertain" : "funding-durable-state-unavailable";
+          }
         }
         if (writerProtection) {
           const proof = writerProtection();

@@ -1,7 +1,7 @@
 /** Circle-issued USDC on NEAR. Amounts are integer micro-USDC, never floats. */
 import { randomInt } from "node:crypto";
 import { NearError } from "./errors.mjs";
-import { usdToYocto } from "./amount.mjs";
+import { QUOTE_DUST_SLOTS, usdToYocto } from "./amount.mjs";
 import { signFunctionCall } from "./tx.mjs";
 
 // https://developers.circle.com/stablecoins/usdc-contract-addresses
@@ -23,10 +23,13 @@ export function formatUsdc(amount) {
 export function usdcDeposit(usd, taken, rng = randomInt) {
   const base = usdToYocto(usd, USDC_RATE, "ceil");
   for (let i = 0; i < 200; i++) {
-    const amount = base + BigInt(rng(1, 1000));
+    const amount = base + BigInt(rng(1, QUOTE_DUST_SLOTS + 1));
     if (!taken(amount)) return amount;
   }
-  for (let dust = 1n; dust < 1000n; dust++) if (!taken(base + dust)) return base + dust;
+  for (let dust = 1; dust <= QUOTE_DUST_SLOTS; dust++) {
+    const amount = base + BigInt(dust);
+    if (!taken(amount)) return amount;
+  }
   throw new NearError("NO_UNIQUE_AMOUNT", "every USDC deposit amount at this price is in use");
 }
 
@@ -66,8 +69,11 @@ export function hasFtTransfer(result, { tokenContract, from, to, amount }) {
   return matches === 1;
 }
 
-export function signFtTransfer({ signer, signerId, tokenContract, to, amount, nonce, blockHash }) {
+export function ftTransferCall({ tokenContract, to, amount }) {
   if (typeof amount !== "bigint" || amount <= 0n || amount >= 1n << 128n) throw new NearError("BAD_AMOUNT", "USDC transfer amount must be a positive u128");
-  return signFunctionCall({ signer, signerId, receiverId: tokenContract, nonce, blockHash,
-    methodName: "ft_transfer", args: { receiver_id: to, amount: amount.toString() }, depositYocto: 1n });
+  return { receiverId: tokenContract, methodName: "ft_transfer", args: { receiver_id: to, amount: amount.toString() }, depositYocto: 1n };
+}
+
+export function signFtTransfer({ signer, signerId, tokenContract, to, amount, nonce, blockHash }) {
+  return signFunctionCall({ signer, signerId, nonce, blockHash, ...ftTransferCall({ tokenContract, to, amount }) });
 }

@@ -1,5 +1,7 @@
 /** Durable Nano creator payments, funded by the provider wallet's shared queue. */
 import { authorAddress } from "./wallet.mjs";
+import { nanoCreatorTransferId } from "./nano-transfer-journal.mjs";
+import { sameCreatorPayout } from "./creator-payout-evidence.mjs";
 
 // Convert only the fee actually collected, after model costs and the deposit cap.
 // usdNano and xnoUsdNano share the same scale, so it cancels without rounding USD.
@@ -12,6 +14,7 @@ export function authorPayoutRaw(settlement, rate, xnoUsdNano) {
 }
 
 export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Date.now, log = () => {}, usage = () => {},
+  marketPayoutMatches = () => true,
   schedule = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
   backoffMs = [30_000, 60_000, 120_000, 300_000, 600_000],
 }) {
@@ -23,16 +26,27 @@ export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Dat
     maintenance?.assertAdmitted();
     const existing = ledger.getPayout(paymentId);
     if (existing) {
-      if (existing.to !== to || existing.amountRaw !== String(amountRaw)) throw new Error("author payout does not match its recorded intent");
+      if (!sameCreatorPayout({ to, amountRaw: String(amountRaw) }, existing)) throw new Error("author payout does not match its recorded intent");
       return existing;
     }
     ledger.putPayout({ paymentId, to, amountRaw: String(amountRaw), status: "queued", prepared: null, attempts: 0, createdAt: now(), nextAttemptAt: now() });
     return ledger.getPayout(paymentId);
   }
   async function drive(rec) {
+    ledger.assertDurable();
     try {
+      const quote = ledger.getQuote(rec.paymentId);
+      const expected = quote?.settlement?.authorPayout;
+      const matches = rec.paymentId.startsWith("market_") ? marketPayoutMatches(rec)
+        : !quote || (expected && sameCreatorPayout(expected, rec));
+      if (!matches) {
+        ledger.updatePayout(rec.paymentId, { reconciliationRequired: true, nextAttemptAt: null });
+        log("Nano creator payout records need reconciliation before a retry");
+        return;
+      }
       const hash = await ops.transferOnce(rec.to, rec.amountRaw, {
         liabilityRaw: rec.amountRaw,
+        transferId: nanoCreatorTransferId(rec.paymentId),
         fundingRunId: rec.paymentId.startsWith("market_") ? `market:${rec.paymentId.slice(7)}` : `near:${rec.paymentId}`,
         prepared: rec.prepared,
         onPrepared(prepared) { ledger.updatePayout(rec.paymentId, { status: "signed", prepared }); },
@@ -51,7 +65,9 @@ export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Dat
   }
   function tick({ force = false } = {}) {
     const pass = async () => {
-      for (const rec of ledger.payouts()) if (rec.status !== "sent" && (force || rec.nextAttemptAt <= now())) await drive(rec);
+      for (const rec of ledger.payouts()) {
+        if (rec.status !== "sent" && !rec.reconciliationRequired && (force || rec.nextAttemptAt <= now())) await drive(rec);
+      }
     };
     let scheduled;
     try { scheduled = maintenance ? maintenance.capture(pass, "wallet") : pass; }

@@ -328,6 +328,11 @@ decimal string. A hire is priced on the **default** plan while it is live
 `PATCH /v1/pricing-plans/{pricing_plan_id}`, fields `price_amount`, `sla_seconds`,
 `listing_status`). A delivery window of one hour is ample: a typical image workflow finishes
 in under a minute, and the worker polls every 45 s (or is told at once, with the webhook).
+For each hire, the worker bounds execution by both the hosted limit and the
+Market deadline. It holds up to one minute for upload and submission, using
+10% of the assignment's time window when that is shorter. It checks the
+remaining window before starting the job and again before running any model.
+Work already produced keeps the normal upload and submission recovery path.
 
 ### 4. Mint the agent token
 
@@ -867,8 +872,11 @@ node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
 
 A direct hire can spend up to its configured budget and the net USD or USDC
 escrow on its assignment, whichever is less. The worker rounds the amount left
-after the fee down to the cent. It checks escrow before starting the assignment
-and before running models. A temporary failure to verify escrow is retried.
+after the fee down to the cent. Before running models, the worker reads the
+assignment again to confirm it is still active, within its delivery deadline,
+and funded. A temporary failure to verify the assignment or its escrow is
+retried. The read-only monitor also checks whether a pending priced run still
+fits its escrow.
 
 A listing has one flat price (the market accepts only `per_call` plans). A workflow that
 costs more than the listing covers is declined, and one that costs far less still pays the

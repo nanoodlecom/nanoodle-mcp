@@ -36,22 +36,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A Nano node stand-in: an opened account with no receivables; work requests are refused. */
 export async function nanoNode() {
+  const frontier = "B".repeat(64);
+  let historyAvailable = true;
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     let body = {};
     try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { body = {}; }
+    const history = [{ type: "open", hash: frontier, height: "1", confirmed: "true", account: body.account, amount: "1" }];
     const answer = {
-      account_info: nanoAccountInfo({ frontier: "B".repeat(64), balance: "0", representative: body.account, height: 1 }),
+      account_info: nanoAccountInfo({ frontier, balance: "0", representative: body.account, height: 1 }),
       block_info: body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY : { error: "Block not found" },
       receivable: { blocks: "" },
-      account_history: { history: "" },
+      account_history: historyAvailable
+        ? { account: body.account, history }
+        : { error: "stand-in: history temporarily unavailable" },
     }[body.action] || { error: "stand-in: not supported" };
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(answer));
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  return { url: `http://127.0.0.1:${server.address().port}`, close: () => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); } };
+  return { url: `http://127.0.0.1:${server.address().port}`, setHistoryAvailable: value => { historyAvailable = value; },
+    close: () => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); } };
 }
 
 export async function runDualSimulation({ print = console.log } = {}) {
@@ -127,6 +133,13 @@ export async function runDualSimulation({ print = console.log } = {}) {
 
     const args = { Idea: "a lighthouse at dawn" };
     step("3. The saved tool, quoted in Nano (the default): idea-poster { Idea }");
+    node.setHistoryAvailable(false);
+    const unavailable = await mcp.call("idea-poster", args);
+    expect(unavailable.isError && !unavailable.structuredContent?.x402
+      && unavailable.content.some(item => /payment detection is temporarily unavailable/i.test(item.text || "")),
+      "the hosted MCP withholds a Nano quote while confirmed history is unavailable");
+    node.setHistoryAvailable(true);
+    await sleep(5100); // Let the five-second failure cache expire in the hosted process.
     const nq = await mcp.call("idea-poster", args);
     show(nq, 3);
     const x402 = nq.structuredContent && nq.structuredContent.x402;
@@ -187,7 +200,7 @@ export async function runDualSimulation({ print = console.log } = {}) {
     const landing = await (await fetch(base + "/")).text();
     const llms = await (await fetch(base + "/llms.txt")).text();
     expect(/paid in Nano over x402/.test(landing) && !/\bNEAR\b|\bUSDC\b/.test(landing), "the primary landing page presents Nano only while backend compatibility calls still work");
-    expect(/## Payment \(x402, Nano\/XNO\)/.test(llms) && !/\bNEAR\b|\bUSDC\b/.test(llms), "the primary page’s plain-text companion describes Nano only");
+    expect(/Nano \(XNO\) is the default/.test(llms) && /Eligible tools also support NEAR/.test(llms) && /\x60run_noodle\x60/.test(llms), "the primary discovery page describes both live payment rails and composition");
   } catch (e) {
     failures.push(`simulation aborted: ${(e && e.message) || e}`);
     print(`  ✗ simulation aborted: ${(e && e.stack) || e}\n${stderr}`);

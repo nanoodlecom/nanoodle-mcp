@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFundingReport } from "../src/funding-report.mjs";
 import { createHostedFundingSources } from "../src/hosted-funding.mjs";
+import { moneyStateStatus } from "../src/service-lifecycle.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY } from "./fixtures/nano-protocol.mjs";
 
 const value = { balanceRaw: "100", liabilitiesRaw: "20", reservedRaw: "80", activeRuns: 1,
@@ -161,11 +162,13 @@ test("private RPC cooldown telemetry selects safe fields and malformed state pau
   const w = await setup(t), head = { hash: "A".repeat(64), blockCount: "10" };
   const rpc = { enforced: true, configuredPeers: 3, minimumPeers: 2, networkPeers: 2, readablePeers: 2, lastReadAt: 2000,
     checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH, account: NANO_GENESIS_REPLY.contents.account, head, confirmed: head },
+    standby: { inUse: false, requestsPerMinute: 4, coldPaymentScanRequests: 4, endpoint: "PRIVATE_STANDBY" },
     configuration: "a".repeat(64), cooldowns: [{ peer: 0, until: 32_000, endpoint: "PRIVATE_CREDENTIAL_URL" }] };
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000, snapshot: async () => ({ ...value, nanoRpc: rpc }) });
   t.after(report.stop);
   let text = await readFile(w.file, "utf8");
   assert.deepEqual(JSON.parse(text).nanoRpc.cooldowns, [{ peer: 0, until: 32_000 }]);
+  assert.deepEqual(JSON.parse(text).nanoRpc.standby, { inUse: false, requestsPerMinute: 4, coldPaymentScanRequests: 4 });
   assert.doesNotMatch(text, /PRIVATE|endpoint/); assert.equal(w.sources.ready(), true);
   rpc.cooldowns = [{ peer: 3, until: 32_000 }]; await report.refresh();
   assert.equal(w.sources.ready(), false);
@@ -203,6 +206,10 @@ test("failed money-state persistence pauses checkout admission without inference
   state.ok = false; await report.refresh();
   assert.equal(w.sources.ready(), false);
   assert.doesNotMatch(await readFile(w.file, "utf8"), /PRIVATE/);
+  state = moneyStateStatus([{ ...state, durabilityUncertain: true }, { ok: true, pendingWrites: 0 }]);
+  await report.refresh();
+  assert.equal(w.sources.ready(), false);
+  assert.equal(JSON.parse(await readFile(w.file, "utf8")).code, "funding-state-durability-uncertain");
   state = { ok: true, pendingWrites: "unknown" }; await report.refresh();
   assert.equal(w.sources.ready(), false);
   assert.equal(JSON.parse(await readFile(w.file, "utf8")).code, "funding-state-unavailable");

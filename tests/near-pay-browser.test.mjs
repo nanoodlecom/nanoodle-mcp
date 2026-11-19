@@ -2,20 +2,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
+import { isExpiredPayment } from "../src/near/payment-view.mjs";
 
 const source = (await readFile(new URL("../src/near-pay-browser.mjs", import.meta.url), "utf8"))
   .replace(/^import .*;$/gm, "");
 
-function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null, asset = {}, finalStatus = "paid" } = {}) {
-  const payment = { paymentId: "nq_test", status: "pending", network: "testnet", payTo: "merchant.testnet", amountYocto: "12345678901234567890123", ...asset };
+function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = null, asset = {}, finalStatus = "paid", initial = {} } = {}) {
+  const payment = { paymentId: "nq_test", status: "pending", network: "testnet", payTo: "merchant.testnet", amountYocto: "12345678901234567890123", ...asset, ...initial };
   const state = { ...payment };
   const events = new Map();
   const elements = new Map();
-  for (const id of ["#near-payment", "#near-pay", "#near-status", "#near-error", "#near-confirm", "#near-title", "#near-deposit", "#near-manual", "#near-note"]) {
+  for (const id of ["#near-payment", "#near-pay", "#near-status", "#near-error", "#near-confirm", "#near-title", "#near-deposit", "#near-manual", "#near-note", "#near-transfer-instructions"]) {
     elements.set(id, { dataset: { payment: JSON.stringify(payment) }, textContent: "", elements: { senderId: { value: "" }, txHash: { value: "" } },
       addEventListener: (name, fn) => events.set(`${id}:${name}`, fn) });
   }
-  let sent = [], confirmed = [], options;
+  const sent = [], confirmed = [], subscriptions = [];
+  let options;
   const storage = new Map(stored ? [["nanoodle-near:nq_test", JSON.stringify(stored)]] : []);
   const context = {
     document: { querySelector: (id) => elements.get(id) },
@@ -29,18 +31,27 @@ function page({ outcome = { transaction: { hash: "transfer-hash" } }, stored = n
     },
     EventSource: class { addEventListener() {} close() {} },
     createRunView: () => ({ render() {}, elapsed() {} }),
-    monitorPaymentRun: ({ initial, update }) => update(initial, null),
+    isExpiredPayment,
+    monitorPaymentRun: ({ initial: starting, update }) => {
+      subscriptions.push(starting.status);
+      update(starting, null);
+      return { stop() {} };
+    },
     setInterval() {},
     fetch: async (url, args) => {
       if (args?.method === "POST") {
-        confirmed.push(JSON.parse(args.body)); state.status = finalStatus;
+        const confirmation = JSON.parse(args.body);
+        confirmed.push(confirmation);
+        Object.assign(state, { status: finalStatus, txHash: confirmation.txHash });
+        delete state.checkingPayment;
       }
       return { ok: true, json: async () => ({ ...state }) };
     },
     setTimeout,
   };
   vm.runInNewContext(source, context);
-  return { elements, sent, confirmed, storage, options: () => options, render: (status) => context.render({ status }), click: () => events.get("#near-pay:click")() };
+  return { elements, sent, confirmed, subscriptions, storage, options: () => options,
+    render: status => context.render({ status }), click: () => events.get("#near-pay:click")() };
 }
 
 test("wallet page requests exactly one native transfer, then confirms it without another payment", async () => {
@@ -66,6 +77,24 @@ test("uncertain wallet outcome is retained so a refresh cannot request a second 
   const reloaded = page({ stored: retained });
   await reloaded.click();
   assert.equal(reloaded.sent.length, 0);
+});
+
+test("an expired checkout hides new payment controls and reconnects after confirming the original saved transfer", async () => {
+  const checking = page({ initial: { status: "expired", checkingPayment: true } });
+  assert.equal(checking.elements.get("#near-title").textContent, "Checking payment");
+  assert.equal(checking.elements.get("#near-pay").hidden, true);
+  assert.equal(checking.elements.get("#near-transfer-instructions").hidden, true);
+  assert.equal(checking.elements.get("#near-manual").hidden, false);
+  await checking.click();
+  assert.deepEqual(checking.sent, []);
+
+  const original = { senderId: "payer.testnet", txHash: "original-transfer" };
+  const reopened = page({ initial: { status: "expired" }, stored: original });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(reopened.confirmed, [original]);
+  assert.deepEqual(reopened.sent, []);
+  assert.deepEqual(reopened.subscriptions, ["expired", "paid"]);
+  assert.match(reopened.elements.get("#near-status").textContent, /Payment confirmed/);
 });
 
 test("USDC wallet payment signs one ft_transfer to the quoted token contract, with one yoctoNEAR attached", async () => {

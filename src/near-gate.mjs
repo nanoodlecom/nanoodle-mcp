@@ -40,13 +40,19 @@ import {
 } from "./near/index.mjs";
 import { knownUsd } from "./usd.mjs";
 import { formatUsdc, usdcDeposit } from "./near/ft.mjs";
+import {
+  countOpenNearQuotes, heldNearQuoteAmounts, holdsNearQuoteAmount, MAX_OPEN_NEAR_QUOTES, RETAIN_NEAR_QUOTE_MS,
+} from "./near/quote-capacity.mjs";
 import { authorPayoutRaw } from "./author-payouts.mjs";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { nearCreatorLiabilities, nearRunFundingBudget } from "./funding-liabilities.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
+import { nearRefundTerms, sameNearRefund } from "./near/refund-terms.mjs";
+import { sameCreatorPayout } from "./creator-payout-evidence.mjs";
 
 const RUN_NOODLE = "run_noodle";
+const refundReference = result => ({ refundId: result.refundId, ...(result.status === "none" && { refundWaived: true }) });
 const FINAL = new Set(["settled", "failed", "rejected"]);
 const SIDE_CARS = ["costUsd", "costExact", "providerUsd", "providerExact", "billedUsd", "textOutput"];
 const TEXT_NOT_RETAINED = "The result text was not retained across a server restart; the run is not repeated.";
@@ -123,8 +129,8 @@ export function createNearGate({
   fetch = globalThis.fetch,
   txTimeoutMs,
   randomInt,
-  maxOpenQuotes = 1000,
-  expiredRetainMs = 3_600_000,
+  maxOpenQuotes = MAX_OPEN_NEAR_QUOTES,
+  expiredRetainMs = RETAIN_NEAR_QUOTE_MS,
   publicBase = null,
   usdcToken = null,
   usdcEnabled = false,
@@ -245,15 +251,22 @@ export function createNearGate({
     const intent = q.settlement?.authorPayout;
     if (!intent) return null;
     const rec = ledger.getPayout(q.id);
+    const verified = rec && !rec.reconciliationRequired && sameCreatorPayout(intent, rec);
+    const hash = verified ? rec.txHash || null : null;
     return { asset: "XNO", to: intent.to, amountRaw: intent.amountRaw, amount: rawToXno(intent.amountRaw, 30),
-      status: rec?.status === "sent" ? "sent" : "pending", txHash: rec?.txHash || null,
-      explorerUrl: rec?.txHash ? `https://nanexplorer.com/nano/block/${rec.txHash}` : null };
+      status: verified && rec.status === "sent" ? "sent" : "pending", txHash: hash,
+      explorerUrl: hash ? `https://nanexplorer.com/nano/block/${hash}` : null };
   }
 
   function ensureAuthorPayout(q) {
     const intent = q.settlement?.authorPayout;
     if (!intent) return;
-    if (ledger.getPayout(q.id)?.status === "sent") return;
+    const existing = ledger.getPayout(q.id);
+    if (existing && !sameCreatorPayout(intent, existing)) {
+      log("Nano creator payout needs reconciliation");
+      return;
+    }
+    if (existing?.status === "sent") return;
     if (!authorPayouts) throw new Error("A Nano creator payout is owed; configure the original Nano wallet to recover it");
     authorPayouts.enqueue({ paymentId: q.id, ...intent });
     // Independent of customer delivery and same-asset change. The durable
@@ -262,9 +275,14 @@ export function createNearGate({
   }
 
   function refundView(q) {
-    if (!q.refundId) return { status: "none", txHash: null };
-    const r = ledger.getRefund(q.refundId);
-    if (!r) return { status: "none", txHash: null };
+    const expected = nearRefundTerms(q);
+    const due = expected && ["settled", "failed", "rejected"].includes(q.status) && BigInt(expected.amountYocto) > 0n;
+    if (!q.refundId && !due) return { status: "none", txHash: null };
+    const r = q.refundId ? ledger.getRefund(q.refundId) : ledger.refundForPayment(q.id);
+    if (!r || r.paymentId !== q.id || r.reconciliationRequired || r.outcomeUnverified
+      || ledger.refundHashConflict(r.id) || ledger.invalidRefundProof(r.id) || (expected && !sameNearRefund(expected, r))) {
+      return { status: "failed_permanent", txHash: null, amountYocto: expected?.amountYocto, to: q.payer };
+    }
     const status = r.status === "sent" ? "sent" : r.status === "failed_permanent" ? "failed_permanent" : "pending";
     return { status, txHash: r.txHash || null, amountYocto: r.amountYocto, to: r.to };
   }
@@ -278,7 +296,7 @@ export function createNearGate({
     if (s) { chargedYocto = BigInt(s.chargedYocto); refundYocto = BigInt(s.refundYocto); }
     const rv = refundView(q);
     // A refund below the minimum is not sent; it counts toward the charge.
-    if (!q.refundId && refundYocto > 0n && !s) { chargedYocto += refundYocto; refundYocto = 0n; }
+    if (q.refundWaived && refundYocto > 0n && !s) { chargedYocto += refundYocto; refundYocto = 0n; }
     const costKnown = !!(s && s.costUsd != null);
     const capped = !!(s && costKnown && BigInt(s.chargedYocto) < BigInt(s.costYocto) + BigInt(s.feeYocto));
     const receipt = {
@@ -383,21 +401,15 @@ export function createNearGate({
 
   /* ---------------- quote ---------------- */
 
-  /** Deposit amounts of unpaid quotes still held (open, or expired within expiredRetainMs). */
+  /** Keep an unpaid quote's amount reserved until its payment window is covered. */
   function openAmounts(asset = "near") {
-    const t = now();
-    const taken = new Set();
-    for (const q of ledger.quotes()) {
-      if (assetOf(q) === asset && (q.status === "pending" || q.status === "expired") && t <= q.expiresAt + expiredRetainMs) taken.add(q.amountYocto);
-    }
-    return taken;
+    return heldNearQuoteAmounts(ledger.quotes(), asset, now(), expiredRetainMs, {
+      coveredThroughMs: ledger.paymentWatchCoverage(), additionallyHeld: ledger.hasUnattachedPayment,
+    });
   }
 
   function openQuoteCount() {
-    const t = now();
-    let n = 0;
-    for (const q of ledger.quotes()) if (q.status === "pending" && t <= q.expiresAt) n++;
-    return n;
+    return countOpenNearQuotes(ledger.quotes(), now());
   }
 
   /** Drop unpaid quotes past retention and finished ones past a day, at most once a minute. */
@@ -448,6 +460,7 @@ export function createNearGate({
   }
 
   async function quote(registry, name, args, tool, asset = "near", resumeTool = null) {
+    ledger.assertDurable();
     if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server.");
     const { pricing, author } = await prepare(registry, name, args, tool);
     if (await canQuote() !== true) {
@@ -592,6 +605,7 @@ export function createNearGate({
   /* ---------------- pay → run → settle ---------------- */
 
   async function acceptPayment(q0, tx, sender, ctx = null) {
+    ledger.assertDurable();
     if (q0.status === "paid" || q0.status === "running" || FINAL.has(q0.status)) return null;
     if (typeof tx !== "string" || !tx.trim() || typeof sender !== "string" || !sender.trim()) {
       throw new GraphArgsError("the paying call needs _payment_tx (your transfer's transaction hash) and _payment_sender (the account you paid from) together with _payment_id");
@@ -603,6 +617,9 @@ export function createNearGate({
     const consumed = ledger.consumedBy(txHash);
     if (consumed && consumed !== q0.id) {
       return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
+    }
+    if (ledger.hasUnattachedPayment(q0.id) && consumed !== q0.id) {
+      return errResult("A transfer is already recorded for this quote. Confirm that original transaction or contact the operator. Do not pay again.");
     }
 
     const note = (s) => {
@@ -633,7 +650,7 @@ export function createNearGate({
     }
 
     const wrongAmount = t.amountYocto !== BigInt(q0.amountYocto);
-    if (wrongAmount && openAmounts(assetOf(q0)).has(t.amountYocto.toString())) {
+    if (wrongAmount && consumed !== q0.id && openAmounts(assetOf(q0)).has(t.amountYocto.toString())) {
       // The transfer carries the exact amount of ANOTHER open quote: it belongs to
       // that quote's payer. Consuming it here would let anyone who sees a payment
       // on chain burn it against a free quote of their own, so it is left untouched.
@@ -641,47 +658,52 @@ export function createNearGate({
         `so it was not used for this one (which asks for ${amountText(q0, q0.amountYocto)} ${symbol(q0)}). Nothing was consumed.`);
     }
 
-    // From here to updateQuote there is no await: the consume and the status
-    // change cannot interleave with another call.
-    if (!ledger.getQuote(q0.id)) {
-      return errResult("This quote expired while the transfer was being checked. Nothing was consumed; contact the operator if you already paid.");
-    }
-    if (consumed !== q0.id && !ledger.consumeTx(txHash, q0.id)) {
+    const reject = wrongAmount ? "wrong_amount" : t.blockTimeMs > q0.expiresAt ? "late_payment" : null;
+    const paidFields = { payer: t.payer, paidYocto: t.amountYocto.toString(), paidAtBlockMs: t.blockTimeMs };
+    const outcome = reject ? {
+      status: "rejected", outcome: reject, finishedAt: now(),
+      error: wrongAmount ? `The quote asked for exactly ${amountText(q0, q0.amountYocto)} ${symbol(q0)}.`
+        : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`,
+    } : { status: "paid" };
+    const q = ledger.recordPayment(q0.id, txHash, { ...paidFields, ...outcome });
+    if (!q) {
+      if (!ledger.getQuote(q0.id)) {
+        return errResult("This quote expired while the transfer was being checked. Nothing was consumed; contact the operator if you already paid.");
+      }
       return errResult("This transaction was already used for another payment. Send a new transfer for this quote, or ask for a new quote.");
     }
-    const paidFields = { payTx: txHash, payer: t.payer, paidYocto: t.amountYocto.toString(), paidAtBlockMs: t.blockTimeMs };
-    const reject = wrongAmount ? "wrong_amount" : t.blockTimeMs > q0.expiresAt ? "late_payment" : null;
     if (reject) {
-      const error = reject === "wrong_amount"
-        ? `The quote asked for exactly ${amountText(q0, q0.amountYocto)} ${symbol(q0)}.`
-        : `The quote expired at ${new Date(q0.expiresAt).toISOString()}.`;
-      let q = ledger.updateQuote(q0.id, { ...paidFields, status: "rejected", outcome: reject, error, finishedAt: now() });
       ev("paid", { paymentId: q.id, tool: q.tool, ok: false, outcome: reject, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
       const rf = await refundFor(q, t.payer, t.amountYocto, reject);
-      q = ledger.updateQuote(q.id, { refundId: rf.refundId });
-      return replay(q);
+      return replay(ledger.updateQuote(q.id, refundReference(rf)));
     }
-    const q = ledger.updateQuote(q0.id, { ...paidFields, status: "paid" });
     ev("paid", { paymentId: q.id, tool: q.tool, ok: true, from: t.payer, amountYocto: paidFields.paidYocto, hash: txHash });
     return null;
   }
 
   /** Public payment state contains no workflow inputs or result text. */
   function paymentView(id) {
+    ledger.assertDurable();
     const q = ledger.getQuote(id);
     if (!q) return null;
     const status = q.status === "pending" && now() > q.expiresAt ? "expired" : q.status;
     const paid = status === "paid" || status === "running" || status === "settled";
+    const checkingPayment = status === "expired" && !q.payTx
+      && (ledger.paymentWatchCoverage() <= q.expiresAt || ledger.hasUnattachedPayment(id));
+    let next = "Review this payment's receipt for its outcome and refund status.";
+    if (status === "expired") next = checkingPayment
+      ? "The quote expired while the watcher was checking for payments. Keep monitoring this quote or confirm the original transfer if you already paid."
+      : "If you already paid, confirm the original transaction on this quote. Otherwise ask for a fresh quote.";
+    else if (status === "pending") next = "Pay this deposit in your wallet; keep monitoring until payment is confirmed.";
+    else if (paid) next = `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`;
     return {
       paymentId: q.id, tool: q.resumeTool || q.tool, network, payTo: merchantId,
       ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
-      done: status !== "pending",
+      done: status !== "pending" && !checkingPayment,
+      ...(checkingPayment && { checkingPayment: true }),
       ...(workflows.has(id) ? { workflow: workflows.get(id) } : {}),
-      next: paid
-        ? `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`
-        : status === "pending" ? "Pay this deposit in your wallet; keep monitoring until payment is confirmed."
-        : "Ask your agent for a fresh quote. Do not pay this quote again.",
+      next,
       ...(q.payTx ? { txHash: q.payTx } : {}),
       ...(FINAL.has(status) ? { receipt: receiptFor(q).structured.receipt } : {}),
     };
@@ -707,12 +729,24 @@ export function createNearGate({
 
   function pendingQuotes() {
     const t = now();
-    return ledger.quotes().filter((q) => ["pending", "expired"].includes(q.status) && t <= q.expiresAt + expiredRetainMs);
+    const coverage = ledger.paymentWatchCoverage();
+    return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs, coverage) || ledger.hasUnattachedPayment(q.id));
+  }
+
+  async function confirmDiscoveredPayment(id, txHash, senderId) {
+    const result = await confirmPayment(id, txHash, senderId);
+    if (result.error && !result.txHash) {
+      throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
+    }
   }
 
   /** Discovered receipts are only hints: verify FINAL, then match an exact quote. */
   async function observeTransfer(txHash, senderId) {
-    if (ledger.consumedBy(txHash)) return;
+    const claimed = ledger.consumedBy(txHash);
+    if (claimed) {
+      if (ledger.hasUnattachedPayment(claimed)) await confirmDiscoveredPayment(claimed, txHash, senderId);
+      return;
+    }
     let transfer;
     try {
       transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
@@ -728,16 +762,14 @@ export function createNearGate({
       else throw e;
     }
     const q = pendingQuotes().find((q) => assetOf(q) === (transfer.asset || "near") && q.amountYocto === transfer.amountYocto.toString()
-      && transfer.blockTimeMs >= q.createdAt);
-    if (q) {
-      const result = await confirmPayment(q.id, txHash, senderId);
-      if (result.error && result.status === "pending") throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
-    }
+      && transfer.blockTimeMs >= q.createdAt && transfer.blockTimeMs <= q.expiresAt + expiredRetainMs);
+    if (q && !ledger.hasUnattachedPayment(q.id)) await confirmDiscoveredPayment(q.id, txHash, senderId);
   }
 
-  function waitForPayment(id, timeoutMs = 25_000, { signal } = {}) {
-    if (signal?.aborted || paymentView(id)?.status !== "pending") return Promise.resolve();
-    return waitForUpdate(id, timeoutMs, { signal });
+  function waitForPayment(id, timeoutMs = 25_000, { signal, previous } = {}) {
+    const view = paymentView(id);
+    if (signal?.aborted || !view || view.done) return Promise.resolve();
+    return waitForUpdate(id, timeoutMs, { signal, previous });
   }
 
   function waitForUpdate(id, timeoutMs = 25_000, { signal, previous } = {}) {
@@ -769,6 +801,10 @@ export function createNearGate({
     if (FINAL.has(q0.status)) return replay(q0);
     if (q0.status === "running") {
       return errResult(`payment ${q0.id} is still being processed — call again in a moment with the same arguments.`);
+    }
+    if (!tx && !sender && now() > q0.expiresAt) {
+      const view = paymentView(q0.id);
+      if (view.checkingPayment) return errResult(view.next, { payment: view });
     }
 
     const refused = await acceptPayment(q0, tx, sender, ctx);
@@ -820,7 +856,7 @@ export function createNearGate({
       q = ledger.updateQuote(q.id, { status: "failed", outcome: "run_failed", error, finishedAt: now() });
       results.set(q.id, { details: `Details: ${msg}` });
       const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), "run_failed");
-      q = ledger.updateQuote(q.id, { refundId: rf.refundId });
+      q = ledger.updateQuote(q.id, refundReference(rf));
       return replay(q);
     }
 
@@ -859,7 +895,7 @@ export function createNearGate({
     const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change", ...refundAsset(q) });
     // Media-only results (links) may be kept; text output is the caller's paid content and stays in memory.
     const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
-    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: persisted, finishedAt: now() });
+    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), result: persisted, finishedAt: now() });
     ev("change", {
       paymentId: q.id, tool: name, to: q.payer, costUsd,
       chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(), status: rf.status, hash: rf.txHash || null,
@@ -881,20 +917,20 @@ export function createNearGate({
           ensureAuthorPayout(q);
           // The run finished and was settled; only the refund intent may be missing.
           const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change", ...refundAsset(q) });
-          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", refundId: rf.refundId, result: null, finishedAt: t });
+          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), result: null, finishedAt: t });
           log(`NEAR payment ${q.id}: settled after a restart (the result text was not kept)`);
         } else {
           const error = "The server restarted while this run was in progress.";
           const done = ledger.updateQuote(q.id, { status: "failed", outcome: "interrupted", error, finishedAt: t });
           const rf = await refundFor(done, q.payer, BigInt(q.paidYocto), "interrupted");
-          ledger.updateQuote(q.id, { refundId: rf.refundId });
+          ledger.updateQuote(q.id, refundReference(rf));
           log(`NEAR payment ${q.id}: interrupted by a restart — whole deposit refunded (${rf.status}), not re-run`);
         }
-      } else if ((q.status === "failed" || q.status === "rejected") && q.paidYocto && !q.refundId) {
+      } else if ((q.status === "failed" || q.status === "rejected") && q.paidYocto && !q.refundId && !q.refundWaived) {
         // Stopped between recording the outcome and recording the refund: owe it now.
         const reason = q.outcome === "wrong_amount" || q.outcome === "late_payment" || q.outcome === "interrupted" ? q.outcome : "run_failed";
         const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), reason);
-        if (rf.refundId) ledger.updateQuote(q.id, { refundId: rf.refundId });
+        if (rf.refundId || rf.status === "none") ledger.updateQuote(q.id, refundReference(rf));
       } else if (q.status === "pending" && t > q.expiresAt) {
         ledger.updateQuote(q.id, { status: "expired" });
       }
@@ -1000,6 +1036,9 @@ export function createNearGate({
         }));
       } catch (e) {
         if (e instanceof GraphRefusedError) return refusedResult(e.refusals);
+        if (e?.code === "STATE_DURABILITY_UNCERTAIN") {
+          return errResult("NEAR checkout is paused while the ledger is recovered. Keep your original payment ID and transaction details.");
+        }
         throw e;
       }
     }

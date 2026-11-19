@@ -15,7 +15,7 @@ import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock
 import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
-import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
+import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH, WORKED_CATALOGS } from "./fixtures/near-fake-chain.mjs";
 import { USDC_CONTRACTS, parseNearToYocto } from "../src/near/index.mjs";
 import { mcpClient, freePort, stopServerChild } from "../scripts/near-simulate.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
@@ -34,6 +34,19 @@ const FRONTIER = "B".repeat(64);
 const BALANCE = "5000000000000000000000000000000"; // 5 XNO in raw
 const AMOUNT = "1230000000000000000000000000";     // 0.00123 XNO
 const WORK = "bbbbbbbbbbbbbbbb";
+
+function hostedWalletHistory(body, state, deposits) {
+  const open = { type: "open", hash: FRONTIER, height: "1", amount: BALANCE, account: PAY_TO, confirmed: "true" };
+  const rows = state.processed.map(({ block, subtype }, index) => ({
+    type: "state", subtype, hash: hashBlock(block), previous: block.previous, height: String(index + 2), confirmed: "true",
+    ...(subtype === "receive" && { account: PAY_TO, amount: deposits.get(block.link.toUpperCase()).amount }),
+  })).reverse();
+  rows.push(open);
+  const start = body.head ? rows.findIndex(row => row.hash === body.head) : 0;
+  if (start < 0) return { error: "Block not found" };
+  const end = start + Number(body.count);
+  return { account: ADDRESS, history: rows.slice(start, end), ...(rows[end] && { previous: rows[end].hash }) };
+}
 
 test("a hosted wallet persists only a corroborated advance and stops spending if its checkpoint disappears", async t => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-checkpoint-"));
@@ -68,7 +81,7 @@ test("a hosted wallet persists only a corroborated advance and stops spending if
   assert.ok(actions.every(action => ["account_info", "block_info"].includes(action)));
 });
 
-test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through the actual server", { timeout: 60_000 }, async () => {
+test("the hosted wallet settles saved, custom and conditional graphs on Nano, NEAR and USDC", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-funding-"));
   const graphs = join(dir, "graphs"), out = join(dir, "out");
   await mkdir(graphs); await mkdir(out);
@@ -88,9 +101,7 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
       const received = new Set(state.processed.filter(p => p.subtype === "receive").map(p => p.block.link.toUpperCase()));
       return reply({ blocks: Object.fromEntries([...deposits].filter(([hash]) => !received.has(hash))) });
     },
-    account_history: (_b, state, reply) => reply({ history: state.processed.filter(p => p.subtype === "receive").map(p => ({
-      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount, confirmed: "true",
-    })) }),
+    account_history: (body, state, reply) => reply(hostedWalletHistory(body, state, deposits)),
     block_info: (body, state, reply) => {
       const p = state.processed.find(p => hashBlock(p.block) === body.hash);
       return p ? reply({ confirmed: "true", contents: p.block, height: String(state.processed.indexOf(p) + 2) }) : reply({ error: "Block not found" });
@@ -116,7 +127,19 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
   near.addAccount("merchant.testnet", parseNearToYocto("10"), key.publicKey);
   near.addAccount("payer.testnet", parseNearToYocto("5"));
   near.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 1_000_000n });
-  const nano = nanoGptMock({ walletPayments: true, walletPaymentSeen(invoice) {
+  const { cases, legacy, ...branchGraph } = JSON.parse(await readFile(join(FIXTURES, "conditional", "decider-branches.json"), "utf8"));
+  await writeFile(join(graphs, "conditional.json"), JSON.stringify(branchGraph));
+  const branchModels = new Map(branchGraph.nodes.filter(node => node.fields.model).map(node => [node.id, node.fields.model]));
+  const chatModels = new Set(branchGraph.nodes.filter(node => node.type === "llm").map(node => node.fields.model));
+  const decisionModels = new Set(branchGraph.nodes.filter(node => node.type === "decide-branch").map(node => node.fields.model));
+  const extraChatModels = [...chatModels].filter(id => !WORKED_CATALOGS.chat.some(entry => entry.id === id));
+  const catalogs = {
+    ...WORKED_CATALOGS,
+    chat: [...WORKED_CATALOGS.chat, ...extraChatModels.map(id => ({ id, pricing: WORKED_CATALOGS.chat[0].pricing, context_length: 32768 }))],
+    decision: [...decisionModels].map(id => ({ id, pricing: { prompt: 0.02, completion: 0 }, context_length: 262144 })),
+  };
+  let decisions = [];
+  const nano = nanoGptMock({ catalogs, walletPayments: true, decisionAnswer: () => decisions.shift(), walletPaymentSeen(invoice) {
     let previous = BigInt(BALANCE);
     for (const p of rpc.state.processed) {
       const amount = previous - BigInt(p.block.balance); previous = BigInt(p.block.balance);
@@ -213,6 +236,46 @@ test("hosted wallet funding runs Nano, NEAR and USDC saved/custom graphs through
       assert.equal(providerBlocks.size, count, "replaying a timed-out payment cannot pay another invoice");
     }
     assert.equal(providerBlocks.size, 11, "each failed run pays at most its one started invoice and no downstream image");
+    for (const [index, asset] of ["nano", "near", "usdc", "usdc"].entries()) {
+      const scenario = cases[index];
+      decisions = [...scenario.answers];
+      const beforeInvoices = providerBlocks.size, beforeChat = nano.chatBodies().length;
+      const tool = asset === "nano" ? "conditional" : "run_noodle";
+      const args = asset === "nano" ? {} : { graph: branchGraph, _pay_with: asset };
+      const price = await client.call("price_noodle", { graph: branchGraph, _pay_with: asset === "usdc" ? "usdc" : "near" });
+      assert.equal(price.structuredContent?.pricing?.safety?.ok, true, JSON.stringify(price));
+      assert.equal(price.structuredContent.pricing.estimatedCost.items.filter(item => item.type === "decide").length, 2);
+      assert.match(JSON.stringify(price.content), /all branches/);
+      const quote = await client.call(tool, args);
+      assert.ok(!quote.isError, JSON.stringify(quote));
+      assert.equal(providerBlocks.size, beforeInvoices, "pricing and a quote never pay for a branch");
+      const payment = quote.structuredContent.payment ?? quote.structuredContent.x402;
+      const resume = { ...args, _payment_id: payment.paymentId };
+      if (asset === "nano") {
+        deposits.set("E".repeat(64), { amount: payment.amountRaw, source: PAY_TO });
+      } else {
+        resume._payment_tx = asset === "usdc"
+          ? near.ftTransfer(USDC_CONTRACTS.testnet, "payer.testnet", "merchant.testnet", BigInt(payment.amountAtomic))
+          : near.transfer("payer.testnet", "merchant.testnet", BigInt(payment.amountYocto));
+        resume._payment_sender = "payer.testnet";
+      }
+      const settled = await client.call(tool, resume);
+      assert.equal(!!settled.isError, !!scenario.error, JSON.stringify(settled));
+      assert.equal(decisions.length, 0);
+      assert.equal(providerBlocks.size - beforeInvoices, scenario.calls.length, "only the selected branch pays provider invoices");
+      assert.deepEqual(nano.chatBodies().slice(beforeChat).map(body => body.model).sort(),
+        scenario.calls.filter(id => branchGraph.nodes.find(node => node.id === id).type === "llm").map(id => branchModels.get(id)).sort());
+      if (asset !== "nano") {
+        const r = settled.structuredContent.receipt;
+        assert.equal(r.outcome, scenario.error ? "run_failed" : "succeeded");
+        assert.equal(r.refund.status, "sent");
+        assert.equal(Number(r.charged.usd), scenario.error ? 0 : scenario.calls.length * 0.000492);
+        assert.equal(BigInt(r.deposit.amountAtomic ?? r.deposit.yocto) - BigInt(r.refund.amountAtomic ?? r.refund.yocto),
+          BigInt(r.charged.amountAtomic ?? r.charged.yocto));
+      }
+      assert.equal(!!(await client.call(tool, resume)).isError, !!scenario.error);
+      assert.equal(providerBlocks.size - beforeInvoices, scenario.calls.length, "replaying the branch never pays again");
+    }
     assert.ok(frozenReads > 0, "the preferred stale peer really answered the scanner and reconciliation reads");
     assert.equal(frozenPublishes, 0, "new sends use the current observed peers rather than the frozen first entry");
     assert.doesNotMatch(stderr, /unhandled|FUNDING_INVALID|cannot persist gate state/i);
@@ -357,6 +420,42 @@ test("live liabilities refuse a funded-looking run before work or a block is pub
   assert.equal(ran, false); assert.equal(mock.state.processed.length, 0);
 });
 
+test("a provider invoice rechecks newly recorded debts after waiting for proof of work", async () => {
+  let debt = 0n;
+  const mock = fakeRpc({ work_generate: (_body, _state, reply) => {
+    debt = BigInt(BALANCE) - BigInt(AMOUNT);
+    return reply({ work: WORK });
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true, fundingLiabilities: () => debt });
+  await wallet.ops.withFunding({ id: "growing-debt", maxRaw: 2n * BigInt(AMOUNT), maxUsd: 0.2 }, async () => {
+    await assert.rejects(wallet.payment(invoice()), { code: "FUNDING_INSUFFICIENT" });
+    debt = 0n;
+    await assert.rejects(wallet.payment(invoice()), { code: "FUNDING_INVOICE_USED" });
+  });
+  assert.equal(mock.state.processed.length, 0);
+});
+
+test("a provider invoice cannot rebuild on a lower balance needed for other claims", async () => {
+  const amount = BigInt(AMOUNT);
+  let attempts = 0;
+  const mock = fakeRpc({ process: (body, state, reply) => {
+    if (++attempts === 1) {
+      state.frontier = "D".repeat(64);
+      state.balance = (3n * amount).toString();
+      return reply({ error: "Fork" });
+    }
+    state.processed.push(body);
+    return reply({ hash: hashBlock(body.block) });
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, requireFunding: true, fundingLiabilities: () => 2n * amount });
+  await wallet.ops.withFunding({ id: "lower-balance", maxRaw: 2n * amount, maxUsd: 0.2 }, async () => {
+    await assert.rejects(wallet.payment(invoice()), { code: "FUNDING_INSUFFICIENT" });
+  });
+  assert.equal(mock.state.infoCalls, 2);
+  assert.equal(attempts, 1);
+  assert.equal(mock.state.processed.length, 0);
+});
+
 test("refunds fulfill their debt while withdrawals cannot consume another run's capital", async () => {
   const mock = fakeRpc(); let debt = 4n * 10n ** 30n;
   const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true,
@@ -394,6 +493,18 @@ test("an unrecorded outgoing claim cannot bypass protected transfer funds", asyn
   assert.equal(mock.state.processed.length, 0);
 });
 
+test("a pool withdrawal rechecks debts accrued while its proof of work was prepared", async () => {
+  let debt = 0n;
+  const mock = fakeRpc({ work_generate: async (_body, _state, reply) => {
+    await new Promise(resolve => setImmediate(resolve));
+    debt = BigInt(BALANCE);
+    return reply({ work: WORK });
+  } });
+  const wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true, fundingLiabilities: () => debt });
+  await assert.rejects(wallet.ops.transfer(PAY_TO, AMOUNT), { code: "FUNDING_INSUFFICIENT" });
+  assert.equal(mock.state.processed.length, 0);
+});
+
 test("durable Nano payouts journal before publishing and recover a lost response after other pool spending", async () => {
   const blocks = new Map(); let unavailable = true, journal;
   const mock = fakeRpc({
@@ -424,11 +535,14 @@ test("durable Nano payouts journal before publishing and recover a lost response
 });
 
 test("a durable Nano send is replaced only when a different successor is confirmed", async () => {
-  const competing = "D".repeat(64), blocks = new Map(); let confirmed = false, journal, signed = 0;
+  const balance = (BigInt(BALANCE) - 1n).toString();
+  const competitor = previous => createBlock(SECRET, { work: WORK, previous, representative: ADDRESS, balance, link: PAY_TO });
+  const competing = competitor(FRONTIER), unrelated = competitor("D".repeat(64));
+  const blocks = new Map(); let reported = competing, confirmed = false, journal, signed = 0;
   const mock = fakeRpc({
     process(body, state, reply) {
       if (body.block.previous === FRONTIER) {
-        state.frontier = competing; state.balance = (BigInt(BALANCE) - 1n).toString();
+        state.frontier = competing.hash; state.balance = balance;
         return reply({ error: "Fork" });
       }
       const hash = hashBlock(body.block);
@@ -436,8 +550,8 @@ test("a durable Nano send is replaced only when a different successor is confirm
       return reply({ hash });
     },
     block_info(body, state, reply) {
-      if (body.hash === FRONTIER) return reply({ successor: competing });
-      if (body.hash === competing) return reply({ confirmed: String(confirmed) });
+      if (body.hash === FRONTIER) return reply({ successor: reported.hash });
+      if (body.hash === reported.hash) return reply({ confirmed: String(confirmed), contents: reported.block });
       return blocks.has(body.hash) ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
     },
   });
@@ -445,9 +559,13 @@ test("a durable Nano send is replaced only when a different successor is confirm
   const options = () => ({ prepared: journal, onPrepared: p => { journal = structuredClone(p); signed++; } });
   await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /Fork/);
   const first = journal.hash;
-  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /Fork/);
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /frontier to be reconciled/);
   assert.equal(signed, 1); assert.equal(mock.state.processed.length, 0);
   confirmed = true;
+  reported = unrelated;
+  await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, options()), /frontier to be reconciled/);
+  assert.equal(signed, 1); assert.equal(mock.state.processed.length, 0);
+  reported = competing;
   const hash = await wallet.ops.transferOnce(PAY_TO, AMOUNT, options());
   assert.notEqual(hash, first); assert.equal(signed, 2); assert.equal(mock.state.processed.length, 1);
 });
@@ -456,6 +574,73 @@ test("a failed durable-send journal write publishes nothing", async () => {
   const mock = fakeRpc(), wallet = createNanoWallet({ secretKey: SECRET, fetch: mock.fetch });
   await assert.rejects(wallet.ops.transferOnce(PAY_TO, AMOUNT, { onPrepared() { throw new Error("disk full"); } }), /disk full/);
   assert.equal(mock.state.processed.length, 0);
+});
+
+test("a durable Nano send preserves new liabilities before its first publication and on replay", async () => {
+  let debt = 0n, prepared, signed = 0, hashOnNode;
+  const mock = fakeRpc({
+    process(body, state, reply) {
+      const hash = hashBlock(body.block);
+      state.processed.push(body);
+      state.frontier = hash; state.balance = body.block.balance;
+      hashOnNode = hash;
+      return reply({ hash });
+    },
+    block_info(body, _state, reply) {
+      if (body.hash === FRONTIER) return reply({ previous: "0".repeat(64), successor: hashOnNode ?? "0".repeat(64) });
+      return body.hash === hashOnNode ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
+    },
+  });
+  const make = () => createNanoWallet({ secretKey: SECRET, fetch: mock.fetch, protectTransfers: true, fundingLiabilities: () => debt });
+  const onPrepared = value => { prepared = value; signed++; debt = BigInt(BALANCE); };
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, { onPrepared }), { code: "FUNDING_INSUFFICIENT" });
+  const replay = { prepared, onPrepared };
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, replay), { code: "FUNDING_INSUFFICIENT" });
+  assert.equal(signed, 1);
+  assert.equal(mock.state.processed.length, 0);
+  debt = 0n;
+  assert.equal(await make().ops.transferOnce(PAY_TO, AMOUNT, replay), prepared.hash);
+  assert.equal(signed, 1);
+  assert.equal(mock.state.processed.length, 1);
+});
+
+test("two identical obligations cannot claim the same signed Nano transfer", async () => {
+  const blocks = new Map(), owners = new Map(), signed = new Map();
+  let unavailable = true;
+  const mock = fakeRpc({
+    process(body, state, reply) {
+      if (unavailable) return { ok: false, status: 503, text: async () => "unavailable" };
+      const hash = hashBlock(body.block);
+      state.processed.push(body);
+      state.frontier = hash; state.balance = body.block.balance;
+      blocks.set(hash, body.block);
+      return reply({ hash });
+    },
+    block_info(body, _state, reply) {
+      if (unavailable) return { ok: false, status: 503, text: async () => "unavailable" };
+      if (body.hash === FRONTIER) return reply({ successor: "0".repeat(64) });
+      return blocks.has(body.hash) ? reply({ confirmed: "true" }) : reply({ error: "Block not found" });
+    },
+  });
+  const make = () => createNanoWallet({ secretKey: SECRET, fetch: mock.fetch,
+    nanoTransferClaimed: (hash, id) => owners.has(hash) && owners.get(hash) !== id });
+  const options = transferId => ({
+    transferId, prepared: signed.get(transferId),
+    onPrepared(value) {
+      assert.equal(owners.has(value.hash), false);
+      owners.set(value.hash, transferId);
+      signed.set(transferId, value);
+    },
+  });
+  const first = "nano:quote:change", second = "creator:job";
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, options(first)), /HTTP 503/);
+  await assert.rejects(make().ops.transferOnce(PAY_TO, AMOUNT, options(second)), { code: "NANO_TRANSFER_ALREADY_CLAIMED" });
+  await assert.rejects(make().payment({ payTo: PAY_TO, amountRaw: AMOUNT }), { code: "NANO_TRANSFER_ALREADY_CLAIMED" });
+  assert.equal(signed.size, 1);
+  unavailable = false;
+  assert.equal(await make().ops.transferOnce(PAY_TO, AMOUNT, options(first)), signed.get(first).hash);
+  assert.notEqual(await make().ops.transferOnce(PAY_TO, AMOUNT, options(second)), signed.get(first).hash);
+  assert.equal(mock.state.processed.length, 2);
 });
 
 /** In-memory Nano RPC: account_info / work_generate / receivable / process, with a frontier that advances. */
@@ -1346,8 +1531,7 @@ async function hostedShutdownWorld(t, withMarket, { operatorControl = false, req
     account_info: (_body, state, reply) => reply(nanoAccountInfo({ frontier: state.frontier, balance: state.balance, representative: ADDRESS,
       height: state.processed.length + 1, pending: pending(state).reduce((sum, [, value]) => sum + BigInt(value.amount), 0n).toString() })),
     receivable: (_body, state, reply) => reply({ blocks: Object.fromEntries(pending(state)) }),
-    account_history: (_body, state, reply) => reply({ history: state.processed.filter(p => p.subtype === "receive").map(p => ({
-      type: "receive", hash: hashBlock(p.block), account: PAY_TO, amount: deposits.get(p.block.link.toUpperCase()).amount, confirmed: "true" })) }),
+    account_history: (body, state, reply) => reply(hostedWalletHistory(body, state, deposits)),
     block_info: (body, state, reply) => {
       const index = state.processed.findIndex(p => hashBlock(p.block) === body.hash);
       return reply(index < 0 ? { error: "Block not found" } : { confirmed: "true", contents: state.processed[index].block, height: String(index + 2) });

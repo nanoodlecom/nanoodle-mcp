@@ -15,15 +15,24 @@ async function fixture() {
   const key = generateNearKey(), merchantKey = generateNearKey(), keyFile = join(stateDir, "payer.json"), merchantFile = join(stateDir, "merchant.json");
   await writeKeyFile(keyFile, payer, key); await writeKeyFile(merchantFile, merchant, merchantKey);
   const signer = await loadNearSigner({ accountId: merchant, keyFile: merchantFile, env: {} });
-  const chain = createFakeChain(); chain.addAccount(payer, parseNearToYocto("1"), key.publicKey); chain.addAccount(merchant, parseNearToYocto("10"), merchantKey.publicKey);
-  const rpc = createNearRpcPool({ urls: ["http://chain.test"], chainId: "testnet", fetch: chain.fetch });
-  const config = { stateDir, payer, merchant, keyFile, url: "http://mcp.test", network: "testnet", twoSteps: true };
   let day = Date.now(), result, quotes = 0, runs = 0;
+  const chain = createFakeChain({ now: () => day }); chain.addAccount(payer, parseNearToYocto("1"), key.publicKey); chain.addAccount(merchant, parseNearToYocto("10"), merchantKey.publicKey);
+  const rpc = createNearRpcPool({ urls: ["http://chain.test"], chainId: "testnet", fetch: chain.fetch, now: () => day });
+  const config = { stateDir, payer, merchant, keyFile, url: "http://mcp.test", network: "testnet", twoSteps: true };
   const change = {}, seen = [];
   const response = body => Response.json(body);
   const deps = { rpc, sleep: async () => {}, now: () => day, fetch: async (url, init) => {
-    if (String(url).includes("/near/status/")) return response({ status: "paid" });
-    if (String(url).includes("/near/result/")) return response(result);
+    if (String(url).includes("/near/status/")) {
+      if (!result) return response({ status: "paid" });
+      return response({ status: "settled", paymentId: new URL(url).pathname.split("/").at(-1),
+        receipt: change.staleStatus ? { outcome: "succeeded", refund: { status: "pending" } } : result.structuredContent.receipt });
+    }
+    if (String(url).includes("/near/result/")) {
+      if (change.unreadyPage) return Response.json({ status: "settled" }, { status: 202 });
+      if (change.markerOnlyInPageMetadata) return response({ ...result, content: [], hidden: result.content[0].text });
+      if (change.wrongPageReceipt) return response({ ...result, structuredContent: { receipt: { outcome: "succeeded" } } });
+      return response(result);
+    }
     const req = JSON.parse(init.body); seen.push(req);
     const ok = value => response({ jsonrpc: "2.0", id: req.id, result: value });
     if (req.method === "initialize") return ok({ protocolVersion: "2025-06-18" });
@@ -55,7 +64,8 @@ async function fixture() {
     const events = [change.noProgress ? null : { jsonrpc: "2.0", method: "notifications/progress", params: { _meta: { [WORKFLOW_META_KEY]: workflow } } }, { jsonrpc: "2.0", id: req.id, result }].filter(Boolean);
     return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
   } };
-  return { config, deps, chain, change, seen, quotes: () => quotes, runs: () => runs, nextDay: () => { day += 86_400_000; } };
+  return { config, deps, chain, change, seen, quotes: () => quotes, runs: () => runs,
+    nextDay: () => { day += 86_400_000; chain.transfer(merchant, payer, 1n); } };
 }
 
 test("daily canary resumes an ambiguous broadcast, verifies the refund, and pays at most once per day", async () => {
@@ -65,10 +75,12 @@ test("daily canary resumes an ambiguous broadcast, verifies the refund, and pays
   await assert.rejects(runCheck(f.config, f.deps), /interrupted/);
   assert.equal(f.chain.sendTxCount, 1, "the payment landed despite a lost response");
   const retained = JSON.parse(readFileSync(join(f.config.stateDir, "state.json")));
+  const reads = f.chain.log.filter(row => row.params?.request_type === "view_account").length;
   const report = await runCheck(f.config, f.deps);
   assert.equal(report.ok, true); assert.equal(report.modelSteps, 2); assert.equal(f.quotes(), 1); assert.equal(f.runs(), 1);
   assert.equal(report.model, "openai/gpt-4.1-nano");
   assert.equal(f.chain.sendTxCount, 2, "one deposit and one refund; no replacement deposit");
+  assert.equal(f.chain.log.filter(row => row.params?.request_type === "view_account").length, reads, "an existing signed payment is reconciled without a new funding check");
   assert.equal(report.paymentTx, retained.signed.txHash);
   assert.equal(statSync(join(f.config.stateDir, "state.json")).mode & 0o777, 0o600);
   assert.doesNotMatch(readFileSync(join(f.config.stateDir, "latest.json"), "utf8"), /nq_quote|signedTxBase64|private_key/);
@@ -76,6 +88,30 @@ test("daily canary resumes an ambiguous broadcast, verifies the refund, and pays
   assert.equal(f.chain.sendTxCount, 2); assert.equal(f.runs(), 1);
   f.nextDay(); assert.equal((await runCheck(f.config, f.deps)).ok, true);
   assert.equal(f.chain.sendTxCount, 4); assert.equal(f.runs(), 2);
+});
+
+test("the payer cannot sign when the deposit fits but storage or gas does not", async t => {
+  for (const shortfall of ["storage", "gas"]) await t.test(shortfall, async () => {
+    const f = await fixture(), wallet = f.chain.accounts.get(f.config.payer);
+    wallet.balance = parseNearToYocto(shortfall === "storage" ? "0.004" : "0.01");
+    if (shortfall === "gas") f.chain.minGasPurchasePrice = "1000000000000000000";
+    await assert.rejects(runCheck(f.config, f.deps), error =>
+      error.report?.stage === "payer_funding" && /deposit, storage and gas/.test(error.message));
+    const state = JSON.parse(readFileSync(join(f.config.stateDir, "state.json")));
+    assert.equal(state.signed, undefined);
+    assert.equal(state.quote, undefined, "a quote that was never signed cannot block tomorrow's canary when it expires");
+    assert.equal(f.chain.sendTxCount, 0);
+    assert.equal(f.runs(), 0);
+    wallet.balance = parseNearToYocto("1");
+    f.chain.minGasPurchasePrice = "1000000000";
+    f.nextDay();
+    assert.equal((await runCheck(f.config, f.deps)).ok, true);
+    assert.equal(f.chain.sendTxCount, 2);
+    assert.equal(f.quotes(), 2);
+    assert.equal(f.runs(), 1);
+    assert.equal((await runCheck(f.config, f.deps)).reused, true);
+    assert.equal(f.chain.sendTxCount, 2, "a funded retry counts as this day's canary");
+  });
 });
 
 test("an unfinished retained graph keeps its original model and payment after a canary update", async () => {
@@ -90,6 +126,26 @@ test("an unfinished retained graph keeps its original model and payment after a 
   assert.equal(report.model, "z-ai/glm-5.3-flash");
   assert.equal(report.paymentTx, state.signed.txHash);
   assert.equal(f.chain.sendTxCount, 2); assert.equal(f.runs(), 1); assert.equal(f.quotes(), 1);
+});
+
+test("same-day canary reuse requires the live payment-page result and refund without paying or running again", async t => {
+  for (const fault of ["unreadyPage", "markerOnlyInPageMetadata", "wrongPageReceipt", "staleStatus"]) await t.test(fault, async () => {
+    const f = await fixture();
+    await runCheck(f.config, f.deps);
+    const file = join(f.config.stateDir, "state.json");
+    const completed = readFileSync(file, "utf8");
+    f.change[fault] = true;
+    const start = f.seen.length;
+    await assert.rejects(runCheck(f.config, f.deps), error => error.report?.stage === "payment_page");
+    assert.equal(f.chain.sendTxCount, 2);
+    assert.equal(f.runs(), 1); assert.equal(f.quotes(), 1);
+    assert.ok(f.seen.slice(start).every(req => req.params?.name !== "run_noodle"));
+    assert.equal(readFileSync(file, "utf8"), completed, "the verified prior payment is retained on a page failure");
+    assert.equal(JSON.parse(readFileSync(join(f.config.stateDir, "latest.json"))).ok, false);
+    f.change[fault] = false;
+    assert.equal((await runCheck(f.config, f.deps)).reused, true);
+    assert.equal(f.chain.sendTxCount, 2);
+  });
 });
 
 test("version-one canary checkpoints retain their original expected output and graph", async () => {

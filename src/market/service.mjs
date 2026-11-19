@@ -25,7 +25,7 @@ import { marketCreatorLiabilities } from "../funding-liabilities.mjs";
 import { createMarketFeeGuard, MARKET_PLATFORM_FEE_BPS } from "./fee-guard.mjs";
 import {
   readCatalog, fetchListingPrice, patchListingPrice, budgetFromPrice, recommendPrice, fmtUsd, usdMicros,
-  PRICE_REFRESH_SECONDS, PROBE_BRIEF,
+  PRICE_REFRESH_SECONDS, listingWorkflowPriceSample,
 } from "./catalog.mjs";
 
 /** The market's platform fee (GET /v1/platform/config: platform_fee_bps 500), taken from the price on acceptance. */
@@ -401,7 +401,7 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
     const wf = agent.defaultWorkflow;
     let r;
     try {
-      r = await runner.price({ graph: wf.graph, inputs: { [wf.inputName]: PROBE_BRIEF } }, { budgetUsd: 1e6 });
+      r = await runner.price(listingWorkflowPriceSample(wf), { budgetUsd: 1e6 });
     } catch (e) { L(`its workflow was not priced (${(e && e.message) || e})`); return null; }
     if (r.ok) {
       if (workflowProblem) { L(`its workflow can run again`); workflowProblem = null; }

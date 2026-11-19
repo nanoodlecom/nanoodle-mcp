@@ -114,9 +114,16 @@ test("Nano QR, waiting, expiry, paid, refund and polling copy stay on Nano while
     if (q === nearQuote) assert.ok(!Object.hasOwn(current, "amountAtomic"));
     if (q === usdcQuote) { assert.equal(current.asset, "USDC"); assert.ok(!Object.hasOwn(current, "amountYocto")); }
   }
+  quote.checkingPayment = true;
+  const checkingPage = await (await fetch(`${base}/pay/${originalId}`)).text();
+  assert.match(checkingPage, /id="pay-instructions" hidden/);
+  const checkingStatus = await (await fetch(`${base}/x402/status/${originalId}`)).json();
+  assert.equal(checkingStatus.status, "pending");
+  assert.equal(checkingStatus.checkingPayment, true);
+  assert.equal(checkingStatus.done, undefined);
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
   function page() {
-    const elements = new Map(["paybox", "status", "expiry"].map(id => [id, { textContent: "", innerHTML: "" }]));
+    const elements = new Map(["paybox", "pay-instructions", "status", "expiry"].map(id => [id, { textContent: "", innerHTML: "" }]));
     const fetched = [], watched = []; let polls = 0;
     const context = vm.createContext({ document: { getElementById: id => elements.get(id) }, Date,
       setTimeout() {}, EventSource: class { constructor(url) { watched.push(url); } addEventListener() {} close() {} },
@@ -131,6 +138,14 @@ test("Nano QR, waiting, expiry, paid, refund and polling copy stay on Nano while
     assert.doesNotMatch(rendered, /USDC|\bNEAR\b/);
     assert.match(rendered, status === "refunded" ? /returned to your wallet/ : ["paid", "consumed"].includes(status) ? /Paid/ : /expired/);
   }
+  const recording = page();
+  assert.equal(recording.context.apply("pending", true), false);
+  assert.equal(recording.elements.get("pay-instructions").hidden, true);
+  assert.equal(recording.elements.get("expiry").hidden, true);
+  assert.match(recording.elements.get("status").textContent, /Recording your Nano transfer/);
+  assert.equal(recording.context.apply("pending", true, true), false);
+  assert.match(recording.elements.get("status").textContent, /Checking Nano payment history/);
+  assert.equal(recording.context.apply("paid"), true);
   const p = page(); await p.context.poll();
   assert.deepEqual(p.watched, [`/x402/watch/${originalId}`]);
   assert.equal(p.fetched.length, 2);

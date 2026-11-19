@@ -154,24 +154,27 @@ float pays model invoices.
 ### Automatic transfer detection
 
 One shared watcher polls finalized NEAR blocks every two seconds. While quotes
-are outstanding it checks only the merchant's account changes, resolves receipt
-IDs with `EXPERIMENTAL_receipt_to_tx`, and runs the same FINAL payment verifier.
+are outstanding it checks the merchant's account changes and includes the
+USDC contract when a quote uses it. It resolves receipt IDs with
+`EXPERIMENTAL_receipt_to_tx` and runs the same FINAL payment verifier.
 An exact amount matching a quote is accepted automatically; the caller does not
 need to paste a transaction hash. A payment must be in a block created after
 its quote for automatic matching. A late exact payment for a retained quote is
 refunded in full. An unmatched top-up is not treated as a workflow purchase.
 Wrong-amount payments can still be confirmed explicitly for a full refund.
 
-The processed block cursor is durable. RPC failures leave it unchanged and
-retry with backoff; restarts catch up, and an existing quote is backfilled when
+The processed block cursor is durable. If an RPC returns malformed discovery
+data or lacks the requested receipt or historical block hash, the watcher
+tries another configured RPC. When no peer can complete the read, the cursor
+stays unchanged and the watcher retries with backoff. Restarts catch up, and an existing quote is backfilled when
 the watcher is first introduced. Re-reading a receipt cannot spend twice: the
 payment gate keeps the consumed transaction hashes. `GET /near/health` reports
 the watcher cursor and status without exposing workflow inputs.
 
-The RPC must support `EXPERIMENTAL_changes` and `EXPERIMENTAL_receipt_to_tx`
-(including receipt-to-transaction tracking). Public FastNEAR RPC was checked
-read-only on mainnet on 2026-11-13. An RPC without those methods leaves automatic
-detection unavailable; the payment page's explicit confirmation remains usable.
+Automatic detection needs an RPC that supports `EXPERIMENTAL_changes` and
+`EXPERIMENTAL_receipt_to_tx` with receipt-to-transaction tracking. Public
+FastNEAR RPC was checked read-only on mainnet on 2026-11-13. Explicit
+confirmation remains available when transaction verification is healthy.
 
 ### Live mainnet verification
 
@@ -934,6 +937,9 @@ Quote record:
 
 Refund record: `{ id, paymentId, to, amountYocto, reason, status: "queued"|"signed"|"sent"|"failed_permanent", txHash, signedTxBase64, nonce, blockHash, signedAt, attempts, nextAttemptAt, lastError, createdAt, sentAt, finishedAt }`.
 The file also keeps `meta.lastNonce`, the last refund nonce this server signed.
+Renewals retain `replacementNonce` and `supersededTxHashes`.
+`outcomeUnverified` keeps the monitoring alert active across RPC errors until
+the refunder verifies a final outcome.
 
 Rules that make restarts safe:
 
@@ -1024,7 +1030,7 @@ a keyed endpoint first and keep a public one as the fallback.
 
 ## Refunds
 
-Refunds are native transfers from the merchant account. A queue in the server sends them
+Refunds are transfers in the payment asset from the merchant account. A queue in the server sends them
 one at a time.
 
 1. **Persist the owed refund as `queued`** before touching the network, so an RPC outage
@@ -1039,16 +1045,17 @@ one at a time.
    (for example, the payer deleted its account after paying) is `failed_permanent` and
    logged for the operator; the NEAR is back in the merchant account.
 4. If the broadcast fails, retry the **same bytes** with backoff (30 s up to 10 min).
-   Before signing again, check the old hash with `tx` (`wait_until: "NONE"`). A new
-   transaction is signed only when the old hash is unknown **and** the network rejected it as
-   `Expired` (its block hash is more than about a day old) or `InvalidNonce` **and** the old
-   transaction was signed less than 36 hours ago. Regular RPC nodes forget transactions after
-   a few epochs, so for an older record "unknown" proves nothing: it is marked
-   `failed_permanent` with `lastError: "UNPROVABLE"` and logged, so the operator checks an
-   explorer (or an archival RPC) instead of the server risking a second refund.
+   On expiry or a nonce rejection, look up every retained transaction hash at
+   `FINAL`. A recent expired transaction can renew its block reference using
+   its original signer and nonce when the finalized access key still permits
+   that nonce. Store the renewed hash and retain the original for reconciliation.
+   A nonce rejection with an unknown outcome retains the original refund for
+   status checks and alerts the operator. Older replacements with unproven
+   nonce history use status checks alone.
 5. After 100 failed attempts, the refund is marked `failed_permanent` and logged for the
-   operator. The money stays in the merchant account, and the receipt says to contact the
-   operator.
+   operator. Check the original transaction history on an archival RPC or
+   explorer before making a replacement. An old hash can be absent from a
+   regular RPC node's history.
 
 The merchant pays the refund's gas, about 0.000045 NEAR per plain transfer (the
 transaction and its receipt each burn 0.0000223 NEAR at testnet's minimum gas price, as
@@ -1124,9 +1131,8 @@ These are deliberate cuts for this version.
   pruned is answered "unknown payment id"; the NEAR stays in the merchant account and the
   operator must return it by hand.
 - No per-client rate limit on free quotes and `price_noodle` (see Quote spam).
-- The refund signer must be the only user of the merchant key. Another wallet sending from
-  the same key can make a signed refund's nonce stale; the server then re-signs it (see
-  [Refunds](#refunds)), which is safe but slower.
+- Reserve the merchant key for the refund signer. Another wallet using the
+  same key can consume a nonce and require [refund reconciliation](#refunds).
 
 ## Module layout
 

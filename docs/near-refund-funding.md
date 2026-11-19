@@ -29,6 +29,13 @@ native customer principal, storage, conservative fees for every actual refund,
 and the existing 0.05 NEAR operating float before admitting model work. Quotes
 also check capacity for one new refund in their chosen asset.
 
+USDC refreshes and new quotes verify the merchant's token balance and
+storage registration at the same finalized block. The public USDC proof
+expires independently after 60 seconds. With zero outstanding USDC debt,
+a missing token view or registration closes USDC quotes while native NEAR
+remains eligible. If a paid USDC obligation needs an unavailable token
+balance, the shared funding check pauses admission until it can verify coverage.
+
 Fee prepayment uses the greater of the block gas price and the protocol's
 minimum gas purchase price. It includes receipt/action fees, implicit-account
 creation and a full-access key for a native refund, and the FT function-call and
@@ -50,6 +57,11 @@ signing. A blocked fresh signature leaves the existing unsigned debt and does
 not consume a nonce. Already signed transfers remain queryable and retry the
 same bytes, even while fresh signing is paused.
 
+Expiry renewal keeps the original access key and nonce. The refunder checks
+the hash and signer fields in the saved transaction before changing its block
+reference. If a node rejects the nonce and the transfer remains unverified,
+the debt stays recorded and the read-only monitor alerts immediately.
+
 ## Completion and restart
 
 An outgoing result must be FINAL and match the stored transaction hash, sender,
@@ -69,10 +81,13 @@ The controller refreshes every 30 seconds and expires its public health after
 60 seconds. `/near/health` exposes only enforcement, time, fixed error codes and
 coverage/capacity booleans. The five-minute no-inference monitor verifies those
 fields and independently reads the actual account, fee floor, obligations and
-balances. Its reports show watcher health, unverified or stale refund funding,
-confirmed shortfalls and per-asset capacity separately. Unnamed RPC errors can
-fall back to the other qualified endpoint on watcher and funding reads. The
-monitor never signs, generates work, runs inference or retries a refund.
+balances. It rereads the ledger after retrieving the account proof and
+requires a finalized block at or above the latest persisted refund checkpoint.
+It independently checks the extra fee for a new quote on each asset. Its reports
+show watcher health, unverified or stale refund funding, confirmed shortfalls
+and per-asset capacity separately. Unnamed RPC errors and balances below the
+refund checkpoint can fall back to another qualified endpoint. The monitor
+never signs, generates work, runs inference or retries a refund.
 
 Offline fixtures cover simultaneous payments, gas/price changes, unavailable
 funding, refund priority, exhausted nonces, same-payment resume, false/nonfinal

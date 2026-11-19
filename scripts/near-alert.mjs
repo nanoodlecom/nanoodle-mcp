@@ -3,7 +3,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
 import { request as httpRequest } from "node:http";
 import { selectFundingPause } from "../src/funding-report.mjs";
 import { atomicJson } from "./near-check.mjs";
@@ -18,6 +17,7 @@ export const BACKUP_UNIT = "nanoodle-backup.service";
 export const BACKUP_TEST_UNIT = "nanoodle-backup-alert-test.service";
 export const EMBER = "bits255.dots.ada_20261002";
 const safe = value => /^[a-zA-Z0-9_.:-]{1,100}$/.test(value || "") ? value : "unknown";
+const admissionLabels = { nano: "Nano", near: "NEAR", usdc: "USDC", market: "Market" };
 
 export function failureEvent(env, latest, now = Date.now()) {
   if (!env.MONITOR_UNIT) return null; // A retry timer never invents another incident.
@@ -26,14 +26,28 @@ export function failureEvent(env, latest, now = Date.now()) {
   const operational = [OPERATIONAL_UNIT, OPERATIONAL_TEST_UNIT].includes(env.MONITOR_UNIT);
   const backup = [BACKUP_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT);
   const test = [TEST_UNIT, MARKET_TEST_UNIT, OPERATIONAL_TEST_UNIT, BACKUP_TEST_UNIT].includes(env.MONITOR_UNIT);
-  const freshFailure = !backup && !test && latest?.ok === false && Math.abs(now - Date.parse(latest.checkedAt)) < 3_600_000;
+  // A timeout or startup failure can leave the previous report in place.
+  // Only the failed invocation can provide the issue scope and incident ID.
+  const matchingOperationalRun = latest?.v === 1 && latest.invocationId === env.MONITOR_INVOCATION_ID
+    && env.MONITOR_SERVICE_RESULT === "exit-code" && env.MONITOR_EXIT_CODE === "exited" && env.MONITOR_EXIT_STATUS === "1";
+  const freshFailure = !backup && !test && latest?.ok === false && Math.abs(now - Date.parse(latest.checkedAt)) < 3_600_000
+    && (!operational || matchingOperationalRun);
   const stage = backup ? "backup" : freshFailure ? safe(latest.stage) : "service";
   const issues = Array.isArray(latest?.checks) ? latest.checks : [];
+  const admission = operational && freshFailure && stage !== "preflight" ? latest.admission : null;
+  const scoped = Object.keys(admissionLabels).every(key => typeof admission?.[key] === "boolean");
+  const affected = Object.entries(admissionLabels).filter(([key]) => admission?.[key] === false).map(([, label]) => label);
+  const advisory = scoped && affected.length === 0;
+  const headline = !scoped ? "Nanoodle operational readiness check FAILED. Payment and Market readiness could not be verified."
+    : advisory ? "Nanoodle readiness advisory. Nano, NEAR, USDC, and Market passed their admission checks."
+    : `Nanoodle admission checks failed for ${affected.join(", ")}.`;
+  const issueCodes = freshFailure && issues.filter(c => c?.ok === false).slice(0, 12)
+    .map(c => `${safe(c.stage)}=${safe(c.code)}`).join(", ");
   const eventId = operational && freshFailure && /^[a-f0-9]{32}$/.test(latest.incidentId || "") ? latest.incidentId : env.MONITOR_INVOCATION_ID;
   return { messageId: "near_check_" + createHash("sha256").update(env.MONITOR_UNIT + ":" + eventId).digest("hex").slice(0, 40), test,
     text: [test ? `TEST ALERT — Nanoodle ${backup ? "backup" : operational ? "operational readiness" : market ? "Market" : "NEAR"} check notification drill. This is not a production outage.`
         : backup ? "Nanoodle encrypted recovery backup FAILED (no inference)."
-        : operational ? "Nanoodle operational readiness check FAILED (every five minutes, no inference)."
+        : operational ? `${headline} The monitor runs every five minutes without inference.`
         : market ? "Nanoodle NEAR AI Market availability check FAILED (every 15 minutes)." : "Nanoodle NEAR MCP daily check FAILED.",
       `Site: https://${market ? "market.near.ai" : "near.nanoodle.com"}. Time: ${new Date(now).toISOString()}.`,
       `Stage: ${stage}. systemd result: ${safe(env.MONITOR_SERVICE_RESULT)}; exit: ${safe(env.MONITOR_EXIT_CODE)}/${safe(env.MONITOR_EXIT_STATUS)}.`,
@@ -41,7 +55,7 @@ export function failureEvent(env, latest, now = Date.now()) {
         : operational ? "Inspect /var/lib/nanoodle-operational-check/latest.json and journalctl -u nanoodle-operational-check.service on 159.195.17.119."
         : `Inspect /var/lib/nanoodle-near-check/${market ? "market-latest.json" : "latest.json"} and journalctl -u ${market ? MARKET_UNIT : CHECK_UNIT} on 159.195.17.119.`,
       backup ? "Confirm the app and its original timers resumed. Preserve payment state and keep the private recovery key off the VPS. This capture executes no models or transfers."
-        : operational ? `Issues: ${freshFailure ? issues.filter(c => !c.ok).slice(0, 12).map(c => `${safe(c.stage)}=${safe(c.code)}`).join(", ") || "service" : "service"}. No payment or workflow is executed by this probe. Preserve money state; do not blindly retry transfers or paid jobs.`
+        : operational ? `Issues: ${issueCodes || "service"}.${advisory ? "" : " Keep existing payment and workflow state for recovery."}`
         : market ? "Read-only probes cover the Market site, API and four published Nanoodle listings with live pricing. This check does not hire agents or run inference."
         : "Payment state is durable: resume the same run; do not send a replacement deposit blindly.",
       ...(test ? ["Mikkel requested this test. Please claim and acknowledge this message in Babel, then reply to it confirming receipt. No repair or paid workflow is requested."] : []),
@@ -134,7 +148,7 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
   return result;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+if (import.meta.main) {
   const config = { stateDir: process.env.CHECK_STATE_DIR || "/var/lib/nanoodle-near-check", url: process.env.BABEL_URL,
     host: process.env.BABEL_HOST, tokenFile: process.env.BABEL_TOKEN_FILE, conversation: process.env.BABEL_CONVERSATION, sender: process.env.BABEL_SENDER };
   try {

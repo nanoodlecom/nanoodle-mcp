@@ -411,6 +411,7 @@ async function main() {
           maxUsd,
           maintenance,
           fundingLiabilities: context => fundingSources ? fundingSources.liabilitiesRaw(context) : 0n,
+          nanoTransferClaimed: (hash, id) => fundingSources?.nanoTransferClaimed(hash, id) === true,
           requireFunding: paidFunding && !apiKey,
           protectTransfers: guardedFunding,
           verifyRpcReads: guardedFunding,
@@ -676,10 +677,13 @@ async function main() {
         requireExistingState: requiredState?.requireExisting === true,
         fundRun: !apiKey ? wallet.ops.withFunding : null,
         canQuote: () => !fundingSources || fundingSources.ready(),
+        verifyPaymentReads: guardedFunding,
         log: (line) => console.error("nanoodle-mcp: " + line),
         usage: usageLog, maintenance,
       });
-      fundingSources?.registerNano(gate.fundingLiabilitiesRaw);
+      fundingSources?.registerNano(gate.fundingLiabilitiesRaw, gate.nanoTransferClaims);
+      if (maintenance) await maintenance.recover(() => gate.resume());
+      else await gate.resume();
       const nanoWrapped = gate.wrapRegistry(registry);
       ({ listTools, callTool } = nanoWrapped);
       const nanoInstructions =
@@ -935,7 +939,8 @@ async function startNearMode({
 
   let ledger;
   try {
-    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant, requireExisting: requireExistingState });
+    ledger = near.openNearLedger({ file: join(outDir, "near-state.json"), network, merchant,
+      requireExisting: requireExistingState, watchPaymentHistory: true });
   } catch (e) { fail(e.message); }
   // NEAR/USD, XNO/USD and the swap rate derived from them. When runs are paid
   // from the Nano wallet, XNO/USD is required to quote; with an API key it is informational.
@@ -979,14 +984,16 @@ async function startNearMode({
     catch (e) { log(`USDC payments are off (${e.code || "unavailable"}): ${e.message}. Native NEAR continues.`); }
   }
   const usdc = { enabled: usdcEnabled, tokenContract: usdcToken, decimals: 6 };
-  const refundFunding = near.createNearFunding({ rpc, ledger, network, accountId: merchant, publicKey: signer.publicKey, usdcToken });
+  const refundFunding = near.createNearFunding({ rpc, ledger, network, accountId: merchant, publicKey: signer.publicKey,
+    usdcToken, usdcQuotesEnabled: usdcEnabled });
   await refundFunding.refresh();
   const fundingTimer = setInterval(() => { refundFunding.refresh().catch(() => {}); }, 30_000);
   fundingTimer.unref();
   const refunder = near.createRefunder({ rpc, signer, accountId: merchant, ledger, log, usdcToken,
     beforeSign: refundFunding.beforeSign, beforeComplete: refundFunding.beforeComplete, maintenance });
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
-  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance }) : null;
+  const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance,
+    marketPayoutMatches: payout => fundingSources?.marketPayoutMatches(payout) ?? true }) : null;
   let watcher = null;
   const gate = createNearGate({
     merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled, authorPayouts,
@@ -1023,6 +1030,7 @@ async function startNearMode({
     "For a human payer, show payment.payUrl and immediately open payment.watchUrl to monitor payment. " +
     "The user connects a wallet and approves the deposit there. When the monitor closes with status paid and done:true, " +
     "repeat the original tool call with identical arguments plus _payment_id; continue automatically without another confirmation. " +
+    "If the quote expires with checkingPayment:true, keep monitoring the same paymentId until done:true. A submitted transfer can be confirmed with its original hash and sender. " +
     "Alternatively, an agent paying directly can send ONE native NEAR transfer of exactly payment.amountYocto to payment.payTo " +
     "(one Transfer action, nothing else), then call the same tool again with identical arguments plus _payment_id, _payment_tx " +
     "(the transaction hash) and _payment_sender (the account you paid from). " +
