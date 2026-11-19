@@ -181,7 +181,7 @@ export function createBidder({ client, runner, state, priceFor, budgetFor, maxBi
       if (job.jobKind !== "standard" || (job.status !== "open" && job.status !== "filling") || job.isPrivate) continue;
       if (typeof job.description !== "string" || !HAS_BLOCK.test(job.description)) continue; // not ours: not recorded, not logged
       try { if (await consider(job)) placed++; } catch (e) {
-        if (["MARKET_FEE_CHANGED", "MARKET_FEE_UNAVAILABLE"].includes(e?.code)) throw e;
+        if (["MARKET_FEE_CHANGED", "MARKET_FEE_UNAVAILABLE", "STATE_DURABILITY_UNCERTAIN"].includes(e?.code)) throw e;
         log(`job ${short(job.jobId)}: not considered (${String((e && e.message) || e).slice(0, 160)}); tried again at the next pass`);
       }
     }

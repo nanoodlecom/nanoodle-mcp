@@ -27,7 +27,7 @@ import {
   closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync, unlinkSync, rmSync, chmodSync,
 } from "node:fs";
 import { join } from "node:path";
-import { writePrivateStateSync } from "../private-state.mjs";
+import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../private-state.mjs";
 import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
 
@@ -121,12 +121,15 @@ export function openMarketState({ dir, now = Date.now, lock = true, requireExist
     return text !== null && parseLock(text).nonce === held.nonce;
   };
   const file = join(dir, STATE_FILE);
+  const releaseLock = () => {
+    if (lockPath && ownsLock()) try { unlinkSync(lockPath); } catch { /* preserve uncertain ownership */ }
+  };
 
   let state;
   let text = null;
   try { text = readFileSync(file, "utf8"); } catch (e) {
     if (e.code !== "ENOENT" || requireExisting) {
-      if (held && ownsLock()) { try { unlinkSync(lockPath); } catch { /* preserve uncertain ownership */ } }
+      releaseLock();
       throw new Error(`market state ${file} could not be read; refusing to start empty`);
     }
   }
@@ -134,30 +137,48 @@ export function openMarketState({ dir, now = Date.now, lock = true, requireExist
     state = { v: 1, assignments: {} };
   } else {
     try { state = JSON.parse(text); } catch {
+      releaseLock();
       throw new Error(`market state ${file} is not valid JSON; refusing to start empty (it may record a paid run). Inspect or move it aside.`);
     }
     if (!state || state.v !== 1 || typeof state.assignments !== "object" || state.assignments === null) {
+      releaseLock();
       throw new Error(`market state ${file} has an unknown shape; refusing to start empty.`);
     }
+    // A previous writer may have stopped after replacing the file. Sync the
+    // directory entry before acting on the snapshot selected during recovery.
+    try { syncPrivateStateParentSync(file); }
+    catch (error) { releaseLock(); throw new PrivateStateDurabilityError(error); }
   }
 
-  let closed = false, persistenceFailed = false;
-  const persist = () => {
+  let closed = false, persistenceFailed = false, uncertainCommit = null;
+  const assertDurable = () => {
+    if (uncertainCommit) throw uncertainCommit;
+  };
+  const persist = assignments => {
     try {
+      assertDurable();
       if (closed) throw new Error("market state is closed");
       if (!ownsLock()) {
         closed = true;
         throw new Error(`${lockPath} is no longer this process's lock (another worker took the state directory over); stopping without writing`);
       }
-      writePrivateStateSync(file, JSON.stringify(state, null, 1), { temporary: `${file}.${process.pid}.tmp` });
+      const next = { ...state, assignments };
+      writePrivateStateSync(file, JSON.stringify(next, null, 1), { temporary: `${file}.${process.pid}.tmp` });
+      state = next;
       persistenceFailed = false;
-    } catch (error) { persistenceFailed = true; throw error; }
+    } catch (error) {
+      persistenceFailed = true;
+      if (error instanceof PrivateStateDurabilityError) uncertainCommit = error;
+      throw error;
+    }
   };
 
   return {
     dir,
     file,
-    persistenceStatus: () => ({ ok: !persistenceFailed && (closed || ownsLock()), pendingWrites: 0 }),
+    assertDurable,
+    persistenceStatus: () => ({ ok: !persistenceFailed && (closed || ownsLock()), pendingWrites: 0,
+      ...(uncertainCommit && { durabilityUncertain: true }) }),
     outDir: (id) => {
       const d = join(dir, "out", String(id).replace(/[^\w.-]+/g, "_"));
       mkdirSync(d, { recursive: true, mode: 0o700 });
@@ -169,37 +190,37 @@ export function openMarketState({ dir, now = Date.now, lock = true, requireExist
     create(id, fields) {
       if (state.assignments[id]) throw new Error(`assignment ${id} already has a record`);
       const t = now();
-      state.assignments[id] = { id, createdAt: t, updatedAt: t, attempts: 0, nextAttemptAt: 0, lastError: null, ...structuredClone(fields) };
-      persist();
-      return structuredClone(state.assignments[id]);
+      const record = { id, createdAt: t, updatedAt: t, attempts: 0, nextAttemptAt: 0, lastError: null, ...structuredClone(fields) };
+      persist({ ...state.assignments, [id]: record });
+      return structuredClone(record);
     },
     /** Merge fields into a record and write it to disk before returning. */
     update(id, fields) {
       const cur = state.assignments[id];
       if (!cur) throw new Error(`no record for assignment ${id}`);
-      state.assignments[id] = { ...cur, ...structuredClone(fields), updatedAt: now() };
-      persist();
-      return structuredClone(state.assignments[id]);
+      const record = { ...cur, ...structuredClone(fields), updatedAt: now() };
+      persist({ ...state.assignments, [id]: record });
+      return structuredClone(record);
     },
     /** Drop records (and their files) that finished before `before` (ms). */
     prune(before, isFinished) {
-      let n = 0;
-      for (const [id, r] of Object.entries(state.assignments)) {
-        if (isFinished(r) && (r.finishedAt || r.updatedAt) < before) {
-          delete state.assignments[id];
-          try { rmSync(join(dir, "out", String(id).replace(/[^\w.-]+/g, "_")), { recursive: true, force: true }); } catch { /* best effort */ }
-          n++;
-        }
+      const expired = Object.entries(state.assignments)
+        .filter(([, r]) => isFinished(r) && (r.finishedAt || r.updatedAt) < before);
+      if (!expired.length) return 0;
+      const assignments = { ...state.assignments };
+      for (const [id] of expired) delete assignments[id];
+      persist(assignments);
+      for (const [id] of expired) {
+        try { rmSync(join(dir, "out", String(id).replace(/[^\w.-]+/g, "_")), { recursive: true, force: true }); } catch { /* best effort */ }
       }
-      if (n) persist();
-      return n;
+      return expired.length;
     },
     close() {
       if (closed && !held) return;
       if (!closed && !ownsLock()) persistenceFailed = true;
       closed = true;
       // Only our own lock is removed; one another process holds now stays.
-      if (lockPath && ownsLock()) try { unlinkSync(lockPath); } catch { /* gone */ }
+      releaseLock();
     },
   };
 }

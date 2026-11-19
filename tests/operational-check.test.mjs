@@ -1646,6 +1646,7 @@ test("retained paid output checks file metadata on both payment rails without di
 test("the no-inference check distinguishes wallet read refusal from missing funding enforcement", async () => {
   for (const [stored, expected] of [["nano-rpc-frontier-regressed", "nano-rpc-frontier-regressed"],
     ["nano-checkpoint-unproven", "nano-checkpoint-unproven"], ["nano-checkpoint-storage-unavailable", "nano-checkpoint-storage-unavailable"],
+    ["funding-state-durability-uncertain", "funding-state-durability-uncertain"],
     ["funding-state-unavailable", "funding-state-unavailable"], ["PRIVATE_PROVIDER_DETAILS", "funding-state-unavailable"]]) {
     const f = fixture();
     f.states["/state/funding-health.json"] = { v: 1, checkedAt: new Date(NOW).toISOString(), ok: false, code: stored };
