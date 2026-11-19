@@ -136,6 +136,7 @@ export function createNearGate({
   usdcEnabled = false,
   authorPayouts = null,
   canQuote = () => true,
+  canFundQuote = null,
   fundRun = null,
   maintenance = null,
   runTimeoutMs = undefined,
@@ -145,6 +146,7 @@ export function createNearGate({
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (canFundQuote !== null && typeof canFundQuote !== "function") throw new TypeError("canFundQuote must be a function or null");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   if (maintenance !== null && typeof maintenance.run !== "function") throw new TypeError("maintenance must provide operation admission and accounting");
   if (refundFunding !== null && ["quote", "run"].some(k => typeof refundFunding[k] !== "function")) throw new TypeError("refundFunding needs quote and run checks");
@@ -515,6 +517,13 @@ export function createNearGate({
         payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
         settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
       };
+      if (canFundQuote && (fundRun || author)) {
+        const { maxRaw, overheadRaw } = nearRunFundingBudget({ ...record, paidYocto: record.amountYocto });
+        const requiredRaw = (fundRun ? maxRaw : 0n) + overheadRaw;
+        if (canFundQuote(requiredRaw) !== true) {
+          return errResult("Cannot quote right now: the shared Nano wallet cannot cover this workflow. Try again shortly. Nothing was quoted or charged.");
+        }
+      }
       ledger.putQuote(record);
       ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source, ...rateExtras(r) });
       const likelyCharge = usdToYocto(pricing.likelyChargeUsd, r, "ceil");
