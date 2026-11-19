@@ -114,6 +114,7 @@ export const SFW_INSTRUCTIONS = "Is this image safe for work? Yes means no nudit
 export const TEXT_RATES = Object.freeze({
   "qwen/qwen3.8-27b-novelist": [0.1, 0.6],
   "deepseek/deepseek-v4.1-flash-1017": [0.1, 0.6],
+  // Delisted 2026-11-18; row retained so a stale mounted graph still prices.
   "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15],
   "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
   "qwen/qwen3.8-27b-antislop": [0.1, 0.6],

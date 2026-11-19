@@ -9,7 +9,7 @@ import { loadTools } from "../src/tools.mjs";
 import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback, echoesInstruction, isParagraphOutput, assessWriterOutput } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
-const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "TheDrummer/Cydonia-24B-v4.3", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
+const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "gemma-4-12b-it-starry-ocean", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
 
 function judge(winner, order, why = "ok") {
   return JSON.stringify({
@@ -993,14 +993,14 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
   const lines = {
     "qwen/qwen3.8-27b-novelist": "NOVELIST-LINE",
     "deepseek/deepseek-v4.1-flash-1017": "DEEPSEEK-LINE",
-    "TheDrummer/Cydonia-24B-v4.3": "CYDONIA-LINE",
+    "gemma-4-12b-it-starry-ocean": "STARRY-LINE",
     "qwen/qwen3.8-27b-antislop": "ANTISLOP-LINE",
     "inception/mercury-3": "MERCURY-LINE",
   };
   const labels = {
     "qwen/qwen3.8-27b-novelist": "A",
     "deepseek/deepseek-v4.1-flash-1017": "B",
-    "TheDrummer/Cydonia-24B-v4.3": "C",
+    "gemma-4-12b-it-starry-ocean": "C",
     "qwen/qwen3.8-27b-antislop": "D",
     "inception/mercury-3": "E",
   };
@@ -1036,7 +1036,7 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
   assert.equal(rebuildHumanizeResult(wf, result, record), null);
   const adapted = JSON.parse(result.get("Decider (GLM-5.3)"));
   assert.equal(adapted.winner, "C");
-  assert.equal(adapted.text, "CYDONIA-LINE", "the consumer adapter attaches the winning writer's text");
+  assert.equal(adapted.text, "STARRY-LINE", "the consumer adapter attaches the winning writer's text");
   for (const [letter, id] of Object.entries(nodes)) {
     const row = adapted.ranked.find((r) => r.writer === letter);
     assert.equal(row.text, result.nodes[id].out.text);
