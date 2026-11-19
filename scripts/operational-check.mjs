@@ -740,7 +740,7 @@ export async function runOperationalCheck(config, deps = {}) {
       need(age <= NEAR_DISCOVERY_MAX_PROOF_AGE_MS, "near-discovery-canary-proof-stale");
       try { base58Decode(report.paymentTx, 32); }
       catch { throw new CheckError("near-discovery-canary-proof-invalid"); }
-      return { paymentTx: report.paymentTx, payer };
+      return { paymentTx: report.paymentTx, payer, outputSha256: report.outputSha256 };
     }, []);
     if (sample) await check("near-payment-discovery", async () => {
       need(near, "near-discovery-finalized-anchor-unavailable");
@@ -832,9 +832,15 @@ export async function runOperationalCheck(config, deps = {}) {
           const result = await response.json(), receipt = result?.structuredContent?.receipt;
           const statusCopy = await statusReceipt;
           need(!result?.isError && matchesLedger(receipt) && (!statusCopy || isDeepStrictEqual(receipt, statusCopy)), code);
-          const output = Array.isArray(result.content) && result.content.find(part => part?.type === "text")?.text;
+          const text = Array.isArray(result.content) && result.content.find(part => part?.type === "text")?.text;
+          const output = typeof text === "string" ? text.trim() : "";
           // An eviction notice can accompany a valid receipt after restart.
-          need(typeof output === "string" && /^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output.trim()), "near-settled-payment-output-unavailable");
+          need(/^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output), "near-settled-payment-output-unavailable");
+          const { outputSha256 } = sample;
+          if (outputSha256 !== undefined) {
+            need(typeof outputSha256 === "string" && /^[a-f0-9]{64}$/.test(outputSha256), "near-settled-payment-output-proof-invalid");
+            need(createHash("sha256").update(output).digest("hex") === outputSha256, "near-settled-payment-output-mismatch");
+          }
         }, []),
       ]);
     }
