@@ -1,0 +1,113 @@
+{
+  "name": "nanoodle",
+  "description": "Saved or agent-composed nanoodle workflows as MCP tools: BYOK, pay per call in Nano, or pay in NEAR",
+  "version": "0.7.0",
+  "documentationUrl": "https://github.com/nanoodlecom/nanoodle-mcp#readme",
+  "iconUrl": "https://nanoodle.com/icon-512.png",
+  "provider": {
+    "organization": "nanoodle",
+    "url": "https://nanoodle.com"
+  },
+  "supportedInterfaces": [
+    {
+      "url": "https://mcp.nanoodle.com/mcp",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false,
+    "extendedAgentCard": false,
+    "extensions": [
+      {
+        "uri": "https://nanoodle.com/identity/live-transport",
+        "description": "Live wire protocol at the declared interface is MCP (streamable HTTP, JSON-RPC). This card is published for discovery; an A2A task-submission interface is not live yet and is not claimed here.",
+        "required": false,
+        "params": {
+          "liveTransport": "mcp-streamable-http",
+          "a2aTaskInterface": "not-live"
+        }
+      }
+    ]
+  },
+  "defaultInputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json",
+    "image/*",
+    "video/*",
+    "audio/*"
+  ],
+  "skills": [
+    {
+      "id": "run-saved-workflow",
+      "name": "Run a saved nanoodle workflow",
+      "description": "Run a workflow graph saved from the nanoodle.com editor (or a nanoodle.com share link) as a single tool call: multi-model text, image, video, audio and 3D pipelines executed end to end, with the result returned to the caller.",
+      "tags": [
+        "mcp",
+        "workflow",
+        "image",
+        "video",
+        "audio",
+        "3d",
+        "multimodal"
+      ],
+      "examples": [
+        "Run this nanoodle share link with the prompt 'a lighthouse at dusk, painterly'",
+        "Run my saved 'product-shot' workflow on this photo"
+      ]
+    },
+    {
+      "id": "compose-custom-workflow",
+      "name": "Compose and run a custom workflow",
+      "description": "Compose a workflow graph inline (text → image → video chains and branches over the NanoGPT model catalog), get a free itemized price, pay per run, and receive the result. Custom composition is a NEAR-rail feature.",
+      "tags": [
+        "mcp",
+        "workflow",
+        "custom",
+        "near",
+        "pricing"
+      ],
+      "examples": [
+        "Build a workflow that turns this paragraph into an illustration, then a 5-second clip",
+        "Price a custom graph before I commit to running it"
+      ]
+    },
+    {
+      "id": "price-workflow",
+      "name": "Price a workflow before running it",
+      "description": "Free, itemized per-node quote for a saved or composed workflow, with a 30-minute validity window on the NEAR rail. No payment is taken for a quote.",
+      "tags": [
+        "pricing",
+        "quote",
+        "free"
+      ],
+      "examples": [
+        "What would this workflow cost to run?",
+        "Give me an itemized price for this graph"
+      ]
+    }
+  ],
+  "x-payment-rails": [
+    {
+      "rail": "nano-x402",
+      "status": "live"
+    },
+    {
+      "rail": "near",
+      "status": "live"
+    },
+    {
+      "rail": "base-usdc-x402",
+      "status": "pending"
+    },
+    {
+      "rail": "solana-usdc-x402",
+      "status": "pending"
+    }
+  ]
+}

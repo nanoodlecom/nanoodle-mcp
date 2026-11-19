@@ -17,10 +17,8 @@
  * Output tokens are sized from the request (maxChars,
  * or the draft length) plus a small slack, not from the model's output cap.
  * The decider's cap adds the ranking JSON and GLM reasoning tokens, which
- * share max_tokens. A caller that already chose writer and judge caps
- * (subnano_comment sizes them from the original draft) is priced at those
- * caps, so a shorter refined draft cannot shrink the hold below the request
- * that will actually be sent. Token counts are a realistic estimate, bytes /
+ * share max_tokens. Pricing honors explicit writer and judge caps so the hold
+ * covers the request that will be sent. Token counts are a realistic estimate, bytes /
  * 3.5. The deposit is that
  * charge times HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up, and
  * never below the charge. Prices are USD per million tokens: the public

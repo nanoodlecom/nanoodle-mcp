@@ -27,6 +27,14 @@ ID. For a named payer, set `CHECK_PAYER_PUBLIC_KEY` in the canary environment
 file. `CHECK_MAX_NEAR` configures the canary's default cap and the monitoring
 threshold together. The operational service's payer key file remains inaccessible.
 
+When the successful canary's discovery proof is configured, the five-minute
+probe also reads that run's settled payment page, status, event stream, and
+result. It checks that the deposit equals the charge plus the refund, verifies
+the completed graph in the status and event stream, and expects a canary marker
+in the result. The alert omits the checkout ID, receipt, and output. At the
+checkout retention limit, the probe stops reporting a checkout result and
+continues on-chain discovery for the lifetime of the proof.
+
 ## Installation on the production box
 
 Create a `nanoodle-check` system user. Generate a dedicated key with
@@ -245,8 +253,10 @@ Coverage:
   enabled. The probe distinguishes a local counter regression, a stalled
   confirmed count and a gap that keeps growing. A widening gap of at least
   50 blocks over at least ten minutes warns even while both counts advance.
-  Stable historical lag and missing samples do not carry a widening trend
-  forward. Wallet read quorum still determines Nano payment readiness.
+  The warning needs two increases and tolerates short plateaus between
+  them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
+  clear the trend. The elapsed time comes from the counter observations.
+  Wallet read quorum determines Nano payment readiness.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the

@@ -120,7 +120,7 @@ receives the brief, a buyer sets each with a line of its own, `Name: value`, any
 brief: `Style: 80s trip-hop bands that have a female singer and an awesome electric style`.
 The name is matched without regard to case; a list marker, Markdown bold and a full-width
 colon are accepted; the first line for a name wins. Those lines are taken out of the text
-that goes to the main input, and the "Started" message and the deliverable say which
+that goes to the main input, and the "Preparing your run" message and the deliverable say which
 inputs the buyer set. A name in the middle of a sentence, or with nothing after the colon,
 is ordinary text. An input the buyer does not set keeps the text in the graph file.
 
@@ -135,7 +135,7 @@ The worker reads what the buyer wrote (`90`, `90 seconds`, `2 min`, `2m30s`, `2:
 `about 3 minutes`; a bare number up to 10 is minutes), clamps it to `min`..`max`, and
 sends the workflow `"<n> seconds"`. With no line, or one it cannot read, it picks a length
 between `defaultMin` and `defaultMax`; the pick is derived from the assignment id, so one
-job always gets the same length. The "Started" message and the deliverable tell the buyer
+job always gets the same length. The "Preparing your run" message and the deliverable tell the buyer
 which length is aimed for and why.
 
 The song's Duration is a target, not a setting: Mureka 9.5 takes no length parameter
@@ -149,7 +149,7 @@ first run with Mureka 9.5 (2026-11-12) was asked for 120 seconds and came back a
   specific workflow.
 - The brief text is an input to the default graph's models, nothing more. It is priced and
   capped like any input (20,000 characters), and checked against the per-job budget.
-- The "Started" message and the deliverable both say the default workflow ran.
+- The "Preparing your run" message and the deliverable both say the default workflow ran.
 - At startup the worker prices the default graph once and refuses to start if it could
   never run (a model that is not priced, an estimated cost + 20% above the budget).
 
@@ -168,12 +168,12 @@ with the job brief embedded):
 
 | Situation | What the worker does | What the buyer sees |
 |---|---|---|
-| Plain words, no workflow block, and the worker has `--default-graph` | runs the default workflow with the brief as its input (the rows below apply to it too) | "Started" naming the default workflow; then the deliverable |
+| Plain words, no workflow block, and the worker has `--default-graph` | runs the default workflow with the brief as its input (the rows below apply to it too) | "Preparing your run" naming the default workflow; then the deliverable |
 | No request (and no default workflow), bad JSON, unknown keys, two candidate blocks | `POST /v1/assignments/{id}/decline` with `reason: "rejected"`, before `start` | a decline detail (≤ 1000 characters) that explains the format and shows an example; full refund |
 | Graph refused (node type, wiring, fields, inputs, short link, unpriceable model) | decline `rejected`, before `start` | every refusal, naming the node and what to use instead; full refund |
 | Estimated cost + 20% above the per-job budget (`OVER_BUDGET`) | decline `rejected`, before `start` | "this workflow's estimated cost plus 20% is $X; this listing covers at most $B — use cheaper models, fewer paid nodes or a lower maxTokens"; full refund |
 | NanoGPT catalog unreachable | retries with backoff; nothing is sent to the market | nothing yet |
-| Accepted | `POST /v1/assignments/{id}/start`, one message on the thread, one progress report, runs the priced graph once, uploads media (`POST /v1/files` → PUT → `POST /v1/files/{id}/complete`), `POST /v1/assignments/{id}/submit` | a "Started" message with the estimated model cost, the number of paid steps and the per-job budget; then the deliverable |
+| Accepted | `POST /v1/assignments/{id}/start`, one message on the thread, one progress report, runs the priced graph once, uploads media (`POST /v1/files` → PUT → `POST /v1/files/{id}/complete`), `POST /v1/assignments/{id}/submit` | a "Preparing your run" message with the estimated model cost, the number of paid steps and the per-job budget; then the deliverable |
 | Run fails | decline `reason: "failed"` | the provider's error for the failing step (any other error, such as a local disk error, is only logged for the operator: the buyer reads "The workflow run failed."), and a full refund; the model cost is the operator's |
 | Run finishes but every output is empty text (`EMPTY_RESULT`) | decline `reason: "failed"` | "the workflow finished but every output was empty text", with the hint to raise `maxTokens` or set `"reasoningEffort": "low"`; full refund. A reasoning model can spend its whole `maxTokens` thinking and return nothing. |
 | Worker restarted while the run was in flight | decline `reason: "failed"`; the run is **never** repeated | "the worker restarted while your workflow was running…"; full refund |
@@ -360,7 +360,7 @@ Start the worker ([Run the worker](#run-the-worker)). Then, signed in as yoursel
 `https://market.near.ai/a/<handle>` (your own draft opens even though Discover lists only
 live agents), click **Hire**, paste a brief from [The job brief](#the-job-brief), and
 confirm. The job appears under **Hiring → My Jobs**; within a poll interval the job page
-shows the "Started" message, then the deliverable, and the assignment reads `submitted`.
+shows the "Preparing your run" message, then the deliverable, and the assignment reads `submitted`.
 
 Also hire it once in plain words (with `--default-graph`, that delivers the default workflow's result), once
 with a broken workflow block, and once with an over-budget graph: the last two must come
