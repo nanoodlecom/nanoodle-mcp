@@ -9,6 +9,10 @@ function output(executable, args, input) {
   return execFileSync(executable, args, { encoding: 'utf8', input }).trim();
 }
 
+function isSourceRecovery() {
+  return process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' && process.env.SOURCE_ONLY === 'true';
+}
+
 function qualify(packReport, before) {
   const [packed] = JSON.parse(readFileSync(packReport, 'utf8'));
   const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
@@ -16,6 +20,13 @@ function qualify(packReport, before) {
   if (packed.name !== packageName || packed.filename !== packageName + '-' + version + '.tgz' ||
       manifest.name !== packageName || manifest.version !== version || !validVersion.test(version)) {
     throw new Error('Source version differs from the tested npm distribution');
+  }
+  if (isSourceRecovery()) {
+    if (process.env.REQUESTED_VERSION !== version) {
+      throw new Error('Requested source version differs from the tested npm distribution');
+    }
+    console.log('source_version=' + version);
+    return;
   }
   if (!before || before === '0'.repeat(40)) return;
   if (!/^[0-9a-f]{40}$/.test(before)) throw new Error('Expected the full commit before the main push');
@@ -46,13 +57,14 @@ function releaseRecord(tag) {
 }
 
 function publish(version) {
-  const { GITHUB_SHA: source, GITHUB_RUN_ID: run } = process.env;
+  const { GITHUB_SHA: source, GITHUB_RUN_ID: run, REQUESTED_VERSION: requested } = process.env;
+  const recovery = isSourceRecovery() && requested === version;
   if (
     process.env.GITHUB_REPOSITORY !== repository || process.env.GITHUB_REF !== 'refs/heads/main' ||
-    process.env.GITHUB_EVENT_NAME !== 'push' || !/^[0-9a-f]{40}$/.test(source) ||
+    (process.env.GITHUB_EVENT_NAME !== 'push' && !recovery) || !/^[0-9a-f]{40}$/.test(source) ||
     source !== output('git', ['rev-parse', 'HEAD']) || !validVersion.test(version)
   ) {
-    throw new Error('Expected a tested main push from ' + repository);
+    throw new Error('Expected a tested main release from ' + repository);
   }
   const tag = 'v' + version;
   const prerelease = version.includes('-');
@@ -81,7 +93,7 @@ function publish(version) {
     name: packageName + ' ' + tag,
     generate_release_notes: true,
     prerelease,
-    body: 'Tested source commit ' + source + '.\n\n[Node and packaging checks](https://github.com/' +
+    body: 'Tested GitHub source release from commit ' + source + '.\n\n[Node and packaging checks](https://github.com/' +
       repository + '/actions/runs/' + run + ')',
   };
   const record = JSON.parse(output(

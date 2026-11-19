@@ -16,6 +16,9 @@ export const OPERATIONAL_TEST_UNIT = "nanoodle-operational-check-alert-test.serv
 export const BACKUP_UNIT = "nanoodle-backup.service";
 export const BACKUP_TEST_UNIT = "nanoodle-backup-alert-test.service";
 export const EMBER = "bits255.dots.ada_20261002";
+// Each bridge call can take 20 seconds. Leave room for the unit's lock and
+// receipt verification within its five-minute startup timeout.
+const MAX_DELIVERIES = 8;
 const safe = value => /^[a-zA-Z0-9_.:-]{1,100}$/.test(value || "") ? value : "unknown";
 const admissionLabels = { nano: "Nano", near: "NEAR", usdc: "USDC", market: "Market" };
 
@@ -71,7 +74,10 @@ function recoveredFundingEvent(latest, now) {
   const checkedAt = Date.parse(latest?.checkedAt);
   const pause = selectFundingPause(latest?.fundingPause, Math.min(now, checkedAt));
   if (latest?.v !== 1 || pause?.recoveredAt == null || !selectFundingPause(pause, now)
-      || !Array.isArray(latest.checks) || !latest.checks.some(check => check?.stage === "runtime-funding" && check.ok === true)) return null;
+      || !Array.isArray(latest.checks)) return null;
+  const confirmed = ["runtime-funding", "nano-funding-evidence-freshness"]
+    .every(stage => latest.checks.find(check => check?.stage === stage)?.ok === true);
+  if (!confirmed) return null;
   const id = createHash("sha256").update(`funding-recovery:${pause.lastFailedAt}:${pause.recoveredAt}:${pause.code}`).digest("hex").slice(0, 40);
   return { messageId: "near_check_" + id, test: false, text: [
     "Nanoodle shared wallet funding paused and recovered.",
@@ -131,7 +137,7 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
     if (!existsSync(file)) atomicJson(file, { ...event, status: "pending", createdAt: new Date(now()).toISOString() });
   }
   if (enqueueOnly) return { ok: true, ...(event ? { messageId: event.messageId, test: event.test, persisted: true } : {}) };
-  let failed = 0, queued = 0, invalid = 0;
+  let queued = 0, invalid = 0;
   const pending = [];
   for (const name of readdirSync(dir).sort()) {
     if (!/^near_check_[a-f0-9]{40}\.json$/.test(name)) continue;
@@ -149,8 +155,10 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
   const rank = item => item.priority === "failure" ? (item.messageId === event?.messageId ? 0 : 1)
     : item.priority === "advisory" || item.test === true ? 3 : 2;
   const createdAt = item => Date.parse(item.createdAt) || 0;
-  pending.sort((a, b) => rank(a.item) - rank(b.item) || createdAt(a.item) - createdAt(b.item));
-  for (const { file, item } of pending) {
+  const lastAttempt = item => Date.parse(item.lastFailureAt) || 0;
+  pending.sort((a, b) => rank(a.item) - rank(b.item)
+    || lastAttempt(a.item) - lastAttempt(b.item) || createdAt(a.item) - createdAt(b.item));
+  for (const { file, item } of pending.slice(0, MAX_DELIVERIES)) {
     try {
       const result = await call("stage_message", { recipient: EMBER, conversation_id: config.conversation, message_id: item.messageId, text: item.text });
       const message = result.message;
@@ -160,10 +168,11 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
       atomicJson(file, item); queued++;
     } catch {
       // Keep the original ID/text even if the bridge queued it but its response was lost.
-      item.lastFailureAt = new Date(now()).toISOString(); atomicJson(file, item); failed++;
+      item.lastFailureAt = new Date(now()).toISOString(); atomicJson(file, item);
     }
   }
-  const result = { ok: failed === 0 && invalid === 0, queued, pending: failed, ...(invalid && { invalid }),
+  const remaining = pending.length - queued;
+  const result = { ok: remaining === 0 && invalid === 0, queued, pending: remaining, ...(invalid && { invalid }),
     ...(event ? { messageId: event.messageId, test: event.test } : {}) };
   atomicJson(join(dir, "latest-delivery.json"), { ...result, checkedAt: new Date(now()).toISOString() });
   return result;

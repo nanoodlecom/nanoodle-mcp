@@ -4,6 +4,7 @@
 import { readFileSync, mkdirSync, mkdtempSync, chmodSync, statfsSync, rmSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { createHash } from "node:crypto";
 import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../src/private-state.mjs";
 import { hostname } from "node:os";
@@ -17,7 +18,7 @@ import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from 
 import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { readNearPaymentReceipts, readNearReceiptTransaction } from "../src/near/watch.mjs";
-import { hasUnverifiedNearPaymentClaim } from "../src/near/ledger.mjs";
+import { hasUnverifiedNearPaymentClaim, SETTLED_NEAR_QUOTE_RETENTION_MS } from "../src/near/ledger.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
 import { USDC_RATE } from "../src/near/ft.mjs";
@@ -112,8 +113,8 @@ function nanoPeerLedgerBaseline(metrics, now) {
 
 function nanoCementationProgress(current, previous, now) {
   const prior = previous?.nanoLedgerSync;
-  const checkedAt = Date.parse(previous?.checkedAt);
-  const continuous = checkedAt <= now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
+  const checkedAt = prior?.observedAt ?? Date.parse(previous?.checkedAt);
+  const continuous = Number.isSafeInteger(checkedAt) && checkedAt < now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
   let unchangedSince = now, peerMedianAtStart = current.peerMedianConfirmed;
   if (continuous && prior?.localConfirmed === current.localConfirmed) {
     const since = prior.unchangedSince;
@@ -139,17 +140,23 @@ function nanoCementationProgress(current, previous, now) {
 
   const priorLead = priorPeer > priorLocal ? priorPeer - priorLocal : 0n;
   const lead = peer - local;
-  if (lead <= priorLead) return progress;
-  // Carry the baseline only across consecutive increases. Steady historical
-  // lag, an isolated change in the peer median and telemetry gaps do not warn.
+  if (lead < priorLead) return progress;
+  // Keep a recent rise through a short plateau. Only another increase can
+  // open the trend warning, and a sustained plateau expires the baseline.
+  const increased = lead > priorLead;
   const trend = prior.wideningGap;
   const firstLead = trend?.leadAtStart === "0" ? 0n : nanoLedgerCount(trend?.leadAtStart);
+  const lastIncrease = trend?.lastIncreaseAt ?? checkedAt;
   const ongoing = Number.isSafeInteger(trend?.since) && trend.since > 0 && trend.since <= checkedAt
-    && firstLead !== null && firstLead < priorLead;
+    && Number.isSafeInteger(lastIncrease) && lastIncrease >= trend.since && lastIncrease <= checkedAt
+    && now - lastIncrease <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS && firstLead !== null && firstLead < priorLead;
+  if (!ongoing && !increased) return progress;
   const since = ongoing ? trend.since : checkedAt;
   const leadAtStart = ongoing ? firstLead : priorLead;
-  const growing = now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
-  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString() },
+  const growing = ongoing && (increased || trend.alerted === true)
+    && now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
+  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString(), lastIncreaseAt: increased ? now : lastIncrease,
+    ...(growing && { alerted: true }) },
     ...(growing && { code: "nano-ledger-confirmations-falling-behind" }) };
 }
 
@@ -164,6 +171,13 @@ async function readDiscoveryStep(step, read) {
     if (error?.code === "RPC_TIMEOUT") throw new CheckError(`near-discovery-${step}-timeout`);
     throw error;
   }
+}
+
+async function checkoutStreamFrame(response, code) {
+  need(response.status === 200 && /^text\/event-stream\b/.test(response.headers.get("content-type") || ""), code);
+  const frame = /^event: status\r?\ndata: (.+)\r?\n\r?\n/m.exec(await response.text());
+  need(frame, code);
+  return JSON.parse(frame[1]);
 }
 
 function backupVerificationProof(file, read, now, stage) {
@@ -246,7 +260,7 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), {
     }
   }
   if (nanoLedgerSync) {
-    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
+    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, nanoLedgerSync.observedAt ?? now);
     nanoLedgerSync = { ...nanoLedgerSync, ...progress };
     const check = code
       ? { stage: "nano-ledger-confirmation-progress", ok: false, code, domains: [] }
@@ -548,14 +562,14 @@ export async function runOperationalCheck(config, deps = {}) {
   if (config.nanoLedgerTelemetry) await check("nano-ledger-sync", async () => {
     need(nanoNodes.some(({ peer }) => peer === 0), "nano-ledger-primary-unavailable");
     const owned = config.nanoRpcUrls[0];
-    const [counts, telemetry] = await Promise.all([
-      nanoRpc(owned, { action: "block_count", include_cemented: "true" }),
+    const [{ counts, observedAt }, telemetry] = await Promise.all([
+      nanoRpc(owned, { action: "block_count", include_cemented: "true" }).then(counts => ({ counts, observedAt: now() })),
       nanoRpc(owned, { action: "telemetry", raw: "true" }),
     ]);
     const local = nanoLedgerCounters(counts.count, counts.cemented);
     need(local, "nano-ledger-local-counters-invalid");
     const network = nanoPeerLedgerBaseline(telemetry.metrics, now());
-    nanoLedgerSync = { localBlocks: local.blocks.toString(), localConfirmed: local.confirmed.toString(),
+    nanoLedgerSync = { observedAt, localBlocks: local.blocks.toString(), localConfirmed: local.confirmed.toString(),
       peerMedianConfirmed: network.median.toString(), peers: network.peers };
     need(network.median - local.blocks < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-blocks-behind");
     need(network.median - local.confirmed < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-confirmations-behind");
@@ -745,6 +759,65 @@ export async function runOperationalCheck(config, deps = {}) {
       }, [])));
       need(witnessed.some(Boolean), "near-payment-discovery-unverified");
     }, []);
+    const checkout = sample && state && await check("near-settled-checkout-proof", () => {
+      const { payer, paymentTx } = sample;
+      const { quotes, consumedTx, refunds } = readNearLedger();
+      const id = consumedTx?.[paymentTx];
+      need(typeof id === "string" && /^nq_[A-Za-z0-9_-]{12}$/.test(id), "near-checkout-canary-record-missing");
+      const quote = quotes[id];
+      const refund = quote ? refunds[quote.refundId] : Object.values(refunds).find(row => row?.paymentId === id);
+      need(refund?.status === "sent" && refund.reason === "change" && refund.paymentId === id && refund.to === payer
+        && typeof refund.txHash === "string" && refund.txHash, "near-checkout-canary-refund-unverified");
+      // The replay index and refund survive quote pruning. A reused daily
+      // proof can be newer than the checkout it originally verified.
+      const finishedAt = quote?.finishedAt ?? refund.sentAt;
+      need(Number.isSafeInteger(finishedAt) && finishedAt > 0 && finishedAt <= now() + 30_000,
+        "near-checkout-canary-record-invalid");
+      if (now() - finishedAt >= SETTLED_NEAR_QUOTE_RETENTION_MS) return null;
+      need(quote?.id === id && quote.payTx === paymentTx && quote.payer === payer && quote.status === "settled"
+        && quote.outcome === "succeeded" && quote.settlement, "near-checkout-canary-record-invalid");
+      return { id, quote, refund };
+    }, []);
+    if (checkout) await check("near-settled-checkout", async () => {
+      const { payer, paymentTx } = sample;
+      const { id, quote, refund } = checkout;
+      const [page, status, watch, resultResponse] = await Promise.all([
+        request(`${config.site}/pay/${id}`, { cache: "no-store" }),
+        http(`${config.site}/near/status/${id}`, { cache: "no-store" }),
+        request(`${config.site}/near/watch/${id}?run=1`, { cache: "no-store", headers: { accept: "text/event-stream" } }),
+        request(`${config.site}/near/result/${id}`, { cache: "no-store" }),
+      ]);
+      need(page.status === 200 && /^text\/html\b/.test(page.headers.get("content-type") || ""),
+        "near-settled-payment-page-invalid");
+      const html = await page.text();
+      need(html.includes('id="near-payment"') && html.includes('id="pay-result"'), "near-settled-payment-page-invalid");
+      const { receipt, workflow } = status ?? {};
+      need(status?.paymentId === id && status.status === "settled" && status.done === true
+        && receipt?.paymentId === id && receipt.rail === "near" && receipt.network === config.network
+        && receipt.outcome === "succeeded" && receipt.deposit?.txHash === paymentTx && receipt.deposit.yocto === quote.paidYocto
+        && receipt.charged?.yocto === quote.settlement.chargedYocto && receipt.refund?.yocto === refund.amountYocto
+        && receipt.refund.to === payer && receipt.refund.status === "sent" && receipt.refund.txHash === refund.txHash,
+      "near-settled-payment-receipt-invalid");
+      const amounts = [quote.paidYocto, quote.settlement.chargedYocto, refund.amountYocto];
+      need(amounts.every(value => typeof value === "string" && /^\d{1,39}$/.test(value)),
+        "near-settled-payment-receipt-invalid");
+      const [deposited, charged, refunded] = amounts.map(BigInt);
+      need(refunded > 0n && deposited === charged + refunded && quote.settlement.refundYocto === refund.amountYocto,
+        "near-settled-payment-receipt-invalid");
+      need(workflow?.v === 1 && workflow.status === "succeeded" && Array.isArray(workflow.links)
+        && Array.isArray(workflow.nodes) && workflow.nodes.length > 0 && workflow.nodes.every(node => node?.status === "done"),
+      "near-settled-payment-workflow-missing");
+      const frame = await checkoutStreamFrame(watch, "near-settled-payment-stream-invalid");
+      need(frame?.paymentId === id && frame.status === "settled" && frame.done === true
+        && isDeepStrictEqual(frame.receipt, receipt) && isDeepStrictEqual(frame.workflow, workflow),
+        "near-settled-payment-stream-invalid");
+      need(resultResponse.status === 200, "near-settled-payment-result-invalid");
+      const result = await resultResponse.json();
+      const output = Array.isArray(result?.content) && result.content.find(part => part?.type === "text")?.text;
+      // A receipt and an eviction notice can be returned even when the paid output is gone.
+      need(!result?.isError && typeof output === "string" && /^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output.trim())
+        && isDeepStrictEqual(result.structuredContent?.receipt, receipt), "near-settled-payment-result-invalid");
+    }, []);
   }
   // Real checkout IDs use 12 characters after their prefix. These GETs
   // exercise public routing and stream termination without accessing a quote.
@@ -764,10 +837,8 @@ export async function runOperationalCheck(config, deps = {}) {
     }, domains),
     check(`${rail}-payment-event-stream`, async () => {
       const response = await request(`${site}${prefix}/watch/${id}${watchQuery}`, { headers: { accept: "text/event-stream" } });
-      need(response.status === 200 && /^text\/event-stream\b/.test(response.headers.get("content-type") || ""),
+      need(unknownTerminal(await checkoutStreamFrame(response, `${rail}-payment-stream-response-invalid`)),
         `${rail}-payment-stream-response-invalid`);
-      const frame = /^event: status\r?\ndata: (.+)\r?\n\r?\n/m.exec(await response.text());
-      need(frame && unknownTerminal(JSON.parse(frame[1])), `${rail}-payment-stream-response-invalid`);
     }, domains),
   ]);
   await Promise.all([
