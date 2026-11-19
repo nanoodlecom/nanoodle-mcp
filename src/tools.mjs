@@ -898,7 +898,7 @@ function inputRefusals(workflowGraph, given) {
  * @returns {Promise<{ read: object|null, safety: {ok, refusals}, pricing: object|null, catalogs: object }>}
  */
 export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
-  allowShortLinks = true, limits = DEFAULT_LIMITS, requireFreshCatalogs = false } = {}) {
+  allowShortLinks = true, limits = DEFAULT_LIMITS, requireFreshCatalogs = false, catalogMaxAgeMs } = {}) {
   let read;
   try {
     read = await readGraphArgs(args == null ? {} : args, { allowShortLinks, fetch, limits });
@@ -915,6 +915,7 @@ export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, lo
     fetch,
     log,
     requireFresh: requireFreshCatalogs,
+    maxAgeMs: catalogMaxAgeMs,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so price_noodle cannot price those nodes",
   });

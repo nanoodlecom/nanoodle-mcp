@@ -197,7 +197,7 @@ export function createMarketWorker({
     return request;
   }
 
-  async function priceRequest(rec, request, jobBudget, reason) {
+  async function priceRequest(rec, request, jobBudget, reason, { refreshCatalogs = false } = {}) {
     if (request.code) {
       log(`assignment ${short(rec.id)}: brief refused (${request.code})`);
       const detail = request.code === "CUSTOM_NOT_OFFERED"
@@ -205,7 +205,7 @@ export function createMarketWorker({
         : briefDeclineDetail(request.detail);
       return { decline: { reason, code: request.code, detail } };
     }
-    const priced = await runner.price(request.args, { budgetUsd: jobBudget });
+    const priced = await runner.price(request.args, { budgetUsd: jobBudget, ...(refreshCatalogs && { refreshCatalogs }) });
     if (!priced.ok) {
       const transient = priced.refusals.some((r) => r.code === "CATALOG_UNAVAILABLE");
       if (transient) return { transient: new Error("the NanoGPT model catalog is unavailable") };
@@ -310,7 +310,7 @@ export function createMarketWorker({
     // Use the current catalog within the accepted budget. On restart, recover the
     // request from the assignment as before. Nothing has run at this point.
     const request = prepared.get(rec.id) || requestFromRow(rec, row);
-    const prep = await priceRequest(rec, request, jobBudget, "failed");
+    const prep = await priceRequest(rec, request, jobBudget, "failed", { refreshCatalogs: true });
     if (prep.transient) return backoff(rec, prep.transient);
     if (prep.decline) return set(rec.id, ok({ phase: "declining", decline: prep.decline }));
     if (prep.pricing.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
