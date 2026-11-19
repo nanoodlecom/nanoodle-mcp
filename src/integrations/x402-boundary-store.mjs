@@ -161,6 +161,7 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
         const issuedAt = now();
         const ttlSeconds = priced.ttlSeconds ?? 60;
         if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 300) fail("BOUNDARY_PRICING_INVALID");
+        if (new Set(priced.prices.map(p => p?.network)).size !== priced.prices.length) fail("BOUNDARY_PRICING_INVALID");
         const requirements = [];
         for (const p of priced.prices) {
           requirements.push(await buildRequirements({
@@ -342,6 +343,39 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
           s.txIndex[txKey] = input.authorizationKey;
         });
         return clone(state.reservationsByAuth[input.authorizationKey]);
+      });
+    },
+
+    // Operator-only dispatch reconciliation: the ONLY way to clear a
+    // persisted dispatch intent that has no outcome (executor crashed or
+    // its reply was lost). The operator must state, from evidence outside
+    // this store, either the authoritative outcome the executor produced
+    // or that the executor provably never ran. Anything else keeps the
+    // intent — and the adapter's DISPATCH_UNCERTAIN — in force.
+    async reconcileDispatch({ fundingKey, resolution }) {
+      return run(() => {
+        if (state.outcomesByFunding[fundingKey]) return clone(state.outcomesByFunding[fundingKey]);
+        if (!state.dispatchIntents[fundingKey]) fail("BOUNDARY_NO_DISPATCH_INTENT");
+        if (!resolution || !["completed", "not_executed"].includes(resolution.kind)) fail("BOUNDARY_RECONCILE_INVALID");
+        if (resolution.kind === "not_executed") {
+          persist(s => { delete s.dispatchIntents[fundingKey]; });
+          return null;
+        }
+        const outcome = resolution.outcome;
+        let valid = outcome && ["completed", "failed"].includes(outcome.status)
+          && outcome.refund && ["not_required", "not_requested", "pending", "refunded", "uncertain"].includes(outcome.refund.state)
+          && (outcome.status !== "completed" || outcome.refund.state === "not_required");
+        if (valid) { try { clone(outcome); } catch { valid = false; } }
+        if (!valid) fail("BOUNDARY_DISPATCH_OUTCOME_INVALID");
+        persist(s => {
+          s.outcomesByFunding[fundingKey] = clone(outcome);
+          const claim = s.fundingByKey[fundingKey];
+          const r = s.reservationsByAuth[claim.authorizationKey];
+          if (r) r.state = "dispatched";
+          claim.state = "dispatched";
+          delete s.dispatchIntents[fundingKey];
+        });
+        return clone(outcome);
       });
     },
 

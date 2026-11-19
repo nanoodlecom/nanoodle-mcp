@@ -233,3 +233,44 @@ test("a failed write rolls back: no phantom reservation survives an unwritable d
   const r = await s.reserve(s.boundary, id); // same call now succeeds cleanly
   assert.equal(r.state, "reserved");
 });
+
+test("reconcileDispatch is the only exit from a crashed dispatch intent, and it demands a stated resolution", async t => {
+  let calls = 0;
+  const s = await setup(t, { execute: async () => { calls++; throw new Error("executor died"); } });
+  const id = s.identity();
+  const r = await s.settle(s.boundary, id);
+  const input = { ...id, reservationId: r.reservationId, receipt: RECEIPT, request: {} };
+  await assert.rejects(s.boundary.dispatchSettled(input), /executor died/);
+  await assert.rejects(s.boundary.reconcileDispatch({ fundingKey: id.fundingKey, resolution: { kind: "shrug" } }),
+    /BOUNDARY_RECONCILE_INVALID/);
+  // Operator proves the executor never ran: intent clears, dispatch may retry.
+  assert.equal(await s.boundary.reconcileDispatch({ fundingKey: id.fundingKey, resolution: { kind: "not_executed" } }), null);
+  await assert.rejects(s.boundary.dispatchSettled(input), /executor died/); // retries the executor (calls=2)
+  assert.equal(calls, 2);
+  // Operator instead records the authoritative outcome: it becomes the cache.
+  const outcome = { status: "failed", refund: { state: "not_requested" } };
+  const recorded = await s.boundary.reconcileDispatch({ fundingKey: id.fundingKey, resolution: { kind: "completed", outcome } });
+  assert.deepEqual(recorded, outcome);
+  const replayed = await s.boundary.dispatchSettled(input);
+  assert.deepEqual(replayed, outcome); assert.equal(calls, 2); // never executed again
+  await assert.rejects(s.boundary.reconcileDispatch({ fundingKey: hex("7"), resolution: { kind: "not_executed" } }),
+    /BOUNDARY_NO_DISPATCH_INTENT/);
+});
+
+test("duplicate-network pricing is rejected before it can poison a quote binding", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "x402-dup-")); t.after(() => rm(dir, { recursive: true, force: true }));
+  const b = createDurableX402Boundary({ file: join(dir, "b.json"),
+    priceQuote: async () => ({ downstream: { asset: "XNO", unit: "raw", amountAtomic: "1" }, ttlSeconds: 60,
+      prices: [{ network: "eip155:8453", amountAtomic: "1" }, { network: "eip155:8453", amountAtomic: "2" }] }),
+    execute: async () => ({ status: "failed", refund: { state: "not_requested" } }) });
+  await assert.rejects(b.issueQuote({ request: { resource: { url: "https://x.invalid/" } }, binding: hex("b"),
+    buildRequirements: async () => ({}) }), /BOUNDARY_PRICING_INVALID/);
+  assert.equal(await b.lookupQuote({ binding: hex("b") }), null);
+});
+
+test("state files missing a required map fail closed at load", async t => {
+  const s = await setup(t);
+  const broken = { version: 1, serial: 0, quotesByBinding: {}, reservationsByAuth: {}, fundingByKey: {}, txIndex: {}, outcomesByFunding: {} };
+  await writeFile(s.file, JSON.stringify(broken));
+  assert.throws(() => s.make(), /BOUNDARY_STATE_CORRUPT/);
+});
