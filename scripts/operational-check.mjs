@@ -11,7 +11,8 @@ import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
-import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw } from "../src/operational-state.mjs";
+import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw, paidNanoRunFundingRaw,
+  marketRunFunding } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
@@ -27,7 +28,7 @@ import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
-import { MARKET_PLATFORM_FEE_BPS } from "../src/market/fee-guard.mjs";
+import { createMarketFeeGuard } from "../src/market/fee-guard.mjs";
 import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
@@ -318,6 +319,7 @@ export async function runOperationalCheck(config, deps = {}) {
           need(!tool.pricedPerRequest && positiveDecimal(amount), "saved-nano-deposit-unavailable");
           const deposit = parseUsdNano(amount);
           need(deposit >= charge && deposit >= parseUsdNano(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
+          await checkUsdRunCapital(`workflow-nano-capital-nano-${name}`, amount, Boolean(authorAddress(published.x402)));
         } else {
           need(parseUsdNano(content.pricing.deposit.usd) >= charge, "saved-workflow-deposit-too-low");
           const denomination = previewDeposit(content, asset, config.network);
@@ -344,9 +346,9 @@ export async function runOperationalCheck(config, deps = {}) {
     return ledger;
   };
   const readNanoLedger = () => read(join(config.outDir, "gate-state.json"));
+  const readMarketLedgers = () => config.agents.map(a => read(join(config.marketStateDir, a.handle, "market-state.json")));
   const state = await check("payment-state", async () => {
-    const nano = readNanoLedger(), near = readNearLedger();
-    const market = config.agents.map(a => read(join(config.marketStateDir, a.handle, "market-state.json")));
+    const nano = readNanoLedger(), near = readNearLedger(), market = readMarketLedgers();
     const liabilities = paymentLiabilities({ nano, near, market }, { now: now() });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
@@ -511,8 +513,6 @@ export async function runOperationalCheck(config, deps = {}) {
       const url = config.nanoRpcUrls[index];
       const deadline = AbortSignal.timeout(config.timeoutMs || 12_000);
       const rpc = body => nanoRpc(url, body, deadline);
-      const historyRequest = { action: "account_history", account, head, count: String(NANO_HISTORY_PAGE), raw: "true" };
-      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, nano.view.confirmedHeight);
       const receivableRequest = { action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
         source: "true", include_only_confirmed: "true" };
       const pending = await rpc(receivableRequest);
@@ -521,24 +521,28 @@ export async function runOperationalCheck(config, deps = {}) {
       need(view.confirmedHeight >= nano.view.confirmedHeight
         && (view.confirmedHeight !== nano.view.confirmedHeight || view.confirmedFrontier === head), "nano-payment-read-anchor-moved");
       checkedReceivable(pending, receivableRequest, view, checkAddress);
+      const historyRequest = { action: "account_history", account, head: view.confirmedFrontier, count: String(NANO_HISTORY_PAGE), raw: "true" };
+      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, view.confirmedHeight);
       return true;
     }, []);
     // A valid but newer account view still matters when its payment window
     // failed validation. Two older windows cannot then prove current reads.
     return view && { view, peer: index, paymentReads: paymentReads === true };
   }))).filter(Boolean) : [];
-  await check("nano-payment-read-quorum", () => {
+  const activePaymentPeers = await check("nano-payment-read-quorum", () => {
     need(nano, "nano-payment-read-anchor-unavailable");
     const ready = currentNanoPaymentPeers(paymentViews);
     const standbyMatches = ready.length === 1 && standbyCheckpoint?.hash === ready[0].view.confirmedFrontier
       && standbyCheckpoint.blockCount === ready[0].view.confirmedHeight.toString();
     need(ready.length >= Math.min(2, config.nanoRpcUrls.length),
       standbyMatches ? "nano-payment-read-standby-unverified" : "nano-payment-read-quorum-unavailable");
+    return ready;
   }, ["nano"]);
   const fallbackPaymentReads = config.nanoRpcUrls.length >= 3 && await check("nano-fallback-payment-reads", () => {
     need(nano, "nano-fallback-payment-read-anchor-unavailable");
-    // Reuse the same payment reads to check whether the first peer can be lost.
-    need(currentNanoPaymentPeers(paymentViews.filter(row => row.peer !== 0)).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
+    // A fallback pair must cover the newest observed confirmed head, even
+    // when only the first peer reported it or its own history read failed.
+    need(activePaymentPeers?.filter(row => row.peer !== 0).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
     return true;
   }, []);
   if (config.nanoStandby && !fallbackPaymentReads) await check("nano-standby-cold-scan-budget", () => {
@@ -733,7 +737,15 @@ export async function runOperationalCheck(config, deps = {}) {
     const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
     need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
   }, []);
-  let queuedNearRaw = null;
+  const hasCapitalEvidence = () => state && nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000;
+  function hasCapital(requiredRaw, market = null) {
+    // The durable check already reserves Market work. Use the newer gross
+    // estimate to correct that reserve upward, without adding it again.
+    const independent = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
+      nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0", marketFundingRaw: market?.totalRaw });
+    return runtimeFunding.availableRaw >= requiredRaw + (market?.waitingRaw ?? 0n) && independent.ok;
+  }
+  let queuedNearRaw = null, queuedNanoRaw = config.providerUsesWallet === false ? 0n : null, marketFunding = null;
   if (state) await check("near-paid-run-funding", () => {
     // The runtime sample came first. Re-read the ledger so a quote that has
     // since acquired a live reservation is not counted again as unstarted.
@@ -741,26 +753,31 @@ export async function runOperationalCheck(config, deps = {}) {
     catch { throw new CheckError("near-paid-run-funding-unverified"); }
     const requiredRaw = queuedNearRaw;
     if (requiredRaw === 0n) return;
-    need(nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000, "near-paid-run-funding-unverified");
-    need(runtimeFunding.availableRaw >= requiredRaw, "near-paid-run-funding-insufficient");
-    // Cross-check the durable obligations and independently confirmed balance.
-    // No extra reserve for a hypothetical new run is needed for this check.
-    const result = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
-      nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
-    need(result.ok, "near-paid-run-funding-insufficient");
+    need(hasCapitalEvidence(), "near-paid-run-funding-unverified");
+    need(hasCapital(requiredRaw), "near-paid-run-funding-insufficient");
+  }, []);
+  if (state && config.providerUsesWallet !== false) await check("nano-paid-run-funding", () => {
+    try { queuedNanoRaw = paidNanoRunFundingRaw(readNanoLedger().quotes); }
+    catch { throw new CheckError("nano-paid-run-funding-unverified"); }
+    if (queuedNanoRaw === 0n) return;
+    need(hasCapitalEvidence() && queuedNearRaw !== null, "nano-paid-run-funding-unverified");
+    need(hasCapital(queuedNanoRaw + queuedNearRaw), "nano-paid-run-funding-insufficient");
+  }, []);
+  if (state && config.providerUsesWallet !== false) await check("market-paid-run-funding", () => {
+    try { marketFunding = marketRunFunding(readMarketLedgers(), rates?.xnoUsd); }
+    catch { throw new CheckError("market-paid-run-funding-unverified"); }
+    if (marketFunding.waitingRaw === 0n) return;
+    need(hasCapitalEvidence() && queuedNearRaw !== null && queuedNanoRaw !== null, "market-paid-run-funding-unverified");
+    need(hasCapital(queuedNanoRaw + queuedNearRaw, marketFunding), "market-paid-run-funding-insufficient");
   }, []);
   async function checkRunCapital(stage, buildBudget) {
     if (config.providerUsesWallet === false) return;
     await check(stage, () => {
-      need(state && nano && rates && runtimeFunding && queuedNearRaw !== null
-        && now() - runtimeFunding.checkedAt <= 60_000, "workflow-nano-capital-unverified");
+      need(hasCapitalEvidence() && queuedNearRaw !== null && queuedNanoRaw !== null && marketFunding, "workflow-nano-capital-unverified");
       const { maxRaw, overheadRaw } = buildBudget();
       // A prospective run must fit alongside already paid work that has yet
       // to reserve Nano. Compare the runtime and durable balances separately.
-      const requiredRaw = maxRaw + overheadRaw + queuedNearRaw;
-      const independent = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
-        nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
-      need(runtimeFunding.availableRaw >= requiredRaw && independent.ok, "workflow-nano-capital-insufficient");
+      need(hasCapital(maxRaw + overheadRaw + queuedNearRaw + queuedNanoRaw, marketFunding), "workflow-nano-capital-insufficient");
     }, []);
   }
   function checkNearPreviewCapital(stage, graph, content, { base, rate, step }) {
@@ -773,9 +790,9 @@ export async function runOperationalCheck(config, deps = {}) {
         xnoUsd: content.near?.rate?.xnoUsd ?? rates.xnoUsd },
     }));
   }
-  function checkMarketRunCapital(stage, budgetUsd, creator) {
+  function checkUsdRunCapital(stage, budgetUsd, creator) {
     return checkRunCapital(stage, () => runFundingBudget({
-      id: "operational-market", budgetUsd, pair: { usdNano: parseUsdNano(rates.xnoUsd), raw: RAW_PER_XNO }, creator,
+      id: "operational-preview", budgetUsd, pair: { usdNano: parseUsdNano(rates.xnoUsd), raw: RAW_PER_XNO }, creator,
     }));
   }
   const nearTools = await check("mcp-discovery", async () => {
@@ -926,9 +943,12 @@ export async function runOperationalCheck(config, deps = {}) {
       }
     }, ["near", "usdc"]);
   }
-  const platform = await check("market-platform-fee", async () => {
-    const result = await http(config.marketUrl + "/v1/platform/config");
-    need(result.platform_fee_bps === MARKET_PLATFORM_FEE_BPS, "market-fee-assumption-changed"); return result;
+  const fees = createMarketFeeGuard({ baseUrl: config.marketUrl, fetch: deps.fetch, timeoutMs: config.timeoutMs });
+  await check("market-platform-fee", async () => {
+    try { await fees.check(); }
+    catch (error) {
+      throw new CheckError(error.code === "MARKET_FEE_CHANGED" ? "market-fee-assumption-changed" : "market-fee-unavailable");
+    }
   }, ["market"]);
   await Promise.all(config.agents.map(async agent => {
     await check(`market-process-${agent.handle}`, async () => {
@@ -1002,8 +1022,8 @@ export async function runOperationalCheck(config, deps = {}) {
       const risk = MARKET_SLA_WARNINGS.find(code => intake.has(code));
       need(!risk, risk);
     }, []);
-    if (agent.bids && platform) {
-      await checkMarketRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
+    if (agent.bids) {
+      await checkUsdRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
     }
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
@@ -1012,10 +1032,10 @@ export async function runOperationalCheck(config, deps = {}) {
       const listing = await fetchListingPrice({ baseUrl: config.marketUrl, handle: agent.handle, fetch: request });
       need(listing.ok && listing.listingStatus === "live", "market-price-unavailable");
       const needUsd = marketNeedUsd(priced.pricing.estimatedCostUsd);
-      need(platform && budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
+      need(budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
       const remote = await mcp("tools/call", { name: "price_noodle", arguments: { graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } } });
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
-      await checkMarketRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
+      await checkUsdRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
   }));
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
