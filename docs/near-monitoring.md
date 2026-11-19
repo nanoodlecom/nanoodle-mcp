@@ -30,10 +30,12 @@ threshold together. The operational service's payer key file remains inaccessibl
 When the successful canary's discovery proof is configured, the five-minute
 probe also reads that run's settled payment page, status, event stream, and
 result. It checks that the deposit equals the charge plus the refund, verifies
-the completed graph in the status and event stream, and expects a canary marker
-in the result. The alert omits the checkout ID, receipt, and output. At the
-checkout retention limit, the probe stops reporting a checkout result and
-continues on-chain discovery for the lifetime of the proof.
+the completed graph in the status and event stream, and compares the result to
+the canary marker's SHA-256 digest. Older proofs check the marker format until
+the next successful daily canary publishes a digest. The alert omits the
+checkout ID, receipt, and output. At the checkout retention limit, the probe
+stops reporting a checkout result and continues on-chain discovery for the
+lifetime of the proof.
 
 ## Installation on the production box
 

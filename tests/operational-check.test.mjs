@@ -5,6 +5,7 @@ import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { hashBlock } from "nanocurrency";
 import { runOperationalCheck, finishOperationalReport, isMarketWorkerAlive } from "../scripts/operational-check.mjs";
@@ -2135,8 +2136,10 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
   const invalidReceipt = "near-settled-payment-receipt-invalid", invalidStream = "near-settled-payment-stream-invalid";
   const invalidResult = "near-settled-payment-result-invalid", missingGraph = "near-settled-payment-workflow-missing";
   const missingOutput = "near-settled-payment-output-unavailable";
+  const outputMismatch = "near-settled-payment-output-mismatch", invalidOutputProof = "near-settled-payment-output-proof-invalid";
   for (const [scenario, errors] of [
-    ["complete", {}], ["older-marker", {}], ["receipt-only", { [result]: missingOutput }],
+    ["complete", {}], ["prefixed-marker", {}], ["older-proof", {}], ["receipt-only", { [result]: missingOutput }],
+    ["wrong-marker", { [result]: outputMismatch }], ["invalid-proof-digest", { [result]: invalidOutputProof }],
     ["page", { [page]: "near-settled-payment-page-invalid" }],
     ["status", { [checkout]: invalidReceipt }], ["unbalanced", { [checkout]: invalidReceipt, [stream]: invalidStream, [result]: invalidResult }],
     ["status-outage", { [checkout]: "http-503", [graph]: "http-503" }],
@@ -2173,7 +2176,8 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
         return new Response(`event: status\ndata: ${JSON.stringify(streamView)}\n\n`, { headers: { "content-type": "text/event-stream" } });
       }
       const text = ["receipt-only", "missing-graph-and-output"].includes(scenario) ? lostOutput
-        : scenario === "older-marker" ? `NANOODLE_OK:${marker}` : marker;
+        : scenario === "prefixed-marker" ? `NANOODLE_OK:${marker}`
+          : scenario === "wrong-marker" ? "0000000000000000" : marker;
       return Response.json(scenario === "result" ? { status: "settled" } : {
         content: [{ type: "text", text }, { type: "text", text: "PRIVATE_RECEIPT_TEXT" }], structuredContent: { receipt },
       }, { status: scenario === "result" ? 202 : 200 });
@@ -2182,7 +2186,10 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
     f.config.canaryPayer = { accountId: payer, maxNear: "0.01", publicKey: "ed25519:private-canary-key" };
     f.config.nearDiscoveryReport = "/discovery/latest.json";
     f.config.invocationId = ID.replaceAll("-", "");
-    f.states[f.config.nearDiscoveryReport] = { v: 1, paymentTx, checkedAt: new Date(NOW - 60_000).toISOString() };
+    const expected = scenario === "prefixed-marker" ? `NANOODLE_OK:${marker}` : marker;
+    const outputSha256 = createHash("sha256").update(expected).digest("hex");
+    f.states[f.config.nearDiscoveryReport] = { v: 1, paymentTx, checkedAt: new Date(NOW - 60_000).toISOString(),
+      ...(scenario !== "older-proof" && { outputSha256: scenario === "invalid-proof-digest" ? null : outputSha256 }) };
     const ledger = f.states[join(f.config.outDir, "near-state.json")];
     const finishedAt = NOW - (scenario === "pruned" ? SETTLED_NEAR_QUOTE_RETENTION_MS + 1 : 120_000);
     const quote = { id, payTx: paymentTx, payer, status: "settled", outcome: "succeeded", paidYocto: "100", finishedAt,
@@ -2205,12 +2212,12 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
     const requests = f.calls.filter(({ url }) => checkoutPaths.includes(url.pathname));
     assert.deepEqual(requests.map(({ url }) => url.pathname), ["pruned", "missing"].includes(scenario) ? [] : checkoutPaths);
     const reportText = JSON.stringify(report);
-    for (const value of [id, payer, paymentTx, refundTx, marker, lostOutput, "PRIVATE_RECEIPT_TEXT"]) assert.ok(!reportText.includes(value));
-    if (scenario === "missing-graph-and-output") {
+    for (const value of [id, payer, paymentTx, refundTx, marker, outputSha256, lostOutput, "PRIVATE_RECEIPT_TEXT"]) assert.ok(!reportText.includes(value));
+    if (["missing-graph-and-output", "wrong-marker", "invalid-proof-digest"].includes(scenario)) {
       const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: f.config.invocationId,
         MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, report, NOW);
       for (const code of Object.values(errors)) assert.ok(alert.text.includes(code));
-      for (const value of [id, payer, paymentTx, refundTx, lostOutput]) assert.ok(!alert.text.includes(value));
+      for (const value of [id, payer, paymentTx, refundTx, marker, outputSha256, lostOutput]) assert.ok(!alert.text.includes(value));
     }
   }
 });
