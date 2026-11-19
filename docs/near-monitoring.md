@@ -241,6 +241,12 @@ Coverage:
 - Nano mainnet identity, confirmed wallet height/frontier agreement across
   configured nodes, and the running wallet's fresh multi-peer read enforcement.
   See [Nano RPC freshness](nano-rpc-freshness.md).
+- The owned Nano node's confirmation counters, when ledger telemetry is
+  enabled. The probe distinguishes a local counter regression, a stalled
+  confirmed count and a gap that keeps growing. A widening gap of at least
+  50 blocks over at least ten minutes warns even while both counts advance.
+  Stable historical lag and missing samples do not carry a widening trend
+  forward. Wallet read quorum still determines Nano payment readiness.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the

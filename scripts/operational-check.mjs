@@ -49,7 +49,7 @@ const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 const NEAR_DISCOVERY_MAX_PROOF_AGE_MS = 27 * 3600_000;
 const NANO_TELEMETRY_AGE_MS = 90_000;
 const NANO_LEDGER_LAG_BLOCKS = 1_000n;
-const NANO_CEMENTATION_STALL_MS = 10 * 60_000;
+const NANO_CEMENTATION_WINDOW_MS = 10 * 60_000;
 const NANO_CEMENTATION_SAMPLE_MAX_AGE_MS = 12 * 60_000;
 const NANO_PEER_ADVANCE_BLOCKS = 50n;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
@@ -120,9 +120,32 @@ function nanoCementationProgress(current, previous, now) {
       peerMedianAtStart = prior.peerMedianConfirmed;
     }
   }
-  const stalled = now - unchangedSince >= NANO_CEMENTATION_STALL_MS
+  const progress = { unchangedSince, peerMedianAtStart };
+  const priorLocal = continuous ? nanoLedgerCount(prior?.localConfirmed) : null;
+  const local = BigInt(current.localConfirmed), peer = BigInt(current.peerMedianConfirmed);
+  if (priorLocal !== null && local < priorLocal) {
+    return { ...progress, code: "nano-ledger-local-confirmations-regressed" };
+  }
+  const stalled = now - unchangedSince >= NANO_CEMENTATION_WINDOW_MS
     && BigInt(current.peerMedianConfirmed) - BigInt(peerMedianAtStart) >= NANO_PEER_ADVANCE_BLOCKS;
-  return { unchangedSince, peerMedianAtStart, stalled };
+  if (stalled) return { ...progress, code: "nano-ledger-confirmations-stalled" };
+  const priorPeer = nanoLedgerCount(prior?.peerMedianConfirmed);
+  if (priorLocal === null || priorPeer === null) return progress;
+
+  const priorLead = priorPeer > priorLocal ? priorPeer - priorLocal : 0n;
+  const lead = peer - local;
+  if (lead <= priorLead) return progress;
+  // Carry the baseline only across consecutive increases. Steady historical
+  // lag, an isolated change in the peer median and telemetry gaps do not warn.
+  const trend = prior.wideningGap;
+  const firstLead = trend?.leadAtStart === "0" ? 0n : nanoLedgerCount(trend?.leadAtStart);
+  const ongoing = Number.isSafeInteger(trend?.since) && trend.since > 0 && trend.since <= checkedAt
+    && firstLead !== null && firstLead < priorLead;
+  const since = ongoing ? trend.since : checkedAt;
+  const leadAtStart = ongoing ? firstLead : priorLead;
+  const growing = now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
+  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString() },
+    ...(growing && { code: "nano-ledger-confirmations-falling-behind" }) };
 }
 
 function currentNanoPaymentPeers(rows) {
@@ -216,10 +239,10 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), { fu
     }
   }
   if (nanoLedgerSync) {
-    const { stalled, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
+    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
     nanoLedgerSync = { ...nanoLedgerSync, ...progress };
-    const check = stalled
-      ? { stage: "nano-ledger-confirmation-progress", ok: false, code: "nano-ledger-confirmations-stalled", domains: [] }
+    const check = code
+      ? { stage: "nano-ledger-confirmation-progress", ok: false, code, domains: [] }
       : { stage: "nano-ledger-confirmation-progress", ok: true };
     checks = [...checks, check].sort((a, b) => a.stage.localeCompare(b.stage));
   }
