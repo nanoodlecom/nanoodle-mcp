@@ -14,7 +14,7 @@ import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain } from "../src/gate.mjs";
 import { wrapNanoCustomWorkflow } from "../src/custom-mcp.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
-import { formatCostUsd, loadTools } from "../src/tools.mjs";
+import { fetchCatalogs, formatCostUsd, loadTools } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 
@@ -164,6 +164,39 @@ test("private Nano workflows bind a quote to their profile and settle only once"
   }
   assert.equal(starts, 1);
   assert.equal(gate.hasOpenProfileQuotes(scope.paymentScope), false);
+});
+
+test("private Nano workflow quotes refuse unpriced models and refund repricing before provider execution", async t => {
+  const chain = fakeChain();
+  const catalogs = structuredClone(WORKED_CATALOGS);
+  const provider = nanoGptMock({ catalogs });
+  const baseUrl = "https://custom-nano-repricing.provider.invalid";
+  const registry = {
+    prepareRunNoodle: async (_args, { read }) => assert.equal(read.source, "graph"),
+    async callTool() { assert.fail("Repricing must stop before model execution"); },
+  };
+  const gate = makeGate(chain);
+  t.after(() => gate.stop());
+  const call = wrapNanoCustomWorkflow({ gate, registry, baseUrl, fetch: provider.fetch });
+  const scope = { paymentScope: "private-repricing-profile", paymentAlias: "poster-ideas" };
+  const args = { graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } };
+  const unpriced = structuredClone(args);
+  unpriced.graph.nodes.find(n => n.type === "image").fields.model = "synthetic-uncatalogued-model";
+  await assert.rejects(call(unpriced, scope), /price|catalog/i);
+  assert.equal(gate.hasOpenProfileQuotes(scope.paymentScope), false);
+
+  const quote = argOf(await call(args, scope));
+  assert.ok(quote.amountUsd < 0.12);
+  catalogs.image[0].pricing.per_image["1024x1024"] = 0.12;
+  await fetchCatalogs(["image"], { baseUrl, fetch: provider.fetch, maxAgeMs: 0 });
+  chain.state.receivable["E".repeat(64)] = { amount: quote.amountRaw, source: PAYER };
+
+  const resumed = await call({ ...args, _payment_id: quote.paymentId }, scope);
+  assert.equal(resumed.isError, true);
+  assert.match(resumed.content[0].text, /no longer fits the quoted budget/);
+  assert.equal(provider.runs(), 0);
+  assert.equal(chain.state.transfers.length, 1);
+  assert.deepEqual(chain.state.transfers[0], { to: PAYER, amountRaw: quote.amountRaw, describe: "refunded" });
 });
 
 test("live liabilities retain change while a settlement transfer is still in flight", async () => {

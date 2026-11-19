@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -199,7 +199,24 @@ test("Custom MCP on both listeners saves, isolates, resumes and revokes private 
   assert.equal((await stat(actualFile)).mode & 0o777, 0o600);
   const stored = await readFile(actualFile, "utf8");
   assert.ok(!stored.includes(key) && !stored.includes(token));
-  assert.ok(!logs().includes(key) && !logs().includes(token));
+  const privateFields = [
+    key, token, secondKey, secondToken, id, workflow.name, workflow.description, input.Idea,
+    ...[key, token, secondKey, secondToken].map(secret => createHash("sha256").update(secret).digest("hex")),
+    WORKED_GRAPH.nodes.find(node => node.type === "llm").fields.system,
+  ];
+  const checkoutFiles = ["gate-state.json", "near-state.json", "usage.jsonl", "near-usage.jsonl"];
+  const checkout = await Promise.all(checkoutFiles.map(file => readFile(join(out, file), "utf8")));
+  for (const [index, data] of [...checkout, logs()].entries()) {
+    assert.ok(privateFields.every(value => !data.includes(value)), `Private profile material in ${checkoutFiles[index] ?? "service logs"}`);
+  }
+  const nanoQuotes = JSON.parse(checkout[0]).quotes;
+  const nearQuotes = Object.values(JSON.parse(checkout[1]).quotes);
+  assert.equal(nanoQuotes.length, 1);
+  assert.equal(nearQuotes.length, 2);
+  for (const quote of [...nanoQuotes, ...nearQuotes]) {
+    assert.match(quote.paymentScope, /^[a-f0-9]{64}$/);
+    assert.match(quote.argsHash, /^[a-f0-9]{32}$/);
+  }
   await restart();
   assert.deepEqual(names(await rpc(privateNear, "tools/list", {}, { token })), ["other", "my-poster"]);
   const latest = (await manage(nearBase, "profile", undefined, { key })).data.profile;
@@ -226,9 +243,9 @@ test("Custom MCP on both listeners saves, isolates, resumes and revokes private 
   assert.equal((await rpc(privateNano, "tools/list", {}, { token })).status, 200);
 });
 
-test("retired subnano_comment cannot be quoted from either listener or a saved profile", { timeout: 15_000 }, async t => {
+test("stale built-ins and retired subnano_comment aliases are refused before quotes or resumes on both listeners", { timeout: 15_000 }, async t => {
   const { nanoBase, nearBase, out, provider } = await dualHost(t);
-  const retired = "subnano_comment";
+  const retired = "subnano_comment", stale = "missing-poster";
   const key = owner(), token = client();
   const installed = [];
   for (const base of [nanoBase, nearBase]) {
@@ -250,7 +267,7 @@ test("retired subnano_comment cannot be quoted from either listener or a saved p
   const file = join(out, "custom-mcp-profiles", installed[0].profile.id + ".json");
   const saved = JSON.parse(await readFile(file, "utf8"));
   for (const { base, alias } of installed) {
-    saved.hosts[base].builtins.push(retired);
+    saved.hosts[base].builtins.push(retired, stale);
     saved.hosts[base].workflows.push({ ...workflow, name: alias });
   }
   await writeFile(file, JSON.stringify(saved));
@@ -265,7 +282,7 @@ test("retired subnano_comment cannot be quoted from either listener or a saved p
       const publicCall = await call(base + "/mcp", retired, args);
       assert.ok(publicCall.data.error || publicCall.data.result?.isError);
       assert.ok(!publicCall.data.result?.structuredContent);
-      for (const name of new Set([retired, alias])) {
+      for (const name of new Set([retired, stale, alias])) {
         for (const arguments_ of [args, { ...args, _payment_id: paymentId }]) {
           const rejected = await call(url, name, arguments_, { token });
           assert.deepEqual(rejected.data.error, { code: -32602, message: "This tool is unavailable in your Custom MCP profile." });
@@ -274,7 +291,7 @@ test("retired subnano_comment cannot be quoted from either listener or a saved p
     }
     const clientConfig = { ...config, revision: profile.revision, workflows: [{ ...workflow, name: alias }] };
     assert.equal((await manage(base, "profile", clientConfig, { key })).status, 400);
-    const rename = { ...clientConfig, builtins: ["poster", retired], workflows: [
+    const rename = { ...clientConfig, builtins: ["poster", retired, stale], workflows: [
       { name: "recovered-workflow", description: workflow.description, previousName: alias },
     ] };
     assert.equal((await manage(base, "profile", rename, { key })).status, 200);
