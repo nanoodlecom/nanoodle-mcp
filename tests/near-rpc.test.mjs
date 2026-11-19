@@ -274,6 +274,44 @@ test("pool: a JSON-RPC answer such as UNKNOWN_TRANSACTION is final for the call"
   assert.deepEqual(calls, ["a.test status", "a.test tx"]);
 });
 
+test("configured archives recover exact, finalized historical transactions and blocks", async () => {
+  const missing = (name) => ({ body: { error: { cause: { name }, code: -32000 } } });
+  const txn = { hash: TX_HASH, signer_id: "payer.near" };
+  const archive = (req, transaction = txn) => {
+    if (req.method === "status") return ok()(req);
+    if (req.method === "block") return { body: { result: { header: { hash: BLOCK_HASH, height: 123 } } } };
+    assert.equal(req.method, "tx");
+    assert.equal(req.params.wait_until, "NONE");
+    return { body: { result: { final_execution_status: "FINAL", transaction } } };
+  };
+  const { fetch, calls } = hostFetch({
+    "regular.test": req => req.method === "status" ? ok()(req)
+      : missing(req.method === "block" ? "UNKNOWN_BLOCK" : "UNKNOWN_TRANSACTION"),
+    "ambiguous.test": req => archive(req, { ...txn, signer_id: "other.near" }),
+    "archive.test": archive,
+  });
+  const pool = createNearRpcPool({ urls: "https://regular.test", archiveUrls: "https://ambiguous.test,https://archive.test",
+    chainId: "mainnet", fetch });
+  const result = await pool.txStatus({ txHash: TX_HASH, senderId: "payer.near" });
+  assert.deepEqual(result.transaction, txn);
+  assert.equal((await pool.block({ blockId: BLOCK_HASH })).header.hash, BLOCK_HASH);
+  assert.deepEqual(calls, ["regular.test status", "regular.test tx", "ambiguous.test status", "ambiguous.test tx",
+    "archive.test status", "archive.test tx", "regular.test block", "archive.test block"]);
+});
+
+test("archive endpoints receive no broadcasts, access-key reads or latest-block requests", async () => {
+  const { fetch, calls } = hostFetch({
+    "regular.test": req => req.method === "status" ? ok()(req) : limited(),
+    "archive.test": () => { assert.fail("operation should stay in the primary pool"); },
+  });
+  const pool = createNearRpcPool({ urls: "https://regular.test", archiveUrls: "https://archive.test", chainId: "mainnet", fetch });
+  await assert.rejects(pool.sendTx("AAAA"), { code: "RPC_HTTP" });
+  await assert.rejects(pool.viewAccessKey({ accountId: "mcp.near", publicKey: "ed25519:key" }), { code: "RPC_HTTP" });
+  await assert.rejects(pool.block({ finality: "final" }), { code: "RPC_HTTP" });
+  assert.deepEqual(calls, ["regular.test status", "regular.test send_tx", "regular.test status", "regular.test query",
+    "regular.test status", "regular.test block"]);
+});
+
 test("pool: unnamed RPC errors fail over on watcher and funding reads", async () => {
   for (const method of ["status", "block", "query", "gas_price", "EXPERIMENTAL_protocol_config", "EXPERIMENTAL_changes", "EXPERIMENTAL_receipt_to_tx"]) {
     const logs = [];

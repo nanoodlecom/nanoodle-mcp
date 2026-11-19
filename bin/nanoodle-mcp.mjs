@@ -886,6 +886,7 @@ async function startNearMode({
   if (!near.isNearAccountId(merchant)) fail(`--near-merchant: "${merchant}" is not a NEAR account id`);
   // One or more endpoints, comma-separated, tried in order with failover.
   const rpcUrls = near.parseRpcUrls(rpcFlag || process.env.NEAR_RPC_URL || near.NEAR_NETWORKS[network].rpcUrls);
+  const archiveUrls = near.parseRpcUrls(process.env.NEAR_ARCHIVE_RPC_URL);
   const rpcUrl = rpcUrls.map(redactUrl).join(", ");
   let signer;
   try {
@@ -893,8 +894,8 @@ async function startNearMode({
   } catch (e) { fail(`NEAR refund key: ${e.message}`); }
   let rpc;
   try {
-    const localRpc = rpcUrls.every(url => ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname));
-    rpc = near.createNearRpcPool({ urls: rpcUrls, chainId: network, maxHeadAgeMs: 90_000, minIntervalMs: localRpc ? 0 : 100,
+    const localRpc = [...rpcUrls, ...archiveUrls].every(url => ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname));
+    rpc = near.createNearRpcPool({ urls: rpcUrls, archiveUrls, chainId: network, maxHeadAgeMs: 90_000, minIntervalMs: localRpc ? 0 : 100,
       fetch: (...args) => { assertWriter(); return globalThis.fetch(...args); },
       log: (line) => console.error("nanoodle-mcp: " + line) });
   } catch (e) { fail(`--near-rpc: ${e.message}`); }
