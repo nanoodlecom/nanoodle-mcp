@@ -427,14 +427,29 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    * receivable for the next pass.
    */
   async function pocketReceivables(fresh = false, stopEarly = null) {
-    let state = await currentState(fresh);
-    let blocks;
-    try {
-      const r = await rpc({ action: "receivable", account: address, count: "50", threshold: "1", include_only_confirmed: "true" });
-      blocks = r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
-    } catch {
-      return state;
+    const request = { action: "receivable", account: address, count: "50", threshold: "1", include_only_confirmed: "true" };
+    let state, receivable;
+    if (readPool) {
+      if (checkpointStore) {
+        await qualifyRestartFloor();
+        checkpointStore.assertCurrent();
+      }
+      try {
+        const window = await readPool.readReceivableState(request);
+        state = parsedAccountState(window.info);
+        receivable = window.receivable;
+        chain = state; checkedAt = now();
+      } catch {
+        // A failed sweep must still allow a send from funds that a separate
+        // account-only read proves are already spendable.
+        return currentState(fresh);
+      }
+    } else {
+      state = await currentState(fresh);
+      try { receivable = await rpc(request); }
+      catch { return state; }
     }
+    const blocks = receivable.blocks && typeof receivable.blocks === "object" ? Object.entries(receivable.blocks) : [];
     let pocketed = 0;
     for (let i = 0; i < blocks.length; i++) {
       const [sendHash, v] = blocks[i];

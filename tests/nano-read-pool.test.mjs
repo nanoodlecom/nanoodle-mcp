@@ -583,6 +583,21 @@ test("a stale negative block lookup cannot hide a positive confirmation", async 
   await assert.rejects(w.pool.block({ action: "block_info", hash: prepared.hash }), { code: "NANO_RPC_BLOCK_UNCERTAIN" });
 });
 
+test("an exact primary confirmation can settle a block at the standby limit but a negative cannot", async () => {
+  const w = world(2, 4), [owned, spare, standby] = w.peers;
+  spare.network = false;
+  await w.pool.read(info);
+  await w.pool.read(receivable);
+  const prepared = createBlock("0".repeat(64), { work: "0".repeat(16), previous: "B".repeat(64), representative: ACCOUNT,
+    balance: "93", link: PAYER });
+  owned.blocks[prepared.hash] = { confirmed: "true", contents: prepared.block, height: "11" };
+  const found = await w.pool.block({ action: "block_info", hash: prepared.hash });
+  assert.equal(found.confirmed, "true");
+  owned.blocks[SEND] = absent();
+  await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.equal(w.calls.filter(call => call.base === standby.base).length, 4);
+});
+
 test("an unconfirmed or mismatched block is never permission to sign a replacement", async () => {
   const w = world(), prepared = createBlock("0".repeat(64), { work: "0".repeat(16), previous: "B".repeat(64), representative: ACCOUNT, balance: "93", link: PAYER });
   w.peers[0].blocks[prepared.hash] = { confirmed: "false", contents: prepared.block };

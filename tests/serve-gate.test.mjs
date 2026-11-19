@@ -197,6 +197,39 @@ test("failed Nano settlement retries persist the debt age and attempt count acro
   assert.equal(chain.state.transfers.length, 0);
 });
 
+test("a Nano refund at the retry limit remains queued after a standby quota deferral", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "gate-standby-debt-")), file = join(dir, "gate-state.json");
+  const chain = fakeChain(), gates = [];
+  t.after(async () => { for (const gate of gates) await gate.stop(); await rm(dir, { recursive: true }); });
+  let now = 1_000_000, quotaAvailable = false, attempts = 0;
+  const signed = { hash: "A".repeat(64), block: { account: GATE_ADDR, link_as_account: PAYER } };
+  await writeFile(file, JSON.stringify({ v: 2, quotes: [], owed: [{ event: "refund", to: PAYER, amountRaw: "100",
+    fields: { paymentId: "awaiting-quota" }, journaled: true, prepared: signed, tries: 99,
+    createdAt: now - 900_001, nextAttemptAt: now }] }));
+  chain.ops.transferOnce = async (_to, _raw, { prepared }) => {
+    attempts++;
+    assert.deepEqual(prepared, signed);
+    if (!quotaAvailable) throw Object.assign(Error("fixture standby budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+    return prepared.hash;
+  };
+  const start = () => {
+    const gate = makeGate(chain, { stateFile: file, now: () => now, pollMs: 5 });
+    gates.push(gate);
+    return gate;
+  };
+  const gate = start();
+  const deferred = await untilState(file, "the deferred refund to reach disk", state => state.owed[0]?.nextAttemptAt === now + 60_000);
+  assert.equal(deferred.owed[0].tries, 99);
+  assert.notEqual(deferred.owed[0].held, true);
+  assert.equal(gate.fundingLiabilitiesRaw(), 100n);
+  await gate.stop();
+  now += 60_000;
+  quotaAvailable = true;
+  start();
+  await untilState(file, "the original refund to settle", state => state.owed.length === 0);
+  assert.equal(attempts, 2);
+});
+
 test("Nano funding handoff uses the paid quote's locked pair and refuses before inference", async () => {
   for (const allowed of [true, false]) {
     const chain = fakeChain(), policies = [];

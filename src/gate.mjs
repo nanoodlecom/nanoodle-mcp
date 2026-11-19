@@ -44,6 +44,7 @@ import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, NANO_PAYMEN
   NANO_RECEIVABLE_COUNT as RECEIVABLE_COUNT, NANO_HISTORY_PAGE as HISTORY_PAGE,
   checkedAnchoredNanoHistory, nanoHistoryKind, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
+import { NANO_STANDBY_BUDGET_MS } from "./nano-read-pool.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -418,12 +419,14 @@ export function createChargeGate({
         }
         return await completeOwed(o);
       } catch (e) {
-        if (!o.confirmedHash && o.tries >= OWED_MAX_TRIES) {
+        const deferred = e?.code === "NANO_RPC_STANDBY_BUDGET";
+        if (deferred && retry) o.tries--;
+        if (!deferred && !o.confirmedHash && o.tries >= OWED_MAX_TRIES) {
           o.held = true;
           o.at = Infinity;
           log(`Nano ${o.event} requires reconciliation after ${o.tries} retries`);
         } else {
-          o.at = now() + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
+          o.at = now() + (deferred ? NANO_STANDBY_BUDGET_MS : OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)]);
           log(`Nano ${o.event} queued after unsuccessful attempt: ${e.message}`);
         }
         if (!retry || o.held) usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw,
