@@ -5,9 +5,6 @@ const NANO_ALIAS = "https://nano.nanoodle.com";
 const NEAR = "https://near.nanoodle.com";
 const NEAR_ALIAS = "https://mcp-near.nanoodle.com";
 const BABEL = "https://babel.255bits.com";
-const MEDIA = "https://media.nanoodle.com";
-const DEMO_ASSETS = /^\/(?:examples|hub-assets)\//;
-const CDN_ASSETS = /^\/(?:mcp\/examples|subnano)\//;
 const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
@@ -38,27 +35,7 @@ function positiveUsd(value) {
   return typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value)) && Number(value) > 0;
 }
 
-function demoAssets(html, site) {
-  const assets = new Map();
-  // Read the server-rendered tags. Ignore markup in scripts and comments.
-  const rendered = html.replace(/<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
-  for (const [tag, element] of rendered.matchAll(/<(img|audio|video|source)(?=[\s/>])[^>]*>/gi)) {
-    for (const [, attribute, doubleQuoted, singleQuoted] of tag.matchAll(/\s(src|poster)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
-      let url;
-      try { url = new URL(doubleQuoted ?? singleQuoted, site + "/"); } catch { continue; }
-      const allowed = url.origin === site ? DEMO_ASSETS : url.origin === MEDIA ? CDN_ASSETS : null;
-      if (!allowed?.test(url.pathname) || url.username || url.password || url.search || url.hash) continue;
-      const type = /\.mp3$/i.test(url.pathname) ? "audio/mpeg" : /\.mp4$/i.test(url.pathname) ? "video/mp4" : "image/";
-      if (type === "image/") {
-        if (!/\.(?:webp|png|jpe?g|gif|svg|avif)$/i.test(url.pathname)) continue;
-      } else if (attribute.toLowerCase() !== "src" || !["source", type.split("/")[0]].includes(element.toLowerCase())) continue;
-      assets.set(url.href, { url, type });
-    }
-  }
-  return [...assets.values()];
-}
-
-export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000, demoMedia = false } = {}) {
+export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 } = {}) {
   const request = createProbeFetch({ fetch, timeoutMs: 6000, maxBytes: 512 * 1024 });
   async function json(url, { body, status = 200 } = {}) {
     const headers = { accept: "application/json", "cache-control": "no-cache" };
@@ -104,36 +81,6 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000,
       && Number(likely) <= Number(deposit), "conditional-price-deposit-invalid");
   }
 
-  async function demo(site) {
-    const page = await request(site + "/");
-    need(page.status === 200, `landing-http-${page.status}`);
-    need(/^text\/html\b/i.test(page.headers.get("content-type") || ""), "landing-type-invalid");
-    const assets = demoAssets(await page.text(), site);
-    need(assets.some(({ type }) => type === "image/"), "demo-images-missing");
-    need(assets.length <= 32, "demo-asset-limit");
-    if (site === NEAR) {
-      need(assets.some(({ type }) => type === "audio/mpeg"), "demo-audio-missing");
-      need(assets.some(({ type }) => type === "video/mp4"), "demo-video-missing");
-    }
-    const readByte = createProbeFetch({ fetch, timeoutMs: 6000, maxBytes: 1 });
-    await Promise.all(assets.map(async ({ url, type }) => {
-      const image = type === "image/", kind = type.split("/")[0];
-      const headers = { origin: site };
-      const response = image ? await request(url.href, { method: "HEAD", headers })
-        : await readByte(url.href, { headers: { ...headers, range: "bytes=0-0" } }).catch(error => {
-          if (error?.message === "probe-response-too-large") throw new ProbeError(`demo-${kind}-range-invalid`);
-          throw error;
-        });
-      need(response.status === (image ? 200 : 206), `demo-${kind}-http-${response.status}`);
-      const mime = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() || "";
-      need(image ? mime.startsWith(type) : mime === type, `demo-${kind}-type-invalid`);
-      const policy = response.headers.get("cross-origin-resource-policy")?.trim().toLowerCase();
-      need(url.origin === site || policy !== "same-origin", `demo-${kind}-cross-origin-blocked`);
-      if (!image) need(/^bytes 0-0\/[1-9]\d*$/.test(response.headers.get("content-range") || "")
-        && (await response.arrayBuffer()).byteLength === 1, `demo-${kind}-range-invalid`);
-    }));
-  }
-
   const probes = {
     "nano-mcp": () => discover(NANO),
     "nano-alias-mcp": () => discover(NANO_ALIAS),
@@ -166,7 +113,6 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000,
       const result = await json(BABEL + "/mcp/v1", { body: rpc("initialize", INIT), status: 401 });
       need(result.error, "invalid-babel-challenge");
     },
-    ...(demoMedia && { "nano-demo-media": () => demo(NANO), "near-demo-media": () => demo(NEAR) }),
   };
   const checkedAt = new Date(now()).toISOString();
   async function check(stage, probe) {
