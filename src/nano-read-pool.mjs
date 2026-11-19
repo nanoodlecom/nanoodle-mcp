@@ -156,15 +156,19 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   let paymentWindowPriorityUntil = -Infinity;
   let standbyAccountEvidence = null;
   const standbyAttempts = [];
+  const historyRefused = new Map();
   const expired = (at, ttl) => now() < at || now() - at >= ttl;
   const cooling = base => (cooldowns.get(base)?.until ?? 0) > now();
+  const requestBlocked = base => cooling(base) || historyRefused.has(base);
   const hasProof = base => !cooling(base) && networks.get(base)?.ok && !expired(networks.get(base).at, networkTtlMs);
-  const hasStandbyQuorum = () => readPeers >= minimum && hasProof(standbyUrl) && preferred.some(hasProof);
+  const availableProof = base => !historyRefused.has(base) && hasProof(base);
+  const hasStandbyQuorum = () => readPeers >= minimum && availableProof(standbyUrl) && preferred.some(availableProof);
   function standbyBudgetAvailable(at, requests) {
     while (standbyAttempts.length && at - standbyAttempts[0] >= NANO_STANDBY_BUDGET_MS) standbyAttempts.shift();
     return standbyAttempts.length + requests <= standby.requestsPerMinute;
   }
   function readRpc(body, base) {
+    if (requestBlocked(base)) throw fail("NANO_RPC_COOLDOWN", "Nano RPC peer is cooling down");
     if (base === standbyUrl) {
       const at = monotonicNow();
       if (!standbyBudgetAvailable(at, 1)) throw standbyBudgetExhausted();
@@ -185,7 +189,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     networks.set(base, { ok: false, at: now() });
   }
   async function proveNetwork(base) {
-    if (cooling(base)) return;
+    if (requestBlocked(base)) return;
     const prior = networks.get(base);
     if (prior && !expired(prior.at, prior.ok ? networkTtlMs : 5_000)) return;
     try { checkNanoGenesis(await readRpc({ action: "block_info", hash: NANO_GENESIS, json_block: "true" }, base)); networks.set(base, { ok: true, at: now() }); }
@@ -195,7 +199,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     if (inflightNetwork) return inflightNetwork;
     inflightNetwork = (async () => {
       await Promise.all(bases.map(proveNetwork));
-      return bases.filter(hasProof);
+      return bases.filter(availableProof);
     })().finally(() => { inflightNetwork = null; });
     return inflightNetwork;
   }
@@ -203,7 +207,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     // A concurrent checkpoint or block lookup must not spend the account_info
     // request needed to validate a receivable or history page already in flight.
     const attempt = standbyTail.then(async () => {
-      if (cooling(standbyUrl)) return null;
+      if (requestBlocked(standbyUrl)) return null;
       const proved = hasProof(standbyUrl);
       const at = monotonicNow(), required = requests + Number(!proved);
       if (background && at < paymentWindowPriorityUntil) throw standbyBudgetExhausted();
@@ -279,7 +283,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   }
   function reusedFundingView(primary) {
     const evidence = standbyAccountEvidence;
-    if (!evidence || !hasProof(standbyUrl) || !hasProof(primary.base)) return null;
+    if (!evidence || !availableProof(standbyUrl) || !availableProof(primary.base)) return null;
     const at = now(), elapsed = monotonicNow() - evidence.monotonicAt;
     if (at < lastReadAt || elapsed < 0) return null;
     const fundingEvidenceExpiresAt = Math.floor(Math.min(lastReadAt + NANO_FUNDING_EVIDENCE_MS,
@@ -334,7 +338,12 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
             const proved = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, frontierHeight ?? height);
             if (BigInt(proved.history[0].height) <= view.confirmedHeight) history = proved;
           } catch (error) {
-            if (error?.rateLimited === true) paymentWindow.historyRefusals.push({ base, error });
+            if (error?.rateLimited === true) {
+              // Suppress new I/O as soon as the peer refuses history. Delay
+              // invalidating this window's already verified account view.
+              historyRefused.set(base, (historyRefused.get(base) ?? 0) + 1);
+              paymentWindow.historyRefusals.push({ base, error });
+            }
           }
         }
         // An older in-flight success cannot erase a newer concurrent refusal.
@@ -428,7 +437,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   function status() {
     return { enforced: true, configuredPeers: allBases.length, minimumPeers: minimum,
       readablePeers: standbyInUse && !hasStandbyQuorum() ? 0 : readPeers,
-      networkPeers: bases.filter(hasProof).length + Number(standbyInUse && hasStandbyQuorum()), lastReadAt,
+      networkPeers: bases.filter(availableProof).length + Number(standbyInUse && hasStandbyQuorum()), lastReadAt,
       configuration, cooldowns: allBases.flatMap((base, peer) => cooling(base) ? [{ peer, until: cooldowns.get(base).until }] : []),
       ...(standby && { standby: { inUse: standbyInUse && hasStandbyQuorum(), requestsPerMinute: standby.requestsPerMinute,
         coldPaymentScanRequests: NANO_COLD_STANDBY_SCAN_REQUESTS } }),
@@ -454,7 +463,12 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       } finally {
         // A refusal of the later history request cools the endpoint for
         // future reads without discarding its already verified receivables.
-        for (const { base, error } of historyRefusals) rateLimit(base, error);
+        for (const { base, error } of historyRefusals) {
+          rateLimit(base, error);
+          const pending = historyRefused.get(base) - 1;
+          if (pending) historyRefused.set(base, pending);
+          else historyRefused.delete(base);
+        }
       }
     },
     async verifyCheckpoint(value) {
@@ -466,12 +480,12 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         throw error;
       }
     },
-    isCooling: base => bases.includes(base) && cooling(base),
+    isCooling: base => bases.includes(base) && requestBlocked(base),
     async block(body) {
       if (body.action !== "block_info" || !hash(body.hash)) throw fail("NANO_RPC_READ_ACTION");
       const primary = await networkBases(), found = [], missing = [];
       async function lookup(base) {
-        if (cooling(base)) return;
+        if (requestBlocked(base)) return;
         const priorCooldown = cooldowns.get(base);
         try {
           const data = await readRpc({ ...body, json_block: "true" }, base);

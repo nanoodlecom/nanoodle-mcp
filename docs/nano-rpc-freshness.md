@@ -61,6 +61,10 @@ are bounded to 30 days, covering observed multi-day IP penalties. Successful
 account or block reads reset that escalation.
 Cooling peers receive no read or publish attempts. Other qualified peers keep
 serving, and the required independent-peer minimum stays the same.
+When a history read is rate-limited, new requests to that peer stop even if
+another peer is still finishing the payment scan. The scan can keep the
+receivables it already verified. It needs confirmed history to advance its
+history cursor.
 
 Reads fan out to qualified peers. The wallet selects the newest consistent
 account height; at the same head, the greater confirmed pending total wins over
