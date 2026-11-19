@@ -27,6 +27,13 @@ ID. For a named payer, set `CHECK_PAYER_PUBLIC_KEY` in the canary environment
 file. `CHECK_MAX_NEAR` configures the canary's default cap and the monitoring
 threshold together. The operational service's payer key file remains inaccessible.
 
+When the successful canary's discovery proof is configured, the five-minute
+probe also reads that run's settled payment page, status, event stream, and
+result. It compares the receipt with the saved deposit, charge, and refund.
+It reports a failure without including the checkout ID, receipt, or output
+in the alert. Once the checkout reaches its retention limit, its separate
+on-chain discovery check continues for the lifetime of the proof.
+
 ## Installation on the production box
 
 Create a `nanoodle-check` system user. Generate a dedicated key with

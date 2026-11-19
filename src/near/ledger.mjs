@@ -20,6 +20,7 @@ import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
 const RECORDED_PAYMENT = new Set(["paid", "running", "settled", "failed", "rejected"]);
+export const SETTLED_NEAR_QUOTE_RETENTION_MS = 86_400_000;
 
 function awaitingPayment(quote) {
   return (quote?.status === "pending" || quote?.status === "expired") && !quote.payTx;
@@ -262,7 +263,7 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
      * the watcher has covered the window and any recorded claim is attached.
      * Consumed hashes and refunds are never pruned.
      */
-    prune({ retainMs = 86_400_000, unpaidRetainMs = 86_400_000 } = {}) {
+    prune({ retainMs = SETTLED_NEAR_QUOTE_RETENTION_MS, unpaidRetainMs = 86_400_000 } = {}) {
       const t = now();
       const coveredThroughMs = ledger.paymentWatchCoverage();
       const doomed = [];
