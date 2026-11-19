@@ -245,8 +245,9 @@ Coverage:
   enabled. The probe distinguishes a local counter regression, a stalled
   confirmed count and a gap that keeps growing. A widening gap of at least
   50 blocks over at least ten minutes warns even while both counts advance.
-  Stable historical lag and missing samples do not carry a widening trend
-  forward. Wallet read quorum still determines Nano payment readiness.
+  The warning needs two increases and tolerates short plateaus between
+  them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
+  clear the trend. Wallet read quorum determines Nano payment readiness.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the
