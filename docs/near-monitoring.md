@@ -127,6 +127,9 @@ delivery. Each systemd invocation has a stable message ID; network failures and
 lost responses retry that ID. `nanoodle-near-alert-retry.timer` drains pending
 messages every five minutes. Babel then owns durable delivery and recipient wakes.
 Queue acceptance is distinct from Ember's authenticated receipt.
+Alerts list admission failures before advisories. The outbox attempts new
+blocking alerts first and keeps unreadable records for inspection. An unreadable
+record counts as a delivery fault while other messages can still be sent.
 
 Provision a dedicated persistent sender through the Babel operator's approved
 process, scoped to a conversation with Ember. Do not copy a native worker's
@@ -243,6 +246,11 @@ Coverage:
   If the watcher is still scanning historical blocks five minutes after the
   first observation, the same alert route reports delayed payment detection.
   The report distinguishes this from a failure to follow the live chain tip.
+  The historical canary reports which RPC step timed out for each peer,
+  from fetching the transaction to resolving the receipt.
+  Historical blocks must match the requested hash, and recovery records a
+  decreasing height bound across restarts. An invalid predecessor leaves
+  coverage at the last verified block and marks the watcher unready.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
 - Retained NEAR and USDC payments must match their replay claims. A missing or
   mismatched claim fails both readiness checks and stops the writer from
@@ -262,8 +270,10 @@ Coverage:
 - Fresh private runtime funding telemetry, enforced spend/transfer protection,
   and active scopes older than the configured execution limit plus 15 minutes
   for payment reconciliation. See [hosted deadlines](hosted-execution.md).
-- Live exchange-rate freshness; platform fee still matching the worker's 5%
-  assumption; authenticated Market token validity and actual worker lock/process.
+- Live exchange-rate freshness, authenticated Market token validity and worker
+  liveness. The fee probe uses the worker's 5% ceiling and reports an
+  unavailable fee separately from a fee above the ceiling. Listing price and
+  Nano funding checks still run at the 5% allowance in either case.
 - Active Market assignments have a delivery-window check. It warns when
   delivery is due within ten minutes or the last quarter of a shorter SLA,
   a worker's retry would miss its cutoff, or model work has reached its
@@ -278,11 +288,15 @@ Coverage:
   same published graphs. These per-workflow alerts preserve admission for other
   workflows.
 - When provider payments use the shared Nano wallet, the monitor checks whether
-  that wallet can reserve each advertised NEAR and USDC deposit, the custom
-  sample, the tested Market listing budgets, and enabled Market bid ceilings.
+  that wallet can reserve the saved workflows' advertised Nano, NEAR and USDC
+  deposits, the custom sample, the tested Market listing budgets, and enabled
+  Market bid ceilings. It uses the sampled Nano rate for the fixed Nano deposits.
   It compares the same run budget against live unreserved funds and the
-  independently confirmed balance after obligations, including paid NEAR and
-  USDC runs still waiting to reserve Nano. A creator run includes overhead
+  independently confirmed balance after obligations. It also checks the
+  combined budgets of paid Nano, NEAR and USDC runs still waiting to start,
+  using each quote's locked rate. Accepted Market jobs waiting to start are
+  included at the sampled Nano rate. Running jobs already affect the runtime
+  balance through reservations. A creator run includes overhead
   from the largest possible deposit with quote dust. These are per-workflow
   warnings. The runtime still verifies funding when each run starts.
 - NEAR and USDC share an open-quote limit. The check warns at 80% and
@@ -293,10 +307,17 @@ Coverage:
 - Disk/inode headroom and a write/fsync probe; disabled/overdue check timers and
   failed scheduled services, including the paid canary and alert-queue retry.
 - The ordinary Nano fallbacks must serve confirmed receivables and continuous
-  raw history from the wallet's confirmed head. Raw history includes
-  representative changes and epoch blocks. The hosted watcher rejects a gap,
-  wrong account, or truncated page before committing coverage. Its completed
-  cursor stays on a block that the older, filtered history can still find.
+  raw history at the newest confirmed wallet head seen during the probe.
+  Each history request uses the head from that node's account read. Raw history
+  includes representative changes and epoch blocks. The hosted watcher rejects
+  a gap, wrong account, or truncated page before committing coverage. Its
+  completed cursor stays on a block that the older, filtered history can find.
+- When a quote is waiting and completed Nano coverage is stale, the readiness
+  check reports whether a verified backfill cursor advanced in the last two
+  minutes. It reports `nano-history-backfill-in-progress` for recent progress
+  and `nano-history-backfill-stalled` for an older cursor. Both report Nano
+  as unready until completed coverage catches up. The monitor reads this
+  evidence from the ledger without spending standby RPC quota.
 
 Install `ops/nanoodle-operational-check.{service,timer}`, reload systemd, start
 the service once, inspect its report, then enable the timer. It runs at every
