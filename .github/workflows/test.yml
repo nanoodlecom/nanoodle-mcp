@@ -172,6 +172,8 @@ jobs:
           key: ffmpeg-7.0.2-linux-amd64-abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
       - run: npm ci
       - run: npm test
+      - name: Simulate Market hires with local stand-ins
+        run: npm run simulate:market
 
   package:
     name: Pack and install the MCP release
