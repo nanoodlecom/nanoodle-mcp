@@ -105,7 +105,7 @@ function strip(res) {
  * @param {number} [opts.skewMs]     tolerated clock skew between the chain and this server
  * @param {(line: string) => void} [opts.log]
  * @param {(event: string, fields: object) => void} [opts.usage]  payments ledger (money events only)
- * @param {number} [opts.txTimeoutMs]  bound on the FINAL `tx` lookup (default in readPaymentTransfer)
+ * @param {number} [opts.txTimeoutMs]  override the transaction lookup timeout
  * @param {(min: number, max: number) => number} [opts.randomInt]  dust source; tests pin it
  * @param {number} [opts.maxOpenQuotes]   unexpired unpaid quotes held at once (default 1000); more are refused as busy
  * @param {number} [opts.expiredRetainMs] how long an expired, unpaid quote is kept so a late transfer is still refunded (1 h)

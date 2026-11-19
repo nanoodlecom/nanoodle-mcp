@@ -307,8 +307,8 @@ test("a discovered exact transfer is accepted automatically; top-ups and older t
   assert.equal(result.structuredContent.receipt.refund.status, "sent");
 });
 
-test("a discovered finalized payment reaches the archive when the live peer cannot read its transaction", async t => {
-  for (const [asset, code] of [["near", "UNKNOWN_TRANSACTION"], ["usdc", "TIMEOUT_ERROR"]]) {
+test("a discovered payment reads existing outcomes and waits for a finalized history peer", async t => {
+  for (const [asset, code] of [["near", "UNKNOWN_TRANSACTION"], ["usdc", "TIMEOUT_ERROR"], ["usdc", "TX_NOT_FINAL"]]) {
     let clock = Date.now();
     let archiveReady = false;
     const lookups = [];
@@ -316,11 +316,12 @@ test("a discovered finalized payment reaches the archive when the live peer cann
     const w = await world({ now: () => clock, usdcToken, rate: createNearRates({ nearUsd: "3.64" }), rpcForChain: chain => createNearRpcPool({
       urls: ["https://live.test", "https://archive.test"], chainId: "testnet", now: () => clock, maxHeadAgeMs: 90_000,
       fetch: (url, init) => {
-        const { method, id } = JSON.parse(init.body), host = new URL(url).hostname;
+        const { method, id, params } = JSON.parse(init.body), host = new URL(url).hostname;
         if (method !== "tx") return chain.fetch(url, init);
-        lookups.push(host);
-        return host === "archive.test" && archiveReady ? chain.fetch(url, init)
-          : Response.json({ jsonrpc: "2.0", id, error: { code: -32000, cause: { name: code } } });
+        lookups.push({ host, waitUntil: params.wait_until });
+        if (host === "archive.test" && archiveReady) return chain.fetch(url, init);
+        if (code === "TX_NOT_FINAL") return Response.json({ jsonrpc: "2.0", id, result: { final_execution_status: "EXECUTED" } });
+        return Response.json({ jsonrpc: "2.0", id, error: { code: -32000, cause: { name: code } } });
       },
     }) });
     const watcher = createNearWatcher({ rpc: w.rpc, ledger: w.ledger, merchantId: MERCHANT,
@@ -335,11 +336,13 @@ test("a discovered finalized payment reaches the archive when the live peer cann
       : w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto));
     const manual = await w.gate.confirmPayment(p.paymentId, tx, PAYER);
     assert.equal(manual.status, "pending");
-    assert.deepEqual(lookups, ["live.test"]);
+    assert.deepEqual(lookups, [{ host: "live.test", waitUntil: "FINAL" }]);
+    lookups.length = 0;
     const before = w.ledger.getMeta("paymentWatch");
     await watcher.tick();
     assert.equal(w.gate.quote(p.paymentId).status, "pending");
     assert.deepEqual(w.ledger.getMeta("paymentWatch"), before);
+    assert.deepEqual(lookups, [{ host: "live.test", waitUntil: "NONE" }, { host: "archive.test", waitUntil: "NONE" }]);
     archiveReady = true;
     lookups.length = 0;
     const runs = mock.runs();
@@ -347,7 +350,8 @@ test("a discovered finalized payment reaches the archive when the live peer cann
     assert.equal(watcher.status().listening, true);
     assert.equal(w.gate.quote(p.paymentId).status, "paid");
     assert.equal(w.gate.quote(p.paymentId).txHash, tx);
-    assert.equal(lookups.filter(host => host === "archive.test").length, usdcToken ? 2 : 1);
+    assert.equal(lookups.filter(({ host }) => host === "archive.test").length, usdcToken ? 2 : 1);
+    assert.ok(lookups.every(({ waitUntil }) => waitUntil === "NONE"));
     await watcher.tick();
     assert.equal(w.events.filter(event => event.event === "paid").length, 1);
     assert.equal(mock.runs(), runs);
