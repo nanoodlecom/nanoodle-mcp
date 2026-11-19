@@ -91,6 +91,22 @@ test("a funding pause keeps the last failed sample and first recovery across a r
   assert.equal((await saved()).pause, undefined);
 });
 
+test("a failed funding snapshot writes only the provider backoff observations", async t => {
+  const w = await setup(t);
+  const configuration = "a".repeat(64), until = 1000 + 86_400_000;
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 1000,
+    snapshot: async () => { throw Object.assign(Error("PRIVATE_PROVIDER"), { code: "NANO_RPC_READ_QUORUM" }); },
+    rpcStatus: () => ({ configuration, configuredPeers: 2, cooldowns: [{ peer: 1, until, url: "PRIVATE_RPC" }],
+      readablePeers: 0, checkpoint: { account: "PRIVATE_ACCOUNT" } }),
+  });
+  t.after(report.stop);
+  const saved = await readFile(w.file, "utf8"), value = JSON.parse(saved);
+  assert.equal(value.code, "nano-rpc-read-quorum");
+  assert.equal(w.sources.ready(), false);
+  assert.deepEqual(value.nanoRpc, { configuration, configuredPeers: 2, cooldowns: [{ peer: 1, until }] });
+  assert.doesNotMatch(saved, /PRIVATE/);
+});
+
 test("a write failure pauses sending; read-only recovery does not need to enable sends first", async t => {
   const w = await setup(t);
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
