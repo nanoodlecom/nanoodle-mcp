@@ -201,6 +201,31 @@ def test_share_link_run_uses_run_noodle_url_and_inputs():
     assert seen["arguments"]["inputs"] == {"Idea": "dawn lighthouse"}
 
 
+def test_sweeper_skips_claimed_jobs():
+    # A job a handler is actively waiting on must not also be delivered
+    # by the background sweeper (double delivery of the same result).
+    from nanoodle_agentverse.service import Job
+
+    service = make_service(tools_handler)
+
+    async def scenario():
+        async def finished():
+            return "done reply"
+
+        job = Job(job_id="claimedjob1", sender=SENDER, label="w")
+        job.task = asyncio.ensure_future(finished())
+        job.claimed = True
+        service._jobs[job.job_id] = job
+        await asyncio.sleep(0.05)
+        assert await service.collect_finished_jobs() == []
+        job.claimed = False
+        assert await service.collect_finished_jobs() == [(SENDER, "done reply")]
+        # and never twice
+        assert await service.collect_finished_jobs() == []
+
+    run(scenario())
+
+
 def test_oversized_input_rejected_before_any_call():
     called = []
     service = make_service(lambda payload: called.append(payload) or tools_handler(payload))

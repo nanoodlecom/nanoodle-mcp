@@ -63,6 +63,11 @@ class Job:
     reply: str | None = None
     done: bool = False
     delivered: bool = False
+    # True while a chat handler is actively waiting on this job within its
+    # short-wait window. The delivery sweeper must skip claimed jobs, or a
+    # job finishing inside the window would be delivered twice: once by
+    # the sweeper, once by the handler's own reply.
+    claimed: bool = False
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -179,6 +184,7 @@ class FacadeService:
             label=request.label or request.tool,
         )
         job.task = asyncio.create_task(self._execute(sender, request, arguments))
+        job.claimed = True
         self._jobs[job.job_id] = job
         self._prune_jobs()
         try:
@@ -186,6 +192,7 @@ class FacadeService:
                 asyncio.shield(job.task), timeout=self._config.short_wait_s
             )
         except asyncio.TimeoutError:
+            job.claimed = False
             return (
                 f"Started {job.label} — it is taking a while, so it is "
                 f"finishing in the background as job {job.job_id}. "
@@ -221,6 +228,7 @@ class FacadeService:
         job.task = asyncio.create_task(
             self._execute_resumed(pending.request, arguments, sender)
         )
+        job.claimed = True
         self._jobs[job.job_id] = job
         self._prune_jobs()
         try:
@@ -228,6 +236,7 @@ class FacadeService:
                 asyncio.shield(job.task), timeout=self._config.short_wait_s
             )
         except asyncio.TimeoutError:
+            job.claimed = False
             return (
                 f"Payment noted — the run is finishing in the background "
                 f"as job {job.job_id}. Ask `status {job.job_id}` or wait "
@@ -362,7 +371,7 @@ class FacadeService:
         """(sender, reply) pairs for jobs that finished since last check."""
         finished: list[tuple[str, str]] = []
         for job in self._jobs.values():
-            if job.done or job.delivered:
+            if job.done or job.delivered or job.claimed:
                 continue
             if job.task is not None and job.task.done():
                 job.done = True
