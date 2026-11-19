@@ -25,7 +25,7 @@ async function setup(t, options = {}) {
     priceQuote: async () => {
       counts.price++;
       return {
-        downstream: { asset: "XNO", unit: "raw", amountAtomic: "1000" }, ttlMs: 60_000,
+        downstream: { asset: "XNO", unit: "raw", amountAtomic: "1000" }, ttlSeconds: 60,
         prices: [{ network: "eip155:8453", amountAtomic: "10000" }, { network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", amountAtomic: "10000" }],
       };
     },
@@ -202,4 +202,34 @@ test("refund state advances monotonically and refunded requires a canonical refu
   const restarted = s.make();
   await assert.rejects(restarted.recordRefundState({ fundingKey: hex("7"), refund: { state: "pending" } }),
     /BOUNDARY_OUTCOME_MISSING/);
+});
+
+test("a second live instance cannot overwrite the first writer's state: fingerprint guard fails closed", async t => {
+  const s = await setup(t); const id = s.identity();
+  const a = s.boundary, b = s.make(); // both loaded the same (empty) state
+  const r = await s.reserve(a, id);
+  assert.equal(r.state, "reserved");
+  // b's snapshot is stale; its next mutation must refuse, not clobber.
+  await assert.rejects(s.reserve(b, s.identity({ authorizationKey: hex("c"), paymentDigest: hex("e") })), /BOUNDARY_STATE_CHANGED/);
+  await assert.rejects(b.lookupQuote({ binding: hex("b") }), /BOUNDARY_STATE_CHANGED/); // poisoned for good
+  // a fresh instance sees a's durable state and can proceed.
+  const c = s.make();
+  const seen = await c.lookupReservation({ authorizationKey: id.authorizationKey });
+  assert.equal(seen.reservationId, r.reservationId);
+  const g = await s.begin(c, { ...id, quoteId: seen.quoteId }, r.reservationId);
+  assert.equal(g.granted, true);
+});
+
+test("a failed write rolls back: no phantom reservation survives an unwritable directory", async t => {
+  const { chmod } = await import("node:fs/promises");
+  const s = await setup(t); const id = s.identity();
+  await s.quote(); // create the file + quote while writable
+  const dir = s.file.slice(0, s.file.lastIndexOf("/"));
+  await chmod(dir, 0o500);
+  try {
+    await assert.rejects(s.reserve(s.boundary, id));
+  } finally { await chmod(dir, 0o700); }
+  assert.equal(await s.boundary.lookupReservation({ authorizationKey: id.authorizationKey }), null);
+  const r = await s.reserve(s.boundary, id); // same call now succeeds cleanly
+  assert.equal(r.state, "reserved");
 });

@@ -25,7 +25,7 @@ async function harness(t, options = {}) {
     ...(r.network === SOLANA ? { extra: { feePayer: svmFeePayer.address } } : {}) })), extensions: [], signers: {} };
   const boundary = createDurableX402Boundary({
     file: join(dir, "boundary.json"),
-    priceQuote: async () => ({ downstream: { asset: "XNO", unit: "raw", amountAtomic: "1000" }, ttlMs: 60_000,
+    priceQuote: async () => ({ downstream: { asset: "XNO", unit: "raw", amountAtomic: "1000" }, ttlSeconds: 60,
       prices: routes.map(r => ({ network: r.network, amountAtomic: "10000" })) }),
     execute: async () => { counts.execute++; return { status: "completed", refund: { state: "not_required" },
       result: { isError: false, content: [{ type: "text", text: "offline protected output" }] } }; },

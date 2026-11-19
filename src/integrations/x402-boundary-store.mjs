@@ -38,6 +38,7 @@
 // moving refund money is a separate, operator-owned policy.
 
 import { existsSync, readFileSync } from "node:fs";
+const sha256 = text => createHash("sha256").update(text).digest("hex");
 import { createHash } from "node:crypto";
 import { writePrivateStateSync } from "../private-state.mjs";
 import { BOUNDARY_CONTRACT, canonical } from "./x402-exact-ingress.mjs";
@@ -70,15 +71,17 @@ function emptyState() {
 }
 
 function loadState(file) {
-  if (!existsSync(file)) return emptyState();
+  if (!existsSync(file)) return { state: emptyState(), fingerprint: null };
+  let raw;
+  try { raw = readFileSync(file, "utf8"); } catch { fail("BOUNDARY_STATE_CORRUPT"); }
   let parsed;
-  try { parsed = JSON.parse(readFileSync(file, "utf8")); }
+  try { parsed = JSON.parse(raw); }
   catch { fail("BOUNDARY_STATE_CORRUPT"); }
   const ok = parsed && parsed.version === STATE_VERSION && Number.isSafeInteger(parsed.serial)
     && ["quotesByBinding", "reservationsByAuth", "fundingByKey", "txIndex", "outcomesByFunding", "dispatchIntents"]
       .every(k => parsed[k] && typeof parsed[k] === "object" && !Array.isArray(parsed[k]));
   if (!ok) fail("BOUNDARY_STATE_CORRUPT");
-  return parsed;
+  return { state: parsed, fingerprint: sha256(raw) };
 }
 
 const IDENTITY_KEYS = ["fundingKey", "quoteId", "binding", "authorizationKey", "paymentDigest"];
@@ -90,14 +93,20 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
   if (typeof file !== "string" || !file) fail("BOUNDARY_FILE_REQUIRED");
   if (typeof priceQuote !== "function") fail("BOUNDARY_PRICE_QUOTE_REQUIRED");
   if (typeof execute !== "function") fail("BOUNDARY_EXECUTOR_REQUIRED");
-  let state = loadState(file);
+  const loaded = loadState(file);
+  let state = loaded.state;
+  // Fingerprint of the exact bytes this instance loaded or last wrote. If
+  // the file changes underneath us (a second live writer, a restore, a
+  // manual edit), the next persist fails closed instead of overwriting
+  // the other writer's grants with our stale whole-file snapshot.
+  let fingerprint = loaded.fingerprint;
   let poisoned = null;
   let chain = Promise.resolve();
   // Serialize every operation; critical sections below never await between
   // check and persist, so a grant is atomic w.r.t. all other operations.
   const run = fn => {
     const result = chain.then(() => {
-      if (poisoned) fail("BOUNDARY_DURABILITY_UNCERTAIN");
+      if (poisoned) throw poisoned;
       return fn();
     });
     chain = result.then(() => {}, () => {});
@@ -106,9 +115,16 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
   function persist(mutate) {
     const backup = clone(state);
     try {
+      if (fingerprint === null ? existsSync(file) : (!existsSync(file) || sha256(readFileSync(file, "utf8")) !== fingerprint)) {
+        poisoned = new BoundaryError("BOUNDARY_STATE_CHANGED");
+        throw poisoned;
+      }
       mutate(state);
-      writePrivateStateSync(file, JSON.stringify(state) + "\n");
+      const text = JSON.stringify(state) + "\n";
+      writePrivateStateSync(file, text);
+      fingerprint = sha256(text);
     } catch (error) {
+      if (error?.code === "BOUNDARY_STATE_CHANGED") throw error;
       if (error?.code === "STATE_DURABILITY_UNCERTAIN") {
         // The replacement may be visible but unconfirmed: trust nothing.
         poisoned = error;
@@ -143,19 +159,19 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
           || priced.downstream?.asset !== "XNO" || priced.downstream?.unit !== "raw"
           || typeof priced.downstream?.amountAtomic !== "string") fail("BOUNDARY_PRICING_INVALID");
         const issuedAt = now();
-        const ttlMs = priced.ttlMs ?? 60_000;
-        if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > 300_000) fail("BOUNDARY_PRICING_INVALID");
+        const ttlSeconds = priced.ttlSeconds ?? 60;
+        if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 300) fail("BOUNDARY_PRICING_INVALID");
         const requirements = [];
         for (const p of priced.prices) {
           requirements.push(await buildRequirements({
-            network: p.network, amountAtomic: p.amountAtomic, maxTimeoutSeconds: Math.ceil(ttlMs / 1000),
+            network: p.network, amountAtomic: p.amountAtomic, maxTimeoutSeconds: ttlSeconds,
           }));
         }
         let quote;
         persist(s => {
           quote = {
             quoteId: priced.quoteId ?? `quote-${++s.serial}`, binding,
-            resource: clone(request.resource), issuedAt, expiresAt: issuedAt + ttlMs,
+            resource: clone(request.resource), issuedAt, expiresAt: issuedAt + ttlSeconds * 1000,
             downstream: clone(priced.downstream), requirements: clone(requirements),
           };
           s.quotesByBinding[binding] = quote;
@@ -285,8 +301,10 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
       // Phase 2: the executor runs exactly once per fundingKey. If it throws
       // or the process dies, the persisted intent blocks any blind re-run.
       const outcome = await execute({ request: clone(input.request), receipt: prepared.receipt });
-      const valid = outcome && ["completed", "failed"].includes(outcome.status)
-        && outcome.refund && typeof outcome.refund.state === "string";
+      let valid = outcome && ["completed", "failed"].includes(outcome.status)
+        && outcome.refund && ["not_required", "not_requested", "pending", "refunded", "uncertain"].includes(outcome.refund.state)
+        && (outcome.status !== "completed" || outcome.refund.state === "not_required");
+      if (valid) { try { clone(outcome); } catch { valid = false; } } // must survive canonical JSON round-trip
       if (!valid) fail("BOUNDARY_DISPATCH_OUTCOME_INVALID");
       // Phase 3 (serialized): persist the typed outcome + dispatched state.
       return run(() => {
