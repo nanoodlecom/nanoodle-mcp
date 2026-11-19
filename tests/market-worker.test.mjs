@@ -212,6 +212,31 @@ test("the worker rechecks the paid assignment after Market confirms start", asyn
   }
 });
 
+test("the worker rechecks cancellation and escrow after the provider refresh and buyer updates", async t => {
+  for (const [name, update, phase, code] of [
+    ["cancelled during refresh", (m, id) => m.cancel(id), "gone", undefined],
+    ["escrow shrank during refresh", (m, id) => { m.rows.get(id).assignment.escrowAmount = "0.005"; }, "declined", "MARKET_ESCROW_TOO_LOW"],
+  ]) {
+    await t.test(name, async () => {
+      const r = await rig();
+      try {
+        const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+        const price = r.runner.price;
+        r.runner.price = async (args, options) => {
+          const priced = await price(args, options);
+          if (options.refreshCatalogs) update(r.m, id);
+          return priced;
+        };
+        await r.once();
+        assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+        assert.equal(nano.runs(), before);
+        assert.equal(r.store.get(id).phase, phase);
+        assert.equal(r.store.get(id).decline?.code, code);
+      } finally { r.store.close(); await r.m.close(); }
+    });
+  }
+});
+
 test("Market stops before inference when the delivery reserve is reached during start, fee check, or progress", async t => {
   for (const phase of ["before-start", "start-fee", "run-fee", "progress"]) {
     await t.test(phase, async () => {

@@ -290,22 +290,29 @@ export function createMarketWorker({
     }
   }
 
-  async function phaseStarted(rec) {
-    // Start is idempotent and its response only carries a timestamp. Read back
-    // the assignment to catch cancellation or changed funding after the poll.
+  async function verifyStartedAssignment(rec) {
     const row = await lookup(rec.id);
     const assignment = row?.assignment;
-    if (!assignment?.status) return backoff(rec, new Error("Market assignment status could not be verified"));
-    if (assignment.status !== "in_progress") return finishGone(rec, assignment.status);
-    if (assignment.submittedAt || assignment.deliverableUrl) return finishGone(rec, "already delivered");
-    if (!Number.isFinite(Date.parse(assignment.startedAt))) {
-      return backoff(rec, new Error("Market assignment start could not be verified"));
+    if (!assignment?.status) return { stop: backoff(rec, new Error("Market assignment status could not be verified")) };
+    if (assignment.status !== "in_progress") return { stop: finishGone(rec, assignment.status) };
+    if (assignment.submittedAt || assignment.deliverableUrl) return { stop: finishGone(rec, "already delivered") };
+    const startedAt = Date.parse(assignment.startedAt);
+    if (!Number.isFinite(startedAt)) {
+      return { stop: backoff(rec, new Error("Market assignment start could not be verified")) };
     }
     const timing = marketDeliveryWindow(assignment);
-    const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
-    const { terms, stop } = checkEscrow(rec, row, "failed");
-    if (stop) return stop;
-    const jobBudget = Math.min(budgetOf(rec), terms.budgetUsd);
+    const deadlineStop = deadlineRefusal(rec, timing);
+    if (deadlineStop) return { stop: deadlineStop };
+    return { row, timing, startedAt, ...checkEscrow(rec, row, "failed") };
+  }
+
+  async function phaseStarted(rec) {
+    // The idempotent start response only carries a timestamp. Verify the
+    // assignment and escrow before committing to a provider price.
+    const started = await verifyStartedAssignment(rec);
+    if (started.stop) return started.stop;
+    const { row, timing } = started;
+    const jobBudget = Math.min(budgetOf(rec), started.terms.budgetUsd);
     if (rec.pricing?.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
     // Use the current catalog within the accepted budget. On restart, recover the
     // request from the assignment as before. Nothing has run at this point.
@@ -319,19 +326,28 @@ export function createMarketWorker({
     await progress(rec.id, `Preparing the workflow (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
     const afterProgress = deadlineRefusal(rec, timing); if (afterProgress) return afterProgress;
     const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
-    const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
+    // Pricing and buyer updates can take time. Recheck the assignment and
+    // escrow before recording the durable claim that authorizes execution.
+    const current = await verifyStartedAssignment(rec);
+    if (current.stop) return current.stop;
+    if (current.startedAt !== started.startedAt) {
+      return backoff(rec, new Error("Market assignment start changed during preparation"));
+    }
+    const elapsed = deadlineRefusal(rec, timing); if (elapsed) return elapsed;
+    const finalBudget = Math.min(jobBudget, current.terms.budgetUsd);
+    if (prep.pricing.depositUsd > finalBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
+    const executionDeadlineAt = Math.min(timing.executionDeadlineAt, current.timing.executionDeadlineAt);
     prepared.delete(rec.id);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),
-      executionDeadlineAt: timing.executionDeadlineAt,
-      budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd,
-      ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), jobBudget) } }),
+      executionDeadlineAt, budgetUsd: finalBudget, listingPriceUsd: current.terms.priceUsd,
+      ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), finalBudget) } }),
     }));
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
     try {
       run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
-        fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt: timing.executionDeadlineAt,
+        fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt,
         onRunComplete(result) {
           if (!rec.creator || !creatorPayments) return;
           const empty = result.outputs.length > 0 && result.outputs.every(o => o.kind === "text" && !String(o.text || "").trim());
