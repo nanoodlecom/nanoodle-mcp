@@ -249,14 +249,22 @@ draft preserves existing permissions and leaves workflow installation to a
 separate authorized change. The recipe uses scripts-disabled installs and no
 secrets.
 
-The qualification suite has 29 passing checks. Cases include reordered/replayed/spoofed funding, amount/identity/chain/hook/fork
+The qualification suite has 44 passing checks (grown from 29 at the original
+qualification: cancel-then-reconcile, malformed verified-job shapes,
+submitted-then-expired loss review, economics boundaries, and direct journal
+tests were added on re-land). Cases include reordered/replayed/spoofed funding, amount/identity/chain/hook/fork
 mismatches, invalid/rebound requirements, expiry during reservation, idempotency
 across restart and uncertain effects, ready-result recovery, ignored-abort
 completion, downstream failure, uncertain SDK submission, evaluator rejection,
 verified revenue and on-chain receipt-hash encoding. This is protocol/offline
 qualification, not live compatibility certification.
 
-The isolated SDK tree currently reports 29 npm audit findings (12 low, 6
-moderate, 11 high); ordinary root dependencies report zero. This SDK tree is not
-loaded by the normal runtime or packed into the npm release. Dependency review,
+At the original qualification (2026-11-03) the isolated SDK tree reported 29
+npm audit findings (12 low, 6 moderate, 11 high) and ordinary root dependencies
+reported zero. The audit endpoint was unavailable from the re-land environment
+(2026-11-19), so those figures are **not refreshed** — re-running `npm audit`
+in both trees is a required activation prerequisite, not a done check. This SDK tree is not
+loaded by the normal runtime or packed into the npm release (verified at
+re-land: `npm pack --dry-run` includes the four inert `src/ecosystems/acp/`
+sources and excludes the whole `qualification/` tree). Dependency review,
 provider setup and live validation remain prerequisites for any future activation.
