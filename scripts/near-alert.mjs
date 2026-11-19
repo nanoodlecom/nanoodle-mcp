@@ -32,19 +32,24 @@ export function failureEvent(env, latest, now = Date.now()) {
     && env.MONITOR_SERVICE_RESULT === "exit-code" && env.MONITOR_EXIT_CODE === "exited" && env.MONITOR_EXIT_STATUS === "1";
   const freshFailure = !backup && !test && latest?.ok === false && Math.abs(now - Date.parse(latest.checkedAt)) < 3_600_000
     && (!operational || matchingOperationalRun);
-  const stage = backup ? "backup" : freshFailure ? safe(latest.stage) : "service";
-  const issues = Array.isArray(latest?.checks) ? latest.checks : [];
-  const admission = operational && freshFailure && stage !== "preflight" ? latest.admission : null;
+  const reportedStage = backup ? "backup" : freshFailure ? safe(latest.stage) : "service";
+  const issues = freshFailure && Array.isArray(latest?.checks) ? latest.checks.filter(c => c?.ok === false) : [];
+  const admission = operational && freshFailure && reportedStage !== "preflight" ? latest.admission : null;
   const scoped = Object.keys(admissionLabels).every(key => typeof admission?.[key] === "boolean");
   const affected = Object.entries(admissionLabels).filter(([key]) => admission?.[key] === false).map(([, label]) => label);
   const advisory = scoped && affected.length === 0;
+  const priority = test ? "test" : advisory ? "advisory" : "failure";
+  const blocksAdmission = c => scoped && Array.isArray(c.domains)
+    && c.domains.some(domain => Object.hasOwn(admissionLabels, domain) && admission[domain] === false);
+  const blocking = issues.filter(blocksAdmission);
+  const stage = blocking.length ? safe(blocking[0].stage) : reportedStage;
   const headline = !scoped ? "Nanoodle operational readiness check FAILED. Payment and Market readiness could not be verified."
     : advisory ? "Nanoodle readiness advisory. Nano, NEAR, USDC, and Market passed their admission checks."
     : `Nanoodle admission checks failed for ${affected.join(", ")}.`;
-  const issueCodes = freshFailure && issues.filter(c => c?.ok === false).slice(0, 12)
+  const issueCodes = [...blocking, ...issues.filter(c => !blocksAdmission(c))].slice(0, 12)
     .map(c => `${safe(c.stage)}=${safe(c.code)}`).join(", ");
   const eventId = operational && freshFailure && /^[a-f0-9]{32}$/.test(latest.incidentId || "") ? latest.incidentId : env.MONITOR_INVOCATION_ID;
-  return { messageId: "near_check_" + createHash("sha256").update(env.MONITOR_UNIT + ":" + eventId).digest("hex").slice(0, 40), test,
+  return { messageId: "near_check_" + createHash("sha256").update(env.MONITOR_UNIT + ":" + eventId).digest("hex").slice(0, 40), test, priority,
     text: [test ? `TEST ALERT — Nanoodle ${backup ? "backup" : operational ? "operational readiness" : market ? "Market" : "NEAR"} check notification drill. This is not a production outage.`
         : backup ? "Nanoodle encrypted recovery backup FAILED (no inference)."
         : operational ? `${headline} The monitor runs every five minutes without inference.`
@@ -126,11 +131,26 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
     if (!existsSync(file)) atomicJson(file, { ...event, status: "pending", createdAt: new Date(now()).toISOString() });
   }
   if (enqueueOnly) return { ok: true, ...(event ? { messageId: event.messageId, test: event.test, persisted: true } : {}) };
-  let failed = 0, queued = 0;
+  let failed = 0, queued = 0, invalid = 0;
+  const pending = [];
   for (const name of readdirSync(dir).sort()) {
     if (!/^near_check_[a-f0-9]{40}\.json$/.test(name)) continue;
-    const file = join(dir, name), item = JSON.parse(readFileSync(file));
-    if (item.status !== "pending") continue;
+    const file = join(dir, name);
+    try {
+      const item = JSON.parse(readFileSync(file));
+      if (!item || item.messageId + ".json" !== name || !["pending", "queued"].includes(item.status)
+        || typeof item.text !== "string" || !item.text.trim()) throw Error("Invalid alert record");
+      if (item.status === "pending") pending.push({ file, item });
+    } catch {
+      // Keep the original record for inspection while delivering other alerts.
+      invalid++;
+    }
+  }
+  const rank = item => item.priority === "failure" ? (item.messageId === event?.messageId ? 0 : 1)
+    : item.priority === "advisory" || item.test === true ? 3 : 2;
+  const createdAt = item => Date.parse(item.createdAt) || 0;
+  pending.sort((a, b) => rank(a.item) - rank(b.item) || createdAt(a.item) - createdAt(b.item));
+  for (const { file, item } of pending) {
     try {
       const result = await call("stage_message", { recipient: EMBER, conversation_id: config.conversation, message_id: item.messageId, text: item.text });
       const message = result.message;
@@ -143,7 +163,8 @@ export async function deliverAlerts(config, { env = process.env, now = Date.now,
       item.lastFailureAt = new Date(now()).toISOString(); atomicJson(file, item); failed++;
     }
   }
-  const result = { ok: failed === 0, queued, pending: failed, ...(event ? { messageId: event.messageId, test: event.test } : {}) };
+  const result = { ok: failed === 0 && invalid === 0, queued, pending: failed, ...(invalid && { invalid }),
+    ...(event ? { messageId: event.messageId, test: event.test } : {}) };
   atomicJson(join(dir, "latest-delivery.json"), { ...result, checkedAt: new Date(now()).toISOString() });
   return result;
 }

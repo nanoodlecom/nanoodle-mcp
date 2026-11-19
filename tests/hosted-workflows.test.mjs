@@ -67,7 +67,11 @@ test("creator HTTP surfaces expose a bound MCP tool without publishing the recip
     assert.equal((await post(`/workflows/${record.id}/mcp`, {}, { Origin: "null" })).status, 403);
     const call = await (await post(`/workflows/${record.id}/mcp`, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "run_workflow", arguments: { Idea: "an otter" } } })).json();
     assert.equal(call.result.content[0].text, "same gate");
-    const guide = await (await fetch(`${base}/workflows/${record.id}/llms.txt`)).text(); assert.match(guide, /Continue automatically/);
+    const guide = await (await fetch(`${base}/workflows/${record.id}/llms.txt`)).text();
+    assert.match(guide, /anyone with this link can quote and pay/);
+    assert.match(guide, /price_workflow/); assert.match(guide, /run_workflow/);
+    assert.match(guide, /NEAR, USDC on NEAR/); assert.match(guide, /\x60Idea\x60/);
+    assert.doesNotMatch(guide, /Write one vivid image prompt|Supply an idea; receive a finished poster/);
     assert.equal((await fetch(`${base}/workflows/${record.id}/graph.json`)).status, 404);
   } finally { await new Promise(resolve => server.close(resolve)); }
 });

@@ -17,14 +17,14 @@ import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
-import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
+import { HUMANIZE_TOOL, HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
 import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
-import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
+import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GUIDE_NODE_MODEL_KIND, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
 
 /**
  * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
@@ -596,14 +596,16 @@ const noodleGuideTool = () => ({
   description:
     "Free, never charged: how to write a custom nanoodle workflow graph for run_noodle — the node " +
     "types this server runs (inputs, outputs, key fields), the wiring rules, a complete example " +
-    "graph, and the priced NanoGPT models with their unit prices (cheapest first). Filter with " +
-    "`kind` (chat, image, video, audio, model3d), `search` (model id substring) and `limit`. " +
+    "graph, and hosted NanoGPT model candidates with their unit prices (cheapest first). Filter with " +
+    "`kind`, `node_type`, `search` (model ID substring) and `limit`. Use `format_only` to skip catalog reads. " +
     "Then check the estimated cost with price_noodle before calling run_noodle.",
   inputSchema: {
     type: "object",
     properties: {
       kind: { type: "string", enum: GUIDE_KINDS, description: "Only list models of this kind." },
       search: { type: "string", description: "Only list models whose id contains this text." },
+      node_type: { type: "string", enum: Object.keys(GUIDE_NODE_MODEL_KIND), description: "Only list model candidates for this hosted node type." },
+      format_only: { type: "boolean", description: "Return the graph format, rules and example without looking up models." },
       limit: { type: "integer", minimum: 1, maximum: 50, description: "How many models to list (default 20)." },
     },
   },
@@ -973,14 +975,27 @@ export async function noodleGuide(args, { baseUrl, fetch = globalThis.fetch, log
   if (a.limit != null && !(Number.isInteger(a.limit) && a.limit >= 1 && a.limit <= 50)) {
     throw new ParamsError('noodle_guide "limit" must be an integer from 1 to 50');
   }
-  const catalogs = await fetchCatalogs(a.kind ? [a.kind] : GUIDE_KINDS, {
+  if (a.node_type != null && (typeof a.node_type !== "string" || !Object.hasOwn(GUIDE_NODE_MODEL_KIND, a.node_type))) {
+    throw new ParamsError('noodle_guide "node_type" must be an allowed hosted node type');
+  }
+  if (a.format_only != null && typeof a.format_only !== "boolean") {
+    throw new ParamsError('noodle_guide "format_only" must be a boolean');
+  }
+  const kind = a.node_type != null ? GUIDE_NODE_MODEL_KIND[a.node_type] : a.kind;
+  if (a.node_type != null && a.kind != null && a.kind !== kind) {
+    throw new ParamsError('noodle_guide "kind" does not match "node_type"');
+  }
+  const kinds = a.format_only ? [] : kind ? [kind] : a.node_type != null ? [] : GUIDE_KINDS;
+  const catalogs = kinds.length ? await fetchCatalogs(kinds, {
     baseUrl: baseUrl || undefined,
     fetch,
     log,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so noodle_guide lists no models of that kind",
-  });
-  const g = authoringGuide({ catalogs, kind: a.kind || null, search: a.search || null, limit: a.limit || 20 });
+    requireFresh: true,
+  }) : {};
+  const g = authoringGuide({ catalogs, kind: kind || null, nodeType: a.node_type ?? null,
+    formatOnly: a.format_only, search: a.search || null, limit: a.limit || 20 });
   return { content: [{ type: "text", text: g.text }], structuredContent: g.structured };
 }
 
@@ -1042,7 +1057,7 @@ export class HumanizeUnpriceableError extends Error {
   constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
 }
 
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
   const executionLimit = hosted || remote ? hostedRunTimeout(runTimeoutMs ?? undefined) : null;
   const runtimeFetch = hostedRunFetch();
   // Wallet mode (payment callback, no key) changes only where money comes from.
@@ -1115,7 +1130,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]), name }),
         inputSchema: buildInputSchema(wf),
         // humanize-comment: input caps + writer record + exact ranked texts (src/humanize.mjs)
-        humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph) : null,
+        humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph, humanizeFallbacks === null ? HUMANIZE_FALLBACKS : humanizeFallbacks) : null,
         // Quoted per request from length and maxChars. The gate reads quoteDeposit.
         pricedPerRequest: name === HUMANIZE_TOOL,
       });
