@@ -30,8 +30,9 @@ In the existing npm package settings, add the GitHub Trusted Publisher for
 `nanoodlecom/nanoodle-mcp`, workflow `test.yml`, and environment `npm`. Enable
 direct `npm publish`. The GitHub `npm` environment accepts the `main` branch.
 
-For the first release with the re-pinned executor, verify `nanoodle@0.13.1` on
-npm and compare its dist integrity with the vendored tarball before merging.
+For the first release with the re-pinned executor, run
+`npm view nanoodle@0.13.1 dist.integrity` and compare the result with the public
+SDK archive integrity in [vendor/README.md](vendor/README.md) before merging.
 The first eligible merge can publish the already-declared `nanoodle-mcp@0.7.0`.
 
 If npm succeeded and Registry publishing needs a retry, rerun the failed jobs

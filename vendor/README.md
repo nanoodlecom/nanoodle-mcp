@@ -5,6 +5,13 @@ The active executor is `nanoodle-0.13.1.tgz`, packed from Nanoodle JS commit
 the proposed 0.13.1 re-pin, including the SDK fixtures used by MCP tests. Its
 SHA-256 is `162638cb2280f5b8a868bcff96b32056e51bac196946f109ed14befcf3c3c5b8`.
 
+The public SDK candidate at `d23f577fa6bf441fce83b301a3d38e5958d1d1f6`
+packs through `npm pack --ignore-scripts` with integrity
+`sha512-gsiY7qP8SOrEpSFdTMiLJbHgCAMGsceK4GhP4fjHNgs1vDcqoy5avcAr6gfw90LF+52LvJmeaBNThjgTW0i84A==`.
+Every published file matches its vendored counterpart byte for byte except
+`package.json`, where the test bundle omits only npm's `files` allowlist.
+The additional vendored files are tests and their fixtures.
+
 ## Rebuild the retained 0.9.0 archive
 
 The 0.9.0 conditional execution patch backports routing, decision validation
