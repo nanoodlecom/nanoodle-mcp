@@ -319,6 +319,7 @@ export async function runOperationalCheck(config, deps = {}) {
           need(!tool.pricedPerRequest && positiveDecimal(amount), "saved-nano-deposit-unavailable");
           const deposit = parseUsdNano(amount);
           need(deposit >= charge && deposit >= parseUsdNano(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
+          await checkUsdRunCapital(`workflow-nano-capital-nano-${name}`, amount, Boolean(authorAddress(published.x402)));
         } else {
           need(parseUsdNano(content.pricing.deposit.usd) >= charge, "saved-workflow-deposit-too-low");
           const denomination = previewDeposit(content, asset, config.network);
@@ -799,9 +800,9 @@ export async function runOperationalCheck(config, deps = {}) {
         xnoUsd: content.near?.rate?.xnoUsd ?? rates.xnoUsd },
     }));
   }
-  function checkMarketRunCapital(stage, budgetUsd, creator) {
+  function checkUsdRunCapital(stage, budgetUsd, creator) {
     return checkRunCapital(stage, () => runFundingBudget({
-      id: "operational-market", budgetUsd, pair: { usdNano: parseUsdNano(rates.xnoUsd), raw: RAW_PER_XNO }, creator,
+      id: "operational-preview", budgetUsd, pair: { usdNano: parseUsdNano(rates.xnoUsd), raw: RAW_PER_XNO }, creator,
     }));
   }
   const nearTools = await check("mcp-discovery", async () => {
@@ -1032,7 +1033,7 @@ export async function runOperationalCheck(config, deps = {}) {
       need(!risk, risk);
     }, []);
     if (agent.bids) {
-      await checkMarketRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
+      await checkUsdRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
     }
     if (!agent.defaultWorkflow) return;
     await check(`workflow-price-${agent.handle}`, async () => {
@@ -1044,7 +1045,7 @@ export async function runOperationalCheck(config, deps = {}) {
       need(budgetFromPrice(listing.priceUsd) >= needUsd, "market-workflow-underpriced");
       const remote = await mcp("tools/call", { name: "price_noodle", arguments: { graph: agent.defaultWorkflow.graph, inputs: { [agent.defaultWorkflow.inputName]: "A lighthouse at dawn" } } });
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
-      await checkMarketRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
+      await checkUsdRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
   }));
   const finishedAt = now();

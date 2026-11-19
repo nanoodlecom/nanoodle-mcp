@@ -623,6 +623,50 @@ test("saved workflow probes flag thin Nano deposits, invalid USDC previews and m
   }
 });
 
+test("fixed Nano workflows need working capital at their advertised deposit and the sampled rate", async t => {
+  const raw = 10n ** 30n, required = 3n * raw / 2n;
+  for (const mode of ["exact", "runtime-short", "confirmed-short", "market-waiting", "provider-key"]) {
+    const f = fixture(({ url, body }) => {
+      if (url.pathname === "/rates" && url.hostname === "site.example") {
+        const source = { usable: true, live: true, at: new Date(NOW).toISOString() };
+        return Response.json({ quoting: true, nearUsd: "3", xnoUsd: "2",
+          sources: { nearUsd: source, xnoUsd: source } });
+      }
+      if (url.hostname === "nano-site.example" && body?.method === "tools/list") {
+        const tools = toolsList();
+        tools.find(tool => tool.name === "sing").description = toolsList("3").find(tool => tool.name === "sing").description;
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools } });
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const reservedRaw = String(10n * raw - required + BigInt(mode === "runtime-short"));
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: "0", reservedRaw,
+      activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "confirmed-short") {
+      f.states["/state/gate-state.json"].owed.push({
+        amountRaw: String(10n * raw - required + 1n), journaled: true, tries: 0, createdAt: NOW,
+      });
+    }
+    if (mode === "market-waiting") {
+      f.states["/jobs/nanoodle-image/market-state.json"].assignments.waiting = {
+        id: "private-accepted-listing", phase: "started", pricing: { depositUsd: 0.4 }, updatedAt: NOW,
+      };
+    }
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "saved-workflow-nano-sing"]) assert.ok(check(stage)?.ok, mode);
+    const funding = check("workflow-nano-capital-nano-sing");
+    if (mode === "provider-key") assert.equal(funding, undefined);
+    else if (mode === "exact") assert.equal(funding?.ok, true);
+    else assert.deepEqual(funding, { stage: "workflow-nano-capital-nano-sing", ok: false,
+      code: "workflow-nano-capital-insufficient", domains: [] }, mode);
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
+    assert.doesNotMatch(JSON.stringify(report), /private-accepted-listing|availableRaw|depositUsd/);
+  }
+});
+
 test("a formerly adequate deposit fails when fresh provider pricing rises or a model disappears", async t => {
   const f = fixture(), price = f.deps.computePrice, localCalls = [];
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
