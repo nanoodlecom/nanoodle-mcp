@@ -39,7 +39,7 @@ import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
-import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
+import { FUNDING_REPORT_MAX_AGE_MS, fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
 import { RAW_PER_XNO, parseSpreadBps, spreadPair } from "../src/near/rates.mjs";
 import { exactUsd } from "../src/custom-workflow.mjs";
@@ -438,8 +438,8 @@ export async function runOperationalCheck(config, deps = {}) {
   const runtimeFunding = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
-    const checkedAt = Date.parse(value.checkedAt), age = now() - checkedAt;
-    need(Number.isFinite(age) && age <= 60_000 && age >= -30_000, "funding-report-stale");
+    const observedAt = now(), checkedAt = Date.parse(value.checkedAt), age = observedAt - checkedAt;
+    need(Number.isFinite(age) && age < FUNDING_REPORT_MAX_AGE_MS && age >= -30_000, "funding-report-stale");
     if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
     need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
     need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
@@ -457,11 +457,12 @@ export async function runOperationalCheck(config, deps = {}) {
     const minimum = Math.min(2, config.nanoRpcUrls.length);
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
-    need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
+    const readAge = observedAt - rpc.lastReadAt;
+    need(Number.isSafeInteger(rpc.lastReadAt) && readAge < FUNDING_REPORT_MAX_AGE_MS && readAge >= -30_000, "nano-read-guard-stale");
     if (rpc.fundingEvidenceExpiresAt !== undefined) {
       const expiresAt = rpc.fundingEvidenceExpiresAt;
       need(config.nanoStandby && rpc.standby?.inUse === true && Number.isSafeInteger(expiresAt)
-        && expiresAt > now() && expiresAt > rpc.lastReadAt && expiresAt - rpc.lastReadAt <= NANO_FUNDING_EVIDENCE_MS,
+        && expiresAt > observedAt && expiresAt > rpc.lastReadAt && expiresAt - rpc.lastReadAt <= NANO_FUNDING_EVIDENCE_MS,
       "nano-read-guard-stale");
     }
     let checkpoint;
@@ -482,7 +483,9 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingEvidenceExpiresAt: rpc.fundingEvidenceExpiresAt,
+    const expiresAt = Math.min(checkedAt + FUNDING_REPORT_MAX_AGE_MS, rpc.lastReadAt + FUNDING_REPORT_MAX_AGE_MS,
+      rpc.fundingEvidenceExpiresAt ?? Infinity);
+    return { availableRaw, expiresAt, checkpoint, coldPaymentScanRequests,
       fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
@@ -864,10 +867,11 @@ export async function runOperationalCheck(config, deps = {}) {
   if (runtimeFunding && rates) await check("nano-unreserved-liquidity", () => {
     // The runtime already accounts for live reservations and liabilities. The
     // on-disk accounting above remains independent so neither counts them twice.
+    need(now() < runtimeFunding.expiresAt, "nano-read-guard-stale");
     const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
     need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
   }, []);
-  const hasCapitalEvidence = () => state && nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000;
+  const hasCapitalEvidence = () => state && nano && rates && runtimeFunding && now() < runtimeFunding.expiresAt;
   function hasCapital(requiredRaw, market = null) {
     // The durable check already reserves Market work. Use the newer gross
     // estimate to correct that reserve upward, without adding it again.
@@ -1186,8 +1190,8 @@ export async function runOperationalCheck(config, deps = {}) {
     }, ["market"]);
   }));
   const finishedAt = now();
-  if (runtimeFunding?.fundingEvidenceExpiresAt !== undefined) await check("nano-funding-evidence-freshness", () => {
-    need(runtimeFunding.fundingEvidenceExpiresAt > finishedAt, "nano-read-guard-stale");
+  if (runtimeFunding) await check("nano-funding-evidence-freshness", () => {
+    need(runtimeFunding.expiresAt > finishedAt, "nano-read-guard-stale");
   });
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), finishedAt,
     { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync,

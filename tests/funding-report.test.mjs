@@ -147,6 +147,42 @@ test("a reused standby proof cannot renew funding admission past its original de
   assert.equal(w.sources.ready(), false);
 });
 
+test("a regular RPC read gives checkout only the remaining lifetime of that read", async t => {
+  let elapsed = 0, wall = 60_000;
+  const w = await setup(t, { now: () => elapsed });
+  const head = { hash: "A".repeat(64), blockCount: "10" };
+  const nanoRpc = { enforced: true, configuredPeers: 2, minimumPeers: 2, networkPeers: 2, readablePeers: 2,
+    lastReadAt: 5_000, checkpoint: { v: 1, networkGenesis: NANO_GENESIS_HASH,
+      account: NANO_GENESIS_REPLY.contents.account, head, confirmed: head } };
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => wall,
+    monotonicNow: () => elapsed, intervalMs: 1_000_000, snapshot: async () => ({ ...value, nanoRpc }) });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  elapsed = 4_999;
+  assert.equal(w.sources.ready(), true);
+  wall = 59_000;
+  elapsed = 5_000;
+  assert.equal(w.sources.ready(), false, "an old chain read and a clock rewind cannot extend the quote lease");
+});
+
+test("a delayed report publication cannot restart an expired quote lease", async t => {
+  let elapsed = 0, wall = 60_000, delay = true;
+  const w = await setup(t, { now: () => elapsed });
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => wall,
+    monotonicNow: () => elapsed, intervalMs: 1_000_000, snapshot: async () => value,
+    writerProtection: () => {
+      // Run during the asynchronous file publication after the sample has
+      // been checked. The wall clock alone cannot expose the elapsed time.
+      if (delay) queueMicrotask(() => { elapsed = 60_000; wall = 59_000; });
+      return { enforced: true, requiredState: true };
+    } });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), false);
+  delay = false;
+  await report.refresh();
+  assert.equal(w.sources.ready(), true, "publishing a new, fresh sample restores quoting");
+});
+
 test("lost writer protection pauses quotes and its private error is not published", async t => {
   const w = await setup(t); let lost = false;
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, snapshot: async () => value,

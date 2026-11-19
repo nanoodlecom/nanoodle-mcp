@@ -1413,6 +1413,34 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
   }
 });
 
+test("a regular Nano read that expires during a probe cannot verify workflow capital", async t => {
+  let checkedAt = NOW;
+  const f = fixture(({ body }) => {
+    if (body?.action === "account_history") checkedAt = NOW + 6_000;
+    return null;
+  });
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.deps.now = () => checkedAt;
+  const runtime = f.states["/state/funding-health.json"];
+  runtime.nanoRpc.lastReadAt = NOW - 55_000;
+  runtime.pause = { lastFailedAt: NOW - 10_000, recoveredAt: NOW - 5_000, code: "nano-rpc-read-quorum" };
+  const report = await runOperationalCheck(f.config, f.deps);
+  const find = stage => report.checks.find(check => check.stage === stage);
+  assert.equal(find("runtime-funding")?.ok, true, "the sample is valid when the probe starts");
+  assert.equal(find("workflow-nano-capital-nano-sing")?.code, "workflow-nano-capital-unverified");
+  assert.equal(find("nano-funding-evidence-freshness")?.code, "nano-read-guard-stale");
+  assert.deepEqual(report.admission, { nano: false, near: false, usdc: false, market: false });
+  const requests = [];
+  const config = { stateDir: f.config.stateDir, operationalReportFile: join(f.config.stateDir, "latest.json"),
+    conversation: "near_check_alerts" };
+  const retry = await deliverAlerts(config, { env: {}, now: () => checkedAt, call: async (_tool, args) => {
+    requests.push(args);
+    return { message: { id: args.message_id, recipient: EMBER, status: "queued" } };
+  } });
+  assert.equal(retry.messageId, undefined, "an initially healthy report cannot announce recovery after its funding evidence expires");
+  assert.deepEqual(requests, []);
+});
+
 test("an exhausted fallback pair exposes an undersized cold standby scan budget without probing it", async t => {
   for (const [peerCooling, requestsPerMinute, coldPaymentScanRequests, expected] of [
     [false, 4, undefined, undefined], [true, 4, undefined, false], [true, 5, undefined, true],
