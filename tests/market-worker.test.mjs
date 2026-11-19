@@ -19,6 +19,7 @@ import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
 import { createMarketCreatorPayments } from "../src/market/creators.mjs";
+import { createRunFunding } from "../src/run-funding.mjs";
 import { deriveAddress, derivePublicKey, deriveSecretKey } from "nanocurrency";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -32,14 +33,14 @@ before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
 /** A market, a state dir and a worker wired together. */
-async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null, maintenance = null, concurrency = 2, now = Date.now, nanoGpt = nano } = {}) {
+async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null, maintenance = null, concurrency = 2, now = Date.now, nanoGpt = nano, runnerFunding = { apiKey: NANO_KEY } } = {}) {
   const m = market || createMarketMock({ now });
   if (!market) await m.listen();
   const stateDir = dir || mkdtempSync(join(tmpdir(), "market-worker-"));
   const logs = [];
   const store = openMarketState({ dir: stateDir });
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
-  const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nanoGpt.url });
+  const runner = createWorkflowRunner({ ...runnerFunding, budgetUsd, baseUrl: nanoGpt.url });
   const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, checkFee, maintenance, concurrency, now, log: (l) => logs.push(l) });
   const once = async () => { await worker.tick(); await worker.drain(); };
   return { m, store, worker, once, logs, stateDir, client, runner };
@@ -93,6 +94,57 @@ test("a fee increase during a buyer progress update prevents inference", async (
     assert.equal(nano.runs(), before);
     assert.match(r.m.rows.get(id).messages[0].body, /^Preparing your run\./);
   } finally { r.store.close(); await r.m.close(); }
+});
+
+test("the fee is checked again after the shared Nano reservation and before any model charge", async t => {
+  for (const code of ["MARKET_FEE_CHANGED", "MARKET_FEE_UNAVAILABLE"]) {
+    await t.test(code, async () => {
+      let clock = Date.now(), reservations = 0, payments = 0, feeError = null;
+      const nanoGpt = nanoGptMock({ walletPayments: true });
+      await nanoGpt.listen();
+      const balanceRaw = 10n ** 30n;
+      const pool = createRunFunding({ serial: execute => execute(), balance: async () => {
+        if (++reservations === 1) feeError = Object.assign(Error("fee verification failed"), { code });
+        return balanceRaw;
+      } });
+      const r = await rig({ now: () => clock, backoffMs: 30_000, nanoGpt, checkFee: async () => {
+        if (feeError) throw feeError;
+        return 500;
+      }, runnerFunding: {
+        fundRun: pool.run,
+        fundingPair: async () => ({ usdNano: 500_000_000n, raw: balanceRaw }),
+        payment: async invoice => {
+          pool.authorize(pool.capture(), invoice, balanceRaw);
+          payments++;
+          nanoGpt.settleWalletInvoice(invoice.paymentId);
+        },
+      } });
+      try {
+        const id = r.m.hire({ description: WORKED() });
+        await r.once();
+        assert.equal(reservations, 1);
+        assert.equal(nanoGpt.runs(), 0);
+        assert.equal(payments, 0);
+        assert.deepEqual(pool.snapshot(), { activeRuns: 0, reservedRaw: "0" });
+        if (code === "MARKET_FEE_CHANGED") {
+          assert.equal(r.store.get(id).phase, "declined");
+          assert.equal(r.store.get(id).decline.code, code);
+        } else {
+          assert.equal(r.store.get(id).phase, "started");
+          assert.equal(r.store.get(id).runStartedAt, null);
+          assert.equal(r.store.get(id).nextAttemptAt, clock + 30_000);
+          feeError = null;
+          clock += 30_000;
+          await r.once();
+          assert.equal(r.store.get(id).phase, "submitted");
+          assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+          assert.equal(nanoGpt.runs(), 1);
+          assert.equal(payments, 2);
+        }
+        assert.deepEqual(pool.snapshot(), { activeRuns: 0, reservedRaw: "0" });
+      } finally { r.store.close(); await r.m.close(); await nanoGpt.close(); }
+    });
+  }
 });
 
 test("direct hires use verified escrow even when the listing's displayed price is higher", async () => {
