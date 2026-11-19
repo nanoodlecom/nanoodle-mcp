@@ -801,7 +801,7 @@ test("paid NEAR and USDC workflows must fit together at their locked Nano rates"
 
 test("valid NEAR and USDC previews must fit both independent Nano balances and already paid work", async t => {
   const raw = 10n ** 30n;
-  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting", "nano-paid-waiting"]) {
+  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting", "nano-paid-waiting", "market-paid-waiting"]) {
     const f = fixture(({ url, body }) => {
       const args = body?.params?.arguments;
       if (url.hostname !== "site.example" || !(args?.graph?.name === "sing" || args?.inputs?.Marker)) return null;
@@ -827,6 +827,11 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       f.states["/state/gate-state.json"].quotes.push({ id: "private-queued-funding-sample", status: "paid", paidAt: NOW,
         amountRaw: String(raw / 2n), usd: "1", pair: { usdNano: "2000000000", raw: String(raw) } });
     }
+    if (mode === "market-paid-waiting") {
+      f.states["/jobs/nanoodle-image/market-state.json"].assignments.private_job = {
+        phase: "started", pricing: { depositUsd: 0.5 }, updatedAt: NOW,
+      };
+    }
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
     for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "nano-paid-run-funding", "saved-workflow-near-sing",
@@ -837,7 +842,7 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       if (mode !== "healthy") assert.deepEqual(check(stage), { stage, ok: false, code: "workflow-nano-capital-insufficient", domains: [] });
     }
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
-    assert.doesNotMatch(JSON.stringify(report), /private-queued-funding-sample|reservedRaw|depositUsd/);
+    assert.doesNotMatch(JSON.stringify(report), /private-queued-funding-sample|private_job|reservedRaw|depositUsd/);
     if (mode === "runtime-reserved") {
       const invocationId = ID.replaceAll("-", "");
       const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
@@ -891,6 +896,57 @@ test("waiting Nano, NEAR and USDC work must fit the same available pool", async 
     if (mode === "missing-rate") assert.equal(check("workflow-nano-capital-near-sing")?.code, "workflow-nano-capital-unverified");
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
     assert.doesNotMatch(JSON.stringify(report), /private-paid-nano|availableRaw|depositUsd/);
+  }
+});
+
+test("accepted Market work must fit the live and confirmed Nano available alongside paid workflows", async t => {
+  const raw = 10n ** 30n;
+  for (const mode of ["exact", "live-short", "chain-short", "starts-during-sample", "unverified", "provider-key"]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"], quotes = f.states["/state/near-state.json"].quotes;
+    const assignments = f.states["/jobs/nanoodle-image/market-state.json"].assignments;
+    const waiting = { id: "private-market-job", phase: "starting", pricing: { depositUsd: 2.5 }, updatedAt: NOW };
+    const latestMarket = ["chain-short", "unverified"].includes(mode);
+    if (!latestMarket) assignments.waiting = waiting;
+    assignments.running = { phase: "running", pricing: { depositUsd: 1.5 }, updatedAt: NOW };
+    ledger.quotes.push({ id: "private-market-test-nano-payment", status: "paid", paidAt: NOW, amountRaw: String(raw), usd: 1,
+      pair: { usdNano: "1000000000", raw: String(raw) } });
+    quotes.near = { status: "paid", asset: "near", depositUsd: "0.75", paidAtBlockMs: NOW,
+      paidYocto: "250000000000000000000000", rate: { xnoUsd: "1" } };
+    quotes.usdc = { status: "paid", asset: "usdc", depositUsd: "0.75", paidAtBlockMs: NOW,
+      paidYocto: "750000", rate: { xnoUsd: "1" } };
+    const available = 5n * raw - BigInt(mode === "live-short") - (mode === "starts-during-sample" ? 2n * raw : 0n);
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: String(raw),
+      reservedRaw: String(9n * raw - available), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "chain-short") {
+      ledger.owed.push({ amountRaw: String(raw * 5n / 2n + 1n), journaled: true, tries: 0, createdAt: NOW });
+    }
+    const read = f.deps.readJson;
+    f.deps.readJson = path => {
+      if (path === "/state/funding-health.json") {
+        if (mode === "starts-during-sample") waiting.phase = "running";
+        if (latestMarket) {
+          if (mode === "unverified") delete waiting.pricing;
+          assignments.waiting = waiting;
+        }
+      }
+      return structuredClone(read(path));
+    };
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const stages = Object.fromEntries(report.checks.map(row => [row.stage, row]));
+    assert.equal(stages["nano-liquidity"].ok, true, mode);
+    assert.equal(stages["near-paid-run-funding"].ok, true, mode);
+    const finding = stages["market-paid-run-funding"];
+    if (mode === "provider-key") assert.equal(finding, undefined);
+    else {
+      assert.equal(finding?.ok, ["exact", "starts-during-sample"].includes(mode), mode);
+      if (!finding.ok) assert.deepEqual(finding, { stage: "market-paid-run-funding", ok: false, domains: [],
+        code: mode === "unverified" ? "market-paid-run-funding-unverified" : "market-paid-run-funding-insufficient" });
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
+    assert.doesNotMatch(JSON.stringify(report), /private-market-(job|test-nano-payment)|availableRaw|depositUsd/);
   }
 });
 

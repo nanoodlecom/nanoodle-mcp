@@ -283,7 +283,9 @@ Coverage:
   It compares the same run budget against live unreserved funds and the
   independently confirmed balance after obligations. It also checks the
   combined budgets of paid Nano, NEAR and USDC runs still waiting to start,
-  using each quote's locked rate. A creator run includes overhead
+  using each quote's locked rate. Accepted Market jobs waiting to start are
+  included at the sampled Nano rate. Running jobs already affect the runtime
+  balance through reservations. A creator run includes overhead
   from the largest possible deposit with quote dust. These are per-workflow
   warnings. The runtime still verifies funding when each run starts.
 - NEAR and USDC share an open-quote limit. The check warns at 80% and
