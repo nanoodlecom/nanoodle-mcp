@@ -1168,6 +1168,10 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
     const report = await runOperationalCheck(f.config, f.deps);
     assert.equal(report.checks.find(c => c.stage === "nano-frontier-agreement")?.ok, true);
     const readiness = report.checks.find(c => c.stage === "nano-fallback-payment-reads");
+    const activeQuorum = report.checks.find(c => c.stage === "nano-payment-read-quorum");
+    const expectedPeers = !activeQuorum?.ok ? undefined : failure === null ? 3 : 2;
+    assert.equal(report.nanoPaymentReadPeers, expectedPeers, failure);
+    assert.equal(JSON.parse(readFileSync(join(f.config.stateDir, "latest.json"), "utf8")).nanoPaymentReadPeers, expectedPeers);
     assert.equal(readiness?.ok, failure === null, failure);
     if (failure) {
       assert.equal(readiness.code, "nano-fallback-payment-read-quorum-unavailable");
@@ -1213,6 +1217,8 @@ test("Nano failover must prove the newest observed head even if it advances duri
     assert.equal(check("nano-frontier-agreement")?.ok, true, mode);
     assert.equal(check("nano-payment-read-quorum")?.ok, healthy, mode);
     assert.equal(check("nano-fallback-payment-reads")?.ok, healthy, mode);
+    const expectedPeers = { "all-advance": 3, "primary-history-invalid": 2 }[mode];
+    assert.equal(report.nanoPaymentReadPeers, expectedPeers, mode);
     assert.deepEqual(report.admission, { nano: healthy, near: true, usdc: true, market: true }, mode);
     assert.equal(f.calls.filter(call => call.body?.action === "account_history").length, 3);
     assert.doesNotMatch(JSON.stringify(report), /BBBBBBBB|nano-[012]\.example/);
@@ -1235,9 +1241,11 @@ test("ordinary peers can agree on the wallet checkpoint without serving the acti
     if (extraPeer) {
       assert.equal(quorum?.ok, true);
       assert.equal(report.checks.find(c => c.stage === "nano-fallback-payment-reads")?.ok, true);
+      assert.equal(report.nanoPaymentReadPeers, 2);
     } else {
       assert.deepEqual(quorum, { stage: "nano-payment-read-quorum", ok: false,
         code: "nano-payment-read-quorum-unavailable", domains: ["nano"] });
+      assert.equal(Object.hasOwn(report, "nanoPaymentReadPeers"), false);
     }
     assert.deepEqual(report.admission, { nano: extraPeer, near: true, usdc: true, market: true });
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PROVIDER_DETAIL|nano-[01]\.example/);

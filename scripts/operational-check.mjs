@@ -228,7 +228,9 @@ export function isMarketWorkerAlive(lock, appDirectory = fileURLToPath(new URL("
   }
 }
 
-export function finishOperationalReport(stateDir, checks, now = Date.now(), { fundingPause = null, nearBackfilling = null, nanoLedgerSync = null, invocationId = null } = {}) {
+export function finishOperationalReport(stateDir, checks, now = Date.now(), {
+  fundingPause = null, nearBackfilling = null, nanoLedgerSync = null, nanoPaymentReadPeers = null, invocationId = null,
+} = {}) {
   const latest = join(stateDir, "latest.json");
   let previous; try { previous = readJson(latest); } catch { /* first probe */ }
   const priorBackfill = previous?.nearBackfillSince;
@@ -257,7 +259,8 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), { fu
   const report = { v: 1, ok: failed.length === 0, checkedAt: new Date(now).toISOString(), stage: failed[0]?.stage || "complete",
     admission, checks, ...(/^[a-f0-9]{32}$/.test(invocationId || "") && { invocationId }),
     ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
-    ...(nearBackfillSince !== null && { nearBackfillSince }), ...(nanoLedgerSync && { nanoLedgerSync }) };
+    ...(nearBackfillSince !== null && { nearBackfillSince }), ...(nanoLedgerSync && { nanoLedgerSync }),
+    ...(nanoPaymentReadPeers !== null && { nanoPaymentReadPeers }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
   // The separate alert user needs to read it, without access to app secrets.
@@ -1112,7 +1115,8 @@ export async function runOperationalCheck(config, deps = {}) {
     need(runtimeFunding.fundingEvidenceExpiresAt > finishedAt, "nano-read-guard-stale");
   });
   return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), finishedAt,
-    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync, invocationId: config.invocationId });
+    { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync,
+      nanoPaymentReadPeers: activePaymentPeers?.length, invocationId: config.invocationId });
 }
 
 async function productionConfig(env = process.env) {
