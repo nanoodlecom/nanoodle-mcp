@@ -43,7 +43,8 @@ export function selectFundingPause(pause, now) {
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
-export async function startFundingReport({ outDir, snapshot, sources, rpcStatus = null, writerProtection = null, durableState = null, intervalMs = 5_000, now = Date.now, log = () => {} }) {
+export async function startFundingReport({ outDir, snapshot, sources, rpcStatus = null, writerProtection = null, durableState = null,
+  mediaRetentionMs, intervalMs = 5_000, now = Date.now, log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
   const identity = maintenanceProcessIdentity();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
@@ -134,7 +135,8 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
       else if (lastWriteHealthy && !sources.ready()) {
         pause = { lastFailedAt: checkedAt, recoveredAt: checkedAt, code: "funding-report-stale" };
       } else if (pause?.recoveredAt === null) pause = { ...pause, recoveredAt: checkedAt };
-      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(checkedAt).toISOString(), ...(pause && { pause }) };
+      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(checkedAt).toISOString(),
+        ...(mediaRetentionMs !== undefined && { mediaRetentionMs }), ...(pause && { pause }) };
       try {
         const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }
