@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw, marketRunFunding } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
@@ -124,6 +124,17 @@ test("deferred Market income is not spendable and concurrent accepted work reser
 test("a workflow without paid model steps requires no Market model-cost reservation", () => {
   const s = snapshots(); s.market.push({ v: 1, assignments: { free: { phase: "running", pricing: { depositUsd: 0 } } } });
   assert.equal(paymentLiabilities(s).marketUsdNano, 0n);
+});
+
+test("the live Market waiting budget excludes running work and preserves creator overhead", () => {
+  const raw = 10n ** 30n;
+  const market = [{ v: 1, assignments: { active: { phase: "running", pricing: { depositUsd: 0.7 } },
+    starting: { phase: "starting", pricing: { depositUsd: 0.3 }, budgetUsd: 40, creator: { status: "awaiting_acceptance" } },
+    legacy: { phase: "started", budgetUsd: 0.7 }, free: { phase: "started", pricing: { depositUsd: 0 } },
+    settled: { phase: "submitted", budgetUsd: 40 } } }];
+  const creatorBudget = 25n * raw / 70n + (5n * raw + 69n) / 70n;
+  assert.deepEqual(marketRunFunding(market, "0.7"), { waitingRaw: raw + creatorBudget, totalRaw: 2n * raw + creatorBudget });
+  assert.throws(() => marketRunFunding(market, "0"), { code: "FUNDING_INVALID" });
 });
 
 test("USDC funds do not cover NEAR gas or storage, and gas price increases are included", () => {
