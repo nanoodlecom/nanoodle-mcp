@@ -96,10 +96,12 @@ No endpoint URLs or credentials are included in that report.
 
 Private funding telemetry additionally selects a configuration digest and
 cooldown peer indices/deadlines. The monitor verifies that the digest matches its
-own ordered endpoint configuration before using those indices. A fresh known
-cooldown remains a reported `nano-rpc-rate-limited` degradation without another
-upstream request. Invalid metadata or changed configuration cannot hide a peer
-failure. The monitor still queries the other peers and independently verifies
+own ordered endpoint configuration before using those indices. An active
+cooldown stays visible and suppresses new requests even when the funding report
+records a failure or its financial evidence has expired. Hosted wallet startup
+also honors unexpired deadlines from the last recorded report for the same peer
+order. A restarted wallet still establishes fresh network and account quorum.
+The monitor queries the other peers and independently verifies
 their frontier agreement and available quorum; loss of quorum closes admission.
 Those peers must also corroborate the latest confirmed wallet checkpoint from
 the runtime report. A peer already beyond that height proves the checkpoint

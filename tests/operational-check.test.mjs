@@ -1252,6 +1252,24 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
   }
 });
 
+test("failed and stale funding snapshots preserve provider cooldowns for the periodic monitor", async t => {
+  for (const [age, code] of [[0, "nano-rpc-read-quorum"], [120_000, "funding-report-stale"]]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.nanoRpcUrls.push("https://nano-2.example");
+    f.states["/state/funding-health.json"] = {
+      v: 1, checkedAt: new Date(NOW - age).toISOString(), ok: false, code: "nano-rpc-read-quorum",
+      nanoRpc: { configuration: rpcPeerSetId(f.config.nanoRpcUrls), configuredPeers: 3,
+        cooldowns: [{ peer: 2, until: NOW + 86_400_000 }] },
+    };
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.ok(f.calls.every(call => call.url.hostname !== "nano-2.example"));
+    assert.ok(report.checks.some(check => check.stage === "nano-node-2" && check.code === "nano-rpc-rate-limited"));
+    assert.ok(report.checks.some(check => check.stage === "runtime-funding" && check.code === code));
+    assert.equal(report.admission.nano, false);
+  }
+});
+
 test("Nano failover must prove the newest observed head even if it advances during the probe", async t => {
   const nextHead = "B".repeat(64);
   for (const mode of ["all-advance", "primary-advances", "newest-history-invalid", "primary-history-invalid"]) {
