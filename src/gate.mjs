@@ -234,6 +234,7 @@ export function createChargeGate({
   monotonicNow = () => performance.now(),
   fundRun = null,
   canQuote = () => true,
+  canFundQuote = null,
   verifyPaymentReads = false,
   maintenance = null,
   runTimeoutMs = undefined,
@@ -244,6 +245,7 @@ export function createChargeGate({
   if (!Number.isFinite(usd) || usd <= 0) throw new Error("charge gate needs a positive default price");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (canFundQuote !== null && typeof canFundQuote !== "function") throw new TypeError("canFundQuote must be a function or null");
   if (typeof verifyPaymentReads !== "boolean" || (verifyPaymentReads && typeof ops.checkpoint !== "function")) {
     throw new TypeError("verifying Nano payment reads requires a wallet checkpoint");
   }
@@ -1428,6 +1430,7 @@ export function createChargeGate({
         catch { log(`ignoring x402.author on ${tool.name}: not a valid Nano address`); return null; }
       };
       const authors = new Map(registry.tools.map((t) => [t.name, authorFor(t)]));
+      const fundingTerms = q => runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(q.tool) });
 
       /**
        * Settle a completed call against what it ACTUALLY cost — the quote was
@@ -1561,6 +1564,10 @@ export function createChargeGate({
             status: "pending", unpublished: true, waiters: [],
             etaMs: etaOf(name),
           };
+          if (fundRun && canFundQuote) {
+            const { maxRaw, overheadRaw } = fundingTerms(q);
+            if (canFundQuote(maxRaw + overheadRaw) !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
+          }
           quotes.set(q.id, q);
           let committed = false;
           try { committed = await persist(); }
@@ -1646,7 +1653,7 @@ export function createChargeGate({
             }
             try {
               note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
-              const budget = fundRun && runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(name) });
+              const budget = fundRun && fundingTerms(q);
               const execute = () => registry.callTool({ name, arguments: args }, budget ? { ...ctx, fundedMaxUsd: budget.maxUsd } : ctx);
               const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await withHostedRun(() => budget
                 ? fundRun(budget, execute)
