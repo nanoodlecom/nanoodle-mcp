@@ -255,7 +255,8 @@ Coverage:
   50 blocks over at least ten minutes warns even while both counts advance.
   The warning needs two increases and tolerates short plateaus between
   them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
-  clear the trend. Wallet read quorum determines Nano payment readiness.
+  clear the trend. The elapsed time comes from the counter observations.
+  Wallet read quorum determines Nano payment readiness.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the

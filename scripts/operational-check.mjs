@@ -113,8 +113,8 @@ function nanoPeerLedgerBaseline(metrics, now) {
 
 function nanoCementationProgress(current, previous, now) {
   const prior = previous?.nanoLedgerSync;
-  const checkedAt = Date.parse(previous?.checkedAt);
-  const continuous = checkedAt <= now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
+  const checkedAt = prior?.observedAt ?? Date.parse(previous?.checkedAt);
+  const continuous = Number.isSafeInteger(checkedAt) && checkedAt < now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
   let unchangedSince = now, peerMedianAtStart = current.peerMedianConfirmed;
   if (continuous && prior?.localConfirmed === current.localConfirmed) {
     const since = prior.unchangedSince;
@@ -260,7 +260,7 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), {
     }
   }
   if (nanoLedgerSync) {
-    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
+    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, nanoLedgerSync.observedAt ?? now);
     nanoLedgerSync = { ...nanoLedgerSync, ...progress };
     const check = code
       ? { stage: "nano-ledger-confirmation-progress", ok: false, code, domains: [] }
@@ -557,14 +557,14 @@ export async function runOperationalCheck(config, deps = {}) {
   if (config.nanoLedgerTelemetry) await check("nano-ledger-sync", async () => {
     need(nanoNodes.some(({ peer }) => peer === 0), "nano-ledger-primary-unavailable");
     const owned = config.nanoRpcUrls[0];
-    const [counts, telemetry] = await Promise.all([
-      nanoRpc(owned, { action: "block_count", include_cemented: "true" }),
+    const [{ counts, observedAt }, telemetry] = await Promise.all([
+      nanoRpc(owned, { action: "block_count", include_cemented: "true" }).then(counts => ({ counts, observedAt: now() })),
       nanoRpc(owned, { action: "telemetry", raw: "true" }),
     ]);
     const local = nanoLedgerCounters(counts.count, counts.cemented);
     need(local, "nano-ledger-local-counters-invalid");
     const network = nanoPeerLedgerBaseline(telemetry.metrics, now());
-    nanoLedgerSync = { localBlocks: local.blocks.toString(), localConfirmed: local.confirmed.toString(),
+    nanoLedgerSync = { observedAt, localBlocks: local.blocks.toString(), localConfirmed: local.confirmed.toString(),
       peerMedianConfirmed: network.median.toString(), peers: network.peers };
     need(network.median - local.blocks < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-blocks-behind");
     need(network.median - local.confirmed < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-confirmations-behind");

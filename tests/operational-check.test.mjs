@@ -1361,7 +1361,7 @@ test("owned Nano ledger telemetry distinguishes missing blocks from delayed conf
     const ledgerCalls = f.calls.filter(call => ["block_count", "telemetry"].includes(call.body?.action));
     assert.equal(ledgerCalls.length, ["disabled", "primary cooldown"].includes(scenario) ? 0 : 2);
     if (["block lag", "confirmation lag", "healthy"].includes(scenario)) {
-      assert.deepEqual(report.nanoLedgerSync, { localBlocks: local.count, localConfirmed: local.cemented,
+      assert.deepEqual(report.nanoLedgerSync, { observedAt: NOW, localBlocks: local.count, localConfirmed: local.cemented,
         peerMedianConfirmed: "100000", peers: 4, unchangedSince: NOW, peerMedianAtStart: "100000" });
     } else assert.equal(report.nanoLedgerSync, undefined);
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PEER|node_1{4}|nano-0\.example/);
@@ -2517,6 +2517,19 @@ test("one delayed jump in the Nano peer median and subsequent flat samples never
   assert.equal(report(21, "1030", "9100").ok, true);
   assert.equal(report(26, "1040", "9110").ok, true);
   assert.equal(report(31, "1050", "9121").ok, true, "new growth needs a fresh baseline after the old one expires");
+});
+
+test("Nano confirmation trend uses the counter observation time even when later checks run slowly", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-counter-time-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (observed, finished, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [],
+    NOW + finished * 60_000, { nanoLedgerSync: { observedAt: NOW + observed * 60_000, localBlocks: "9800",
+      localConfirmed, peerMedianConfirmed, peers: 7 } });
+  const progress = value => value.checks.find(check => check.stage === "nano-ledger-confirmation-progress");
+  report(0, 0, "1000", "9000");
+  assert.equal(progress(report(5, 5, "1010", "9040")).ok, true);
+  assert.equal(progress(report(9, 12, "1020", "9080")).ok, true, "the ninth-minute sample cannot age in later checks");
+  assert.equal(progress(report(14, 14, "1030", "9100")).code, "nano-ledger-confirmations-falling-behind");
 });
 
 test("Nano remote counter variation, missing samples and local regression are distinguished", t => {
