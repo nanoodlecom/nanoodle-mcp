@@ -678,6 +678,7 @@ async function main() {
         requireExistingState: requiredState?.requireExisting === true,
         fundRun: !apiKey ? wallet.ops.withFunding : null,
         canQuote: () => !fundingSources || fundingSources.ready(),
+        canFundQuote: fundingSources?.canFundQuote ?? null,
         verifyPaymentReads: guardedFunding,
         log: (line) => console.error("nanoodle-mcp: " + line),
         usage: usageLog, maintenance,
@@ -1001,6 +1002,7 @@ async function startNearMode({
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
     canQuote: () => watcher?.status().listening === true && (!fundingSources || fundingSources.ready()),
+    canFundQuote: fundingSources?.canFundQuote ?? null,
     fundRun: modelPayment === "wallet" ? nanoOps.withFunding : null, refundFunding, maintenance,
   });
   fundingSources?.registerNear(gate.fundingLiabilitiesRaw, () => authorPayouts?.records() ?? []);

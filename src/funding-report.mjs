@@ -57,10 +57,11 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
   function refresh() {
     if (pending) return pending;
     pending = (async () => {
-      let report, readExpiresAt = Infinity;
+      let report, readExpiresAt = Infinity, availableRaw = null;
       try {
         const value = await snapshot();
         const balance = fundingRaw(value.balanceRaw), liabilities = fundingRaw(value.liabilitiesRaw), reserved = fundingRaw(value.reservedRaw);
+        availableRaw = balance - liabilities - reserved;
         if (!Number.isSafeInteger(value.activeRuns) || value.activeRuns < 0 ||
             !(value.oldestStartedAt === null || (Number.isSafeInteger(value.oldestStartedAt) && value.oldestStartedAt > 0))) throw Error("invalid snapshot");
         // Select aggregate fields and the public-chain handoff checkpoint
@@ -140,7 +141,7 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         // Publishing can take time. A clock adjustment or delayed write
         // cannot give the original chain read a new checkout lease.
         const readyForMs = Math.min(expiresAt - now(), monotonicDeadline - monotonicNow());
-        sources.setStorageReady(true); sources.setReady(report.ok, readyForMs);
+        sources.setStorageReady(true); sources.setReady(report.ok, readyForMs, availableRaw);
         lastWriteHealthy = report.ok;
       } catch (error) {
         lastWriteHealthy = false;

@@ -37,6 +37,25 @@ test("funding health is private aggregate telemetry and insufficient funds pause
   assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
 });
 
+test("quote budgets use current unreserved funds under the existing funding lease", async t => {
+  let clock = 2_000, balanceRaw = "100";
+  const w = await setup(t, { now: () => clock });
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => clock,
+    snapshot: async () => ({ ...value, balanceRaw }) });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  assert.equal(w.sources.canFundQuote(1n), false);
+  balanceRaw = "125";
+  await report.refresh();
+  assert.equal(w.sources.canFundQuote(25n), true);
+  assert.equal(w.sources.canFundQuote(26n), false);
+  clock += 60_000;
+  assert.equal(w.sources.canFundQuote(1n), false);
+  balanceRaw = "99";
+  await report.refresh();
+  assert.equal(w.sources.canFundQuote(1n), false);
+});
+
 test("unreadable financial state fails closed and later recovery can resume quote readiness", async t => {
   const w = await setup(t); let fail = true;
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources,
