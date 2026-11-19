@@ -146,8 +146,9 @@ function methods(call) {
       if (ref && typeof ref.finality === "string") return call("block", { finality: ref.finality });
       throw new TypeError("block() needs { finality } or { blockId }");
     },
-    txStatus({ txHash, senderId, waitUntil = "FINAL", timeoutMs: perCall } = {}) {
-      return call("tx", { tx_hash: txHash, sender_account_id: senderId, wait_until: waitUntil }, { timeoutMs: perCall });
+    txStatus({ txHash, senderId, waitUntil = "FINAL", timeoutMs: perCall, receiptDiscovered = false } = {}) {
+      return call("tx", { tx_hash: txHash, sender_account_id: senderId, wait_until: waitUntil },
+        { timeoutMs: perCall, receiptDiscovered });
     },
     viewAccessKey({ accountId, publicKey }) {
       return call("query", { request_type: "view_access_key", finality: "final", account_id: accountId, public_key: publicKey });
@@ -189,7 +190,8 @@ function discoveryReadCanFailOver(method, params, error) {
  *
  *  - A call moves to the next endpoint on transport or node-health failures.
  *    Unnamed server errors also allow failover on watcher and funding reads.
- *    A named answer such as "unknown transaction" is final for that call.
+ *    A named answer such as "unknown transaction" is final for an ordinary lookup.
+ *    An already discovered finalized receipt can use another peer's history.
  *    Node-local discovery misses and missing historical hashes can fail over.
  *  - Once attempted, `send_tx` moves on only for RPC_HTTP. Preflight health
  *    failures may move on before any bytes are broadcast. Signed bytes are identical on
@@ -333,6 +335,13 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
         return result;
       } catch (e) {
         if (e?.code === "RPC_WRONG_NETWORK" && ep.wrongChain) continue;
+        if (method === "tx" && attempted && opts?.receiptDiscovered === true
+            && (e?.code === "UNKNOWN_TRANSACTION" || e?.code === "TIMEOUT_ERROR")) {
+          // This peer may lack the historical outcome while its live chain
+          // reads remain healthy. A receipt is only a hint to keep looking.
+          lastErr = e;
+          continue;
+        }
         const retry = TRANSPORT_CODES.has(e?.code)
           || discoveryReadCanFailOver(method, params, e)
           || (e?.code === "RPC_ERROR" && (!attempted || RECOVERABLE_READS.has(method)));

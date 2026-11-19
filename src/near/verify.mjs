@@ -25,14 +25,16 @@ function hasKey(obj, key) {
  * never seen is held by the RPC node (about 30 s on public testnet RPC) before it
  * answers TIMEOUT_ERROR, so the default leaves room for that answer.
  */
-export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract = null, txTimeoutMs = 40_000 }) {
+export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract = null, txTimeoutMs = 40_000,
+  receiptDiscovered = false }) {
   base58Decode(txHash, 32);
   assertNearAccountId(senderId);
   assertNearAccountId(merchantId);
 
   let r;
   try {
-    r = await rpc.txStatus({ txHash, senderId, waitUntil: "FINAL", timeoutMs: txTimeoutMs });
+    r = await rpc.txStatus({ txHash, senderId, waitUntil: "FINAL", timeoutMs: txTimeoutMs,
+      ...(receiptDiscovered && { receiptDiscovered }) });
   } catch (e) {
     if (NOT_FOUND.has(e?.code)) throw new NearError("TX_NOT_FOUND", `transaction ${txHash} was not found as final on this network`, { cause: e });
     if (TRANSPORT.has(e?.code)) throw new NearError("RPC_UNAVAILABLE", "the NEAR RPC could not be reached; try again", { cause: e });
