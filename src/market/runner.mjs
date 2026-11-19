@@ -169,7 +169,7 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
             const value = result.outputs[o.key];
             if (value === undefined) continue;
             if (value instanceof MediaRef) {
-              const bytes = Buffer.from(await value.bytes());
+              const bytes = Buffer.from(await value.bytes(hostedRunOptions()));
               const ext = extForMedia(bytes, value.mime);
               const safe = String(o.key).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "output";
               const filename = `${String(++n).padStart(2, "0")}-${safe}.${ext}`;

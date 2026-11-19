@@ -7,6 +7,15 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact MCP version on main to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 env:
   NODE_OPTIONS: --use-openssl-ca
@@ -139,3 +148,116 @@ jobs:
           key: ffmpeg-7.0.2-linux-amd64-abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
       - run: npm ci
       - run: npm test
+
+  package:
+    name: Pack and install the MCP release
+    if: github.event_name == 'pull_request' || (github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main')
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - name: Patch system trust before dependency or release downloads
+        timeout-minutes: 2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --only-upgrade ca-certificates
+          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.3'
+      - name: Build and install the release tarball outside the checkout
+        id: pack
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          npm ci --omit=dev --ignore-scripts
+          mkdir "$RUNNER_TEMP/consumer"
+          version="$(node -p 'require("./package.json").version')"
+          sdk_version="$(node -p 'require("./package-lock.json").packages["node_modules/nanoodle"].version')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$REQUESTED_VERSION" != "$version" ]]; then
+            echo "Requested version must match package.json on the tested main revision" >&2
+            exit 1
+          fi
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/nanoodle-mcp-$version.tgz" "$RUNNER_TEMP/nanoodle-mcp.tgz"
+          cd "$RUNNER_TEMP/consumer"
+          npm install --omit=dev --ignore-scripts "$RUNNER_TEMP/nanoodle-mcp.tgz"
+          installed_sdk="$(node -p 'require("./node_modules/nanoodle-mcp/node_modules/nanoodle/package.json").version')"
+          test "$installed_sdk" = "$sdk_version"
+          test "$(node_modules/.bin/nanoodle-mcp --version)" = "nanoodle-mcp $version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          name: npm-distribution
+          path: ${{ runner.temp }}/nanoodle-mcp.tgz
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish the tested npm package
+    if: >-
+      github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && needs.qualify-github-source.outputs.version != '' &&
+      needs.qualify-github-source.outputs.version == needs.package.outputs.version))
+    needs: [package, qualify-github-source]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: npm-publish
+      cancel-in-progress: false
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/nanoodle-mcp/v/${{ needs.package.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Patch system trust before dependency or release downloads
+        timeout-minutes: 2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --only-upgrade ca-certificates
+          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.3'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-distribution
+      - name: Publish if this version is absent from npm
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          status="$(curl --silent --show-error --retry 2 --max-time 30 \
+            --output "$RUNNER_TEMP/npm-version.json" --write-out '%{http_code}' \
+            "https://registry.npmjs.org/nanoodle-mcp/$VERSION")"
+          case "$status" in
+            200)
+              jq -e --arg version "$VERSION" '.name == "nanoodle-mcp" and .version == $version and .mcpName == "io.github.nanoodlecom/nanoodle-mcp"' \
+                "$RUNNER_TEMP/npm-version.json" >/dev/null
+              echo "nanoodle-mcp@$VERSION is already published"
+              ;;
+            404)
+              flags=()
+              if [[ "$VERSION" == *-* ]]; then flags+=(--tag next); fi
+              npm publish ./nanoodle-mcp.tgz --ignore-scripts --access public "${flags[@]}"
+              ;;
+            *) echo "npm version lookup returned HTTP $status" >&2; exit 1 ;;
+          esac
+
+  publish-registry:
+    name: Publish to the MCP Registry
+    needs: [package, publish-npm]
+    uses: ./.github/workflows/publish-mcp-registry.yml
+    with:
+      version: ${{ needs.package.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
