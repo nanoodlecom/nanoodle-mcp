@@ -58,6 +58,12 @@ It also checks both public MCP listeners without executing a workflow.
 The monitor evaluates NEAR/USD separately from XNO/USD so a stale NEAR spot
 price leaves the Nano funding checks available.
 
+When a provider API key pays for models, the monitor checks the Nano owed for
+authored NEAR and USDC workflows. Paid queues use the locked rates and quoted
+previews include the maximum payment dust. The check compares the combined
+obligations with both the live unreserved pool and the confirmed on-chain
+balance. Provider model costs belong to the API-key account.
+
 ## Verification and remaining recovery limits
 
 Offline tests exercise actual hosted Nano, NEAR and USDC saved/custom calls
