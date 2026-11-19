@@ -1,6 +1,7 @@
 import { createProbeFetch } from "./probe-http.mjs";
 
 const NANO = "https://mcp.nanoodle.com";
+const NANO_ALIAS = "https://nano.nanoodle.com";
 const NEAR = "https://near.nanoodle.com";
 const NEAR_ALIAS = "https://mcp-near.nanoodle.com";
 const BABEL = "https://babel.255bits.com";
@@ -60,15 +61,15 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       && REQUIRED_TOOLS.every(name => tools.some(tool => tool?.name === name)), "mcp-tools-missing");
   }
 
-  async function conditionalPrice(asset) {
-    const response = await json(NEAR + "/mcp", { body: rpc("tools/call", {
-      name: "price_noodle", arguments: { graph: CONDITIONAL_GRAPH, _pay_with: asset },
+  async function conditionalPrice(site, asset) {
+    const response = await json(site + "/mcp", { body: rpc("tools/call", {
+      name: "price_noodle", arguments: { graph: CONDITIONAL_GRAPH, ...(asset ? { _pay_with: asset } : {}) },
     }) });
     const result = response.result, content = result?.structuredContent, pricing = content?.pricing;
     need(response.jsonrpc === "2.0" && response.id === 1 && !response.error && !result?.isError
       && pricing?.currency === "USD" && pricing.safety?.ok === true && Array.isArray(pricing.unpriced)
       && pricing.unpriced.length === 0, "conditional-price-unavailable");
-    need(!content.payment && !content.quote && !content.x402 && content[asset]?.network === "mainnet",
+    need(!content.payment && !content.quote && !content.x402 && (!asset || content[asset]?.network === "mainnet"),
       "conditional-price-response-invalid");
     const estimate = pricing.estimatedCost, likely = pricing.likelyCharge?.usd, deposit = pricing.deposit?.usd;
     const items = estimate?.items;
@@ -82,6 +83,7 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
 
   const probes = {
     "nano-mcp": () => discover(NANO),
+    "nano-alias-mcp": () => discover(NANO_ALIAS),
     "near-mcp": () => discover(NEAR),
     "near-alias-mcp": () => discover(NEAR_ALIAS),
     "nano-rates": async () => {
@@ -126,6 +128,11 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     }
   }
   const checks = await Promise.all(Object.entries(probes).map(([stage, probe]) => check(stage, probe)));
-  checks.push(...await Promise.all(["near", "usdc"].map(asset => check(`${asset}-conditional-pricing`, () => conditionalPrice(asset)))));
+  checks.push(...await Promise.all([
+    check("nano-conditional-graph-pricing", () => conditionalPrice(NANO)),
+    check("nano-alias-conditional-graph-pricing", () => conditionalPrice(NANO_ALIAS)),
+    check("near-conditional-pricing", () => conditionalPrice(NEAR, "near")),
+    check("usdc-conditional-pricing", () => conditionalPrice(NEAR, "usdc")),
+  ]));
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }
