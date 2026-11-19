@@ -44,9 +44,13 @@ jobs:
       - name: Patch system trust before dependency or release downloads
         timeout-minutes: 2
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --only-upgrade ca-certificates
-          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+          minimum=20260816ubuntu0.24.04.1
+          installed="$(dpkg-query -W -f='${Version}' ca-certificates)"
+          if ! dpkg --compare-versions "$installed" ge "$minimum"; then
+            sudo apt-get update
+            sudo apt-get install -y --only-upgrade ca-certificates
+            dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "$minimum"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -83,9 +87,13 @@ jobs:
       - name: Patch system trust before dependency or release downloads
         timeout-minutes: 2
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --only-upgrade ca-certificates
-          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+          minimum=20260816ubuntu0.24.04.1
+          installed="$(dpkg-query -W -f='${Version}' ca-certificates)"
+          if ! dpkg --compare-versions "$installed" ge "$minimum"; then
+            sudo apt-get update
+            sudo apt-get install -y --only-upgrade ca-certificates
+            dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "$minimum"
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -107,9 +115,13 @@ jobs:
       - name: Patch system trust before dependency or release downloads
         timeout-minutes: 2
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --only-upgrade ca-certificates
-          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+          minimum=20260816ubuntu0.24.04.1
+          installed="$(dpkg-query -W -f='${Version}' ca-certificates)"
+          if ! dpkg --compare-versions "$installed" ge "$minimum"; then
+            sudo apt-get update
+            sudo apt-get install -y --only-upgrade ca-certificates
+            dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "$minimum"
+          fi
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -173,9 +185,13 @@ jobs:
       - name: Patch system trust before dependency or release downloads
         timeout-minutes: 2
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --only-upgrade ca-certificates
-          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+          minimum=20260816ubuntu0.24.04.1
+          installed="$(dpkg-query -W -f='${Version}' ca-certificates)"
+          if ! dpkg --compare-versions "$installed" ge "$minimum"; then
+            sudo apt-get update
+            sudo apt-get install -y --only-upgrade ca-certificates
+            dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "$minimum"
+          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -233,9 +249,13 @@ jobs:
       - name: Patch system trust before dependency or release downloads
         timeout-minutes: 2
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --only-upgrade ca-certificates
-          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1
+          minimum=20260816ubuntu0.24.04.1
+          installed="$(dpkg-query -W -f='${Version}' ca-certificates)"
+          if ! dpkg --compare-versions "$installed" ge "$minimum"; then
+            sudo apt-get update
+            sudo apt-get install -y --only-upgrade ca-certificates
+            dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "$minimum"
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: '24.22.3'
