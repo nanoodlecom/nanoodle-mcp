@@ -211,6 +211,18 @@ test('spoof completion cannot earn revenue; evaluator rejection records loss exp
   await f.restart(); assert.equal((await event(f)).state, 'rejected'); assert.equal(f.state.count.dispatch, 1);
 });
 
+test('submitted job that expires without evaluator action records loss review, never redispatches', async t => {
+  const f = await fixture(); t.after(() => f.close()); await funded(f); await event(f);
+  assert.equal(f.journal.get('8453:7').state, 'submitted');
+  f.state.raw.status = 5;
+  f.state.logs.push(encodedLog('JobExpired', { jobId: 7n }));
+  const r = await f.seller.handle(f.session, system('job.expired'));
+  assert.equal(r.state, 'expired'); assert.equal(r.lossReviewRequired, true);
+  assert.equal(r.evaluatorReceipt.releasedAtomic, '0'); assert.equal(r.evaluatorReceipt.profit, null);
+  await f.restart(); assert.equal((await event(f)).state, 'expired');
+  assert.deepEqual(f.state.count, { quote: 1, reserve: 1, dispatch: 1, budget: 1, submit: 1, publish: 1 });
+});
+
 test('malformed verified-job shapes fail closed on the funded path with zero effects', async t => {
   const variants = {
     status_string: { status: '1' }, status_missing: { status: undefined },
