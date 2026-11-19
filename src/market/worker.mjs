@@ -607,7 +607,8 @@ export function createMarketWorker({
         const epoch = String(a.slaDeadlineAt || "");
         if ((a.submittedAt || a.deliverableUrl) && epoch !== rec.epoch && !(rec.reworks || []).includes(epoch)) {
           log(`assignment ${short(a.assignmentId)}: sent back by the buyer (or a dispute redo)`);
-          store.update(a.assignmentId, ok({ phase: "reworking", reworkEpoch: epoch, epoch, reworks: [...(rec.reworks || []), epoch] }));
+          store.update(a.assignmentId, ok({ phase: "reworking", reworkEpoch: epoch, reworkStartedAt: now(),
+            epoch, reworks: [...(rec.reworks || []), epoch] }));
         }
       }
     }
