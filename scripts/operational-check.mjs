@@ -1108,7 +1108,7 @@ export async function runOperationalCheck(config, deps = {}) {
       throw new CheckError(error.code === "MARKET_FEE_CHANGED" ? "market-fee-assumption-changed" : "market-fee-unavailable");
     }
   }, ["market"]);
-  await Promise.all(config.agents.map(async agent => {
+  const pendingMarketPrices = await Promise.all(config.agents.map(async agent => {
     await check(`market-process-${agent.handle}`, async () => {
       const lock = read(join(config.marketStateDir, agent.handle, "worker.lock"));
       const alive = deps.isWorkerAlive || isMarketWorkerAlive;
@@ -1185,7 +1185,8 @@ export async function runOperationalCheck(config, deps = {}) {
       const risk = MARKET_SLA_WARNINGS.find(code => intake.risks.has(code));
       need(!risk, risk);
     }, []);
-    if (intake?.pendingPricing.length) await check(`market-pending-pricing-${agent.handle}`, async () => {
+    const pendingPrices = intake?.pendingPricing.length ? await check(`market-pending-pricing-${agent.handle}`, async () => {
+      const prices = new Map();
       for (const { job, assignmentId, budgetUsd } of intake.pendingPricing.slice(0, MARKET_MAX_REPRICES)) {
         const { args } = resolveJobBrief(job, assignmentId, { defaultWorkflow: agent.defaultWorkflow, customWorkflows: agent.custom });
         need(args, "market-pending-brief-unpriceable");
@@ -1193,14 +1194,17 @@ export async function runOperationalCheck(config, deps = {}) {
         const priced = await priceWorkflow(args, freshPriceOptions).catch(() => null);
         const estimate = priced?.pricing?.estimatedCostUsd;
         need(priced?.safety?.ok === true && Number.isFinite(estimate) && estimate >= 0, "market-pending-price-unavailable");
-        need(marketNeedUsd(estimate) <= budgetUsd, "market-pending-price-over-budget");
+        const needUsd = marketNeedUsd(estimate);
+        need(needUsd <= budgetUsd, "market-pending-price-over-budget");
+        prices.set(assignmentId, needUsd);
       }
       need(intake.pendingPricing.length <= MARKET_MAX_REPRICES, "market-pending-pricing-scan-incomplete");
-    }, []);
+      return prices;
+    }, []) : null;
     if (agent.bids) {
       await checkUsdRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
     }
-    if (!agent.defaultWorkflow) return;
+    if (!agent.defaultWorkflow) return pendingPrices;
     await check(`workflow-price-${agent.handle}`, async () => {
       const priced = await priceWorkflow(listingWorkflowPriceSample(agent.defaultWorkflow), freshPriceOptions);
       need(priced.safety.ok && priced.pricing, "workflow-not-priceable");
@@ -1212,7 +1216,21 @@ export async function runOperationalCheck(config, deps = {}) {
       need(!remote.isError && remote.structuredContent?.pricing?.safety?.ok, "mcp-pricing-unavailable");
       await checkUsdRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
+    return pendingPrices;
   }));
+  if (config.providerUsesWallet !== false && pendingMarketPrices.some(prices => prices?.size)) {
+    await check("market-repriced-run-funding", () => {
+      need(hasCapitalEvidence(), "market-repriced-run-funding-unverified");
+      let market, queuedRaw;
+      try {
+        // Some jobs may have started during the catalog reads. The latest
+        // records decide which quotes still need a reservation.
+        market = marketRunFunding(readMarketLedgers(), rates.xnoUsd, { pendingPrices: pendingMarketPrices });
+        queuedRaw = paidNanoRunFundingRaw(readNanoLedger().quotes) + paidNearRunFundingRaw(readNearLedger().quotes);
+      } catch { throw new CheckError("market-repriced-run-funding-unverified"); }
+      if (market.waitingRaw > 0n) need(hasCapital(queuedRaw, market), "market-repriced-run-funding-insufficient");
+    }, []);
+  }
   const finishedAt = now();
   if (runtimeFunding) await check("nano-funding-evidence-freshness", () => {
     need(runtimeFunding.expiresAt > finishedAt, "nano-read-guard-stale");

@@ -2274,6 +2274,59 @@ test("accepted Market jobs are repriced locally against the smaller of escrow an
   }
 });
 
+test("fresh Market prices and waiting USDC work must fit the same Nano pool", async t => {
+  const raw = 10n ** 30n, otherId = "5f5fe889-cd2d-4cf2-852b-d7dfca700eed";
+  const privateIdea = "PRIVATE_REPRICED_MARKET_WORK";
+  for (const mode of ["exact", "short-one-raw", "started-during-repricing", "provider-key"]) {
+    const rows = [ID, otherId].map(assignmentId => {
+      const row = marketIntakeRow(60_000, { assignmentId });
+      row.job.description = JSON.stringify({ graph: { v: 1, nodes: [], links: [] }, inputs: { Idea: privateIdea } });
+      return row;
+    });
+    const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments"
+      ? Response.json({ assignments: rows }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.agents[0].custom = true;
+    const assignments = f.states["/jobs/nanoodle-image/market-state.json"].assignments;
+    for (const { assignment } of rows) assignments[assignment.assignmentId] = {
+      id: assignment.assignmentId, phase: "starting", pricing: { depositUsd: 0.1 }, budgetUsd: 0.95,
+    };
+    const near = f.states["/state/near-state.json"];
+    near.quotes.usdc = { status: "paid", asset: "usdc", depositUsd: "0.3", paidAtBlockMs: NOW,
+      paidYocto: "300000", rate: { xnoUsd: "1" } };
+    bindFixturePayments(near, "usdc");
+    const available = mode === "started-during-repricing" ? 9n * raw / 10n : 3n * raw / 2n - BigInt(mode === "short-one-raw");
+    Object.assign(f.states["/state/funding-health.json"], {
+      liabilitiesRaw: "0", reservedRaw: String(10n * raw - available), activeRuns: 1, oldestStartedAt: NOW - 1000,
+    });
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const original = f.deps.computePrice;
+    f.deps.computePrice = async (args, options) => {
+      if (args.inputs?.Idea !== privateIdea) return original(args, options);
+      if (mode === "started-during-repricing") {
+        Object.assign(assignments[otherId], { phase: "running", pricing: { depositUsd: 0.6 } });
+      }
+      return { safety: { ok: true }, pricing: { estimatedCostUsd: 0.5 } };
+    };
+
+    const report = await runOperationalCheck(f.config, f.deps);
+    const stage = name => report.checks.find(row => row.stage === name);
+    assert.equal(stage("market-pending-pricing-nanoodle-image")?.ok, true, mode);
+    const refreshed = stage("market-repriced-run-funding");
+    if (mode === "provider-key") {
+      assert.equal(refreshed, undefined);
+    } else {
+      assert.equal(stage("market-paid-run-funding")?.ok, true, mode);
+      assert.equal(refreshed?.ok, mode !== "short-one-raw", mode);
+      if (mode === "short-one-raw") assert.deepEqual(refreshed, { stage: "market-repriced-run-funding",
+        ok: false, code: "market-repriced-run-funding-insufficient", domains: [] });
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify({ report, calls: f.calls }), /PRIVATE_REPRICED_MARKET_WORK/);
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(otherId));
+  }
+});
+
 test("Market delivery windows warn before expiry without changing payment readiness", async t => {
   const cases = [
     ["started", 30_000, 3600, {}, "market-sla-start-window-ended"],

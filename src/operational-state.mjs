@@ -154,17 +154,20 @@ export function paidNanoRunFundingRaw(quotes) {
 }
 
 /** Accepted Market launches and running work, priced at the sampled Nano rate. */
-export function marketRunFunding(market, xnoUsd) {
+export function marketRunFunding(market, xnoUsd, { pendingPrices = [] } = {}) {
   const pair = { usdNano: xnoUsd == null ? null : parseUsdNano(xnoUsd), raw: RAW_PER_XNO };
   let waitingRaw = 0n, totalRaw = 0n;
-  for (const state of market) {
+  for (const [index, state] of market.entries()) {
     for (const rec of marketAssignments(state)) {
-      const budgetUsd = marketReservationUsd(rec);
-      if (budgetUsd === 0) continue;
+      const recordedUsd = marketReservationUsd(rec);
+      if (recordedUsd === 0) continue;
+      const waiting = rec.phase !== "running";
+      const refreshedUsd = waiting ? pendingPrices[index]?.get(rec.id) : undefined;
+      const budgetUsd = Math.max(recordedUsd, refreshedUsd ?? 0);
       const { maxRaw, overheadRaw } = runFundingBudget({ id: rec.id, budgetUsd, pair, creator: !!rec.creator });
       const requiredRaw = maxRaw + overheadRaw;
       totalRaw += requiredRaw;
-      if (rec.phase !== "running") waitingRaw += requiredRaw;
+      if (waiting) waitingRaw += requiredRaw;
     }
   }
   return { waitingRaw, totalRaw };
