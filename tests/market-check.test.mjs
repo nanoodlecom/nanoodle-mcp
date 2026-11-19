@@ -8,12 +8,13 @@ import { MARKET_HANDLES, runMarketCheck } from "../scripts/market-check.mjs";
 
 const setup = () => ({ stateDir: mkdtempSync(join(tmpdir(), "market-check-")), retryMs: 0 });
 const agentId = handle => `00000000-0000-0000-0000-${String(MARKET_HANDLES.indexOf(handle) + 1).padStart(12, "0")}`;
-function healthy(url, init) {
+function healthy(url, init, fee = 500) {
   assert.equal(init.method, "GET"); assert.equal(init.headers.authorization, undefined);
+  assert.equal(init.headers["cache-control"], "no-cache, no-store");
   assert.equal(init.body, undefined); assert.equal(init.redirect, "error"); assert.ok(init.signal);
   const path = new URL(url).pathname;
   if (path === "/") return new Response("<title>NEAR AI Agent Market</title>", { headers: { "content-type": "text/html" } });
-  if (path === "/v1/platform/config") return Response.json({ public_host: new URL(url).host, platform_fee_bps: 500 });
+  if (path === "/v1/platform/config") return Response.json({ public_host: new URL(url).host, platform_fee_bps: fee });
   const handle = path.split("/").at(-1);
   if (MARKET_HANDLES.includes(handle)) return Response.json({ handle, agent_id: agentId(handle), listing_status: "live", availability: "available", available_now: false, funding_paused: false });
   if (path.endsWith("/pricing-plans")) return Response.json([{ agent_id: path.split("/").at(-2), is_default: true, listing_status: "live", price_amount: "0.03" }]);
@@ -38,6 +39,17 @@ test("a transient API failure retries before declaring an outage", async () => {
     return healthy(url, init);
   } });
   assert.equal(report.ok, true); assert.equal(report.checks.find(c => c.stage === "market-api").attempts, 2);
+});
+
+test("independent availability detects a fee increase above the spending guard", async () => {
+  let fee = 501;
+  const observe = () => runMarketCheck(setup(), { fetch: async (url, init) => healthy(url, init, fee) });
+  const increased = await observe();
+  assert.equal(increased.ok, false);
+  assert.deepEqual(increased.checks.find(c => c.stage === "market-api"),
+    { stage: "market-api", ok: false, attempts: 3, error: "market-fee-assumption-changed" });
+  fee = 499;
+  assert.equal((await observe()).ok, true);
 });
 
 test("HTML API fallbacks, unpublished or unfunded listings, and missing live prices fail after bounded retries", async () => {
