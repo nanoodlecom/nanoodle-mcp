@@ -1,6 +1,6 @@
 {
-  "checkedOn": "2026-11-03",
-  "repositoryBase": "98e426254a038c90fcaa14a42881ace6bb8c7278",
+  "checkedOn": "2026-11-18",
+  "repositoryBase": "2d89400 (main, 2026-11-18) + this branch",
   "officialSources": [
     {
       "url": "https://github.com/x402-foundation/x402",
@@ -21,6 +21,10 @@
     {
       "url": "https://github.com/x402-foundation/x402/tree/main/typescript/packages/mechanisms/svm",
       "purpose": "Solana exact SDK"
+    },
+    {
+      "url": "https://docs.cdp.coinbase.com/x402/seller/get-discovered",
+      "purpose": "CDP Bazaar discovery: extensions.bazaar declaration, settle-time indexing trigger, 500-char description limit, metadata content policy"
     }
   ],
   "publishedPackages": [
@@ -53,6 +57,12 @@
       "version": "2.57.14",
       "tarball": "https://registry.npmjs.org/viem/-/viem-2.57.14.tgz",
       "integrity": "sha512-ctaSyx3I24va98H2PYz8C30FKXXo8Th/H6Wrn7za7N+RuPQHiL09zFedX6GZDCtz73YFLrf7YeVOgU5CUVByng=="
+    },
+    {
+      "name": "@x402/extensions",
+      "version": "2.29.0",
+      "tarball": "https://registry.npmjs.org/@x402/extensions/-/extensions-2.29.0.tgz",
+      "integrity": "sha512-FCpjZ6QR6ZtHTRZBV7VHMt7tc66LnTrpKDERiL3atXlLu4PlmgiulHt9PWE+Ktm5iUbXr3dAYZu2e7XrVd/XgA=="
     }
   ],
   "fixtureConstruction": {

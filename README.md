@@ -360,9 +360,11 @@ once and draw down a balance, that's exactly what a NanoGPT account is:
 (Nano included) into an account, take its API key, and run the server in
 normal BYOK mode — same tools, one payment instead of many.
 
-An experimental [Base/Solana x402 exact ingress adapter](docs/x402-exact-ingress.md)
-is available for offline qualification through an injected quote/reservation
-boundary. It is not enabled by the CLI or hosted server.
+An experimental [Base/Solana x402 exact ingress](docs/x402-exact-ingress.md)
+ships with its durable payment-authority store and CDP Bazaar discovery
+support, qualified offline only. It is not enabled by the CLI or hosted
+server, and no live payment path exists until an operator wires a route,
+a facilitator and a `payTo` address.
 
 ## Serve mode — host your noodles as a service (`--serve`)
 
