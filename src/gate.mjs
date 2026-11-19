@@ -44,9 +44,11 @@ import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, NANO_PAYMEN
   NANO_RECEIVABLE_COUNT as RECEIVABLE_COUNT, NANO_HISTORY_PAGE as HISTORY_PAGE,
   checkedAnchoredNanoHistory, nanoHistoryKind, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
+import { NANO_STANDBY_BUDGET_MS } from "./nano-read-pool.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
+export const LIVE_RATE_MAX_AGE_MS = 300_000;
 const QUOTE_READ_PROOF_TTL_MS = 30_000;
 const QUOTE_READ_RETRY_MS = 5_000;
 const QUOTE_READ_UNAVAILABLE = "Nano payment detection is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
@@ -118,8 +120,7 @@ const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
  * The XNO/USD rate oracle: a keyless request with `x-x402: true` answers 402
  * with the invoice pair (raw XNO amount + USD value) NanoGPT settles x402
  * payments at. Returns that exact pair { usdNano, raw }. The probe invoice is
- * never paid; it expires on their side. `signal` is optional (the charge gate
- * passes none).
+ * never paid; it expires on their side. The signal bounds the probe request.
  */
 export async function probeX402Pair({ fetch, url, signal }) {
   const r = await fetch(url, {
@@ -195,7 +196,7 @@ function settlementReceipt(q, journaled = false) {
  * @param {(params) => Promise<void>} [opts.validate]  registry arg validation — quotes are only
  *                                        issued for calls that would actually run (never charge for a typo)
  * @param {number|null} [opts.xnoUsd]     static XNO/USD rate override; null (default) → NanoGPT's own
- *                                        x402 invoices are the oracle (60s cache, stale-tolerant)
+ *                                        x402 invoices are the oracle (60s cache, 5min maximum age)
  * @param {string} [opts.oracleBase]      NanoGPT API base for the rate probe (default https://nano-gpt.com)
  * @param {string|null} [opts.wsUrl]      Nano node websocket (wss://…) for push confirmations
  * @param {string} opts.publicBase        absolute base URL for pay links (no trailing slash)
@@ -265,28 +266,34 @@ export function createChargeGate({
   // answers 402 with the SAME invoice pair (raw XNO amount + USD value) they
   // settle our downstream payments at — so we quote callers at the rate we pay,
   // not a market feed's. The probe invoice is never paid; it expires on their
-  // side, and the 60s cache keeps probes to at most one a minute while quoting.
+  // side. Successful probes are reused for 60 seconds.
   const oracleUrl = x402ProbeUrl(oracleBase);
-  const nanoGptPair = () => probeX402Pair({ fetch, url: oracleUrl });
+  const nanoGptPair = () => probeX402Pair({ fetch, url: oracleUrl, signal: AbortSignal.timeout(8_000) });
 
   let rate = Number.isFinite(xnoUsd) && xnoUsd > 0
     ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: 10n ** 30n }, at: Infinity, source: "static" }
     : null;
   let rateProbe = null; // in-flight oracle probe — concurrent cold quoters share one request
+  function rateYoungerThan(limit) {
+    if (!rate) return false;
+    if (rate.at === Infinity) return true;
+    const age = monotonicNow() - rate.at;
+    return age >= 0 && age < limit;
+  }
   async function ratePair() {
-    if (rate && (rate.at === Infinity || now() - rate.at < 60_000)) return rate.pair;
+    if (rateYoungerThan(60_000)) return rate.pair;
     try {
       if (!rateProbe) rateProbe = nanoGptPair().finally(() => { rateProbe = null; });
       const pair = await rateProbe;
-      rate = { pair, at: now(), source: "nanogpt-x402" };
+      rate = { pair, at: monotonicNow(), source: "nanogpt-x402" };
       return pair;
     } catch (e) {
-      if (rate) {
+      if (rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
         log(`NanoGPT rate oracle failed (${e.message}) — using stale cached pair`);
         return rate.pair;
       }
       throw new Error("cannot price this call: the NanoGPT x402 rate probe failed " +
-        `(${e.message}) and there is no cached rate or --xno-usd override`);
+        `(${e.message}) and there is no current cached rate or --xno-usd override`);
     }
   }
   const rateSource = () => (rate ? rate.source : null);
@@ -418,12 +425,14 @@ export function createChargeGate({
         }
         return await completeOwed(o);
       } catch (e) {
-        if (!o.confirmedHash && o.tries >= OWED_MAX_TRIES) {
+        const deferred = e?.code === "NANO_RPC_STANDBY_BUDGET";
+        if (deferred && retry) o.tries--;
+        if (!deferred && !o.confirmedHash && o.tries >= OWED_MAX_TRIES) {
           o.held = true;
           o.at = Infinity;
           log(`Nano ${o.event} requires reconciliation after ${o.tries} retries`);
         } else {
-          o.at = now() + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
+          o.at = now() + (deferred ? NANO_STANDBY_BUDGET_MS : OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)]);
           log(`Nano ${o.event} queued after unsuccessful attempt: ${e.message}`);
         }
         if (!retry || o.held) usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw,
@@ -827,10 +836,10 @@ export function createChargeGate({
     return floor;
   }
 
-  async function readHistoryPage(head, raw, height = null) {
+  async function readHistoryPage(head, raw, { height = null, existingPayments = false } = {}) {
     const request = { action: "account_history", account: address, count: String(HISTORY_PAGE),
       ...(head && { head }), ...(raw && { raw: "true" }) };
-    const page = await ops.rpc(request);
+    const page = await ops.rpc(request, undefined, existingPayments ? { existingPaymentHistory: true } : undefined);
     if (raw) {
       const proved = checkedAnchoredNanoHistory(page, request, checkAddress, height);
       return { entries: proved.history, next: proved.previous };
@@ -862,12 +871,12 @@ export function createChargeGate({
     return blocks && typeof blocks === "object" ? Object.entries(blocks) : [];
   }
 
-  async function readPaymentWindow({ existingPayments = false } = {}) {
+  async function readPaymentWindow({ existingPayments = false, historyHead = null, historyHeight = null } = {}) {
     if (verifyPaymentReads && ops.readPaymentWindow) {
       try {
-        const { receivable, history } = await ops.readPaymentWindow();
+        const { receivable, history } = await ops.readPaymentWindow({ existingPayments, historyHead, historyHeight });
         return { blocks: receivableBlocks(receivable), history: history && {
-          anchored: true, latest: { entries: history.history, next: history.previous },
+          anchored: true, page: { entries: history.history, next: history.previous },
         } };
       } catch (error) {
         // Keep finding already-issued payments when the standby has enough
@@ -880,14 +889,15 @@ export function createChargeGate({
     return { blocks: receivableBlocks(receivable), history: null };
   }
 
-  async function readLatestHistory() {
+  async function readLatestHistory({ existingPayments = false } = {}) {
     const anchor = ops.checkpoint?.()?.confirmed;
     const anchored = isNanoHistoryHash(anchor?.hash);
     if (verifyPaymentReads && (!anchored || !isNanoHistoryHeight(anchor.blockCount))) {
       throw new Error("Nano payment history lacks a confirmed checkpoint");
     }
-    const latest = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored, anchored ? anchor.blockCount : null);
-    return { anchored, latest };
+    const page = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored,
+      { height: anchored ? anchor.blockCount : null, existingPayments });
+    return { anchored, page };
   }
 
   function recordPaymentRead(ready, sequence) {
@@ -951,16 +961,34 @@ export function createChargeGate({
   /** Pocketed payments disappear from receivable. Inspect the latest page for
    * quick confirmation, while a fixed backfill resumes older pages across
    * ticks and restarts until it reaches the last completed checkpoint. */
-  async function scanHistory(startedAt, fullReceivableWindow, history) {
+  async function scanHistory(startedAt, fullReceivableWindow, history, historyHead) {
     const prior = historyScan;
-    const { anchored, latest } = history ?? await readLatestHistory();
     const replay = prior.backfill;
     const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
+    delete batch.quotaDeferred;
     const floor = prior.through === null ? initialHistoryFloor() : null;
-    if (replay) inspectHistory(latest.entries, replay.newest || prior.through, floor);
+    const readOrDefer = async read => {
+      try { return await read(); }
+      catch (error) {
+        if (error?.code === "NANO_RPC_STANDBY_BUDGET" && batch.next) {
+          await saveHistory({ ...prior, backfill: { ...batch, quotaDeferred: true } });
+        }
+        throw error;
+      }
+    };
+    const { anchored, page: first } = history ?? await readOrDefer(async () => historyHead
+      ? { anchored: true, page: await readHistoryPage(historyHead, true, { height: batch.nextHeight ?? null, existingPayments: true }) }
+      : readLatestHistory({ existingPayments: true }));
+    let firstPage = first;
+    if (replay && !historyHead) {
+      inspectHistory(first.entries, replay.newest || prior.through, floor);
+      firstPage = null;
+    }
 
-    for (let used = replay ? 1 : 0; used < HISTORY_MAX_PAGES; used++) {
-      const page = batch.next ? await readHistoryPage(batch.next, anchored) : latest;
+    for (let used = firstPage ? 0 : 1; used < HISTORY_MAX_PAGES; used++) {
+      const page = firstPage ?? await readOrDefer(() => readHistoryPage(batch.next, anchored,
+        { height: batch.nextHeight ?? null, existingPayments: true }));
+      firstPage = null;
       // A completed cursor must still be visible if an older release resumes
       // with the default history mode, which skips change and epoch blocks.
       batch.newest ??= page.entries.find(entry => ["send", "receive", "open"].includes(nanoHistoryKind(entry)))?.hash ?? null;
@@ -973,6 +1001,13 @@ export function createChargeGate({
         return saveHistory({ through, coveredAt, backfill: null });
       }
       batch.next = page.next;
+      if (anchored) {
+        batch.nextHeight = (BigInt(page.entries.at(-1).height) - 1n).toString();
+        batch.advancedAt = Math.max(batch.advancedAt ?? batch.startedAt, now());
+      } else {
+        delete batch.nextHeight;
+        delete batch.advancedAt;
+      }
     }
     await saveHistory({ ...prior, backfill: batch });
   }
@@ -989,8 +1024,10 @@ export function createChargeGate({
     if (!anyPaymentWatchable()) return;
     const startedAt = now();
     const sequence = ++paymentReadSequence;
+    const replay = historyScan.backfill?.quotaDeferred ? historyScan.backfill : null;
+    const historyHead = replay?.next ?? null;
     try {
-      const { blocks, history } = await readPaymentWindow({ existingPayments: true });
+      const { blocks, history } = await readPaymentWindow({ existingPayments: true, historyHead, historyHeight: replay?.nextHeight ?? null });
       for (const [hash, v] of blocks) {
         const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
         const source = typeof v === "object" && v !== null ? v.source : null;
@@ -1004,8 +1041,8 @@ export function createChargeGate({
         ops.pocket().catch(() => {}); // best-effort; the next tick retries
       }
       if (anyPaymentWatchable()) {
-        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT, history);
-        recordPaymentRead(true, sequence);
+        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT, history, historyHead);
+        if (!historyHead) recordPaymentRead(true, sequence);
       }
     } catch (error) {
       recordPaymentRead(false, sequence);

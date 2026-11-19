@@ -25,7 +25,7 @@ import {
 } from "../src/near/quote-capacity.mjs";
 import { authorAddress, resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
-import { parseUsdNano } from "../src/gate.mjs";
+import { LIVE_RATE_MAX_AGE_MS, parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { createMarketFeeGuard } from "../src/market/fee-guard.mjs";
@@ -33,7 +33,7 @@ import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice, priceSavedWorkflow } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
+import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
@@ -49,7 +49,7 @@ const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
 const NEAR_DISCOVERY_MAX_PROOF_AGE_MS = 27 * 3600_000;
 const NANO_TELEMETRY_AGE_MS = 90_000;
 const NANO_LEDGER_LAG_BLOCKS = 1_000n;
-const NANO_CEMENTATION_STALL_MS = 10 * 60_000;
+const NANO_CEMENTATION_WINDOW_MS = 10 * 60_000;
 const NANO_CEMENTATION_SAMPLE_MAX_AGE_MS = 12 * 60_000;
 const NANO_PEER_ADVANCE_BLOCKS = 50n;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
@@ -122,14 +122,45 @@ function nanoCementationProgress(current, previous, now) {
       peerMedianAtStart = prior.peerMedianConfirmed;
     }
   }
-  const stalled = now - unchangedSince >= NANO_CEMENTATION_STALL_MS
+  const progress = { unchangedSince, peerMedianAtStart };
+  const priorLocal = continuous ? nanoLedgerCount(prior?.localConfirmed) : null;
+  const local = BigInt(current.localConfirmed), peer = BigInt(current.peerMedianConfirmed);
+  if (priorLocal !== null && local < priorLocal) {
+    return { ...progress, code: "nano-ledger-local-confirmations-regressed" };
+  }
+  const stalled = now - unchangedSince >= NANO_CEMENTATION_WINDOW_MS
     && BigInt(current.peerMedianConfirmed) - BigInt(peerMedianAtStart) >= NANO_PEER_ADVANCE_BLOCKS;
-  return { unchangedSince, peerMedianAtStart, stalled };
+  if (stalled) return { ...progress, code: "nano-ledger-confirmations-stalled" };
+  const priorPeer = nanoLedgerCount(prior?.peerMedianConfirmed);
+  if (priorLocal === null || priorPeer === null) return progress;
+
+  const priorLead = priorPeer > priorLocal ? priorPeer - priorLocal : 0n;
+  const lead = peer - local;
+  if (lead <= priorLead) return progress;
+  // Carry the baseline only across consecutive increases. Steady historical
+  // lag, an isolated change in the peer median and telemetry gaps do not warn.
+  const trend = prior.wideningGap;
+  const firstLead = trend?.leadAtStart === "0" ? 0n : nanoLedgerCount(trend?.leadAtStart);
+  const ongoing = Number.isSafeInteger(trend?.since) && trend.since > 0 && trend.since <= checkedAt
+    && firstLead !== null && firstLead < priorLead;
+  const since = ongoing ? trend.since : checkedAt;
+  const leadAtStart = ongoing ? firstLead : priorLead;
+  const growing = now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
+  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString() },
+    ...(growing && { code: "nano-ledger-confirmations-falling-behind" }) };
 }
 
 function currentNanoPaymentPeers(rows) {
   const { current, latestConfirmed } = qualifyNanoAccountViews(rows);
   return current.filter(row => row.paymentReads && row.view.confirmedHeight === latestConfirmed.confirmedHeight);
+}
+
+async function readDiscoveryStep(step, read) {
+  try { return await read(); }
+  catch (error) {
+    if (error?.code === "RPC_TIMEOUT") throw new CheckError(`near-discovery-${step}-timeout`);
+    throw error;
+  }
 }
 
 function backupVerificationProof(file, read, now, stage) {
@@ -210,10 +241,10 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), { fu
     }
   }
   if (nanoLedgerSync) {
-    const { stalled, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
+    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, now);
     nanoLedgerSync = { ...nanoLedgerSync, ...progress };
-    const check = stalled
-      ? { stage: "nano-ledger-confirmation-progress", ok: false, code: "nano-ledger-confirmations-stalled", domains: [] }
+    const check = code
+      ? { stage: "nano-ledger-confirmation-progress", ok: false, code, domains: [] }
       : { stage: "nano-ledger-confirmation-progress", ok: true };
     checks = [...checks, check].sort((a, b) => a.stage.localeCompare(b.stage));
   }
@@ -410,6 +441,12 @@ export async function runOperationalCheck(config, deps = {}) {
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
+    if (rpc.fundingEvidenceExpiresAt !== undefined) {
+      const expiresAt = rpc.fundingEvidenceExpiresAt;
+      need(config.nanoStandby && rpc.standby?.inUse === true && Number.isSafeInteger(expiresAt)
+        && expiresAt > now() && expiresAt > rpc.lastReadAt && expiresAt - rpc.lastReadAt <= NANO_FUNDING_EVIDENCE_MS,
+      "nano-read-guard-stale");
+    }
     let checkpoint;
     try { checkpoint = selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
@@ -428,7 +465,8 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingPause: pause?.recoveredAt != null ? pause : null };
+    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingEvidenceExpiresAt: rpc.fundingEvidenceExpiresAt,
+      fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -578,9 +616,12 @@ export async function runOperationalCheck(config, deps = {}) {
     const { history, waiting } = nanoWatchDemand(ledger, at);
     if (!waiting.length) return;
     if (ledger.historyScan !== undefined) {
-      need(history.coveredAt === null || history.coveredAt <= at + 30_000, "nano-payment-coverage-invalid");
-      need(history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS, "nano-payment-coverage-stale");
-      return;
+      const advancedAt = history.backfill?.advancedAt;
+      need((history.coveredAt === null || history.coveredAt <= at + 30_000)
+        && (advancedAt === undefined || advancedAt <= at + 30_000), "nano-payment-coverage-invalid");
+      if (history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS) return;
+      if (advancedAt === undefined) throw new CheckError("nano-payment-coverage-stale");
+      throw new CheckError(at - advancedAt > NANO_SCAN_GRACE_MS ? "nano-history-backfill-stalled" : "nano-history-backfill-in-progress");
     }
     need(nano, "nano-payment-observation-unavailable");
     const observed = await check("nano-legacy-payment-observation", async () => {
@@ -670,18 +711,18 @@ export async function runOperationalCheck(config, deps = {}) {
       const { paymentTx, payer } = sample;
       const accounts = [config.merchant, USDC_CONTRACTS[config.network]];
       const witnessed = await Promise.all(nearNodes.map(({ index, rpc, identity }) => check(`near-discovery-peer-${index}`, async () => {
-        const tx = await rpc.txStatus({ txHash: paymentTx, senderId: payer });
+        const tx = await readDiscoveryStep("transaction", () => rpc.txStatus({ txHash: paymentTx, senderId: payer }));
         const receipt = Array.isArray(tx.receipts_outcome)
           && tx.receipts_outcome.find(row => row.outcome?.executor_id === config.merchant);
         need(tx.final_execution_status === "FINAL" && Object.hasOwn(tx.status ?? {}, "SuccessValue")
           && tx.transaction?.hash === paymentTx && tx.transaction.signer_id === payer && tx.transaction.receiver_id === config.merchant
           && typeof receipt?.id === "string" && typeof receipt.block_hash === "string"
           && Object.hasOwn(receipt.outcome.status ?? {}, "SuccessValue"), "near-discovery-canary-transaction-unverified");
-        const block = nearBlockIdentity(await rpc.block({ blockId: receipt.block_hash }));
+        const block = nearBlockIdentity(await readDiscoveryStep("block", () => rpc.block({ blockId: receipt.block_hash })));
         need(block.hash === receipt.block_hash && block.height <= identity.height, "near-discovery-canary-block-mismatch");
-        const ids = await readNearPaymentReceipts(rpc, block.hash, accounts);
+        const ids = await readDiscoveryStep("account-changes", () => readNearPaymentReceipts(rpc, block.hash, accounts));
         need(ids.has(receipt.id), "near-discovery-canary-receipt-missing");
-        const resolved = await readNearReceiptTransaction(rpc, receipt.id, block.height);
+        const resolved = await readDiscoveryStep("receipt-lookup", () => readNearReceiptTransaction(rpc, receipt.id, block.height));
         need(resolved.transaction_hash === paymentTx && resolved.sender_account_id === payer, "near-discovery-canary-receipt-mismatch");
         return true;
       }, [])));
@@ -737,19 +778,28 @@ export async function runOperationalCheck(config, deps = {}) {
       need(fundingHealth[key] === true, code);
     }, [asset]);
   }
-  const rates = await check("exchange-rates", async () => {
+  const rateView = await check("exchange-rates", async () => {
     const result = await http(config.site + "/rates");
-    need(result.quoting && parseUsdNano(result.nearUsd) > 0n && parseUsdNano(result.xnoUsd) > 0n, "exchange-rate-not-usable");
-    for (const name of ["nearUsd", "xnoUsd"]) {
-      const source = result.sources?.[name];
-      need(source?.usable === true, "exchange-rate-not-usable");
-      if (source.live) {
-        const age = now() - Date.parse(source.at);
-        need(Number.isFinite(age) && age <= 300_000 && age >= -30_000, "exchange-rate-stale");
-      } else checks.push({ stage: `static-rate-${name}`, ok: false, code: "static-rate-needs-operator-review", domains: [] });
-    }
+    need(typeof result?.quoting === "boolean", "exchange-rate-not-usable");
     return result;
   });
+  function verifyRate(name) {
+    const source = rateView.sources?.[name];
+    need(source?.usable === true && parseUsdNano(rateView[name]) > 0n, "exchange-rate-not-usable");
+    if (source.live) {
+      const age = now() - Date.parse(source.at);
+      need(age >= -30_000 && age < LIVE_RATE_MAX_AGE_MS, "exchange-rate-stale");
+    } else checks.push({ stage: `static-rate-${name}`, ok: false, code: "static-rate-needs-operator-review", domains: [] });
+  }
+  const rates = rateView && await check("exchange-rate-xno", () => {
+    verifyRate("xnoUsd");
+    return rateView;
+  });
+  if (rateView) await check("exchange-rate-near", () => {
+    verifyRate("nearUsd");
+    // The aggregate quoting flag can also be down because XNO is unavailable.
+    if (rates || rateView.xnoRequired === false) need(rateView.quoting, "exchange-rate-not-usable");
+  }, ["near"]);
   if (state && nano && rates) await check("nano-liquidity", async () => {
     const result = nanoLiquidityCheck({ liabilities: state.liabilities, nanoBalanceRaw: nano.info.confirmed_balance,
       xnoUsd: rates.xnoUsd, providerReserveUsd });
@@ -1062,7 +1112,11 @@ export async function runOperationalCheck(config, deps = {}) {
       await checkUsdRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
   }));
-  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
+  const finishedAt = now();
+  if (runtimeFunding?.fundingEvidenceExpiresAt !== undefined) await check("nano-funding-evidence-freshness", () => {
+    need(runtimeFunding.fundingEvidenceExpiresAt > finishedAt, "nano-read-guard-stale");
+  });
+  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), finishedAt,
     { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync, invocationId: config.invocationId });
 }
 

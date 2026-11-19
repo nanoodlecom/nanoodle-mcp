@@ -892,11 +892,12 @@ function inputRefusals(workflowGraph, given) {
 }
 
 /** Price an operator-installed graph from public catalogs without running it. */
-export async function priceSavedWorkflow(graph, { inputs, baseUrl, fetch, log, catalogTimeoutMs } = {}) {
+export async function priceSavedWorkflow(graph, { inputs, baseUrl, fetch, log, catalogTimeoutMs, catalogMaxAgeMs } = {}) {
   const workflow = new Workflow(graph, { quiet: true });
   if (workflow.warnings.length) throw new Error("Saved workflow contains unsupported nodes");
   const catalogs = await fetchCatalogs(graphModelKinds(workflow.graph), {
-    baseUrl, fetch, log, requireFresh: true, ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
+    baseUrl, fetch, log, requireFresh: true, maxAgeMs: catalogMaxAgeMs,
+    ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
   });
   return { pricing: priceGraph(workflow.graph, catalogs, { inputs }), catalogs };
 }
@@ -1320,7 +1321,12 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
         let runWf = tool.wf, hf = null;
         if (ctx?.fundedMaxUsd && !tool.humanize) {
-          const { pricing, catalogs: fresh } = await priceSavedWorkflow(tool.wf.graph, { inputs, baseUrl, log, catalogTimeoutMs });
+          const { pricing, catalogs: fresh } = await priceSavedWorkflow(tool.wf.graph, {
+            inputs, baseUrl, fetch: runtimeFetch, log, catalogTimeoutMs, catalogMaxAgeMs: 0,
+          });
+          if (pricing.unpriced.some(node => node.catalogMissing)) {
+            throw new FundingError("QUOTE_CATALOG_UNAVAILABLE", "The current model catalogs could not verify this quote's budget. No model work started.");
+          }
           if (!Number.isFinite(pricing.estimatedCostUsd)
             || parseUsdNano(pricing.estimatedCostUsd, { roundUp: true }) > parseUsdNano(ctx.fundedMaxUsd)) {
             throw new FundingError("QUOTE_BUDGET_EXCEEDED", "The current model estimate exceeds this quote's budget. No model work started.");

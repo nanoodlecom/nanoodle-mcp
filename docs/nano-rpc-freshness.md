@@ -124,6 +124,13 @@ does not request work or broadcast blocks. The five-minute monitor checks a
 fresh standby-assisted checkpoint against a directly readable primary. It
 reports when the standby covers quorum and makes no separate standby requests.
 
+A wallet sweep uses the corroborated account view from its confirmed receivable
+read to build the receive. While both mainnet proofs are fresh, an exact
+confirmed block from the primary can settle a journaled send. Establishing an
+absent block still requires every selected peer. If the local standby budget
+runs out, refunds and creator payouts retain their signed intent and retry count.
+The monitor continues to track the age of these obligations.
+
 Offline tests include a real hosted server with a frozen preferred peer and two
 current peers. Nano, NEAR and USDC saved/custom runs, timeout refunds and replay
 all use that fixture. The frozen peer returns empty pending/history lists and

@@ -302,6 +302,31 @@ test("Nano checkout detects stale coverage only while a quote has been waiting",
   }
 });
 
+test("stale Nano coverage distinguishes a moving history cursor from a stalled one while keeping admission closed", async t => {
+  for (const [scenario, advancedAt, expected] of [
+    ["advancing", NOW - 63_000, "nano-history-backfill-in-progress"],
+    ["at the grace limit", NOW - 120_000, "nano-history-backfill-in-progress"],
+    ["stalled", NOW - 120_001, "nano-history-backfill-stalled"],
+    ["impossible future progress", NOW + 30_001, "nano-payment-coverage-invalid"],
+    ["legacy cursor", undefined, "nano-payment-coverage-stale"],
+  ]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"];
+    ledger.historyScan = { through: "C".repeat(64), coveredAt: NOW - 600_000, backfill: {
+      newest: "A".repeat(64), next: "B".repeat(64), startedAt: NOW - 500_000, fullReceivableWindow: false, quotaDeferred: true,
+      ...(advancedAt !== undefined && { advancedAt, nextHeight: "100" }),
+    } };
+    ledger.quotes.push({ id: "private-backfill-quote", status: "pending", createdAt: NOW - 500_000,
+      expiresAt: NOW + 600_000, amountRaw: "50000000000000000000000" });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
+    assert.deepEqual(probe, { stage: "nano-payment-scan-progress", ok: false, code: expected, domains: ["nano"] }, scenario);
+    assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-backfill-quote|advancedAt|nextHeight|BBBBBBBB/);
+  }
+});
+
 test("a legacy Nano writer alerts on an aged confirmed matching transfer missing from its ledger", async t => {
   const account = NANO_GENESIS_REPLY.contents.account;
   const sender = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
@@ -1297,7 +1322,9 @@ test("owned Nano ledger telemetry distinguishes missing blocks from delayed conf
 });
 
 test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
-  for (const failure of [null, "matching-with-lagging-peer", "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+  for (const failure of [null, "matching-with-lagging-peer", "reused-funding", "expired-funding", "expired-during-check",
+    "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+    let checkedAt = NOW;
     const f = fixture(({ url, body }) => {
       assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
       if (url.hostname === "nano-0.example") {
@@ -1307,8 +1334,10 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
         return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
       }
+      if (failure === "expired-during-check" && body?.action === "account_history") checkedAt = NOW + 5_000;
       return null;
     });
+    f.deps.now = () => checkedAt;
     const url = "https://standby.example/rpc?api_key=PRIVATE_STANDBY";
     f.config.nanoStandby = { url, requestsPerMinute: 10 };
     const rpc = f.states["/state/funding-health.json"].nanoRpc;
@@ -1316,14 +1345,21 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       configuration: failure === "digest" ? "a".repeat(64) : rpcPeerSetId([...f.config.nanoRpcUrls, url]),
       standby: { inUse: failure !== "inactive", requestsPerMinute: failure === "quota" ? 11 : 10 },
       cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      ...(["reused-funding", "expired-funding", "expired-during-check"].includes(failure) && { lastReadAt: NOW - 25_000,
+        fundingEvidenceExpiresAt: NOW + (failure === "expired-funding" ? 0 : 5_000) }),
       ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
     const report = await runOperationalCheck(f.config, f.deps);
-    const ready = failure === null || failure === "matching-with-lagging-peer";
+    const ready = [null, "matching-with-lagging-peer", "reused-funding"].includes(failure);
     assert.equal(report.admission.nano, false);
     assert.equal(report.admission.near, ready);
     if (ready) {
       assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
       assert.ok(report.checks.some(c => c.stage === "nano-payment-read-quorum" && c.code === "nano-payment-read-standby-unverified"));
+    }
+    if (failure === "expired-funding") assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "nano-read-guard-stale"));
+    if (failure === "expired-during-check") {
+      assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+      assert.ok(report.checks.some(c => c.stage === "nano-funding-evidence-freshness" && c.code === "nano-read-guard-stale"));
     }
     if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
@@ -1822,11 +1858,17 @@ test("watcher readiness rejects malformed heights, impossible leads and unknown 
 test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a real receipt", async t => {
   const payer = "private-canary.near", paymentTx = base58Encode(Buffer.alloc(32, 3));
   const receiptId = base58Encode(Buffer.alloc(32, 4)), receiptBlock = base58Encode(Buffer.alloc(32, 5));
-  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof"]) {
+  const timeoutMethods = { transaction: "tx", block: "block", "account-changes": "EXPERIMENTAL_changes",
+    "receipt-lookup": "EXPERIMENTAL_receipt_to_tx" };
+  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof", ...Object.keys(timeoutMethods)]) {
     const f = fixture(({ url, body }, config) => {
       if (!url.hostname.startsWith("near-") || !body) return null;
       const json = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
       const merchant = config.merchant;
+      if (url.hostname === "near-1.example" && body.method === timeoutMethods[scenario]
+        && (body.method !== "block" || body.params.block_id === receiptBlock)) {
+        throw new DOMException("PRIVATE_TIMEOUT_DETAIL", "TimeoutError");
+      }
       if (body.method === "tx") {
         assert.deepEqual(body.params, { tx_hash: paymentTx, sender_account_id: payer, wait_until: "FINAL" });
         return json({ final_execution_status: "FINAL", status: { SuccessValue: "" },
@@ -1865,10 +1907,12 @@ test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a
       assert.equal(find("near-payment-discovery")?.ok, scenario !== "empty-changes");
       assert.equal(find("near-discovery-peer-1")?.ok, scenario === "complete");
       if (scenario !== "complete") assert.deepEqual(find("near-discovery-peer-1").domains, []);
+      if (timeoutMethods[scenario]) assert.equal(find("near-discovery-peer-1").code, `near-discovery-${scenario}-timeout`);
     }
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
     assert.ok(!JSON.stringify(report).includes(paymentTx));
     assert.ok(!JSON.stringify(report).includes(payer));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_TIMEOUT_DETAIL/);
   }
 });
 
@@ -1945,6 +1989,23 @@ test("disagreeing Nano frontiers, an underfunded pool and stale exchange rates c
     });
     const report = await runOperationalCheck(f.config, f.deps);
     assert.equal(report.ok, false); assert.equal(report.admission.nano, false); assert.equal(report.admission.market, false);
+  }
+});
+
+test("a stale NEAR spot price leaves the fresh XNO capital checks and other lanes available", async t => {
+  for (const stale of ["near", "xno"]) {
+    const sources = Object.fromEntries(["near", "xno"].map(asset => [
+      `${asset}Usd`, { usable: true, live: true, at: new Date(NOW - (asset === stale ? 300_000 : 0)).toISOString() },
+    ]));
+    const f = fixture(({ url }) => url.pathname === "/rates"
+      ? Response.json({ quoting: false, nearUsd: "3", xnoUsd: "1", xnoRequired: true, sources }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const failed = report.checks.filter(c => !c.ok && c.domains?.length);
+    assert.deepEqual(failed, [{ stage: `exchange-rate-${stale}`, ok: false, code: "exchange-rate-stale",
+      domains: stale === "near" ? ["near"] : ["nano", "near", "usdc", "market"] }]);
+    assert.deepEqual(report.admission, { nano: stale === "near", near: false, usdc: stale === "near", market: stale === "near" });
+    assert.equal(report.checks.some(c => c.stage === "nano-liquidity" && c.ok), stale === "near");
   }
 });
 
@@ -2214,4 +2275,43 @@ test("a gap or invalid prior Nano telemetry starts a new comparison", t => {
   assert.equal(rebuilt.ok, true);
   assert.equal(rebuilt.nanoLedgerSync.unchangedSince, NOW + 23 * 60_000);
   assert.equal(rebuilt.nanoLedgerSync.peerMedianAtStart, "4600");
+});
+
+test("the monitor reports a widening Nano confirmation gap even while the owned node advances", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-slowdown-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const backlog = { stage: "nano-ledger-sync", ok: false, code: "nano-ledger-confirmations-behind", domains: [] };
+  const invocationId = "a".repeat(32);
+  const report = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [backlog],
+    NOW + minutes * 60_000, { invocationId, nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  const progress = value => value.checks.find(check => check.stage === "nano-ledger-confirmation-progress");
+  const initial = report(0, "1000", "9000");
+  assert.equal(progress(report(5, "1010", "9040")).ok, true, "one interval is not sustained lag");
+  const slowing = report(10, "1020", "9080");
+  assert.deepEqual(progress(slowing), { stage: "nano-ledger-confirmation-progress", ok: false,
+    code: "nano-ledger-confirmations-falling-behind", domains: [] });
+  assert.notEqual(slowing.incidentId, initial.incidentId);
+  assert.deepEqual(slowing.admission, { nano: true, near: true, usdc: true, market: true });
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, slowing, NOW + 10 * 60_000);
+  assert.match(alert.text, /nano-ledger-confirmations-falling-behind/);
+  assert.equal(report(15, "1030", "9100").incidentId, slowing.incidentId);
+  const catchingUp = report(20, "1080", "9110");
+  assert.equal(progress(catchingUp).ok, true);
+  assert.equal(catchingUp.ok, false, "the old absolute backlog remains visible");
+});
+
+test("Nano remote counter variation, missing samples and local regression are distinguished", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-regression-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [],
+    NOW + minutes * 60_000, { nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  report(0, "1000", "9000");
+  assert.equal(report(5, "1010", "9080").ok, true, "a single jump in the peer median is not sufficient");
+  assert.equal(report(10, "1020", "9085").ok, true, "a shrinking gap resets the trend");
+  assert.equal(report(25, "1030", "9210").ok, true, "a missing interval invalidates the prior baseline");
+  const regressed = report(30, "1029", "9200");
+  assert.equal(regressed.checks[0].code, "nano-ledger-local-confirmations-regressed");
+  assert.deepEqual(regressed.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.equal(report(35, "1029", "9205").ok, true, "the next sample starts from the new local counter");
 });
