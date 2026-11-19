@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { keccak256, toHex, decodeFunctionData } from 'viem';
-import { fixture, sdk, message, system, encodedLog, client, provider, evaluator, economics, contract, blockHash } from './fixtures.mjs';
+import { fixture, sdk, message, system, encodedLog, client, provider, evaluator, economics, offering, contract, blockHash } from './fixtures.mjs';
 import { createAcpSeller, validateEconomics } from '../../src/ecosystems/acp/seller.mjs';
 import { openAcpJournal } from '../../src/ecosystems/acp/journal.mjs';
 
@@ -209,6 +209,34 @@ test('spoof completion cannot earn revenue; evaluator rejection records loss exp
   assert.equal(r.state, 'rejected'); assert.equal(r.lossReviewRequired, true);
   assert.equal(r.evaluatorReceipt.releasedAtomic, '0'); assert.equal(r.evaluatorReceipt.profit, null);
   await f.restart(); assert.equal((await event(f)).state, 'rejected'); assert.equal(f.state.count.dispatch, 1);
+});
+
+test('malformed verified-job shapes fail closed on the funded path with zero effects', async t => {
+  const variants = {
+    status_string: { status: '1' }, status_missing: { status: undefined },
+    expiry_number: { expiredAt: 1804205400 }, budget_string: { budget: '1000000' },
+    no_provenance: { provenance: undefined }, no_events: { events: undefined },
+    events_not_array: { events: {} }, client_number: { client: 42 },
+  };
+  for (const [name, patch] of Object.entries(variants)) {
+    await t.test(name, async t => {
+      const f = await fixture(); t.after(() => f.close()); await funded(f);
+      const good = await f.readJob('7');
+      const badJob = { ...good, ...patch };
+      const counts = { reserve: 0, dispatch: 0 };
+      const seller = createAcpSeller({ enabled: true, mode: 'offline-qualification', sdk, journal: f.journal,
+        readJob: async () => badJob,
+        workflow: { quote: async () => { throw Error('unreachable'); },
+          recoverCall: async () => ({ name: offering.tool, arguments: { Idea: 'Ada' } }),
+          reserve: async () => { counts.reserve++; throw Error('unreachable'); },
+          dispatch: async () => { counts.dispatch++; throw Error('unreachable'); } },
+        offering, economics, now: () => f.state.now });
+      const r = await seller.handle(f.session, system('job.funded'));
+      assert.equal(r.state, 'review_required');
+      assert.deepEqual(counts, { reserve: 0, dispatch: 0 });
+      assert.equal(f.state.count.submit, 0);
+    });
+  }
 });
 
 test('journal exclusive lock, tampered proof binding, hook jobs and wrong chain fail closed', async t => {
