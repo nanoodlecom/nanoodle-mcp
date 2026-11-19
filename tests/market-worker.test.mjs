@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
-import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
+import { nanoGptMock, WORKED_CATALOGS, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner, checkNanoGptKey, isOperatorSideFailure } from "../src/market/runner.mjs";
@@ -32,14 +32,14 @@ before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
 /** A market, a state dir and a worker wired together. */
-async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null, maintenance = null, concurrency = 2, now = Date.now } = {}) {
+async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null, maintenance = null, concurrency = 2, now = Date.now, nanoGpt = nano } = {}) {
   const m = market || createMarketMock({ now });
   if (!market) await m.listen();
   const stateDir = dir || mkdtempSync(join(tmpdir(), "market-worker-"));
   const logs = [];
   const store = openMarketState({ dir: stateDir });
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
-  const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nano.url });
+  const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nanoGpt.url });
   const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, checkFee, maintenance, concurrency, now, log: (l) => logs.push(l) });
   const once = async () => { await worker.tick(); await worker.drain(); };
   return { m, store, worker, once, logs, stateDir, client, runner };
@@ -129,6 +129,60 @@ test("an older pending start cannot spend against a listing price above its escr
   } finally { r.store.close(); await r.m.close(); }
 });
 
+test("a model price increase after Market start is refused before any inference", async () => {
+  const catalogs = structuredClone(WORKED_CATALOGS);
+  const provider = nanoGptMock({ catalogs });
+  await provider.listen();
+  const r = await rig({ nanoGpt: provider });
+  try {
+    const idea = "the accepted idea";
+    const id = r.m.hire({ description: WORKED(idea) });
+    const price = r.runner.price;
+    const start = r.client.start;
+    let prices = 0;
+    r.runner.price = async (args, options) => {
+      ++prices;
+      assert.equal(args.inputs.Idea, idea);
+      assert.equal(options.budgetUsd, 0.5);
+      return price(args, options);
+    };
+    r.client.start = async (id) => {
+      const result = await start(id);
+      catalogs.image[0].pricing.per_image["1024x1024"] = 1;
+      r.m.rows.get(id).job.description = WORKED("an edited brief");
+      return result;
+    };
+    await r.once();
+    assert.equal(prices, 2);
+    assert.equal(provider.runs(), 0);
+    assert.equal(r.store.get(id).phase, "declined");
+    assert.equal(r.store.get(id).decline.code, "OVER_BUDGET");
+    assert.equal(r.m.rows.get(id).assignment.cancelReason, "failed");
+  } finally { r.store.close(); await r.m.close(); await provider.close(); }
+});
+
+test("an unavailable catalog after Market start delays inference until pricing recovers", async () => {
+  let timestamp = Date.now();
+  const r = await rig({ now: () => timestamp, backoffMs: 1000 });
+  try {
+    const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+    const price = r.runner.price;
+    let prices = 0;
+    r.runner.price = async (args, options) => {
+      if (++prices === 2) return { ok: false, refusals: [{ code: "CATALOG_UNAVAILABLE" }] };
+      return price(args, options);
+    };
+    await r.once();
+    assert.equal(r.store.get(id).phase, "started");
+    assert.equal(nano.runs(), before);
+    timestamp += 1001;
+    await r.once();
+    assert.equal(r.store.get(id).phase, "submitted");
+    assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+    assert.equal(nano.runs(), before + 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
 test("the worker rechecks the paid assignment after Market confirms start", async t => {
   const cases = [
     ["cancelled", (m, id) => m.cancel(id), "gone", undefined],
@@ -153,6 +207,31 @@ test("the worker rechecks the paid assignment after Market confirms start", asyn
         assert.equal(r.store.get(id).phase, phase);
         assert.equal(r.store.get(id).decline?.code, code);
         assert.equal(r.m.calls("POST", /\/submit$/).length, 0);
+      } finally { r.store.close(); await r.m.close(); }
+    });
+  }
+});
+
+test("the worker rechecks cancellation and escrow after the provider refresh and buyer updates", async t => {
+  for (const [name, update, phase, code] of [
+    ["cancelled during refresh", (m, id) => m.cancel(id), "gone", undefined],
+    ["escrow shrank during refresh", (m, id) => { m.rows.get(id).assignment.escrowAmount = "0.005"; }, "declined", "MARKET_ESCROW_TOO_LOW"],
+  ]) {
+    await t.test(name, async () => {
+      const r = await rig();
+      try {
+        const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+        const price = r.runner.price;
+        r.runner.price = async (args, options) => {
+          const priced = await price(args, options);
+          if (options.refreshCatalogs) update(r.m, id);
+          return priced;
+        };
+        await r.once();
+        assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+        assert.equal(nano.runs(), before);
+        assert.equal(r.store.get(id).phase, phase);
+        assert.equal(r.store.get(id).decline?.code, code);
       } finally { r.store.close(); await r.m.close(); }
     });
   }

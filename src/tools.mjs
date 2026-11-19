@@ -771,7 +771,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
     if (value instanceof MediaRef) {
       await mkdir(outDir, { recursive: true });
       // bytes() before naming: for hosted media the mime is only known after the fetch
-      const bytes = await value.bytes();
+      const bytes = await value.bytes(hostedRunOptions());
       const safeKey = o.key.replace(/[^\w.-]+/g, "_");
       const ext = extForMedia(bytes, value.mime);
       const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
@@ -910,7 +910,7 @@ export async function priceSavedWorkflow(graph, { inputs, baseUrl, fetch, log, c
  * @returns {Promise<{ read: object|null, safety: {ok, refusals}, pricing: object|null, catalogs: object }>}
  */
 export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
-  allowShortLinks = true, limits = DEFAULT_LIMITS, requireFreshCatalogs = false } = {}) {
+  allowShortLinks = true, limits = DEFAULT_LIMITS, requireFreshCatalogs = false, catalogMaxAgeMs } = {}) {
   let read;
   try {
     read = await readGraphArgs(args == null ? {} : args, { allowShortLinks, fetch, limits });
@@ -927,6 +927,7 @@ export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, lo
     fetch,
     log,
     requireFresh: requireFreshCatalogs,
+    maxAgeMs: catalogMaxAgeMs,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so price_noodle cannot price those nodes",
   });

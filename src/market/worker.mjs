@@ -39,7 +39,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { splitPlainBrief, resolveFields, parseBrief, BriefError } from "./brief.mjs";
+import { resolveJobBrief } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
 import { marketEscrowTerms } from "./catalog.mjs";
 import { marketDeliveryWindow } from "./deadline.mjs";
@@ -104,7 +104,7 @@ export function createMarketWorker({
   let priceNow = listingPriceUsd;
   const log = (line) => rawLog(logSafe(line));
   const inflight = new Map();
-  /** Priced requests from this process, by assignment id: { pricing, inputs } (the bound graph is not persisted). */
+  // Keep the accepted request in memory so pricing it again cannot replace the buyer's workflow.
   const prepared = new Map();
   const lastProgress = new Map();
   let active = 0;
@@ -188,51 +188,32 @@ export function createMarketWorker({
 
   /* ------------------------------ phases ------------------------------ */
 
-  async function priceFromRow(rec, row, jobBudget) {
-    let args;
-    let usedDefault = false;
-    let usedFields = [];
-    let fieldNotes = [];
-    try {
-      args = parseBrief(row.job && row.job.description);
-      if (!customWorkflows) {
-        log(`assignment ${short(rec.id)}: brief refused (CUSTOM_NOT_OFFERED)`);
-        return { decline: { reason: "rejected", code: "CUSTOM_NOT_OFFERED", detail: customNotOfferedDetail({ label: defaultWorkflow.label, customHandle }) } };
-      }
-    } catch (e) {
-      if (!(e instanceof BriefError)) throw e;
-      if (!customWorkflows && e.code !== "NO_REQUEST") {
-        // A workflow block that does not parse: the buyer meant a workflow, which this listing does not run.
-        log(`assignment ${short(rec.id)}: brief refused (CUSTOM_NOT_OFFERED, ${e.code})`);
-        return { decline: { reason: "rejected", code: "CUSTOM_NOT_OFFERED", detail: customNotOfferedDetail({ label: defaultWorkflow.label, customHandle }) } };
-      }
-      // A brief in plain words (no workflow block at all) runs the operator's default
-      // workflow, with the brief as its input. A block that is there but broken is still
-      // refused: the buyer meant a specific workflow, and guessing would spend their hire.
-      // "Name: value" lines set the workflow's other named inputs (a song's "Style: ...").
-      const split = splitPlainBrief((row.job && row.job.description) || "", (defaultWorkflow && defaultWorkflow.fieldNames) || []);
-      const plain = split.main || String((row.job && row.job.title) || "").trim();
-      if (!(defaultWorkflow && e.code === "NO_REQUEST" && plain)) {
-        log(`assignment ${short(rec.id)}: brief refused (${e.code})`);
-        return { decline: { reason: "rejected", code: e.code, detail: briefDeclineDetail(e.message) } };
-      }
-      // Typed fields (a song's Duration) are read, clamped and defaulted; the same job always gets the same default.
-      const resolved = resolveFields(split.fields, defaultWorkflow.fieldSpecs || {}, rec.id);
-      args = { graph: defaultWorkflow.graph, inputs: { ...resolved.inputs, [defaultWorkflow.inputName]: plain } };
-      usedDefault = true;
-      usedFields = resolved.set;
-      fieldNotes = resolved.notes;
-      log(`assignment ${short(rec.id)}: plain brief (${plain.length} characters${usedFields.length ? `; also set: ${usedFields.join(", ")}` : ""}) → default workflow ${JSON.stringify(defaultWorkflow.label)}`);
+  function requestFromRow(rec, row) {
+    const request = resolveJobBrief(row.job, rec.id, { defaultWorkflow, customWorkflows });
+    const { usedDefault, usedFields, briefLength } = request;
+    if (usedDefault) {
+      log(`assignment ${short(rec.id)}: plain brief (${briefLength} characters${usedFields.length ? `; also set: ${usedFields.join(", ")}` : ""}) → default workflow ${JSON.stringify(defaultWorkflow.label)}`);
     }
-    const priced = await runner.price(args, { budgetUsd: jobBudget });
+    return request;
+  }
+
+  async function priceRequest(rec, request, jobBudget, reason, { refreshCatalogs = false } = {}) {
+    if (request.code) {
+      log(`assignment ${short(rec.id)}: brief refused (${request.code})`);
+      const detail = request.code === "CUSTOM_NOT_OFFERED"
+        ? customNotOfferedDetail({ label: defaultWorkflow.label, customHandle })
+        : briefDeclineDetail(request.detail);
+      return { decline: { reason, code: request.code, detail } };
+    }
+    const priced = await runner.price(request.args, { budgetUsd: jobBudget, ...(refreshCatalogs && { refreshCatalogs }) });
     if (!priced.ok) {
       const transient = priced.refusals.some((r) => r.code === "CATALOG_UNAVAILABLE");
       if (transient) return { transient: new Error("the NanoGPT model catalog is unavailable") };
       const codes = [...new Set(priced.refusals.map((r) => r.code))];
       log(`assignment ${short(rec.id)}: workflow refused (${codes.join(", ")})`);
-      return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd: jobBudget }) } };
+      return { decline: { reason, code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd: jobBudget }) } };
     }
-    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault, usedFields, fieldNotes, x402: priced.x402 };
+    return priced;
   }
 
   async function phaseNew(rec, row) {
@@ -241,7 +222,8 @@ export function createMarketWorker({
     const quoted = useBidBudget && !!row.assignment.bidId;
     const jobBudget = quoted ? terms.budgetUsd : Math.min(budgetNow, terms.budgetUsd);
     if (quoted) log(`assignment ${short(rec.id)}: awarded from a bid at $${terms.priceUsd}; its budget is $${jobBudget}`);
-    const r = await priceFromRow(rec, row, jobBudget);
+    const request = requestFromRow(rec, row);
+    const r = await priceRequest(rec, request, jobBudget, "rejected");
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
     let creator = null;
@@ -256,11 +238,11 @@ export function createMarketWorker({
         return backoff(rec, new Error("Creator exchange rate is unavailable"));
       }
     }
-    prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault, usedFields: r.usedFields, fieldNotes: r.fieldNotes });
+    prepared.set(rec.id, request);
     log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, with 20% $${r.pricing.depositUsd}, within budget $${jobBudget}`);
     return set(rec.id, ok({
-      phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
-      defaultFields: r.usedDefault ? r.usedFields : [], defaultNotes: r.usedDefault ? r.fieldNotes : [],
+      phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: request.usedDefault ? defaultWorkflow.label : null,
+      defaultFields: request.usedFields, defaultNotes: request.fieldNotes,
       budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd, quoted,
       ...(creator ? { creator } : {}),
     }));
@@ -308,50 +290,64 @@ export function createMarketWorker({
     }
   }
 
-  async function phaseStarted(rec) {
-    // Start is idempotent and its response only carries a timestamp. Read back
-    // the assignment to catch cancellation or changed funding after the poll.
+  async function verifyStartedAssignment(rec) {
     const row = await lookup(rec.id);
     const assignment = row?.assignment;
-    if (!assignment?.status) return backoff(rec, new Error("Market assignment status could not be verified"));
-    if (assignment.status !== "in_progress") return finishGone(rec, assignment.status);
-    if (assignment.submittedAt || assignment.deliverableUrl) return finishGone(rec, "already delivered");
-    if (!Number.isFinite(Date.parse(assignment.startedAt))) {
-      return backoff(rec, new Error("Market assignment start could not be verified"));
+    if (!assignment?.status) return { stop: backoff(rec, new Error("Market assignment status could not be verified")) };
+    if (assignment.status !== "in_progress") return { stop: finishGone(rec, assignment.status) };
+    if (assignment.submittedAt || assignment.deliverableUrl) return { stop: finishGone(rec, "already delivered") };
+    const startedAt = Date.parse(assignment.startedAt);
+    if (!Number.isFinite(startedAt)) {
+      return { stop: backoff(rec, new Error("Market assignment start could not be verified")) };
     }
     const timing = marketDeliveryWindow(assignment);
-    const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
-    const { terms, stop } = checkEscrow(rec, row, "failed");
-    if (stop) return stop;
-    const jobBudget = Math.min(budgetOf(rec), terms.budgetUsd);
-    let prep = prepared.get(rec.id);
-    if (!prep) {
-      // Restarted between start and run: nothing ran yet. Price again from the brief,
-      // against the budget the job was accepted under.
-      const r = await priceFromRow(rec, row, jobBudget);
-      if (r.transient) return backoff(rec, r.transient);
-      if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
-      prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
-    }
+    const deadlineStop = deadlineRefusal(rec, timing);
+    if (deadlineStop) return { stop: deadlineStop };
+    return { row, timing, startedAt, ...checkEscrow(rec, row, "failed") };
+  }
+
+  async function phaseStarted(rec) {
+    // The idempotent start response only carries a timestamp. Verify the
+    // assignment and escrow before committing to a provider price.
+    const started = await verifyStartedAssignment(rec);
+    if (started.stop) return started.stop;
+    const { row, timing } = started;
+    const jobBudget = Math.min(budgetOf(rec), started.terms.budgetUsd);
+    if (rec.pricing?.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
+    // Use the current catalog within the accepted budget. On restart, recover the
+    // request from the assignment as before. Nothing has run at this point.
+    const request = prepared.get(rec.id) || requestFromRow(rec, row);
+    const prep = await priceRequest(rec, request, jobBudget, "failed", { refreshCatalogs: true });
+    if (prep.transient) return backoff(rec, prep.transient);
+    if (prep.decline) return set(rec.id, ok({ phase: "declining", decline: prep.decline }));
     if (prep.pricing.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
     const afterPricing = deadlineRefusal(rec, timing); if (afterPricing) return afterPricing;
-    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null, fields: prep.usedDefault ? prep.usedFields || [] : [], notes: prep.usedDefault ? prep.fieldNotes || [] : [] }), `nanoodle-start-${rec.id}`);
+    await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: request.usedDefault ? defaultWorkflow.label : null, fields: request.usedFields, notes: request.fieldNotes }), `nanoodle-start-${rec.id}`);
     await progress(rec.id, `Preparing the workflow (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
     const afterProgress = deadlineRefusal(rec, timing); if (afterProgress) return afterProgress;
     const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
-    const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
+    // Pricing and buyer updates can take time. Recheck the assignment and
+    // escrow before recording the durable claim that authorizes execution.
+    const current = await verifyStartedAssignment(rec);
+    if (current.stop) return current.stop;
+    if (current.startedAt !== started.startedAt) {
+      return backoff(rec, new Error("Market assignment start changed during preparation"));
+    }
+    const elapsed = deadlineRefusal(rec, timing); if (elapsed) return elapsed;
+    const finalBudget = Math.min(jobBudget, current.terms.budgetUsd);
+    if (prep.pricing.depositUsd > finalBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
+    const executionDeadlineAt = Math.min(timing.executionDeadlineAt, current.timing.executionDeadlineAt);
     prepared.delete(rec.id);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),
-      executionDeadlineAt: timing.executionDeadlineAt,
-      budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd,
-      ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), jobBudget) } }),
+      executionDeadlineAt, budgetUsd: finalBudget, listingPriceUsd: current.terms.priceUsd,
+      ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), finalBudget) } }),
     }));
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
     try {
       run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
-        fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt: timing.executionDeadlineAt,
+        fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt,
         onRunComplete(result) {
           if (!rec.creator || !creatorPayments) return;
           const empty = result.outputs.length > 0 && result.outputs.every(o => o.kind === "text" && !String(o.text || "").trim());

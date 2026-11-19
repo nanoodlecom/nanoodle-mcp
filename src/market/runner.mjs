@@ -88,18 +88,20 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
     /**
      * Check and price a request. Never runs anything, never throws for a bad graph.
      * @param {object} args
-     * @param {{ budgetUsd?: number }} [o]  the budget for this request (default: the runner's
+     * @param {{ budgetUsd?: number, refreshCatalogs?: boolean }} [o]  the budget for this request (default: the runner's
      *   budgetUsd). A worker whose listing price changes passes the budget a job was accepted under.
+     *   Request fresh catalog data after starting the assignment before dispatching inference.
      * @returns {Promise<{ ok: boolean, refusals: Array<{code,message}>, pricing: object|null, inputs: object }>}
      */
-    async price(args, { budgetUsd: cap } = {}) {
+    async price(args, { budgetUsd: cap, refreshCatalogs = false } = {}) {
       if (cap !== undefined && !(Number.isFinite(cap) && cap > 0)) throw new TypeError("price: budgetUsd must be a positive number");
       const budget = cap === undefined ? L.maxDepositUsd : cap;
       // The direct rails' deposit check is switched off; the market rule is applied below.
       const limits = { ...L, maxDepositUsd: Number.MAX_SAFE_INTEGER };
       let computed;
       try {
-        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits, requireFreshCatalogs: true });
+        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits, requireFreshCatalogs: true,
+          ...(refreshCatalogs && { catalogMaxAgeMs: 0 }) });
       } catch (e) {
         if (e instanceof GraphArgsError || e instanceof ParamsError) {
           return { ok: false, refusals: [{ code: "BAD_REQUEST", message: e.message }], pricing: null, inputs: {} };
@@ -167,7 +169,7 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
             const value = result.outputs[o.key];
             if (value === undefined) continue;
             if (value instanceof MediaRef) {
-              const bytes = Buffer.from(await value.bytes());
+              const bytes = Buffer.from(await value.bytes(hostedRunOptions()));
               const ext = extForMedia(bytes, value.mime);
               const safe = String(o.key).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "output";
               const filename = `${String(++n).padStart(2, "0")}-${safe}.${ext}`;
