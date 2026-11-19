@@ -796,17 +796,17 @@ export async function runOperationalCheck(config, deps = {}) {
     nearTools && checkSavedWorkflows(config.site, nearTools, ["near", "usdc"], heldNearAmounts),
     nanoTools && checkSavedWorkflows(config.nanoSite, nanoTools, ["nano"]),
   ]);
-  await check("custom-workflow-pricing", async () => {
-    const { graph, inputs } = checkGraph("readonly-operational-probe", true);
-    const charge = await freshCharge({ graph, inputs });
-    for (const asset of ["near", "usdc"]) {
+  const { graph, inputs } = checkGraph("readonly-operational-probe", true);
+  const customCharge = await check("custom-workflow-pricing", () => freshCharge({ graph, inputs }), ["near", "usdc"]);
+  if (customCharge !== null) for (const asset of ["near", "usdc"]) {
+    await check(`custom-workflow-pricing-${asset}`, async () => {
       const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph, inputs, _pay_with: asset } });
       const content = savedPricingContent(result);
-      need(parseUsdNano(content.pricing.deposit.usd) >= charge, "custom-workflow-deposit-too-low");
+      need(parseUsdNano(content.pricing.deposit.usd) >= customCharge, "custom-workflow-deposit-too-low");
       const denomination = previewDeposit(content, asset, config.network);
       await checkNearPreviewCapital(`workflow-nano-capital-${asset}-custom`, graph, content, denomination);
-    }
-  }, ["near", "usdc", "market"]);
+    }, [asset]);
+  }
   if (near) {
     if (config.canaryPayer) await check("near-canary-payer-funding", async () => {
       const { accountId, publicKey, maxNear } = config.canaryPayer;
