@@ -83,7 +83,9 @@ check(!!row.assignment.startedAt, "start was declared before the run");
 check(nano.runs() - runs0 === 1, "the workflow ran exactly once on NanoGPT");
 check(row.versions.length === 1 && row.versions[0].files.length === 1, "one version, with the generated image attached");
 check(market.calls("PUT", /^\/_storage\//).every((c) => !c.auth), "the presigned upload carried no Authorization header");
-check(row.messages.some((m) => /^Started\./.test(m.body)), "the buyer got a 'Started' message on the thread");
+const preparationNotices = row.messages.filter(({ body }) => /^Preparing your run\./.test(body));
+check(preparationNotices.length === 1 && preparationNotices[0].body.includes("Once funding is confirmed"),
+  "the buyer got one preparation notice explaining the funding check");
 const md = row.versions[0]?.markdown || "";
 const costPart = md.slice(md.indexOf("## What this job consumed"), md.indexOf("<details>"));
 console.log("    The buyer's deliverable (cost section):");

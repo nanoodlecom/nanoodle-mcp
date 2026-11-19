@@ -29,10 +29,11 @@ threshold together. The operational service's payer key file remains inaccessibl
 
 When the successful canary's discovery proof is configured, the five-minute
 probe also reads that run's settled payment page, status, event stream, and
-result. It compares the receipt with the saved deposit, charge, and refund.
-It reports a failure without including the checkout ID, receipt, or output
-in the alert. Once the checkout reaches its retention limit, its separate
-on-chain discovery check continues for the lifetime of the proof.
+result. It checks that the deposit equals the charge plus the refund, verifies
+the completed graph in the status and event stream, and expects a canary marker
+in the result. The alert omits the checkout ID, receipt, and output. At the
+checkout retention limit, the probe stops reporting a checkout result and
+continues on-chain discovery for the lifetime of the proof.
 
 ## Installation on the production box
 
@@ -258,7 +259,8 @@ Coverage:
   50 blocks over at least ten minutes warns even while both counts advance.
   The warning needs two increases and tolerates short plateaus between
   them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
-  clear the trend. Wallet read quorum determines Nano payment readiness.
+  clear the trend. The elapsed time comes from the counter observations.
+  Wallet read quorum determines Nano payment readiness.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the

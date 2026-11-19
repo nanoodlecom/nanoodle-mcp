@@ -181,6 +181,11 @@ function discoveryReadCanFailOver(method, params, error) {
   return method === "block" && typeof params?.block_id === "string" && error?.code === "UNKNOWN_BLOCK";
 }
 
+function isTransactionHistoryRead(method, params) {
+  return method === "tx" && typeof params?.tx_hash === "string"
+    && typeof params.sender_account_id === "string" && !Object.hasOwn(params, "signed_tx_base64");
+}
+
 /**
  * The same client over several endpoints, tried in order with failover.
  *
@@ -190,8 +195,10 @@ function discoveryReadCanFailOver(method, params, error) {
  *
  *  - A call moves to the next endpoint on transport or node-health failures.
  *    Unnamed server errors also allow failover on watcher and funding reads.
- *    A named answer such as "unknown transaction" is final for an ordinary lookup.
  *    An already discovered finalized receipt can use another peer's history.
+ *    Configured archival peers also allow an exact transaction lookup past a
+ *    regular peer's history miss. Archive lookups request the current outcome
+ *    immediately and require a FINAL response.
  *    Node-local discovery misses and missing historical hashes can fail over.
  *  - Once attempted, `send_tx` moves on only for RPC_HTTP. Preflight health
  *    failures may move on before any bytes are broadcast. Signed bytes are identical on
@@ -209,15 +216,18 @@ function discoveryReadCanFailOver(method, params, error) {
  *
  * Every endpoint is equally trusted for finality; list only ones you trust.
  */
-export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, minIntervalMs = 0, recheckMs = 30_000, maxHeadAgeMs = null, maxClockSkewMs = MAX_CLOCK_SKEW_MS, now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), log = () => {} } = {}) {
+export function createNearRpcPool({ urls, archiveUrls, chainId = null, fetch = globalThis.fetch, timeoutMs = 10_000, cooldownMs = 30_000, minIntervalMs = 0, recheckMs = 30_000, maxHeadAgeMs = null, maxClockSkewMs = MAX_CLOCK_SKEW_MS, now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), log = () => {} } = {}) {
   const list = parseRpcUrls(urls);
+  const archive = parseRpcUrls(archiveUrls).filter(url => !list.includes(url));
   if (!list.length) throw new TypeError("createNearRpcPool needs at least one url");
   if (!Number.isFinite(minIntervalMs) || minIntervalMs < 0 || minIntervalMs > 60_000) throw new TypeError("minIntervalMs must be between 0 and 60000");
   if (!Number.isSafeInteger(recheckMs) || recheckMs < 0 || recheckMs > 60_000) throw new TypeError("recheckMs must be between 0 and 60000");
   if (maxHeadAgeMs !== null && (!Number.isSafeInteger(maxHeadAgeMs) || maxHeadAgeMs <= 0)) throw new TypeError("maxHeadAgeMs must be a positive integer or null");
   if (!Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs < 0) throw new TypeError("maxClockSkewMs must be a nonnegative integer");
-  const eps = list.map((url) => ({ url, client: createNearRpc({ url, fetch, timeoutMs }), checkedAt: null, headAt: null,
-    checking: null, finalAnchor: null, finalChecking: null, wrongChain: false, downUntil: 0 }));
+  const endpoint = (url, archiveOnly) => ({ url, archiveOnly, client: createNearRpc({ url, fetch, timeoutMs }),
+    checkedAt: null, headAt: null, checking: null, finalAnchor: null, finalChecking: null, wrongChain: false, downUntil: 0 });
+  const primaryPeers = list.map(url => endpoint(url, false));
+  const archivePeers = archive.map(url => endpoint(url, true));
   const host = (url) => { try { return new URL(url).host; } catch { return "rpc"; } };
   let nextStart = 0;
   let latestFinal = null;
@@ -292,11 +302,14 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
   }
 
   async function call(method, params, opts) {
-    const usable = eps.filter((ep) => !ep.wrongChain);
-    if (!usable.length) throw new NearError("RPC_WRONG_NETWORK", `no NEAR RPC endpoint is on ${chainId}`);
+    const lookup = isTransactionHistoryRead(method, params);
+    const history = lookup || method === "EXPERIMENTAL_receipt_to_tx" || isAnchoredAccountChanges(method, params)
+      || (method === "block" && typeof params?.block_id === "string");
+    const usable = (history ? [...primaryPeers, ...archivePeers] : primaryPeers).filter(ep => !ep.wrongChain);
+    const archiveAvailable = lookup && usable.some(ep => ep.archiveOnly);
     const t = now();
-    const rested = usable.filter((ep) => ep.downUntil <= t);
-    const order = rested.length ? [...rested, ...usable.filter((ep) => ep.downUntil > t)] : usable;
+    const order = [...usable.filter(ep => ep.downUntil <= t), ...usable.filter(ep => ep.downUntil > t)];
+    if (!order.length) throw new NearError("RPC_WRONG_NETWORK", `no NEAR RPC endpoint is on ${chainId}`);
     let lastErr = null;
     for (const ep of order) {
       if (ep.wrongChain) continue;
@@ -306,15 +319,19 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
           await ensureChecked(ep);
           if (latestFinal && ep.finalAnchor !== latestFinal) await ensureFinalAnchor(ep);
         }
-        const result = await request(ep, method, params, opts, () => {
+        const archiveTx = ep.archiveOnly && lookup;
+        const result = await request(ep, method, archiveTx ? { ...params, wait_until: "NONE" } : params, opts, () => {
           if (method !== "status" && latestFinal && ep.finalAnchor !== latestFinal) {
             throw new NearError("RPC_STALE", "NEAR finalized checkpoint advanced before dispatch");
           }
           attempted = true;
         });
         if (method === "status") checkStatus(ep, result);
-        if (method === "tx" && opts?.receiptDiscovered === true && result.final_execution_status !== "FINAL") {
+        if ((archiveTx || method === "tx" && opts?.receiptDiscovered === true) && result.final_execution_status !== "FINAL") {
           throw new NearError("TX_NOT_FINAL", "NEAR RPC has no finalized outcome for the discovered transaction");
+        }
+        if (archiveTx && (result.transaction?.hash !== params.tx_hash || result.transaction?.signer_id !== params.sender_account_id)) {
+          throw new NearError("RPC_BAD_RESPONSE", "NEAR archive returned a different transaction or signer");
         }
         if (maxHeadAgeMs !== null && method === "block" && params?.finality) {
           assertFreshBlock(result, freshness());
@@ -338,7 +355,7 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
         return result;
       } catch (e) {
         if (e?.code === "RPC_WRONG_NETWORK" && ep.wrongChain) continue;
-        if (method === "tx" && attempted && opts?.receiptDiscovered === true
+        if (method === "tx" && attempted && (opts?.receiptDiscovered === true || archiveAvailable)
             && (e?.code === "UNKNOWN_TRANSACTION" || e?.code === "TIMEOUT_ERROR" || e?.code === "TX_NOT_FINAL")) {
           // This peer may lack the historical outcome while its live chain
           // reads remain healthy. A receipt is only a hint to keep looking.
@@ -354,7 +371,7 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
         ep.headAt = null;
         const status = e?.data?.status;
         const httpStatus = Number.isInteger(status) && status >= 100 && status <= 599 ? ` ${status}` : "";
-        if (ep.downUntil <= now() && eps.length > 1) log(`NEAR RPC ${host(ep.url)} failed (${e.code}${httpStatus}); trying the next endpoint`);
+        if (ep.downUntil <= now() && order.length > 1) log(`NEAR RPC ${host(ep.url)} failed (${e.code}${httpStatus}); trying the next endpoint`);
         ep.downUntil = now() + cooldownMs;
       }
     }
