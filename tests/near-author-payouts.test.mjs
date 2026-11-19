@@ -85,6 +85,39 @@ test("restored NEAR and Market creator payouts with mismatched evidence stay hel
   }
 });
 
+test("a standby quota deferral retains the signed creator payout without increasing its retry count", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "near-author-standby-")), file = join(dir, "state.json");
+  t.after(() => rm(dir, { recursive: true }));
+  let now = 1_000_000, quotaAvailable = false, calls = 0;
+  const paymentId = "market_standby-deferral", prepared = { hash: "B".repeat(64) };
+  const ops = { async transferOnce(_to, _raw, terms) {
+    calls++;
+    if (calls === 1) terms.onPrepared(prepared);
+    else assert.deepEqual(terms.prepared, prepared);
+    if (!quotaAvailable) throw Object.assign(Error("fixture standby budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+    return prepared.hash;
+  } };
+  const open = () => {
+    const ledger = openNearLedger({ file, network: "testnet", merchant: M });
+    return { ledger, payouts: createAuthorPayouts({ ledger, ops, now: () => now, schedule: () => null }) };
+  };
+  const { payouts, ledger } = open();
+  payouts.enqueue({ paymentId, to: AUTHOR, amountRaw: "100" });
+  await payouts.tick();
+  const deferred = ledger.getPayout(paymentId);
+  assert.equal(deferred.status, "signed");
+  assert.equal(deferred.attempts, 0);
+  assert.equal(deferred.nextAttemptAt, now + 60_000);
+  const restarted = open();
+  await restarted.payouts.tick();
+  assert.equal(calls, 1);
+  now += 60_000;
+  quotaAvailable = true;
+  await restarted.payouts.tick();
+  assert.equal(restarted.ledger.getPayout(paymentId).txHash, prepared.hash);
+  assert.equal(calls, 2);
+});
+
 test("a replayed USDC receipt cannot show a wrong-asset refund or mismatched creator payout as sent", async () => {
   const w = await world(), { p, pay } = await quoteAndPay(w, "usdc");
   await pay();

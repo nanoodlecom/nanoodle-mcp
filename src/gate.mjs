@@ -44,6 +44,7 @@ import { isNanoHistoryHash, isNanoHistoryHeight, NANO_LATE_WATCH_MS, NANO_PAYMEN
   NANO_RECEIVABLE_COUNT as RECEIVABLE_COUNT, NANO_HISTORY_PAGE as HISTORY_PAGE,
   checkedAnchoredNanoHistory, nanoHistoryKind, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
 import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-journal.mjs";
+import { NANO_STANDBY_BUDGET_MS } from "./nano-read-pool.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
@@ -418,12 +419,14 @@ export function createChargeGate({
         }
         return await completeOwed(o);
       } catch (e) {
-        if (!o.confirmedHash && o.tries >= OWED_MAX_TRIES) {
+        const deferred = e?.code === "NANO_RPC_STANDBY_BUDGET";
+        if (deferred && retry) o.tries--;
+        if (!deferred && !o.confirmedHash && o.tries >= OWED_MAX_TRIES) {
           o.held = true;
           o.at = Infinity;
           log(`Nano ${o.event} requires reconciliation after ${o.tries} retries`);
         } else {
-          o.at = now() + OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)];
+          o.at = now() + (deferred ? NANO_STANDBY_BUDGET_MS : OWED_BACKOFF_MS[Math.min(o.tries, OWED_BACKOFF_MS.length - 1)]);
           log(`Nano ${o.event} queued after unsuccessful attempt: ${e.message}`);
         }
         if (!retry || o.held) usage(o.event, { ...o.fields, ok: false, to: o.to, amountRaw: o.amountRaw,
@@ -827,10 +830,10 @@ export function createChargeGate({
     return floor;
   }
 
-  async function readHistoryPage(head, raw, height = null) {
+  async function readHistoryPage(head, raw, { height = null, existingPayments = false } = {}) {
     const request = { action: "account_history", account: address, count: String(HISTORY_PAGE),
       ...(head && { head }), ...(raw && { raw: "true" }) };
-    const page = await ops.rpc(request);
+    const page = await ops.rpc(request, undefined, existingPayments ? { existingPaymentHistory: true } : undefined);
     if (raw) {
       const proved = checkedAnchoredNanoHistory(page, request, checkAddress, height);
       return { entries: proved.history, next: proved.previous };
@@ -862,12 +865,12 @@ export function createChargeGate({
     return blocks && typeof blocks === "object" ? Object.entries(blocks) : [];
   }
 
-  async function readPaymentWindow({ existingPayments = false } = {}) {
+  async function readPaymentWindow({ existingPayments = false, historyHead = null, historyHeight = null } = {}) {
     if (verifyPaymentReads && ops.readPaymentWindow) {
       try {
-        const { receivable, history } = await ops.readPaymentWindow();
+        const { receivable, history } = await ops.readPaymentWindow({ existingPayments, historyHead, historyHeight });
         return { blocks: receivableBlocks(receivable), history: history && {
-          anchored: true, latest: { entries: history.history, next: history.previous },
+          anchored: true, page: { entries: history.history, next: history.previous },
         } };
       } catch (error) {
         // Keep finding already-issued payments when the standby has enough
@@ -880,14 +883,15 @@ export function createChargeGate({
     return { blocks: receivableBlocks(receivable), history: null };
   }
 
-  async function readLatestHistory() {
+  async function readLatestHistory({ existingPayments = false } = {}) {
     const anchor = ops.checkpoint?.()?.confirmed;
     const anchored = isNanoHistoryHash(anchor?.hash);
     if (verifyPaymentReads && (!anchored || !isNanoHistoryHeight(anchor.blockCount))) {
       throw new Error("Nano payment history lacks a confirmed checkpoint");
     }
-    const latest = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored, anchored ? anchor.blockCount : null);
-    return { anchored, latest };
+    const page = await readHistoryPage(anchored ? anchor.hash.toUpperCase() : null, anchored,
+      { height: anchored ? anchor.blockCount : null, existingPayments });
+    return { anchored, page };
   }
 
   function recordPaymentRead(ready, sequence) {
@@ -951,16 +955,34 @@ export function createChargeGate({
   /** Pocketed payments disappear from receivable. Inspect the latest page for
    * quick confirmation, while a fixed backfill resumes older pages across
    * ticks and restarts until it reaches the last completed checkpoint. */
-  async function scanHistory(startedAt, fullReceivableWindow, history) {
+  async function scanHistory(startedAt, fullReceivableWindow, history, historyHead) {
     const prior = historyScan;
-    const { anchored, latest } = history ?? await readLatestHistory();
     const replay = prior.backfill;
     const batch = replay ? { ...replay } : { newest: null, next: null, startedAt, fullReceivableWindow };
+    delete batch.quotaDeferred;
     const floor = prior.through === null ? initialHistoryFloor() : null;
-    if (replay) inspectHistory(latest.entries, replay.newest || prior.through, floor);
+    const readOrDefer = async read => {
+      try { return await read(); }
+      catch (error) {
+        if (error?.code === "NANO_RPC_STANDBY_BUDGET" && batch.next) {
+          await saveHistory({ ...prior, backfill: { ...batch, quotaDeferred: true } });
+        }
+        throw error;
+      }
+    };
+    const { anchored, page: first } = history ?? await readOrDefer(async () => historyHead
+      ? { anchored: true, page: await readHistoryPage(historyHead, true, { height: batch.nextHeight ?? null, existingPayments: true }) }
+      : readLatestHistory({ existingPayments: true }));
+    let firstPage = first;
+    if (replay && !historyHead) {
+      inspectHistory(first.entries, replay.newest || prior.through, floor);
+      firstPage = null;
+    }
 
-    for (let used = replay ? 1 : 0; used < HISTORY_MAX_PAGES; used++) {
-      const page = batch.next ? await readHistoryPage(batch.next, anchored) : latest;
+    for (let used = firstPage ? 0 : 1; used < HISTORY_MAX_PAGES; used++) {
+      const page = firstPage ?? await readOrDefer(() => readHistoryPage(batch.next, anchored,
+        { height: batch.nextHeight ?? null, existingPayments: true }));
+      firstPage = null;
       // A completed cursor must still be visible if an older release resumes
       // with the default history mode, which skips change and epoch blocks.
       batch.newest ??= page.entries.find(entry => ["send", "receive", "open"].includes(nanoHistoryKind(entry)))?.hash ?? null;
@@ -973,6 +995,13 @@ export function createChargeGate({
         return saveHistory({ through, coveredAt, backfill: null });
       }
       batch.next = page.next;
+      if (anchored) {
+        batch.nextHeight = (BigInt(page.entries.at(-1).height) - 1n).toString();
+        batch.advancedAt = Math.max(batch.advancedAt ?? batch.startedAt, now());
+      } else {
+        delete batch.nextHeight;
+        delete batch.advancedAt;
+      }
     }
     await saveHistory({ ...prior, backfill: batch });
   }
@@ -989,8 +1018,10 @@ export function createChargeGate({
     if (!anyPaymentWatchable()) return;
     const startedAt = now();
     const sequence = ++paymentReadSequence;
+    const replay = historyScan.backfill?.quotaDeferred ? historyScan.backfill : null;
+    const historyHead = replay?.next ?? null;
     try {
-      const { blocks, history } = await readPaymentWindow({ existingPayments: true });
+      const { blocks, history } = await readPaymentWindow({ existingPayments: true, historyHead, historyHeight: replay?.nextHeight ?? null });
       for (const [hash, v] of blocks) {
         const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
         const source = typeof v === "object" && v !== null ? v.source : null;
@@ -1004,8 +1035,8 @@ export function createChargeGate({
         ops.pocket().catch(() => {}); // best-effort; the next tick retries
       }
       if (anyPaymentWatchable()) {
-        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT, history);
-        recordPaymentRead(true, sequence);
+        await scanHistory(startedAt, blocks.length >= RECEIVABLE_COUNT, history, historyHead);
+        if (!historyHead) recordPaymentRead(true, sequence);
       }
     } catch (error) {
       recordPaymentRead(false, sequence);

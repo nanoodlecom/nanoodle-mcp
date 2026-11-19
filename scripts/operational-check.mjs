@@ -33,7 +33,7 @@ import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
-import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
+import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
@@ -151,6 +151,14 @@ function nanoCementationProgress(current, previous, now) {
 function currentNanoPaymentPeers(rows) {
   const { current, latestConfirmed } = qualifyNanoAccountViews(rows);
   return current.filter(row => row.paymentReads && row.view.confirmedHeight === latestConfirmed.confirmedHeight);
+}
+
+async function readDiscoveryStep(step, read) {
+  try { return await read(); }
+  catch (error) {
+    if (error?.code === "RPC_TIMEOUT") throw new CheckError(`near-discovery-${step}-timeout`);
+    throw error;
+  }
 }
 
 function backupVerificationProof(file, read, now, stage) {
@@ -409,6 +417,12 @@ export async function runOperationalCheck(config, deps = {}) {
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
       && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
     need(Number.isSafeInteger(rpc.lastReadAt) && now() - rpc.lastReadAt <= 60_000 && now() - rpc.lastReadAt >= -30_000, "nano-read-guard-stale");
+    if (rpc.fundingEvidenceExpiresAt !== undefined) {
+      const expiresAt = rpc.fundingEvidenceExpiresAt;
+      need(config.nanoStandby && rpc.standby?.inUse === true && Number.isSafeInteger(expiresAt)
+        && expiresAt > now() && expiresAt > rpc.lastReadAt && expiresAt - rpc.lastReadAt <= NANO_FUNDING_EVIDENCE_MS,
+      "nano-read-guard-stale");
+    }
     let checkpoint;
     try { checkpoint = selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
@@ -427,7 +441,8 @@ export async function runOperationalCheck(config, deps = {}) {
       if (inUse) standbyCheckpoint = checkpoint.confirmed;
     }
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
-    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingPause: pause?.recoveredAt != null ? pause : null };
+    return { availableRaw, checkedAt, checkpoint, coldPaymentScanRequests, fundingEvidenceExpiresAt: rpc.fundingEvidenceExpiresAt,
+      fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
@@ -577,9 +592,12 @@ export async function runOperationalCheck(config, deps = {}) {
     const { history, waiting } = nanoWatchDemand(ledger, at);
     if (!waiting.length) return;
     if (ledger.historyScan !== undefined) {
-      need(history.coveredAt === null || history.coveredAt <= at + 30_000, "nano-payment-coverage-invalid");
-      need(history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS, "nano-payment-coverage-stale");
-      return;
+      const advancedAt = history.backfill?.advancedAt;
+      need((history.coveredAt === null || history.coveredAt <= at + 30_000)
+        && (advancedAt === undefined || advancedAt <= at + 30_000), "nano-payment-coverage-invalid");
+      if (history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS) return;
+      if (advancedAt === undefined) throw new CheckError("nano-payment-coverage-stale");
+      throw new CheckError(at - advancedAt > NANO_SCAN_GRACE_MS ? "nano-history-backfill-stalled" : "nano-history-backfill-in-progress");
     }
     need(nano, "nano-payment-observation-unavailable");
     const observed = await check("nano-legacy-payment-observation", async () => {
@@ -669,18 +687,18 @@ export async function runOperationalCheck(config, deps = {}) {
       const { paymentTx, payer } = sample;
       const accounts = [config.merchant, USDC_CONTRACTS[config.network]];
       const witnessed = await Promise.all(nearNodes.map(({ index, rpc, identity }) => check(`near-discovery-peer-${index}`, async () => {
-        const tx = await rpc.txStatus({ txHash: paymentTx, senderId: payer });
+        const tx = await readDiscoveryStep("transaction", () => rpc.txStatus({ txHash: paymentTx, senderId: payer }));
         const receipt = Array.isArray(tx.receipts_outcome)
           && tx.receipts_outcome.find(row => row.outcome?.executor_id === config.merchant);
         need(tx.final_execution_status === "FINAL" && Object.hasOwn(tx.status ?? {}, "SuccessValue")
           && tx.transaction?.hash === paymentTx && tx.transaction.signer_id === payer && tx.transaction.receiver_id === config.merchant
           && typeof receipt?.id === "string" && typeof receipt.block_hash === "string"
           && Object.hasOwn(receipt.outcome.status ?? {}, "SuccessValue"), "near-discovery-canary-transaction-unverified");
-        const block = nearBlockIdentity(await rpc.block({ blockId: receipt.block_hash }));
+        const block = nearBlockIdentity(await readDiscoveryStep("block", () => rpc.block({ blockId: receipt.block_hash })));
         need(block.hash === receipt.block_hash && block.height <= identity.height, "near-discovery-canary-block-mismatch");
-        const ids = await readNearPaymentReceipts(rpc, block.hash, accounts);
+        const ids = await readDiscoveryStep("account-changes", () => readNearPaymentReceipts(rpc, block.hash, accounts));
         need(ids.has(receipt.id), "near-discovery-canary-receipt-missing");
-        const resolved = await readNearReceiptTransaction(rpc, receipt.id, block.height);
+        const resolved = await readDiscoveryStep("receipt-lookup", () => readNearReceiptTransaction(rpc, receipt.id, block.height));
         need(resolved.transaction_hash === paymentTx && resolved.sender_account_id === payer, "near-discovery-canary-receipt-mismatch");
         return true;
       }, [])));
@@ -1061,7 +1079,11 @@ export async function runOperationalCheck(config, deps = {}) {
       await checkUsdRunCapital(`workflow-nano-capital-market-${agent.handle}`, needUsd, Boolean(authorAddress(agent.defaultWorkflow.graph.x402)));
     }, ["market"]);
   }));
-  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), now(),
+  const finishedAt = now();
+  if (runtimeFunding?.fundingEvidenceExpiresAt !== undefined) await check("nano-funding-evidence-freshness", () => {
+    need(runtimeFunding.fundingEvidenceExpiresAt > finishedAt, "nano-read-guard-stale");
+  });
+  return finishOperationalReport(config.stateDir, checks.sort((a, b) => a.stage.localeCompare(b.stage)), finishedAt,
     { fundingPause: runtimeFunding?.fundingPause, nearBackfilling: watcherHealth?.backfilling, nanoLedgerSync, invocationId: config.invocationId });
 }
 

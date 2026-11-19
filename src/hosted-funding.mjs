@@ -5,6 +5,8 @@ import { nanoFundingLiabilities, nearCreatorLiabilities, marketCreatorLiabilitie
 import { creatorNanoTransferClaims, gateNanoTransferClaims, hasOtherNanoTransferClaim } from "./nano-transfer-journal.mjs";
 import { marketCreatorPayoutTerms, sameCreatorPayout } from "./creator-payout-evidence.mjs";
 
+const MAX_READY_AGE_MS = 60_000;
+
 function read(file) {
   try { return JSON.parse(readFileSync(file, "utf8")); }
   catch (error) { if (error.code === "ENOENT") return null; throw Error("funding-state-unreadable", { cause: error }); }
@@ -24,7 +26,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
     return value;
   }
   let nanoLive = null, nanoTransfersLive = null, nearLive = null, payoutsLive = null;
-  let quoteReady = false, storageReady = true, readyAt = null;
+  let quoteReady = false, storageReady = true, readyAt = null, readyForMs = 0;
   const marketLive = new Map();
   function nanoDisk() {
     const s = readState(nanoFile);
@@ -67,12 +69,16 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
       // Expire even when the refresh task is stuck on the wallet queue. Use a
       // monotonic clock so wall-clock changes cannot extend a healthy lease.
       const age = now() - readyAt;
-      if (!Number.isFinite(age) || age < 0 || age >= 60_000) {
+      if (!Number.isFinite(age) || age < 0 || age >= readyForMs) {
         quoteReady = false; readyAt = null;
       }
       return quoteReady;
     },
-    setReady(value) { quoteReady = storageReady && value === true; readyAt = quoteReady ? now() : null; },
+    setReady(value, maxAgeMs = MAX_READY_AGE_MS) {
+      quoteReady = storageReady && value === true && Number.isFinite(maxAgeMs) && maxAgeMs > 0;
+      readyForMs = quoteReady ? Math.min(maxAgeMs, MAX_READY_AGE_MS) : 0;
+      readyAt = quoteReady ? now() : null;
+    },
     setStorageReady(value) { storageReady = value === true; if (!storageReady) { quoteReady = false; readyAt = null; } },
     registerNano(reader, transfers) { nanoLive = reader; nanoTransfersLive = transfers; },
     registerNear(reader, payouts) { nearLive = reader; payoutsLive = payouts; },

@@ -2,6 +2,7 @@
 import { authorAddress } from "./wallet.mjs";
 import { nanoCreatorTransferId } from "./nano-transfer-journal.mjs";
 import { sameCreatorPayout } from "./creator-payout-evidence.mjs";
+import { NANO_STANDBY_BUDGET_MS } from "./nano-read-pool.mjs";
 
 // Convert only the fee actually collected, after model costs and the deposit cap.
 // usdNano and xnoUsdNano share the same scale, so it cancels without rounding USD.
@@ -53,11 +54,12 @@ export function createAuthorPayouts({ ledger, ops, maintenance = null, now = Dat
       });
       ledger.updatePayout(rec.paymentId, { status: "sent", txHash: hash, sentAt: now(), nextAttemptAt: null });
       try { usage("author_payout", { rail: "near", paymentId: rec.paymentId, to: rec.to, amountRaw: rec.amountRaw, hash, ok: true }); } catch { /* money is already journaled */ }
-    } catch {
+    } catch (error) {
       // Keep signed bytes even when the publish response was lost. A retry can
       // only republish that block, or replace a provably confirmed losing fork.
-      const attempts = (rec.attempts || 0) + 1;
-      const delay = backoffMs[Math.min(attempts - 1, backoffMs.length - 1)];
+      const deferred = error?.code === "NANO_RPC_STANDBY_BUDGET";
+      const attempts = (rec.attempts || 0) + Number(!deferred);
+      const delay = deferred ? NANO_STANDBY_BUDGET_MS : backoffMs[Math.min(attempts - 1, backoffMs.length - 1)];
       ledger.updatePayout(rec.paymentId, { attempts, nextAttemptAt: now() + delay });
       log(`Nano creator payout pending for payment ${rec.paymentId}; retrying in ${delay / 1000}s`);
       schedule(() => { tick().catch(() => {}); }, delay);
