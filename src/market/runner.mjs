@@ -137,13 +137,14 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
      * @throws on a failed run (message from describeRunFailure; `buyerMessage` is set only
    *   when the message is the provider's per-step errors, safe to show the buyer)
      */
-    async run({ pricing, inputs, outDir, fundingId, creator = false, onRunComplete = null, executionDeadlineAt = null }) {
+    async run({ pricing, inputs, outDir, fundingId, creator = false, beforeInference = null, onRunComplete = null, executionDeadlineAt = null }) {
       if (executionDeadlineAt !== null && !Number.isSafeInteger(executionDeadlineAt)) throw new TypeError("Invalid Market execution deadline");
       const remaining = executionDeadlineAt === null ? executionLimit : executionDeadlineAt - Date.now();
       if (remaining < 1) {
         throw Object.assign(Error("The Market execution deadline passed before the work began"), { code: "MARKET_SLA_TOO_CLOSE" });
       }
       return withHostedRun(async () => {
+        if (beforeInference !== null && typeof beforeInference !== "function") throw new TypeError("beforeInference must be a function or null");
         if (onRunComplete !== null && typeof onRunComplete !== "function") throw new TypeError("onRunComplete must be a function or null");
         const { wf, inputs: resolved } = await prepareRunNoodle(
           { graph: pricing.boundGraph, inputs },
@@ -151,6 +152,10 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
         );
         const { onProgress, notices } = runNotices(wf);
         const execute = async () => {
+          if (beforeInference) {
+            hostedRunOptions(); // A slow funding reservation can outlast the execution window.
+            await beforeInference();
+          }
           let result;
           try {
             result = await wf.run(resolved, hostedRunOptions({ onProgress }));
