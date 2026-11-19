@@ -110,6 +110,11 @@ class McpClient:
         except TimeoutError as exc:
             raise McpError("the Nanoodle endpoint timed out") from exc
         except Exception as exc:  # connection errors etc. — sanitise, don't leak
+            # urllib wraps socket timeouts in URLError(reason=TimeoutError);
+            # classify those as timeouts, not as unreachability.
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
+                raise McpError("the Nanoodle endpoint timed out") from exc
             raise McpError(
                 f"the Nanoodle endpoint could not be reached ({type(exc).__name__})"
             ) from exc

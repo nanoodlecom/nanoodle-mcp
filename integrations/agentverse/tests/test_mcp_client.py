@@ -121,6 +121,19 @@ def test_transport_timeout_becomes_mcp_error():
         client.call_tool("w", {})
 
 
+def test_urllib_wrapped_timeout_classified_as_timeout():
+    import socket
+    import urllib.error
+
+    def handler(payload):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    client, _ = make_client(handler)
+    with pytest.raises(McpError) as excinfo:
+        client.call_tool("w", {})
+    assert "timed out" in str(excinfo.value)
+
+
 def test_extract_media_urls_filters():
     text = "see https://nanoodle.com/guide and https://h.example/out/a.mp4."
     assert extract_media_urls(text) == ["https://h.example/out/a.mp4"]
