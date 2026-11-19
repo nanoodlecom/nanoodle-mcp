@@ -112,6 +112,13 @@ This check reports that as a failure. Finish paid checks before restarting the
 app, and inspect the retained original result and on-chain receipt before
 archiving an interrupted manual check.
 
+The five-minute read-only check reports the retained canary's checkout page,
+receipt, graph, event stream and result separately. It can report a missing
+result even when the graph or event stream is also missing. Each receipt is
+checked against the local deposit, charge and refund records, and the
+readable copies must agree. These checks use the existing canary data and
+leave payment admission to the funding and watcher checks.
+
 ## Babel failure alerts
 
 The same durable outbox also recognizes the manual `nanoodle-backup.service`

@@ -2055,13 +2055,21 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
   const paymentTx = base58Encode(Buffer.alloc(32, 3)), refundTx = base58Encode(Buffer.alloc(32, 4));
   const marker = "3afd12ab9de1a228", lostOutput = "The result text was not retained across a server restart; the run is not repeated.";
   const checkoutPaths = [`/pay/${id}`, `/near/status/${id}`, `/near/watch/${id}`, `/near/result/${id}`];
-  for (const [scenario, code] of [
-    ["complete", null], ["older-marker", null], ["receipt-only", "near-settled-payment-result-invalid"],
-    ["page", "near-settled-payment-page-invalid"],
-    ["status", "near-settled-payment-receipt-invalid"], ["unbalanced", "near-settled-payment-receipt-invalid"],
-    ["stream", "near-settled-payment-stream-invalid"], ["result", "near-settled-payment-result-invalid"],
-    ["different-graph", "near-settled-payment-stream-invalid"], ["missing-graph", "near-settled-payment-workflow-missing"],
-    ["pruned", null], ["missing", "near-checkout-canary-record-invalid"],
+  const checkout = "near-settled-checkout", page = "near-settled-payment-page", graph = "near-settled-payment-workflow";
+  const stream = "near-settled-payment-stream", result = "near-settled-payment-result";
+  const stages = [checkout, page, graph, stream, result].sort();
+  const invalidReceipt = "near-settled-payment-receipt-invalid", invalidStream = "near-settled-payment-stream-invalid";
+  const invalidResult = "near-settled-payment-result-invalid", missingGraph = "near-settled-payment-workflow-missing";
+  const missingOutput = "near-settled-payment-output-unavailable";
+  for (const [scenario, errors] of [
+    ["complete", {}], ["older-marker", {}], ["receipt-only", { [result]: missingOutput }],
+    ["page", { [page]: "near-settled-payment-page-invalid" }],
+    ["status", { [checkout]: invalidReceipt }], ["unbalanced", { [checkout]: invalidReceipt, [stream]: invalidStream, [result]: invalidResult }],
+    ["status-outage", { [checkout]: "http-503", [graph]: "http-503" }],
+    ["stream", { [stream]: invalidStream }], ["result", { [result]: invalidResult }],
+    ["different-graph", { [stream]: invalidStream }], ["missing-graph", { [graph]: missingGraph, [stream]: invalidStream }],
+    ["missing-graph-and-output", { [graph]: missingGraph, [stream]: invalidStream, [result]: missingOutput }],
+    ["pruned", {}], ["missing", {}],
   ]) {
     const charged = scenario === "unbalanced" ? "21" : "20";
     const receipt = { rail: "near", network: "mainnet", paymentId: id, outcome: "succeeded",
@@ -2069,7 +2077,7 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
       refund: { status: "sent", txHash: refundTx, yocto: "80", to: payer } };
     const workflow = { v: 1, status: "succeeded", nodes: [{ id: "extract", status: "done" }], links: [] };
     const view = { paymentId: id, status: "settled", done: true, receipt,
-      ...(scenario !== "missing-graph" && { workflow }) };
+      ...(!["missing-graph", "missing-graph-and-output"].includes(scenario) && { workflow }) };
     const f = fixture(({ url, init, body }) => {
       if (url.hostname.startsWith("near-") && body?.method === "tx") {
         return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32000, cause: { name: "UNKNOWN_TRANSACTION" } } });
@@ -2080,14 +2088,18 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
       if (url.pathname.startsWith("/pay/")) return new Response(scenario === "page"
         ? "<h1>Wrong page</h1>" : '<div id="near-payment"><div id="pay-result"></div></div>',
       { headers: { "content-type": "text/html" } });
-      if (url.pathname.startsWith("/near/status/")) return Response.json(scenario === "status" ? { ...view, receipt: null } : view);
+      if (url.pathname.startsWith("/near/status/")) {
+        if (scenario === "status-outage") return new Response(null, { status: 503 });
+        return Response.json(scenario === "status" ? { ...view, receipt: null } : view);
+      }
       if (url.pathname.startsWith("/near/watch/")) {
         assert.equal(url.search, "?run=1");
         const frame = scenario === "stream" ? { ...view, done: false } : view;
         const streamView = scenario === "different-graph" ? { ...frame, workflow: { ...workflow, links: [1] } } : frame;
         return new Response(`event: status\ndata: ${JSON.stringify(streamView)}\n\n`, { headers: { "content-type": "text/event-stream" } });
       }
-      const text = scenario === "receipt-only" ? lostOutput : scenario === "older-marker" ? `NANOODLE_OK:${marker}` : marker;
+      const text = ["receipt-only", "missing-graph-and-output"].includes(scenario) ? lostOutput
+        : scenario === "older-marker" ? `NANOODLE_OK:${marker}` : marker;
       return Response.json(scenario === "result" ? { status: "settled" } : {
         content: [{ type: "text", text }, { type: "text", text: "PRIVATE_RECEIPT_TEXT" }], structuredContent: { receipt },
       }, { status: scenario === "result" ? 202 : 200 });
@@ -2095,6 +2107,7 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
     t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
     f.config.canaryPayer = { accountId: payer, maxNear: "0.01", publicKey: "ed25519:private-canary-key" };
     f.config.nearDiscoveryReport = "/discovery/latest.json";
+    f.config.invocationId = ID.replaceAll("-", "");
     f.states[f.config.nearDiscoveryReport] = { v: 1, paymentTx, checkedAt: new Date(NOW - 60_000).toISOString() };
     const ledger = f.states[join(f.config.outDir, "near-state.json")];
     const finishedAt = NOW - (scenario === "pruned" ? SETTLED_NEAR_QUOTE_RETENTION_MS + 1 : 120_000);
@@ -2106,19 +2119,25 @@ test("the monitor verifies the completed canary checkout with read-only, redacte
       status: "sent", txHash: refundTx, sentAt: finishedAt } };
     const report = await runOperationalCheck(f.config, f.deps);
     const proof = report.checks.find(({ stage }) => stage === "near-settled-checkout-proof");
-    const row = report.checks.find(({ stage }) => stage === "near-settled-checkout");
+    const observed = report.checks.filter(({ stage }) => stages.includes(stage));
     assert.equal(proof?.ok, scenario !== "missing", scenario);
-    if (scenario === "missing") assert.equal(proof.code, code);
-    if (["pruned", "missing"].includes(scenario)) assert.equal(row, undefined);
+    if (scenario === "missing") assert.equal(proof.code, "near-checkout-canary-record-invalid");
+    if (["pruned", "missing"].includes(scenario)) assert.deepEqual(observed, []);
     else {
-      assert.equal(row?.code ?? null, code, scenario);
-      assert.equal(row?.ok, code === null, scenario);
-      assert.deepEqual(row?.domains, code ? [] : undefined, scenario);
+      assert.deepEqual(observed.map(({ stage }) => stage), stages);
+      assert.deepEqual(Object.fromEntries(observed.filter(({ ok }) => !ok).map(({ stage, code }) => [stage, code])), errors, scenario);
+      for (const failure of observed.filter(({ ok }) => !ok)) assert.deepEqual(failure.domains, [], scenario);
     }
     const requests = f.calls.filter(({ url }) => checkoutPaths.includes(url.pathname));
     assert.deepEqual(requests.map(({ url }) => url.pathname), ["pruned", "missing"].includes(scenario) ? [] : checkoutPaths);
     const reportText = JSON.stringify(report);
     for (const value of [id, payer, paymentTx, refundTx, marker, lostOutput, "PRIVATE_RECEIPT_TEXT"]) assert.ok(!reportText.includes(value));
+    if (scenario === "missing-graph-and-output") {
+      const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: f.config.invocationId,
+        MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, report, NOW);
+      for (const code of Object.values(errors)) assert.ok(alert.text.includes(code));
+      for (const value of [id, payer, paymentTx, refundTx, lostOutput]) assert.ok(!alert.text.includes(value));
+    }
   }
 });
 
