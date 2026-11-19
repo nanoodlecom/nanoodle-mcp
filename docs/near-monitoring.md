@@ -398,7 +398,10 @@ and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund fundin
 the Babel authentication challenge, and NEAR AI Market's public site, API and
 Nanoodle listings. The free `price_noodle` probes check that the decision model
 and both branches are priced in NEAR and USDC, and the estimated charge fits
-the deposit. All probes use bounded retries and record only check results.
+the deposit. The hosted runner also checks rendered preview images on the Nano
+hub and NEAR demo. It checks image headers and reads one byte from each audio
+or video sample to verify that the player can load a byte range. All probes
+use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
 during an npm outage. The probes use public discovery, status and pricing.
 
