@@ -722,6 +722,26 @@ test("the monitor reports an unattached NEAR payment claim without exposing its 
   assert.ok(!recovered.checks.some(c => c.stage === "near-payment-claim-unattached"));
 });
 
+test("the readiness report closes both NEAR payment rails when a retained transfer lacks its replay claim", async t => {
+  for (const [asset, owner] of [["near", undefined], ["usdc", "private-pruned-id"]]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const near = f.states["/state/near-state.json"];
+    const id = "private-retained-quote", payTx = "private-retained-transfer";
+    near.quotes[id] = { id, status: "settled", asset, payTx, settlement: { refundYocto: "0" } };
+    near.consumedTx = owner ? { [payTx]: owner } : {};
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(report.checks.find(c => c.stage === "near-payment-replay-coverage"), {
+      stage: "near-payment-replay-coverage", ok: false, code: "near-payment-replay-unverified", domains: ["near", "usdc"],
+    });
+    assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-(?:retained|pruned)/);
+    near.consumedTx[payTx] = id;
+    const restored = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(restored.admission, { nano: true, near: true, usdc: true, market: true });
+  }
+});
+
 test("scheduled checks catch expired quote windows that finalized backfill has not covered", async t => {
   const f = fixture();
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));

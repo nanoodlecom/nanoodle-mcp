@@ -100,6 +100,30 @@ test("consumeTx twice is false, also after reopen", async () => {
   });
 });
 
+test("a restored payment must retain its replay claim before the ledger can reopen", async () => {
+  await withDir(async (dir) => {
+    const file = join(dir, "s.json"), l = openNearLedger({ file, ...OPTS });
+    l.putQuote({ id: "retained", status: "pending" });
+    l.recordPayment("retained", "paid-hash", { status: "paid" });
+    l.putQuote({ id: "legacy", status: "pending" });
+    l.consumeTx("legacy-hash", "legacy");
+    l.consumeTx("pruned-hash", "pruned");
+    const snapshot = JSON.parse(await readFile(file, "utf8"));
+    for (const owner of [undefined, "pruned"]) {
+      const consumedTx = { ...snapshot.consumedTx, "paid-hash": owner };
+      const incomplete = JSON.stringify({ ...snapshot, consumedTx });
+      await writeFile(file, incomplete);
+      assert.throws(() => openNearLedger({ file, ...OPTS, requireExisting: true }), { code: "STATE_PAYMENT_REPLAY_UNVERIFIED" });
+      assert.equal(await readFile(file, "utf8"), incomplete);
+    }
+    await writeFile(file, JSON.stringify(snapshot));
+    const restored = openNearLedger({ file, ...OPTS, requireExisting: true });
+    assert.equal(restored.consumedBy("paid-hash"), "retained");
+    assert.equal(restored.consumedBy("pruned-hash"), "pruned");
+    assert.equal(restored.hasUnattachedPayment("legacy"), true);
+  });
+});
+
 test("duplicate ids and unknown ids", async () => {
   await withDir(async (dir) => {
     const l = openNearLedger({ file: join(dir, "s.json"), ...OPTS });

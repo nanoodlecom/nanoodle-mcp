@@ -41,6 +41,14 @@ function copy(v) {
   return v === undefined ? undefined : structuredClone(v);
 }
 
+/** Retained transfers must be owned by their quote in the replay index. */
+export function hasUnverifiedNearPaymentClaim(quotes, consumedTx) {
+  return Object.entries(quotes).some(([id, quote]) => {
+    const hash = quote?.payTx;
+    return hash != null && (typeof hash !== "string" || !hash || !Object.hasOwn(consumedTx, hash) || consumedTx[hash] !== id);
+  });
+}
+
 export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false, watchPaymentHistory = false }) {
   if (typeof requireExisting !== "boolean") throw TypeError("requireExisting must be a boolean");
   if (typeof watchPaymentHistory !== "boolean") throw TypeError("watchPaymentHistory must be a boolean");
@@ -74,6 +82,10 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     if (state.network !== network || state.merchant !== merchant) {
       throw new NearError("STATE_MISMATCH",
         `NEAR state file ${file} belongs to ${state.merchant} on ${state.network}, not ${merchant} on ${network}`);
+    }
+    if (hasUnverifiedNearPaymentClaim(state.quotes, state.consumedTx)) {
+      throw new NearError("STATE_PAYMENT_REPLAY_UNVERIFIED",
+        "The NEAR ledger cannot verify every retained payment against its replay index. Reconcile the ledger before starting.");
     }
     // A previous writer may have stopped after replacing the file. Confirm
     // the directory entry before using the selected snapshot for recovery.

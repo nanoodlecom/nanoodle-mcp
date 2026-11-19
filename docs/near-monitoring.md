@@ -244,6 +244,9 @@ Coverage:
   first observation, the same alert route reports delayed payment detection.
   The report distinguishes this from a failure to follow the live chain tip.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
+- Retained NEAR and USDC payments must match their replay claims. A missing or
+  mismatched claim fails both readiness checks and stops the writer from
+  starting with that ledger. Claims for pruned quotes remain valid.
 - Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
   separate NEAR/USDC quote capacity. Fee calculations include the protocol's
   gas purchase floor and complete action costs; paid/running work retains fees
