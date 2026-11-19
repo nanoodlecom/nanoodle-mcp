@@ -245,6 +245,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       if (isPublish) checkpointStore.assertCurrent();
     }
     if (readPool && base === rpcBases) {
+      if (body.action === "account_history" && opts.existingPaymentHistory) return readPool.readPaymentHistory(body);
       if (["account_info", "receivable", "account_history"].includes(body.action)) return readPool.read(body);
       if (body.action === "block_info") return readPool.block(body);
     }
@@ -274,6 +275,10 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       }
       throw e;
     });
+    return parsedAccountState(info);
+  }
+
+  function parsedAccountState(info) {
     if (!/^[a-f0-9]{64}$/i.test(info.frontier || "") || !/^\d{1,39}$/.test(String(info.balance)) || !checkAddress(info.representative)) {
       throw new Error("Nano RPC account_info returned invalid wallet state");
     }
@@ -291,18 +296,30 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    */
   let chain = null;
   let checkedAt = null;
-  async function currentState(fresh = false) {
+  async function currentState(fresh = false, { forFundingReport = false } = {}) {
     if (checkpointStore) {
       await qualifyRestartFloor();
       checkpointStore.assertCurrent();
     }
     const health = readPool?.status();
-    if (!fresh && chain && (!readPool || (checkedAt != null && now() >= checkedAt && now() - checkedAt < 30_000
-        && health.networkPeers >= health.minimumPeers && health.readablePeers >= health.minimumPeers))) return chain;
+    if (!fresh && chain && (!forFundingReport || !health?.standby?.inUse)
+        && (!readPool || (checkedAt != null && now() >= checkedAt && now() - checkedAt < 30_000
+          && health.networkPeers >= health.minimumPeers && health.readablePeers >= health.minimumPeers))) {
+      return forFundingReport ? { state: chain, nanoRpc: health } : chain;
+    }
+    const priorChain = forFundingReport ? chain : null;
     chain = null; // a failed refetch must not leave the suspect cache behind
+    if (forFundingReport && readPool) {
+      const { info, nanoRpc, reused } = await readPool.readFundingInfo();
+      const state = parsedAccountState(info);
+      if (!reused) { chain = state; checkedAt = now(); }
+      else if (priorChain?.frontier === state.frontier && priorChain.blockCount === state.blockCount
+        && priorChain.balance === state.balance && priorChain.representative === state.representative) chain = priorChain;
+      return { state, nanoRpc };
+    }
     chain = await accountState();
     checkedAt = now();
-    return chain;
+    return forFundingReport ? { state: chain } : chain;
   }
 
   function advanced(state, hash, balance) {
@@ -410,14 +427,29 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
    * receivable for the next pass.
    */
   async function pocketReceivables(fresh = false, stopEarly = null) {
-    let state = await currentState(fresh);
-    let blocks;
-    try {
-      const r = await rpc({ action: "receivable", account: address, count: "50", threshold: "1", include_only_confirmed: "true" });
-      blocks = r.blocks && typeof r.blocks === "object" ? Object.entries(r.blocks) : [];
-    } catch {
-      return state;
+    const request = { action: "receivable", account: address, count: "50", threshold: "1", include_only_confirmed: "true" };
+    let state, receivable;
+    if (readPool) {
+      if (checkpointStore) {
+        await qualifyRestartFloor();
+        checkpointStore.assertCurrent();
+      }
+      try {
+        const window = await readPool.readReceivableState(request);
+        state = parsedAccountState(window.info);
+        receivable = window.receivable;
+        chain = state; checkedAt = now();
+      } catch {
+        // A failed sweep must still allow a send from funds that a separate
+        // account-only read proves are already spendable.
+        return currentState(fresh);
+      }
+    } else {
+      state = await currentState(fresh);
+      try { receivable = await rpc(request); }
+      catch { return state; }
     }
+    const blocks = receivable.blocks && typeof receivable.blocks === "object" ? Object.entries(receivable.blocks) : [];
     let pocketed = 0;
     for (let i = 0; i < blocks.length; i++) {
       const [sendHash, v] = blocks[i];
@@ -691,9 +723,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
      */
     ops: {
       rpc,
-      ...(readPool && { readPaymentWindow: async () => {
+      ...(readPool && { readPaymentWindow: async options => {
         if (checkpointStore) await qualifyRestartFloor();
-        return readPool.readPaymentWindow();
+        return readPool.readPaymentWindow(options);
       } }),
       withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
       fundingStatus: funding.snapshot,
@@ -713,9 +745,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         await readPool.verifyCheckpoint(checkpoint);
       }, HOUSEKEEPING, false),
       fundingReport: () => enqueue(async () => {
-        const state = await currentState();
+        const { state, nanoRpc } = await currentState(false, { forFundingReport: true });
         return { ...funding.report(), balanceRaw: state.balance.toString(), protectTransfers,
-          ...(readPool ? { nanoRpc: readPool.status() } : {}) };
+          ...(nanoRpc && { nanoRpc }) };
       }, HOUSEKEEPING, false), // read-only telemetry must not keep drain permanently nonzero
       // The journal callback MUST persist the signed block before returning.
       // Retrying after a lost response or a restart uses the same block hash.

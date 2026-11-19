@@ -182,9 +182,9 @@ function notesPhrase(notes) {
 /** The first message on the thread after start. */
 export function startedMessage(p, { budgetUsd, defaultLabel = null, fields = [], notes = [] }) {
   const which = defaultLabel
-    ? `Your brief has no workflow block, so this agent's default workflow (${mdEscape(defaultLabel)}) runs once now with your brief as its input${fieldsPhrase(fields)}:`
-    : "Your workflow passed the safety checks and runs once now:";
-  return `Started. ${which} estimated model cost $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"} (this agent's per-job budget is $${exactUsd(budgetUsd)}). ${notesPhrase(notes)}The result and an itemized cost report follow as the delivery.`;
+    ? `I selected this agent's default workflow (${mdEscape(defaultLabel)}) with your brief as its input${fieldsPhrase(fields)}.`
+    : "Your workflow passed the safety checks.";
+  return `Preparing your run. ${which} Estimated model cost is $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"} (this agent's per-job budget is $${exactUsd(budgetUsd)}). ${notesPhrase(notes)}Once funding is confirmed, the workflow runs once. Delivery includes the result and an itemized cost report.`;
 }
 
 /** The thread message when the buyer asks for changes (or a dispute redo sends the job back). */

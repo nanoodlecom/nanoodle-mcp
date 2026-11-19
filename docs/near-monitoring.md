@@ -246,6 +246,11 @@ Coverage:
   If the watcher is still scanning historical blocks five minutes after the
   first observation, the same alert route reports delayed payment detection.
   The report distinguishes this from a failure to follow the live chain tip.
+  The historical canary reports which RPC step timed out for each peer,
+  from fetching the transaction to resolving the receipt.
+  Historical blocks must match the requested hash, and recovery records a
+  decreasing height bound across restarts. An invalid predecessor leaves
+  coverage at the last verified block and marks the watcher unready.
 - Current gas/storage costs, native NEAR reserve and USDC registration/balance.
 - Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
   separate NEAR/USDC quote capacity. Fee calculations include the protocol's
@@ -304,6 +309,12 @@ Coverage:
   includes representative changes and epoch blocks. The hosted watcher rejects
   a gap, wrong account, or truncated page before committing coverage. Its
   completed cursor stays on a block that the older, filtered history can find.
+- When a quote is waiting and completed Nano coverage is stale, the readiness
+  check reports whether a verified backfill cursor advanced in the last two
+  minutes. It reports `nano-history-backfill-in-progress` for recent progress
+  and `nano-history-backfill-stalled` for an older cursor. Both report Nano
+  as unready until completed coverage catches up. The monitor reads this
+  evidence from the ledger without spending standby RPC quota.
 
 Install `ops/nanoodle-operational-check.{service,timer}`, reload systemd, start
 the service once, inspect its report, then enable the timer. It runs at every
