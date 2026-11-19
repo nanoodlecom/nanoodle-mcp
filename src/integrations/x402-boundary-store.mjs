@@ -31,6 +31,11 @@
 // writer lock (src/process-lock.mjs) for the state file — the store does
 // not silently share a file between live instances.
 //
+// Injected callbacks must be bounded by the caller (the adapter wraps
+// every boundary call in its timeout): a hung priceQuote/execute blocks
+// the serialized operation chain behind it, by design — no operation is
+// ever allowed to overtake a grant or an intent.
+//
 // This module performs no network, wallet, FX or refund TRANSFER work. The
 // operator injects `priceQuote` (authoritative USDC pricing + downstream
 // XNO budget) and `execute` (the established Nano-funded workflow executor
@@ -60,7 +65,6 @@ class BoundaryError extends Error {
 const fail = code => { throw new BoundaryError(code); };
 const clone = x => x === null || x === undefined ? x : JSON.parse(canonical(x));
 const digest = x => createHash("sha256").update(canonical(x)).digest("hex");
-const isHex64 = x => typeof x === "string" && /^[a-f0-9]{64}$/.test(x);
 
 function emptyState() {
   return {
@@ -369,6 +373,8 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
           && (outcome.status !== "completed" || outcome.refund.state === "not_required");
         if (valid) { try { clone(outcome); } catch { valid = false; } }
         if (!valid) fail("BOUNDARY_DISPATCH_OUTCOME_INVALID");
+        const claim0 = state.fundingByKey[fundingKey];
+        if (!claim0) fail("BOUNDARY_FUNDING_CLAIM_MISSING");
         persist(s => {
           s.outcomesByFunding[fundingKey] = clone(outcome);
           const claim = s.fundingByKey[fundingKey];
