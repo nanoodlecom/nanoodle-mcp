@@ -147,7 +147,7 @@ const MAX_FILE = 100 * 1024 * 1024;
  */
 export function createMarketMock({
   token = MOCK_TOKEN, handle = "nanoodle-test", priceAmount = "1.00", listingStatus = "live",
-  tokenReadsDraft = true, pricePatch = "forbidden", now = () => Date.now(),
+  tokenReadsDraft = true, pricePatch = "forbidden", now = () => Date.now(), platformFeeBps = 500,
 } = {}) {
   const ownerAccountId = randomUUID();
   const agents = new Map(); // agentId -> { agentId, handle, token, listingStatus, plans: [PricingPlan] }
@@ -282,6 +282,7 @@ export function createMarketMock({
 
   /** Route one request. Returns { status, json?, headers? }. */
   function route(method, path, query, body, headers) {
+    if (method === "GET" && path === "/v1/platform/config") return { status: 200, json: { platform_fee_bps: platformFeeBps } };
     const err = (status, code, message, extra = {}) => ({ status, json: { error: code, ...(message ? { message } : {}), ...extra } });
     const bodyCheck = (schema) => {
       const v = validate(schema, body, { strict: true });

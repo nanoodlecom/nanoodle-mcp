@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry Nanoodle Babel alerts until the bridge accepts them
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=nanoodle-near-alert@retry.service
+
+[Install]
+WantedBy=timers.target

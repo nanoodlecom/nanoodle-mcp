@@ -22,10 +22,11 @@
  *   is priced again then, against the awarded amount, and declined with a full
  *   refund if it no longer fits.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { writePrivateStateSync } from "../private-state.mjs";
 import { parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
+import { isMarketDollarToken } from "./catalog.mjs";
 
 const short = (id) => String(id).slice(0, 8);
 const usd = (n) => (Math.round(n * 100) / 100).toFixed(2);
@@ -48,13 +49,13 @@ export function openBidState(file, { now = Date.now, retainMs = 30 * 86_400_000 
   } catch (e) {
     if (!(e && e.code === "ENOENT")) throw new Error(`bid state ${file} cannot be read (${(e && e.message) || e}); inspect or move it aside`);
   }
+  let persistenceFailed = false;
   const persist = () => {
-    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
-    renameSync(tmp, file);
+    try { writePrivateStateSync(file, JSON.stringify(state), { temporary: `${file}.tmp` }); persistenceFailed = false; }
+    catch (error) { persistenceFailed = true; throw error; }
   };
   return {
+    persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0 }),
     get: (jobId) => state.jobs[jobId] || null,
     all: () => Object.entries(state.jobs).map(([jobId, r]) => ({ jobId, ...r })),
     set(jobId, rec) {
@@ -97,9 +98,10 @@ export function bidProposal({ priceUsd, needUsd, pricing }) {
  * @param {number} [o.maxBidUsd]     no bid above this (default 5)
  * @param {number} [o.slaSeconds]    the delivery window a bid promises (default 3600)
  * @param {number} [o.maxPerTick]    bids placed in one pass (default 5)
+ * @param {() => Promise<number>} [o.checkFee]  verify the fee immediately before a bid
  * @param {(line: string) => void} [o.log]
  */
-export function createBidder({ client, runner, state, priceFor, budgetFor, maxBidUsd = 5, slaSeconds = 3600, maxPerTick = 5, log = () => {} }) {
+export function createBidder({ client, runner, state, priceFor, budgetFor, maxBidUsd = 5, slaSeconds = 3600, maxPerTick = 5, checkFee, log = () => {} }) {
   const skip = (job, reason, extra = {}) => {
     log(`job ${short(job.jobId)}: no bid — ${reason}`);
     state.set(job.jobId, { status: "skipped", reason, ...extra });
@@ -117,6 +119,10 @@ export function createBidder({ client, runner, state, priceFor, budgetFor, maxBi
       skip(job, `it asks for a ${job.minBuilderVerification} builder`);
       return false;
     }
+    if (!isMarketDollarToken(job.budgetToken)) {
+      skip(job, "its budget currency is outside USD and USDC");
+      return false;
+    }
     const priced = await runner.price(args, { budgetUsd: budgetFor(maxBidUsd) });
     if (!priced.ok) {
       if (priced.refusals.some((r) => r.code === "CATALOG_UNAVAILABLE")) {
@@ -129,6 +135,7 @@ export function createBidder({ client, runner, state, priceFor, budgetFor, maxBi
     }
     const needUsd = priced.pricing.depositUsd;
     const priceUsd = priceFor(needUsd);
+    await checkFee?.();
     let bid;
     try {
       bid = await client.placeBid(job.jobId, { amount: usd(priceUsd), proposal: bidProposal({ priceUsd, needUsd, pricing: priced.pricing }), slaSeconds });
@@ -152,7 +159,7 @@ export function createBidder({ client, runner, state, priceFor, budgetFor, maxBi
     return true;
   }
 
-  /** One pass over the board. Never throws for a market or pricing problem. */
+  /** One pass over the board. Fee verification failures abort the pass. */
   async function tick() {
     // Two reads: the board's own search for the word, and the newest jobs unfiltered (the search
     // is free text and is not documented to match a code block's tag).
@@ -174,6 +181,7 @@ export function createBidder({ client, runner, state, priceFor, budgetFor, maxBi
       if (job.jobKind !== "standard" || (job.status !== "open" && job.status !== "filling") || job.isPrivate) continue;
       if (typeof job.description !== "string" || !HAS_BLOCK.test(job.description)) continue; // not ours: not recorded, not logged
       try { if (await consider(job)) placed++; } catch (e) {
+        if (["MARKET_FEE_CHANGED", "MARKET_FEE_UNAVAILABLE"].includes(e?.code)) throw e;
         log(`job ${short(job.jobId)}: not considered (${String((e && e.message) || e).slice(0, 160)}); tried again at the next pass`);
       }
     }

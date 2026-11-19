@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile, readdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -172,6 +172,40 @@ test("prune drops old finished quotes and long-expired unpaid quotes; consumedTx
   });
 });
 
+test("NEAR retention keeps quotes with a short creator payout or a wrong-asset refund", async () => {
+  await withDir(async dir => {
+    const l = openNearLedger({ file: join(dir, "state.json"), ...OPTS, now: () => 90_000_000 });
+    l.putQuote({ id: "job", status: "settled", finishedAt: 1, payer: "payer.testnet", asset: "usdc",
+      tokenContract: "token.testnet", refundId: "refund",
+      settlement: { refundYocto: "70", authorPayout: { to: "author", amountRaw: "30" } } });
+    l.putRefund({ id: "refund", paymentId: "job", status: "sent", asset: "near", to: "payer.testnet", amountYocto: "70" });
+    l.putPayout({ paymentId: "job", status: "sent", to: "author", amountRaw: "25" });
+    assert.equal(l.prune(), 0);
+    l.updateRefund("refund", { asset: "usdc", tokenContract: "token.testnet" });
+    assert.equal(l.prune(), 0);
+    l.updatePayout("job", { amountRaw: "30" });
+    assert.equal(l.prune(), 1);
+    assert.equal(l.getQuote("job"), null);
+    assert.equal(l.getRefund("refund").status, "sent");
+    assert.equal(l.getPayout("job").status, "sent");
+  });
+});
+
+test("NEAR retention preserves a quote if its refund hash also belongs to a pruned payment", async () => {
+  await withDir(async dir => {
+    const l = openNearLedger({ file: join(dir, "state.json"), ...OPTS, now: () => 90_000_000 });
+    const row = { id: "refund", paymentId: "payment", status: "sent", to: "payer.testnet", amountYocto: "70", txHash: "shared" };
+    l.putQuote({ id: row.paymentId, status: "settled", finishedAt: 1, payer: row.to, refundId: row.id,
+      settlement: { refundYocto: row.amountYocto } });
+    l.putRefund(row);
+    l.putRefund({ ...row, id: "old-refund", paymentId: "old-payment", txHash: "replacement", supersededTxHashes: ["shared"] });
+    assert.equal(l.prune(), 0);
+    assert.ok(l.getQuote(row.paymentId));
+    l.updateRefund("old-refund", { supersededTxHashes: ["unrelated"] });
+    assert.equal(l.prune(), 1);
+  });
+});
+
 test("a bigint is rejected and nothing changes", async () => {
   await withDir(async (dir) => {
     const file = join(dir, "s.json");
@@ -199,5 +233,29 @@ test("a failed write rolls the in-memory state back", async () => {
     await writeFile(parent, "x");
     assert.throws(() => l.consumeTx("H", "nq_a"));
     assert.equal(l.consumedBy("H"), null);
+  });
+});
+
+test("payment attachment and duplicate protection commit together after a write failure", async () => {
+  await withDir(async (dir) => {
+    const file = join(dir, "near-state.json"), stage = `${file}.tmp-${process.pid}`;
+    const ledger = openNearLedger({ file, ...OPTS });
+    ledger.putQuote({ id: "first", status: "pending" });
+    ledger.putQuote({ id: "second", status: "pending" });
+    const old = await readFile(file, "utf8"), payment = { status: "paid", paidYocto: "1" };
+    await mkdir(stage);
+    assert.throws(() => ledger.recordPayment("first", "hash", payment));
+    assert.equal(ledger.consumedBy("hash"), null);
+    assert.deepEqual(ledger.getQuote("first"), { id: "first", status: "pending" });
+    assert.equal(await readFile(file, "utf8"), old);
+    await rm(stage, { recursive: true });
+    assert.equal(ledger.recordPayment("first", "hash", payment).payTx, "hash");
+    const reopened = openNearLedger({ file, ...OPTS });
+    assert.equal(reopened.consumedBy("hash"), "first");
+    assert.equal(reopened.getQuote("first").status, "paid");
+    assert.equal(reopened.recordPayment("second", "hash", payment), null);
+    assert.equal(reopened.recordPayment("first", "different-hash", payment), null);
+    assert.equal(reopened.consumedBy("different-hash"), null);
+    assert.equal(reopened.getQuote("second").status, "pending");
   });
 });

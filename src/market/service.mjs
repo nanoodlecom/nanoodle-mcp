@@ -9,6 +9,8 @@
  *     run it sells. One wallet has one account chain, so the worker shares the
  *     server's wallet queue rather than opening the same wallet in a second process.
  */
+import { moneyStateStatus } from "../service-lifecycle.mjs";
+import { MaintenanceError } from "../maintenance.mjs";
 import { parseArgs } from "node:util";
 import { readFileSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
@@ -19,13 +21,15 @@ import { createWorkflowRunner, checkNanoGptKey } from "./runner.mjs";
 import { createMarketWorker, logSafe } from "./worker.mjs";
 import { createWebhookHandler, secretFileReader } from "./webhook.mjs";
 import { createBidder, openBidState } from "./bidder.mjs";
+import { marketCreatorLiabilities } from "../funding-liabilities.mjs";
+import { createMarketFeeGuard, MARKET_PLATFORM_FEE_BPS } from "./fee-guard.mjs";
 import {
   readCatalog, fetchListingPrice, patchListingPrice, budgetFromPrice, recommendPrice, fmtUsd, usdMicros,
-  PRICE_REFRESH_SECONDS, PROBE_BRIEF,
+  PRICE_REFRESH_SECONDS, listingWorkflowPriceSample,
 } from "./catalog.mjs";
 
 /** The market's platform fee (GET /v1/platform/config: platform_fee_bps 500), taken from the price on acceptance. */
-export const PLATFORM_FEE_RATE = 0.05;
+export const PLATFORM_FEE_RATE = MARKET_PLATFORM_FEE_BPS / 10_000;
 
 export const HELP = `Usage: node scripts/market-worker.mjs --budget-usd <usd> [options]
        node scripts/market-worker.mjs --agents-file <catalog.json> [options]
@@ -233,13 +237,21 @@ function readCatalogConfig(a, env, agentsFile, { needKey }) {
  * @param {{ close: () => void }} store
  * @param {{ pollMs: number, once?: boolean, log: (l: string) => void }} o
  */
-export function runLoop(worker, store, { pollMs, once = false, log }) {
+export function runLoop(worker, store, { pollMs, once = false, log, closeStore = true }) {
   let stopping = false;
   let ended = false;
   let wake = null;
   let pokes = []; // resolvers of poke() calls not yet served by a poll
   const stop = () => { stopping = true; if (wake) wake(); };
   const poke = () => (ended || stopping ? Promise.resolve() : new Promise((r) => { pokes.push(r); if (wake) wake(); }));
+  const poll = async () => {
+    try { await worker.tick(); }
+    catch (error) {
+      if (!(error instanceof MaintenanceError && error.code === "SERVICE_DRAINING")) throw error;
+      // A planned pause leaves the worker and its durable state available for
+      // resume; it is not a fatal loop failure or a failed buyer assignment.
+    }
+  };
   const done = (async () => {
     let code = 0;
     try {
@@ -247,8 +259,8 @@ export function runLoop(worker, store, { pollMs, once = false, log }) {
         // Only the pokes made before this poll starts are served by it.
         const served = pokes;
         pokes = [];
-        try { await worker.tick(); } finally { for (const r of served) r(); }
-        if (once) { await worker.drain(); await worker.tick(); await worker.drain(); break; }
+        try { await poll(); } finally { for (const r of served) r(); }
+        if (once) { await worker.drain(); await poll(); await worker.drain(); break; }
         if (!pokes.length && !stopping) {
           let timer;
           await new Promise((r) => { wake = r; timer = setTimeout(r, pollMs); });
@@ -266,7 +278,7 @@ export function runLoop(worker, store, { pollMs, once = false, log }) {
       log(`stopped: ${(e && e.message) || e}; no new polls, waiting for the runs in flight to finish`);
       try { await worker.drain(); } catch (e2) { log(`while waiting: ${(e2 && e2.message) || e2}`); }
     }
-    try { store.close(); } catch { /* already closed */ }
+    if (closeStore) try { store.close(); } catch { /* already closed */ }
     return code;
   })();
   return { done, stop, poke };
@@ -303,19 +315,22 @@ export function createNotifier({ url, fetch = globalThis.fetch, log = () => {}, 
  * @param {(line: string) => void} o.log
  * @returns {Promise<{ done: Promise<number>, stop: () => void, store: object }>}
  */
-export async function startMarketService(cfg, { payment = null, log: baseLog, fetch = globalThis.fetch }) {
+export async function startMarketService(cfg, { maintenance = null, payment = null, creatorPayments = null, fundRun = null, fundingPair = null, registerFundingSource = () => {}, requireExistingState = false, log: baseLog, fetch = globalThis.fetch }) {
   const notify = cfg.notifyUrl ? createNotifier({ url: cfg.notifyUrl, log: baseLog }) : null;
   const log = notify ? (line) => { baseLog(line); if (NOTIFY_LINES.test(line)) notify(line); } : baseLog;
+  const checkFee = createMarketFeeGuard({ baseUrl: cfg.baseUrl, fetch }).check;
   if (!cfg.apiKey && typeof payment !== "function") die("no NanoGPT funding source: an API key or a wallet payment callback is needed");
-  if (cfg.catalog) return startCatalogService(cfg, { payment, log, baseLog, notify, fetch });
+  if (cfg.catalog) return startCatalogService(cfg, { maintenance, payment, creatorPayments, fundRun, fundingPair, registerFundingSource, checkFee, log, baseLog, notify, fetch, requireExistingState });
   let store;
-  try { store = openMarketState({ dir: cfg.stateDir }); } catch (e) { die(e.message); }
+  try { store = openMarketState({ dir: cfg.stateDir, requireExisting: requireExistingState }); } catch (e) { die(e.message); }
+  registerFundingSource(store.file, () => store.all());
   const fail = (msg) => { try { store.close(); } catch { /* closed */ } die(msg); };
   const client = createMarketClient({ baseUrl: cfg.baseUrl, token: cfg.token });
-  const runner = createWorkflowRunner({ apiKey: cfg.apiKey || undefined, payment: cfg.apiKey ? undefined : payment, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
+  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment, fundRun, fundingPair };
+  const runner = createWorkflowRunner({ ...funding, budgetUsd: cfg.budgetUsd, baseUrl: cfg.nanogptBase, log });
   const worker = createMarketWorker({
     client, store, runner, budgetUsd: cfg.budgetUsd, listingPriceUsd: cfg.listingPriceUsd, defaultWorkflow: cfg.defaultWorkflow,
-    concurrency: cfg.concurrency, retainMs: cfg.retainMs, log,
+    concurrency: cfg.concurrency, retainMs: cfg.retainMs, log, creatorPayments, checkFee, maintenance,
   });
   if (cfg.apiKey) {
     // A rejected key would fail every hire after the buyer has paid; stop here instead.
@@ -340,7 +355,8 @@ export async function startMarketService(cfg, { payment = null, log: baseLog, fe
   if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s; per-job budget $${cfg.budgetUsd}${cfg.listingPriceUsd != null ? `, listing price $${cfg.listingPriceUsd}` : ""}; state in ${cfg.stateDir}`);
   const loop = runLoop(worker, store, { pollMs: cfg.pollMs, once: cfg.once, log });
-  return { done: loop.done, stop: loop.stop, store };
+  return { done: loop.done, stop: loop.stop, store, persistenceStatus: store.persistenceStatus,
+    fundingLiabilitiesRaw: context => marketCreatorLiabilities(store.all(), { ...context, payouts: creatorPayments?.payoutRecords?.() ?? [] }) };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -367,7 +383,7 @@ function tokenFileExists(path) {
  * follows on the market. The worker is created at the first price that can
  * be determined; until then the listing takes no jobs (`gate.tick` is a no-op).
  */
-function createListing({ agent, token, store, cfg, funding, log, customHandle, fetch }) {
+function createListing({ maintenance, agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments, checkFee }) {
   const L = (line) => log(`[${agent.handle}] ${line}`);
   const client = createMarketClient({ baseUrl: cfg.baseUrl, token });
   // Every price() call from the worker and the probe passes its own budget; this one is only the default.
@@ -385,7 +401,7 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
     const wf = agent.defaultWorkflow;
     let r;
     try {
-      r = await runner.price({ graph: wf.graph, inputs: { [wf.inputName]: PROBE_BRIEF } }, { budgetUsd: 1e6 });
+      r = await runner.price(listingWorkflowPriceSample(wf), { budgetUsd: 1e6 });
     } catch (e) { L(`its workflow was not priced (${(e && e.message) || e})`); return null; }
     if (r.ok) {
       if (workflowProblem) { L(`its workflow can run again`); workflowProblem = null; }
@@ -460,8 +476,8 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
         worker = createMarketWorker({
           client, store, runner, budgetUsd, listingPriceUsd: price.priceUsd,
           defaultWorkflow: agent.defaultWorkflow, customWorkflows: agent.custom, customHandle: agent.custom ? null : customHandle,
-          bidTerms: agent.bids ? bidTerms : null,
-          concurrency: cfg.concurrency, retainMs: cfg.retainMs, log: L,
+          useBidBudget: agent.bids,
+          concurrency: cfg.concurrency, retainMs: cfg.retainMs, log: L, creatorPayments, checkFee, maintenance,
         });
       } else {
         worker.setBudget({ budgetUsd, listingPriceUsd: price.priceUsd });
@@ -491,21 +507,18 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
     }
   }
 
-  // A job awarded from one of this listing's bids: its escrow is the quoted price.
-  const bidTerms = (escrowAmount) => {
-    const micros = usdMicros(escrowAmount);
-    return micros != null && micros > 0 ? { priceUsd: micros / 1e6, budgetUsd: budgetFromPrice(micros / 1e6) } : null;
-  };
-  let bidder = null;
+  let bidder = null, bidState = null, bidReadFailed = false;
   let bidProblem = null;
   /** One pass over the job board (only for a listing with "bids": true that is taking jobs). Never throws. */
   async function bidTick() {
     if (!agent.bids || !worker) return;
     try {
       if (!bidder) {
+        try { bidState = openBidState(join(cfg.stateDir, agent.handle, "bids.json")); bidReadFailed = false; }
+        catch (error) { bidReadFailed = true; throw error; }
         bidder = createBidder({
-          client, runner, state: openBidState(join(cfg.stateDir, agent.handle, "bids.json")),
-          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, log: (line) => L(`bids: ${line}`),
+          client, runner, state: bidState,
+          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, checkFee, log: (line) => L(`bids: ${line}`),
         });
       }
       await bidder.tick();
@@ -520,11 +533,22 @@ function createListing({ agent, token, store, cfg, funding, log, customHandle, f
     tick: async () => { if (worker) await worker.tick(); },
     drain: async () => { if (worker) await worker.drain(); },
   };
-  return { handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
+  return { persistenceStatus: () => moneyStateStatus([store.persistenceStatus(), bidState?.persistenceStatus(), { ok: !bidReadFailed, pendingWrites: 0 }]),
+    handle: agent.handle, webhookSecretFile: agent.webhookSecretFile || null, bids: !!agent.bids, bidTick, refresh, gate, store, log: L, active: () => !!worker, worker: () => worker };
 }
 
-async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }) {
-  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment };
+async function startCatalogService(cfg, { maintenance, payment, creatorPayments, fundRun, fundingPair, registerFundingSource, checkFee, log, baseLog, notify, fetch, requireExistingState }) {
+  const activities = new Set();
+  const perform = fn => {
+    const promise = maintenance ? maintenance.run(fn, "background") : Promise.resolve().then(fn);
+    activities.add(promise);
+    promise.then(() => activities.delete(promise), () => activities.delete(promise));
+    return promise;
+  };
+  const backgroundError = error => {
+    if (!(error instanceof MaintenanceError && error.code === "SERVICE_DRAINING")) log("Market catalog background pass failed; will retry");
+  };
+  const funding = cfg.apiKey ? { apiKey: cfg.apiKey } : { payment, fundRun, fundingPair };
   if (cfg.ignored && cfg.ignored.length) log(`the agents file replaces ${cfg.ignored.join(", ")}; ${cfg.ignored.length === 1 ? "it is" : "they are"} ignored`);
   await checkFunding(cfg, log);
   const custom = cfg.catalog.agents.find((a) => a.custom);
@@ -537,11 +561,14 @@ async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }
     let token, store;
     try { token = readSecretFile(agent.tokenFile, "token"); } catch (e) { L(`NEEDS OPERATOR — skipped: ${e.message}`); continue; }
     if (!/^aat_/.test(token)) L("warning: the agent token does not start with aat_");
-    try { store = openMarketState({ dir: join(cfg.stateDir, agent.handle) }); } catch (e) { L(`NEEDS OPERATOR — skipped: ${e.message}`); continue; }
-    listings.push(createListing({ agent, token, store, cfg, funding, log, customHandle, fetch }));
+    try { store = openMarketState({ dir: join(cfg.stateDir, agent.handle), requireExisting: requireExistingState }); } catch (e) { L(`NEEDS OPERATOR — skipped: ${e.message}`); continue; }
+    registerFundingSource(store.file, () => store.all());
+    listings.push(createListing({ maintenance, agent, token, store, cfg, funding, log, customHandle, fetch, creatorPayments, checkFee }));
   }
   if (!listings.length) die(`no listing in ${cfg.catalog.file} can run (see the lines above); add a token file and restart`);
-  await Promise.all(listings.map((l) => l.refresh()));
+  const initializeListings = () => Promise.all(listings.map((l) => perform(() => l.refresh())));
+  if (maintenance?.initializing?.()) await maintenance.recover(initializeListings);
+  else await initializeListings();
   if (notify) baseLog("hires and outcomes are also posted to MARKET_NOTIFY_URL");
   log(`polling ${cfg.baseUrl} every ${cfg.pollMs / 1000} s for ${listings.length} listing${listings.length === 1 ? "" : "s"} (${listings.map((l) => l.handle + (l.active() ? "" : " (off: no price)")).join(", ")}); prices read again every ${cfg.priceRefreshMs / 1000} s; state in ${cfg.stateDir}/<handle>`);
 
@@ -549,23 +576,33 @@ async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }
   let stopped = false;
   const schedule = () => {
     if (stopped || cfg.once) return;
-    timer = setTimeout(async () => {
-      for (const l of listings) { if (stopped) return; await l.refresh(); }
-      schedule();
+    timer = setTimeout(() => {
+      if (stopped) return;
+      perform(async () => { for (const l of listings) { if (stopped) return; await l.refresh(); } })
+        .catch(backgroundError).finally(schedule);
     }, cfg.priceRefreshMs);
     timer.unref?.();
   };
   schedule();
-  const loops = listings.map((l) => runLoop(l.gate, l.store, { pollMs: cfg.pollMs, once: cfg.once, log: l.log }));
-  const done = Promise.all(loops.map((x) => x.done)).then((codes) => { stopped = true; clearTimeout(timer); return Math.max(0, ...codes); });
+  const loops = listings.map((l) => runLoop(l.gate, l.store, { pollMs: cfg.pollMs, once: cfg.once, log: l.log, closeStore: false }));
+  const done = Promise.all(loops.map((x) => x.done)).then(async codes => {
+    stopped = true; clearTimeout(timer); clearTimeout(bidTimer);
+    // Price/bid passes share these stores. Closing a store while a pass is
+    // awaiting the market can lose its final assignment/offer update.
+    await Promise.allSettled([...activities]);
+    closeAll();
+    return Math.max(0, ...codes);
+  });
   // Quotes: listings with "bids": true read the job board and bid on jobs that carry a workflow (bidder.mjs).
   const bidders = listings.filter((l) => l.bids);
   let bidTimer = null;
-  const bidPass = async () => {
-    for (const l of bidders) { if (stopped) return; await l.bidTick(); }
-    if (stopped || cfg.once) return;
-    bidTimer = setTimeout(bidPass, cfg.bidPollMs);
-    bidTimer.unref?.();
+  const bidPass = () => {
+    if (stopped) return;
+    perform(async () => { for (const l of bidders) { if (stopped) return; await l.bidTick(); } })
+      .catch(backgroundError).finally(() => {
+        if (stopped || cfg.once) return;
+        bidTimer = setTimeout(bidPass, cfg.bidPollMs); bidTimer.unref?.();
+      });
   };
   if (bidders.length) {
     log(`bids: ${bidders.map((l) => l.handle).join(", ")} read${bidders.length === 1 ? "s" : ""} the job board every ${cfg.bidPollMs / 1000} s and bid${bidders.length === 1 ? "s" : ""} on jobs that carry a nanoodle workflow`);
@@ -583,5 +620,8 @@ async function startCatalogService(cfg, { payment, log, baseLog, notify, fetch }
   });
   const webhook = hooked.size && !cfg.once ? createWebhookHandler({ listings: hooked }) : null;
   if (webhook) log(`webhooks: ${[...hooked.keys()].join(", ")} also poll at once on a signed event at /market/webhook/<handle>`);
-  return { done, stop, store: { close: closeAll }, listings, webhook };
+  return { done, stop, store: { close: closeAll }, listings, webhook,
+    persistenceStatus: () => moneyStateStatus(listings.map(listing => listing.persistenceStatus())),
+    fundingLiabilitiesRaw: context => marketCreatorLiabilities(listings.flatMap(l => l.store.all()),
+      { ...context, payouts: creatorPayments?.payoutRecords?.() ?? [] }) };
 }

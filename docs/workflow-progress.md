@@ -19,7 +19,7 @@ HTTP clients request `Accept: text/event-stream` and set
 `params._meta.progressToken` on `tools/call`. Both HTTP and stdio emit
 `notifications/progress` with a readable `message`, increasing `progress`,
 the original token, and the snapshot under
-`params._meta["com.nanoodle/workflow"]`. Payment metadata stays outside tool
+`params._meta["com.nanoodle/workflow"]`. Progress metadata stays outside tool
 arguments, so it does not alter a quote's argument hash. HTTP heartbeats keep
 the current step visible during a long provider operation.
 

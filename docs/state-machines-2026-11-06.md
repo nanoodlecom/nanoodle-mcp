@@ -60,22 +60,54 @@ The tests use fixture accounts, local HTTP, scripted providers and temporary fil
 
 Origin and disconnect behavior follows the [MCP 2025-06-18 transport requirements](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports): validate Origin; treat a disconnected transport independently from workflow cancellation.
 
-## Remaining financial recovery gaps — do not infer launch qualification
+## Payment recovery regression checks
 
-Run `node scripts/audit-payment-recovery.mjs`. It contains no wallet creation and prints only synthetic aggregate evidence:
+Run `node scripts/audit-payment-recovery.mjs` to check payment recovery with
+synthetic wallet and ledger fixtures. The tests exercise quote durability,
+resumable confirmed Nano history, restart recovery for signed refunds,
+customer change and creator payouts, funding checks just before publication,
+and duplicate transfer detection across the shared wallet. They neither use
+real wallet credentials nor invoke inference.
 
-```json
-{"gap":"inflight_change_not_durable","firstSends":1,"persistedOwed":0,"restoredSends":0}
-{"gap":"ambiguous_send_retried_as_new_transfer","acceptedSends":2}
-{"gap":"restart_seeds_only_first_history_page","historyEntries":150,"pages":3,"status":"pending"}
-```
+Nano records a durable execution claim before opening a provider budget.
+When a writer restarts with an unfinished claim, it records a failure and
+full-deposit refund intent together. An unused payment remains ready for
+its first run. A paid quote from before execution claims requires
+reconciliation if its outcome is absent. Its funds stay reserved.
+The scheduled check reports those holds and claims beyond their deadlines.
 
-- **Unjournaled effects:** successful-settlement transfers are started before an owed intent is persisted. A restart can retain `settled:true` with no send obligation even though change/author payout did not complete. Initial refunds and successful owed-send removal have analogous crash windows. Quote creation/payment acknowledgment also lacks an awaited durable write barrier. Atomic rename alone does not close these windows.
-- **Ambiguous send retry:** the wallet attempts same-block recovery, but if it cannot establish the outcome, the gate queues a fresh `ops.transfer`. The fixture accepts a send, loses its response, and observes two accepted transfers after backoff. A safe fix needs a stable logical send ID, persisted exact signed block/hash, authoritative reconciliation and a durable completion record. Never resolve this by blindly reissuing a live transfer or editing live balances.
-- **History cursor loss:** first startup walk reads only one 100-entry page; later walks stop at the newest marker. A restored pending quote pocketed below that first page remains unpaid. The 1,000-entry churn cap similarly advances the marker before all backlog is covered. A resumable durable scan cursor and payment-hash consumption record are needed together: indiscriminately scanning old amounts can falsely match a reused amount tag.
-- **Policy/recovery limits:** expired quotes are actively watched for one hour although metadata is retained longer; unresolved owed sends are dropped after the maximum tries; repeated text regeneration can repeat provider effects. There is no shared multiworker claim/settlement authority. These are existing limitations, not repaired by the targeted patch.
+The Nano writer records outgoing intent with the payment outcome and saves
+the exact signed block before publication. Retries reconcile that block.
+A replacement requires a confirmed competing block on the same account
+and predecessor. The monitor flags unsigned debts created by the old writer
+and blocks claimed by more than one obligation. Preserve old debts as
+liabilities and reconcile them against the chain before any further transfer.
+Current settlements also retain the expected recipient and confirmation for
+each outgoing leg. Missing or incomplete evidence keeps the balance reserved
+and preserves the quote for reconciliation. The writer holds any restored
+send whose amount or recipient conflicts with its settlement.
 
-The safe next implementation is one canonical durable payment/execution authority with operation IDs and explicit `intent → submitted → uncertain → reconciled → completed` transitions. The service must never choose a new send on an uncertain operation. Keep payer content out of durable records and retain outstanding obligations until authoritative resolution. This work needs coordinated integration with the existing protocol owners and a reviewed recovery/migration strategy; no existing live financial record was rewritten by the audit.
+NEAR and USDC refunds also match the payer, asset and token contract. The
+ledger preserves every uncovered remainder and the gas needed to send it.
+A transaction hash belongs to one refund, including hashes retained from
+nonce renewal. If two refunds claim one hash, both balances stay reserved
+and their retries stay on hold until the records are reconciled.
+Before rebroadcasting, recovery verifies the saved signature and checks the
+transaction against the recorded payer, amount, asset, nonce and block.
+The read-only monitor performs the same check on saved transactions. Invalid
+evidence keeps the debt reserved and the original bytes available for review.
+The NEAR readiness monitor compares finalized hashes at each height reported
+by fresh RPC peers. The writer verifies its last accepted finalized block on a
+replacement peer before using it for payment reads or signed submissions.
+NEAR and Market creator payouts cover only the matching recipient and
+amount. Restored outbox entries that disagree with the original obligation
+stay held with their signed bytes. The payment and assignment records remain
+available after ordinary retention until their financial evidence matches.
+
+The Nano gate and creator payout ledger still share one wallet writer.
+Activation and rollback require the guarded release procedure. A writer
+without signed-transfer recovery cannot safely retry a ledger that contains
+unfinished signed intents.
 
 ## Existing work and release boundary
 

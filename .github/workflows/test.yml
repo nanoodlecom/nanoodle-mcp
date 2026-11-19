@@ -9,6 +9,57 @@ on:
   pull_request:
 
 jobs:
+  # Only a tested version change on main creates a GitHub source release.
+  qualify-github-source:
+    name: Qualify GitHub source release
+    if: github.event_name == 'pull_request' || (github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main')
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.qualify.outputs.source_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.3'
+      - name: Compare the packaged version with the prior main commit
+        id: qualify
+        env:
+          BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+        run: |
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/source-pack.json"
+          node .github/scripts/publish_source.mjs qualify "$RUNNER_TEMP/source-pack.json" >> "$GITHUB_OUTPUT"
+
+  publish-github-source:
+    name: Publish tested GitHub source release
+    if: ${{ github.repository == 'nanoodlecom/nanoodle-mcp' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.qualify-github-source.outputs.version != '' }}
+    needs: qualify-github-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: github-source-${{ needs.qualify-github-source.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.3'
+      - name: Tag and release the tested source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_VERSION: ${{ needs.qualify-github-source.outputs.version }}
+        run: node .github/scripts/publish_source.mjs publish "$SOURCE_VERSION"
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -17,6 +68,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24.22.3"
+      - name: Restore pinned ffmpeg archive
+        id: ffmpeg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+        with:
+          path: /tmp/ffmpeg.tar.xz
+          key: ffmpeg-7.0.2-linux-amd64-abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
       # The apt ffmpeg package is about 94MB across 99 dependencies, fetched
       # from the Azure Ubuntu mirror. That download has no bound of its own,
       # and this job's 10-minute limit has cancelled the run while libavcodec
@@ -26,11 +87,30 @@ jobs:
         run: |
           set -euo pipefail
           url=https://johnvansickle.com/ffmpeg/releases/ffmpeg-7.0.2-amd64-static.tar.xz
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 "$url" -o /tmp/ffmpeg.tar.xz
-          echo "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67  /tmp/ffmpeg.tar.xz" | sha256sum -c
+          verify_ffmpeg() {
+            echo "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67  /tmp/ffmpeg.tar.xz" | sha256sum -c
+          }
+          if ! { test -f /tmp/ffmpeg.tar.xz && verify_ffmpeg; }; then
+            for attempt in 1 2; do
+              rm -f /tmp/ffmpeg.tar.xz
+              if curl -fsSL --connect-timeout 10 --max-time 45 -H 'Cache-Control: no-cache' "$url" -o /tmp/ffmpeg.tar.xz && verify_ffmpeg; then
+                break
+              fi
+            done
+          fi
+          # Cache hits and both download attempts must pass the unchanged pin.
+          verify_ffmpeg
           tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
           sudo install -m 755 /tmp/ffmpeg-7.0.2-amd64-static/ffmpeg /tmp/ffmpeg-7.0.2-amd64-static/ffprobe /usr/local/bin/
           ffmpeg -hide_banner -version
           ffprobe -hide_banner -version
+      - name: Cache verified ffmpeg archive
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          path: /tmp/ffmpeg.tar.xz
+          key: ffmpeg-7.0.2-linux-amd64-abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
       - run: npm ci
       - run: npm test

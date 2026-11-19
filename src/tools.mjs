@@ -20,10 +20,11 @@ import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd } from "./usd.mjs";
+import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
-import { readGraphArgs, checkGraphSafety, priceGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
+import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GUIDE_NODE_MODEL_KIND, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
 
 /**
  * A graph file → the editor share link that opens it: #g=<b64url(gzip(JSON))>,
@@ -38,6 +39,7 @@ export function editorShareUrl(rawText) {
 /** Public NanoGPT catalog endpoints by pricing kind — no API key, `{ data: [...] }`. */
 const CATALOG_PATH = {
   chat: "/api/v1/models?detailed=true",
+  decision: "/api/v1/decision-models",
   image: "/api/v1/image-models",
   video: "/api/v1/video-models",
   audio: "/api/v1/audio-models",
@@ -47,6 +49,7 @@ const CATALOG_PATH = {
 /** Cached catalog arrays by `${base}|${kind}` — the public catalogs move slowly and every fetch is unauthenticated. */
 const catalogCache = new Map();
 const CATALOG_TTL_MS = 60 * 60 * 1000;
+const PAID_CATALOG_TTL_MS = 5 * 60 * 1000;
 /**
  * Failure markers by the same key. An endpoint that's down stays down for more
  * than one call, so one failed round trip covers the next minute instead of
@@ -77,10 +80,13 @@ const CATALOG_TIMEOUT_MS = 8000;
  * `maxAgeMs: 0` forces a refetch (the hourly estimate refresh) and bypasses the
  * failure marker; anything else serves a cached array younger than that, so a
  * per-call path (run_noodle) doesn't pay a round trip on every run.
+ * `requireFresh` uses a five-minute cache and omits a catalog if its refresh
+ * fails. Hosted price checks need to see that models are currently priceable.
  * `consequence` is appended to the failure log line, so each caller can name
  * what its own users lose.
  */
-export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
+export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {},
+  requireFresh = false, maxAgeMs = requireFresh ? PAID_CATALOG_TTL_MS : CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const base = String(baseUrl).replace(/\/+$/, "");
   const catalogs = {};
   // A stale copy still beats nothing: the payload gates and the forecast are both
@@ -98,7 +104,7 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
     if (hit && Date.now() - hit.at < maxAgeMs) { catalogs[kind] = hit.data; return; }
     const failed = catalogFailures.get(key);
     if (failed && Date.now() - failed.at < Math.min(CATALOG_FAIL_TTL_MS, maxAgeMs)) {
-      if (hit) serveStale(kind, hit, failed.why);
+      if (hit && !requireFresh) serveStale(kind, hit, failed.why);
       return; // already logged when the failure was recorded
     }
     try {
@@ -114,12 +120,14 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
         catalogFailures.delete(key);
       } else {
         catalogFailures.set(key, { at: Date.now(), why: "empty" });
-        log(`${kind} catalog came back empty — those graphs run without the model's declared limits${consequence}`);
+        const impact = requireFresh ? "" : " — those graphs run without the model's declared limits";
+        log(`${kind} catalog came back empty${impact}${consequence}`);
       }
     } catch (e) {
       const why = e && e.name === "TimeoutError" ? `no response in ${timeoutMs}ms` : e.message;
       catalogFailures.set(key, { at: Date.now(), why });
-      if (hit) { serveStale(kind, hit, why); return; }
+      if (hit && !requireFresh) { serveStale(kind, hit, why); return; }
+      if (requireFresh) { log(`could not refresh ${kind} catalog (${why})${consequence}`); return; }
       log(`could not load ${kind} catalog (${why}) — those graphs run without the model's declared limits${consequence}`);
     }
   }));
@@ -463,7 +471,7 @@ function authorOptional(wf, inp) {
 }
 
 /** Derived inputs paired with schema-safe keys ("System prompt" → "System_prompt"), deduped. */
-function keyedInputs(wf) {
+export function keyedInputs(wf) {
   const used = new Map();
   return wf.inputs.map((inp) => {
     let safe = schemaKey(inp.key);
@@ -478,7 +486,7 @@ function keyedInputs(wf) {
   });
 }
 
-function buildInputSchema(wf) {
+export function buildInputSchema(wf) {
   const properties = {};
   const required = [];
   for (const { inp, safe, optional, hasDef } of keyedInputs(wf)) {
@@ -526,7 +534,7 @@ const RUN_NOODLE_NAME = "run_noodle";
 export const PRICE_NOODLE_NAME = "price_noodle";
 export const NOODLE_GUIDE_NAME = "noodle_guide";
 /** Model catalog kinds noodle_guide can list. */
-const GUIDE_KINDS = ["chat", "image", "video", "audio", "model3d"];
+const GUIDE_KINDS = ["chat", "decision", "image", "video", "audio", "model3d"];
 
 /** `url` / `graph` / `inputs`: the arguments run_noodle and price_noodle share. */
 const graphArgProperties = () => ({
@@ -588,14 +596,16 @@ const noodleGuideTool = () => ({
   description:
     "Free, never charged: how to write a custom nanoodle workflow graph for run_noodle — the node " +
     "types this server runs (inputs, outputs, key fields), the wiring rules, a complete example " +
-    "graph, and the priced NanoGPT models with their unit prices (cheapest first). Filter with " +
-    "`kind` (chat, image, video, audio, model3d), `search` (model id substring) and `limit`. " +
+    "graph, and hosted NanoGPT model candidates with their unit prices (cheapest first). Filter with " +
+    "`kind`, `node_type`, `search` (model ID substring) and `limit`. Use `format_only` to skip catalog reads. " +
     "Then check the estimated cost with price_noodle before calling run_noodle.",
   inputSchema: {
     type: "object",
     properties: {
       kind: { type: "string", enum: GUIDE_KINDS, description: "Only list models of this kind." },
       search: { type: "string", description: "Only list models whose id contains this text." },
+      node_type: { type: "string", enum: Object.keys(GUIDE_NODE_MODEL_KIND), description: "Only list model candidates for this hosted node type." },
+      format_only: { type: "boolean", description: "Return the graph format, rules and example without looking up models." },
       limit: { type: "integer", minimum: 1, maximum: 50, description: "How many models to list (default 20)." },
     },
   },
@@ -752,6 +762,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
       const rec = result.nodes && result.nodes[o.nodeId];
       if (rec && rec.status === "skipped" && rec.gatedBy) {
         content.push({ type: "text", text: `${o.key}: skipped — gate "${gateName(rec.gatedBy)}" answered no` });
+      } else if (rec?.skipReason === "branch") {
+        content.push({ type: "text", text: `${o.key}: skipped — branch not selected` });
       }
       continue;
     }
@@ -809,7 +821,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * checked the graph first does not decode it twice.
  * @returns {Promise<{ graph: object, workflowGraph: object, inputs: object, wf: Workflow, catalogs: object, source: string, url: string|null }>}
  */
-export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs, allowShortLinks = true, read = null } = {}) {
+export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
+  allowShortLinks = true, read = null, requireFreshCatalogs = false } = {}) {
   if (args == null) args = {};
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
@@ -829,10 +842,11 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch =
     baseUrl: baseUrl || undefined,
     fetch,
     log,
+    requireFresh: requireFreshCatalogs,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
-    consequence: ", so this link runs with whatever payload it asked for",
+    consequence: requireFreshCatalogs ? ", so graphs using it cannot be quoted" : ", so this link runs with whatever payload it asked for",
   });
-  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs });
+  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs, fetch: hostedRunFetch(fetch) });
   if (wf.warnings.length) {
     // unknown node types: the graph decodes but run() would always refuse
     throw new Error(`this ${r.source === "graph" ? "graph" : "share link"} can't run headlessly — ${wf.warnings.join("; ")}`);
@@ -844,7 +858,7 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch =
 async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx }) {
   const { wf, inputs } = await prepareRunNoodle(params.arguments, { apiKey, payment, baseUrl, log, catalogTimeoutMs, allowShortLinks: true });
   const { onProgress, notices, finish } = runNotices(wf, ctx);
-  const result = await wf.run(inputs, { onProgress }).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
+  const result = await wf.run(inputs, hostedRunOptions({ onProgress })).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
   finish(result);
   return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices });
 }
@@ -883,7 +897,8 @@ function inputRefusals(workflowGraph, given) {
  * throw GraphArgsError (-32602); everything else is reported, not thrown.
  * @returns {Promise<{ read: object|null, safety: {ok, refusals}, pricing: object|null, catalogs: object }>}
  */
-export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs, allowShortLinks = true, limits = DEFAULT_LIMITS } = {}) {
+export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
+  allowShortLinks = true, limits = DEFAULT_LIMITS, requireFreshCatalogs = false } = {}) {
   let read;
   try {
     read = await readGraphArgs(args == null ? {} : args, { allowShortLinks, fetch, limits });
@@ -899,6 +914,7 @@ export async function computePrice(args, { baseUrl, fetch = globalThis.fetch, lo
     baseUrl: baseUrl || undefined,
     fetch,
     log,
+    requireFresh: requireFreshCatalogs,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so price_noodle cannot price those nodes",
   });
@@ -959,14 +975,27 @@ export async function noodleGuide(args, { baseUrl, fetch = globalThis.fetch, log
   if (a.limit != null && !(Number.isInteger(a.limit) && a.limit >= 1 && a.limit <= 50)) {
     throw new ParamsError('noodle_guide "limit" must be an integer from 1 to 50');
   }
-  const catalogs = await fetchCatalogs(a.kind ? [a.kind] : GUIDE_KINDS, {
+  if (a.node_type != null && (typeof a.node_type !== "string" || !Object.hasOwn(GUIDE_NODE_MODEL_KIND, a.node_type))) {
+    throw new ParamsError('noodle_guide "node_type" must be an allowed hosted node type');
+  }
+  if (a.format_only != null && typeof a.format_only !== "boolean") {
+    throw new ParamsError('noodle_guide "format_only" must be a boolean');
+  }
+  const kind = a.node_type != null ? GUIDE_NODE_MODEL_KIND[a.node_type] : a.kind;
+  if (a.node_type != null && a.kind != null && a.kind !== kind) {
+    throw new ParamsError('noodle_guide "kind" does not match "node_type"');
+  }
+  const kinds = a.format_only ? [] : kind ? [kind] : a.node_type != null ? [] : GUIDE_KINDS;
+  const catalogs = kinds.length ? await fetchCatalogs(kinds, {
     baseUrl: baseUrl || undefined,
     fetch,
     log,
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: ", so noodle_guide lists no models of that kind",
-  });
-  const g = authoringGuide({ catalogs, kind: a.kind || null, search: a.search || null, limit: a.limit || 20 });
+    requireFresh: true,
+  }) : {};
+  const g = authoringGuide({ catalogs, kind: kind || null, nodeType: a.node_type ?? null,
+    formatOnly: a.format_only, search: a.search || null, limit: a.limit || 20 });
   return { content: [{ type: "text", text: g.text }], structuredContent: g.structured };
 }
 
@@ -1028,7 +1057,9 @@ export class HumanizeUnpriceableError extends Error {
   constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
 }
 
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null }) {
+  const executionLimit = hosted || remote ? hostedRunTimeout(runTimeoutMs ?? undefined) : null;
+  const runtimeFetch = hostedRunFetch();
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -1061,7 +1092,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
       let wf, x402 = null, text;
       try {
         text = await readFile(path, "utf8");
-        wf = Workflow.fromJSON(text, { apiKey, payment, baseUrl, quiet: true });
+        wf = Workflow.fromJSON(text, { apiKey, payment, baseUrl, quiet: true, fetch: runtimeFetch });
         // The library normalizes graphs and drops unknown keys — the hand-added
         // "x402" block (per-graph price / author payout address) rides the raw file.
         const parsed = JSON.parse(text);
@@ -1253,101 +1284,109 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
 
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
     async callTool(params, ctx = null) {
-      if (params != null && typeof params === "object" && !Array.isArray(params)) {
-        if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx });
-        if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
-        if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
-      }
-      const { tool, inputs } = await registry.prepareCall(params);
-      if (tool.builtin) {
-        const t0 = Date.now();
-        const result = await tool.run(params.arguments || {}, {
-          apiKey, payment, baseUrl, registry, hosted, remote,
-          humanize: byName.get(HUMANIZE_TOOL),
-          catalogs: registry.catalogs,
-        });
-        await recordCost(tool, result, Date.now() - t0);
-        return result;
-      }
-
-      // Everything past this point is a run failure, not a protocol error → isError content.
-      const t0 = Date.now();
-      const { onProgress, notices, finish } = runNotices(tool.wf, ctx);
-      // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
-      // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
-      let runWf = tool.wf, hf = null;
-      if (tool.humanize) {
-        const args = params.arguments || {};
-        const opts = humanizeCallOpts(args);
-        const { cleanDraft, writerDraft, spans } = collectSpans(opts.draft, opts.keep);
-        if (cleanDraft !== opts.draft) {
-          const dk = Object.keys(inputs).find((k) => k.trim().toLowerCase() === "draft");
-          if (dk) inputs[dk] = cleanDraft;
+      const execute = async () => {
+        if (params != null && typeof params === "object" && !Array.isArray(params)) {
+          if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx });
+          if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
+          if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
         }
-        // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
-        // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
-        const prices = humanizePriceTable(registry.catalogs);
-        // subnano_comment passes the caps it will send. The deposit has to
-        // reserve those caps even when the refined draft is shorter than the
-        // original, or the decider hold is skipped inside an exact quote.
-        const writerOutTokens = Number(params.maxTokens) > 0 ? Math.floor(Number(params.maxTokens)) : 0;
-        const judgeOutTokens = Number(params.judgeMaxTokens) > 0 ? Math.floor(Number(params.judgeMaxTokens)) : 0;
-        const quoted = humanizeDepositUsd(tool.wf.graph, args, {
-          prices,
-          ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
-          ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
-        });
-        // Estimated decider headroom for admission checks: until the decider
-        // starts, a writer step is admitted only if it fits with this estimate
-        // still counted. It is an estimate, not money set aside.
-        const deciderReserveUsd = quoted != null ? (humanizeDeciderReserveUsd(tool.wf.graph, args, {
-          prices,
-          ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
-          ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
-        }) ?? 0) : 0;
-        // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
-        hf = humanizeFetch({
-          record: tool.humanize,
-          hosted,
-          draft: cleanDraft,
-          writerDraft: spans.length ? writerDraft : null,
-          spans,
-          ending: opts.ending,
-          maxChars: opts.maxChars,
-          guidance: opts.guidance,
-          title: opts.title === true,
-          payment: apiKey ? null : payment,
-          baseUrl: baseUrl || "https://nano-gpt.com",
-          // An unpriceable request falls back to the worst-case ceiling, never a stale pin.
-          budgetUsd: hosted ? (quoted ?? humanizeQuoteOrCeiling(tool, null, prices)) : null,
-          deciderReserveUsd: hosted ? deciderReserveUsd : 0,
-          prices,
-          // subnano_comment sizes this humanize run from the request. A normal
-          // humanize-comment call leaves these unset, and the v2.8 caps apply.
-          ...(Number(params.maxTokens) > 0 ? { writerTokenCap: Math.floor(Number(params.maxTokens)) } : {}),
-          ...(Number(params.judgeMaxTokens) > 0 ? { judgeTokenCap: Math.floor(Number(params.judgeMaxTokens)) } : {}),
-        });
-        // a writer payment that settles after its writer stopped waiting: the operator log keeps it
-        hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
-        runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
-      }
-      const result = await runWf.run(inputs, { onProgress }).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
-      finish(result);
-      if (tool.humanize) {
-        notices.push(...humanizeRunNotes(hf.state));
-        const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered, hf.state);
-        if (note) notices.push(note);
-        const fb = await applyHumanizeFallback(runWf, result, tool.humanize, hf.state);
-        if (fb && fb.error) throw new Error(fb.error);
-        if (fb && fb.note) notices.push(fb.note);
-        // attempts whose answer never reached the engine (failed fallbacks, paid-but-failed calls,
-        // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
-        if (hf.state.unreportedUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.unreportedUsd;
-        if (hf.state.reviewUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.reviewUsd;
-        if (hf.state.costUnknown) result.costExact = false;
-      }
-      await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
-      return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
+        const { tool, inputs } = await registry.prepareCall(params);
+        if (tool.builtin) {
+          const t0 = Date.now();
+          const result = await tool.run(params.arguments || {}, {
+            apiKey, payment, baseUrl, registry, hosted, remote, fetch: runtimeFetch,
+            humanize: byName.get(HUMANIZE_TOOL),
+            catalogs: registry.catalogs,
+          });
+          await recordCost(tool, result, Date.now() - t0);
+          return result;
+        }
+
+        // Everything past this point is a run failure, not a protocol error → isError content.
+        const t0 = Date.now();
+        const { onProgress, notices, finish } = runNotices(tool.wf, ctx);
+        // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
+        // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
+        let runWf = tool.wf, hf = null;
+        if (ctx?.paidFunding === true && !tool.humanize) {
+          const bound = bindPaidGraph(tool.wf.graph, registry.catalogs || tool.wf.catalog);
+          runWf = new Workflow(bound.graph, { apiKey: apiKey ?? null, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: runtimeFetch });
+        }
+        if (tool.humanize) {
+          const args = params.arguments || {};
+          const opts = humanizeCallOpts(args);
+          const { cleanDraft, writerDraft, spans } = collectSpans(opts.draft, opts.keep);
+          if (cleanDraft !== opts.draft) {
+            const dk = Object.keys(inputs).find((k) => k.trim().toLowerCase() === "draft");
+            if (dk) inputs[dk] = cleanDraft;
+          }
+          // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
+          // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
+          const prices = humanizePriceTable(registry.catalogs);
+          // subnano_comment passes the caps it will send. The deposit has to
+          // reserve those caps even when the refined draft is shorter than the
+          // original, or the decider hold is skipped inside an exact quote.
+          const writerOutTokens = Number(params.maxTokens) > 0 ? Math.floor(Number(params.maxTokens)) : 0;
+          const judgeOutTokens = Number(params.judgeMaxTokens) > 0 ? Math.floor(Number(params.judgeMaxTokens)) : 0;
+          const quoted = humanizeDepositUsd(tool.wf.graph, args, {
+            prices,
+            ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
+            ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
+          });
+          // Estimated decider headroom for admission checks: until the decider
+          // starts, a writer step is admitted only if it fits with this estimate
+          // still counted. It is an estimate, not money set aside.
+          const deciderReserveUsd = quoted != null ? (humanizeDeciderReserveUsd(tool.wf.graph, args, {
+            prices,
+            ...(writerOutTokens > 0 ? { writerOutTokens } : {}),
+            ...(judgeOutTokens > 0 ? { judgeOutTokens } : {}),
+          }) ?? 0) : 0;
+          // keyless x402: the wrapper settles writer invoices itself with the same callback (see humanize.mjs)
+          hf = humanizeFetch({
+            fetch: runtimeFetch,
+            record: tool.humanize,
+            hosted,
+            draft: cleanDraft,
+            writerDraft: spans.length ? writerDraft : null,
+            spans,
+            ending: opts.ending,
+            maxChars: opts.maxChars,
+            guidance: opts.guidance,
+            title: opts.title === true,
+            payment: apiKey ? null : payment,
+            baseUrl: baseUrl || "https://nano-gpt.com",
+            // An unpriceable request falls back to the worst-case ceiling, never a stale pin.
+            budgetUsd: hosted ? (quoted ?? humanizeQuoteOrCeiling(tool, null, prices)) : null,
+            deciderReserveUsd: hosted ? deciderReserveUsd : 0,
+            prices,
+            // subnano_comment sizes this humanize run from the request. A normal
+            // humanize-comment call leaves these unset, and the v2.8 caps apply.
+            ...(Number(params.maxTokens) > 0 ? { writerTokenCap: Math.floor(Number(params.maxTokens)) } : {}),
+            ...(Number(params.judgeMaxTokens) > 0 ? { judgeTokenCap: Math.floor(Number(params.judgeMaxTokens)) } : {}),
+          });
+          // a writer payment that settles after its writer stopped waiting: the operator log keeps it
+          hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
+          runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
+        }
+        const result = await runWf.run(inputs, hostedRunOptions({ onProgress })).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
+        finish(result);
+        if (tool.humanize) {
+          notices.push(...humanizeRunNotes(hf.state));
+          const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered, hf.state);
+          if (note) notices.push(note);
+          const fb = await applyHumanizeFallback(runWf, result, tool.humanize, hf.state);
+          if (fb && fb.error) throw new Error(fb.error);
+          if (fb && fb.note) notices.push(fb.note);
+          // attempts whose answer never reached the engine (failed fallbacks, paid-but-failed calls,
+          // timed-out re-asks) are still billed: put them in the total that feeds refund and payout math
+          if (hf.state.unreportedUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.unreportedUsd;
+          if (hf.state.reviewUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.reviewUsd;
+          if (hf.state.costUnknown) result.costExact = false;
+        }
+        await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
+        return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
+      };
+      return executionLimit === null ? execute() : withHostedRun(execute, executionLimit);
     },
   };
   return registry;

@@ -17,6 +17,7 @@
  */
 import { logSafe } from "../src/market/worker.mjs";
 import { HELP, MarketConfigError, readConfig, startMarketService } from "../src/market/service.mjs";
+import { acquireWriterLocks, canonicalStatePath } from "../src/process-lock.mjs";
 
 export { PLATFORM_FEE_RATE, defaultStateDir, readDefaultWorkflow, readConfig, runLoop } from "../src/market/service.mjs";
 
@@ -31,7 +32,13 @@ function orDie(e) {
 async function main() {
   const log = (line) => process.stderr.write(`${new Date().toISOString()} market-worker: ${logSafe(line)}\n`);
   let svc;
-  try { svc = await startMarketService(readConfig(), { log }); } catch (e) { orDie(e); }
+  try {
+    const cfg = readConfig();
+    if (process.env.NANOODLE_STATE_POLICY) die("This production state policy requires the in-server Market worker; start nanoodle-mcp.service");
+    const held = acquireWriterLocks({ resources: [`market:${canonicalStatePath(cfg.stateDir)}`] });
+    process.once("exit", held.close);
+    svc = await startMarketService(cfg, { log });
+  } catch (e) { if (!(e instanceof MarketConfigError)) die(e.message); orDie(e); }
   let signalled = false;
   const onSignal = (sig) => {
     if (signalled) { log(`${sig} again: exiting now; a job that was running is handed back on the next start`); try { svc.store.close(); } catch { /* closed */ } process.exit(1); }

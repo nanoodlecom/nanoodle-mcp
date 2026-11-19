@@ -15,9 +15,10 @@
  *                                                  └── run failed / found "running" after a restart ──> declining (failed)
  *                                                                                    request changes ──> reworking ──> submitting
  *
- * - The paid workflow runs only after `start` answered 200, and only from the
- *   "started" phase. "running" is written (fsync) before the first NanoGPT
- *   call. A record found in "running" when the worker starts was interrupted:
+ * - The paid workflow runs only after `start` answered 200 and a fresh read
+ *   confirms the assignment is still active and funded. "running" is written
+ *   (fsync) before the first NanoGPT call. A record found in "running" when
+ *   the worker starts was interrupted:
  *   it is handed back with a full buyer refund (decline, reason "failed"), and
  *   never run again.
  * - `start` is idempotent on the market, so an uncertain start is retried.
@@ -40,6 +41,9 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { splitPlainBrief, resolveFields, parseBrief, BriefError } from "./brief.mjs";
 import { MarketApiError } from "./client.mjs";
+import { marketEscrowTerms } from "./catalog.mjs";
+import { marketDeliveryWindow } from "./deadline.mjs";
+import { marketCreatorPayoutTerms, sameCreatorPayout } from "../creator-payout-evidence.mjs";
 import {
   pricingSummary, buildDeliverable, textOutputsFile, briefDeclineDetail, refusalDeclineDetail, failureDeclineDetail, customNotOfferedDetail,
   startedMessage, REWORK_MESSAGE, MAX_INLINE_TEXT_BYTES, MAX_DELIVERABLE_BYTES, MAX_LISTED_FILES,
@@ -47,7 +51,7 @@ import {
 
 /** Phases after which the worker does nothing more for an assignment (unless the buyer sends it back). */
 export const TERMINAL = new Set(["declined", "gone", "ignored", "stuck", "submitted"]);
-const NEEDS_ROW = new Set(["new", "started"]);
+const NEEDS_ROW = new Set(["new", "starting", "started"]);
 const PROGRESS_MIN_MS = 30_000;
 
 const short = (id) => String(id).slice(0, 8);
@@ -75,9 +79,7 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  *        workflow block is declined before start (default true)
  * @param {string|null} [o.customHandle]  with customWorkflows false: the handle of a listing that does run
  *        buyers' own workflows, named in that decline
- * @param {((escrowAmount: string) => { priceUsd: number, budgetUsd: number }|null)|null} [o.bidTerms]
- *        for a job awarded from a bid (the row has a bidId): the price and budget its escrow gives.
- *        Unset, such a job runs within the listing's budget like any other.
+ * @param {boolean} [o.useBidBudget]  allow awards with a bidId to use their own net escrow as the budget
  * @param {number} [o.concurrency]  assignments advanced at once (default 2)
  * @param {number} [o.backoffMs]    first retry delay after a transient error (default 30 s, doubling to 10 min)
  * @param {number} [o.retainMs]     keep finished records this long (default 30 days)
@@ -86,11 +88,16 @@ const tag = (s) => createHash("sha256").update(String(s)).digest("hex").slice(0,
  */
 export function createMarketWorker({
   client, store, runner, budgetUsd, listingPriceUsd = null, defaultWorkflow = null,
-  customWorkflows = true, customHandle = null, bidTerms = null, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
+  customWorkflows = true, customHandle = null, useBidBudget = false, concurrency = 2, backoffMs = 30_000, maxBackoffMs = 600_000, retainMs = 30 * 86_400_000,
   log: rawLog = () => {}, now = Date.now,
+  creatorPayments = null,
+  checkFee = null,
+  maintenance = null,
 }) {
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createMarketWorker needs a positive budgetUsd");
   if (!customWorkflows && !defaultWorkflow) throw new TypeError("createMarketWorker: a listing without custom workflows needs a default workflow");
+  if (maintenance !== null && (typeof maintenance.run !== "function" || typeof maintenance.capture !== "function" || typeof maintenance.assertAdmitted !== "function")) throw new TypeError("maintenance must provide operation admission and accounting");
+  maintenance?.assertAdmitted();
   // The current budget and price. They can change while the worker runs (the listing's price
   // on the market changed); a job keeps the budget it was accepted under (stored on its record).
   let budgetNow = budgetUsd;
@@ -119,6 +126,48 @@ export function createMarketWorker({
   const ok = (fields) => ({ attempts: 0, nextAttemptAt: 0, lastError: null, ...fields });
   /** The budget a job was accepted under (records from before this field existed: the current one). */
   const budgetOf = (rec) => (Number.isFinite(rec.budgetUsd) && rec.budgetUsd > 0 ? rec.budgetUsd : budgetNow);
+  const creatorProceedsOf = rec => {
+    const cap = rec.creator?.proceedsCapUsd;
+    if (cap == null) return budgetOf(rec); // Honor already-accepted legacy terms.
+    if (!Number.isFinite(cap) || cap <= 0 || cap > budgetOf(rec)) throw Error("Invalid accepted creator budget");
+    return cap;
+  };
+  function declineEscrow(rec, reason, code) {
+    const detail = code === "MARKET_ESCROW_CURRENCY" ? "The assignment's escrow is in an unsupported currency."
+      : "The assignment's escrow after the marketplace fee cannot cover this workflow.";
+    return set(rec.id, ok({ phase: "declining", decline: { reason, code, detail: `${detail} No model was run. Your payment will be refunded in full.` } }));
+  }
+  function checkEscrow(rec, row, reason) {
+    const terms = marketEscrowTerms(row?.assignment);
+    if (!terms.code) return { terms };
+    if (terms.code === "MARKET_ESCROW_UNAVAILABLE") return { stop: backoff(rec, new Error("Market assignment escrow could not be verified")) };
+    return { stop: declineEscrow(rec, reason, terms.code) };
+  }
+  function finishGone(rec, reason) {
+    prepared.delete(rec.id);
+    log(`assignment ${short(rec.id)}: skipping workflow (${reason}); nothing was run`);
+    return set(rec.id, ok({ phase: "gone", finishedAt: now() }));
+  }
+  function deadlineRefusal(rec, timing) {
+    const at = now();
+    if (!timing || timing.hiredAt > at + 30_000) return backoff(rec, new Error("Market assignment delivery deadline could not be verified"));
+    if (at < timing.executionDeadlineAt) return null;
+    const expired = at >= timing.deadline;
+    const reason = expired ? "The assignment's delivery deadline passed before inference could start."
+      : "Too little time remained to run the workflow and submit its result.";
+    return set(rec.id, ok({ phase: "declining", decline: { reason: "failed",
+      code: expired ? "MARKET_SLA_EXPIRED" : "MARKET_SLA_TOO_CLOSE",
+      detail: `${reason} No model was run. Your payment will be refunded in full.` } }));
+  }
+  async function feeRefusal(rec, reason) {
+    if (!checkFee) return null;
+    try { await checkFee(); return null; }
+    catch (error) {
+      if (error.code !== "MARKET_FEE_CHANGED") return backoff(rec, error);
+      return set(rec.id, ok({ phase: "declining", decline: { reason, code: error.code,
+        detail: "The marketplace fee changed beyond this listing's pricing allowance. No model was run; your payment is refunded in full." } }));
+    }
+  }
 
   async function progress(id, message, percent) {
     const t = now();
@@ -183,30 +232,42 @@ export function createMarketWorker({
       log(`assignment ${short(rec.id)}: workflow refused (${codes.join(", ")})`);
       return { decline: { reason: "rejected", code: codes.join(","), detail: refusalDeclineDetail(priced.refusals, { budgetUsd: jobBudget }) } };
     }
-    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault, usedFields, fieldNotes };
+    return { pricing: priced.pricing, inputs: priced.inputs, usedDefault, usedFields, fieldNotes, x402: priced.x402 };
   }
 
   async function phaseNew(rec, row) {
-    // A job awarded from a bid was quoted its own price: its budget is what that escrow leaves
-    // after the fee, not the listing's.
-    const a = (row && row.assignment) || {};
-    const quoted = bidTerms && a.bidId ? bidTerms(a.escrowAmount) : null;
-    const jobBudget = quoted ? Math.max(quoted.budgetUsd, 1e-6) : budgetNow;
-    const jobPrice = quoted ? quoted.priceUsd : priceNow;
-    if (quoted) log(`assignment ${short(rec.id)}: awarded from a bid at $${quoted.priceUsd}; its budget is $${quoted.budgetUsd}`);
+    const { terms, stop } = checkEscrow(rec, row, "rejected");
+    if (stop) return stop;
+    const quoted = useBidBudget && !!row.assignment.bidId;
+    const jobBudget = quoted ? terms.budgetUsd : Math.min(budgetNow, terms.budgetUsd);
+    if (quoted) log(`assignment ${short(rec.id)}: awarded from a bid at $${terms.priceUsd}; its budget is $${jobBudget}`);
     const r = await priceFromRow(rec, row, jobBudget);
     if (r.transient) return backoff(rec, r.transient);
     if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
+    let creator = null;
+    if (r.x402?.author != null && r.x402.author !== "") {
+      if (!creatorPayments) return set(rec.id, ok({ phase: "declining", decline: { reason: "rejected", code: "CREATOR_PAYOUT_UNAVAILABLE", detail: "This workflow names a creator, but Nano creator payouts are not configured. Nothing was run; your payment is refunded in full." } }));
+      try {
+        const terms = await creatorPayments.prepare(r.x402);
+        creator = terms ? { ...terms, proceedsCapUsd: Math.min(jobBudget, r.pricing.depositUsd) } : null;
+      }
+      catch (e) {
+        if (e instanceof TypeError) return set(rec.id, ok({ phase: "declining", decline: { reason: "rejected", code: "BAD_AUTHOR", detail: "The workflow's x402.author must be a valid Nano address. Nothing was run; your payment is refunded in full." } }));
+        return backoff(rec, new Error("Creator exchange rate is unavailable"));
+      }
+    }
     prepared.set(rec.id, { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault, usedFields: r.usedFields, fieldNotes: r.fieldNotes });
     log(`assignment ${short(rec.id)}: accepted — estimated cost $${r.pricing.estimatedCostUsd.toFixed(6)}, with 20% $${r.pricing.depositUsd}, within budget $${jobBudget}`);
     return set(rec.id, ok({
       phase: "starting", pricing: pricingSummary(r.pricing), defaultWorkflow: r.usedDefault ? defaultWorkflow.label : null,
       defaultFields: r.usedDefault ? r.usedFields : [], defaultNotes: r.usedDefault ? r.fieldNotes : [],
-      budgetUsd: jobBudget, listingPriceUsd: jobPrice, quoted: !!quoted,
+      budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd, quoted,
+      ...(creator ? { creator } : {}),
     }));
   }
 
   async function phaseDeclining(rec) {
+    prepared.delete(rec.id);
     try {
       await client.decline(rec.id, { reason: rec.decline.reason, detail: rec.decline.detail });
     } catch (e) {
@@ -224,7 +285,14 @@ export function createMarketWorker({
     return set(rec.id, ok({ phase: "declined", finishedAt: now() }));
   }
 
-  async function phaseStarting(rec) {
+  async function phaseStarting(rec, row) {
+    const { terms, stop } = checkEscrow(rec, row, "rejected");
+    if (stop) return stop;
+    if (rec.pricing?.depositUsd > terms.budgetUsd) return declineEscrow(rec, "rejected", "MARKET_ESCROW_TOO_LOW");
+    const timing = marketDeliveryWindow(row?.assignment);
+    const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
+    const refused = await feeRefusal(rec, "rejected"); if (refused) return refused;
+    const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
     try {
       const r = await client.start(rec.id);
       return set(rec.id, ok({ phase: "started", startedAt: (r && r.startedAt) || new Date(now()).toISOString() }));
@@ -240,8 +308,22 @@ export function createMarketWorker({
     }
   }
 
-  async function phaseStarted(rec, row) {
-    const jobBudget = budgetOf(rec);
+  async function phaseStarted(rec) {
+    // Start is idempotent and its response only carries a timestamp. Read back
+    // the assignment to catch cancellation or changed funding after the poll.
+    const row = await lookup(rec.id);
+    const assignment = row?.assignment;
+    if (!assignment?.status) return backoff(rec, new Error("Market assignment status could not be verified"));
+    if (assignment.status !== "in_progress") return finishGone(rec, assignment.status);
+    if (assignment.submittedAt || assignment.deliverableUrl) return finishGone(rec, "already delivered");
+    if (!Number.isFinite(Date.parse(assignment.startedAt))) {
+      return backoff(rec, new Error("Market assignment start could not be verified"));
+    }
+    const timing = marketDeliveryWindow(assignment);
+    const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
+    const { terms, stop } = checkEscrow(rec, row, "failed");
+    if (stop) return stop;
+    const jobBudget = Math.min(budgetOf(rec), terms.budgetUsd);
     let prep = prepared.get(rec.id);
     if (!prep) {
       // Restarted between start and run: nothing ran yet. Price again from the brief,
@@ -251,15 +333,31 @@ export function createMarketWorker({
       if (r.decline) return set(rec.id, ok({ phase: "declining", decline: r.decline }));
       prep = { pricing: r.pricing, inputs: r.inputs, usedDefault: r.usedDefault };
     }
-    prepared.delete(rec.id);
+    if (prep.pricing.depositUsd > jobBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
+    const refused = await feeRefusal(rec, "failed"); if (refused) return refused;
+    const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
     await say(rec.id, startedMessage(prep.pricing, { budgetUsd: jobBudget, defaultLabel: prep.usedDefault ? defaultWorkflow.label : null, fields: prep.usedDefault ? prep.usedFields || [] : [], notes: prep.usedDefault ? prep.fieldNotes || [] : [] }), `nanoodle-start-${rec.id}`);
-    // Durable BEFORE the first paid call: a crash from here on is never re-run.
-    rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now() }));
     await progress(rec.id, `Running the workflow once (${prep.pricing.items.length} paid step${prep.pricing.items.length === 1 ? "" : "s"})`, 10);
+    const afterProgress = deadlineRefusal(rec, timing); if (afterProgress) return afterProgress;
+    prepared.delete(rec.id);
+    // Durable BEFORE the first paid call: a crash from here on is never re-run.
+    rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),
+      executionDeadlineAt: timing.executionDeadlineAt,
+      budgetUsd: jobBudget, listingPriceUsd: terms.priceUsd,
+      ...(rec.creator && { creator: { ...rec.creator, proceedsCapUsd: Math.min(creatorProceedsOf(rec), jobBudget) } }),
+    }));
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
     try {
-      run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id) });
+      run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
+        fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt: timing.executionDeadlineAt,
+        onRunComplete(result) {
+          if (!rec.creator || !creatorPayments) return;
+          const empty = result.outputs.length > 0 && result.outputs.every(o => o.kind === "text" && !String(o.text || "").trim());
+          const reserveRaw = empty ? "0" : creatorPayments.amount(rec.creator, { costUsd: result.costUsd, proceedsUsd: creatorProceedsOf(rec) });
+          rec = set(rec.id, { creator: { ...rec.creator, reserveRaw } });
+        },
+      });
     } catch (e) {
       log(`assignment ${short(rec.id)}: run failed (${errText(e)}); handing it back`);
       // Only the provider's own per-step message (runner.mjs marks it buyerMessage) goes to the
@@ -421,8 +519,8 @@ export function createMarketWorker({
       switch (rec.phase) {
         case "new": rec = await phaseNew(rec, row); break;
         case "declining": rec = await phaseDeclining(rec); break;
-        case "starting": rec = await phaseStarting(rec); break;
-        case "started": rec = await phaseStarted(rec, row); break;
+        case "starting": rec = await phaseStarting(rec, row); break;
+        case "started": rec = await phaseStarted(rec); break;
         case "running": rec = phaseInterrupted(rec); break;
         case "delivering": rec = await phaseDelivering(rec); break;
         case "submitting": rec = await phaseSubmitting(rec); break;
@@ -437,7 +535,7 @@ export function createMarketWorker({
 
   function launch(id, row) {
     if (inflight.has(id)) return;
-    const p = (async () => {
+    const execute = async () => {
       await acquire();
       try { await advance(id, row); } catch (e) {
         const rec = store.get(id);
@@ -447,11 +545,31 @@ export function createMarketWorker({
         release();
         inflight.delete(id);
       }
-    })();
+    };
+    // Include waiting for a concurrency slot and all delivery/submission work,
+    // not only the runner's funding reservation.
+    const scheduled = maintenance ? maintenance.capture(execute) : execute;
+    const p = scheduled();
     inflight.set(id, p);
   }
 
   /** One poll: list actionable assignments, record new ones, and advance everything that is due. */
+  async function reconcileCreator(rec) {
+    if (!rec.creator || ["queued", "none", "cancelled"].includes(rec.creator.status) || rec.phase !== "submitted") return;
+    if (!creatorPayments) return; // Keep the debt until the payout wallet is configured again.
+    if (rec.creator.status === "awaiting_acceptance") {
+      const row = await lookup(rec.id);
+      if (row?.assignment?.status === "cancelled") { set(rec.id, { creator: { ...rec.creator, status: "cancelled" } }); return; }
+      if (row?.assignment?.status !== "accepted") return;
+      const amountRaw = creatorPayments.amount(rec.creator, { costUsd: rec.run?.costUsd, proceedsUsd: creatorProceedsOf(rec) });
+      rec = set(rec.id, { creator: { ...rec.creator, amountRaw, status: amountRaw === "0" ? "none" : "owed" } });
+    }
+    if (rec.creator.status === "owed") {
+      creatorPayments.enqueue(rec.id, rec.creator);
+      set(rec.id, { creator: { ...rec.creator, status: "queued" } });
+    }
+  }
+
   async function tick() {
     let rows = null;
     try { rows = await client.listActionable(); } catch (e) {
@@ -504,13 +622,23 @@ export function createMarketWorker({
         let found;
         try { found = await lookup(rec.id); } catch (e) { backoff(rec, e); continue; }
         if (found && found.assignment.status === "in_progress") { launch(rec.id, found); continue; }
-        log(`assignment ${short(rec.id)}: no longer in progress (${found ? found.assignment.status : "not listed"}); nothing was run`);
-        store.update(rec.id, ok({ phase: "gone", finishedAt: now() }));
+        finishGone(rec, found?.assignment.status ?? "not listed");
         continue;
       }
       launch(rec.id, row);
     }
-    try { store.prune(now() - retainMs, (r) => r.phase === "declined" || r.phase === "gone" || r.phase === "ignored" || r.phase === "submitted"); } catch { /* next time */ }
+    for (const rec of store.all()) {
+      try { await reconcileCreator(rec); } catch { log(`assignment ${short(rec.id)}: creator settlement is pending; will retry`); }
+    }
+    try {
+      const payouts = new Map((creatorPayments?.payoutRecords?.() ?? []).map(p => [p.paymentId, p]));
+      store.prune(now() - retainMs, r => {
+        if (!["declined", "gone", "ignored", "submitted"].includes(r.phase)) return false;
+        const payout = payouts.get(`market_${r.id}`), expected = marketCreatorPayoutTerms(r);
+        if (expected) return r.creator.status === "queued" && payout && !payout.reconciliationRequired && sameCreatorPayout(expected, payout);
+        return !payout && (!r.creator || ["none", "cancelled"].includes(r.creator.status));
+      });
+    } catch { /* next time */ }
   }
 
   /** Wait for every assignment being advanced right now. */
@@ -528,5 +656,5 @@ export function createMarketWorker({
     priceNow = p;
   }
 
-  return { tick, drain, setBudget, budget: () => ({ budgetUsd: budgetNow, listingPriceUsd: priceNow }), inflight: () => inflight.size };
+  return { tick: maintenance ? () => maintenance.run(tick, "background") : tick, drain, setBudget, budget: () => ({ budgetUsd: budgetNow, listingPriceUsd: priceNow }), inflight: () => inflight.size };
 }

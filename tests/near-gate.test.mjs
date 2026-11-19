@@ -8,15 +8,21 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadTools } from "../src/tools.mjs";
+import { fetchCatalogs, loadTools } from "../src/tools.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
+import { serveHttp } from "../src/http.mjs";
 import {
-  createNearRpc, openNearLedger, createNearUsdRate, createRefunder, parseNearSecretKey, parseNearToYocto,
+  createNearRpc, createNearWatcher, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
 } from "../src/near/index.mjs";
-import { createFakeChain, throwawayNearKey, GAS_YOCTO, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
+import { createRunFunding } from "../src/run-funding.mjs";
+import { createNearFunding } from "../src/near/funding.mjs";
+import { USDC_CONTRACTS } from "../src/near/ft.mjs";
+import { RETAIN_NEAR_QUOTE_MS } from "../src/near/quote-capacity.mjs";
+import { createFakeChain, throwawayNearKey, GAS_YOCTO, WORKED_CATALOGS, WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
 
 const MERCHANT = "merchant.testnet";
 const PAYER = "payer.testnet";
@@ -37,29 +43,35 @@ before(async () => {
 });
 after(() => { globalThis.fetch = realFetch; });
 
-async function world({ limits, dust = 137, publicBase } = {}) {
+async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false,
+  merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch, now = Date.now,
+  watchPaymentHistory = false, randomInt = () => dust++ } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
-  const chain = createFakeChain();
-  chain.addAccount(MERCHANT, parseNearToYocto("10"), key.publicKey);
+  const chain = createFakeChain({ now });
+  chain.addAccount(MERCHANT, merchantBalance, key.publicKey);
   chain.addAccount(PAYER, parseNearToYocto("5"));
-  const registry = await loadTools({ dirs: [graphsDir], apiKey: "test-key", outDir: out, publicBase: "http://127.0.0.1:1", log: () => {} });
+  if (usdcToken) chain.addFt(usdcToken, { [MERCHANT]: 0n, [PAYER]: 1_000_000n });
+  const registry = await loadTools({ dirs: [graphsDir], apiKey: "test-key", baseUrl, outDir: out, publicBase: "http://127.0.0.1:1", log: () => {} });
   const file = join(out, "near-state.json");
   const events = [];
   const make = () => {
     const rpc = createNearRpc({ url: "https://rpc.fake", fetch: chain.fetch });
-    const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT });
+    const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT, now, watchPaymentHistory });
     const signer = parseNearSecretKey(key.secretKey);
-    const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null });
+    const refundFunding = guardRefunds ? createNearFunding({ rpc, ledger, accountId: MERCHANT, publicKey: signer.publicKey, network: "testnet" }) : null;
+    const refunder = createRefunder({ rpc, signer, accountId: MERCHANT, ledger, schedule: () => null,
+      beforeSign: refundFunding?.beforeSign, beforeComplete: refundFunding?.beforeComplete, maintenance, usdcToken });
     const gate = createNearGate({
       merchantId: MERCHANT, network: "testnet", rpc, ledger, refunder,
-      rate: createNearUsdRate({ staticUsd: "3.64" }),
+      rate: rate || createNearUsdRate({ staticUsd: "3.64" }),
       // The first quote gets the worked example's dust (137 steps); later ones count up from there.
-      limits, fetch: mock.fetch, randomInt: () => dust++, publicBase,
+      limits, fetch: catalogFetch, randomInt, publicBase, canQuote, fundRun, refundFunding, maintenance,
+      baseUrl, now, ...(usdcToken && { usdcEnabled: true, usdcToken }),
       usage: (event, fields) => events.push({ event, ...fields }),
     });
     const { listTools, callTool } = gate.wrapRegistry(registry);
-    return { gate, ledger, refunder, listTools, callTool };
+    return { gate, ledger, rpc, refunder, listTools, callTool };
   };
   const g = make();
   return { ...g, chain, registry, file, out, events, restart: async () => { const n = make(); await n.gate.resume(); return n; } };
@@ -67,6 +79,140 @@ async function world({ limits, dust = 137, publicBase } = {}) {
 
 const call = (w, name, args) => w.callTool({ name, arguments: args });
 const text = (r) => r.content.map((c) => c.text || "").join("\n");
+
+test("saved and custom NEAR workflows inherit one funding reservation from their paid quote", async () => {
+  for (const [name, inputs] of [["idea-poster", INPUTS], ["run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }]]) {
+    let tail = Promise.resolve();
+    const pool = createRunFunding({ serial: fn => { const p = tail.then(fn); tail = p.catch(() => {}); return p; },
+      balance: async () => 100n * 10n ** 30n });
+    const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+    const policies = [];
+    const w = await world({ rate, fundRun: (terms, execute) => { policies.push(terms); return pool.run(terms, execute); } });
+    const original = w.registry.callTool;
+    w.registry.callTool = (...args) => {
+      assert.equal(pool.snapshot().activeRuns, 1);
+      return original(...args);
+    };
+    const { p, tx } = await quoteAndPay(w, name, inputs);
+    const result = await call(w, name, { ...inputs, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+    assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+    assert.equal(policies.length, 1);
+    assert.equal(policies[0].id, `near:${p.paymentId}`);
+    assert.ok(policies[0].maxRaw > 0n);
+    assert.equal(pool.snapshot().activeRuns, 0);
+    await call(w, name, { ...inputs, _payment_id: p.paymentId });
+    assert.equal(policies.length, 1, "receipt replay cannot grant a new budget");
+  }
+});
+
+test("funding refusal refunds a NEAR deposit without starting a model", async () => {
+  const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+  const pool = createRunFunding({ serial: fn => fn(), balance: async () => 0n });
+  const w = await world({ rate, fundRun: pool.run });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  const before = mock.runs();
+  const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+  assert.equal(result.structuredContent.receipt.outcome, "run_failed");
+  assert.equal(result.structuredContent.receipt.refund.status, "sent");
+  assert.equal(mock.runs(), before);
+});
+
+test("an increased model price beyond the locked quote refunds NEAR and USDC before reserving or running", async () => {
+  for (const [asset, name, inputs] of [["near", "idea-poster", INPUTS], ["usdc", "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }]]) {
+    const usdcToken = asset === "usdc" ? USDC_CONTRACTS.testnet : undefined;
+    const baseUrl = `https://repriced-${asset}.example`;
+    const rate = createNearRates({ nearUsd: "3.64", xnoUsd: "0.5", xnoRequired: true });
+    const w = await world({ rate, baseUrl, usdcToken, fundRun: () => assert.fail("No run reservation is needed if the quote cannot cover it") });
+    const args = { ...inputs, _pay_with: asset };
+    const quote = await call(w, name, args);
+    assert.ok(!quote.isError, text(quote));
+    const payment = quote.structuredContent.payment;
+    const amount = BigInt(payment.amountAtomic ?? payment.amountYocto);
+    const tx = usdcToken ? w.chain.ftTransfer(usdcToken, PAYER, MERCHANT, amount) : w.chain.transfer(PAYER, MERCHANT, amount);
+
+    const costlyImage = { ...WORKED_CATALOGS.image[0], pricing: { per_image: { "1024x1024": 0.08 }, currency: "USD" } };
+    const refreshed = nanoGptMock({ catalogs: { ...WORKED_CATALOGS, image: [costlyImage] } });
+    await fetchCatalogs(["image"], { baseUrl, fetch: refreshed.fetch, maxAgeMs: 0 });
+    const before = mock.runs();
+    const paidArgs = { ...args, _payment_id: payment.paymentId, _payment_tx: tx, _payment_sender: PAYER };
+    const result = await call(w, name, paidArgs);
+    assert.equal(result.isError, true);
+    assert.match(text(result), /estimate exceeds this quote's budget. No model work started/);
+    const { charged, refund, outcome } = result.structuredContent.receipt;
+    assert.equal(outcome, "run_failed");
+    assert.equal(charged.amountAtomic ?? charged.yocto, "0");
+    assert.equal(refund.amountAtomic ?? refund.yocto, amount.toString());
+    assert.equal(refund.status, "sent");
+    assert.deepEqual((await call(w, name, paidArgs)).structuredContent, result.structuredContent);
+    assert.equal(w.chain.sendTxCount, 1);
+    assert.equal(mock.runs(), before);
+  }
+});
+
+test("an expired catalog cannot make the pricing probe or a new quote look ready during an outage", async t => {
+  let now = Date.now(), requests = 0;
+  const baseUrl = "https://stale-catalog.example";
+  t.mock.method(Date, "now", () => now);
+  const catalogFetch = async () => {
+    requests++;
+    return new Response("Catalog unavailable", { status: 503 });
+  };
+  await fetchCatalogs(["chat", "image"], { baseUrl, fetch: mock.fetch });
+  const w = await world({ baseUrl, catalogFetch });
+  const args = { graph: WORKED_GRAPH, inputs: INPUTS };
+  const fresh = await call(w, "price_noodle", args);
+  assert.equal(fresh.structuredContent.pricing.safety.ok, true);
+  assert.equal(requests, 0);
+
+  now += 5 * 60_000;
+  const stale = await call(w, "price_noodle", args);
+  const safety = stale.structuredContent.pricing.safety;
+  assert.equal(safety.ok, false);
+  assert.ok(safety.refusals.some(item => item.code === "CATALOG_UNAVAILABLE"));
+  const refused = await call(w, "idea-poster", INPUTS);
+  assert.equal(refused.isError, true);
+  assert.equal(w.ledger.quotes().length, 0);
+  assert.equal(requests, 2, "one attempt per catalog during the refresh cooldown");
+});
+
+test("refund gas is checked before quoting and inference; a paid call resumes without another payment", async () => {
+  const w = await world({ guardRefunds: true, merchantBalance: parseNearToYocto("0.0001") });
+  const before = mock.runs();
+  const unavailable = await call(w, "idea-poster", INPUTS);
+  assert.equal(unavailable.isError, true); assert.equal(unavailable.structuredContent?.payment, undefined);
+  assert.equal(w.ledger.quotes().length, 0); assert.equal(mock.runs(), before);
+  w.chain.accounts.get(MERCHANT).balance = parseNearToYocto("10");
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  const args = { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER };
+  w.chain.accounts.get(MERCHANT).balance = 0n;
+  const paused = await call(w, "idea-poster", args);
+  assert.equal(paused.isError, true); assert.match(text(paused), /same payment id/);
+  assert.equal(w.ledger.getQuote(p.paymentId).status, "paid"); assert.equal(mock.runs(), before);
+  w.chain.accounts.get(MERCHANT).balance = parseNearToYocto("10");
+  const result = await call(w, "idea-poster", args);
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(result.structuredContent.receipt.refund.status, "sent");
+  const runs = mock.runs(); w.chain.accounts.get(MERCHANT).balance = 0n;
+  assert.equal((await call(w, "idea-poster", args)).structuredContent.receipt.outcome, "succeeded");
+  assert.equal(mock.runs(), runs, "replay stays available even when no new work is affordable");
+});
+
+test("watcher outage pauses new payments while paid runs and receipts remain accessible", async () => {
+  let ready = true;
+  const w = await world({ canQuote: () => ready });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  ready = false;
+  const refused = await call(w, "idea-poster", INPUTS);
+  assert.equal(refused.isError, true);
+  assert.match(text(refused), /finalized-payment monitoring is temporarily unavailable/);
+  assert.equal(refused.structuredContent?.payment, undefined);
+  const paid = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER });
+  assert.equal(paid.structuredContent.receipt.outcome, "succeeded");
+  const replay = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.deepEqual(replay, paid);
+  ready = true;
+  assert.ok((await call(w, "idea-poster", INPUTS)).structuredContent.payment);
+});
 
 test("wallet page confirms payment without running; the original MCP call resumes with only its id", async () => {
   const w = await world({ publicBase: "https://mcp-near.nanoodle.com" });
@@ -123,6 +269,144 @@ test("a discovered exact transfer is accepted automatically; top-ups and older t
   assert.equal(w.gate.quote(p.paymentId).status, "paid");
   const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
   assert.equal(result.structuredContent.receipt.refund.status, "sent");
+});
+
+test("watcher replay repairs an expired quote with an old unattached claim after final proof", async () => {
+  let clock = Date.now();
+  const w = await world({ now: () => clock });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS, { blockTimeMs: clock + 1 });
+  assert.equal(w.ledger.consumeTx(tx, p.paymentId), true);
+  clock = Date.parse(p.expiresAt) + 3_600_001;
+  const restarted = await w.restart();
+  assert.deepEqual(restarted.gate.pendingQuotes().map(q => q.id), [p.paymentId]);
+  assert.equal(restarted.gate.quote(p.paymentId).status, "expired");
+  const otherTx = w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto), { blockTimeMs: clock });
+  const other = await restarted.gate.confirmPayment(p.paymentId, otherTx, PAYER);
+  assert.match(other.error, /Confirm that original transaction/);
+  assert.equal(restarted.ledger.consumedBy(otherTx), null);
+  w.chain.hideTx = 1;
+  await assert.rejects(restarted.gate.observeTransfer(tx, PAYER), { code: "WATCH_CONFIRM_FAILED" });
+  assert.equal(restarted.ledger.getQuote(p.paymentId).payTx, null);
+  const runs = mock.runs();
+  await restarted.gate.observeTransfer(tx, PAYER);
+  await restarted.gate.observeTransfer(tx, PAYER);
+  assert.equal(restarted.gate.quote(p.paymentId).status, "paid");
+  assert.equal(restarted.gate.quote(p.paymentId).txHash, tx);
+  assert.equal(restarted.ledger.getQuote(p.paymentId).payer, PAYER);
+  assert.equal(restarted.ledger.hasUnattachedPayment(p.paymentId), false);
+  assert.equal(w.events.filter(event => event.event === "paid").length, 1);
+  assert.equal(mock.runs(), runs);
+});
+
+test("a restart beyond retention backfills on-time NEAR and USDC checkout deposits from a legacy cursor", async t => {
+  let clock = Date.now();
+  const now = () => clock, token = USDC_CONTRACTS.testnet;
+  const rate = createNearRates({ nearUsd: "3.64", now });
+  const w = await world({ now, rate, usdcToken: token, watchPaymentHistory: true, randomInt: () => 137 });
+  clock += 1_000;
+  const quote = async (server, asset) => (await call(server, "idea-poster", { ...INPUTS, _pay_with: asset })).structuredContent.payment;
+  const unpaid = await quote(w, "near"), near = await quote(w, "near"), usdc = await quote(w, "usdc");
+  const nearTx = w.chain.transfer(PAYER, MERCHANT, BigInt(near.amountYocto), { blockTimeMs: ++clock });
+  const usdcTx = w.chain.ftTransfer(token, PAYER, MERCHANT, BigInt(usdc.amountAtomic), { blockTimeMs: ++clock });
+  const { header } = await w.rpc.block({ finality: "final" });
+  w.ledger.setMeta("paymentWatch", { height: header.height, hash: header.hash, backfill: null });
+
+  clock = Date.parse(unpaid.expiresAt) + RETAIN_NEAR_QUOTE_MS + 1;
+  const unrelated = w.chain.transfer(PAYER, MERCHANT, BigInt(unpaid.amountYocto));
+  const restarted = await w.restart();
+  const watcher = createNearWatcher({ rpc: restarted.rpc, ledger: restarted.ledger, merchantId: MERCHANT,
+    pendingQuotes: restarted.gate.pendingQuotes, observeTransfer: restarted.gate.observeTransfer,
+    tokenContracts: [token], maxBlocksPerTick: 1, now, schedule: () => null });
+  t.after(() => watcher.stop());
+  const runs = mock.runs();
+  await watcher.start();
+  assert.equal(restarted.ledger.getMeta("paymentWatch").coveredThroughMs, null);
+  assert.equal(watcher.status().backfilling, true);
+  assert.equal(restarted.ledger.consumedBy(unrelated), null);
+  const newQuote = await quote(restarted, "near");
+  assert.notEqual(newQuote.amountYocto, unpaid.amountYocto, "the earlier amount is still reserved");
+  assert.equal(restarted.ledger.prune({ unpaidRetainMs: RETAIN_NEAR_QUOTE_MS }), 0);
+
+  await watcher.tick();
+  assert.equal(restarted.gate.quote(usdc.paymentId).txHash, usdcTx);
+  assert.equal(restarted.gate.quote(near.paymentId).status, "expired");
+  assert.equal(restarted.ledger.getMeta("paymentWatch").coveredThroughMs, null);
+  await watcher.tick();
+  assert.equal(restarted.gate.quote(near.paymentId).txHash, nearTx);
+  assert.equal(restarted.gate.quote(near.paymentId).status, "paid");
+  assert.equal(restarted.gate.quote(usdc.paymentId).status, "paid");
+  await watcher.tick();
+  assert.equal(watcher.status().backfilling, false);
+  assert.equal(restarted.ledger.getMeta("paymentWatch").coveredThroughMs, clock);
+  assert.equal(restarted.ledger.prune({ unpaidRetainMs: RETAIN_NEAR_QUOTE_MS }), 1);
+  assert.equal(restarted.gate.quote(unpaid.paymentId), null);
+  assert.equal((await quote(restarted, "near")).amountYocto, unpaid.amountYocto);
+  assert.equal(mock.runs(), runs);
+});
+
+test("payment and workflow streams keep following an expired quote while its original deposit is checked", { timeout: 10_000 }, async t => {
+  let clock = Date.now() - 60 * 60_000;
+  const w = await world({ now: () => clock, watchPaymentHistory: true });
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS, { blockTimeMs: clock + 1 });
+  const unpaid = (await call(w, "idea-poster", INPUTS)).structuredContent.payment;
+  clock = Date.parse(p.expiresAt) + 1;
+
+  const server = await serveHttp({ port: 0, commit: null, name: "test", version: "test", nearGate: w.gate,
+    listTools: w.listTools, callTool: w.callTool, publicBase: "https://checkout.test", log() {} });
+  const stop = new AbortController(), base = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => {
+    stop.abort();
+    server.closeAllConnections();
+    return new Promise(resolve => server.close(resolve));
+  });
+  const get = path => realFetch(base + path, { signal: stop.signal });
+  async function openWatch(suffix) {
+    const response = await get(`/near/watch/${p.paymentId}${suffix}`);
+    assert.equal(response.status, 200);
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffered = "";
+    return async () => {
+      while (!buffered.includes("\n\n")) {
+        const chunk = await reader.read();
+        if (chunk.done) return null;
+        buffered += chunk.value;
+      }
+      const end = buffered.indexOf("\n\n");
+      const frame = buffered.slice(0, end);
+      buffered = buffered.slice(end + 2);
+      return JSON.parse(frame.split("\n").find(line => line.startsWith("data: ")).slice(6));
+    };
+  }
+  const statusUrl = `/near/status/${p.paymentId}`;
+  const checking = await (await get(statusUrl)).json();
+  assert.equal(checking.status, "expired");
+  assert.equal(checking.checkingPayment, true);
+  assert.equal(checking.done, false);
+  const page = await (await get(`/pay/${p.paymentId}`)).text();
+  assert.match(page, /id="near-title">Checking payment/);
+  assert.match(page, /id="near-pay" type="button" hidden disabled/);
+  const retry = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(retry.structuredContent.payment.checkingPayment, true);
+
+  const [paymentFrame, runFrame] = await Promise.all([openWatch(""), openWatch("?run=1")]);
+  assert.deepEqual(await paymentFrame(), checking);
+  assert.deepEqual(await runFrame(), checking);
+  const polled = get(statusUrl + "?wait=1").then(response => response.json());
+  const runs = mock.runs();
+  await w.gate.observeTransfer(tx, PAYER);
+  assert.equal((await polled).txHash, tx);
+  const paid = await paymentFrame();
+  assert.equal(paid.status, "paid");
+  assert.equal(paid.done, true);
+  assert.equal(await paymentFrame(), null);
+  assert.deepEqual(await runFrame(), { ...paid, done: false });
+  assert.equal(mock.runs(), runs);
+
+  w.ledger.setMeta("paymentWatch", { coveredThroughMs: clock });
+  const expired = await (await get(`/near/status/${unpaid.paymentId}`)).json();
+  assert.equal(expired.status, "expired");
+  assert.equal(expired.checkingPayment, undefined);
+  assert.equal(expired.done, true);
 });
 
 test("wallet confirmation refunds wrong and late transfers without running a model", async () => {
@@ -612,4 +896,27 @@ test("NEAR tool schemas describe what this server accepts (no media inputs, no s
   }
   const rn = w.listTools().find((x) => x.name === "run_noodle");
   assert.doesNotMatch(rn.description, /da\.gd|TinyURL|fragment-less short links trigger/);
+});
+
+for (const name of ["idea-poster", "run_noodle"]) test(`maintenance preserves the same paid NEAR quote for ${name} without inference or a refund`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "near-gate-maintenance-")), file = join(dir, "flag.json");
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const maintenance = createMaintenanceBarrier({ file, ownerUid: process.getuid() }), w = await world({ maintenance });
+  const inputs = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: INPUTS } : INPUTS;
+  const payment = (await call(w, name, inputs)).structuredContent.payment;
+  const tx = w.chain.transfer(PAYER, MERCHANT, BigInt(payment.amountYocto));
+  await w.gate.confirmPayment(payment.paymentId, tx, PAYER);
+  assert.equal(w.ledger.getQuote(payment.paymentId).status, "paid");
+  const before = mock.runs();
+  await writeFile(file, JSON.stringify({ v: 1, token: "f".repeat(32), operation: "backup", revision: null }), { mode: 0o600 });
+  await assert.rejects(call(w, name, { ...inputs, _payment_id: payment.paymentId }), { code: "SERVICE_DRAINING", executionNotStarted: true });
+  assert.equal(w.ledger.getQuote(payment.paymentId).status, "paid");
+  assert.equal(w.ledger.refunds().length, 0); assert.equal(mock.runs(), before);
+  await rm(file);
+  const result = await call(w, name, { ...inputs, _payment_id: payment.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  const count = mock.runs(); assert.ok(count > before);
+  await call(w, name, { ...inputs, _payment_id: payment.paymentId });
+  assert.equal(mock.runs(), count);
+  maintenance.close(); await maintenance.waitForIdle();
 });

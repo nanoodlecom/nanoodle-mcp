@@ -1,0 +1,23 @@
+[Unit]
+Description=Send Nanoodle check failures to Ember over Babel
+After=network.target
+
+[Service]
+Type=oneshot
+User=nanoodle-check
+Group=nanoodle-check
+WorkingDirectory=/srv/nanoodle-mcp/app
+EnvironmentFile=/etc/nanoodle-near-check/babel.env
+StateDirectory=nanoodle-near-check
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=/opt/node-v22.23.4-linux-x64/bin/node /srv/nanoodle-mcp/app/scripts/near-alert.mjs --enqueue-only
+ExecStart=/usr/bin/flock -w 30 /var/lib/nanoodle-near-check/alert.lock /opt/node-v22.23.4-linux-x64/bin/node /srv/nanoodle-mcp/app/scripts/near-alert.mjs
+TimeoutStartSec=5min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost

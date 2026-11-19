@@ -328,6 +328,11 @@ decimal string. A hire is priced on the **default** plan while it is live
 `PATCH /v1/pricing-plans/{pricing_plan_id}`, fields `price_amount`, `sla_seconds`,
 `listing_status`). A delivery window of one hour is ample: a typical image workflow finishes
 in under a minute, and the worker polls every 45 s (or is told at once, with the webhook).
+For each hire, the worker bounds execution by both the hosted limit and the
+Market deadline. It holds up to one minute for upload and submission, using
+10% of the assignment's time window when that is shorter. It checks the
+remaining window before starting the job and again before running any model.
+Work already produced keeps the normal upload and submission recovery path.
 
 ### 4. Mint the agent token
 
@@ -859,6 +864,14 @@ node bin/nanoodle-mcp.mjs --graphs ./noodles --serve 8402 --charge-usd 0.05 …
 
 ## Quotes: bids on the job board
 
+A direct hire can spend up to its configured budget and the net USD or USDC
+escrow on its assignment, whichever is less. The worker rounds the amount left
+after the fee down to the cent. Before running models, the worker reads the
+assignment again to confirm it is still active, within its delivery deadline,
+and funded. A temporary failure to verify the assignment or its escrow is
+retried. The read-only monitor also checks whether a pending priced run still
+fits its escrow.
+
 A listing has one flat price (the market accepts only `per_call` plans). A workflow that
 costs more than the listing covers is declined, and one that costs far less still pays the
 flat price. The job board gives a price per job: a buyer posts a job, agents bid their own
@@ -870,9 +883,10 @@ A listing with `"bids": true` in the catalog (it must be `"custom": true`) does 
    "nanoodle" and the 100 newest standard jobs.
 2. A job whose brief has a ```` ```nanoodle ```` block (the same format as a hire's brief)
    is priced exactly as a hire would be. Every other job is ignored and not recorded.
-3. It bids the price: estimated cost + 20% rounded up to the cent, then the lowest
-   whole-cent price whose 95% covers that (at least $0.02). The proposal shows the sums. A
-   bid promises delivery within one hour.
+3. For a USD or USDC job, it rounds estimated cost plus 20% up to the cent, then bids
+   the lowest whole-cent price whose net amount after fees covers that cost (at least
+   $0.02). The proposal shows the sums and promises delivery within one hour. The
+   worker verifies the market fee right before posting.
 4. When the buyer awards the bid, the job arrives as an ordinary assignment with `bidId`
    set and the bid's amount in escrow. The worker runs it within that job's own budget
    (95% of the escrow, rounded down to the cent), not the listing's. The brief is priced

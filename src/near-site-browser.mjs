@@ -1,9 +1,11 @@
 import { WORKFLOW_META_KEY } from "./workflow-progress.mjs";
-import { renderWorkflow, displayAmount } from "./workflow-view.mjs";
+import { createRunView, resultText } from "./run-view.mjs";
+import { isExpiredPayment } from "./near/payment-view.mjs";
+export { resultText } from "./run-view.mjs";
 let rpcId = 0;
-export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch } = {}) {
+export async function callMcp(name, args, { onProgress = () => {}, onWorkflow = () => {}, fetch: request = globalThis.fetch, endpoint = "/mcp" } = {}) {
   const id = ++rpcId;
-  const response = await request("/mcp", { method: "POST", headers: { "Content-Type": "application/json", Accept: args._payment_id ? "text/event-stream" : "application/json" },
+  const response = await request(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Accept: args._payment_id ? "text/event-stream" : "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args, ...(args._payment_id ? { _meta: { progressToken: `studio:${id}` } } : {}) } }) });
   if (!response.ok) throw new Error(`The server could not complete this request (${response.status}).`);
   const unwrap = message => { if (message.error) throw new Error(message.error.message); return message.result; };
@@ -39,21 +41,11 @@ export function savedInputs(schema) {
   return result;
 }
 
-export function resultText(result) {
-  const content = [...(result.content || [])];
-  // The gate appends its receipt after the paid output. Render that current
-  // structured receipt separately, so an earlier "pending" line cannot linger
-  // after a refund has been confirmed by the monitor.
-  if (result.structuredContent?.receipt?.outcome === "succeeded" && /^Paid [\d.]+ (?:USDC|NEAR)\b/.test(content.at(-1)?.text || "")) {
-    content.pop();
-    if (content.at(-1)?.type === "text" && /^charged: \$/.test(content.at(-1).text)) content.pop();
-  }
-  return content.filter(c => c.type === "text").map(c => c.text).join("\n\n");
-}
-
 export function startStudio({ config, rpc = callMcp, status, update, storage, pause = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const sessions = [], monitoring = new Set();
-  const persist = () => { try { storage?.setItem("nanoodle-near-studio:v1", JSON.stringify(sessions.map(({ result, ...session }) => session))); } catch {} };
+  const storageKey = `nanoodle-near-studio:v1${config.hosted ? `:${config.hosted}` : ""}`;
+  const request = (name, args, options) => rpc(name, args, { ...options, endpoint: config.mcpPath || "/mcp" });
+  const persist = () => { try { storage?.setItem(storageKey, JSON.stringify(sessions.map(({ result, ...session }) => session))); } catch {} };
   const changed = session => { persist(); update(session, sessions); };
   async function monitor(session) {
     const id = session.payment.paymentId;
@@ -66,17 +58,18 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
           session.view = view;
           if (view.workflow) session.workflow = view.workflow;
           if (view.receipt) session.receipt = view.receipt;
-          if (view.status === "expired") { session.phase = "finished"; changed(session); break; }
+          if (isExpiredPayment(view) || view.status === "unknown") { session.phase = "finished"; changed(session); break; }
           if (["paid", "settled", "rejected", "failed"].includes(view.status) && !session.result) {
             session.phase = "running"; changed(session);
-            const result = await rpc(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); },
+            const result = await request(session.name, { ...session.args, _payment_id: id }, { onProgress: message => { session.message = message; changed(session); },
               onWorkflow: workflow => { session.workflow = workflow; changed(session); } });
             if (result.isError && !result.structuredContent?.receipt) throw new Error((result.content || []).map(c => c.text || "").join("\n"));
             session.result = result; session.message = "";
           }
           const receipt = view.receipt || session.result?.structuredContent?.receipt;
           if (session.result && receipt && receipt.refund?.status !== "pending") { session.phase = "finished"; session.receipt = receipt; changed(session); break; }
-          session.phase = view.status === "pending" ? "waiting" : "running"; changed(session);
+          session.phase = view.checkingPayment ? "checking" : view.status === "pending" ? "waiting" : "running";
+          changed(session);
         } catch (error) { session.message = error.message; changed(session); }
         await pause(session.phase === "waiting" ? 100 : 2000);
       }
@@ -84,23 +77,23 @@ export function startStudio({ config, rpc = callMcp, status, update, storage, pa
   }
   return {
     sessions,
-    async quote(name, args) {
+    async quote(name, args, { title } = {}) {
       if (sessions.filter(s => s.phase !== "finished").length >= 10) throw new Error("This tab already has ten open quotes. Finish a payment or wait for an earlier quote to expire.");
       const snapshot = JSON.parse(JSON.stringify(args));
-      const result = await rpc(name, snapshot), payment = result.structuredContent?.payment;
+      const result = await request(name, snapshot), payment = result.structuredContent?.payment;
       if (result.isError || !payment || payment.status !== "payment_required") throw new Error((result.content || []).map(c => c.text || "").join("\n") || "This workflow could not be quoted.");
       if (payment.payTo !== config.merchant || !/^nq_[A-Za-z0-9_-]+$/.test(payment.paymentId)) throw new Error("The server returned an unexpected payment destination.");
-      const session = { name, args: snapshot, payment, pricing: result.structuredContent.pricing, phase: "waiting" };
+      const session = { name, args: snapshot, payment, pricing: result.structuredContent.pricing, ...(title ? { title } : {}), phase: "waiting" };
       sessions.push(session); changed(session); void monitor(session); return session;
     },
     restore() {
       try {
-        const previous = JSON.parse(storage?.getItem("nanoodle-near-studio:v1") || "[]");
+        const previous = JSON.parse(storage?.getItem(storageKey) || "[]");
         if (!Array.isArray(previous)) return;
         const restored = [];
         for (const session of previous.slice(-10)) {
           if (!session?.payment || session.payment.payTo !== config.merchant || !/^nq_[A-Za-z0-9_-]+$/.test(session.payment.paymentId)
-            || !session.args || typeof session.args !== "object" || !["run_noodle", ...config.tools.map(t => t.name)].includes(session.name)) continue;
+            || !session.args || typeof session.args !== "object" || typeof session.name !== "string" || !/^[A-Za-z0-9_-]+$/.test(session.name)) continue;
           restored.push(session);
         }
         sessions.push(...restored);
@@ -125,7 +118,8 @@ function mount(root) {
     { id: "topic", type: "text", name: "Topic", fields: { text: "" } },
     { id: "writer", type: "llm", fields: { model: "meta-llama/llama-3.3-70b-instruct", system: "Reply with one vivid sentence about the topic.", maxTokens: 48 } },
   ], links: [{ id: "topic-writer", from: { node: "topic", port: "text" }, to: { node: "writer", port: "prompt" } }] };
-  let mode = "saved", selected = null, quoting = false, renderedResult = null, renderedWorkflow = null, workflowDisplayKey = null;
+  let mode = "saved", selected = null, quoting = false;
+  const runView = createRunView("studio");
   const safeUrl = value => {
     const url = new URL(value, location.origin), canonical = new URL(config.publicBase).origin;
     if (![location.origin, canonical].includes(url.origin) || !["http:", "https:"].includes(url.protocol)) throw new Error("Unexpected payment URL.");
@@ -137,15 +131,16 @@ function mount(root) {
     for (const item of sessions) {
       const button = document.createElement("button"); button.type = "button";
       button.setAttribute("aria-pressed", String(item === selected));
-      button.textContent = `${item.name.replace(/[-_]/g, " ")} · ${item.payment.asset || "NEAR"} · ${item.phase}`;
+      button.textContent = `${item.title || item.name.replace(/[-_]/g, " ")} · ${item.payment.asset || "NEAR"} · ${item.phase}`;
       button.addEventListener("click", () => { selected = item; render(item, sessions); }); node("studio-history").append(button);
     }
     if (session !== selected) return;
     node("studio-empty").hidden = true; node("studio-payment").hidden = false;
     const p = session.payment, receipt = session.receipt || session.result?.structuredContent?.receipt;
-    const title = session.name === "run_noodle" ? "Your workflow" : config.tools.find(t => t.name === session.name)?.title || session.name.replace(/[-_]/g, " ");
+    const title = session.title || (session.name === "run_noodle" ? "Your workflow" : config.tools.find(t => t.name === session.name)?.title || session.name.replace(/[-_]/g, " "));
     node("studio-quoted-tool").textContent = title;
-    const stage = receipt ? receipt.outcome === "succeeded" ? "Complete" : "Run failed" : session.phase === "waiting" ? "Awaiting payment" : session.phase === "running" ? "Running workflow" : "Quote expired";
+    const stage = receipt ? receipt.outcome === "succeeded" ? "Complete" : "Run failed"
+      : ({ waiting: "Awaiting payment", checking: "Checking payment", running: "Running workflow" })[session.phase] || "Quote expired";
     node("studio-stage").textContent = stage;
     node("studio-stage").dataset.phase = receipt ? receipt.outcome === "succeeded" ? "done" : "error" : session.phase;
     node("studio-amount").textContent = `${p.amount ?? p.amountNear} ${p.asset || "NEAR"}`;
@@ -156,65 +151,10 @@ function mount(root) {
     const refundMessage = refundStatus === "sent" ? "Change returned to your wallet." : refundStatus === "pending" ? "Returning your unused deposit…" : refundStatus === "skipped" ? "No change is due." : `Refund status: ${refundStatus}.`;
     node("studio-status").textContent = receipt
       ? `${receipt.outcome === "succeeded" ? "Your result is ready." : "This run did not complete."} ${refundMessage}`
+      : session.phase === "checking" ? session.view.next || "Checking for your original transfer…"
       : session.message || (session.phase === "waiting" ? "Pay the exact deposit in your wallet to start." : session.phase === "running" ? "Payment confirmed. Preparing your workflow…" : `Quote ${session.view?.status || "finished"}.`);
     node("studio-payment-note").hidden = session.phase !== "waiting";
-    node("studio-totals").hidden = !receipt;
-    if (receipt) {
-      for (const [id, amount] of [["paid", receipt.deposit], ["charged", receipt.charged], ["returned", receipt.refund]]) {
-        const exact = amount?.amount ?? amount?.near ?? "0";
-        node(`studio-total-${id}`).textContent = `${displayAmount(exact)} ${p.asset || "NEAR"}`;
-        node(`studio-total-${id}`).title = `${exact} ${p.asset || "NEAR"} (exact)`;
-      }
-      node("studio-refund-state").textContent = receipt.refund.status === "sent" ? "Back in your wallet" : receipt.refund.status === "pending" ? "Returning to your wallet…" : receipt.refund.status === "skipped" ? "No change due" : `Refund ${receipt.refund.status}`;
-    }
-    node("studio-workflow").hidden = !session.workflow;
-    if (session.workflow) {
-      if (renderedWorkflow !== session.workflow) { renderWorkflow(node("studio-workflow-graph"), session.workflow); renderedWorkflow = session.workflow; }
-      const wf = session.workflow, finished = wf.nodes.filter(n => ["done", "skipped", "gated", "error"].includes(n.status)).length;
-      const displayKey = `${p.paymentId}:${!!wf.finishedAt}`;
-      if (workflowDisplayKey !== displayKey) { node("studio-workflow").open = !wf.finishedAt; workflowDisplayKey = displayKey; }
-      node("studio-workflow-count").textContent = `${finished} / ${wf.nodes.length} steps finished`;
-      const elapsed = Math.max(0, Math.floor(((wf.finishedAt || Date.now()) - wf.startedAt) / 1000));
-      node("studio-elapsed").textContent = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
-    }
-    node("studio-result").hidden = !session.result;
-    if (session.result) {
-      const text = resultText(session.result);
-      const newOutput = renderedResult !== session.result;
-      if (newOutput) {
-        // Media already has a player/preview and download action. Keep its raw
-        // URL in details rather than repeating it in the main result.
-        const readable = text.split("\n").filter(line => !/^[^\n]*https?:\/\/[^\s]+\/out\/[^\s]+$/.test(line.trim())).join("\n").trim();
-        node("studio-output").textContent = readable; node("studio-output").hidden = !readable;
-        node("studio-raw-output").textContent = text;
-        node("studio-media").replaceChildren(); renderedResult = session.result;
-      }
-      node("studio-receipt").textContent = JSON.stringify(receipt, null, 2);
-      node("studio-output-links").replaceChildren();
-      for (const value of [...new Set(text.match(/https?:\/\/[^\s<>"')]+/g) || [])]) {
-        const url = new URL(value), a = document.createElement("a");
-        // Both hostnames serve the same output directory. Preview only local
-        // generated files; never fetch an arbitrary model-supplied media host.
-        const media = /^\/out\/[^/]+\.(png|jpe?g|webp|gif|mp4|webm|mp3|wav|ogg)$/i.exec(url.pathname);
-        const resultUrl = media ? new URL(url.pathname, location.origin).href : url.href;
-        if (media && newOutput) {
-          const kind = /^(png|jpe?g|webp|gif)$/i.test(media[1]) ? "img" : /^(mp4|webm)$/i.test(media[1]) ? "video" : "audio";
-          const preview = document.createElement(kind); preview.src = resultUrl;
-          if (kind === "img") { preview.alt = "Generated workflow result"; preview.loading = "lazy"; }
-          else { preview.controls = true; preview.preload = "metadata"; }
-          node("studio-media").append(preview);
-        }
-        a.href = resultUrl; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = media ? "Download result ↗" : "Open result ↗";
-        node("studio-output-links").append(a);
-      }
-      node("studio-transactions").replaceChildren();
-      for (const [label, leg] of [["Payment", receipt?.deposit], ["Refund", receipt?.refund]]) {
-        if (!leg?.explorerUrl) continue;
-        const url = new URL(leg.explorerUrl);
-        if (!["https:", "http:"].includes(url.protocol)) continue;
-        const a = document.createElement("a"); a.href = url.href; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = `${label} transaction ↗`; node("studio-transactions").append(a);
-      }
-    }
+    runView.render({ ...session, receipt });
   }
   let tabStorage = null; try { tabStorage = sessionStorage; } catch {}
   const studio = startStudio({ config, storage: tabStorage, update: render, status: async payment => {
@@ -231,12 +171,13 @@ function mount(root) {
     if (mode === "saved") {
       const schema = config.tools.find(t => t.name === node("studio-tool").value)?.schema;
       const fields = node("studio-saved-inputs"); fields.replaceChildren();
-      const defaults = savedInputs(schema);
+      const defaults = { ...savedInputs(schema), ...config.tools.find(t => t.name === node("studio-tool").value)?.defaults };
       const advanced = document.createElement("details"), summary = document.createElement("summary");
       summary.textContent = "Advanced instructions"; advanced.append(summary); advanced.className = "form-help";
       for (const [key, field] of Object.entries(schema?.properties || {})) {
         if (key.startsWith("_")) continue;
-        const label = document.createElement("label"), input = document.createElement("textarea");
+        const label = document.createElement("label"), input = document.createElement(field.enum ? "select" : "textarea");
+        if (field.enum) for (const value of field.enum) { const option = document.createElement("option"); option.value = option.textContent = value; input.append(option); }
         label.textContent = key.replace(/_/g, " "); input.id = `saved-${key}`; label.htmlFor = input.id;
         input.dataset.input = key; input.rows = 2; input.dataset.type = field.type;
         input.value = defaults[key] ?? ""; input.required = schema.required?.includes(key) || false;
@@ -262,15 +203,20 @@ function mount(root) {
         [...node("studio-saved-inputs").querySelectorAll("[data-input]")].filter(input => input.value.trim()).map(input => [input.dataset.input,
           ["integer", "number"].includes(input.dataset.type) ? Number(input.value) : input.value]));
       if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) throw new Error("Inputs must be a JSON object.");
-      const name = mode === "custom" ? "run_noodle" : node("studio-tool").value;
-      const args = mode === "custom" ? { graph: JSON.parse(node("studio-graph").value), inputs } : inputs;
-      const session = await studio.quote(name, { ...args, _pay_with: node("studio-asset").value }); selected = session; render(session, studio.sessions);
+      const template = mode === "saved" ? config.tools.find(t => t.name === node("studio-tool").value) : null;
+      const name = mode === "custom" || template?.graph ? "run_noodle" : node("studio-tool").value;
+      const args = mode === "custom" ? { graph: JSON.parse(node("studio-graph").value), inputs } : template?.graph ? { graph: template.graph, inputs } : inputs;
+      const session = await studio.quote(name, { ...args, _pay_with: node("studio-asset").value }, { title: template?.title }); selected = session; render(session, studio.sessions);
     } catch (error) { node("studio-error").textContent = error.message; }
     finally { quoting = false; node("studio-quote").disabled = false; }
   });
-  const command = () => node("connect-client").value === "url" ? `${config.publicBase}/mcp` : `${node("connect-client").value} mcp add --transport http nanoodle ${config.publicBase}/mcp`;
+  const command = () => node("connect-client").value === "url" ? `${config.publicBase}${config.mcpPath || "/mcp"}` : `${node("connect-client").value} mcp add --transport http nanoodle ${config.publicBase}${config.mcpPath || "/mcp"}`;
   node("connect-client").addEventListener("change", () => { node("connect-command").textContent = command(); });
   node("connect-copy").addEventListener("click", async () => { try { await navigator.clipboard.writeText(command()); node("connect-copy").textContent = "Copied"; } catch { node("connect-copy").textContent = "Select the command to copy"; } });
+  node("agent-copy")?.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(node("agent-instructions").textContent); node("agent-copy").textContent = "Copied"; }
+    catch { node("agent-copy").textContent = "Select the instructions to copy"; }
+  });
   setInterval(() => {
     const wf = selected?.workflow;
     if (!wf || selected.phase !== "running" || wf.finishedAt) return;

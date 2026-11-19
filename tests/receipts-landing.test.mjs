@@ -51,7 +51,7 @@ test("page thumbs stay on the media host", () => {
 
 test("landing receipts sit between the flow strip and the cost card", async () => {
   const html = await withServer(true, async (base) => await (await fetch(`${base}/`)).text());
-  const flow = html.indexOf("No tab, no tip, no signup.");
+  const flow = html.indexOf('<div class="flow">');
   const runs = html.indexOf(HEADING);
   const cost = html.indexOf("What a call costs");
   assert.ok(flow >= 0 && runs > flow && cost > runs, "section is out of order");
@@ -101,22 +101,8 @@ test("free-mode landing still shows receipts and skips the payment story", async
   assert.ok(section(html).includes(INTRO));
 });
 
-test("llms.txt carries a short receipts version ahead of the tool list", async () => {
+test("llms.txt links to reviewed results rather than copying the receipts archive", async () => {
   const txt = await withServer(true, async (base) => await (await fetch(`${base}/llms.txt`)).text());
-  const runs = txt.indexOf(`## ${HEADING}`);
-  const tools = txt.indexOf("## Tools");
-  assert.ok(runs >= 0 && tools > runs);
-  assertNoPaymentRail(txt.slice(runs, tools), "llms.txt");
-  assert.ok(txt.includes(INTRO));
-  assert.ok(txt.includes(`Open in Subnano: ${orderedArticles()[0].url}`));
-  assert.ok(txt.includes(`Read all of Nano Maxi's notes: ${PROFILE}`));
-  for (const article of ARTICLES) {
-    assert.ok(txt.includes(article.title), article.key);
-    assert.ok(txt.includes(article.url), article.key);
-    assert.ok(txt.includes(article.blurb), article.key);
-  }
-  for (const guide of GUIDES) {
-    assert.ok(txt.includes(guide.title));
-    assert.ok(txt.includes(guide.href));
-  }
+  assert.match(txt, /\[Reviewed outputs\]\(https:\/\/nanoodle\.com\/examples\/gallery\//);
+  for (const article of ARTICLES) assert.ok(!txt.includes(article.blurb), article.key);
 });

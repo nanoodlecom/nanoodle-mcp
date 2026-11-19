@@ -10,11 +10,19 @@
  * Values must be JSON-safe; callers store yocto amounts as integer strings.
  * One process owns a state file.
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { PrivateStateDurabilityError, syncPrivateStateParentSync, writePrivateStateSync } from "../private-state.mjs";
 import { NearError } from "./errors.mjs";
+import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META } from "./quote-capacity.mjs";
+import { conflictingNearRefunds, nearRefundTerms, sameNearRefund } from "./refund-terms.mjs";
+import { hasInvalidNearRefundProof } from "./refund-proof.mjs";
+import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
+
+function awaitingPayment(quote) {
+  return (quote?.status === "pending" || quote?.status === "expired") && !quote.payTx;
+}
 
 function isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -33,19 +41,9 @@ function copy(v) {
   return v === undefined ? undefined : structuredClone(v);
 }
 
-function fsyncDir(dir) {
-  let fd;
-  try {
-    fd = openSync(dir, "r");
-    fsyncSync(fd);
-  } catch {
-    // Directory fsync is not supported everywhere; the file itself is synced.
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
-
-export function openNearLedger({ file, network, merchant, now = Date.now }) {
+export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false, watchPaymentHistory = false }) {
+  if (typeof requireExisting !== "boolean") throw TypeError("requireExisting must be a boolean");
+  if (typeof watchPaymentHistory !== "boolean") throw TypeError("watchPaymentHistory must be a boolean");
   if (typeof file !== "string" || !file) throw new TypeError("openNearLedger needs a file path");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof merchant !== "string" || !merchant) throw new TypeError("openNearLedger needs a merchant account");
@@ -55,10 +53,10 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
   try {
     text = readFileSync(file, "utf8");
   } catch (e) {
-    if (e?.code !== "ENOENT") throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} could not be read`, { cause: e });
+    if (e?.code !== "ENOENT" || requireExisting) throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} could not be read; refusing to start empty`, { cause: e });
   }
   if (text === null) {
-    state = { v: 1, network, merchant, quotes: {}, consumedTx: {}, refunds: {}, meta: {} };
+    state = { v: 1, network, merchant, quotes: {}, consumedTx: {}, refunds: {}, payouts: {}, meta: {} };
   } else {
     try {
       state = JSON.parse(text);
@@ -67,46 +65,67 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
     }
     if (!isPlainObject(state) || state.v !== 1 || typeof state.network !== "string" || typeof state.merchant !== "string"
       || !isPlainObject(state.quotes) || !isPlainObject(state.consumedTx) || !isPlainObject(state.refunds)
+      || (state.payouts !== undefined && !isPlainObject(state.payouts))
       || (state.meta !== undefined && !isPlainObject(state.meta))) {
       throw new NearError("STATE_UNREADABLE", `NEAR state file ${file} does not have the expected shape; refusing to start empty`);
     }
     state.meta ??= {};
+    state.payouts ??= {};
     if (state.network !== network || state.merchant !== merchant) {
       throw new NearError("STATE_MISMATCH",
         `NEAR state file ${file} belongs to ${state.merchant} on ${state.network}, not ${merchant} on ${network}`);
     }
+    // A previous writer may have stopped after replacing the file. Confirm
+    // the directory entry before using the selected snapshot for recovery.
+    try { syncPrivateStateParentSync(file); }
+    catch (cause) { throw new NearError("STATE_DURABILITY_UNCERTAIN", "The NEAR ledger could not be made durable on open", { cause }); }
   }
-  let persisted = JSON.stringify(state);
+  let persisted = JSON.stringify(state), persistenceFailed = false, uncertainCommit = null;
+  let refundConflicts;
+  const refundProofs = new WeakMap();
+  function invalidRefundProof(record) {
+    if (!refundProofs.has(record)) refundProofs.set(record, hasInvalidNearRefundProof(record, merchant));
+    return refundProofs.get(record);
+  }
+  // Earlier releases could persist the claim before attaching it to its quote.
+  // Index those exceptions once so watching blocks does not scan the tx history.
+  const unattachedPayments = new Set();
+  for (const id of Object.values(state.consumedTx)) {
+    if (awaitingPayment(state.quotes[id])) unattachedPayments.add(id);
+  }
 
   function persist() {
     const next = JSON.stringify(state);
-    const tmp = `${file}.tmp-${process.pid}`;
     try {
-      const dir = dirname(file);
-      mkdirSync(dir, { recursive: true });
-      const fd = openSync(tmp, "w", 0o600);
-      try {
-        writeSync(fd, next);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(tmp, file);
-      fsyncDir(dir);
+      writePrivateStateSync(file, next);
+      persistenceFailed = false;
       persisted = next;
     } catch (e) {
-      state = JSON.parse(persisted); // roll the in-memory state back to what is on disk
+      persistenceFailed = true;
+      if (e instanceof PrivateStateDurabilityError) uncertainCommit = e;
+      state = JSON.parse(persisted); // Only expose the last successfully synced snapshot.
       throw e;
     }
   }
 
   function mutate(fn) {
+    assertDurable();
     fn();
     persist();
   }
 
+  function assertDurable() {
+    // Only a fresh open can reconcile which complete snapshot survived. Another
+    // mutation in this process could overwrite the visible replacement from the
+    // older in-memory state.
+    if (uncertainCommit) throw new NearError("STATE_DURABILITY_UNCERTAIN", "The NEAR ledger needs recovery before it can accept more work", { cause: uncertainCommit });
+  }
+
   const ledger = {
     file,
+    persistenceStatus: () => ({ ok: !persistenceFailed, pendingWrites: 0, ...(uncertainCommit && { durabilityUncertain: true }) }),
+    assertDurable,
+    paymentWatchCoverage: () => nearPaymentWatchCoverage(state.meta[PAYMENT_WATCH_META], watchPaymentHistory),
 
     getQuote(id) {
       return Object.hasOwn(state.quotes, id) ? copy(state.quotes[id]) : null;
@@ -134,10 +153,29 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
       }
       if (Object.hasOwn(state.consumedTx, txHash)) return false;
       mutate(() => { state.consumedTx[txHash] = paymentId; });
+      if (awaitingPayment(state.quotes[paymentId])) unattachedPayments.add(paymentId);
       return true;
     },
     consumedBy(txHash) {
       return Object.hasOwn(state.consumedTx, txHash) ? state.consumedTx[txHash] : null;
+    },
+    hasUnattachedPayment(id) {
+      return unattachedPayments.has(id) && awaitingPayment(state.quotes[id]);
+    },
+    recordPayment(id, txHash, patch) {
+      if (typeof txHash !== "string" || !txHash || !isPlainObject(patch) || !["paid", "rejected"].includes(patch.status)) {
+        throw new TypeError("recordPayment needs a tx hash and payment fields");
+      }
+      assertJsonSafe(patch, "payment");
+      const quote = state.quotes[id], owner = ledger.consumedBy(txHash);
+      if (!awaitingPayment(quote) || (owner !== null && owner !== id)
+        || (unattachedPayments.has(id) && owner !== id)) return null;
+      mutate(() => {
+        state.consumedTx[txHash] = id;
+        state.quotes[id] = { ...quote, ...copy(patch), id, payTx: txHash };
+      });
+      unattachedPayments.delete(id);
+      return copy(state.quotes[id]);
     },
 
     putRefund(refund) {
@@ -146,12 +184,14 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
       }
       assertJsonSafe(refund, "refund");
       if (Object.hasOwn(state.refunds, refund.id)) throw new NearError("DUPLICATE_ID", `refund ${refund.id} already exists`);
+      refundConflicts = undefined;
       mutate(() => { state.refunds[refund.id] = copy(refund); });
     },
     updateRefund(id, patch) {
       if (!Object.hasOwn(state.refunds, id)) throw new NearError("NOT_FOUND", `no refund ${id}`);
       if (!isPlainObject(patch)) throw new TypeError("patch must be an object");
       assertJsonSafe(patch, "patch");
+      refundConflicts = undefined;
       mutate(() => { state.refunds[id] = { ...state.refunds[id], ...copy(patch), id }; });
       return copy(state.refunds[id]);
     },
@@ -165,6 +205,34 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
     refunds() {
       return Object.values(state.refunds).map(copy);
     },
+    refundHashConflict(id) {
+      refundConflicts ??= conflictingNearRefunds(Object.values(state.refunds));
+      return refundConflicts.has(id);
+    },
+    invalidRefundProof(id) {
+      return invalidRefundProof(state.refunds[id]);
+    },
+
+    // Creator payouts are in Nano, independently of the customer's payment asset.
+    // Keep this outbox after quote pruning, like refunds and consumed hashes.
+    putPayout(payout) {
+      if (!isPlainObject(payout) || typeof payout.paymentId !== "string" || !payout.paymentId) throw new TypeError("a payout needs a paymentId");
+      assertJsonSafe(payout, "payout");
+      if (Object.hasOwn(state.payouts, payout.paymentId)) throw new NearError("DUPLICATE_ID", "a payout already exists for this payment");
+      mutate(() => { state.payouts[payout.paymentId] = copy(payout); });
+    },
+    getPayout(paymentId) {
+      return Object.hasOwn(state.payouts, paymentId) ? copy(state.payouts[paymentId]) : null;
+    },
+    updatePayout(paymentId, patch) {
+      if (!Object.hasOwn(state.payouts, paymentId)) throw new NearError("NOT_FOUND", "no payout for this payment");
+      assertJsonSafe(patch, "payout patch");
+      mutate(() => { state.payouts[paymentId] = { ...state.payouts[paymentId], ...copy(patch), paymentId }; });
+      return copy(state.payouts[paymentId]);
+    },
+    payouts() {
+      return Object.values(state.payouts).map(copy);
+    },
 
     getMeta(key) {
       return Object.hasOwn(state.meta, key) ? copy(state.meta[key]) : undefined;
@@ -175,19 +243,36 @@ export function openNearLedger({ file, network, merchant, now = Date.now }) {
     },
 
     /**
-     * Delete finished quotes older than retainMs, and unpaid quotes (pending or
-     * expired) more than unpaidRetainMs past their expiry. Consumed hashes and
-     * refunds are never pruned.
+     * Delete old finished quotes. Release unpaid quotes after retention once
+     * the watcher has covered the window and any recorded claim is attached.
+     * Consumed hashes and refunds are never pruned.
      */
     prune({ retainMs = 86_400_000, unpaidRetainMs = 86_400_000 } = {}) {
       const t = now();
+      const coveredThroughMs = ledger.paymentWatchCoverage();
       const doomed = [];
+      const refundsByPayment = new Map();
+      const refundRows = Object.values(state.refunds), conflicts = conflictingNearRefunds(refundRows);
+      for (const refund of refundRows) {
+        if (!refundsByPayment.has(refund.paymentId)) refundsByPayment.set(refund.paymentId, []);
+        refundsByPayment.get(refund.paymentId).push(refund);
+      }
       for (const [id, q] of Object.entries(state.quotes)) {
-        if ((q.status === "pending" || q.status === "expired") && !q.payTx) {
-          if (typeof q.expiresAt === "number" && t - q.expiresAt > unpaidRetainMs) doomed.push(id);
+        if (awaitingPayment(q)) {
+          if (!unattachedPayments.has(id) && Number.isFinite(q.expiresAt)
+            && !holdsNearQuoteAmount(q, t, unpaidRetainMs, coveredThroughMs)) doomed.push(id);
           continue;
         }
         if (!FINAL_QUOTE.has(q.status)) continue;
+        const expected = nearRefundTerms(q), associated = refundsByPayment.get(id) ?? [];
+        if (associated.some(refund => conflicts.has(refund.id))) continue;
+        if (expected && expected.amountYocto !== "0") {
+          const [refund] = associated;
+          if (associated.length !== 1 || refund.reconciliationRequired || refund.outcomeUnverified
+            || refund.status === "failed_permanent" || !sameNearRefund(expected, refund) || invalidRefundProof(refund)) continue;
+        }
+        const creator = q.settlement?.authorPayout, payout = state.payouts[id];
+        if (creator && (!payout || payout.reconciliationRequired || !sameCreatorPayout(creator, payout))) continue;
         const at = typeof q.finishedAt === "number" ? q.finishedAt : null;
         if (at !== null && t - at > retainMs) doomed.push(id);
       }

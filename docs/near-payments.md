@@ -154,24 +154,27 @@ float pays model invoices.
 ### Automatic transfer detection
 
 One shared watcher polls finalized NEAR blocks every two seconds. While quotes
-are outstanding it checks only the merchant's account changes, resolves receipt
-IDs with `EXPERIMENTAL_receipt_to_tx`, and runs the same FINAL payment verifier.
+are outstanding it checks the merchant's account changes and includes the
+USDC contract when a quote uses it. It resolves receipt IDs with
+`EXPERIMENTAL_receipt_to_tx` and runs the same FINAL payment verifier.
 An exact amount matching a quote is accepted automatically; the caller does not
 need to paste a transaction hash. A payment must be in a block created after
 its quote for automatic matching. A late exact payment for a retained quote is
 refunded in full. An unmatched top-up is not treated as a workflow purchase.
 Wrong-amount payments can still be confirmed explicitly for a full refund.
 
-The processed block cursor is durable. RPC failures leave it unchanged and
-retry with backoff; restarts catch up, and an existing quote is backfilled when
+The processed block cursor is durable. If an RPC returns malformed discovery
+data or lacks the requested receipt or historical block hash, the watcher
+tries another configured RPC. When no peer can complete the read, the cursor
+stays unchanged and the watcher retries with backoff. Restarts catch up, and an existing quote is backfilled when
 the watcher is first introduced. Re-reading a receipt cannot spend twice: the
 payment gate keeps the consumed transaction hashes. `GET /near/health` reports
 the watcher cursor and status without exposing workflow inputs.
 
-The RPC must support `EXPERIMENTAL_changes` and `EXPERIMENTAL_receipt_to_tx`
-(including receipt-to-transaction tracking). Public FastNEAR RPC was checked
-read-only on mainnet on 2026-11-13. An RPC without those methods leaves automatic
-detection unavailable; the payment page's explicit confirmation remains usable.
+Automatic detection needs an RPC that supports `EXPERIMENTAL_changes` and
+`EXPERIMENTAL_receipt_to_tx` with receipt-to-transaction tracking. Public
+FastNEAR RPC was checked read-only on mainnet on 2026-11-13. Explicit
+confirmation remains available when transaction verification is healthy.
 
 ### Live mainnet verification
 
@@ -271,7 +274,60 @@ or refund again. A quote is bound to its asset and exact original request;
 wrong amounts or late matched payments refund in the payment asset. Disabling
 new USDC quotes does not discard outstanding token refund obligations.
 
+## Workflow creator payouts
+
+A workflow can declare its creator's Nano address in top-level graph metadata:
+
+```json
+"x402": { "author": "nano_…" }
+```
+
+This works for saved tools and custom `run_noodle` graphs (objects, JSON strings,
+or full share links). The recipient is locked when quoting. Customers still pay
+NEAR or USDC and receive change in the same asset. On a successful run, the
+collected 20% markup is paid to the author **in Nano from the shared Nano pool**.
+There is no extra charge to the customer. Missing `author` leaves the fee with
+the operator; invalid addresses are refused before quoting.
+
+The payout uses the quote's locked XNO/USD rate. In integer arithmetic:
+
+```
+feeCollected = min(feeAtomic, max(chargedAtomic - costAtomic, 0))
+authorRaw = floor(feeCollected × rate.usdNano × 10^30 / (rate.yocto × xnoUsdNano))
+```
+
+`Atomic` means yoctoNEAR for native payments and six-decimal token units for USDC.
+The rate pair uses those same units. A deposit exhausted by model cost leaves
+no author payout. Failed, rejected and interrupted runs produce no payout.
+An authored workflow needs a current XNO/USD rate and a configured Nano wallet
+before payment can be quoted, even when an API key pays the model provider.
+
+The durable payout outbox is separate from customer refunds and is never pruned
+with quotes. It records the debt and signed Nano block before broadcasting.
+Retries and restarts republish the same block, so a lost response cannot create
+a second payout. A new block can be signed only when a different confirmed
+successor proves the original cannot land. All Nano operations use the existing
+wallet's single signing queue. Payouts retry independently; customer results and
+refunds do not wait for them. `receipt.authorPayout` exposes the recipient,
+`amountRaw`, display amount, status and Nano block hash; it is also receipt leg 4.
+The payment quote exposes `payment.authorPayout` before the customer pays.
+
 ## Browser studio
+
+The private `/pay/<paymentId>` page follows the complete run, using the same
+graph, receipt and result renderer as the studio. Its `?run=1` event subscription
+continues through payment, node execution and refund settlement. Reopening the
+page attaches to the current snapshot and reads the existing result; it never
+starts a workflow or requests another payment.
+
+`GET /near/result/<paymentId>` is a read-only result endpoint: 202 while the run
+is unfinished, 200 with the existing MCP result and receipt after settlement,
+404 for an unknown id. The unguessable private payment link grants read access
+to that run's output, so keep it private. Responses use `no-store`; pay pages
+send no referrer. Paid text remains in memory and is not recoverable after a
+server restart. Persisted media links remain recoverable while the files exist.
+The default agent payment watcher still closes on payment so agents can resume
+their bound MCP call immediately; the browser's optional run watcher is separate.
 
 **https://near.nanoodle.com** presents Nanoodle on NEAR and offers NEAR or USDC
 only when enabled. Ready-made workflows have editable named inputs; the custom
@@ -356,6 +412,12 @@ This formula is the same one the Nano charge mode uses for saved graphs (`priceF
 `src/gate.mjs`), so both payment rails quote the same deposits. When a deposit would exceed
 the operator's configured maximum (`--near-max-deposit-usd`, default $2.00), the call is
 refused before a quote exists.
+
+The NEAR and USDC gates check prices again before starting a paid run. They use
+catalog data cached for up to five minutes. If a refresh is required and fails,
+affected models are treated as unpriceable. If the new model estimate exceeds
+the wallet funding budget locked by the original quote, the service refunds
+the whole deposit before starting any model work.
 
 The deposit in NEAR is `ceil(deposit USD / rate)`, rounded up to a whole 0.000001 NEAR.
 Dust of 1 to 999 steps of 0.000001 NEAR is then added, chosen so the amount differs from
@@ -875,6 +937,9 @@ Quote record:
 
 Refund record: `{ id, paymentId, to, amountYocto, reason, status: "queued"|"signed"|"sent"|"failed_permanent", txHash, signedTxBase64, nonce, blockHash, signedAt, attempts, nextAttemptAt, lastError, createdAt, sentAt, finishedAt }`.
 The file also keeps `meta.lastNonce`, the last refund nonce this server signed.
+Renewals retain `replacementNonce` and `supersededTxHashes`.
+`outcomeUnverified` keeps the monitoring alert active across RPC errors until
+the refunder verifies a final outcome.
 
 Rules that make restarts safe:
 
@@ -965,7 +1030,7 @@ a keyed endpoint first and keep a public one as the fallback.
 
 ## Refunds
 
-Refunds are native transfers from the merchant account. A queue in the server sends them
+Refunds are transfers in the payment asset from the merchant account. A queue in the server sends them
 one at a time.
 
 1. **Persist the owed refund as `queued`** before touching the network, so an RPC outage
@@ -980,16 +1045,17 @@ one at a time.
    (for example, the payer deleted its account after paying) is `failed_permanent` and
    logged for the operator; the NEAR is back in the merchant account.
 4. If the broadcast fails, retry the **same bytes** with backoff (30 s up to 10 min).
-   Before signing again, check the old hash with `tx` (`wait_until: "NONE"`). A new
-   transaction is signed only when the old hash is unknown **and** the network rejected it as
-   `Expired` (its block hash is more than about a day old) or `InvalidNonce` **and** the old
-   transaction was signed less than 36 hours ago. Regular RPC nodes forget transactions after
-   a few epochs, so for an older record "unknown" proves nothing: it is marked
-   `failed_permanent` with `lastError: "UNPROVABLE"` and logged, so the operator checks an
-   explorer (or an archival RPC) instead of the server risking a second refund.
+   On expiry or a nonce rejection, look up every retained transaction hash at
+   `FINAL`. A recent expired transaction can renew its block reference using
+   its original signer and nonce when the finalized access key still permits
+   that nonce. Store the renewed hash and retain the original for reconciliation.
+   A nonce rejection with an unknown outcome retains the original refund for
+   status checks and alerts the operator. Older replacements with unproven
+   nonce history use status checks alone.
 5. After 100 failed attempts, the refund is marked `failed_permanent` and logged for the
-   operator. The money stays in the merchant account, and the receipt says to contact the
-   operator.
+   operator. Check the original transaction history on an archival RPC or
+   explorer before making a replacement. An old hash can be absent from a
+   regular RPC node's history.
 
 The merchant pays the refund's gas, about 0.000045 NEAR per plain transfer (the
 transaction and its receipt each burn 0.0000223 NEAR at testnet's minimum gas price, as
@@ -1065,9 +1131,8 @@ These are deliberate cuts for this version.
   pruned is answered "unknown payment id"; the NEAR stays in the merchant account and the
   operator must return it by hand.
 - No per-client rate limit on free quotes and `price_noodle` (see Quote spam).
-- The refund signer must be the only user of the merchant key. Another wallet sending from
-  the same key can make a signed refund's nonce stale; the server then re-signs it (see
-  [Refunds](#refunds)), which is safe but slower.
+- Reserve the merchant key for the refund signer. Another wallet using the
+  same key can consume a nonce and require [refund reconciliation](#refunds).
 
 ## Module layout
 

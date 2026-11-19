@@ -1,0 +1,381 @@
+# Daily paid MCP check
+
+`scripts/near-check.mjs` exercises the public MCP with one cheap custom text →
+LLM workflow and native NEAR. The optional `--two-steps` adds a second LLM to
+check data handoff. Each new run uses a random marker and checks the answer,
+automatic payment discovery (without transaction hints), streamed node progress,
+the finalized refund and receipt arithmetic, replay, and the payment-page result
+cache. It also checks MCP initialization, discovery, agent instructions and pricing.
+
+The default limits are $0.001 estimated model cost and 0.01 NEAR deposited per
+run. The server's $0.01 minimum deposit is mostly refunded. Actual model cost
+plus the service fee must be at most $0.0012 for the check to pass. Network gas
+is additional. A cap violation stops before payment; an unexpectedly high final
+charge fails the check after settlement. Only a small dedicated payer wallet is
+available to this process; it cannot access the merchant key. Funding is manual,
+so total losses are also bounded by that wallet's balance.
+
+Before signing, the canary checks the payer's balance, storage requirements,
+full-access key and gas prepayment at a single fresh finalized block. A shortfall
+leaves the graph ready for a new quote after funding. Any previously signed
+payment still follows the same-hash recovery path.
+
+The five-minute operational probe reads the dedicated payer's public balance and
+key status and warns when the payer cannot cover the maximum canary deposit,
+storage and gas. It derives an implicit account's public key from its account
+ID. For a named payer, set `CHECK_PAYER_PUBLIC_KEY` in the canary environment
+file. `CHECK_MAX_NEAR` configures the canary's default cap and the monitoring
+threshold together. The operational service's payer key file remains inaccessible.
+
+## Installation on the production box
+
+Create a `nanoodle-check` system user. Generate a dedicated key with
+`generateNearKey` / `writeKeyFile` from `scripts/near-testnet-lib.mjs`, write it to
+`/etc/nanoodle-near-check/payer.json` (root:nanoodle-check, 0640), and fund its
+implicit account once. Do not put the merchant credentials into the check's env.
+Use a separate `/etc/nanoodle-near-check` directory (root:nanoodle-check, 0750).
+Write `/etc/nanoodle-near-check/env` (root:nanoodle-check, 0640):
+
+```sh
+CHECK_URL=https://near.nanoodle.com
+CHECK_PAYER=<dedicated implicit account>
+CHECK_KEY_FILE=/etc/nanoodle-near-check/payer.json
+```
+
+Install `ops/nanoodle-near-check.{service,timer}` in `/etc/systemd/system/`, then:
+
+```sh
+systemctl daemon-reload
+systemctl start nanoodle-near-check.service
+systemctl enable --now nanoodle-near-check.timer
+systemctl list-timers nanoodle-near-check.timer
+```
+
+The timer runs at **09:00 UTC daily**, including one catch-up after downtime.
+No automatic service restart is configured. A failure leaves a failed systemd
+unit and a redacted `latest.json`. The failure hook alerts Ember over Babel when
+the notification setup below is installed.
+
+```sh
+systemctl status nanoodle-near-check.service
+journalctl -u nanoodle-near-check.service --since yesterday
+cat /var/lib/nanoodle-near-check/latest.json
+```
+
+## Recovery and manual checks
+
+New canaries use the non-reasoning `openai/gpt-4.1-nano` model with a 256-token
+limit. New version-two checkpoints require the model's first text output to
+equal a fresh 16-character hexadecimal marker. No decorative prefix is required;
+the two-step variant extracts and copies that marker through both models.
+The marker checks payment, execution and result delivery without
+depending on a thinking model finishing inside a tiny budget. Strict marker,
+progress, receipt, refund and replay checks still apply. Retained work keeps its
+original graph and signed payment when the script changes; an incorrect result
+stays failed and is not automatically rerun or replaced.
+
+State and signed transaction bytes are saved atomically before broadcasting.
+Reruns resume the same payment and graph. They never re-sign an ambiguous or
+expired transaction or replace an unfinished quote. A completed day performs
+free MCP checks and reads the payment page's status and result endpoints. Both
+must still return the verified receipt, and the result must contain the exact
+canary output. The check reuses the original deposit and performs no inference.
+After recovering an older unfinished day, the next invocation can start today's
+check. Always run under the same `flock` as the systemd service to avoid overlap.
+
+For a separate manual two-step check, use a separate private state directory:
+
+```sh
+flock -n /var/lib/nanoodle-near-check/check.lock \
+  node scripts/near-check.mjs --two-steps --state-dir /private/manual-check \
+  --payer <account> --key-file /private/payer.json
+```
+
+`state.json` contains private quote capabilities and signed transaction bytes;
+keep it private. `latest.json` is redacted and contains only verification facts
+and public transaction hashes. If a quote expires unpaid or a signed transaction
+is rejected, inspect the recorded hash and account on chain before archiving the
+state. Do not delete state to blindly retry. If recovery finds a completed run
+whose original progress stream was lost, missing live progress correctly fails
+the check rather than claiming that streaming was verified.
+The server also keeps paid text output in memory: a restart between execution
+and replay can preserve the receipt and refund while losing replayable text.
+This check reports that as a failure. Finish paid checks before restarting the
+app, and inspect the retained original result and on-chain receipt before
+archiving an interrupted manual check.
+
+## Babel failure alerts
+
+The same durable outbox also recognizes the manual `nanoodle-backup.service`
+and labeled `nanoodle-backup-alert-test.service` drill. Backup messages select
+only the systemd invocation/result and a fixed backup stage; they never read
+payment reports, archive contents or recovery keys. They ask the operator to
+confirm that the app and original timers resumed. This does not install or
+schedule a backup, provide an off-server destination, or keep Babel reachable
+during loss of the shared VPS.
+
+The five-minute readiness check also verifies backup capture and export age,
+offsite copy age, and whether the two proofs cover the same encrypted archive.
+A new export has 15 minutes for offsite verification. An overdue generation
+raises a backup warning through Babel while payment admission is assessed
+independently. The proof files contain a checksum-derived generation ID.
+Neither the monitor report nor the alert contains that ID or archive paths.
+
+The check's `OnFailure` starts `nanoodle-near-alert@<failed-unit>.service`.
+`scripts/near-alert.mjs` saves a selected-metadata message before attempting
+delivery. Each systemd invocation has a stable message ID; network failures and
+lost responses retry that ID. `nanoodle-near-alert-retry.timer` drains pending
+messages every five minutes. Babel then owns durable delivery and recipient wakes.
+Queue acceptance is distinct from Ember's authenticated receipt.
+
+Provision a dedicated persistent sender through the Babel operator's approved
+process, scoped to a conversation with Ember. Do not copy a native worker's
+expiring credential. Keep its token in `/etc/nanoodle-near-check/babel-token`
+(root:nanoodle-check, 0640), and write `babel.env` alongside it:
+
+```sh
+BABEL_URL=http://127.0.0.1:8403/mcp/v1
+BABEL_HOST=babel.255bits.com
+BABEL_TOKEN_FILE=/etc/nanoodle-near-check/babel-token
+BABEL_SENDER=<dedicated sender ID>
+BABEL_CONVERSATION=<dedicated alert conversation>
+```
+
+The supplied unit restricts network access to localhost. The Babel credential
+has no wallet access. Alert text contains the time, failed stage, service result
+and recovery instructions; it excludes prompts, quote capabilities and keys.
+Install `ops/nanoodle-near-alert@.service` and
+`ops/nanoodle-near-alert-retry.timer`, reload systemd, and enable the retry timer.
+Inspect delivery with:
+
+```sh
+systemctl status 'nanoodle-near-alert@nanoodle-near-check.service.service'
+cat /var/lib/nanoodle-near-check/alerts/latest-delivery.json
+```
+
+Test the exact failure path without paying for a workflow:
+
+```sh
+systemd-run --unit=nanoodle-near-check-alert-test \
+  --property=OnFailure=nanoodle-near-alert@nanoodle-near-check-alert-test.service.service \
+  /usr/bin/false
+```
+
+This unit's failure is expected. Its alert is explicitly labeled TEST and asks
+Ember to claim and acknowledge it. Verify `message_status` for the resulting
+message using the sender's own credential. A queued message alone does not prove
+receipt. Never acknowledge on Ember's behalf.
+
+The operational probe allows a recently started app up to 45 seconds to initialize
+both listeners and the NEAR watcher before running its full check. This applies
+only when systemd reports a live app started within the last minute. An old,
+missing or failed app is checked immediately. A bounded grace expiring still runs
+all normal probes and alerts on failure; it never reports recovery by itself.
+These warm-up GET requests execute no workflows or payments. This avoids the
+temporary 502 alarm observed just after the planned 2026-11-17 backup drill.
+
+The readiness check reads active Market assignments, then compares each paid
+hire with the worker's local state. It flags hires still untracked after five
+minutes, remote starts without a corresponding local record, and active
+assignments past their Market deadline. It reports if the bounded five-page
+scan cannot cover the full queue. The reports and Babel alerts carry fixed
+diagnostic codes. They omit assignment IDs and buyer text.
+
+## NEAR AI Market availability every 15 minutes
+
+`scripts/market-check.mjs` makes public GET requests to `market.near.ai`: the
+website, platform API, and the four published Nanoodle profiles (song, image,
+character, clip) with their default live pricing plans. It checks that profiles
+are live, available and not funding-paused. Occupied job slots alone do not
+fail a check. The custom-workflow profile is not published yet and is excluded;
+add it to `MARKET_HANDLES` after publication.
+
+This is an availability check, not a paid execution test. It uses no credentials,
+creates no jobs, runs no inference, and makes no payments. It does not prove an
+authenticated worker can complete an assignment. Each failed probe gets up to
+three attempts with a two-second pause; each request, including its response
+body, has a 12-second deadline. Reports contain selected public status only.
+
+Install `ops/nanoodle-market-check.{service,timer}` alongside the existing check
+and alert units, then:
+
+```sh
+systemctl daemon-reload
+systemctl start nanoodle-market-check.service
+systemctl enable --now nanoodle-market-check.timer
+TZ=UTC systemctl list-timers nanoodle-market-check.timer
+cat /var/lib/nanoodle-near-check/market-latest.json
+```
+
+The timer runs at **:00, :15, :30 and :45 UTC** with a catch-up after downtime.
+It runs on the same production VPS, `159.195.17.119`, as user `nanoodle-check`;
+the unit hides the payer key and Babel token. Failures use the existing Babel
+sender, conversation with Ember, private outbox and five-minute alert retry
+timer. No additional Babel enrollment or grant is required.
+
+Test the Market failure route without interrupting the actual service:
+
+```sh
+systemd-run --unit=nanoodle-market-check-alert-test \
+  --property=OnFailure=nanoodle-near-alert@nanoodle-market-check-alert-test.service.service \
+  /usr/bin/false
+```
+
+The resulting alert explicitly says TEST. As above, verify Ember's authenticated
+receipt separately from queue admission.
+
+## Financial and workflow readiness every five minutes
+
+`scripts/operational-check.mjs` runs as `nanoodle-mcp` with its existing config
+and filesystem access. It reads public chain data and authenticated read-only
+Market assignments, checks free MCP discovery/pricing, and reads local ledgers.
+It does not execute models, generate PoW, pay invoices, sign/broadcast transfers,
+start/retry jobs, submit bids or change listings. A small unique temporary file
+is written, fsynced and removed in the output directory to verify persistence.
+
+Coverage:
+
+- Nano mainnet identity, confirmed wallet height/frontier agreement across
+  configured nodes, and the running wallet's fresh multi-peer read enforcement.
+  See [Nano RPC freshness](nano-rpc-freshness.md).
+- NEAR network, syncing, finalized head age and cross-node consistency;
+  payment-watcher age/lag and the merchant's current refund-key permission.
+  If the watcher is still scanning historical blocks five minutes after the
+  first observation, the same alert route reports delayed payment detection.
+  The report distinguishes this from a failure to follow the live chain tip.
+- Current gas/storage costs, native NEAR reserve and USDC registration/balance.
+- Enforced [NEAR refund funding](near-refund-funding.md), its fresh health and
+  separate NEAR/USDC quote capacity. Fee calculations include the protocol's
+  gas purchase floor and complete action costs; paid/running work retains fees
+  before its refund outbox entry exists. These add two per-asset probes.
+- Balances after customer/creator liabilities and accepted Market work; Market
+  revenue is not treated as spendable before settlement. A $2 provider-funding
+  buffer and 0.05 NEAR native reserve are checked in addition to recorded debts.
+- Stuck paid runs, missing refund/payout intents, pending/permanently failed
+  refunds, creator payouts and Market work requiring an operator.
+  Nano settlement alerts use the age of the debt and the persisted failed
+  attempt count. A restored debt without a creation time starts aging from
+  the time it is loaded.
+- Fresh private runtime funding telemetry, enforced spend/transfer protection,
+  and active scopes older than the configured execution limit plus 15 minutes
+  for payment reconciliation. See [hosted deadlines](hosted-execution.md).
+- Live exchange-rate freshness; platform fee still matching the worker's 5%
+  assumption; authenticated Market token validity and actual worker lock/process.
+- Active Market assignments have a delivery-window check. It warns when
+  delivery is due within ten minutes or the last quarter of a shorter SLA,
+  a worker's retry would miss its cutoff, or model work has reached its
+  execution cutoff. The report identifies the listing and the fixed outcome.
+- Catalog pricing and Market net-price coverage for all four predefined graphs.
+  The free MCP check prices a custom two-step graph separately in NEAR and USDC
+  against one fresh provider estimate, so a preview failure identifies the
+  affected currency.
+- Free pricing for each of the five saved MCP workflows shown on both sites and
+  the paid 3D template. It checks NEAR/USDC denomination and compares the Nano
+  site's advertised fixed deposits with the current estimated charge for the
+  same published graphs. These per-workflow alerts preserve admission for other
+  workflows.
+- When provider payments use the shared Nano wallet, the monitor checks whether
+  that wallet can reserve each advertised NEAR and USDC deposit, the custom
+  sample, the tested Market listing budgets, and enabled Market bid ceilings.
+  It compares the same run budget against live unreserved funds and the
+  independently confirmed balance after obligations, including paid NEAR and
+  USDC runs still waiting to reserve Nano. A creator run includes overhead
+  from the largest possible deposit with quote dust. These are per-workflow
+  warnings. The runtime still verifies funding when each run starts.
+- NEAR and USDC share an open-quote limit. The check warns at 80% and
+  reports both quote lanes unavailable at the limit. The saved-workflow probes
+  also check capacity for their current exact payment amounts. Expired quotes
+  still hold an amount during the late-refund window. A full amount range
+  affects only workloads at that price and denomination.
+- Disk/inode headroom and a write/fsync probe; disabled/overdue check timers and
+  failed scheduled services, including the paid canary and alert-queue retry.
+- The ordinary Nano fallbacks must serve confirmed receivables and continuous
+  raw history from the wallet's confirmed head. Raw history includes
+  representative changes and epoch blocks. The hosted watcher rejects a gap,
+  wrong account, or truncated page before committing coverage. Its completed
+  cursor stays on a block that the older, filtered history can still find.
+
+Install `ops/nanoodle-operational-check.{service,timer}`, reload systemd, start
+the service once, inspect its report, then enable the timer. It runs at every
+five-minute UTC boundary with a catch-up after downtime. Its four-minute unit
+deadline bounds the entire probe. The app needs to be running before the check
+can succeed. The unit grants write access only to its report directory and the
+output directory needed by the unique persistence probe.
+
+```sh
+systemctl start nanoodle-operational-check.service
+cat /var/lib/nanoodle-operational-check/latest.json
+systemctl enable --now nanoodle-operational-check.timer
+TZ=UTC systemctl list-timers nanoodle-operational-check.timer
+```
+
+The report contains fixed stage/error codes, timestamps and readiness booleans;
+no prompts, assignment bodies, account secrets, raw upstream errors or private
+URLs. Its directory is 0755 and `latest.json` is 0644 so the separate Babel alert
+user can read this selected report without gaining access to the app's keys.
+The report's `admission` fields are readiness observations; this monitor does
+not itself enforce per-run reservations or alter the payment gates.
+
+The app retains its most recent shared-wallet funding pause for 15 minutes
+after recovery. The readiness probe includes the last failed sample, the
+recovery time, and an allowlisted reason when it confirms funding is healthy.
+This catches pauses between probes while preserving the current admission
+status. The existing alert retry timer queues one recovery notice per observed
+pause for Ember, even when the readiness probe succeeds.
+
+Failures use the existing sender/outbox/Ember route. An unchanged incident has
+one message ID across timer invocations, with a new reminder after six hours;
+recovery followed by another failure is a new incident. Hook delivery retries
+remain separate from probe execution. Test the real hook without an outage:
+
+```sh
+systemd-run --unit=nanoodle-operational-check-alert-test \
+  --property=OnFailure=nanoodle-near-alert@nanoodle-operational-check-alert-test.service.service \
+  /usr/bin/false
+```
+
+Read the broader [reliability audit](operational-reliability.md) for remaining
+runtime prevention and full-host recovery requirements.
+
+Protocol references: [Nano confirmed account fields](https://docs.nano.org/commands/rpc-protocol/#account_info),
+[NEAR gas prices](https://docs.near.org/api/rpc/gas) and
+[NEAR storage/transaction configuration](https://docs.near.org/api/rpc/protocol).
+
+## Public availability from outside production
+
+The [public availability workflow](../.github/workflows/public-check.yml) runs
+on a GitHub-hosted runner every 15 minutes. It checks MCP discovery on the Nano
+and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund funding,
+the Babel authentication challenge, and NEAR AI Market's public site, API and
+Nanoodle listings. The free `price_noodle` probes check that the decision model
+and both branches are priced in NEAR and USDC, and the estimated charge fits
+the deposit. All probes use bounded retries and record only check results.
+The hosted workflow runs both checks with Node and can still probe Market
+during an npm outage. The probes use public discovery, status and pricing.
+
+Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
+or use **Run workflow** to check from a separate network. GitHub routes scheduled
+failure notifications to the account that last changed the schedule, according
+to its notification settings. Scheduled runs may be delayed or skipped. The
+VPS monitors still check wallet balances, agreement between nodes and private
+payment state. They send their alerts to Ember through Babel. A whole VPS
+outage can interrupt that route, while GitHub can still record the public
+failure. [GitHub schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+
+The same public probes can also run on Cloudflare as the
+`nanoodle-public-availability` Worker. Its configuration in
+`ops/cloudflare-public-check.jsonc` schedules the checks every 15 minutes and
+exposes no HTTP route. The Worker logs a count and fixed failure codes, and a
+failed probe marks the scheduled event failed. Check the Worker's logs or Cron
+Events in the Cloudflare dashboard for execution evidence. This deployment has
+no notification integration. [Cloudflare Cron Events](https://developers.cloudflare.com/workers/configuration/cron-triggers/#view-past-events)
+
+Run the Worker against the production public URLs from the local Workers runtime
+before deploying.
+
+```sh
+npx wrangler@4.164.0 dev --local --test-scheduled --config ops/cloudflare-public-check.jsonc
+curl -fsS 'http://127.0.0.1:8787/cdn-cgi/local/scheduled?format=json'
+npx wrangler@4.164.0 deploy --config ops/cloudflare-public-check.jsonc
+npx wrangler@4.164.0 tail nanoodle-public-availability --format json
+```

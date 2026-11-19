@@ -312,6 +312,13 @@ the result. The seed/private key never leaves the process: only the *signed
 block* goes to the RPC node, and neither secret is ever logged. An API key,
 if present, always wins — the wallet is only used keyless.
 
+Hosted paid tools and Market workers compare account reads across configured
+Nano RPCs, validate mainnet identity and pause new spending on stale or
+inconsistent views. Configure independent peers with a comma-separated
+`NANO_RPC_URL`; multiple configured peers require at least two readable nodes.
+See [Nano RPC freshness](docs/nano-rpc-freshness.md) for protocol requirements,
+monitoring and the remaining restart-recovery limits.
+
 **Proof-of-work reliability.** Every send block needs Nano proof-of-work. The
 server asks the RPC node's `work_generate` first, but public nodes routinely
 refuse or throttle it (no GPU, key required); the fallback is local
@@ -362,6 +369,12 @@ service *anyone's* agent can connect to:
 ```bash
 nanoodle-mcp --graphs ~/noodles --serve 8402
 ```
+
+Hosted execution has a 30-minute deadline across each workflow and its output
+downloads. Operators can set `NANOODLE_RUN_TIMEOUT_MS` (positive milliseconds,
+at most 24 hours). Saved/custom workflows and Market jobs use the same rule;
+nested tools share their parent's deadline. See [execution and payment
+cancellation](docs/hosted-execution.md).
 
 Callers connect with one command — no key, no signup:
 
@@ -516,6 +529,8 @@ Direct-wallet spending has no cap and is not refunded. A short comment
 is not asked for the longest comment's hold. The graph's `usd` is only the
 ceiling for that longest request, used when a model has no price.
 
+#### Workflow creator payouts
+
 `usd` overrides the deposit for every other tool. `author` routes **the 20% markup of every
 successful call to that address** — computed on what the run *actually* cost,
 never on the deposit, and capped by whatever the deposit has left once the cost
@@ -531,6 +546,89 @@ markup = cost / 5                    (20%, integer floor)
 take   = min(markup, deposit − cost) → author (or kept, if no author field)
 change = deposit − cost − take       → back to the payer
 ```
+
+The same `x402.author` field also works on the NEAR service, for both saved workflows
+and custom graphs passed to `run_noodle`. The customer pays in **NEAR or USDC on NEAR**;
+the author still receives **Nano**, from the same Nano wallet pool used to fund models.
+The payout converts only the collected markup at the quote's locked XNO/USD rate,
+using integer arithmetic and rounding down to raw. It is capped by what remains of
+the deposit after model costs. There is no additional creator fee. Customer change
+and failure refunds stay in the customer's original asset. Without `x402.author`,
+the operator keeps the markup.
+
+NEAR creator payouts use a durable outbox: the debt and signed Nano block are recorded
+before publication, and retries replay that same block. A replacement is allowed only
+when a different, confirmed successor proves the original block can never land.
+Pending payouts survive restarts and quote pruning; receipts expose the author,
+exact Nano amount, status and block hash. Payout retries do not block the result or
+customer refund. Authored workflows are refused before quoting if no Nano payout
+wallet or current XNO/USD rate is available. API-key-funded servers can configure
+`NANO_SEED` or `NANO_PRIVATE_KEY` for these payouts too.
+
+#### Hosted creator workflows
+
+On [near.nanoodle.com/creators](https://near.nanoodle.com/creators), upload a
+native Nanoodle graph. An embedded `x402.author` Nano address is optional. Nanoodle stores
+the recipe, funds the model calls from its shared pool, and supplies a run page
+and a dedicated MCP endpoint. The creator supplies the workflow, not a server,
+provider key or marketplace token. Customers still pay NEAR or USDC before execution. With a valid address, successful
+runs pay the creator in Nano using the rules above; without one, no creator payout
+is made. The form warns on the first Host click and requires a second Host click
+for the same graph, name and description to host without creator payouts. Editing
+the form or choosing another file resets that acknowledgment. Free checking never
+requires a payout address; malformed explicit metadata is still rejected.
+
+Connected, named Text and Choice nodes become customer inputs automatically.
+Multiple inputs are mapped independently; no primary input selection is needed.
+Locked nodes, unnamed defaults, and saved optional prompts stay in the recipe.
+A saved text feeding only an optional field port (such as Image→Video's motion
+prompt) also stays in the recipe. The Day to Night example exposes its Day
+keyframe prompt and Night keyframe instruction while preserving its motion
+default. Names do not turn text into image inputs: upload nodes remain
+unsupported by the paid hosted runner. Model configuration stays in the stored
+recipe; callers cannot replace the graph or payout address.
+Uploads are immutable and deduplicated: a revision gets a new link. Public
+pages and MCP discovery do not distribute the graph. Hosting the platform
+yourself remains supported by this open-source repository.
+
+`POST /creators/check` validates and prices without executing; `POST
+/creators/workflows` hosts it. Both accept `{graph, name, description}`;
+the check response includes the same customer `schema` as the hosted endpoint.
+Explicit legacy `inputName` submissions still select a named Text node for the
+single-input pricing probe and publish their former full input schema. The
+automatic form omits `inputName`; existing hosted records keep their published
+schemas. ComfyUI/OpenArt exports receive a format error before
+pricing or hosting: rebuild or open a supported native graph in the Nanoodle
+editor and use Save to export `noodle-graph.json`. Renaming a foreign JSON file
+does not convert it. A successful upload returns `/workflows/wf_…` and
+`/workflows/wf_…/mcp`. The endpoint offers `run_workflow` and free
+`price_workflow`, using the same NEAR/USDC gate, execution graph, receipt and
+result components as the main service. `/workflows/wf_…/llms.txt` explains
+automatic payment continuation for that endpoint.
+
+Hosting is immediate after automated graph, price and Nano-address checks.
+There is **no Nanoodle review or approval step**. Share the run page with people,
+or connect an agent to the uploaded workflow's `/workflows/wf_…/mcp` endpoint.
+The page supplies the MCP URL, client connection command and copyable payment
+instructions. Users pay the execution quote in NEAR/USDC before the workflow
+runs; unused funds return in the same asset. Successful executions route the
+collected model-cost fee to the embedded Nano author address as above.
+
+Creator marketplace-listing setup is not currently offered. Market holds buyer
+funds in escrow and releases seller proceeds after delivery/acceptance; those
+proceeds cannot fund Nanoodle's upfront execution quote for that same job. Such
+an integration requires the creator to front the execution cost. The existing
+Nanoodle marketplace workers remain separate from this hosted creator flow.
+
+For Nanoodle's existing marketplace workers, which execute their own hires
+directly rather than through a paid MCP call, the creator payout becomes owed
+only after **acceptance**.
+It is 20% of actual model cost, capped by accepted proceeds after model costs,
+converted at the XNO/USD rate locked before execution. Refunded hires and
+unknown model costs create no payout. The common durable Nano outbox retries
+pending sends without rerunning the workflow or paying a settled assignment
+twice. The marketplace's own fee and cent rounding can reduce the payout.
+Official registration/adoption flow: [market.near.ai agent guide](https://market.near.ai/skill/flows/a2a-x402.md).
 
 A run costing more than its deposit keeps the whole deposit and the operator
 absorbs the excess; a run whose model reports no cost settles at $0 and the
@@ -787,6 +885,15 @@ From version 0.7.0, `run_noodle` also takes a workflow you composed yourself: pa
 `graph` instead of `url`. Two free helpers sit next to it: `noodle_guide` explains
 the graph format, node types and priced models, and `price_noodle` returns the
 itemized estimated cost of a `graph` or `url` without running it.
+
+For agent-authored graphs, call `noodle_guide` first. For example,
+`{"node_type":"ivideo","limit":5}` returns model candidates for an
+image-to-video node, and `{"format_only":true}` returns the graph contract and
+a minimal example without looking up model catalogs. The guide filters for
+the hosted node policy, provider-advertised capabilities and a priceable
+baseline. It does not create a quote, run inference or list the editor's full
+inventory. Before quoting a run, pass the actual graph, settings and inputs to
+`price_noodle`.
 
 ## Pay with NEAR / run custom workflows
 

@@ -1,84 +1,48 @@
-/** Offline evidence for remaining recovery gaps. Never imports or creates a wallet. */
-import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createChargeGate, hashArgs } from '../src/gate.mjs';
-const address = 'nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet';
-const source = 'nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3';
-const params = { name: 'poster', arguments: {} };
-const registry = (callTool) => ({ tools: [{ name: 'poster' }],
-  listTools: () => [{ name: 'poster', description: 'fixture', inputSchema: {} }], callTool });
-const result = () => ({ content: [{ type: 'text', text: 'fixture' }], textOutput: true, costUsd: 0.02 });
-const options = { address, usd: 0.05, xnoUsd: 1, publicBase: 'http://fixture.invalid', pollMs: 5 };
-const quote = (extra = {}) => ({ id: 'pay_fixture', tool: 'poster', argsHash: hashArgs('poster', {}),
-  amountRaw: String(5n * 10n ** 28n), usd: 0.05, pair: { usdNano: '1000000000', raw: String(10n ** 30n) },
-  source, status: 'paid', createdAt: Date.now(), expiresAt: Date.now() + 900_000, ...extra });
-const retry = { ...params, arguments: { _payment_id: 'pay_fixture' } };
-async function until(fn) {
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) {
-    try { const value = await fn(); if (value) return value; } catch { /* write in progress */ }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error('offline probe timed out');
-}
-const dir = await mkdtemp(join(tmpdir(), 'mcp-recovery-probes-'));
-try {
-  const stateFile = join(dir, 'settlement.json');
-  await writeFile(stateFile, JSON.stringify({ v: 2, quotes: [quote()], owed: [] }));
-  let firstSends = 0, restoredSends = 0;
-  const gate = createChargeGate({ ...options, stateFile, ops: {
-    rpc: async () => ({}), transfer: () => { firstSends++; return new Promise(() => {}); },
-  } });
-  await gate.wrapRegistry(registry(result)).callTool(retry);
-  const saved = await until(async () => {
-    const data = JSON.parse(await readFile(stateFile, 'utf8'));
-    return data.quotes[0].settled && data;
-  });
-  assert.equal(firstSends, 1);
-  assert.deepEqual(saved.owed, []);
-  const restored = createChargeGate({ ...options, stateFile, ops: {
-    rpc: async () => ({}), transfer: async () => { restoredSends++; return 'F'.repeat(64); },
-  } });
-  await restored.wrapRegistry(registry(result)).callTool(retry);
-  assert.equal(restoredSends, 0);
-  console.log(JSON.stringify({ gap: 'inflight_change_not_durable', firstSends, persistedOwed: saved.owed.length, restoredSends }));
+/** Offline payment-recovery regression checks using synthetic wallet fixtures. */
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-  let time = Date.now(), acceptedSends = 0;
-  const secondFile = join(dir, 'ambiguous.json');
-  await writeFile(secondFile, JSON.stringify({ v: 2, quotes: [quote()], owed: [] }));
-  const ambiguous = createChargeGate({ ...options, stateFile: secondFile, now: () => time, ops: {
-    rpc: async () => ({}), transfer: async () => {
-      acceptedSends++;
-      if (acceptedSends === 1) throw new Error('fixture: accepted send, response and reconciliation unavailable');
-      return 'F'.repeat(64);
-    },
-  } });
-  await ambiguous.wrapRegistry(registry(async () => { throw new Error('fixture provider failed'); })).callTool(retry);
-  time += 31_000;
-  await until(() => acceptedSends === 2);
-  console.log(JSON.stringify({ gap: 'ambiguous_send_retried_as_new_transfer', acceptedSends }));
-
-  const thirdFile = join(dir, 'history.json');
-  await writeFile(thirdFile, JSON.stringify({ v: 2, quotes: [quote({ status: 'pending', source: null })], owed: [] }));
-  const history = Array.from({ length: 150 }, (_, i) => ({ hash: i.toString(16).padStart(64, '0'), type: 'receive',
-    amount: i === 149 ? quote().amountRaw : '1', account: source }));
-  let pages = 0;
-  const deep = createChargeGate({ ...options, stateFile: thirdFile, ops: {
-    rpc: async (body) => {
-      if (body.action !== 'account_history') return {};
-      pages++;
-      const at = body.head ? history.findIndex((e) => e.hash === body.head) : 0;
-      return { history: history.slice(at, at + 100), ...(at + 100 < history.length ? { previous: history[at + 100].hash } : {}) };
-    }, transfer: async () => { throw new Error('no transfers in history probe'); },
-  } });
-  await until(() => pages >= 3);
-  assert.equal(deep.quote('pay_fixture').status, 'pending');
-  console.log(JSON.stringify({ gap: 'restart_seeds_only_first_history_page', historyEntries: history.length, pages, status: deep.quote('pay_fixture').status }));
-} finally {
-  // The last probe has an unref'ed watcher. It owns no real resources or data.
-  // Leave it idle until process exit, and wait for queued fixture writes first.
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  await rm(dir, { recursive: true, force: true });
-}
+const checks = [
+  "Nano payment stays pending until its original transfer is durable",
+  "Nano history resumes beyond the page cap",
+  "Nano history screens unconfirmed and pre-quote deposits",
+  "a restart reconciles signed Nano transfers",
+  "Nano payment recovery retains a signed send if the completion write fails",
+  "a Nano workflow killed after provider dispatch",
+  "a failed Nano execution-claim write buys no inference",
+  "Nano startup records an interrupted refund while admission is paused",
+  "a pre-claim Nano deposit is reserved for reconciliation",
+  "the scheduled check detects overdue Nano execution",
+  "modern Nano settlement evidence reserves",
+  "a marked Nano refund requires proof",
+  "earlier Nano outcomes preserve the receipt formats",
+  "Nano restore retains aged settlement gaps",
+  "the scheduled check reserves incomplete Nano settlements",
+  "NEAR and USDC refund evidence cannot release",
+  "restored NEAR refund evidence that conflicts",
+  "NEAR and Market creator payout evidence covers",
+  "restored NEAR and Market creator payouts",
+  "a replayed USDC receipt cannot show",
+  "Market creator payout verification reads",
+  "Market retention preserves an assignment",
+  "NEAR retention keeps quotes",
+  "the scheduled check detects NEAR, USDC and Market settlement mismatches",
+  "a NEAR refund transaction shared across records",
+  "a restored NEAR refund sharing a transaction candidate",
+  "a fresh NEAR refund that signs a previously claimed transaction",
+  "NEAR retention preserves a quote if its refund hash",
+  "a replayed USDC receipt with a shared refund hash",
+  "restored signed refunds with incorrect payer",
+  "a valid restored NEAR refund can rebroadcast",
+  "a sent refund whose signed terms disagree",
+  "a durable Nano send preserves new liabilities",
+  "two identical obligations cannot claim the same signed Nano transfer",
+  "the scheduled check detects legacy send debt",
+];
+const suites = ["serve-gate", "x402-wallet", "operational-check", "state-audit", "funding-liabilities",
+  "near-funding", "near-refunds", "near-author-payouts", "hosted-funding", "market-worker", "near-ledger"].map(name =>
+  fileURLToPath(new URL(`../tests/${name}.test.mjs`, import.meta.url)));
+const result = spawnSync(process.execPath, ["--test", "--test-reporter=spec",
+  "--test-name-pattern", checks.join("|"), ...suites], { stdio: "inherit" });
+if (result.error) throw result.error;
+process.exitCode = result.status ?? 1;

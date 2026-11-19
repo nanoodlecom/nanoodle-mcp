@@ -44,7 +44,7 @@ async function savedGate(t, quote, extra = {}) {
 test('artifact delivery withholds bookkeeping, staging files, directories and symlinks', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'mcp-artifact-audit-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const privateFiles = ['gate-state.json', 'usage.jsonl', 'costs.json', 'gate-state.json.tmp', 'future-private.txt'];
+  const privateFiles = ['gate-state.json', 'usage.jsonl', 'costs.json', 'gate-state.json.tmp', 'funding-health.json', 'funding-health.json.tmp', 'future-private.txt'];
   for (const file of privateFiles) await writeFile(join(dir, file), 'PRIVATE-BOOKKEEPING');
   await writeFile(join(dir, 'result.png'), 'GENERATED-IMAGE');
   await writeFile(join(dir, 'result.bin'), 'GENERATED-BINARY');
@@ -91,7 +91,7 @@ test('idless messages cannot execute tools or produce request replies', async ()
   assert.equal(calls, 2);
 });
 
-test('a failed regeneration after restart cannot refund an already settled deposit', async (t) => {
+test('a settled payment cannot regenerate inference or refund its deposit after restart', async (t) => {
   const transfers = [];
   const quote = savedQuote({ settled: true, settleReceipt: { known: true, costUsd: 0.02,
     take: '4000000000000000000000000000', change: '26000000000000000000000000000', author: true } });
@@ -103,25 +103,19 @@ test('a failed regeneration after restart cannot refund an already settled depos
   const retry = { ...params, arguments: { ...params.arguments, _payment_id: quote.id } };
   const result = await wrapped.callTool(retry);
   assert.equal(result.isError, true);
-  assert.equal(calls, 1);
+  assert.equal(calls, 0);
   assert.deepEqual(transfers, [], 'the first settlement already returned change and paid the author');
   assert.match(result.content[0].text, /already settled/i);
   assert.doesNotMatch(result.content[0].text, /was refunded|being refunded/);
   assert.deepEqual(await wrapped.callTool(retry), result);
-  assert.equal(calls, 1, 'a failed recovery replays, rather than redispatching');
-  for (let i = 0; i < 100; i++) {
-    const data = JSON.parse(await readFile(stateFile, 'utf8'));
-    if (data.quotes[0].error) {
-      assert.doesNotMatch(data.quotes[0].error, /SECRET-PROVIDER/);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  assert.fail('redacted recovery error was not persisted');
+  assert.equal(calls, 0, 'a completed payment never authorizes another paid execution');
+  const data = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(data.quotes[0].settled, true);
+  assert.doesNotMatch(JSON.stringify(data), /SECRET-PROVIDER/);
 });
 
 test('retention cannot forget a paid quote before the customer claims its run', async (t) => {
-  const quote = savedQuote({ createdAt: Date.now() - 25 * 60 * 60_000, expiresAt: Date.now() - 24 * 60 * 60_000 });
+  const quote = savedQuote({ runDeadlineAt: null, createdAt: Date.now() - 25 * 60 * 60_000, expiresAt: Date.now() - 24 * 60 * 60_000 });
   const { gate } = await savedGate(t, quote);
   assert.equal(gate.quote(quote.id)?.status, 'paid');
   assert.equal(gate.quote(quote.id)?.status, 'paid', 'repeated status reads must preserve the unpaid obligation');
@@ -133,6 +127,25 @@ test('retention cannot forget a paid quote before the customer claims its run', 
   assert.equal(gate.quote(quote.id).status, 'consumed', 'completion begins the replay retention window');
   await wrapped.callTool({ ...params, arguments: { ...params.arguments, _payment_id: quote.id } });
   assert.equal(calls, 1, 'a late claim still has a replay window after completion');
+});
+
+test('a pre-claim Nano deposit is reserved for reconciliation across restarts', async (t) => {
+  const quote = savedQuote(), { gate, stateFile } = await savedGate(t, quote);
+  let calls = 0;
+  const workflow = registry(async () => { calls++; return { content: [] }; });
+  const call = { ...params, arguments: { ...params.arguments, _payment_id: quote.id } };
+  assert.match((await gate.wrapRegistry(workflow).callTool(call)).content[0].text, /execution history.*needs reconciliation/i);
+  assert.equal(gate.fundingLiabilitiesRaw(), BigInt(quote.amountRaw));
+  await gate.stop();
+  const data = JSON.parse(await readFile(stateFile, 'utf8'));
+  assert.equal(data.quotes[0].executionNeedsReconciliation, true);
+  assert.deepEqual(data.owed, [], 'an older ambiguous payment cannot authorize a new refund');
+
+  const restarted = createChargeGate(gateOptions({ stateFile }));
+  t.after(() => restarted.stop());
+  assert.match(restarted.quote(quote.id).next, /execution history.*needs reconciliation/i);
+  assert.equal((await restarted.wrapRegistry(workflow).callTool(call)).isError, true);
+  assert.equal(calls, 0);
 });
 
 test('abandoning a payment wait releases it immediately without changing the quote', async (t) => {

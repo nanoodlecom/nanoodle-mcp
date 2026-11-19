@@ -21,6 +21,8 @@ import { join } from "node:path";
 import { MediaRef } from "nanoodle";
 import { computePrice, prepareRunNoodle, describeRunFailure, runNotices, extForMedia, ParamsError } from "../tools.mjs";
 import { DEFAULT_LIMITS, GraphArgsError, GraphRefusedError, exactUsd } from "../custom-workflow.mjs";
+import { runFundingBudget } from "../run-funding.mjs";
+import { withHostedRun, hostedRunTimeout, hostedRunOptions } from "../hosted-run.mjs";
 
 /** The operator's margin on a market job, on top of the estimated model cost. */
 export const MARKET_MARGIN_RATE = 0.2;
@@ -66,11 +68,17 @@ export async function checkNanoGptKey({ apiKey, baseUrl = "https://nano-gpt.com"
  * @param {object} [o.limits]      custom-workflow caps (maxDepositUsd is replaced by budgetUsd)
  * @param {(line: string) => void} [o.log]
  */
-export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetch = globalThis.fetch, limits = DEFAULT_LIMITS, log = () => {} }) {
+export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetch = globalThis.fetch, limits = DEFAULT_LIMITS, log = () => {}, fundRun = null, fundingPair = null, runTimeoutMs = undefined }) {
+  const executionLimit = hostedRunTimeout(runTimeoutMs);
   const keyed = typeof apiKey === "string" && !!apiKey;
   if (!keyed && typeof payment !== "function") throw new TypeError("createWorkflowRunner needs the operator's NanoGPT API key or an x402 payment callback");
   // A key always wins, as everywhere else in this package.
-  const funding = keyed ? { apiKey } : { payment };
+  // Explicit wallet mode must not inherit a different account's environment
+  // key inside Workflow; that would silently bypass the funding controller.
+  const funding = keyed ? { apiKey } : { apiKey: null, payment };
+  if ((fundRun !== null || fundingPair !== null) && (keyed || typeof fundRun !== "function" || typeof fundingPair !== "function")) {
+    throw new TypeError("wallet run funding needs both fundRun and fundingPair, without an API key");
+  }
   if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) throw new TypeError("createWorkflowRunner needs a positive budgetUsd");
   const L = { ...DEFAULT_LIMITS, ...(limits || {}), maxDepositUsd: budgetUsd };
 
@@ -91,7 +99,7 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
       const limits = { ...L, maxDepositUsd: Number.MAX_SAFE_INTEGER };
       let computed;
       try {
-        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits });
+        computed = await computePrice(args, { baseUrl, fetch, log, allowShortLinks: false, limits, requireFreshCatalogs: true });
       } catch (e) {
         if (e instanceof GraphArgsError || e instanceof ParamsError) {
           return { ok: false, refusals: [{ code: "BAD_REQUEST", message: e.message }], pricing: null, inputs: {} };
@@ -116,6 +124,7 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
         refusals,
         pricing,
         inputs: (computed.read && computed.read.inputs) || {},
+        x402: computed.read?.graph?.x402 || null,
       };
     },
 
@@ -126,43 +135,57 @@ export function createWorkflowRunner({ apiKey, payment, budgetUsd, baseUrl, fetc
      * @throws on a failed run (message from describeRunFailure; `buyerMessage` is set only
    *   when the message is the provider's per-step errors, safe to show the buyer)
      */
-    async run({ pricing, inputs, outDir }) {
-      const { wf, inputs: resolved } = await prepareRunNoodle(
-        { graph: pricing.boundGraph, inputs },
-        { ...funding, baseUrl, fetch, log, allowShortLinks: false },
-      );
-      const { onProgress, notices } = runNotices(wf);
-      let result;
-      try {
-        result = await wf.run(resolved, { onProgress });
-      } catch (e) {
-        const d = describeRunFailure(e);
-        // describeRunFailure returns a new error only when the engine reported per-step
-        // (provider) errors; that text may go to the buyer. Anything else stays operator-only.
-        // ...unless the failure is the operator's own (a rejected key, an empty balance):
-        // the buyer cannot act on it and should not read about the operator's account.
-        if (d !== e && !isOperatorSideFailure(d.message)) d.buyerMessage = d.message;
-        throw d;
+    async run({ pricing, inputs, outDir, fundingId, creator = false, onRunComplete = null, executionDeadlineAt = null }) {
+      if (executionDeadlineAt !== null && !Number.isSafeInteger(executionDeadlineAt)) throw new TypeError("Invalid Market execution deadline");
+      const remaining = executionDeadlineAt === null ? executionLimit : executionDeadlineAt - Date.now();
+      if (remaining < 1) {
+        throw Object.assign(Error("The Market execution deadline passed before the work began"), { code: "MARKET_SLA_TOO_CLOSE" });
       }
-      const outputs = [];
-      let n = 0;
-      for (const o of wf.outputs) {
-        const value = result.outputs[o.key];
-        if (value === undefined) continue;
-        if (value instanceof MediaRef) {
-          const bytes = Buffer.from(await value.bytes());
-          const ext = extForMedia(bytes, value.mime);
-          const safe = String(o.key).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "output";
-          const filename = `${String(++n).padStart(2, "0")}-${safe}.${ext}`;
-          const path = join(outDir, filename);
-          writeFileSync(path, bytes, { mode: 0o600 });
-          outputs.push({ key: o.key, kind: "file", path, filename, byteSize: bytes.length, mime: value.mime || null });
-        } else {
-          outputs.push({ key: o.key, kind: "text", text: String(value) });
-        }
-      }
-      const costUsd = typeof result.costUsd === "number" && Number.isFinite(result.costUsd) ? result.costUsd : null;
-      return { costUsd, costExact: result.costExact !== false && costUsd != null, notices: [...notices], outputs };
+      return withHostedRun(async () => {
+        if (onRunComplete !== null && typeof onRunComplete !== "function") throw new TypeError("onRunComplete must be a function or null");
+        const { wf, inputs: resolved } = await prepareRunNoodle(
+          { graph: pricing.boundGraph, inputs },
+          { ...funding, baseUrl, fetch, log, allowShortLinks: false },
+        );
+        const { onProgress, notices } = runNotices(wf);
+        const execute = async () => {
+          let result;
+          try {
+            result = await wf.run(resolved, hostedRunOptions({ onProgress }));
+          } catch (e) {
+            const d = describeRunFailure(e);
+            // describeRunFailure returns a new error only when the engine reported per-step
+            // (provider) errors; that text may go to the buyer. Anything else stays operator-only.
+            // ...unless the failure is the operator's own (a rejected key, an empty balance):
+            // the buyer cannot act on it and should not read about the operator's account.
+            if (d !== e && !isOperatorSideFailure(d.message)) d.buyerMessage = d.message;
+            throw d;
+          }
+          const outputs = [];
+          let n = 0;
+          for (const o of wf.outputs) {
+            const value = result.outputs[o.key];
+            if (value === undefined) continue;
+            if (value instanceof MediaRef) {
+              const bytes = Buffer.from(await value.bytes());
+              const ext = extForMedia(bytes, value.mime);
+              const safe = String(o.key).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "output";
+              const filename = `${String(++n).padStart(2, "0")}-${safe}.${ext}`;
+              const path = join(outDir, filename);
+              writeFileSync(path, bytes, { mode: 0o600 });
+              outputs.push({ key: o.key, kind: "file", path, filename, byteSize: bytes.length, mime: value.mime || null });
+            } else {
+              outputs.push({ key: o.key, kind: "text", text: String(value) });
+            }
+          }
+          const costUsd = typeof result.costUsd === "number" && Number.isFinite(result.costUsd) ? result.costUsd : null;
+          const run = { costUsd, costExact: result.costExact !== false && costUsd != null, notices: [...notices], outputs };
+          if (onRunComplete) await onRunComplete(run);
+          return run;
+        };
+        return fundRun ? await fundRun(runFundingBudget({ id: fundingId, budgetUsd: pricing.depositUsd,
+          pair: await fundingPair(), creator }), execute) : await execute();
+      }, Math.min(executionLimit, remaining));
     },
   };
 }

@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,11 +21,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function serve(env) {
   const dir = mkdtempSync(join(tmpdir(), "market-in-server-"));
   const graphs = join(dir, "noodles"); mkdirSync(graphs);
+  mkdirSync(join(dir, "out"), { mode: 0o700 });
   writeFileSync(join(graphs, "idea-poster.json"), JSON.stringify(WORKED_GRAPH));
   const def = join(dir, "default.json"); writeFileSync(def, JSON.stringify({ ...WORKED_GRAPH, name: "Idea to image" }));
   const port = await freePort();
   const child = spawn(process.execPath, [BIN, "--graphs", graphs, "--out", join(dir, "out"), "--serve", `127.0.0.1:${port}`], {
-    env: { PATH: process.env.PATH, HOME: dir, NANOGPT_API_KEY: NANO_KEY, MARKET_STATE_DIR: join(dir, "market-state"), MARKET_DEFAULT_GRAPH: def, ...env },
+    env: { PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_API_KEY: NANO_KEY, MARKET_STATE_DIR: join(dir, "market-state"), MARKET_DEFAULT_GRAPH: def, ...env },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";
@@ -41,7 +42,7 @@ async function serve(env) {
   };
   await until(/MCP over HTTP on/);
   const exited = new Promise((r) => child.once("exit", (code, sig) => r({ code, sig })));
-  return { port, until, stderr: () => stderr, child, exited, kill: () => { child.kill("SIGKILL"); return exited; } };
+  return { outDir: join(dir, "out"), port, until, stderr: () => stderr, child, exited, kill: () => { child.kill("SIGKILL"); return exited; } };
 }
 
 test("the worker runs inside the server: a plain-language hire is delivered; SIGTERM drains and exits 0", { timeout: 90_000 }, async () => {
@@ -72,7 +73,7 @@ test("the worker runs inside the server: a plain-language hire is delivered; SIG
     assert.match(srv.stderr(), /hires and outcomes are also posted to MARKET_NOTIFY_URL/);
     srv.child.kill("SIGTERM");
     assert.deepEqual(await srv.exited, { code: 0, sig: null });
-    assert.match(srv.stderr(), /market worker: SIGTERM: no new jobs/);
+    assert.match(srv.stderr(), /SIGTERM: no new work; waiting for accepted workflows and settlement/);
   } finally { if (srv.child.exitCode === null) await srv.kill(); await m.close(); await nano.close(); hook.closeAllConnections?.(); await new Promise((r) => hook.close(r)); }
 });
 
@@ -118,15 +119,22 @@ test("several listings inside the server (MARKET_AGENTS_FILE): each hire runs on
   } finally { if (srv.child.exitCode === null) await srv.kill(); await m.close(); await nano.close(); hook.closeAllConnections?.(); await new Promise((r) => hook.close(r)); }
 });
 
-test("a broken market setting leaves the MCP server serving with the worker off", { timeout: 60_000 }, async () => {
+test("a broken market setting leaves the MCP server serving but cannot qualify a maintenance handoff", { timeout: 60_000 }, async () => {
   const nano = nanoGptMock(); await nano.listen();
   // budget above what a $0.10 hire pays after the fee
-  const srv = await serve({ NANOGPT_BASE_URL: nano.url, MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.5", MARKET_LISTING_PRICE_USD: "0.10" });
+  const operator = mkdtempSync(join(tmpdir(), "market-off-maintenance-"));
+  const srv = await serve({ NANOGPT_BASE_URL: nano.url, MARKET_AGENT_TOKEN: MOCK_TOKEN, MARKET_JOB_BUDGET_USD: "0.5", MARKET_LISTING_PRICE_USD: "0.10",
+    NANOODLE_MAINTENANCE_FILE: join(operator, "control.json"), NANOODLE_MAINTENANCE_OWNER_UID: String(process.getuid()) });
   try {
     await srv.until(/market worker: OFF — --budget-usd 0\.5 is above what a \$0\.1 hire pays you/);
     await srv.until(/the MCP server is serving normally/);
+    const proof = join(srv.outDir, "maintenance-health.json"), deadline = Date.now() + 5000;
+    while (!existsSync(proof)) { assert.ok(Date.now() < deadline, srv.stderr()); await sleep(10); }
+    const frame = JSON.parse(readFileSync(proof));
+    assert.equal(frame.moneyState.ok, false, "a configured but absent Market writer must refuse maintenance qualification");
+    assert.equal(frame.readyToStop, false);
     assert.equal((await fetch(`http://127.0.0.1:${srv.port}/`)).status, 200);
-  } finally { await srv.kill(); await nano.close(); }
+  } finally { await srv.kill(); await nano.close(); rmSync(operator, { recursive: true, force: true }); }
 });
 
 test("configuration: a wallet-funded host needs no NanoGPT key; a runner takes a key or a payment callback", () => {
@@ -188,4 +196,39 @@ test("the hosted song workflow: the brief goes to Song idea, Style is a settable
   assert.equal(byName.Lyrics.type, "join");
   assert.ok(d.graph.links.some((l) => l.to.node === byName.Lyrics.id && l.from.node === byName["Write lyrics"].id));
   assert.ok(!d.graph.links.some((l) => l.from.node === byName.Lyrics.id));
+});
+
+test("SIGTERM during Market startup rejects new HTTP work and waits for an already accepted workflow", { timeout: 15000 }, async t => {
+  let reachedBoot, releaseBoot, reachedModel, releaseModel;
+  const bootEntered = new Promise(resolve => { reachedBoot = resolve; }), bootHold = new Promise(resolve => { releaseBoot = resolve; });
+  const modelEntered = new Promise(resolve => { reachedModel = resolve; }), modelHold = new Promise(resolve => { releaseModel = resolve; });
+  const provider = nanoGptMock({ beforeChat: async () => { reachedModel(); await modelHold; } }); await provider.listen();
+  const market = createMarketMock(); await market.listen();
+  const proxy = http.createServer(async (req, res) => {
+    if (req.url === "/v1/agents/nanoodle-test") { reachedBoot(); await bootHold; }
+    const upstream = await fetch(market.url + req.url, { headers: req.headers });
+    res.writeHead(upstream.status, { "Content-Type": "application/json" }); res.end(await upstream.text());
+  });
+  await new Promise(resolve => proxy.listen(0, "127.0.0.1", resolve));
+  const dir = mkdtempSync(join(tmpdir(), "shutdown-startup-")), token = join(dir, "token"), catalog = join(dir, "catalog.json");
+  writeFileSync(token, MOCK_TOKEN, { mode: 0o600 });
+  writeFileSync(catalog, JSON.stringify({ agents: [{ handle: "nanoodle-test", tokenFile: token, custom: true, priceUsd: 1 }] }));
+  const server = await serve({ NANOGPT_BASE_URL: provider.url, MARKET_BASE_URL: `http://127.0.0.1:${proxy.address().port}`, MARKET_AGENTS_FILE: catalog });
+  t.after(async () => {
+    releaseBoot(); releaseModel(); await server.kill();
+    proxy.closeAllConnections(); await new Promise(resolve => proxy.close(resolve));
+    await market.close(); await provider.close(); rmSync(dir, { recursive: true, force: true });
+  });
+  await bootEntered;
+  const base = `http://127.0.0.1:${server.port}`, message = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "idea-poster", arguments: { Idea: "finish accepted work" } } };
+  const result = fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(message) });
+  await modelEntered;
+  server.child.kill("SIGTERM"); await server.until(/SIGTERM: no new work/);
+  const refused = await fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(message) });
+  assert.equal(refused.status, 503, "startup accounting must not lend admission to new network requests");
+  releaseBoot(); await sleep(20); assert.equal(server.child.exitCode, null, "initialization finishing does not abandon the existing model");
+  releaseModel(); const response = await result;
+  assert.equal(response.status, 200); assert.ok(!(await response.json()).result.isError);
+  assert.deepEqual(await server.exited, { code: 0, sig: null });
+  assert.equal(provider.runs(), 1);
 });

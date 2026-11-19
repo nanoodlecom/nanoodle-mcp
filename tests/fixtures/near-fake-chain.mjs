@@ -19,6 +19,7 @@
 import http from "node:http";
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { base58Encode, base58Decode } from "../../src/near/base58.mjs";
+import { nearProtocol } from "./near-fees.mjs";
 
 export const GAS_YOCTO = 44_627_500_000_000_000_000n; // ~0.0000446 NEAR, a plain transfer's burn
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -60,6 +61,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
   const blocks = new Map();   // hash -> block
   const txs = new Map();      // hash -> FINAL tx result
   const tokens = new Map();
+  const snapshots = new Map();
   let height = 230_000_000;
   const log = [];             // every RPC call: { method, params }
   const chain = {
@@ -72,6 +74,8 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     /** tx lookups answer "unknown" this many more times (not final yet). */
     hideTx: 0,
     sendTxCount: 0,
+    gasPrice: "100000000",
+    minGasPurchasePrice: "1000000000",
   };
 
   let lastBlockHash = rid();
@@ -96,6 +100,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     return block;
   }
   let head = newBlock(now());
+  const snapshot = () => snapshots.set(head.header.hash, { accounts: structuredClone(accounts), tokens: structuredClone(tokens) });
 
   chain.addAccount = (id, balanceYocto = 0n, publicKey = null, nonce = 275_735_371_000_000n) => {
     const a = { balance: BigInt(balanceYocto), keys: new Map() };
@@ -121,6 +126,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
   function record({ hash, signerId, publicKey, nonce, receiverId, actions, signature, blockTimeMs, success = true, logs = [] }) {
     const block = newBlock(blockTimeMs ?? now());
     head = block;
+    snapshot();
     const receiptId = rid();
     const meta = { version: 1, gas_profile: null };
     const result = {
@@ -165,6 +171,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
 
   /** A wallet-side transfer: records a FINAL tx and returns its hash. */
   chain.transfer = (from, to, yocto, { blockTimeMs, actions } = {}) => {
+    snapshot();
     const acts = actions || [{ Transfer: { deposit: BigInt(yocto).toString() } }];
     const total = acts.reduce((s, x) => s + BigInt((x.Transfer && x.Transfer.deposit) || 0), 0n);
     move(from, to, total);
@@ -173,6 +180,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     return hash;
   };
   chain.ftTransfer = (contract, from, to, amount, { blockTimeMs } = {}) => {
+    snapshot();
     const event = moveFt(contract, from, to, amount);
     move(from, contract, 1n);
     const hash = rid();
@@ -192,13 +200,16 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
     const { id, method, params } = req || {};
     log.push({ method, params });
     if (method === "status") {
-      return ok(id, { chain_id: chainId, sync_info: { latest_block_hash: head.header.hash, latest_block_height: head.header.height, syncing: false }, version: { version: "fake" } });
+      return ok(id, { chain_id: chainId, sync_info: { latest_block_hash: head.header.hash, latest_block_height: head.header.height,
+        latest_block_time: new Date(Number(BigInt(head.header.timestamp_nanosec) / 1_000_000n)).toISOString(), syncing: false }, version: { version: "fake" } });
     }
     if (method === "block") {
       if (params && params.finality) return ok(id, head);
       const b = blocks.get(params && params.block_id);
       return b ? ok(id, b) : rpcError(id, "UNKNOWN_BLOCK", "DB Not Found Error: BLOCK HEIGHT");
     }
+    if (method === "gas_price") return ok(id, { gas_price: chain.gasPrice });
+    if (method === "EXPERIMENTAL_protocol_config") return ok(id, nearProtocol({ chainId, floor: chain.minGasPurchasePrice }));
     if (method === "tx") {
       // Like public testnet RPC (checked on rpc.testnet.near.org and rpc.testnet.fastnear.com,
       // 2026-11), the lookup finds the transaction even when sender_account_id is wrong.
@@ -225,9 +236,14 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
         : rpcError(id, "UNKNOWN_RECEIPT", "unknown receipt");
     }
     if (method === "query") {
-      const acct = accounts.get(params.account_id);
+      const at = params.block_id == null ? head : blocks.get(params.block_id);
+      if (!at) return rpcError(id, "UNKNOWN_BLOCK", "unknown query block");
+      const state = at === head ? { accounts, tokens } : snapshots.get(at.header.hash);
+      if (!state) return rpcError(id, "UNKNOWN_BLOCK", "missing historical state");
+      const metadata = { block_hash: at.header.hash, block_height: at.header.height };
+      const acct = state.accounts.get(params.account_id);
       if (params.request_type === "call_function") {
-        const balances = tokens.get(params.account_id);
+        const balances = state.tokens.get(params.account_id);
         if (!balances) return rpcError(id, "UNKNOWN_ACCOUNT", "unknown token");
         const args = JSON.parse(Buffer.from(params.args_base64, "base64").toString());
         let value;
@@ -235,18 +251,18 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
         else if (params.method_name === "ft_balance_of") value = String(balances.get(args.account_id) ?? 0n);
         else if (params.method_name === "storage_balance_of") value = balances.has(args.account_id) ? { total: "1250000000000000000000", available: "0" } : null;
         else return rpcError(id, "UNSUPPORTED", "unknown FT view");
-        return ok(id, { result: [...Buffer.from(JSON.stringify(value))], logs: [], block_hash: head.header.hash, block_height: head.header.height });
+        return ok(id, { result: [...Buffer.from(JSON.stringify(value))], logs: [], ...metadata });
       }
       if (params.request_type === "view_account") {
         if (!acct) return rpcError(id, "UNKNOWN_ACCOUNT", `account ${params.account_id} does not exist while viewing`);
-        return ok(id, { amount: acct.balance.toString(), locked: "0", code_hash: "11111111111111111111111111111111", storage_usage: 182, block_height: head.header.height, block_hash: head.header.hash });
+        return ok(id, { amount: acct.balance.toString(), locked: "0", code_hash: "11111111111111111111111111111111", storage_usage: 182, ...metadata });
       }
       if (params.request_type === "view_access_key") {
         const k = acct && acct.keys.get(params.public_key);
         if (!k) {
-          return ok(id, { error: `access key ${params.public_key} does not exist while viewing`, logs: [], block_height: head.header.height, block_hash: head.header.hash });
+          return ok(id, { error: `access key ${params.public_key} does not exist while viewing`, logs: [], ...metadata });
         }
-        return ok(id, { nonce: Number(k.nonce), permission: "FullAccess", block_height: head.header.height, block_hash: head.header.hash });
+        return ok(id, { nonce: Number(k.nonce), permission: "FullAccess", ...metadata });
       }
       return rpcError(id, "UNSUPPORTED", "fake chain: unsupported query");
     }
@@ -276,6 +292,7 @@ export function createFakeChain({ chainId = "testnet", now = Date.now } = {}) {
       if (!blocks.has(base58Encode(t.blockHash))) {
         return rpcError(id, "INVALID_TRANSACTION", { TxExecutionError: { InvalidTxError: "Expired" } });
       }
+      snapshot();
       key.nonce = t.nonce;
       let logs = [];
       if (t.actions[0].Transfer) move(t.signerId, t.receiverId, t.actions[0].Transfer.deposit);
@@ -367,7 +384,7 @@ export const XNO_PROBE = Object.freeze({ raw: "10000000000000000000000000000", u
 const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 /**
- * NanoGPT stand-in: public catalogs, chat and image generation. The LLM call
+ * NanoGPT stand-in: public catalogs, chat, image generation, and scripted decisions. The LLM call
  * reports $0.00041 and the image $0.009, so the worked example's actual model
  * cost is $0.00941. A prompt containing "FAIL" gets a 400 (the run fails); one
  * containing "HOLD" never answers (a run in flight when the server dies).
@@ -375,22 +392,46 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
-export function nanoGptMock({ beforeChat = async () => {} } = {}) {
+export function nanoGptMock({ beforeChat = async () => {}, decisionAnswer, catalogs = WORKED_CATALOGS, walletPayments = false, walletPaymentSeen = null } = {}) {
   let chatRuns = 0;
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
   const json = (status, obj) => ({ status, body: JSON.stringify(obj) });
   let probes = 0;
   let probe = XNO_PROBE;
+  const invoices = new Map();
+  let invoiceSequence = 0;
   async function handle(method, path, body, headers = {}) {
     const p = path.replace(/^https?:\/\/[^/]+/, "");
+    if (walletPayments && method === "POST" && p.startsWith("/api/x402/complete/")) {
+      const invoice = invoices.get(p.split("/").at(-1));
+      if (invoice && !invoice.paid && walletPaymentSeen) invoice.paid = !!await walletPaymentSeen(invoice);
+      if (!invoice?.paid) return json(402, { error: "fixture payment not settled" });
+      invoice.response ||= handle(invoice.method, invoice.path, invoice.body, {});
+      return invoice.response;
+    }
+    const decision = method === "POST" && p === "/api/v1/decisions" && typeof decisionAnswer === "function";
+    if (walletPayments && method === "POST" && (decision || ["/api/v1/chat/completions", "/v1/images/generations"].includes(p))) {
+      if (headers.authorization || headers["x-api-key"]) throw new Error("wallet fixture received an unexpected API key");
+      if (String(headers["x-x402"] || "") === "true") {
+        const paymentId = `fixture-invoice-${++invoiceSequence}`;
+        const text = decision || p.includes("chat/completions");
+        const amountRaw = text ? "820000000000000000000000000" : "18000000000000000000000000000";
+        invoices.set(paymentId, { paymentId, amountRaw, method, path, body, paid: false, response: null });
+        return json(402, { accepts: [{ scheme: "nano", paymentId,
+          payTo: "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet",
+          maxAmountRequired: amountRaw,
+          maxAmountRequiredUSD: text ? "0.00041" : "0.009" }] });
+      }
+    }
     if (method === "POST" && p === "/api/v1/chat/completions" && String(headers["x-x402"] || "") === "true") {
       probes++;
       return json(402, { accepts: [{ scheme: "nano", maxAmountRequired: probe.raw, maxAmountRequiredUSD: probe.usd }] });
     }
-    if (method === "GET" && p === "/api/v1/models?detailed=true") return json(200, { data: WORKED_CATALOGS.chat });
-    if (method === "GET" && p === "/api/v1/image-models") return json(200, { data: WORKED_CATALOGS.image });
-    if (method === "GET" && /^\/api\/v1\/(video|audio|3d)-models$/.test(p)) return json(200, { data: [] });
+    if (method === "GET" && p === "/api/v1/models?detailed=true") return json(200, { data: catalogs.chat });
+    if (method === "GET" && p === "/api/v1/decision-models") return json(200, { data: catalogs.decision || [] });
+    if (method === "GET" && p === "/api/v1/image-models") return json(200, { data: catalogs.image });
+    if (method === "GET" && /^\/api\/v1\/(video|audio|3d)-models$/.test(p)) return json(200, { data: catalogs[p.includes("3d") ? "model3d" : p.includes("video") ? "video" : "audio"] || [] });
     if (method === "POST" && p === "/api/v1/chat/completions") {
       await beforeChat();
       chatRuns++;
@@ -402,10 +443,18 @@ export function nanoGptMock({ beforeChat = async () => {} } = {}) {
       return json(200, { choices: [{ message: { content: REPLY } }], x_nanogpt_pricing: { costUsd: 0.00041 } });
     }
     if (method === "POST" && p === "/v1/images/generations") return json(200, { data: [{ b64_json: PNG_B64 }], cost: 0.009 });
+    if (decision) return json(200, {
+      answers: { answer: { type: "noul", noul: decisionAnswer(body) } }, usage: { cost: 0.00041 },
+    });
     return json(404, { error: `stub: no route for ${method} ${p}` });
   }
   return {
     REPLY,
+    settleWalletInvoice(id) {
+      const invoice = invoices.get(id);
+      if (!invoice || invoice.paid) throw new Error("fixture invoice missing or already settled");
+      invoice.paid = true;
+    },
     runs: () => chatRuns,
     /** XNO/USD rate probes answered (never runs). */
     probes: () => probes,

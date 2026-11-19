@@ -15,8 +15,11 @@ import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 import { createMarketClient } from "../src/market/client.mjs";
 import { openMarketState, STATE_FILE } from "../src/market/state.mjs";
 import { createWorkflowRunner, checkNanoGptKey, isOperatorSideFailure } from "../src/market/runner.mjs";
+import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createMarketWorker } from "../src/market/worker.mjs";
 import { BRIEF_TEMPLATE } from "../src/market/brief.mjs";
+import { createMarketCreatorPayments } from "../src/market/creators.mjs";
+import { deriveAddress, derivePublicKey, deriveSecretKey } from "nanocurrency";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NANO_KEY = "nanogpt-test-key-do-not-log";
@@ -29,17 +32,17 @@ before(async () => { nano = nanoGptMock(); await nano.listen(); });
 after(async () => { await nano.close(); });
 
 /** A market, a state dir and a worker wired together. */
-async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null } = {}) {
-  const m = market || createMarketMock();
+async function rig({ budgetUsd = 0.5, dir = null, market = null, backoffMs = 0, defaultWorkflow = null, creatorPayments = null, customWorkflows = true, checkFee = null, maintenance = null, concurrency = 2, now = Date.now } = {}) {
+  const m = market || createMarketMock({ now });
   if (!market) await m.listen();
   const stateDir = dir || mkdtempSync(join(tmpdir(), "market-worker-"));
   const logs = [];
   const store = openMarketState({ dir: stateDir });
   const client = createMarketClient({ baseUrl: m.url, token: MOCK_TOKEN });
   const runner = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd, baseUrl: nano.url });
-  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, log: (l) => logs.push(l) });
+  const worker = createMarketWorker({ client, store, runner, budgetUsd, listingPriceUsd: 1, backoffMs, defaultWorkflow, creatorPayments, customWorkflows, checkFee, maintenance, concurrency, now, log: (l) => logs.push(l) });
   const once = async () => { await worker.tick(); await worker.drain(); };
-  return { m, store, worker, once, logs, stateDir };
+  return { m, store, worker, once, logs, stateDir, client, runner };
 }
 
 const noSecrets = (logs) => {
@@ -47,6 +50,235 @@ const noSecrets = (logs) => {
   assert.ok(!all.includes(MOCK_TOKEN), "the agent token appears in the log");
   assert.ok(!all.includes(NANO_KEY), "the NanoGPT key appears in the log");
 };
+
+test("a changed Market fee prevents both starting a hire and inference after a start", async () => {
+  for (const boundary of [1, 2]) {
+    let checks = 0;
+    const r = await rig({ checkFee: async () => {
+      if (++checks === boundary) { const error = Error("fee changed"); error.code = "MARKET_FEE_CHANGED"; throw error; }
+      return 500;
+    } });
+    try {
+      const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+      await r.once();
+      assert.equal(r.store.get(id).phase, "declined");
+      assert.equal(r.store.get(id).decline.code, "MARKET_FEE_CHANGED");
+      assert.equal(nano.runs(), before);
+      assert.equal(checks, boundary);
+    } finally { r.store.close(); await r.m.close(); }
+  }
+});
+
+test("direct hires use verified escrow even when the listing's displayed price is higher", async () => {
+  const r = await rig();
+  try {
+    const low = r.m.hire({ description: WORKED(), priceUsd: "0.02" });
+    const unknown = r.m.hire({ description: WORKED(), priceUsd: "unavailable" });
+    const foreign = r.m.hire({ description: WORKED(), priceUsd: "1.00", escrowToken: "NEAR" });
+    const covered = r.m.hire({ description: WORKED(), priceUsd: "0.10", escrowToken: "USDC" });
+    const before = nano.runs();
+    await r.once();
+    assert.equal(r.store.get(low).decline.code, "OVER_BUDGET");
+    assert.equal(r.store.get(unknown).phase, "new");
+    assert.match(r.store.get(unknown).lastError, /escrow could not be verified/);
+    assert.equal(r.store.get(foreign).decline.code, "MARKET_ESCROW_CURRENCY");
+    assert.equal(r.store.get(covered).phase, "submitted");
+    assert.equal(r.store.get(covered).budgetUsd, 0.09);
+    assert.equal(r.store.get(covered).listingPriceUsd, 0.10);
+    assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+    assert.equal(nano.runs() - before, 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("an older pending start cannot spend against a listing price above its escrow", async () => {
+  const r = await rig();
+  try {
+    const id = r.m.hire({ description: WORKED(), priceUsd: "0.02" });
+    r.store.create(id, { phase: "starting", budgetUsd: 0.5, listingPriceUsd: 1, pricing: { depositUsd: 0.02 } });
+    const before = nano.runs();
+    await r.once();
+    assert.equal(r.store.get(id).decline.code, "MARKET_ESCROW_TOO_LOW");
+    assert.equal(r.m.calls("POST", /\/start$/).length, 0);
+    assert.equal(nano.runs(), before);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("the worker rechecks the paid assignment after Market confirms start", async t => {
+  const cases = [
+    ["cancelled", (m, id) => m.cancel(id), "gone", undefined],
+    ["reduced escrow", (m, id) => { m.rows.get(id).assignment.escrowAmount = "0.02"; }, "declined", "MARKET_ESCROW_TOO_LOW"],
+    ["expired SLA", (m, id) => Object.assign(m.rows.get(id).assignment, {
+      createdAt: new Date(Date.now() - 60_000).toISOString(), slaDeadlineAt: new Date(Date.now() - 1000).toISOString(),
+    }), "declined", "MARKET_SLA_EXPIRED"],
+  ];
+  for (const [name, update, phase, code] of cases) {
+    await t.test(name, async () => {
+      const r = await rig();
+      try {
+        const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+        const start = r.client.start;
+        r.client.start = async (id) => {
+          const started = await start(id);
+          update(r.m, id);
+          return started;
+        };
+        await r.once();
+        assert.equal(nano.runs(), before);
+        assert.equal(r.store.get(id).phase, phase);
+        assert.equal(r.store.get(id).decline?.code, code);
+        assert.equal(r.m.calls("POST", /\/submit$/).length, 0);
+      } finally { r.store.close(); await r.m.close(); }
+    });
+  }
+});
+
+test("Market stops before inference when the delivery reserve is reached during start, fee check, or progress", async t => {
+  for (const phase of ["before-start", "start-fee", "run-fee", "progress"]) {
+    await t.test(phase, async () => {
+      let clock = Date.now(), fees = 0;
+      const advance = () => { clock += 180_000; };
+      const r = await rig({ now: () => clock, checkFee: async () => {
+        fees += 1;
+        if ((phase === "start-fee" && fees === 1) || (phase === "run-fee" && fees === 2)) advance();
+        return 500;
+      } });
+      try {
+        const id = r.m.hire({ description: WORKED(), slaSeconds: 200 });
+        if (phase === "before-start") advance();
+        if (phase === "progress") {
+          const progress = r.client.progress;
+          r.client.progress = (...args) => { advance(); return progress(...args); };
+        }
+        const before = nano.runs();
+        await r.once();
+        assert.equal(r.store.get(id).phase, "declined");
+        assert.equal(r.store.get(id).decline.code, "MARKET_SLA_TOO_CLOSE");
+        assert.equal(r.m.calls("POST", /\/start$/).length, ["before-start", "start-fee"].includes(phase) ? 0 : 1);
+        assert.equal(r.m.calls("POST", /\/submit$/).length, 0);
+        assert.equal(nano.runs(), before);
+      } finally { r.store.close(); await r.m.close(); }
+    });
+  }
+});
+
+test("Market runs against the fresh delivery window read after start", async () => {
+  const clock = Date.now();
+  const r = await rig({ now: () => clock });
+  try {
+    const id = r.m.hire({ description: WORKED(), slaSeconds: 3600 });
+    const start = r.client.start;
+    r.client.start = async id => {
+      const reply = await start(id);
+      Object.assign(r.m.rows.get(id).assignment, { slaSeconds: 200, slaDeadlineAt: new Date(clock + 200_000).toISOString() });
+      return reply;
+    };
+    const run = r.runner.run;
+    r.runner.run = args => {
+      assert.equal(args.executionDeadlineAt, clock + 180_000);
+      assert.equal(r.store.get(id).executionDeadlineAt, args.executionDeadlineAt);
+      return run(args);
+    };
+    await r.once();
+    assert.equal(r.store.get(id).phase, "submitted");
+    assert.equal(r.m.calls("POST", /\/submit$/).length, 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("the worker retries an unavailable post-start read without starting or running twice", async () => {
+  const r = await rig({ backoffMs: 60_000 });
+  try {
+    const id = r.m.hire({ description: WORKED() }), before = nano.runs();
+    const start = r.client.start;
+    r.client.start = async (id) => {
+      const started = await start(id);
+      r.m.fault({ method: "GET", path: /\/v1\/agents\/me\/assignments$/, mode: "status", status: 503 });
+      return started;
+    };
+    await r.once();
+    assert.equal(r.store.get(id).phase, "started");
+    assert.equal(nano.runs(), before);
+    r.store.update(id, { nextAttemptAt: 0 });
+    await r.once();
+    assert.equal(r.store.get(id).phase, "submitted");
+    assert.equal(nano.runs(), before + 1);
+    assert.equal(r.m.calls("POST", /\/start$/).length, 1);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("accepted market hires pay the embedded Nano author once, at the locked rate, including after restart", async () => {
+  const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
+  const owed = new Map(); let xnoUsd = "0.5";
+  const creatorPayments = createMarketCreatorPayments({ rates: { currentUsdc: async () => ({ xnoUsd }) },
+    payouts: { enqueue: intent => { assert.ok(!owed.has(intent.paymentId), "must not enqueue a settled assignment twice"); owed.set(intent.paymentId, intent); }, tick: async () => {} } });
+  const r = await rig({ creatorPayments });
+  const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author } }, inputs: { Idea: "a lighthouse" } }) });
+  const before = nano.runs(); await r.once();
+  assert.equal(r.store.get(id).creator.status, "awaiting_acceptance"); assert.equal(owed.size, 0);
+  xnoUsd = "1"; r.m.accept(id); await r.once();
+  assert.equal(owed.size, 1); const intent = owed.get(`market_${id}`);
+  assert.equal(intent.to, author); assert.equal(BigInt(intent.amountRaw), 3764n * 10n ** 24n);
+  assert.equal(r.store.get(id).creator.status, "queued");
+  r.store.close();
+  const restarted = await rig({ creatorPayments, dir: r.stateDir, market: r.m }); await restarted.once();
+  assert.equal(owed.size, 1); assert.equal(nano.runs() - before, 1);
+  restarted.store.close(); await r.m.close();
+});
+
+test("Market retention preserves an assignment whose creator payout evidence is incomplete", async () => {
+  let amountRaw = "10";
+  const creatorPayments = { payoutRecords: () => [{ paymentId: "market_a", to: "author", amountRaw, status: "sent" }] };
+  const w = await rig({ creatorPayments });
+  try {
+    w.store.create("a", { phase: "submitted", finishedAt: Date.now() - 31 * 86_400_000,
+      creator: { status: "queued", author: "author", amountRaw: "20" } });
+    const before = nano.runs();
+    await w.once();
+    assert.ok(w.store.get("a"));
+    amountRaw = "20";
+    await w.once();
+    assert.equal(w.store.get("a"), null);
+    assert.equal(nano.runs(), before);
+  } finally { w.store.close(); await w.m.close(); }
+});
+
+test("creator workflows are refused before running when Nano payouts are unavailable", async () => {
+  const r = await rig(), before = nano.runs();
+  const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author: "nano_missing" } }, inputs: { Idea: "a lighthouse" } }) });
+  await r.once(); assert.equal(r.store.get(id).phase, "declined"); assert.equal(nano.runs(), before);
+  assert.equal(r.store.get(id).decline.code, "CREATOR_PAYOUT_UNAVAILABLE"); r.store.close(); await r.m.close();
+});
+
+test("market creator amounts are capped after model costs and never pay on an unknown cost", () => {
+  const payments = createMarketCreatorPayments({});
+  assert.equal(payments.amount({ xnoUsd: "0.5" }, { costUsd: 1, proceedsUsd: 1.1 }), String(2n * 10n ** 29n));
+  assert.equal(payments.amount({ xnoUsd: "0.5" }, { costUsd: 1, proceedsUsd: 0.9 }), "0");
+  assert.equal(payments.amount({ xnoUsd: "0.5" }, { costUsd: null, proceedsUsd: 1 }), "0");
+});
+
+test("hosted marketplace briefs cannot replace the workflow or its embedded creator; cancelled hires never owe a payout", async () => {
+  const author = deriveAddress(derivePublicKey(deriveSecretKey("0".repeat(64), 1)), { useNanoPrefix: true });
+  const payouts = [], creatorPayments = createMarketCreatorPayments({ rates: { currentUsdc: async () => ({ xnoUsd: "0.5" }) }, payouts: { enqueue: intent => payouts.push(intent), tick: async () => {} } });
+  const r = await rig({ customWorkflows: false, creatorPayments, defaultWorkflow: { graph: { ...WORKED_GRAPH, x402: { author } }, inputName: "Idea", label: "Hosted poster" } });
+  try {
+    const malicious = r.m.hire({ description: WORKED() }), before = nano.runs(); await r.once();
+    assert.equal(r.store.get(malicious).phase, "declined"); assert.equal(nano.runs(), before);
+    const id = r.m.hire({ description: "A lighthouse at dawn" }); await r.once(); assert.equal(r.store.get(id).creator.author, author);
+    r.m.cancel(id); await r.once(); assert.equal(r.store.get(id).creator.status, "cancelled"); assert.equal(payouts.length, 0);
+  } finally { r.store.close(); await r.m.close(); }
+});
+
+test("an accepted creator debt survives an outbox failure and restart without repeating model execution", async () => {
+  let fail = true; const paid = [], creatorPayments = {
+    prepare: async () => ({ author: "test-author", xnoUsd: "0.5", status: "awaiting_acceptance" }), amount: () => "100",
+    enqueue: (id, terms) => { if (fail) throw new Error("disk unavailable"); paid.push({ id, ...terms }); },
+  };
+  const r = await rig({ creatorPayments });
+  const id = r.m.hire({ description: brief({ graph: { ...WORKED_GRAPH, x402: { author: "test-author" } }, inputs: { Idea: "a lighthouse" } }) });
+  const before = nano.runs(); await r.once(); r.m.accept(id); await r.once(); assert.equal(r.store.get(id).creator.status, "owed"); r.store.close();
+  fail = false; const resumed = await rig({ creatorPayments, dir: r.stateDir, market: r.m });
+  try { await resumed.once(); await resumed.once(); assert.equal(paid.length, 1); assert.equal(resumed.store.get(id).creator.status, "queued"); assert.equal(nano.runs() - before, 1); }
+  finally { resumed.store.close(); await r.m.close(); }
+});
 
 test("a normal job: started, run once, outputs uploaded, Markdown with itemized and actual cost submitted", async () => {
   const { m, store, once, logs } = await rig();
@@ -506,4 +738,43 @@ test("a typed Duration field: the buyer's length is used, none given picks one f
   assert.match(md, new RegExp(`with your brief as the input \\(1 output\\)\\. Duration: none given, so it aims for about ${n} seconds \\(picked between 120 and 240\\)\\. Files`));
   assert.deepEqual(market.violations, []);
   store.close(); await market.close();
+});
+
+test("Market drain includes delivery and submission after the workflow has completed", { timeout: 10000 }, async t => {
+  const maintenance = createMaintenanceBarrier(), r = await rig({ maintenance }); let entered, release;
+  const reached = new Promise(resolve => { entered = resolve; }), hold = new Promise(resolve => { release = resolve; });
+  t.after(async () => { release(); await r.worker.drain(); r.store.close(); await r.m.close(); });
+  const submit = r.client.submit;
+  r.client.submit = async (...args) => { entered(); await hold; return submit(...args); };
+  const id = r.m.hire({ description: WORKED("finish this accepted job") });
+  await r.worker.tick(); await reached;
+  assert.equal(r.store.get(id).phase, "submitting");
+  maintenance.close();
+  const later = r.m.hire({ description: WORKED("wait until after maintenance") });
+  await assert.rejects(r.worker.tick(), { code: "SERVICE_DRAINING" });
+  assert.equal(r.store.get(later), null);
+  let idle = false; const drained = maintenance.waitForIdle().then(() => { idle = true; });
+  await Promise.resolve(); assert.equal(idle, false);
+  assert.equal(maintenance.snapshot().counts.request, 1);
+  release(); await drained; await r.worker.drain();
+  assert.equal(r.store.get(id).phase, "submitted");
+  assert.equal(r.m.rows.get(id).versions.length, 1);
+  assert.equal(maintenance.snapshot().activeOperations, 0);
+});
+
+test("Market assignments waiting for a concurrency slot retain admission and finish through pause", { timeout: 10000 }, async t => {
+  const maintenance = createMaintenanceBarrier(), r = await rig({ maintenance, concurrency: 1 }); let entered, release, runs = 0;
+  const reached = new Promise(resolve => { entered = resolve; }), hold = new Promise(resolve => { release = resolve; });
+  t.after(async () => { release(); await r.worker.drain(); r.store.close(); await r.m.close(); });
+  const execute = r.runner.run;
+  r.runner.run = async (...args) => { if (++runs === 1) { entered(); await hold; } return execute(...args); };
+  const ids = [r.m.hire({ description: WORKED("first accepted job") }), r.m.hire({ description: WORKED("queued accepted job") })];
+  await r.worker.tick(); await reached;
+  assert.equal(maintenance.snapshot().counts.request, 2);
+  maintenance.close();
+  release(); await maintenance.waitForIdle(); await r.worker.drain();
+  assert.equal(runs, 2);
+  assert.deepEqual(ids.map(id => r.store.get(id).phase), ["submitted", "submitted"]);
+  assert.ok(ids.every(id => r.m.rows.get(id).versions.length === 1));
+  assert.equal(maintenance.snapshot().activeOperations, 0);
 });
