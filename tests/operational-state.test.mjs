@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
@@ -50,6 +50,18 @@ test("a crash before refund/payout intent creation cannot erase those liabilitie
   s.near.refunds.r = { paymentId: "q1", asset: "usdc", amountYocto: "200", status: "sent" };
   s.near.payouts.q1 = { paymentId: "q1", amountRaw: "300", status: "sent" };
   const done = paymentLiabilities(s); assert.equal(done.nanoRaw, 0n); assert.equal(done.usdcAtomic, 0n); assert.deepEqual(done.issues, []);
+});
+
+test("the paid workflow funding check keeps creator overhead and the last unit of USDC deposit dust", () => {
+  const raw = 10n ** 30n;
+  const paid = { id: "authored", status: "paid", asset: "usdc", author: "nano_author",
+    depositUsd: "0.6", paidYocto: "600001", rate: { xnoUsd: "0.2", usdNano: "1000000000", yocto: "1000000" } };
+  const total = paidNearRunFundingRaw({ paid, reserved: { ...paid, status: "running" }, unpaid: { ...paid, status: "pending" },
+    completed: { ...paid, fundingOutcomeReady: true } });
+  const modelCap = 5n * raw / 2n;
+  const creatorCap = (600001n * raw + 1199999n) / 1200000n;
+  assert.equal(total, modelCap + creatorCap);
+  assert.throws(() => paidNearRunFundingRaw({ paid: { ...paid, paidYocto: "0" } }), /invalid-paid-near-amount/);
 });
 
 test("stuck work, permanently failed refunds and long-pending creator payouts remain visible and reserved", () => {

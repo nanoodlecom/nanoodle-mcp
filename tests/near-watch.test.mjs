@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
-import { createNearWatcher, createNearRpc, openNearLedger, NearError } from "../src/near/index.mjs";
+import { createNearWatcher, createNearRpc, createNearRpcPool, openNearLedger, NearError } from "../src/near/index.mjs";
 import { createFakeChain } from "./fixtures/near-fake-chain.mjs";
 
 async function world() {
@@ -52,6 +52,48 @@ test("a failed receipt lookup or gate confirmation retries the same block, witho
   assert.equal(watcher.status().listening, true);
   assert.ok(w.ledger.getMeta("paymentWatch").coveredThroughMs > before.coveredThroughMs);
   assert.equal(w.observed[0].hash, tx); watcher.stop();
+});
+
+test("receipt discovery fails over before the watcher checkpoints the block", async t => {
+  for (const scenario of ["wrong-block", "missing-receipt", "bad-lookup", "unavailable-lookup"]) {
+    const w = await world();
+    const method = ["wrong-block", "missing-receipt"].includes(scenario) ? "EXPERIMENTAL_changes" : "EXPERIMENTAL_receipt_to_tx";
+    const attempted = [];
+    let fallbackUnavailable = scenario === "unavailable-lookup";
+    const fetch = async (url, init) => {
+      const endpoint = new URL(url).hostname, request = JSON.parse(init.body);
+      if (request.method !== method) return w.chain.fetch(url, init);
+      attempted.push(endpoint);
+      if (endpoint === "fallback.test" && !fallbackUnavailable) return w.chain.fetch(url, init);
+      const result = scenario === "wrong-block" ? { block_hash: "different-block", changes: [] }
+        : scenario === "missing-receipt" ? { block_hash: request.params.block_id, changes: [
+          { cause: { type: "receipt_processing" }, change: { account_id: "merchant.testnet" } },
+        ] } : { transaction_hash: "not-a-transaction-hash", sender_account_id: "payer.testnet" };
+      const answer = scenario === "unavailable-lookup"
+        ? { error: { code: -32000, cause: { name: "UNKNOWN_RECEIPT" } } } : { result };
+      return Response.json({ jsonrpc: "2.0", id: request.id, ...answer });
+    };
+    const rpc = createNearRpcPool({ urls: ["https://primary.test", "https://fallback.test"],
+      chainId: "testnet", maxHeadAgeMs: 90_000, fetch });
+    const watcher = createNearWatcher({ ...w.opts, rpc });
+    t.after(() => watcher.stop());
+    await watcher.start();
+    const previous = w.ledger.getMeta("paymentWatch");
+    w.quote(); const tx = w.pay(); await watcher.tick();
+    assert.deepEqual(attempted, ["primary.test", "fallback.test"], scenario);
+    if (fallbackUnavailable) {
+      assert.equal(watcher.status().listening, false);
+      assert.deepEqual(w.ledger.getMeta("paymentWatch"), previous);
+      assert.deepEqual(w.observed, []);
+      fallbackUnavailable = false; await watcher.tick();
+    }
+    assert.equal(watcher.status().listening, true, scenario);
+    assert.ok(w.ledger.getMeta("paymentWatch").height > previous.height, scenario);
+    assert.deepEqual(w.observed, [{ hash: tx, sender: "payer.testnet" }], scenario);
+    await watcher.tick();
+    assert.equal(w.observed.length, 1);
+    await watcher.stop();
+  }
 });
 
 test("a first startup with old quotes backfills final receipts instead of missing a transfer", async () => {

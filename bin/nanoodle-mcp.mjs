@@ -677,6 +677,7 @@ async function main() {
         requireExistingState: requiredState?.requireExisting === true,
         fundRun: !apiKey ? wallet.ops.withFunding : null,
         canQuote: () => !fundingSources || fundingSources.ready(),
+        verifyPaymentReads: guardedFunding,
         log: (line) => console.error("nanoodle-mcp: " + line),
         usage: usageLog, maintenance,
       });

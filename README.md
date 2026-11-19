@@ -886,6 +886,15 @@ From version 0.7.0, `run_noodle` also takes a workflow you composed yourself: pa
 the graph format, node types and priced models, and `price_noodle` returns the
 itemized estimated cost of a `graph` or `url` without running it.
 
+For agent-authored graphs, call `noodle_guide` first. For example,
+`{"node_type":"ivideo","limit":5}` returns model candidates for an
+image-to-video node, and `{"format_only":true}` returns the graph contract and
+a minimal example without looking up model catalogs. The guide filters for
+the hosted node policy, provider-advertised capabilities and a priceable
+baseline. It does not create a quote, run inference or list the editor's full
+inventory. Before quoting a run, pass the actual graph, settings and inputs to
+`price_noodle`.
+
 ## Pay with NEAR / run custom workflows
 
 A server started with `--near-merchant` sells workflow runs for **NEAR**, with

@@ -106,7 +106,8 @@ function fakeRegistry({ author = null, onCall } = {}) {
   return registry;
 }
 
-function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10, usage, xnoUsd = 1.0, fetch, stateFile, fundRun, maintenance } = {}) {
+function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300, pollMs = 10, usage,
+  xnoUsd = 1.0, fetch, stateFile, fundRun, canQuote, verifyPaymentReads, maintenance } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
@@ -117,10 +118,10 @@ function makeGate(chain, { usd = 0.05, registry, now, waitMs = 300, pollMs = 10,
     pollMs,
     waitMs,
     usage,
-    now,
+    now, monotonicNow,
     fetch,
     stateFile,
-    fundRun, maintenance,
+    fundRun, canQuote, verifyPaymentReads, maintenance,
   });
   return gate;
 }
@@ -796,6 +797,133 @@ test("already-pocketed payments are found via account_history", async () => {
   assert.ok(!res.isError, JSON.stringify(res.content));
 });
 
+test("guarded Nano quotes share a read-only proof and stay unpublished until both reads recover", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-quote-readiness-")), file = join(dir, "gate-state.json");
+  const head = "A".repeat(64), attempts = [], usage = [];
+  let monotonic = 0, historyReady = false, fundingReady = true, pauseFunding = false;
+  chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
+  chain.ops.rpc = async body => {
+    attempts.push(body.action);
+    assert.equal(body.account, GATE_ADDR);
+    if (body.action === "receivable") {
+      assert.equal(body.include_only_confirmed, "true");
+      return { blocks: "" };
+    }
+    assert.equal(body.action, "account_history");
+    assert.equal(body.head, head);
+    assert.equal(body.raw, "true");
+    if (!historyReady) return { account: GATE_ADDR, history: [] };
+    if (pauseFunding) fundingReady = false;
+    return { account: GATE_ADDR, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }] };
+  };
+  const gate = makeGate(chain, { registry, stateFile: file, pollMs: 60_000, verifyPaymentReads: true, canQuote: () => fundingReady,
+    monotonicNow: () => monotonic, usage: event => usage.push(event) });
+  t.after(async () => { await gate.stop(); await rm(dir, { recursive: true }); });
+  const { callTool } = gate.wrapRegistry(registry);
+  const request = () => callTool({ name: "poster", arguments: { Text: "payment reads" } });
+  for (const result of await Promise.all([request(), request(), request()])) {
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /payment detection is temporarily unavailable/i);
+    assert.equal(result.structuredContent?.x402, undefined);
+  }
+  assert.deepEqual(attempts, ["receivable", "account_history"]);
+  assert.equal((await request()).isError, true);
+  assert.equal(attempts.length, 2, "rapid retries do not repeat failed RPC reads");
+  assert.deepEqual(usage, []);
+  await assert.rejects(readFile(file, "utf8"), { code: "ENOENT" });
+  assert.equal(registry.callCount(), 0);
+  assert.equal(chain.state.transfers.length, 0);
+
+  monotonic += 5_000;
+  historyReady = true;
+  pauseFunding = true;
+  const fundingRefusal = await request();
+  assert.equal(fundingRefusal.isError, true);
+  assert.match(fundingRefusal.content[0].text, /funding is temporarily unavailable/i);
+  await assert.rejects(readFile(file, "utf8"), { code: "ENOENT" });
+  pauseFunding = false;
+  fundingReady = true;
+  const quote = argOf(await request());
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(saved.quotes.find(row => row.id === quote.paymentId)?.historyAfter, "1");
+  assert.equal(usage[0], "quote");
+});
+
+test("a failed Nano watcher read invalidates quote readiness while issued payments still resolve", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  const head = "A".repeat(64);
+  let historyReady = true, failed = false, combinedReads = 0, fallbackReads = 0;
+  chain.ops.checkpoint = () => ({ confirmed: { hash: head, blockCount: "1" } });
+  const rpc = chain.ops.rpc;
+  chain.ops.readPaymentWindow = async () => {
+    combinedReads++;
+    if (!historyReady) throw Object.assign(new Error("test combined budget exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+    return { receivable: await rpc({ action: "receivable", count: "500" }), history: {
+      account: GATE_ADDR, previous: null, history: [{ hash: head, type: "open", height: "1", confirmed: true, account: PAYER, amount: "1" }],
+    } };
+  };
+  chain.ops.rpc = body => {
+    assert.equal(historyReady, false, "a verified combined window needs no further RPC");
+    if (body.action === "receivable") {
+      fallbackReads++;
+      return rpc(body);
+    }
+    assert.equal(body.action, "account_history");
+    throw new Error("test history unavailable");
+  };
+  const gate = createChargeGate({ address: GATE_ADDR, ops: chain.ops, usd: 0.05, xnoUsd: 1, publicBase: "http://pay.test",
+    pollMs: 5, verifyPaymentReads: true, log: line => { if (line.includes("payment scan failed")) failed = true; } });
+  t.after(() => gate.stop());
+  const { callTool } = gate.wrapRegistry(registry);
+  const request = text => callTool({ name: "poster", arguments: { Text: text } });
+  const original = argOf(await request("issued before the outage"));
+  assert.ok(combinedReads > 0);
+  historyReady = false;
+  await until("the watcher to report its broken history RPC", () => failed);
+  assert.equal((await request("new customer")).isError, true, "a watcher failure supersedes a fresh positive quote probe");
+  assert.equal(gate.quote(original.paymentId).status, "pending");
+
+  chain.state.receivable["D".repeat(64)] = { amount: original.amountRaw, source: PAYER };
+  assert.equal(await gate.waitForPayment(original.paymentId, 1_000), "paid");
+  assert.ok(fallbackReads > 0, "the watcher still looks for receivables for existing quotes");
+});
+
+test("anchored history does not advance past a truncated page and then finds the pocketed payment", async t => {
+  const chain = fakeChain(), registry = fakeRegistry();
+  const dir = await mkdtemp(join(tmpdir(), "nano-anchored-history-")), file = join(dir, "gate-state.json");
+  const open = { hash: "A".repeat(64), type: "open", height: "1", confirmed: "true", account: PAYER, amount: "1" };
+  const change = { hash: "C".repeat(64), type: "state", subtype: "change", height: "3", confirmed: "true", previous: "D".repeat(64) };
+  let anchor = open, paid = null, truncate = true, malformedReads = 0;
+  chain.ops.checkpoint = () => ({ confirmed: { hash: anchor.hash, blockCount: anchor.height } });
+  const rpc = chain.ops.rpc;
+  chain.ops.rpc = body => {
+    if (body.action !== "account_history") return rpc(body);
+    assert.equal(body.raw, "true");
+    const start = { account: body.account };
+    if (body.head === open.hash) return { ...start, history: [open] };
+    assert.equal(body.head, change.hash);
+    if (truncate) { malformedReads++; return { ...start, history: [change, paid] }; }
+    return { ...start, history: [change, paid, open] };
+  };
+  const gate = makeGate(chain, { registry, stateFile: file, pollMs: 5, now: () => 8_000_000 });
+  t.after(async () => { await gate.stop(); await rm(dir, { recursive: true }); });
+  const { callTool } = gate.wrapRegistry(registry);
+  const quote = argOf(await callTool({ name: "poster", arguments: { Text: "raw history" } }));
+  const first = await untilState(file, "opening checkpoint", state => state.historyScan?.through === open.hash);
+  paid = { hash: change.previous, type: "state", subtype: "receive", height: "2", confirmed: "true",
+    previous: open.hash, account: PAYER, amount: quote.amountRaw, local_timestamp: "8000" };
+  anchor = change;
+  await until("truncated history attempts", () => malformedReads >= 2);
+  const waiting = JSON.parse(await readFile(file, "utf8"));
+  assert.deepEqual(waiting.historyScan, first.historyScan);
+  assert.equal(gate.quote(quote.paymentId).status, "pending");
+  truncate = false;
+  assert.equal(await gate.waitForPayment(quote.paymentId, 2000), "paid");
+  const saved = await untilState(file, "rollback-compatible history checkpoint", state => state.historyScan?.through === paid.hash);
+  assert.equal(saved.quotes.find(value => value.id === quote.paymentId).payHash, paid.hash);
+});
+
 /*
  * Burst regression: pre-fix, `receivable` was polled with count 50 and history
  * with a fixed 25-entry window every 5th tick, so a burst of simultaneous
@@ -866,12 +994,18 @@ test("Nano history screens unconfirmed and pre-quote deposits before matching a 
   const chain = fakeChain(), registry = fakeRegistry();
   let highest = { blockCount: "7", hash: testHash(7) };
   chain.ops.checkpoint = () => ({ confirmed: highest });
+  const rpc = chain.ops.rpc;
+  chain.ops.rpc = async body => {
+    const result = await rpc(body);
+    if (body.action !== "account_history") return result;
+    return { ...result, account: body.account, previous: result.history.at(-1)?.previous };
+  };
   const gate = makeGate(chain, { registry, now: () => 8_000_000, pollMs: 5 });
   t.after(() => gate.stop());
   const { callTool } = gate.wrapRegistry(registry);
   const p = argOf(await callTool({ name: "poster", arguments: { Text: "confirmed only" } }));
-  const old = { type: "receive", account: PAYER, amount: p.amountRaw, hash: highest.hash, height: "7", confirmed: "true" };
-  const next = { ...old, hash: testHash(8), height: "8", confirmed: "false" };
+  const old = { type: "receive", account: PAYER, amount: p.amountRaw, hash: highest.hash, height: "7", previous: testHash(6), confirmed: "true" };
+  const next = { ...old, hash: testHash(8), height: "8", previous: old.hash, confirmed: "false" };
   chain.state.history.push(next, old);
   highest = { blockCount: "8", hash: next.hash };
   assert.equal(await gate.waitForPayment(p.paymentId, 35), "pending");
@@ -998,30 +1132,84 @@ test("payment-required text carries the tool's typical runtime when known", asyn
   assert.match(quote.content[0].text, /send exactly 0\.08\d* XNO/);
 });
 
-test("gate state survives a restart: pending quote pays and settles under the reloaded gate", async () => {
-  const { mkdtemp } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-  const stateFile = join(await mkdtemp(join(tmpdir(), "gate-state-")), "gate-state.json");
+test("gate state survives a restart: pending quote pays and settles under the reloaded gate", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "gate-state-"));
+  const stateFile = join(dir, "gate-state.json");
+  let original, restored, server;
+  t.after(async () => {
+    if (server) {
+      server.close();
+      server.closeAllConnections();
+    }
+    await restored?.stop();
+    await original?.stop();
+    await rm(dir, { recursive: true, force: true });
+  });
 
   const chain1 = fakeChain();
   const registry1 = fakeRegistry();
-  const gate1 = makeGate(chain1, { registry: registry1, stateFile }).wrapRegistry(registry1);
+  original = makeGate(chain1, { registry: registry1, stateFile });
+  const gate1 = original.wrapRegistry(registry1);
   const x = argOf(await gate1.callTool({ name: "poster", arguments: { Text: "a" } }));
   await untilState(stateFile, "the quote to reach the state file", quoteIn(x.paymentId));
+  await original.stop();
 
-  // "deploy": a brand-new gate + chain, same state file
   const chain2 = fakeChain();
   const registry2 = fakeRegistry({ onCall: async () => ({ content: [{ type: "text", text: "ran" }], costUsd: 0.02 }) });
-  const gate2 = makeGate(chain2, { registry: registry2, stateFile }).wrapRegistry(registry2);
-  chain2.state.receivable["A".repeat(64)] = { amount: x.amountRaw, source: PAYER };
-  const res = await gate2.callTool({ name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } });
-  assert.ok(!res.isError, JSON.stringify(res.content));
+  restored = makeGate(chain2, { registry: registry2, stateFile });
+  const { callTool, listTools } = restored.wrapRegistry(registry2);
+  server = await serveHttp({ host: "127.0.0.1", port: 0, name: "t", version: "0", listTools, callTool,
+    gate: restored, publicBase: "http://pay.test", log: () => {} });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const watch = await fetch(`${base}/x402/watch/${x.paymentId}`, {
+    headers: { Accept: "text/event-stream" }, signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(watch.status, 200);
+  assert.match(watch.headers.get("content-type"), /^text\/event-stream/);
+  const frames = [], paymentHash = "A".repeat(64);
+  await readSse(watch, ({ event, data }) => {
+    if (event !== "status") return;
+    frames.push(data);
+    if (frames.length === 1) {
+      assert.equal(data.status, "pending");
+      assert.equal(data.done, undefined);
+      chain2.state.receivable[paymentHash] = { amount: x.amountRaw, source: PAYER };
+    }
+  });
+  const paid = frames.at(-1);
+  assert.equal(paid?.status, "paid");
+  assert.equal(paid.done, true);
+  assert.ok(paid.next.includes(x.paymentId));
+  const committed = quoteIn(x.paymentId)(JSON.parse(await readFile(stateFile, "utf8")));
+  assert.equal(committed.status, "paid");
+  assert.equal(committed.payHash, paymentHash);
+  assert.equal(registry2.callCount(), 0);
+
+  const run = async () => {
+    const reply = await fetch(`${base}/mcp`, {
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "poster", arguments: { Text: "a", _payment_id: x.paymentId } } }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    assert.equal(reply.status, 200);
+    return (await reply.json()).result;
+  };
+  const result = await run();
+  assert.ok(!result.isError, JSON.stringify(result.content));
+  const replay = await run();
+  assert.ok(!replay.isError);
+  assert.equal(replay.content[0].text, result.content[0].text);
   assert.equal(registry2.callCount(), 1);
-  // settle math still exact after the pair's BigInts round-tripped through JSON
-  const change = await until("the change send to reach the chain",
-    () => chain2.state.transfers.find((t) => t.describe === "change:"));
+  const saved = await untilState(stateFile, "the settled run and its recorded change",
+    state => { const q = quoteIn(x.paymentId)(state); return q?.settled && q.transferReceipts?.change; });
+  assert.equal(chain2.state.transfers.length, 1);
+  const [change] = chain2.state.transfers;
+  assert.equal(change.describe, "change:");
   assert.equal(BigInt(x.amountRaw) - 24n * 10n ** 27n, BigInt(change.amountRaw));
+  const receipt = quoteIn(x.paymentId)(saved).transferReceipts.change;
+  assert.equal(receipt.amountRaw, change.amountRaw);
+  assert.equal(receipt.to, PAYER);
 });
 
 test("gate state survives a restart: completed runs replay, they never run twice", async () => {
@@ -1701,7 +1889,7 @@ test("no graph names an author: the page says the markup stays with the server, 
     // Says where the money actually goes today.
     assert.match(html, /None of the workflows here name one yet, so for now the markup stays with this server\./);
     assert.match(html, /No workflow here claims it yet/);
-    assert.match(txt, /No workflow on this server carries that field, so the markup stays with the operator\./);
+    assert.match(txt, /otherwise the operator keeps the markup/);
 
     // Never the unconditional claim, in either place.
     for (const [where, body] of [["landing page", html], ["/llms.txt", txt]]) {
@@ -1715,7 +1903,7 @@ test("no graph names an author: the page says the markup stays with the server, 
 
     // The genuine feature survives: a graph CAN claim it, and the page says how.
     assert.match(html, /"x402": \{"author": "nano_…"\}/);
-    assert.match(txt, /x402": \{"author": "nano_…"\}/);
+    assert.match(txt, /A graph can assign the available markup to its author/);
   } finally {
     server.close();
   }
@@ -1916,14 +2104,14 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
     const res = await fetch(`${base}/llms.txt`);
     assert.match(res.headers.get("content-type"), /text\/plain/);
     const txt = await res.text();
-    assert.match(txt, /endpoint: http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /MCP endpoint: http:\/\/pay\.test\/mcp/);
     assert.match(txt, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
     assert.match(txt, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
-    assert.match(txt, /## Payment \(x402, Nano\/XNO\)/);
-    assert.match(txt, /settles at metered model cost \+ 20%/);
-    assert.match(txt, /- poster: /);
-    assert.match(txt, /graph: http:\/\/pay\.test\/graph\/poster\.json/);
-    assert.match(txt, /npx nanoodle-mcp --graphs/);
+    assert.match(txt, /Nano \(XNO\) is the default/);
+    assert.match(txt, /settle at metered model cost plus a 20% markup/);
+    assert.match(txt, /- `poster`: /);
+    assert.match(txt, /\[graph JSON\]\(http:\/\/pay\.test\/graph\/poster\.json\)/);
+    assert.match(txt, /nanoodle-mcp --graphs/);
   } finally {
     server.close();
   }
@@ -1937,8 +2125,9 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
   const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
   try {
     const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
-    assert.doesNotMatch(txt, /Payment/);
-    assert.match(txt, /- poster: /);
+    assert.doesNotMatch(txt, /quote is not permission|payment guide/);
+    assert.match(txt, /operator’s balance/);
+    assert.match(txt, /- `poster`: /);
   } finally {
     freeServer.close();
   }
@@ -2022,12 +2211,12 @@ test("llms.txt carries a Privacy section; free mode drops the charge-specific li
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const txt = await (await fetch(`${base}/llms.txt`)).text();
-    assert.match(txt, /## Privacy/);
-    assert.match(txt, /No accounts, no API keys, no sign-ins/);
-    assert.match(txt, /Prompts and inputs are never written to disk or logs/);
-    assert.match(txt, /short hash binding a payment to its call/); // charge-only
-    assert.match(txt, /auto-deletes after 24h/);
-    assert.match(txt, /payments ledger \(usage\.jsonl\)/); // charge-only
+    assert.match(txt, /## Costs and data/);
+    assert.match(txt, /do not require a Nanoodle login or a NanoGPT API key/);
+    assert.match(txt, /ordinary invocations the server does not persist prompts or input media/);
+    assert.match(txt, /quote is not permission to spend/); // charge-only
+    assert.match(txt, /retention is 24 hours by default/);
+    assert.match(txt, /payment and receipt records/);
     assert.match(txt, /nano-gpt\.com\/privacy/);
   } finally {
     server.close();
@@ -2042,9 +2231,9 @@ test("llms.txt carries a Privacy section; free mode drops the charge-specific li
   const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
   try {
     const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
-    assert.match(txt, /## Privacy/);
-    assert.doesNotMatch(txt, /short hash binding a payment/);
-    assert.doesNotMatch(txt, /payments ledger \(usage\.jsonl\)/);
+    assert.match(txt, /## Costs and data/);
+    assert.doesNotMatch(txt, /quote is not permission to spend/);
+    assert.doesNotMatch(txt, /Nano payment guide/);
   } finally {
     freeServer.close();
   }
@@ -2948,11 +3137,19 @@ test("a failed Nano state flush remains unhealthy after drain until a later snap
 });
 
 test("a Nano payment stays pending until its original transfer is durable, even after it leaves the RPC window", { timeout: 5000 }, async t => {
+  const { maintenance } = await gateMaintenance(t);
   const chain = fakeChain(), registry = fakeRegistry(), dir = await mkdtemp(join(tmpdir(), "nano-pending-deposit-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  const gates = [];
+  t.after(async () => {
+    maintenance.close();
+    for (const gate of gates) await gate.stop();
+    // Successful replay can return while the wallet is durably recording change.
+    await maintenance.waitForIdle();
+    await rm(dir, { recursive: true, force: true });
+  });
   const stateFile = join(dir, "state.json"), temporary = stateFile + ".tmp";
-  const gate = makeGate(chain, { registry, stateFile, waitMs: 25, pollMs: 5 });
-  t.after(() => gate.stop());
+  const gate = makeGate(chain, { registry, stateFile, maintenance, waitMs: 25, pollMs: 5 });
+  gates.push(gate);
   const wrapped = gate.wrapRegistry(registry), args = { Text: "original payment" };
   const quote = async args => {
     const payment = argOf(await wrapped.callTool({ name: "poster", arguments: args }));
@@ -2986,8 +3183,8 @@ test("a Nano payment stays pending until its original transfer is durable, even 
   assert.equal(written.status, "paid");
   await gate.stop();
 
-  const reopened = makeGate(chain, { registry, stateFile });
-  t.after(() => reopened.stop());
+  const reopened = makeGate(chain, { registry, stateFile, maintenance });
+  gates.push(reopened);
   const running = reopened.wrapRegistry(registry);
   assert.equal((await callPaid(running)).isError, undefined);
   assert.equal((await callPaid(running)).isError, undefined);

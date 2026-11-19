@@ -8,11 +8,11 @@ import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-async function pages(toolName, structured) {
+async function pages(toolName, structured, publicBase = "https://mcp.nanoodle.com") {
   const tool = { name: toolName, description: "Generate reference and parts images.", inputSchema: { type: "object" } };
   const server = await serveHttp({
     host: "127.0.0.1", port: 0, name: "examples", version: "0",
-    publicBase: "http://example.test", log: () => {},
+    publicBase, log: () => {},
     listTools: () => [tool], callTool: async () => { throw new Error("No generation in this test"); },
     toolInfo: [{ ...tool, rawText: "{}", editorUrl: "https://nanoodle.com/#g=test",
       ...(structured ? { card: { intent: tool.description, steps: [{ kind: "image", label: "Image", n: 2 }] } } : {}),
@@ -33,19 +33,26 @@ async function pages(toolName, structured) {
 for (const structured of [true, false]) {
   test(`mounted character workflow exposes playable outcome and local skill (structured=${structured})`, async () => {
     const [html, text] = await pages("character-sprites", structured);
+    assert.match(html, /graph generates a character reference and parts sheet/);
+    assert.match(html, /local skill bakes animated sprites/);
+    assert.match(html, /coding agent adds combat, gravity and game rules/);
     for (const body of [html, text]) {
       assert.match(body, /Iron Verdict/);
       assert.match(body, /https:\/\/nanoodle\.com\/examples\/iron-verdict\//);
       assert.match(body, /https:\/\/github\.com\/nanoodlecom\/noodle-skills\/tree\/main\/skills\/character-sprites/);
-      assert.match(body, /graph generates a character reference and parts sheet/);
-      assert.match(body, /local skill bakes animated sprites/);
-      assert.match(body, /coding agent adds combat, gravity and game rules/);
     }
     assert.match(html, /href="\/graph\/character-sprites\.json"/);
     assert.match(html, /src="https:\/\/media\.nanoodle\.com\/mcp\/examples\/iron-verdict\.png"/);
-    assert.match(text, /graph: http:\/\/example\.test\/graph\/character-sprites\.json/);
+    assert.match(text, /https:\/\/mcp\.nanoodle\.com\/graph\/character-sprites\.json/);
+    assert.doesNotMatch(text, /graph generates a character reference and parts sheet/);
   });
 }
+
+test("a third-party server's discovery does not imply its identically named tool is first-party", async () => {
+  const [, text] = await pages("character-sprites", true, "http://third-party.test");
+  assert.match(text, /http:\/\/third-party\.test\/graph\/character-sprites\.json/);
+  assert.doesNotMatch(text, /Iron Verdict|skills\/character-sprites/);
+});
 
 test("servers without the character workflow do not imply the example tool is mounted", async () => {
   for (const name of ["poster", "constructor"]) {
@@ -61,7 +68,7 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
       const [html, text] = await pages(name, structured);
       for (const body of [html, text]) {
         assert.ok(body.includes(name === "sing" ? "https://mcp.nanoodle.com/examples/sing.mp3" : `https://nanoodle.com/examples/gallery/#${name}`));
-        assert.doesNotMatch(body, /undefined|agent skill:|give your agent the skill|Iron Verdict/);
+        assert.doesNotMatch(body, /undefined|agent skill:|give your agent the skill|local skill|Iron Verdict/);
       }
       assert.match(html, />See sample<\/a>/);
       assert.ok(html.includes(`id="${name}"`));
@@ -74,21 +81,21 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
         assert.match(html, /Audio sample/);
         assert.match(html, /<audio controls preload="none"/);
         assert.match(html, /src="\/examples\/sing.mp3" type="audio\/mpeg"/);
-        assert.match(text, /Mureka 9.5/);
+        assert.match(html, /Mureka 9.5/);
       }
       if (name === "talking-avatar") {
         assert.match(html, /Video sample/);
-        assert.match(text, /check precise lip-sync timing in playback/);
+        assert.match(html, /check precise lip-sync timing in playback/);
       }
       if (name === "idea-to-3d-model") {
         assert.match(html, /3D sample/);
-        assert.match(text, /holds up from every side/);
-        assert.match(text, /go soft at some angles/);
+        assert.match(html, /holds up from every side/);
+        assert.match(html, /go soft at some angles/);
       }
       if (name === "mix-the-references") {
         assert.match(html, /Composite sample/);
-        assert.match(text, /names each image by number/);
-        assert.match(text, /paper boats from the place reference mostly drop out/);
+        assert.match(html, /names each image by number/);
+        assert.match(html, /paper boats from the place reference mostly drop out/);
       }
     }
   });
@@ -121,9 +128,12 @@ test("sample calls come from saved graph inputs and omit workflows requiring upl
     assert.match(html, /Try the included sample/);
     assert.match(html, /Rewrite &lt;release notes&gt; for customers &amp; preserve dates/);
     assert.equal((html.match(/Try the included sample/g) || []).length, 1);
-    const call = JSON.parse(text.match(/example MCP call .*?: (.+)/)[1]);
+    const sample = html.match(/<pre>(\{\s*&quot;jsonrpc&quot;:[\s\S]*?\})<\/pre>/)[1];
+    const call = JSON.parse(sample.replaceAll("&quot;", '"'));
     assert.deepEqual(call, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "release-notes", arguments: {} } });
     await registry.prepareCall(call.params);
+    assert.match(text, /\x60release-notes\x60/);
+    assert.doesNotMatch(text, /Rewrite <release notes>|example MCP call/);
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
     await rm(dir, { recursive: true, force: true });

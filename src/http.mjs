@@ -14,7 +14,7 @@
  *                        with _payment_id is the RESULTS stream only.
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
  *                        flows, daily run write-ups, tool list w/ per-workflow editor links, self-hosting + author-payout story
- *   GET  /llms.txt       the same story as plain text, written for agents
+ *   GET  /llms.txt       endpoint discovery, written for agents
  *   GET  /version        { name, version, commit } — short git sha, so a deploy can be matched to main
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
@@ -39,7 +39,7 @@ import http from "node:http";
 import { MaintenanceError } from "./maintenance.mjs";
 import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 import { nearShowcase } from "./near-showcase.mjs";
-import { nearAgentGuide } from "./near/agent-guide.mjs";
+import { creatorDiscovery, endpointDiscovery } from "./discovery.mjs";
 import { isExpiredPayment } from "./near/payment-view.mjs";
 import { NANOODLE_BRAND, NANO_BRAND_HEAD, NANO_CONNECTOR, NANO_WORDMARK, NANO_SURFACE_CSS, NANO_PORT_CSS } from "./brand.mjs";
 import { nearSitePage, nearWorkflowCopy, BRAND_BASE } from "./near-site.mjs";
@@ -54,7 +54,7 @@ import { fileURLToPath } from "node:url";
 import { qrModules } from "nanoodle";
 import { createDispatcher, gitShortSha } from "./server.mjs";
 import { renderCost } from "./tools.mjs";
-import { receiptsHtml, receiptsLines, RECEIPTS_CSS } from "./receipts.mjs";
+import { receiptsHtml, RECEIPTS_CSS } from "./receipts.mjs";
 import { workflowExample } from "./workflow-examples.mjs";
 import { MEDIA_EXTS } from "./sweep.mjs";
 
@@ -543,99 +543,6 @@ function landingHtml({ name, version, listTools, publicBase, charged, toolInfo =
   `, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + NANO_LANDING_CSS, ogHead);
 }
 
-/** The landing page's story as plain text — the version an agent should read. */
-function llmsTxt({ name, version, listTools, publicBase, charged, toolInfo = [], paymentNote = null, near = false, usdc = null, network = "mainnet" }) {
-  if (charged) { near = false; paymentNote = null; }
-  const authored = authorCount(toolInfo);
-  const tools = listTools().filter((t) => t.name !== "run_noodle" || near);
-  const infoByName = new Map(toolInfo.map((t) => [t.name, t]));
-  const lines = [
-    `# ${name} v${version}`,
-    ``,
-    near && !charged
-      ? `Public MCP server: AI workflows paid per call in ${usdc?.enabled ? "NEAR or Circle-issued USDC on NEAR" : "native NEAR"}, with automatic same-asset refunds — built with nanoodle (https://nanoodle.com).`
-      : charged
-      ? `Public MCP server: AI workflows (image, video, audio, text) paid per call in Nano over x402 — built with nanoodle (https://nanoodle.com).`
-      : `Public MCP server: AI media workflows (image, video, audio, text) built with nanoodle (https://nanoodle.com).`,
-    ``,
-    `endpoint: ${publicBase}/mcp (MCP streamable HTTP — POST JSON-RPC, SSE progress on tools/call)`,
-    `connect (Claude): claude mcp add --transport http noodles ${publicBase}/mcp`,
-    `connect (Grok):   grok mcp add --transport http noodles ${publicBase}/mcp`,
-    ``,
-  ];
-  if (near) {
-    lines.push(nearAgentGuide({ publicBase, usdc: !!usdc?.enabled, network }));
-    const custom = nearShowcase(tools, toolInfo).tools.find(t => t.graph);
-    if (custom) lines.push(`Featured ready-made template: ${custom.name}. GET ${publicBase}/examples/${custom.name}.json, then pass that JSON as graph to price_noodle and run_noodle, with inputs and your selected _pay_with. The template uses priced provider defaults.`, ``);
-  }
-  if (charged) {
-    lines.push(
-      `## Payment (x402, Nano/XNO)`,
-      ``,
-      `- No accounts, no API keys. On each PAYMENT REQUIRED quote (this call hangs up):`,
-      `  1. Show the user ONLY the payUrl (${publicBase}/pay/<id>).`,
-      `  2. IMMEDIATELY open the agent-only payment-monitor SSE at structuredContent.x402.watchUrl (${publicBase}/x402/watch/<id>) — never show that URL to the user. Wait until it CLOSES with status "paid", done:true, and next. (Or poll ${publicBase}/x402/status/<id>?wait=1.)`,
-      `  3. ONLY THEN tools/call again with _payment_id — that is the RESULTS stream. Do not open it while still watching for payment.`,
-      `- Paying is the consent; do not wait for a human "go". The quote carries payUrl, watchUrl, and a next imperative that says: on this payment link, show payUrl and open watchUrl now (blocking:false).`,
-      `- The quote is a deposit: the run settles at metered model cost + 20%, and the difference returns to the payer on-chain. Failed runs are refunded automatically.`,
-      `- The 20% is the author's cut, but only when the graph asks for it: a workflow carrying "x402": {"author": "nano_…"} is paid the markup on-chain, capped by what the deposit has left after cost. ` +
-        (authored === 0
-          ? `No workflow on this server carries that field, so the markup stays with the operator.`
-          : authored === tools.length
-          ? `Every workflow on this server carries that field.`
-          : `${authored} of the ${tools.length} workflows here carry it; on the rest the markup stays with the operator.`),
-      ``,
-    );
-  }
-  if (paymentNote) lines.push(charged ? `## Payment in NEAR` : `## Payment`, ``, paymentNote, ``);
-  lines.push(...receiptsLines(), ``);
-  lines.push(`## Tools`, ``);
-  for (const t of tools) {
-    lines.push(`- ${t.name}: ${t.description}`);
-    const info = infoByName.get(t.name);
-    if (info && info.rawText) lines.push(`  graph: ${publicBase}/graph/${encodeURIComponent(t.name)}.json`);
-    const sample = infoByName.get(t.name)?.card?.sample;
-    if (sample) lines.push(
-      `  included sample (${sample.label}): ${sample.text.replace(/\s+/g, " ")}`,
-      `  example MCP call (uses saved inputs; requests paid generation): ${JSON.stringify(sampleCall(t.name))}`,
-    );
-    const example = workflowExample(t.name);
-    if (example) lines.push(
-      `  outcome example: ${example.title} — ${example.play}`,
-      ...(example.skill ? [`  agent skill: ${example.skill}`] : []),
-      `  ${example.description}`,
-    );
-  }
-  lines.push(
-    ``,
-    `## Privacy`,
-    ``,
-    `Relay this to anyone deciding whether to pay — every line is verifiable in the published source.`,
-    `- No accounts, no API keys, no sign-ins${charged ? " — paying is the only thing that authorizes a call" : ""}.`,
-    `- Prompts and inputs are never written to disk or logs.`,
-  );
-  if (charged) lines.push(`- The server keeps only a short hash binding a payment to its call, never the arguments themselves.`);
-  lines.push(
-    `- Input media is held in memory only, never stored.`,
-    `- Generated media auto-deletes after 24h (the --out-ttl default in serve mode), served at unguessable URLs until then.`,
-    `- Results are held in memory for delivery, not stored.`,
-    `- No analytics, trackers, IP logs, or access logs — the server keeps no request logs.`,
-  );
-  if (charged) lines.push(`- The only log is a payments ledger (usage.jsonl): money-lifecycle events that mirror the public Nano ledger — no run telemetry, no error text.`);
-  lines.push(
-    `- Caveat: generation runs on NanoGPT's API (https://nano-gpt.com), so prompt content in flight is governed by their privacy policy (https://nano-gpt.com/privacy).`,
-    ``,
-    `## Source`,
-    ``,
-    `MIT-licensed: server https://github.com/nanoodlecom/nanoodle-mcp, editor https://github.com/nanoodlecom/nanoodle, executor https://github.com/nanoodlecom/nanoodle-js.`,
-    `The workflows this server exposes are not covered by that — each graph belongs to whoever wrote it and carries whatever licence they give it.`,
-    `One runtime dependency is GPL-3.0: nanocurrency (https://github.com/marvinroger/nanocurrency-js), which signs the Nano blocks for the optional x402 wallet. Details: https://github.com/nanoodlecom/nanoodle-mcp#licensing`,
-    `Self-host: npx nanoodle-mcp --graphs ./noodles --serve 8402`,
-    ``,
-  );
-  return lines.join("\n");
-}
-
 function nearPayPageHtml(q) {
   const asset = q.asset === "USDC" ? "USDC" : "NEAR";
   const amount = q.amount ?? q.amountNear;
@@ -807,8 +714,8 @@ export async function serveHttp({
 }) {
   if (maintenance !== null && typeof maintenance.run !== "function") throw new TypeError("maintenance must provide request admission and accounting");
   const sha = commit === undefined ? gitShortSha() : (commit || null);
-  // Each public page describes its own payment experience. Routing and stored
-  // payments still share the original backend, including compatibility calls.
+  // The marketing page emphasizes its default payment rail. Discovery below
+  // uses the actual endpoint registry, exactly as tools/list does.
   const publicTools = () => gate ? listTools().filter(t => !["run_noodle", "price_noodle", "noodle_guide"].includes(t.name)).map(t => ({
     ...t, description: toolInfo.find(info => info.name === t.name)?.description || t.description?.split(" It can also be paid in NEAR:")[0],
   })) : listTools();
@@ -1004,7 +911,7 @@ export async function serveHttp({
       if (req.method !== "GET" && req.method !== "HEAD") return send(405, JSON.stringify({ error: "method not allowed" }));
 
       if (creators && (url.pathname === "/creators" || hosted)) {
-        if (hosted && hostedMatch[2] === "llms.txt") return send(200, `${hosted.name}\n${hosted.description}\nMCP endpoint: ${hosted.mcpUrl}\n${creators.instructions(hosted.id)}\n\n${JSON.stringify(creators.listTools(hosted.id), null, 2)}`, "text/plain; charset=utf-8");
+        if (hosted && hostedMatch[2] === "llms.txt") return send(200, creatorDiscovery(hosted, creators.listTools(hosted.id)), "text/plain; charset=utf-8");
         const opts = { version, publicBase, merchant: nearHealth?.merchant, network: nearHealth?.network, usdc,
           scriptUrl: scriptUrls["near-site.js"], creatorScriptUrl: scriptUrls["creator-site.js"] };
         const page = hosted ? hostedWorkflowPage(hosted, opts) : creatorPage(opts);
@@ -1017,7 +924,11 @@ export async function serveHttp({
       }
 
       if (url.pathname === "/llms.txt") {
-        return send(200, llmsTxt({ name, version, listTools: publicTools, publicBase, charged: !!gate, toolInfo, paymentNote, near: !!nearGate, usdc, network: nearHealth?.network }), "text/plain; charset=utf-8");
+        const tools = listTools();
+        const template = nearGate && !gate ? nearShowcase(tools, toolInfo).tools.find(t => t.graph)?.name : null;
+        const guide = endpointDiscovery({ name, tools, publicBase: publicBase || publicOrigin, charged: !!gate, toolInfo, near: !!nearGate,
+          usdc: !!usdc?.enabled, network: nearHealth?.network, creatorHosting: !!creators, template });
+        return send(200, guide, "text/plain; charset=utf-8");
       }
 
       if (url.pathname === "/rates" && rates) {

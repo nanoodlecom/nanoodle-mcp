@@ -1,7 +1,7 @@
 // Read-only accounting for probes and admission checks. Never opens a ledger,
 // signs a transaction, retries an assignment, or returns customer content.
 import { parseUsdNano } from "./usd.mjs";
-import { nanoFundingCoverage, nanoQuoteClaim, nearCreatorCoverage, marketCreatorCoverage } from "./funding-liabilities.mjs";
+import { nanoFundingCoverage, nanoQuoteClaim, nearCreatorCoverage, marketCreatorCoverage, nearRunFundingBudget } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
 import { NANO_LATE_WATCH_MS, nanoQuoteNeedsHistory, readNanoPaymentHistory } from "./nano-payment-history.mjs";
@@ -112,6 +112,18 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
   }
   for (const issue of nearClaims.issues) issues.add(issue);
   return { ...nearClaims, nanoRaw, marketUsdNano, issues: [...issues].sort() };
+}
+
+/** Accepted NEAR and USDC payments waiting to acquire a Nano run reservation. */
+export function paidNearRunFundingRaw(quotes) {
+  let requiredRaw = 0n;
+  for (const quote of values(quotes)) {
+    if (quote.status !== "paid" || quote.settlement || quote.fundingOutcomeReady === true) continue;
+    if (amount(quote.paidYocto) === 0n) throw Error("invalid-paid-near-amount");
+    const { maxRaw, overheadRaw } = nearRunFundingBudget(quote);
+    requiredRaw += maxRaw + overheadRaw;
+  }
+  return requiredRaw;
 }
 
 export function nanoLiquidityCheck({ liabilities, nanoBalanceRaw, xnoUsd, providerReserveUsd = "2" }) {
