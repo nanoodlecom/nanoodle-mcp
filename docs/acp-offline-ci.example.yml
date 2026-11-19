@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.3'
       - run: npm ci --ignore-scripts
       - run: npm --prefix qualification/acp-v2 ci --ignore-scripts
       - run: npm --prefix qualification/acp-v2 test

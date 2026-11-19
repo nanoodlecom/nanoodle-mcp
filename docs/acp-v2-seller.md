@@ -236,7 +236,9 @@ npm --prefix qualification/acp-v2 ci --ignore-scripts
 npm --prefix qualification/acp-v2 test
 ```
 
-Use Node 24.22.1. The suite uses real SDK `AcpAgent`, `JobSession`, `AssetToken`,
+Use a Node version inside the root package `engines` range (for the 24.x line,
+24.22.3 or later; the original qualification ran on 24.22.1, which the current
+`engines` field no longer admits — the CI recipe now pins 24.22.3). The suite uses real SDK `AcpAgent`, `JobSession`, `AssetToken`,
 EVM submit encoder and ACP ABI, fake transport/API/chain/provider operations,
 and the repository's real dispatcher and Nano gate. No model API, account,
 wallet signer, external network or funds are needed. `*.qual.mjs` is explicit
