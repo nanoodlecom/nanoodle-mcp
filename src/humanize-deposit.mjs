@@ -13,7 +13,7 @@
  * writer, one extra retry, the decider, and a second decider pass when a
  * protected span can be repaired or the call can ask the decider to confirm
  * one fitting rewrite (a title, a maxChars cap, or a required ending).
- * When Cydonia fails and the Starry Ocean fallback runs, both calls are charged.
+ * When a writer's fallback model runs, both calls are charged.
  * Output tokens are sized from the request (maxChars,
  * or the draft length) plus a small slack, not from the model's output cap.
  * The decider's cap adds the ranking JSON and GLM reasoning tokens, which
@@ -39,6 +39,8 @@ export { HUMANIZE_SETTLE_MARKUP };
 export const HUMANIZE_MODEL_PRICES = Object.freeze({
   "qwen/qwen3.8-27b-novelist": [0.1, 0.6],
   "deepseek/deepseek-v4.1-flash-1017": [0.1, 0.6],
+  // Delisted 2026-11-18; row retained so a stale mounted graph still prices
+  // (its calls then fail per-writer) instead of failing every quote.
   "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15],
   "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
   "qwen/qwen3.8-27b-antislop": [0.1, 0.6],
@@ -187,8 +189,8 @@ function stageCalls(graph, spec, prices) {
     const primaryCall = priced(n.fields.model, primary, inTok);
     const primaryRetry = priced(n.fields.model, primary, retryTok);
     if (fb) {
-      // The quote reserves the larger of these two rates. When Cydonia fails and
-      // Starry runs, both calls are charged. A hosted run refuses an invoice that
+      // The quote reserves the larger of these two rates. When a primary fails
+      // and its fallback runs, both calls are charged. A hosted run refuses an invoice that
       // does not fit the remaining deposit. Direct-wallet spending has no cap.
       const fbCall = priced(fbModel, fb, inTok);
       const fbRetry = priced(fbModel, fb, retryTok);

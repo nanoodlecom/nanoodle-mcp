@@ -302,6 +302,31 @@ test("Nano checkout detects stale coverage only while a quote has been waiting",
   }
 });
 
+test("stale Nano coverage distinguishes a moving history cursor from a stalled one while keeping admission closed", async t => {
+  for (const [scenario, advancedAt, expected] of [
+    ["advancing", NOW - 63_000, "nano-history-backfill-in-progress"],
+    ["at the grace limit", NOW - 120_000, "nano-history-backfill-in-progress"],
+    ["stalled", NOW - 120_001, "nano-history-backfill-stalled"],
+    ["impossible future progress", NOW + 30_001, "nano-payment-coverage-invalid"],
+    ["legacy cursor", undefined, "nano-payment-coverage-stale"],
+  ]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"];
+    ledger.historyScan = { through: "C".repeat(64), coveredAt: NOW - 600_000, backfill: {
+      newest: "A".repeat(64), next: "B".repeat(64), startedAt: NOW - 500_000, fullReceivableWindow: false, quotaDeferred: true,
+      ...(advancedAt !== undefined && { advancedAt, nextHeight: "100" }),
+    } };
+    ledger.quotes.push({ id: "private-backfill-quote", status: "pending", createdAt: NOW - 500_000,
+      expiresAt: NOW + 600_000, amountRaw: "50000000000000000000000" });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
+    assert.deepEqual(probe, { stage: "nano-payment-scan-progress", ok: false, code: expected, domains: ["nano"] }, scenario);
+    assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-backfill-quote|advancedAt|nextHeight|BBBBBBBB/);
+  }
+});
+
 test("a legacy Nano writer alerts on an aged confirmed matching transfer missing from its ledger", async t => {
   const account = NANO_GENESIS_REPLY.contents.account;
   const sender = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
@@ -598,6 +623,50 @@ test("saved workflow probes flag thin Nano deposits, invalid USDC previews and m
   }
 });
 
+test("fixed Nano workflows need working capital at their advertised deposit and the sampled rate", async t => {
+  const raw = 10n ** 30n, required = 3n * raw / 2n;
+  for (const mode of ["exact", "runtime-short", "confirmed-short", "market-waiting", "provider-key"]) {
+    const f = fixture(({ url, body }) => {
+      if (url.pathname === "/rates" && url.hostname === "site.example") {
+        const source = { usable: true, live: true, at: new Date(NOW).toISOString() };
+        return Response.json({ quoting: true, nearUsd: "3", xnoUsd: "2",
+          sources: { nearUsd: source, xnoUsd: source } });
+      }
+      if (url.hostname === "nano-site.example" && body?.method === "tools/list") {
+        const tools = toolsList();
+        tools.find(tool => tool.name === "sing").description = toolsList("3").find(tool => tool.name === "sing").description;
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools } });
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const reservedRaw = String(10n * raw - required + BigInt(mode === "runtime-short"));
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: "0", reservedRaw,
+      activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "confirmed-short") {
+      f.states["/state/gate-state.json"].owed.push({
+        amountRaw: String(10n * raw - required + 1n), journaled: true, tries: 0, createdAt: NOW,
+      });
+    }
+    if (mode === "market-waiting") {
+      f.states["/jobs/nanoodle-image/market-state.json"].assignments.waiting = {
+        id: "private-accepted-listing", phase: "started", pricing: { depositUsd: 0.4 }, updatedAt: NOW,
+      };
+    }
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "saved-workflow-nano-sing"]) assert.ok(check(stage)?.ok, mode);
+    const funding = check("workflow-nano-capital-nano-sing");
+    if (mode === "provider-key") assert.equal(funding, undefined);
+    else if (mode === "exact") assert.equal(funding?.ok, true);
+    else assert.deepEqual(funding, { stage: "workflow-nano-capital-nano-sing", ok: false,
+      code: "workflow-nano-capital-insufficient", domains: [] }, mode);
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
+    assert.doesNotMatch(JSON.stringify(report), /private-accepted-listing|availableRaw|depositUsd/);
+  }
+});
+
 test("a formerly adequate deposit fails when fresh provider pricing rises or a model disappears", async t => {
   const f = fixture(), price = f.deps.computePrice, localCalls = [];
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
@@ -844,7 +913,7 @@ test("paid NEAR and USDC workflows must fit together at their locked Nano rates"
 
 test("valid NEAR and USDC previews must fit both independent Nano balances and already paid work", async t => {
   const raw = 10n ** 30n;
-  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting"]) {
+  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting", "nano-paid-waiting", "market-paid-waiting"]) {
     const f = fixture(({ url, body }) => {
       const args = body?.params?.arguments;
       if (url.hostname !== "site.example" || !(args?.graph?.name === "sing" || args?.inputs?.Marker)) return null;
@@ -866,9 +935,18 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       f.states["/state/near-state.json"].quotes.queued = { id: "private-queued-funding-sample", status: "paid", asset: "usdc",
         depositUsd: "1", paidYocto: "1000000", paidAtBlockMs: NOW, rate: { xnoUsd: "2" } };
     }
+    if (mode === "nano-paid-waiting") {
+      f.states["/state/gate-state.json"].quotes.push({ id: "private-queued-funding-sample", status: "paid", paidAt: NOW,
+        amountRaw: String(raw / 2n), usd: "1", pair: { usdNano: "2000000000", raw: String(raw) } });
+    }
+    if (mode === "market-paid-waiting") {
+      f.states["/jobs/nanoodle-image/market-state.json"].assignments.private_job = {
+        phase: "started", pricing: { depositUsd: 0.5 }, updatedAt: NOW,
+      };
+    }
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
-    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "saved-workflow-near-sing",
+    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "nano-paid-run-funding", "saved-workflow-near-sing",
       "saved-workflow-usdc-sing", "custom-workflow-pricing"]) assert.ok(check(stage)?.ok, mode + " " + stage);
     for (const stage of ["workflow-nano-capital-near-sing", "workflow-nano-capital-usdc-sing",
       "workflow-nano-capital-near-custom", "workflow-nano-capital-usdc-custom"]) {
@@ -876,7 +954,7 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       if (mode !== "healthy") assert.deepEqual(check(stage), { stage, ok: false, code: "workflow-nano-capital-insufficient", domains: [] });
     }
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
-    assert.doesNotMatch(JSON.stringify(report), /private-queued-funding-sample|reservedRaw|depositUsd/);
+    assert.doesNotMatch(JSON.stringify(report), /private-queued-funding-sample|private_job|reservedRaw|depositUsd/);
     if (mode === "runtime-reserved") {
       const invocationId = ID.replaceAll("-", "");
       const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
@@ -884,6 +962,103 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       assert.match(alert.text, /workflow-nano-capital-insufficient/);
       assert.doesNotMatch(alert.text, /private-queued-funding-sample|reservedRaw|depositUsd/);
     }
+  }
+});
+
+test("waiting Nano, NEAR and USDC work must fit the same available pool", async t => {
+  const raw = 10n ** 30n, nanoDeposit = 9n * raw / 4n, combined = 5n * raw;
+  for (const mode of ["exact", "live-short", "chain-short", "missing-rate", "started-during-sample", "provider-key"]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"], quotes = f.states["/state/near-state.json"].quotes;
+    const nano = { id: "private-paid-nano", status: "paid", paidAt: NOW, amountRaw: String(nanoDeposit),
+      usd: "1.125", pair: { usdNano: "500000000", raw: String(raw) } };
+    if (["missing-rate", "provider-key"].includes(mode)) delete nano.pair;
+    ledger.quotes.push(nano);
+    quotes.near = { status: "paid", asset: "near", depositUsd: "1.2",
+      paidYocto: "400000000000000000000000", paidAtBlockMs: NOW, rate: { xnoUsd: "0.5" } };
+    quotes.usdc = { status: "paid", asset: "usdc", depositUsd: "0.07",
+      paidYocto: "70000", paidAtBlockMs: NOW, rate: { xnoUsd: "0.2" } };
+    const shortfall = ["live-short", "started-during-sample"].includes(mode) ? 1n : 0n;
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: String(nanoDeposit),
+      reservedRaw: String(10n * raw - nanoDeposit - combined + shortfall), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "chain-short") ledger.owed.push({
+      amountRaw: String(10n * raw - nanoDeposit - combined + 1n), journaled: true, tries: 0, createdAt: NOW,
+    });
+    if (mode === "started-during-sample") {
+      const read = f.deps.readJson;
+      f.deps.readJson = path => {
+        if (path === "/state/funding-health.json") nano.status = "consumed";
+        return structuredClone(read(path));
+      };
+    }
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    assert.equal(check("near-paid-run-funding")?.ok, true, mode);
+    assert.equal(check("nano-liquidity")?.ok, true, mode);
+    const finding = check("nano-paid-run-funding");
+    if (mode === "provider-key") {
+      assert.equal(finding, undefined);
+    } else {
+      assert.equal(finding?.ok, ["exact", "started-during-sample"].includes(mode), mode);
+      if (!finding.ok) assert.deepEqual(finding, { stage: "nano-paid-run-funding", ok: false,
+        code: mode === "missing-rate" ? "nano-paid-run-funding-unverified" : "nano-paid-run-funding-insufficient", domains: [] });
+    }
+    if (mode === "missing-rate") assert.equal(check("workflow-nano-capital-near-sing")?.code, "workflow-nano-capital-unverified");
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
+    assert.doesNotMatch(JSON.stringify(report), /private-paid-nano|availableRaw|depositUsd/);
+  }
+});
+
+test("accepted Market work must fit the live and confirmed Nano available alongside paid workflows", async t => {
+  const raw = 10n ** 30n;
+  for (const mode of ["exact", "live-short", "chain-short", "starts-during-sample", "unverified", "provider-key"]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"], quotes = f.states["/state/near-state.json"].quotes;
+    const assignments = f.states["/jobs/nanoodle-image/market-state.json"].assignments;
+    const waiting = { id: "private-market-job", phase: "starting", pricing: { depositUsd: 2.5 }, updatedAt: NOW };
+    const latestMarket = ["chain-short", "unverified"].includes(mode);
+    if (!latestMarket) assignments.waiting = waiting;
+    assignments.running = { phase: "running", pricing: { depositUsd: 1.5 }, updatedAt: NOW };
+    ledger.quotes.push({ id: "private-market-test-nano-payment", status: "paid", paidAt: NOW, amountRaw: String(raw), usd: 1,
+      pair: { usdNano: "1000000000", raw: String(raw) } });
+    quotes.near = { status: "paid", asset: "near", depositUsd: "0.75", paidAtBlockMs: NOW,
+      paidYocto: "250000000000000000000000", rate: { xnoUsd: "1" } };
+    quotes.usdc = { status: "paid", asset: "usdc", depositUsd: "0.75", paidAtBlockMs: NOW,
+      paidYocto: "750000", rate: { xnoUsd: "1" } };
+    const available = 5n * raw - BigInt(mode === "live-short") - (mode === "starts-during-sample" ? 2n * raw : 0n);
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: String(raw),
+      reservedRaw: String(9n * raw - available), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "chain-short") {
+      ledger.owed.push({ amountRaw: String(raw * 5n / 2n + 1n), journaled: true, tries: 0, createdAt: NOW });
+    }
+    const read = f.deps.readJson;
+    f.deps.readJson = path => {
+      if (path === "/state/funding-health.json") {
+        if (mode === "starts-during-sample") waiting.phase = "running";
+        if (latestMarket) {
+          if (mode === "unverified") delete waiting.pricing;
+          assignments.waiting = waiting;
+        }
+      }
+      return structuredClone(read(path));
+    };
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const stages = Object.fromEntries(report.checks.map(row => [row.stage, row]));
+    assert.equal(stages["nano-liquidity"].ok, true, mode);
+    assert.equal(stages["near-paid-run-funding"].ok, true, mode);
+    const finding = stages["market-paid-run-funding"];
+    if (mode === "provider-key") assert.equal(finding, undefined);
+    else {
+      assert.equal(finding?.ok, ["exact", "starts-during-sample"].includes(mode), mode);
+      if (!finding.ok) assert.deepEqual(finding, { stage: "market-paid-run-funding", ok: false, domains: [],
+        code: mode === "unverified" ? "market-paid-run-funding-unverified" : "market-paid-run-funding-insufficient" });
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
+    assert.doesNotMatch(JSON.stringify(report), /private-market-(job|test-nano-payment)|availableRaw|depositUsd/);
   }
 });
 
@@ -965,7 +1140,7 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
 });
 
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
-  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "moved-after-history", "inconsistent-newer-view"]) {
+  for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "stale-history", "inconsistent-newer-view"]) {
     const f = fixture(({ url, body }) => {
       if (url.hostname !== "nano-2.example") return null;
       if (body.action === "account_history" && failure === "history-http") return new Response("PRIVATE_RPC_DETAIL", { status: 503 });
@@ -980,7 +1155,7 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
       if (body.action === "receivable" && ["inconsistent-receivable", "inconsistent-newer-view"].includes(failure)) {
         return Response.json({ blocks: { ["B".repeat(64)]: { amount: "1", source: body.account } } });
       }
-      if (body.action === "account_info" && ["moved-after-history", "inconsistent-newer-view"].includes(failure)
+      if (body.action === "account_info" && ["stale-history", "inconsistent-newer-view"].includes(failure)
         && f.calls.some(c => c.url.hostname === url.hostname && c.body.action === "receivable")) {
         return Response.json(nanoAccountInfo({ height: 11, frontier: "B".repeat(64) }));
       }
@@ -1000,12 +1175,47 @@ test("Nano fallback peers must serve the payment reads even while the preferred 
     }
     const calls = f.calls.filter(c => ["account_history", "receivable"].includes(c.body?.action));
     assert.ok(calls.every(c => ["nano-0.example", "nano-1.example", "nano-2.example"].includes(c.url.hostname)));
-    assert.equal(calls.filter(c => c.body.action === "account_history").length, 3, "share peer reads between both checks");
+    const receivableRejected = ["inconsistent-receivable", "inconsistent-newer-view"].includes(failure);
+    assert.equal(calls.filter(c => c.body.action === "account_history").length, receivableRejected ? 2 : 3,
+      "share peer reads and skip history when a receivable check already failed");
     assert.ok(calls.some(c => c.body.action === "account_history" && c.body.count === "100" && c.body.raw === "true"));
     assert.ok(calls.some(c => c.body.action === "receivable" && c.body.count === "500" && c.body.include_only_confirmed === "true"));
-    assert.deepEqual(report.admission, { nano: !["moved-after-history", "inconsistent-newer-view"].includes(failure),
+    assert.deepEqual(report.admission, { nano: !["stale-history", "inconsistent-newer-view"].includes(failure),
       near: true, usdc: true, market: true });
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_RPC_DETAIL|nano-2\.example|BBBBBBBB/);
+  }
+});
+
+test("Nano failover must prove the newest observed head even if it advances during the probe", async t => {
+  const nextHead = "B".repeat(64);
+  for (const mode of ["all-advance", "primary-advances", "newest-history-invalid", "primary-history-invalid"]) {
+    const advances = host => mode !== "primary-advances" || host === "nano-0.example";
+    const f = fixture(({ url, body }) => {
+      if (!/^nano-\d/.test(url.hostname)) return null;
+      const newer = advances(url.hostname);
+      if (body.action === "account_info" && newer
+        && f.calls.some(call => call.url.hostname === url.hostname && call.body?.action === "receivable")) {
+        return Response.json(nanoAccountInfo({ height: 11, frontier: nextHead }));
+      }
+      if (body.action === "account_history") {
+        assert.equal(body.head, newer ? nextHead : "A".repeat(64));
+        const stale = mode === "newest-history-invalid" || (mode === "primary-history-invalid" && url.hostname === "nano-0.example");
+        return Response.json(rawHistory(body, null, newer && !stale ? 11 : 10));
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.nanoRpcUrls.push("https://nano-2.example");
+    f.states["/state/funding-health.json"].nanoRpc.configuredPeers = 3;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    const healthy = ["all-advance", "primary-history-invalid"].includes(mode);
+    assert.equal(check("nano-frontier-agreement")?.ok, true, mode);
+    assert.equal(check("nano-payment-read-quorum")?.ok, healthy, mode);
+    assert.equal(check("nano-fallback-payment-reads")?.ok, healthy, mode);
+    assert.deepEqual(report.admission, { nano: healthy, near: true, usdc: true, market: true }, mode);
+    assert.equal(f.calls.filter(call => call.body?.action === "account_history").length, 3);
+    assert.doesNotMatch(JSON.stringify(report), /BBBBBBBB|nano-[012]\.example/);
   }
 });
 
@@ -1088,7 +1298,9 @@ test("owned Nano ledger telemetry distinguishes missing blocks from delayed conf
 });
 
 test("a runtime standby is recognized only with a fresh matching primary and without another standby request", async () => {
-  for (const failure of [null, "matching-with-lagging-peer", "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+  for (const failure of [null, "matching-with-lagging-peer", "reused-funding", "expired-funding", "expired-during-check",
+    "mismatch", "inactive", "digest", "quota", "initializing", "cooling"]) {
+    let checkedAt = NOW;
     const f = fixture(({ url, body }) => {
       assert.notEqual(url.hostname, "standby.example", "scheduled probes do not spend the standby budget");
       if (url.hostname === "nano-0.example") {
@@ -1098,8 +1310,10 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       if (failure === "mismatch" && url.hostname === "nano-1.example" && body.action === "account_info") {
         return Response.json(nanoAccountInfo({ frontier: "C".repeat(64), balance: "10000000000000000000000000000000" }));
       }
+      if (failure === "expired-during-check" && body?.action === "account_history") checkedAt = NOW + 5_000;
       return null;
     });
+    f.deps.now = () => checkedAt;
     const url = "https://standby.example/rpc?api_key=PRIVATE_STANDBY";
     f.config.nanoStandby = { url, requestsPerMinute: 10 };
     const rpc = f.states["/state/funding-health.json"].nanoRpc;
@@ -1107,14 +1321,21 @@ test("a runtime standby is recognized only with a fresh matching primary and wit
       configuration: failure === "digest" ? "a".repeat(64) : rpcPeerSetId([...f.config.nanoRpcUrls, url]),
       standby: { inUse: failure !== "inactive", requestsPerMinute: failure === "quota" ? 11 : 10 },
       cooldowns: failure === "cooling" ? [{ peer: 2, until: NOW + 60_000 }] : [],
+      ...(["reused-funding", "expired-funding", "expired-during-check"].includes(failure) && { lastReadAt: NOW - 25_000,
+        fundingEvidenceExpiresAt: NOW + (failure === "expired-funding" ? 0 : 5_000) }),
       ...(failure === "initializing" && { lastReadAt: NOW - 61_000 }) });
     const report = await runOperationalCheck(f.config, f.deps);
-    const ready = failure === null || failure === "matching-with-lagging-peer";
+    const ready = [null, "matching-with-lagging-peer", "reused-funding"].includes(failure);
     assert.equal(report.admission.nano, false);
     assert.equal(report.admission.near, ready);
     if (ready) {
       assert.ok(report.checks.some(c => c.stage === "nano-standby" && c.code === "nano-standby-covering-quorum"));
       assert.ok(report.checks.some(c => c.stage === "nano-payment-read-quorum" && c.code === "nano-payment-read-standby-unverified"));
+    }
+    if (failure === "expired-funding") assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "nano-read-guard-stale"));
+    if (failure === "expired-during-check") {
+      assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.ok));
+      assert.ok(report.checks.some(c => c.stage === "nano-funding-evidence-freshness" && c.code === "nano-read-guard-stale"));
     }
     if (failure === "mismatch") assert.ok(report.checks.some(c => c.stage === "nano-frontier-agreement" && c.code === "nano-standby-checkpoint-disagrees"));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_STANDBY|standby\.example/);
@@ -1613,11 +1834,17 @@ test("watcher readiness rejects malformed heights, impossible leads and unknown 
 test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a real receipt", async t => {
   const payer = "private-canary.near", paymentTx = base58Encode(Buffer.alloc(32, 3));
   const receiptId = base58Encode(Buffer.alloc(32, 4)), receiptBlock = base58Encode(Buffer.alloc(32, 5));
-  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof"]) {
+  const timeoutMethods = { transaction: "tx", block: "block", "account-changes": "EXPERIMENTAL_changes",
+    "receipt-lookup": "EXPERIMENTAL_receipt_to_tx" };
+  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof", ...Object.keys(timeoutMethods)]) {
     const f = fixture(({ url, body }, config) => {
       if (!url.hostname.startsWith("near-") || !body) return null;
       const json = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
       const merchant = config.merchant;
+      if (url.hostname === "near-1.example" && body.method === timeoutMethods[scenario]
+        && (body.method !== "block" || body.params.block_id === receiptBlock)) {
+        throw new DOMException("PRIVATE_TIMEOUT_DETAIL", "TimeoutError");
+      }
       if (body.method === "tx") {
         assert.deepEqual(body.params, { tx_hash: paymentTx, sender_account_id: payer, wait_until: "FINAL" });
         return json({ final_execution_status: "FINAL", status: { SuccessValue: "" },
@@ -1656,10 +1883,12 @@ test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a
       assert.equal(find("near-payment-discovery")?.ok, scenario !== "empty-changes");
       assert.equal(find("near-discovery-peer-1")?.ok, scenario === "complete");
       if (scenario !== "complete") assert.deepEqual(find("near-discovery-peer-1").domains, []);
+      if (timeoutMethods[scenario]) assert.equal(find("near-discovery-peer-1").code, `near-discovery-${scenario}-timeout`);
     }
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
     assert.ok(!JSON.stringify(report).includes(paymentTx));
     assert.ok(!JSON.stringify(report).includes(payer));
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_TIMEOUT_DETAIL/);
   }
 });
 
@@ -1915,6 +2144,25 @@ test("a changed Market fee or invalid agent token is actionable even when public
     const report = await runOperationalCheck(f.config, f.deps);
     assert.equal(report.ok, false); assert.equal(report.admission.market, false); assert.equal(report.admission.nano, true);
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_ERROR|SYNTHETIC_PRIVATE/);
+  }
+});
+
+test("the scheduled Market fee check uses the worker's upper limit and separates fee and price failures", async t => {
+  for (const [fee, code] of [[0, null], [499, null], [500, null], [501, "market-fee-assumption-changed"],
+    ["500", "market-fee-unavailable"], [-1, "market-fee-unavailable"], [10_001, "market-fee-unavailable"]]) {
+    const f = fixture(({ url, init }) => {
+      if (url.pathname !== "/v1/platform/config") return null;
+      assert.equal(new Headers(init.headers).has("authorization"), false);
+      return Response.json({ platform_fee_bps: fee });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const marketFee = report.checks.find(check => check.stage === "market-platform-fee");
+    assert.equal(marketFee?.ok, code === null, String(fee));
+    assert.equal(marketFee?.code, code ?? undefined, String(fee));
+    assert.equal(report.admission.market, code === null, String(fee));
+    assert.ok(report.checks.find(check => check.stage === "workflow-price-nanoodle-image")?.ok, String(fee));
+    assert.ok(report.checks.find(check => check.stage === "workflow-nano-capital-market-nanoodle-image")?.ok, String(fee));
   }
 });
 

@@ -55,7 +55,7 @@ test("a failed receipt lookup or gate confirmation retries the same block, witho
 });
 
 test("receipt discovery fails over before the watcher checkpoints the block", async t => {
-  for (const scenario of ["wrong-block", "missing-receipt", "bad-lookup", "unavailable-lookup"]) {
+  for (const scenario of ["wrong-block", "missing-receipt", "bad-lookup", "unavailable-lookup", "timeout"]) {
     const w = await world();
     const method = ["wrong-block", "missing-receipt"].includes(scenario) ? "EXPERIMENTAL_changes" : "EXPERIMENTAL_receipt_to_tx";
     const attempted = [];
@@ -65,6 +65,7 @@ test("receipt discovery fails over before the watcher checkpoints the block", as
       if (request.method !== method) return w.chain.fetch(url, init);
       attempted.push(endpoint);
       if (endpoint === "fallback.test" && !fallbackUnavailable) return w.chain.fetch(url, init);
+      if (scenario === "timeout") throw new DOMException("RPC timed out", "TimeoutError");
       const result = scenario === "wrong-block" ? { block_hash: "different-block", changes: [] }
         : scenario === "missing-receipt" ? { block_hash: request.params.block_id, changes: [
           { cause: { type: "receipt_processing" }, change: { account_id: "merchant.testnet" } },
@@ -137,6 +138,45 @@ test("a long outage keeps new payments live while old payments backfill within o
   assert.equal(restarted.status().backfilling, false);
   for (const hash of [...old, fresh]) assert.ok(w.observed.some(o => o.hash === hash), "no payment is lost during recovery or restart");
   restarted.stop();
+});
+
+test("an invalid backfill predecessor cannot advance coverage, including after restart", async t => {
+  for (const scenario of ["repeated-block", "self-parent", "missing-parent", "legacy-cursor"]) {
+    const w = await world(), options = { ...w.opts, maxBlocksPerTick: 1 };
+    const first = createNearWatcher(options);
+    t.after(() => first.stop());
+    await first.start(); w.quote();
+    const payments = Array.from({ length: 4 }, () => w.pay());
+    await first.tick(); await first.stop();
+    const previous = w.ledger.getMeta("paymentWatch");
+    assert.equal(previous.backfill.maxHeight, previous.height - 1);
+    if (scenario === "legacy-cursor") delete previous.backfill.maxHeight;
+    w.ledger.setMeta("paymentWatch", previous);
+    let broken = scenario !== "legacy-cursor";
+    const restarted = createNearWatcher({ ...options, rpc: { ...w.rpc, block: async ref => {
+      const block = await w.rpc.block(ref);
+      if (broken && ref.blockId === previous.backfill.nextHash) {
+        if (scenario === "repeated-block") block.header.height = previous.height;
+        else if (scenario === "self-parent") block.header.prev_hash = block.header.hash;
+        else delete block.header.prev_hash;
+      }
+      return block;
+    } } });
+    t.after(() => restarted.stop());
+    const handled = w.observed.length;
+    await restarted.start();
+    if (scenario !== "legacy-cursor") {
+      assert.equal(restarted.status().error, "RPC_BAD_RESPONSE", scenario);
+      assert.equal(restarted.status().listening, false, scenario);
+      assert.deepEqual(w.ledger.getMeta("paymentWatch"), previous, scenario);
+      assert.equal(w.observed.length, handled, scenario);
+      broken = false;
+    }
+    for (let i = 0; i < 8 && restarted.status().backfilling; i++) await restarted.tick();
+    assert.equal(restarted.status().listening, true, scenario);
+    assert.equal(restarted.status().backfilling, false, scenario);
+    assert.deepEqual(w.observed.map(payment => payment.hash), payments.reverse(), scenario);
+  }
 });
 
 test("accepting the last pending quote at the live tip leaves a readable recovery cursor", async () => {

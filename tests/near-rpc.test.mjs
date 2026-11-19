@@ -41,7 +41,8 @@ test("parseRpcJson keeps unsafe integers exact and leaves safe ones as numbers",
 });
 
 test("request shapes for every method", async () => {
-  const { fetch, calls } = mockFetch(() => ({ body: { result: { ok: true } } }));
+  const { fetch, calls } = mockFetch(req => ({ body: { result: req.params.block_id
+    ? { header: { hash: req.params.block_id, height: 100 } } : { ok: true } } }));
   const rpc = createNearRpc({ url: URL_, fetch });
   assert.equal(rpc.url, URL_);
   await rpc.status();
@@ -312,6 +313,17 @@ test("pool: node-local discovery errors fail over while a skipped height remains
   }
 });
 
+test("pool: the wrong historical block fails over before its timestamp can be used", async () => {
+  const block = { header: { height: 90, hash: BLOCK_HASH, timestamp_nanosec: "1000000000" } };
+  const { fetch, calls } = hostFetch({
+    "a.test": () => ({ body: { result: { header: { ...block.header, hash: TX_HASH } } } }),
+    "b.test": () => ({ body: { result: block } }),
+  });
+  const rpc = createNearRpcPool({ urls: ["https://a.test", "https://b.test"], fetch });
+  assert.deepEqual(await rpc.block({ blockId: BLOCK_HASH }), block);
+  assert.deepEqual(calls, ["a.test block", "b.test block"]);
+});
+
 test("pool: an unnamed submit or transaction lookup error remains with the caller", async () => {
   const failure = req => req.method === "status" ? ok()(req) : { body: { error: { code: -32000 } } };
   const { fetch, calls } = hostFetch({ "a.test": failure, "b.test": ok() });
@@ -460,7 +472,8 @@ test("pool: fresh status does not make a regressed latest head safe; historical 
   const rpc = createNearRpcPool({ urls: "https://a.test", chainId: "mainnet", maxHeadAgeMs: 90_000, now: () => at, fetch: f.fetch });
   await rpc.block({ finality: "final" }); height = 99;
   await assert.rejects(rpc.block({ finality: "final" }), { code: "RPC_STALE" });
-  assert.deepEqual(await rpc.block({ blockId: "old-payment-block" }), healthyHead(at - 86_400_000, 5));
+  const historical = healthyHead(at - 86_400_000, 5);
+  assert.deepEqual(await rpc.block({ blockId: historical.header.hash }), historical);
 });
 
 test("pool: all frozen nodes fail closed and a healthy node's negative answer is still authoritative", async () => {

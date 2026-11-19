@@ -126,6 +126,15 @@ test("a block that cannot be read -> RPC_UNAVAILABLE", async () => {
   await assert.rejects(readPaymentTransfer({ rpc, ...ARGS }), { code: "RPC_UNAVAILABLE" });
 });
 
+test("an unrelated block or unrepresentable timestamp cannot date a payment", async () => {
+  const { rpc } = chain();
+  for (const header of [{ hash: TX_HASH, timestamp_nanosec: BLOCK_NS },
+    { hash: OUTCOME_BLOCK, timestamp_nanosec: "9".repeat(30) }]) {
+    const custom = { ...rpc, block: async () => ({ header }) };
+    await assert.rejects(readPaymentTransfer({ rpc: custom, ...ARGS }), { code: "RPC_UNAVAILABLE" });
+  }
+});
+
 test("bad inputs are rejected before any RPC call", async () => {
   const { rpc, calls } = chain();
   await assert.rejects(readPaymentTransfer({ rpc, ...ARGS, txHash: "not-base58!" }), { code: "BAD_BASE58" });

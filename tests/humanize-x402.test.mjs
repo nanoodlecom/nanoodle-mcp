@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm, copyFile } from "node:fs/promises";
+import { mkdtemp, rm, copyFile, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTools } from "../src/tools.mjs";
@@ -11,6 +11,10 @@ import { humanizeFetch, requestOutputTokenCap } from "../src/humanize.mjs";
 import { HUMANIZE_MODEL_PRICES } from "../src/humanize-deposit.mjs";
 
 const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
+// CYD/STARRY are a synthetic primary/fallback pair for this suite: since the
+// 2026-11-18 delisting repair the production panel has writer C on Starry
+// Ocean with no fallback, so the fallback payment paths are exercised here
+// with a stand-in pair injected through loadTools' humanizeFallbacks option.
 const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop";
 const PRICE = 0.0001;
 delete process.env.NANOGPT_API_KEY; // keyless runs only: never fall back to an ambient key
@@ -80,7 +84,11 @@ async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRIC
   const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-x402-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
-  const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  // Point the copied graph's writer C at the synthetic primary (its model field
+  // and the judge's [C] label move together), and inject the synthetic fallback.
+  const graphPath = join(dir, "humanize-comment.noodle-graph.json");
+  await writeFile(graphPath, (await readFile(graphPath, "utf8")).split(STARRY).join(CYD));
+  const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {}, humanizeFallbacks: { [CYD]: STARRY } });
   let hook = null;
   const run = async (args) => {
     const result = await registry.callTool({ name: "humanize-comment", arguments: args || { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
