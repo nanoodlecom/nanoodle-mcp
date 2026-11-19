@@ -26,8 +26,18 @@ test("recent paid failures count execution outcomes and exclude stale or unrelat
     old: { status: "failed", outcome: "run_failed", finishedAt: NOW - 30 * 60_000 },
     future: { status: "failed", outcome: "run_failed", finishedAt: NOW + 10 },
   };
+  const marketFailure = { phase: "declining", outcome: "run_failed", runStartedAt: NOW - 60_000, runFinishedAt: NOW - 1 };
+  s.market.push({ v: 1, assignments: {
+    failed: marketFailure,
+    declined: { ...marketFailure, phase: "declined" },
+    rejected: { phase: "declined", finishedAt: NOW },
+    successful: { ...marketFailure, outcome: "ran" },
+    unstarted: { ...marketFailure, runStartedAt: null },
+    future: { ...marketFailure, runFinishedAt: NOW + 1 },
+    old: { ...marketFailure, runStartedAt: NOW - 3_600_000, runFinishedAt: NOW - 30 * 60_000 },
+  } });
   const original = JSON.stringify(s);
-  assert.deepEqual(recentPaidWorkflowFailures(s, NOW), { nano: 2, near: 1, usdc: 1 });
+  assert.deepEqual(recentPaidWorkflowFailures(s, NOW), { nano: 2, near: 1, usdc: 1, market: 2 });
   assert.equal(JSON.stringify(s), original);
 });
 

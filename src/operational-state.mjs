@@ -29,8 +29,8 @@ function marketReservationUsd(record) {
   return usd;
 }
 
-export function recentPaidWorkflowFailures({ nano, near }, now = Date.now()) {
-  const failures = { nano: 0, near: 0, usdc: 0 };
+export function recentPaidWorkflowFailures({ nano, near, market = [] }, now = Date.now()) {
+  const failures = { nano: 0, near: 0, usdc: 0, market: 0 };
   const recent = at => Number.isSafeInteger(at) && at <= now && now - at < PAID_FAILURE_WINDOW_MS;
   for (const quote of nano.quotes) {
     // Late deposits can also be refunded. A failed run retains a redacted
@@ -44,6 +44,14 @@ export function recentPaidWorkflowFailures({ nano, near }, now = Date.now()) {
   for (const quote of values(near.quotes)) {
     if (quote.status === "failed" && quote.outcome === "run_failed" && recent(quote.finishedAt)) {
       failures[quote.asset === "usdc" ? "usdc" : "near"]++;
+    }
+  }
+  for (const ledger of market) {
+    for (const record of marketAssignments(ledger)) {
+      if (record.outcome === "run_failed" && recent(record.runFinishedAt)
+        && Number.isSafeInteger(record.runStartedAt) && record.runStartedAt > 0 && record.runStartedAt <= record.runFinishedAt) {
+        failures.market++;
+      }
     }
   }
   return failures;

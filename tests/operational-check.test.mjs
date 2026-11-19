@@ -219,12 +219,16 @@ test("two recent paid workflow failures warn while checkout lanes stay open", as
   state.quotes.push({ ...quote, id: "private-workflow-one" });
   const stage = report => report.checks.find(c => c.stage === "paid-workflow-execution");
   let report = await runOperationalCheck(f.config, f.deps);
-  assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: true, failures: { nano: 1, near: 0, usdc: 0 } });
+  assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: true,
+    failures: { nano: 1, near: 0, usdc: 0, market: 0 } });
 
-  state.quotes.push({ ...quote, id: "private-workflow-two" });
+  f.states["/jobs/nanoodle-image/market-state.json"].assignments["private-workflow-two"] = {
+    phase: "declined", outcome: "run_failed", runStartedAt: NOW - 3000, runFinishedAt: NOW - 500,
+    run: { error: "PRIVATE_WORKFLOW_ERROR" },
+  };
   report = await runOperationalCheck(f.config, f.deps);
   assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: false,
-    failures: { nano: 2, near: 0, usdc: 0 }, code: "paid-workflow-failures-repeated", domains: [] });
+    failures: { nano: 1, near: 0, usdc: 0, market: 1 }, code: "paid-workflow-failures-repeated", domains: [] });
   assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_WORKFLOW_ERROR|private-workflow-/);
 });
