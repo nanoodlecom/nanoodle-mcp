@@ -178,6 +178,8 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
 
     async reserve(input) {
       return run(() => {
+        const quote = state.quotesByBinding[input.binding];
+        if (!quote || quote.quoteId !== input.quoteId) fail("BOUNDARY_QUOTE_MISMATCH");
         const existing = state.reservationsByAuth[input.authorizationKey];
         if (existing) { assertIdentity(existing, input); return clone(existing); }
         if (!(input.now < input.expiresAt)) fail("BOUNDARY_RESERVATION_EXPIRED");
@@ -200,10 +202,11 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
         if (r.reservationId !== input.reservationId) fail("BOUNDARY_IDENTITY_MISMATCH");
         const claim = state.fundingByKey[input.fundingKey];
         if (claim) {
-          // Funding is already claimed — by us (lost reply / retry) or by a
-          // different authorization (fresh nonce, other network). Either way
-          // no second grant exists; the adapter blocks or reports pending.
-          assertIdentity(claim, claim.authorizationKey === input.authorizationKey ? input : claim);
+          // Funding is already claimed — by this authorization (lost reply /
+          // retry: verify the full identity) or by a different one (fresh
+          // nonce, other network: return the winning claim untouched).
+          // Either way no second grant exists.
+          if (claim.authorizationKey === input.authorizationKey) assertIdentity(claim, input);
           return { granted: false, reservation: clone(r), fundingClaim: clone(claim) };
         }
         if (r.state !== "reserved" || !(input.now < input.expiresAt)) {

@@ -117,3 +117,14 @@ test("without discoveryFor nothing changes: no extensions anywhere", async t => 
   const quote = await app.handle({ params });
   assert.equal(quote.status, 402); assert.equal(quote.body.extensions, undefined);
 });
+
+test("a discovery failure after settlement cannot block replay of paid work", async t => {
+  const h = await harness(t);
+  const { paymentSignature } = await h.payment();
+  assert.equal((await h.app.handle({ params, paymentSignature })).status, 200);
+  const broken = createX402ExactIngress({ ...h.settings,
+    discoveryFor: () => { throw new Error("metadata service down"); } });
+  const replay = await broken.handle({ params, paymentSignature });
+  assert.equal(replay.status, 200, JSON.stringify(replay));
+  assert.equal(h.counts.settle, 1); assert.equal(h.counts.execute, 1);
+});

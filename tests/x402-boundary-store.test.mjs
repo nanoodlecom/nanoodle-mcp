@@ -48,7 +48,10 @@ async function setup(t, options = {}) {
       scheme: "exact", network, asset: "USDC", payTo: "0x1111", amount: amountAtomic, maxTimeoutSeconds, extra: {},
     }),
   });
-  const reserve = (b, id) => b.reserve({ ...id, now: time, expiresAt: time + 60_000 });
+  // The real flow always issues (or re-reads) the quote before reserving:
+  // prepare() binds the identity to the actually-issued quoteId.
+  const prepare = async (b, id) => { const q = await quote(b); id.quoteId = q.quoteId; return id; };
+  const reserve = async (b, id) => { await prepare(b, id); return b.reserve({ ...id, now: time, expiresAt: time + 60_000 }); };
   const begin = (b, id, reservationId) => b.beginSettlement({ ...id, reservationId, now: time, expiresAt: time + 60_000 });
   const settle = async (b, id, reservationId, receipt = RECEIPT) => {
     const r = await reserve(b, id); const g = await begin(b, id, r.reservationId ?? reservationId);

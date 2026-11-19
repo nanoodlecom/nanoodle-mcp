@@ -272,7 +272,6 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
       check(nonempty(ctx.requestId) && nonempty(ctx.customerScope) && /^[a-f0-9]{64}$/.test(ctx.workflowDigest)
         && nonempty(ctx.resource?.url), "MISSING_AUTHORITATIVE_CONTEXT");
       const request = { ...ctx, call: clean };
-      const declaredExtensions = await discoveryExtensions(clean, signal);
       const binding = hash(["nanoodle-x402-ingress/v1", request, policy, facilitatorId]);
       // Request identity deliberately excludes network, nonce, quote ID and
       // mutable workflow/price data. Requoting a request cannot fund it twice.
@@ -285,7 +284,7 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         check(now() < q.expiresAt, "QUOTE_EXPIRED");
         const { supportedNetworks } = await sdk(signal);
         check(q.requirements.every(r => supportedNetworks.has(r.network)), "NETWORK_UNAVAILABLE");
-        return required(q, declaredExtensions);
+        return required(q, await discoveryExtensions(clean, signal));
       }
       check(typeof paymentSignature === "string" && paymentSignature.length <= 16_384, "INVALID_PAYMENT_HEADER");
       const payload = copy(decodePaymentSignatureHeader(paymentSignature));
@@ -309,6 +308,10 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         return { status: 202, body: { code: "SETTLEMENT_UNCERTAIN", reservationId: reservation.reservationId } };
       const payer = ctx.payer ?? auth.payer;
       if (!reservation || reservation.state === "reserved") {
+        // Discovery is computed only here and for the challenge above —
+        // never on the replay path, so a metadata failure cannot block
+        // delivery of work that has already been paid for and settled.
+        const declaredExtensions = await discoveryExtensions(clean, signal);
         check(now() < q.expiresAt, "QUOTE_EXPIRED");
         const { server, supportedNetworks } = await sdk(signal);
         check(supportedNetworks.has(r.network), "NETWORK_UNAVAILABLE");
