@@ -292,6 +292,12 @@ Coverage:
   representative changes and epoch blocks. The hosted watcher rejects a gap,
   wrong account, or truncated page before committing coverage. Its completed
   cursor stays on a block that the older, filtered history can still find.
+- When a quote is waiting and completed Nano coverage is stale, the readiness
+  check reports whether a verified backfill cursor advanced in the last two
+  minutes. It reports `nano-history-backfill-in-progress` for recent progress
+  and `nano-history-backfill-stalled` for an older cursor. Both report Nano
+  as unready until completed coverage catches up. The monitor reads this
+  evidence from the ledger without spending standby RPC quota.
 
 Install `ops/nanoodle-operational-check.{service,timer}`, reload systemd, start
 the service once, inspect its report, then enable the timer. It runs at every

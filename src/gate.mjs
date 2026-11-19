@@ -862,10 +862,10 @@ export function createChargeGate({
     return blocks && typeof blocks === "object" ? Object.entries(blocks) : [];
   }
 
-  async function readPaymentWindow({ existingPayments = false, historyHead = null } = {}) {
+  async function readPaymentWindow({ existingPayments = false, historyHead = null, historyHeight = null } = {}) {
     if (verifyPaymentReads && ops.readPaymentWindow) {
       try {
-        const { receivable, history } = await ops.readPaymentWindow({ existingPayments, historyHead });
+        const { receivable, history } = await ops.readPaymentWindow({ existingPayments, historyHead, historyHeight });
         return { blocks: receivableBlocks(receivable), history: history && {
           anchored: true, page: { entries: history.history, next: history.previous },
         } };
@@ -880,7 +880,7 @@ export function createChargeGate({
     return { blocks: receivableBlocks(receivable), history: null };
   }
 
-  async function readLatestHistory(existingPayments = false) {
+  async function readLatestHistory({ existingPayments = false } = {}) {
     const anchor = ops.checkpoint?.()?.confirmed;
     const anchored = isNanoHistoryHash(anchor?.hash);
     if (verifyPaymentReads && (!anchored || !isNanoHistoryHeight(anchor.blockCount))) {
@@ -968,8 +968,8 @@ export function createChargeGate({
       }
     };
     const { anchored, page: first } = history ?? await readOrDefer(async () => historyHead
-      ? { anchored: true, page: await readHistoryPage(historyHead, true, { existingPayments: true }) }
-      : readLatestHistory(true));
+      ? { anchored: true, page: await readHistoryPage(historyHead, true, { height: batch.nextHeight ?? null, existingPayments: true }) }
+      : readLatestHistory({ existingPayments: true }));
     let firstPage = first;
     if (replay && !historyHead) {
       inspectHistory(first.entries, replay.newest || prior.through, floor);
@@ -977,7 +977,8 @@ export function createChargeGate({
     }
 
     for (let used = firstPage ? 0 : 1; used < HISTORY_MAX_PAGES; used++) {
-      const page = firstPage ?? await readOrDefer(() => readHistoryPage(batch.next, anchored, { existingPayments: true }));
+      const page = firstPage ?? await readOrDefer(() => readHistoryPage(batch.next, anchored,
+        { height: batch.nextHeight ?? null, existingPayments: true }));
       firstPage = null;
       // A completed cursor must still be visible if an older release resumes
       // with the default history mode, which skips change and epoch blocks.
@@ -991,6 +992,13 @@ export function createChargeGate({
         return saveHistory({ through, coveredAt, backfill: null });
       }
       batch.next = page.next;
+      if (anchored) {
+        batch.nextHeight = (BigInt(page.entries.at(-1).height) - 1n).toString();
+        batch.advancedAt = Math.max(batch.advancedAt ?? batch.startedAt, now());
+      } else {
+        delete batch.nextHeight;
+        delete batch.advancedAt;
+      }
     }
     await saveHistory({ ...prior, backfill: batch });
   }
@@ -1007,9 +1015,10 @@ export function createChargeGate({
     if (!anyPaymentWatchable()) return;
     const startedAt = now();
     const sequence = ++paymentReadSequence;
-    const historyHead = historyScan.backfill?.quotaDeferred ? historyScan.backfill.next : null;
+    const replay = historyScan.backfill?.quotaDeferred ? historyScan.backfill : null;
+    const historyHead = replay?.next ?? null;
     try {
-      const { blocks, history } = await readPaymentWindow({ existingPayments: true, historyHead });
+      const { blocks, history } = await readPaymentWindow({ existingPayments: true, historyHead, historyHeight: replay?.nextHeight ?? null });
       for (const [hash, v] of blocks) {
         const amount = typeof v === "object" && v !== null ? v.amount : v; // nodes return "raw" or {amount, source}
         const source = typeof v === "object" && v !== null ? v.source : null;

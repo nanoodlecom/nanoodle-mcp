@@ -1007,18 +1007,22 @@ test("Nano standby quota saves the next history page and resumes it across resta
   const lookups = [], refused = [], savedPages = new Map();
   latest = page(open);
   chain.ops.checkpoint = () => ({ confirmed: { hash: latest.history[0].hash, blockCount: latest.history[0].height } });
-  chain.ops.readPaymentWindow = async ({ existingPayments, historyHead }) => {
+  const budgetError = () => Object.assign(Error("fixture standby window exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+  chain.ops.readPaymentWindow = async ({ existingPayments, historyHead, historyHeight }) => {
     if (existingPayments) lookups.push(historyHead);
+    if (mode === "refusing") throw budgetError();
     const history = historyHead === null ? latest : savedPages.get(historyHead);
     assert.ok(history, "the combined scan must request the saved continuation");
+    assert.equal(historyHeight, historyHead === null ? null : history.history[0].height);
     return { receivable: { blocks: chain.state.receivable }, history };
   };
   chain.ops.rpc = async (body, _base, options) => {
+    if (body.action === "receivable") return { blocks: chain.state.receivable };
     assert.equal(body.action, "account_history");
     assert.equal(options?.existingPaymentHistory, true);
-    assert.equal(mode, "limited");
+    assert.ok(["limited", "refusing"].includes(mode));
     refused.push(body.head);
-    throw Object.assign(Error("fixture standby window exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+    throw budgetError();
   };
   const start = () => {
     const gate = makeGate(chain, { registry, stateFile: file, now: () => now, pollMs: 1_000, verifyPaymentReads: true });
@@ -1045,12 +1049,20 @@ test("Nano standby quota saves the next history page and resumes it across resta
   assert.equal(waiting.historyScan.through, open.hash);
   assert.equal(waiting.historyScan.coveredAt, initial.historyScan.coveredAt);
   assert.deepEqual(waiting.historyScan.backfill, { newest: head.hash, next: middle.hash, startedAt: now,
-    fullReceivableWindow: false, quotaDeferred: true });
+    fullReceivableWindow: false, quotaDeferred: true, nextHeight: middle.height, advancedAt: now });
+
+  now += 1_000;
+  mode = "refusing";
+  const noQuota = start();
+  await until("another standby refusal on the same page", () => refused.length === 2);
+  await noQuota.stop();
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")).historyScan, waiting.historyScan, "a refusal cannot renew progress");
 
   const paid = block(2, "receive", { account: PAYER, amount: old.amountRaw });
   const fresh = block(5, "receive", { account: PAYER, amount: recent.amountRaw });
   now += 60_000;
   latest = page(fresh, head);
+  mode = "limited";
   savedPages.set(middle.hash, page(middle));
   savedPages.set(paid.hash, page(paid, open));
   const incomingHash = testHash(20);
@@ -1060,7 +1072,9 @@ test("Nano standby quota saves the next history page and resumes it across resta
   const advanced = await untilState(file, "the next saved page after another quota refusal", s => s.historyScan?.backfill?.next === paid.hash);
   await secondRecovery.stop();
   assert.deepEqual(lookups, [middle.hash]);
-  assert.equal(refused[1], paid.hash);
+  assert.equal(refused[2], paid.hash);
+  assert.equal(advanced.historyScan.backfill.nextHeight, paid.height);
+  assert.equal(advanced.historyScan.backfill.advancedAt, now);
   assert.equal(advanced.historyScan.coveredAt, initial.historyScan.coveredAt);
   assert.equal(quoteIn(incoming.paymentId)(advanced).payHash, incomingHash);
   assert.equal(secondRecovery.quote(recent.paymentId).status, "pending");

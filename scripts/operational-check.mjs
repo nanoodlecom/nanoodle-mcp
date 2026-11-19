@@ -557,9 +557,12 @@ export async function runOperationalCheck(config, deps = {}) {
     const { history, waiting } = nanoWatchDemand(ledger, at);
     if (!waiting.length) return;
     if (ledger.historyScan !== undefined) {
-      need(history.coveredAt === null || history.coveredAt <= at + 30_000, "nano-payment-coverage-invalid");
-      need(history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS, "nano-payment-coverage-stale");
-      return;
+      const advancedAt = history.backfill?.advancedAt;
+      need((history.coveredAt === null || history.coveredAt <= at + 30_000)
+        && (advancedAt === undefined || advancedAt <= at + 30_000), "nano-payment-coverage-invalid");
+      if (history.coveredAt !== null && at - history.coveredAt <= NANO_SCAN_GRACE_MS) return;
+      if (advancedAt === undefined) throw new CheckError("nano-payment-coverage-stale");
+      throw new CheckError(at - advancedAt > NANO_SCAN_GRACE_MS ? "nano-history-backfill-stalled" : "nano-history-backfill-in-progress");
     }
     need(nano, "nano-payment-observation-unavailable");
     const observed = await check("nano-legacy-payment-observation", async () => {

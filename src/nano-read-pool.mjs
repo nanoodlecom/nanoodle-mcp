@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { MAX_RPC_RETRY_MS, rpcPeerSetId } from "./rpc-backoff.mjs";
 import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
-import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "./nano-payment-history.mjs";
+import { checkedAnchoredNanoHistory, isNanoBlockHeight, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "./nano-payment-history.mjs";
 
 export { NANO_GENESIS } from "./nano-checkpoint.mjs";
 // Genesis, receivable, account_info, and history at that confirmed account head.
@@ -315,8 +315,10 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
           const head = paymentWindow.historyHead ?? view.confirmedFrontier;
           const request = { action: "account_history", account, head, count: String(NANO_HISTORY_PAGE), raw: "true" };
           try {
-            const height = head === view.confirmedFrontier ? view.confirmedHeight : null;
-            const proved = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, height);
+            const height = paymentWindow.historyHeight;
+            const frontierHeight = head === view.confirmedFrontier ? view.confirmedHeight : null;
+            if (height !== null && frontierHeight !== null && BigInt(height) !== frontierHeight) throw fail("NANO_RPC_UNPROVEN_HISTORY");
+            const proved = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, frontierHeight ?? height);
             if (BigInt(proved.history[0].height) <= view.confirmedHeight) history = proved;
           } catch (error) {
             if (error?.rateLimited === true) paymentWindow.historyRefusals.push({ base, error });
@@ -424,12 +426,13 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     read: (body, anchor) => read(body, anchor),
     readFundingInfo: () => read(infoRequest(), null, { background: true, fundingReport: true }),
     readPaymentHistory: body => read(body, null, { existingPayments: true }),
-    async readPaymentWindow({ existingPayments = false, historyHead = null } = {}) {
+    async readPaymentWindow({ existingPayments = false, historyHead = null, historyHeight = null } = {}) {
       if (historyHead !== null && (!existingPayments || !hash(historyHead))) throw fail("NANO_RPC_UNPROVEN_HISTORY");
+      if (historyHeight !== null && (historyHead === null || !isNanoBlockHeight(historyHeight))) throw fail("NANO_RPC_UNPROVEN_HISTORY");
       const historyRefusals = [];
       try {
         const window = await read({ action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
-          source: "true" }, null, { paymentWindow: { historyHead: historyHead?.toUpperCase(), historyRefusals }, existingPayments,
+          source: "true" }, null, { paymentWindow: { historyHead: historyHead?.toUpperCase(), historyHeight, historyRefusals }, existingPayments,
           background: !existingPayments });
         if (existingPayments && window.history) paymentWindowPriorityUntil = -Infinity;
         return window;

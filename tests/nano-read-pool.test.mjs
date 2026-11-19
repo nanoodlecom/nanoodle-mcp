@@ -240,11 +240,14 @@ test("a deferred history continuation reserves the next budget window and is pro
     { code: "NANO_RPC_STANDBY_BUDGET" });
   w.tick(60_000);
   await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" });
-  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true, historyHead: OTHER })).history, continuation);
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true, historyHead: OTHER, historyHeight: "9" })).history, continuation);
   assert.deepEqual(historyRequests.filter(call => call.base === standby.base).map(call => call.head), [head, OTHER]);
   assert.deepEqual(w.calls.filter(call => call.base === standby.base).map(call => call.action),
     ["block_info", "receivable", "account_info", "account_history", "block_info", "receivable", "account_info", "account_history"]);
   await assert.rejects(w.pool.readPaymentWindow({ historyHead: OTHER }), { code: "NANO_RPC_UNPROVEN_HISTORY" });
+  w.tick(60_000);
+  const wrongHeight = await w.pool.readPaymentWindow({ existingPayments: true, historyHead: OTHER, historyHeight: "8" });
+  assert.equal(wrongHeight.history, null, "an internally valid page at the wrong continuation height is unproved");
 });
 
 test("funding can reuse a matching payment account proof only through its original expiry", async () => {

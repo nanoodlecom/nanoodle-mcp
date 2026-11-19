@@ -302,6 +302,31 @@ test("Nano checkout detects stale coverage only while a quote has been waiting",
   }
 });
 
+test("stale Nano coverage distinguishes a moving history cursor from a stalled one while keeping admission closed", async t => {
+  for (const [scenario, advancedAt, expected] of [
+    ["advancing", NOW - 63_000, "nano-history-backfill-in-progress"],
+    ["at the grace limit", NOW - 120_000, "nano-history-backfill-in-progress"],
+    ["stalled", NOW - 120_001, "nano-history-backfill-stalled"],
+    ["impossible future progress", NOW + 30_001, "nano-payment-coverage-invalid"],
+    ["legacy cursor", undefined, "nano-payment-coverage-stale"],
+  ]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"];
+    ledger.historyScan = { through: "C".repeat(64), coveredAt: NOW - 600_000, backfill: {
+      newest: "A".repeat(64), next: "B".repeat(64), startedAt: NOW - 500_000, fullReceivableWindow: false, quotaDeferred: true,
+      ...(advancedAt !== undefined && { advancedAt, nextHeight: "100" }),
+    } };
+    ledger.quotes.push({ id: "private-backfill-quote", status: "pending", createdAt: NOW - 500_000,
+      expiresAt: NOW + 600_000, amountRaw: "50000000000000000000000" });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const probe = report.checks.find(c => c.stage === "nano-payment-scan-progress");
+    assert.deepEqual(probe, { stage: "nano-payment-scan-progress", ok: false, code: expected, domains: ["nano"] }, scenario);
+    assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-backfill-quote|advancedAt|nextHeight|BBBBBBBB/);
+  }
+});
+
 test("a legacy Nano writer alerts on an aged confirmed matching transfer missing from its ledger", async t => {
   const account = NANO_GENESIS_REPLY.contents.account;
   const sender = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
