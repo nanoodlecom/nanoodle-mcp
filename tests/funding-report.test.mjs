@@ -20,13 +20,14 @@ async function setup(t, options = {}) {
 test("funding health is private aggregate telemetry and insufficient funds pause new quotes", async t => {
   const w = await setup(t); let balanceRaw = "100";
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000,
-    snapshot: async () => ({ ...value, balanceRaw, process: { pid: -1, secret: "PROVIDER_PRIVATE" } }) });
+    snapshot: async () => ({ ...value, balanceRaw, creatorReservations: true, process: { pid: -1, secret: "PROVIDER_PRIVATE" } }) });
   t.after(report.stop);
   assert.equal(w.sources.ready(), true);
   assert.equal((await stat(w.file)).mode & 0o777, 0o600);
   const saved = await readFile(w.file, "utf8");
   assert.doesNotMatch(saved, /SECRET|privateExtra/);
   assert.equal(JSON.parse(saved).checkedAt, new Date(2000).toISOString());
+  assert.equal(JSON.parse(saved).creatorReservations, true);
   const identity = JSON.parse(saved).process;
   assert.equal(identity.pid, process.pid); assert.equal(identity.uid, process.getuid());
   assert.match(identity.startTicks, /^[1-9][0-9]*$/);

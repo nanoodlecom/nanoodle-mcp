@@ -58,11 +58,16 @@ It also checks both public MCP listeners without executing a workflow.
 The monitor evaluates NEAR/USD separately from XNO/USD so a stale NEAR spot
 price leaves the Nano funding checks available.
 
-When a provider API key pays for models, the monitor checks the Nano owed for
-authored NEAR and USDC workflows. Paid queues use the locked rates and quoted
-previews include the maximum payment dust. The check compares the combined
-obligations with both the live unreserved pool and the confirmed on-chain
-balance. Provider model costs belong to the API-key account.
+When a provider API key pays for models, authored NEAR and USDC workflows
+reserve their creator payout in the shared Nano wallet before execution. The
+wallet uses the locked rate and exact deposit, including payment dust. If the
+payout cannot fit alongside other reservations and debts, the customer gets
+the full deposit back before any model work starts. A durable ledger entry
+protects the payout after the reservation releases.
+
+The monitor requires evidence of this reservation policy and checks paid
+queues and authored previews against both the live unreserved pool and the
+confirmed on-chain balance. Preview funding includes the maximum payment dust.
 
 ## Verification and remaining recovery limits
 

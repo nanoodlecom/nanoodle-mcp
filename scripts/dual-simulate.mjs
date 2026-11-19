@@ -19,7 +19,7 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -118,6 +118,9 @@ export async function runDualSimulation({ print = console.log } = {}) {
     }
     print(stderr.split("\n").filter((l) => /MCP over HTTP|XNO\/USD|rates:|ledger/.test(l)).map((l) => "  [server] " + l.replace(/^nanoodle-mcp:\s*/, "")).join("\n"));
     expect(/paid in Nano \(XNO to nano_\w+\) or in NEAR on testnet to merchant\.testnet/.test(stderr), "the server says it takes Nano or NEAR");
+    const funding = JSON.parse(await readFile(join(outDir, "funding-health.json"), "utf8"));
+    expect(funding.creatorReservations === true && funding.enforced === false && funding.protectTransfers === true,
+      "the API-funded process reports enforced creator reservations");
 
     const mcp = mcpClient(base);
     const init = await mcp.initialize();
