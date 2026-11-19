@@ -19,6 +19,7 @@ import { hasInvalidNearRefundProof } from "./refund-proof.mjs";
 import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
+const RECORDED_PAYMENT = new Set(["paid", "running", "settled", "failed", "rejected"]);
 
 function awaitingPayment(quote) {
   return (quote?.status === "pending" || quote?.status === "expired") && !quote.payTx;
@@ -45,7 +46,9 @@ function copy(v) {
 export function hasUnverifiedNearPaymentClaim(quotes, consumedTx) {
   return Object.entries(quotes).some(([id, quote]) => {
     const hash = quote?.payTx;
-    return hash != null && (typeof hash !== "string" || !hash || !Object.hasOwn(consumedTx, hash) || consumedTx[hash] !== id);
+    const paymentRecorded = hash != null || RECORDED_PAYMENT.has(quote?.status)
+      || quote?.paidYocto != null || quote?.payer != null || quote?.paidAtBlockMs != null;
+    return paymentRecorded && (typeof hash !== "string" || !hash.trim() || !Object.hasOwn(consumedTx, hash) || consumedTx[hash] !== id);
   });
 }
 

@@ -116,6 +116,13 @@ test("a restored payment must retain its replay claim before the ledger can reop
       assert.throws(() => openNearLedger({ file, ...OPTS, requireExisting: true }), { code: "STATE_PAYMENT_REPLAY_UNVERIFIED" });
       assert.equal(await readFile(file, "utf8"), incomplete);
     }
+    for (const status of ["paid", "running", "settled", "failed", "rejected"]) {
+      const quotes = { ...snapshot.quotes, retained: { id: "retained", status, payTx: null } };
+      const incomplete = JSON.stringify({ ...snapshot, quotes });
+      await writeFile(file, incomplete);
+      assert.throws(() => openNearLedger({ file, ...OPTS, requireExisting: true }), { code: "STATE_PAYMENT_REPLAY_UNVERIFIED" }, status);
+      assert.equal(await readFile(file, "utf8"), incomplete);
+    }
     await writeFile(file, JSON.stringify(snapshot));
     const restored = openNearLedger({ file, ...OPTS, requireExisting: true });
     assert.equal(restored.consumedBy("paid-hash"), "retained");
@@ -179,6 +186,11 @@ test("prune drops old finished quotes and long-expired unpaid quotes; consumedTx
     l.putQuote({ id: "running_old", status: "running", createdAt: 0 });
     l.putQuote({ id: "settled_no_time", status: "settled" });
     l.consumeTx("TX_OLD", "settled_old");
+    for (const id of ["running_old", "settled_new", "settled_no_time"]) {
+      const txHash = "payment-" + id;
+      l.updateQuote(id, { payTx: txHash });
+      l.consumeTx(txHash, id);
+    }
     l.putRefund({ id: "rf_old", paymentId: "settled_old", status: "sent" });
     assert.equal(l.prune(), 5);
     const left = l.quotes().map((q) => q.id).sort();
