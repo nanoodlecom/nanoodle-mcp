@@ -10,7 +10,11 @@ It does not establish live compatibility, demand, adoption or profitability.
 
 Verified 2026-11-03 against the official [ACP v2 repository](https://github.com/Virtual-Protocol/acp-node-v2),
 [ACP overview](https://os.virtuals.io/acp/overview), and the
-[provider workflow](https://os.virtuals.io/acp/cli/provider-workflow). Current ACP uses
+[provider workflow](https://os.virtuals.io/acp/cli/provider-workflow). Re-verified
+2026-11-19 for this re-land onto current `main`: npm `latest` for
+`@virtuals-protocol/acp-node-v2` is still **0.1.15** (registry record last
+modified 2026-10-05), so there is no SDK version drift to absorb; the pinned
+qualification tree is unchanged. Current ACP uses
 `AcpAgent.on("entry", ...)` and `JobSession`, rather than the archived ACP
 callback/phase model. The qualified package is `@virtuals-protocol/acp-node-v2`
 **0.1.15**, with **viem 2.57.14**; the independent qualification lock records all
@@ -26,6 +30,62 @@ zero hook. Fund transfer, router, subscription and unknown hooks are refused.
 `fromBlock` must be an operator-verified deployment/job creation bound that
 includes the funding log. Missing history fails closed. RPC identity/finality
 are operator trust assumptions; no live RPC is configured or exercised.
+
+## Traction reality (checked 2026-11-17)
+
+Read this before treating ACP as a revenue channel. Virtuals' own marketing
+cites **2.55M lifetime ACP jobs**, but that figure spans earlier ACP versions
+and legacy contracts. The **current** ACP contract, measured independently via
+agenteconomy.to on 2026-11-17, created only **164 jobs in the preceding 7 days**
+(roughly 35 jobs/day since 2026-10-01) across all providers and offerings.
+Planning number: tens of jobs per day for the whole marketplace, not millions.
+This integration is a cheap, already-built option on a thin market — worth
+keeping qualified and ready, not worth live-activation effort ahead of busier
+rails, and not a demand or revenue claim of any kind.
+
+## Seller runbook — the future live path (NOT executed by this PR)
+
+Nothing below has been done. No agent, wallet, signer or offering exists.
+Activation is a separate, separately approved change after the production
+seams in the next section exist. The steps are recorded now because ACP v2
+onboarding is **partly manual** and that friction should be priced in:
+
+1. **Register the agent by hand.** In the Virtuals app
+   (`app.virtuals.io` / ACP dashboard), create/register the seller agent in
+   the Service Registry. There is no programmatic registration call in the
+   v2 SDK for this step.
+2. **Create the offering by hand.** Offerings are created in the dashboard by
+   pasting offering blocks (name, description, fixed price, SLA, requirement
+   schema, deliverable description) into the web UI — the SDK *consumes*
+   offerings, it does not create them. `qualification/acp-v2/offering.draft.json`
+   is the field-by-field source to paste from; keep the offering hidden/private
+   until activation review. Any dashboard-side field rename since this was
+   written must be re-checked at activation time.
+3. **Wallet and signer (placeholders only).** The dashboard issues a
+   `walletId`; a signer is added through the agent's **Signers** tab. Record
+   only placeholders in config (e.g. `ACP_WALLET_ID=<from dashboard>`,
+   `ACP_SIGNER_ADDRESS=<0x… from Signers tab>`). Real keys/custody live with
+   the operator's chosen provider (Privy/Alchemy per the SDK docs), never in
+   this repository, never in the journal, never in a PR.
+4. **Pricing.** Fixed price in **USDC on Base (chain 8453)**, set in the
+   dashboard offering and mirrored in the adapter `economics` config. The
+   price must pass the admission inequality in the economics section with the
+   *real* platform fee filled in — the fee is still unknown and fails closed.
+5. **Job lifecycle the adapter implements.** Buyer requirement message →
+   adapter quotes downstream Nano cost and calls `setBudget` → buyer funds
+   escrow (`JobFunded` on the ACP contract) → adapter verifies funding from
+   finalized chain state (never from the notification alone) → reserves
+   operator Nano liquidity → executes the workflow exactly once → submits the
+   deliverable receipt via `JobSession.submit` → an **external evaluator**
+   completes or rejects → on completion, `PaymentReleased` is the only
+   revenue evidence. Rejection/expiry after dispatch is a real downstream
+   loss and goes to manual review; the adapter never refunds, never
+   auto-retries a charged effect, and never evaluates its own work.
+6. **Go-live gate.** All of: production seams (locked quote valuation,
+   durable liquidity reservation, confirmed Nano payment, protected input
+   recovery, approved result publication) implemented and reviewed; isolated
+   SDK dependency audit reviewed; a named operator holding the wallet/signer;
+   Mikkel's explicit go. Until then the seller stays `enabled: false`.
 
 ## Integration boundary
 

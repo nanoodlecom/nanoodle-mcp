@@ -1,6 +1,9 @@
 {
   "observed": "2026-11-03",
+  "relandObserved": "2026-11-19",
+  "relandSdkDrift": "none: npm latest @virtuals-protocol/acp-node-v2 still 0.1.15 (registry modified 2026-10-05); pins unchanged",
   "targetBase": "98e426254a038c90fcaa14a42881ace6bb8c7278",
+  "relandBase": "2d8940077b359374435c38a50ff6cea00b66e797",
   "officialRepository": "https://github.com/Virtual-Protocol/acp-node-v2",
   "officialOverview": "https://os.virtuals.io/acp/overview",
   "officialSourceHead": "392dcc6eb17a6884c214c21aff31afa1b99f45ae",
