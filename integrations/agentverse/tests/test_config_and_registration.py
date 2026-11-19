@@ -54,6 +54,19 @@ def test_http_remote_endpoint_rejected():
         config.require_runnable()
 
 
+def test_seed_appears_nowhere_in_registration_outputs():
+    import register_agent
+
+    secret = "a very secret seed phrase value"
+    config = Config.from_env({"NANOODLE_AGENTVERSE_SEED": secret})
+    profile = register_agent.load_profile()
+    payload = register_agent.build_profile_payload(profile, "agent1qexample")
+    plan = register_agent.registration_plan(config, profile)
+    assert secret not in str(payload)
+    assert secret not in "\n".join(plan)
+    assert secret not in repr(config)
+
+
 def test_profile_payload_shape():
     import register_agent
 
