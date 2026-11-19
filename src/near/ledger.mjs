@@ -19,6 +19,7 @@ import { hasInvalidNearRefundProof } from "./refund-proof.mjs";
 import { sameCreatorPayout } from "../creator-payout-evidence.mjs";
 
 const FINAL_QUOTE = new Set(["settled", "failed", "expired", "rejected"]);
+const RECORDED_PAYMENT = new Set(["paid", "running", "settled", "failed", "rejected"]);
 
 function awaitingPayment(quote) {
   return (quote?.status === "pending" || quote?.status === "expired") && !quote.payTx;
@@ -39,6 +40,16 @@ function assertJsonSafe(value, path = "value") {
 
 function copy(v) {
   return v === undefined ? undefined : structuredClone(v);
+}
+
+/** Retained transfers must be owned by their quote in the replay index. */
+export function hasUnverifiedNearPaymentClaim(quotes, consumedTx) {
+  return Object.entries(quotes).some(([id, quote]) => {
+    const hash = quote?.payTx;
+    const paymentRecorded = hash != null || RECORDED_PAYMENT.has(quote?.status)
+      || quote?.paidYocto != null || quote?.payer != null || quote?.paidAtBlockMs != null;
+    return paymentRecorded && (typeof hash !== "string" || !hash.trim() || !Object.hasOwn(consumedTx, hash) || consumedTx[hash] !== id);
+  });
 }
 
 export function openNearLedger({ file, network, merchant, now = Date.now, requireExisting = false, watchPaymentHistory = false }) {
@@ -74,6 +85,10 @@ export function openNearLedger({ file, network, merchant, now = Date.now, requir
     if (state.network !== network || state.merchant !== merchant) {
       throw new NearError("STATE_MISMATCH",
         `NEAR state file ${file} belongs to ${state.merchant} on ${state.network}, not ${merchant} on ${network}`);
+    }
+    if (hasUnverifiedNearPaymentClaim(state.quotes, state.consumedTx)) {
+      throw new NearError("STATE_PAYMENT_REPLAY_UNVERIFIED",
+        "The NEAR ledger cannot verify every retained payment against its replay index. Reconcile the ledger before starting.");
     }
     // A previous writer may have stopped after replacing the file. Confirm
     // the directory entry before using the selected snapshot for recovery.

@@ -199,6 +199,15 @@ function fixture(override = () => null) {
   return { config, deps, calls, states };
 }
 
+function bindFixturePayments(ledger, ...ids) {
+  ledger.consumedTx ??= {};
+  for (const id of ids) {
+    const hash = "fixture-payment-" + id;
+    ledger.quotes[id].payTx = hash;
+    ledger.consumedTx[hash] = id;
+  }
+}
+
 test("operational probes cover live readiness with no inference, signing or Market mutation and a redacted report", async () => {
   const f = fixture(), before = JSON.stringify(f.states);
   const report = await runOperationalCheck(f.config, f.deps);
@@ -440,6 +449,7 @@ test("the scheduled check detects NEAR, USDC and Market settlement mismatches wi
   const marketFile = Object.keys(f.states).find(path => path.endsWith("/market-state.json"));
   f.states[marketFile].assignments = { job: { id: "private-market-job", phase: "submitted",
     creator: { status: "queued", author: "private-author", amountRaw: "30" } } };
+  bindFixturePayments(state, "privateJob");
   const report = await runOperationalCheck(f.config, f.deps);
   for (const stage of ["near-refund-evidence-mismatch", "creator-payout-evidence-mismatch", "near-refund-duplicate-transaction",
     "near-refund-signed-terms-mismatch"]) {
@@ -791,6 +801,30 @@ test("the monitor reports an unattached NEAR payment claim without exposing its 
   assert.ok(!recovered.checks.some(c => c.stage === "near-payment-claim-unattached"));
 });
 
+test("the readiness report closes both NEAR payment rails when a retained transfer lacks its replay claim", async t => {
+  for (const [asset, owner] of [["near", undefined], ["usdc", "private-pruned-id"]]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const near = f.states["/state/near-state.json"];
+    const id = "private-retained-quote", payTx = "private-retained-transfer";
+    near.quotes[id] = { id, status: "settled", asset, payTx, settlement: { refundYocto: "0" } };
+    near.consumedTx = owner ? { [payTx]: owner } : {};
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(report.checks.find(c => c.stage === "near-payment-replay-coverage"), {
+      stage: "near-payment-replay-coverage", ok: false, code: "near-payment-replay-unverified", domains: ["near", "usdc"],
+    });
+    assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+    assert.doesNotMatch(JSON.stringify(report), /private-(?:retained|pruned)/);
+    near.consumedTx[payTx] = id;
+    delete near.quotes[id].payTx;
+    const noHash = await runOperationalCheck(f.config, f.deps);
+    assert.equal(noHash.checks.find(c => c.stage === "near-payment-replay-coverage").code, "near-payment-replay-unverified");
+    near.quotes[id].payTx = payTx;
+    const restored = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(restored.admission, { nano: true, near: true, usdc: true, market: true });
+  }
+});
+
 test("scheduled checks catch expired quote windows that finalized backfill has not covered", async t => {
   const f = fixture();
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
@@ -894,6 +928,7 @@ test("paid NEAR and USDC workflows must fit together at their locked Nano rates"
         return structuredClone(read(path));
       };
     }
+    bindFixturePayments(f.states["/state/near-state.json"], "native", "stable", "running");
     const result = await runOperationalCheck(f.config, f.deps);
     for (const stage of ["runtime-funding", "nano-liquidity", "nano-unreserved-liquidity"]) {
       assert.equal(result.checks.find(c => c.stage === stage)?.ok, true, scenario + " " + stage);
@@ -944,6 +979,7 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
         phase: "started", pricing: { depositUsd: 0.5 }, updatedAt: NOW,
       };
     }
+    if (mode === "paid-waiting") bindFixturePayments(f.states["/state/near-state.json"], "queued");
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
     for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "nano-paid-run-funding", "saved-workflow-near-sing",
@@ -993,6 +1029,7 @@ test("waiting Nano, NEAR and USDC work must fit the same available pool", async 
       };
     }
     if (mode === "provider-key") f.config.providerUsesWallet = false;
+    bindFixturePayments(f.states["/state/near-state.json"], "near", "usdc");
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
     assert.equal(check("near-paid-run-funding")?.ok, true, mode);
@@ -1046,6 +1083,7 @@ test("accepted Market work must fit the live and confirmed Nano available alongs
       return structuredClone(read(path));
     };
     if (mode === "provider-key") f.config.providerUsesWallet = false;
+    bindFixturePayments(f.states["/state/near-state.json"], "near", "usdc");
     const report = await runOperationalCheck(f.config, f.deps);
     const stages = Object.fromEntries(report.checks.map(row => [row.stage, row]));
     assert.equal(stages["nano-liquidity"].ok, true, mode);
@@ -1753,6 +1791,7 @@ test("retained NEAR and USDC quotes share refund gas and warn before deposits ar
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
   const ledger = f.states["/state/near-state.json"];
   Object.assign(ledger, { quotes, meta });
+  bindFixturePayments(ledger, "paid");
   const stage = "near-open-quote-refund-fees";
   let report = await runOperationalCheck(f.config, f.deps);
   assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
@@ -1776,6 +1815,7 @@ test("an independently proven USDC refund shortfall pauses both quote rails", as
   const f = fixture();
   t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
   f.states["/state/near-state.json"].quotes.paid = { id: "paid", asset: "usdc", status: "paid", paidYocto: "1000001" };
+  bindFixturePayments(f.states["/state/near-state.json"], "paid");
   const report = await runOperationalCheck(f.config, f.deps);
   assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
   assert.ok(report.checks.some(c => c.stage === "near-independent-refund-headroom" && c.code === "independent-usdc-refund-debt-uncovered"));

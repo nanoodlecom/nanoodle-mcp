@@ -225,7 +225,9 @@ test("restored signed refunds with incorrect payer, amount, contract or signatur
       const id = `rf_${i}`, paymentId = `payment_${i}`;
       const amountYocto = asset === "usdc" ? "100" : AMOUNT.toString();
       const fields = { asset, ...(asset === "usdc" && { tokenContract }) };
-      initial.putQuote({ id: paymentId, status: "settled", refundId: id, payer: to, ...fields,
+      const payTx = `retained-payment-${i}`;
+      initial.consumeTx(payTx, paymentId);
+      initial.putQuote({ id: paymentId, status: "settled", refundId: id, payer: to, payTx, ...fields,
         settlement: { refundYocto: amountYocto } });
       initial.putRefund({ id, paymentId, to, status: "signed", amountYocto, ...fields, ...proof });
     }

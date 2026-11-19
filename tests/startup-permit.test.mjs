@@ -208,8 +208,12 @@ test('the hosted CLI recovers a recorded refund once and refuses stale Nano peer
   cpSync(join(packageRoot, 'tests/fixtures/hello-noodle.json'), join(graphs, 'hello.json'));
   const file = join(out, 'near-state.json');
   const ledger = openNearLedger({ file, network: 'testnet', merchant });
-  ledger.putQuote({ id: 'nq_startup', status: 'running', asset: 'near', tool: 'hello', amountYocto: String(deposit), paidYocto: String(deposit),
-    payer, payTx: 'synthetic-prior-paid-transfer', paidAtBlockMs: Date.now(), createdAt: Date.now(), expiresAt: Date.now() + 3600000 });
+  const paidAt = Date.now();
+  ledger.putQuote({ id: 'nq_startup', status: 'pending', asset: 'near', tool: 'hello', amountYocto: String(deposit),
+    createdAt: paidAt, expiresAt: paidAt + 3600000 });
+  ledger.recordPayment('nq_startup', 'synthetic-prior-paid-transfer',
+    { status: 'paid', paidYocto: String(deposit), payer, paidAtBlockMs: paidAt });
+  ledger.updateQuote('nq_startup', { status: 'running' });
   const policy = join(w.root, 'state-policy.json');
   json(policy, { v: 1, outDir: out, nanoAddress: account, chargeNano: false, near: { network: 'testnet', merchant }, marketRoot: null, marketHandles: [] });
   const initialBalance = chain.balance(payer);

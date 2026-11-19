@@ -17,6 +17,7 @@ import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from 
 import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { readNearPaymentReceipts, readNearReceiptTransaction } from "../src/near/watch.mjs";
+import { hasUnverifiedNearPaymentClaim } from "../src/near/ledger.mjs";
 import { assertFreshBlock, nearBlockIdentity } from "../src/near/freshness.mjs";
 import { DUST_STEP_YOCTO, QUOTE_DUST_SLOTS, usdToYocto } from "../src/near/amount.mjs";
 import { USDC_RATE } from "../src/near/ft.mjs";
@@ -389,6 +390,9 @@ export async function runOperationalCheck(config, deps = {}) {
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
     return { liabilities, near };
   });
+  if (state) await check("near-payment-replay-coverage", () => {
+    need(!hasUnverifiedNearPaymentClaim(state.near.quotes, state.near.consumedTx ?? {}), "near-payment-replay-unverified");
+  }, ["near", "usdc"]);
   const heldNearAmounts = state && await check("near-open-quote-capacity", () => {
     const quotes = Object.values(state.near.quotes), checkedAt = now();
     const open = countOpenNearQuotes(quotes, checkedAt);
