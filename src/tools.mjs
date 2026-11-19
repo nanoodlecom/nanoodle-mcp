@@ -22,7 +22,7 @@ import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUs
 import { knownUsd } from "./usd.mjs";
 import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
-import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
+import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
 import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
 
@@ -154,7 +154,7 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
 export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const needed = new Set();
   for (const t of registry.tools) {
-    if (!t.wf) continue; // built-ins (subnano_comment, sfw_check) have no graph
+    if (!t.wf) continue; // Built-in tools have no graph.
     for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
   }
   if (!needed.size) {
@@ -1058,9 +1058,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   const failures = [];
   // Seed the reserved run_noodle name so a file that sanitizes to it gets suffixed, not shadowed.
   // Shared across every dir, so the first-scanned occurrence of a name wins it.
-  // Built-in tool names are reserved the same way as run_noodle: a graph file
-  // that sanitizes to one of them is suffixed (-2), it does not replace the tool.
-  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [PRICE_NOODLE_NAME, 1], [NOODLE_GUIDE_NAME, 1], [SUBNANO_TOOL, 1], [SFW_TOOL, 1]]);
+  // Reserve the retired name so no graph can take over its outstanding checkout IDs.
+  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [PRICE_NOODLE_NAME, 1], [NOODLE_GUIDE_NAME, 1], ["subnano_comment", 1], [SFW_TOOL, 1]]);
 
   for (const dir of dirs) {
     let entries;
@@ -1138,12 +1137,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     }
     Object.assign(t.inputSchema.properties, humanizeExtraProperties());
   }
-  // Built-ins ship in the package so a deploy does not need a new graph file.
-  // They stay off an empty directory: with no graph loaded there is nothing to serve.
-  if (tools.length) {
-    const humanize = tools.find((t) => t.name === HUMANIZE_TOOL);
-    for (const b of builtinTools({ spendSource, humanize, hosted, remote })) tools.push(b);
-  }
+  if (tools.length) tools.push(createSfwTool({ spendSource, hosted, remote }));
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
@@ -1308,9 +1302,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
           // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
           const prices = humanizePriceTable(registry.catalogs);
-          // subnano_comment passes the caps it will send. The deposit has to
-          // reserve those caps even when the refined draft is shorter than the
-          // original, or the decider hold is skipped inside an exact quote.
+          // Reserve explicit caps for the whole run, including the decider hold.
           const writerOutTokens = Number(params.maxTokens) > 0 ? Math.floor(Number(params.maxTokens)) : 0;
           const judgeOutTokens = Number(params.judgeMaxTokens) > 0 ? Math.floor(Number(params.judgeMaxTokens)) : 0;
           const quoted = humanizeDepositUsd(tool.wf.graph, args, {
@@ -1344,8 +1336,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
             budgetUsd: hosted ? (quoted ?? humanizeQuoteOrCeiling(tool, null, prices)) : null,
             deciderReserveUsd: hosted ? deciderReserveUsd : 0,
             prices,
-            // subnano_comment sizes this humanize run from the request. A normal
-            // humanize-comment call leaves these unset, and the v2.8 caps apply.
+            // Use the standard caps when the caller leaves these unset.
             ...(Number(params.maxTokens) > 0 ? { writerTokenCap: Math.floor(Number(params.maxTokens)) } : {}),
             ...(Number(params.judgeMaxTokens) > 0 ? { judgeTokenCap: Math.floor(Number(params.judgeMaxTokens)) } : {}),
           });

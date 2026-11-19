@@ -1284,7 +1284,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
   const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: hosted ? "hosted" : payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], deciderReserveUsd: Math.max(0, knownUsd(deciderReserveUsd) ?? 0), judgeFinish: null, judgeTruncated: false };
-  // Optional caps from a caller that already sized this run (subnano_comment).
+  // Optional caps from a caller that already sized this run.
   // Unset, both stay 0 and every call uses requestOutputTokenCap, which includes
   // the decider's ranking JSON and GLM reasoning reserve.
   const sizedCap = (judge = false) => {
