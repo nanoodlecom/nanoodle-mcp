@@ -97,8 +97,8 @@ export function createNearWatcher({
       // After a long outage, keep new payments live while recovering older
       // quotes newest-first. Rewalking a range is safe: the gate durably
       // consumes each payment hash before execution.
-      if (height - state.height > maxBlocksPerTick) {
-        const cutoffMs = Math.min(...pendingQuotes().map(q => q.createdAt), state.backfill?.cutoffMs ?? Infinity);
+      if (!state.backfill && height - state.height > maxBlocksPerTick) {
+        const cutoffMs = Math.min(...pendingQuotes().map(q => q.createdAt));
         const nextHash = previousBlockHash(latest);
         await inspect(latest);
         remaining--;
@@ -107,9 +107,18 @@ export function createNearWatcher({
           maxHeight: height - 1,
           cutoffMs,
         } });
+      } else if (state.backfill && height - state.height >= remaining && remaining > 1) {
+        // A second large advance must not replace the saved recovery cursor.
+        // Check the latest block now, leaving its gap for the contiguous scan.
+        await inspect(latest);
+        remaining--;
       }
+      // Head traffic cannot spend the last slot while older payments are
+      // still being recovered. Both paths keep the existing shared budget.
+      const reservedForBackfill = state.backfill ? 1 : 0;
       let nextHeight = state.height + 1;
-      while (nextHeight <= height && remaining-- > 0) {
+      while (nextHeight <= height && remaining > reservedForBackfill) {
+        remaining--;
         let block;
         try { block = nextHeight === height ? latest : await rpc.call("block", { block_id: nextHeight }); }
         catch (e) {
