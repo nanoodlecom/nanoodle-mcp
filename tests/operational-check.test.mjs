@@ -2063,6 +2063,44 @@ test("Market intake catches unclaimed hires, remote starts missing local state a
   }
 });
 
+test("accepted Market jobs are repriced locally against the smaller of escrow and their locked budget", async t => {
+  const privateIdea = "PRIVATE_ACCEPTED_MARKET_WORKFLOW";
+  for (const [escrowAmount, budgetUsd, expected] of [
+    ["1.00", 0.11, "market-pending-price-over-budget"],
+    ["0.12", 0.50, "market-pending-price-over-budget"],
+    ["1.00", 0.12, null],
+    ["1.00", 0.50, "market-pending-price-unavailable"],
+  ]) {
+    const row = marketIntakeRow(60_000, { escrowAmount, startedAt: new Date(NOW - 500).toISOString() });
+    row.job.description = JSON.stringify({ graph: { v: 1, nodes: [], links: [] }, inputs: { Idea: privateIdea } });
+    const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments"
+      ? Response.json({ assignments: [row] }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.agents[0].custom = true;
+    f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = {
+      phase: "started", pricing: { depositUsd: 0.03 }, budgetUsd,
+    };
+    const originalPrice = f.deps.computePrice;
+    let priced = 0;
+    f.deps.computePrice = async (args, options) => {
+      if (args.inputs?.Idea !== privateIdea) return originalPrice(args, options);
+      ++priced;
+      assert.equal(options.allowShortLinks, false);
+      assert.equal(options.requireFreshCatalogs, true);
+      if (expected === "market-pending-price-unavailable") throw new Error(privateIdea);
+      return { safety: { ok: true }, pricing: { estimatedCostUsd: 0.1 } };
+    };
+    const report = await runOperationalCheck(f.config, f.deps);
+    const finding = report.checks.find(check => check.stage === "market-pending-pricing-nanoodle-image");
+    assert.equal(priced, 1);
+    assert.equal(finding.ok, expected === null);
+    assert.equal(finding.code ?? null, expected);
+    if (expected) assert.deepEqual(finding.domains, []);
+    assert.equal(report.admission.market, true);
+    assert.doesNotMatch(JSON.stringify({ report, calls: f.calls }), /PRIVATE_ACCEPTED_MARKET_WORKFLOW/);
+  }
+});
+
 test("Market delivery windows warn before expiry without changing payment readiness", async t => {
   const cases = [
     ["started", 30_000, 3600, {}, "market-sla-start-window-ended"],

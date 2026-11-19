@@ -394,7 +394,8 @@ test("a job keeps the budget it was accepted under when the listing's budget cha
     assert.match(m.rows.get(first).messages[0].body, /per-job budget is \$0\.5\)/);
     assert.equal(m.rows.get(second).assignment.cancelReason, "rejected", "a new job is priced against the new budget");
     assert.match(m.rows.get(second).assignment.cancelDetail, /per-job budget \$0\.02/);
-    assert.deepEqual(seen, [0.5, 0.02]);
+    // The first hire is priced at acceptance and again before dispatch.
+    assert.deepEqual(seen, [0.5, 0.5, 0.02]);
     assert.throws(() => worker.setBudget({ budgetUsd: 0 }), TypeError);
     assert.throws(() => createMarketWorker({ client: {}, store, runner, budgetUsd: 1, customWorkflows: false }), /needs a default workflow/);
   } finally { store.close(); await m.close(); }

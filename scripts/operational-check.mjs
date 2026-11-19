@@ -27,6 +27,7 @@ import { authorAddress, resolveWalletKey, isThrottleError } from "../src/wallet.
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
 import { LIVE_RATE_MAX_AGE_MS, parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
+import { resolveJobBrief } from "../src/market/brief.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { createMarketFeeGuard } from "../src/market/fee-guard.mjs";
 import { marketDeliveryWindow } from "../src/market/deadline.mjs";
@@ -54,6 +55,7 @@ const NANO_CEMENTATION_SAMPLE_MAX_AGE_MS = 12 * 60_000;
 const NANO_PEER_ADVANCE_BLOCKS = 50n;
 const MARKET_PICKUP_GRACE_MS = 5 * 60_000;
 const MARKET_MAX_PAGES = 5;
+const MARKET_MAX_REPRICES = 20;
 const MARKET_SLA_WARNINGS = ["market-sla-execution-overdue", "market-sla-start-window-ended",
   "market-sla-retry-after-cutoff", "market-sla-delivery-due"];
 const SHARED_SAVED_WORKFLOWS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
@@ -1028,7 +1030,8 @@ export async function runOperationalCheck(config, deps = {}) {
       need(assignments.length < MARKET_MAX_PAGES * 100, "market-intake-scan-incomplete");
       const active = assignments.filter(row => row?.job?.jobKind !== "competition");
       const risks = new Set();
-      if (!active.length) return risks;
+      const pendingPricing = [];
+      if (!active.length) return { risks, pendingPricing };
       // Read after the remote poll. The worker persists its record before starting a hire.
       const state = read(join(config.marketStateDir, agent.handle, "market-state.json"));
       need(state?.v === 1 && state.assignments && typeof state.assignments === "object" && !Array.isArray(state.assignments),
@@ -1051,9 +1054,13 @@ export async function runOperationalCheck(config, deps = {}) {
           need(checkedAt - hiredAt <= MARKET_PICKUP_GRACE_MS, "market-intake-untracked");
         } else {
           const needUsd = record?.pricing?.depositUsd;
-          if ((record?.phase === "starting" || record?.phase === "started") && Number.isFinite(needUsd)) {
+          if (["starting", "started"].includes(record?.phase) && !a.submittedAt && !a.deliverableUrl) {
             const { budgetUsd } = marketEscrowTerms(a);
-            if (budgetUsd !== undefined) need(needUsd <= budgetUsd, "market-intake-escrow-below-priced-need");
+            if (budgetUsd !== undefined) {
+              if (Number.isFinite(needUsd)) need(needUsd <= budgetUsd, "market-intake-escrow-below-priced-need");
+              const lockedBudget = Number.isFinite(record.budgetUsd) && record.budgetUsd > 0 ? record.budgetUsd : budgetUsd;
+              pendingPricing.push({ job: row.job, assignmentId: a.assignmentId, budgetUsd: Math.min(lockedBudget, budgetUsd) });
+            }
           }
         }
         const beforeRun = !record || ["new", "starting", "started"].includes(record.phase);
@@ -1066,11 +1073,23 @@ export async function runOperationalCheck(config, deps = {}) {
         if (Number.isSafeInteger(record?.nextAttemptAt) && record.nextAttemptAt >= cutoff) risks.add("market-sla-retry-after-cutoff");
         if (checkedAt >= warningAt) risks.add("market-sla-delivery-due");
       }
-      return risks;
+      return { risks, pendingPricing };
     }, ["market"]);
     if (intake) await check(`market-sla-${agent.handle}`, () => {
-      const risk = MARKET_SLA_WARNINGS.find(code => intake.has(code));
+      const risk = MARKET_SLA_WARNINGS.find(code => intake.risks.has(code));
       need(!risk, risk);
+    }, []);
+    if (intake?.pendingPricing.length) await check(`market-pending-pricing-${agent.handle}`, async () => {
+      for (const { job, assignmentId, budgetUsd } of intake.pendingPricing.slice(0, MARKET_MAX_REPRICES)) {
+        const { args } = resolveJobBrief(job, assignmentId, { defaultWorkflow: agent.defaultWorkflow, customWorkflows: agent.custom });
+        need(args, "market-pending-brief-unpriceable");
+        // Resolve and price private briefs in process; only public catalog reads use the network.
+        const priced = await priceWorkflow(args, freshPriceOptions).catch(() => null);
+        const estimate = priced?.pricing?.estimatedCostUsd;
+        need(priced?.safety?.ok === true && Number.isFinite(estimate) && estimate >= 0, "market-pending-price-unavailable");
+        need(marketNeedUsd(estimate) <= budgetUsd, "market-pending-price-over-budget");
+      }
+      need(intake.pendingPricing.length <= MARKET_MAX_REPRICES, "market-pending-pricing-scan-incomplete");
     }, []);
     if (agent.bids) {
       await checkUsdRunCapital(`workflow-nano-capital-market-bids-${agent.handle}`, budgetFromPrice(agent.maxBidUsd), true);
