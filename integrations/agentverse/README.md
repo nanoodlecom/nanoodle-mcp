@@ -102,6 +102,13 @@ outcome is to switch the facade off and record that.
 | `protocol-manifest.json` | The published AgentChatProtocol manifest (name/version/digest from `uagents_core`) |
 | `tests/` | pytest suite with a mocked MCP endpoint — no network, no uAgents runtime needed except the registration-payload test's package import |
 
+## References (primary sources, checked 2026-11-19)
+
+- Agentverse overview — https://docs.agentverse.ai/documentation/getting-started/overview (updated 2026-10-19): discovery via ASI:One, README/keywords/tags drive ranking, analytics are the feedback surface, monetisation is via tags/subscriptions/deep links.
+- ASI:One-compatible chat agents — https://innovationlab.fetch.ai/resources/docs/next/examples/chat-protocol/asi-compatible-uagents : `uagents==0.25.5`, Agent Chat Protocol 0.3.0 imports from `uagents_core.contrib.protocols.chat`, `mailbox=True`, `publish_manifest=True`, ack-then-reply handler shape. This sidecar's wiring follows it.
+- Almanac registration — https://network.fetch.ai/docs/introduction/almanac/register-in-almanac : registration is on-chain, fee-bearing (FET), and expires by block height, so agents re-register.
+- Payment shapes — this repo's `src/gate.mjs` and README: the hosted endpoint's unpaid `tools/call` hangs up with a quote (`structuredContent` carries `paymentId` / `payUrl` / agent-only `watchUrl`); the results call is the same arguments plus `_payment_id`.
+
 ## Run the tests
 
 ```bash

@@ -54,7 +54,9 @@ execute step from an automated job.
    `Successfully registered as mailbox agent in Agentverse`. In the
    Agentverse inspector, Connect → Mailbox if prompted.
 6. **Profile.** In the Agentverse dashboard, open the agent profile:
-   confirm the name/handle (`@nanoodle` suggested), paste
+   confirm the name/handle (`@nanoodle` suggested; if taken, use
+   `@nanoodle-workflows` and record the choice in the marketplace
+   ledger), paste
    `profile/README.md` as the readme, and set the keywords/tags from
    `profile/profile.json`.
 7. **Endpoint choice.** Decide which MCP endpoint the live agent calls:
