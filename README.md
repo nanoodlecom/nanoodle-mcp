@@ -1405,6 +1405,22 @@ publish unless `server.json`'s version is really on npm. See
 manifest (`io.github.nanoodlecom/nanoodle-mcp`); see [PUBLISHING.md](PUBLISHING.md)
 for the release checklist.
 
+## Agent identity
+
+One identity, every directory. `server.json` is the source of truth; two
+further documents are generated from it (`npm run build:identity`) and checked
+for drift on every `npm test`:
+
+- `agent-card.json` — the A2A Agent Card, for serving at
+  `https://mcp.nanoodle.com/.well-known/agent-card.json`
+- `agent-registration.json` — the ERC-8004 / Solana 8004 registration file,
+  for serving at `https://mcp.nanoodle.com/.well-known/agent-registration.json`
+
+Where nanoodle is listed (NEAR Agent Market, MCP Registry, npm), the refresh
+procedure, and the one-command registry publish
+(`npm run publish:registry -- --execute`, dry-run without `--execute`) live in
+[docs/agent-identity.md](docs/agent-identity.md).
+
 ## Which repo do I want?
 
 This server exposes saved workflows as typed MCP tools. If your agent supports
