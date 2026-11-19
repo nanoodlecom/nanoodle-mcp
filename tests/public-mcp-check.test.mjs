@@ -4,15 +4,38 @@ import { runPublicMcpCheck } from "../scripts/public-mcp-check.mjs";
 
 const NOW = Date.parse("2026-11-18T04:30:00Z");
 const stamp = new Date(NOW).toISOString();
+const archives = ["archival-rpc.mainnet.fastnear.com", "archival-rpc.mainnet.near.org"];
+const archivedTx = "34E7weKCDqXh3xPKdBgSWRqo44yTWjbka9deMK8JbAxx";
+const archivedBlock = "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL";
 
 function fixture({ missingTool = false, scanAt = stamp, funded = true, usdcUnavailable = false, lostHost, transientRates = false,
-  missingDecision = false, invalidDeposit = false } = {}) {
+  missingDecision = false, invalidDeposit = false, missingHistory = [], wrongHistoricalBlock = [] } = {}) {
   const calls = [];
   async function fetch(url, init) {
     const { hostname, pathname } = new URL(url);
     const body = init.body ? JSON.parse(init.body) : null;
     calls.push({ hostname, pathname, method: body?.method, tool: body?.params?.name });
     if (hostname === lostHost) throw Error("private transport details");
+    if (archives.includes(hostname)) {
+      assert.equal(init.method, "POST");
+      assert.equal(new Headers(init.headers).has("authorization"), false);
+      assert.equal(body.jsonrpc, "2.0");
+      assert.equal(body.id, 1);
+      if (body.method === "tx") {
+        assert.deepEqual(body.params, { tx_hash: archivedTx, sender_account_id: "escrow.ai.near", wait_until: "NONE" });
+        if (missingHistory.includes(hostname)) {
+          return Response.json({ jsonrpc: "2.0", id: 1, error: { cause: { name: "UNKNOWN_TRANSACTION" }, details: "private provider details" } });
+        }
+        return Response.json({ jsonrpc: "2.0", id: 1, result: { final_execution_status: "FINAL",
+          status: { Failure: {} }, transaction: { hash: archivedTx, signer_id: "escrow.ai.near" },
+          transaction_outcome: { block_hash: archivedBlock } } });
+      }
+      assert.equal(body.method, "block");
+      assert.deepEqual(body.params, { block_id: archivedBlock });
+      return Response.json({ jsonrpc: "2.0", id: 1, result: { header: {
+        hash: archivedBlock, height: wrongHistoricalBlock.includes(hostname) ? 194263440 : 194263441,
+      } } });
+    }
     if (hostname === "babel.255bits.com" && pathname === "/mcp/v1") {
       return Response.json({ error: "private challenge details" }, { status: 401 });
     }
@@ -58,11 +81,26 @@ test("public availability uses discovery, status and free pricing, and retries a
   const { calls, run } = fixture({ transientRates: true });
   const report = await run();
   assert.equal(report.ok, true);
-  assert.equal(report.checks.length, 9);
+  assert.equal(report.checks.length, 10);
   assert.equal(report.checks.find(check => check.stage === "nano-rates").attempts, 2);
-  assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["initialize", "tools/call", "tools/list"]);
+  assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["block", "initialize", "tools/call", "tools/list", "tx"]);
   assert.equal(calls.filter(call => call.tool === "price_noodle").length, 2);
-  assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/mcp", "/mcp/v1", "/near/health", "/rates"]);
+  assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/", "/mcp", "/mcp/v1", "/near/health", "/rates"]);
+});
+
+test("archival history distinguishes missing redundancy from complete history loss", async () => {
+  const check = report => report.checks.find(row => row.stage === "near-archival-history");
+  const single = await fixture({ missingHistory: [archives[0]] }).run();
+  assert.equal(single.ok, true);
+  assert.deepEqual(check(single).peers, [
+    { host: archives[0], ok: false, attempts: 2, code: "near-history-transaction-missing" },
+    { host: archives[1], ok: true, attempts: 1 },
+  ]);
+  const lost = await fixture({ missingHistory: [archives[0]], wrongHistoricalBlock: [archives[1]] }).run();
+  assert.equal(lost.ok, false);
+  assert.deepEqual(lost.checks.filter(row => !row.ok).map(row => row.code), ["near-no-readable-archive"]);
+  assert.equal(check(lost).peers[1].code, "near-history-block-unverified");
+  assert.doesNotMatch(JSON.stringify(lost), /private provider details/);
 });
 
 test("public readiness reports missing USDC proof as a token-specific check failure", async () => {

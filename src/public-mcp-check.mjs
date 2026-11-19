@@ -4,6 +4,10 @@ const NANO = "https://mcp.nanoodle.com";
 const NEAR = "https://near.nanoodle.com";
 const NEAR_ALIAS = "https://mcp-near.nanoodle.com";
 const BABEL = "https://babel.255bits.com";
+const NEAR_ARCHIVES = ["https://archival-rpc.mainnet.fastnear.com", "https://archival-rpc.mainnet.near.org"];
+// Published mainnet fixture from https://docs.fastnear.com/rpc/transaction/tx.
+const ARCHIVE_SAMPLE = { tx: "34E7weKCDqXh3xPKdBgSWRqo44yTWjbka9deMK8JbAxx", signer: "escrow.ai.near",
+  block: "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL", height: 194263441 };
 const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
@@ -50,6 +54,18 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
 
   // Discovery and free pricing only. A paid tool is never called by a probe.
   function rpc(method, params) { return { jsonrpc: "2.0", id: 1, method, params }; }
+  async function readArchive(site) {
+    const fixture = ARCHIVE_SAMPLE;
+    const tx = await json(site, { body: rpc("tx", { tx_hash: fixture.tx, sender_account_id: fixture.signer, wait_until: "NONE" }) });
+    if (tx.error?.cause?.name === "UNKNOWN_TRANSACTION") throw new ProbeError("near-history-transaction-missing");
+    need(tx.jsonrpc === "2.0" && tx.id === 1 && !tx.error && tx.result?.final_execution_status === "FINAL"
+      && tx.result.transaction?.hash === fixture.tx && tx.result.transaction?.signer_id === fixture.signer
+      && tx.result.transaction_outcome?.block_hash === fixture.block
+      && Object.hasOwn(tx.result.status ?? {}, "Failure"), "near-history-transaction-unverified");
+    const block = await json(site, { body: rpc("block", { block_id: fixture.block }) });
+    need(block.jsonrpc === "2.0" && block.id === 1 && !block.error && block.result?.header?.hash === fixture.block
+      && block.result.header.height === fixture.height, "near-history-block-unverified");
+  }
   async function discover(site) {
     const hello = await json(site + "/mcp", { body: rpc("initialize", INIT) });
     need(hello.jsonrpc === "2.0" && hello.id === 1 && !hello.error && hello.result?.serverInfo?.name === "nanoodle-mcp",
@@ -126,6 +142,15 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     }
   }
   const checks = await Promise.all(Object.entries(probes).map(([stage, probe]) => check(stage, probe)));
-  checks.push(...await Promise.all(["near", "usdc"].map(asset => check(`${asset}-conditional-pricing`, () => conditionalPrice(asset)))));
+  // The first batch uses the shared fetch pool. The second keeps four
+  // concurrent requests even when all archive peers need verification.
+  const [pricing, archiveReads] = await Promise.all([
+    Promise.all(["near", "usdc"].map(asset => check(`${asset}-conditional-pricing`, () => conditionalPrice(asset)))),
+    Promise.all(NEAR_ARCHIVES.map(site => check(new URL(site).hostname, () => readArchive(site)))),
+  ]);
+  const peers = archiveReads.map(({ stage, ...result }) => ({ host: stage, ...result }));
+  const archived = peers.some(peer => peer.ok);
+  checks.push(...pricing, { stage: "near-archival-history", ok: archived, peers,
+    ...(!archived && { code: "near-no-readable-archive" }) });
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }
