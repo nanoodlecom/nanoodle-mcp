@@ -2,13 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createBlock, checkAddress, hashBlock } from "nanocurrency";
 import { createNanoReadPool, nanoStandbyConfig, NANO_COLD_STANDBY_SCAN_REQUESTS } from "../src/nano-read-pool.mjs";
+import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
 const ACCOUNT = NANO_GENESIS_REPLY.contents.account, PAYER = "nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7";
 const SEND = "A".repeat(64), OTHER = "C".repeat(64);
 const absent = () => Object.assign(Error("Block not found"), { authoritative: true });
 const pending = amount => ({ blocks: { [SEND]: { amount: String(amount), source: PAYER } } });
-function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfirmed = null) {
+function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfirmed = null, previousFundingReport = null) {
   let at = 1_000, elapsed = 0;
   const peers = Array.from({ length: count + Number(requestsPerMinute > 0) }, (_, index) => ({
     base: requestsPerMinute ? `https://peer-${index}.example` : String(index),
@@ -17,7 +18,7 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
   const calls = [];
   const standby = requestsPerMinute ? { url: peers[count].base, requestsPerMinute } : undefined;
   const pool = createNanoReadPool({ bases: peers.slice(0, count).map(p => p.base), account, checkAddress, hashBlock, standby, persistConfirmed,
-    now: () => at, monotonicNow: () => elapsed,
+    now: () => at, monotonicNow: () => elapsed, previousFundingReport,
     rpc: async (body, base) => {
       calls.push({ action: body.action, base });
       const p = peers.find(p => p.base === base);
@@ -37,6 +38,23 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
 }
 const receivable = { action: "receivable", account: ACCOUNT, count: "50", threshold: "1", source: "true" };
 const info = { action: "account_info", account: ACCOUNT };
+
+test("an exact prior report preserves a provider cooldown across restart without restoring read quorum", async () => {
+  const until = 1_000 + 5 * 86_400_000;
+  const previous = { v: 1, checkedAt: new Date(900).toISOString(), ok: false,
+    nanoRpc: { configuration: rpcPeerSetId(["0", "1", "2"]), configuredPeers: 3, cooldowns: [{ peer: 1, until }] } };
+  const w = world(3, 0, ACCOUNT, null, previous);
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 1, until }]);
+  assert.equal(w.pool.status().readablePeers, 0);
+  assert.equal(w.pool.status().networkPeers, 0);
+  await w.pool.read(info);
+  assert.ok(w.calls.every(call => call.base !== "1"));
+  w.tick(until - 1_000);
+  await w.pool.read(info);
+  assert.ok(w.calls.some(call => call.base === "1"));
+  const reordered = { ...previous, nanoRpc: { ...previous.nanoRpc, configuration: rpcPeerSetId(["1", "0", "2"]) } };
+  assert.deepEqual(world(3, 0, ACCOUNT, null, reordered).pool.status().cooldowns, []);
+});
 
 test("the optional standby requires two primaries, an independent hostname and an explicit quota", () => {
   const bases = ["https://primary.example", "http://other.example:7077"];
@@ -390,6 +408,21 @@ test("a throttled block lookup cannot be mistaken for an authoritative absence",
   const before = w.calls.filter(call => call.base === "0").length;
   await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), e => e.authoritative === true);
   assert.equal(w.calls.filter(call => call.base === "0").length, before);
+});
+
+test("overlapping provider refusals preserve the longest retry deadline", async () => {
+  const w = world();
+  await w.pool.read(info);
+  const refusals = [];
+  w.peers[0].accountRead = () => new Promise((_, reject) => refusals.push(reject));
+  const first = w.pool.read(info), second = w.pool.read(info);
+  while (refusals.length < 2) await new Promise(resolve => setImmediate(resolve));
+  const longDelay = 5 * 86_400_000;
+  refusals[0](Object.assign(Error("429"), { rateLimited: true, retryAfterMs: longDelay }));
+  await first;
+  refusals[1](Object.assign(Error("429"), { rateLimited: true, retryAfterMs: 30_000 }));
+  await second;
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 0, until: 1_000 + longDelay }]);
 });
 
 test("a frozen first peer cannot hide a confirmed payment behind an empty list", async () => {

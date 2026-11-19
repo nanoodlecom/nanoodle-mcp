@@ -455,6 +455,16 @@ export async function runOperationalCheck(config, deps = {}) {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
     const observedAt = now(), checkedAt = Date.parse(value.checkedAt), age = observedAt - checkedAt;
+    const rpc = value.nanoRpc;
+    if (Number.isFinite(age) && age >= -30_000 && rpc?.configuredPeers === peerUrls.length
+        && (rpc.cooldowns !== undefined || rpc.configuration !== undefined)) {
+      need(rpc.configuration === rpcPeerSetId(peerUrls), "nano-peer-configuration-mismatch");
+      try {
+        nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, peerUrls.length, Math.min(checkedAt, observedAt))
+          .filter(item => item.until > observedAt);
+      }
+      catch { need(false, "nano-cooldown-observation-invalid"); }
+    }
     need(Number.isFinite(age) && age < FUNDING_REPORT_MAX_AGE_MS && age >= -30_000, "funding-report-stale");
     if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
     need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
@@ -468,7 +478,6 @@ export async function runOperationalCheck(config, deps = {}) {
     need(Number.isSafeInteger(limit) && limit > 0 && limit <= 24 * 3_600_000, "funding-report-invalid");
     need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
       && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= limit + 15 * 60_000, "funding-run-stuck");
-    const rpc = value.nanoRpc;
     need(rpc?.enforced === true && rpc.configuredPeers === peerUrls.length, "nano-read-guard-not-enforced");
     const minimum = Math.min(2, config.nanoRpcUrls.length);
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
@@ -484,13 +493,9 @@ export async function runOperationalCheck(config, deps = {}) {
     let checkpoint;
     try { checkpoint = selectNanoCheckpoint(rpc.checkpoint, config.nanoAddress); }
     catch { need(false, "nano-checkpoint-unavailable"); }
-    if (config.nanoStandby || rpc.cooldowns !== undefined || rpc.configuration !== undefined) {
-      need(rpc.configuration === rpcPeerSetId(peerUrls), "nano-peer-configuration-mismatch");
-      try { nanoCooldowns = selectRpcCooldowns(rpc.cooldowns, peerUrls.length, now()); }
-      catch { need(false, "nano-cooldown-observation-invalid"); }
-    }
     let coldPaymentScanRequests = NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS;
     if (config.nanoStandby) {
+      need(rpc.configuration === rpcPeerSetId(peerUrls), "nano-peer-configuration-mismatch");
       const { inUse, requestsPerMinute, coldPaymentScanRequests: reportedCost } = rpc.standby ?? {};
       need(typeof inUse === "boolean" && requestsPerMinute === config.nanoStandby.requestsPerMinute
         && (reportedCost === undefined || reportedCost === NANO_COLD_STANDBY_SCAN_REQUESTS)

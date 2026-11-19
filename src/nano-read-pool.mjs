@@ -1,5 +1,5 @@
 import { performance } from "node:perf_hooks";
-import { MAX_RPC_RETRY_MS, rpcPeerSetId } from "./rpc-backoff.mjs";
+import { MAX_RPC_RETRY_MS, rpcPeerSetId, selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 import { checkedAnchoredNanoHistory, isNanoBlockHeight, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "./nano-payment-history.mjs";
 
@@ -155,13 +155,23 @@ export function checkedHistory(value, checkAddress) {
 /** Read-only account ordering, shared by hosted wallet paths. No PoW, signing,
  * publication, inference or balance aggregation across different snapshots. */
 export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBlock, standby: standbyOptions,
-  persistConfirmed = null, now = Date.now, monotonicNow = () => performance.now(), networkTtlMs = 30_000 }) {
+  persistConfirmed = null, previousFundingReport = null, now = Date.now, monotonicNow = () => performance.now(), networkTtlMs = 30_000 }) {
   assertDistinctNanoRpcPeers(bases);
   if (typeof checkAddress !== "function" || typeof hashBlock !== "function") throw new TypeError("Nano read pool needs wallet-owned address and hash validators");
   const standby = nanoStandbyConfig(bases, standbyOptions), standbyUrl = standby?.url;
   const allBases = standby ? [...bases, standbyUrl] : bases;
   const minimum = Math.min(2, bases.length), networks = new Map(), cooldowns = new Map(), laggingPeers = new Set();
   const configuration = rpcPeerSetId(allBases);
+  const observedAt = Date.parse(previousFundingReport?.checkedAt);
+  const priorRpc = previousFundingReport?.nanoRpc;
+  const startedAt = now();
+  if (previousFundingReport?.v === 1 && Number.isFinite(observedAt) && observedAt <= startedAt
+      && priorRpc?.configuration === configuration && priorRpc.configuredPeers === allBases.length) {
+    try {
+      const saved = selectRpcCooldowns(priorRpc.cooldowns, allBases.length, observedAt);
+      for (const { peer, until } of saved) if (until > startedAt) cooldowns.set(allBases[peer], { until, failures: 1 });
+    } catch { /* Unusable advisory data confers no authority on any peer. */ }
+  }
   let high = null, final = null, blocked = false, lastReadAt = null, readPeers = 0, preferred = [], inflightNetwork = null;
   let standbyInUse = false, standbyTail = Promise.resolve();
   let paymentWindowPriorityUntil = -Infinity;
@@ -188,10 +198,11 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   }
   function rateLimit(base, error) {
     if (error?.rateLimited !== true) return;
-    const failures = Math.min((cooldowns.get(base)?.failures || 0) + 1, 5);
+    const prior = cooldowns.get(base);
+    const failures = Math.min((prior?.failures || 0) + 1, 5);
     const fallback = Math.min(300_000, 30_000 * 2 ** (failures - 1));
     const hint = Number.isSafeInteger(error.retryAfterMs) && error.retryAfterMs >= 0 ? Math.min(MAX_RPC_RETRY_MS, error.retryAfterMs) : 0;
-    cooldowns.set(base, { until: now() + Math.max(fallback, hint), failures });
+    cooldowns.set(base, { until: Math.max(prior?.until ?? 0, now() + Math.max(fallback, hint)), failures });
     networks.set(base, { ok: false, at: now() });
   }
   async function proveNetwork(base) {
