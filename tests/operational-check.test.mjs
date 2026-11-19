@@ -826,7 +826,7 @@ test("paid NEAR and USDC workflows must fit together at their locked Nano rates"
 
 test("valid NEAR and USDC previews must fit both independent Nano balances and already paid work", async t => {
   const raw = 10n ** 30n;
-  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting"]) {
+  for (const mode of ["healthy", "runtime-reserved", "chain-obligations", "paid-waiting", "nano-paid-waiting"]) {
     const f = fixture(({ url, body }) => {
       const args = body?.params?.arguments;
       if (url.hostname !== "site.example" || !(args?.graph?.name === "sing" || args?.inputs?.Marker)) return null;
@@ -848,9 +848,13 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       f.states["/state/near-state.json"].quotes.queued = { id: "private-queued-funding-sample", status: "paid", asset: "usdc",
         depositUsd: "1", paidYocto: "1000000", paidAtBlockMs: NOW, rate: { xnoUsd: "2" } };
     }
+    if (mode === "nano-paid-waiting") {
+      f.states["/state/gate-state.json"].quotes.push({ id: "private-queued-funding-sample", status: "paid", paidAt: NOW,
+        amountRaw: String(raw / 2n), usd: "1", pair: { usdNano: "2000000000", raw: String(raw) } });
+    }
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
-    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "saved-workflow-near-sing",
+    for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "near-paid-run-funding", "nano-paid-run-funding", "saved-workflow-near-sing",
       "saved-workflow-usdc-sing", "custom-workflow-pricing"]) assert.ok(check(stage)?.ok, mode + " " + stage);
     for (const stage of ["workflow-nano-capital-near-sing", "workflow-nano-capital-usdc-sing",
       "workflow-nano-capital-near-custom", "workflow-nano-capital-usdc-custom"]) {
@@ -866,6 +870,52 @@ test("valid NEAR and USDC previews must fit both independent Nano balances and a
       assert.match(alert.text, /workflow-nano-capital-insufficient/);
       assert.doesNotMatch(alert.text, /private-queued-funding-sample|reservedRaw|depositUsd/);
     }
+  }
+});
+
+test("waiting Nano, NEAR and USDC work must fit the same available pool", async t => {
+  const raw = 10n ** 30n, nanoDeposit = 9n * raw / 4n, combined = 5n * raw;
+  for (const mode of ["exact", "live-short", "chain-short", "missing-rate", "started-during-sample", "provider-key"]) {
+    const f = fixture();
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const ledger = f.states["/state/gate-state.json"], quotes = f.states["/state/near-state.json"].quotes;
+    const nano = { id: "private-paid-nano", status: "paid", paidAt: NOW, amountRaw: String(nanoDeposit),
+      usd: "1.125", pair: { usdNano: "500000000", raw: String(raw) } };
+    if (["missing-rate", "provider-key"].includes(mode)) delete nano.pair;
+    ledger.quotes.push(nano);
+    quotes.near = { status: "paid", asset: "near", depositUsd: "1.2",
+      paidYocto: "400000000000000000000000", paidAtBlockMs: NOW, rate: { xnoUsd: "0.5" } };
+    quotes.usdc = { status: "paid", asset: "usdc", depositUsd: "0.07",
+      paidYocto: "70000", paidAtBlockMs: NOW, rate: { xnoUsd: "0.2" } };
+    const shortfall = ["live-short", "started-during-sample"].includes(mode) ? 1n : 0n;
+    Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: String(nanoDeposit),
+      reservedRaw: String(10n * raw - nanoDeposit - combined + shortfall), activeRuns: 1, oldestStartedAt: NOW - 1000 });
+    if (mode === "chain-short") ledger.owed.push({
+      amountRaw: String(10n * raw - nanoDeposit - combined + 1n), journaled: true, tries: 0, createdAt: NOW,
+    });
+    if (mode === "started-during-sample") {
+      const read = f.deps.readJson;
+      f.deps.readJson = path => {
+        if (path === "/state/funding-health.json") nano.status = "consumed";
+        return structuredClone(read(path));
+      };
+    }
+    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = stage => report.checks.find(row => row.stage === stage);
+    assert.equal(check("near-paid-run-funding")?.ok, true, mode);
+    assert.equal(check("nano-liquidity")?.ok, true, mode);
+    const finding = check("nano-paid-run-funding");
+    if (mode === "provider-key") {
+      assert.equal(finding, undefined);
+    } else {
+      assert.equal(finding?.ok, ["exact", "started-during-sample"].includes(mode), mode);
+      if (!finding.ok) assert.deepEqual(finding, { stage: "nano-paid-run-funding", ok: false,
+        code: mode === "missing-rate" ? "nano-paid-run-funding-unverified" : "nano-paid-run-funding-insufficient", domains: [] });
+    }
+    if (mode === "missing-rate") assert.equal(check("workflow-nano-capital-near-sing")?.code, "workflow-nano-capital-unverified");
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true }, mode);
+    assert.doesNotMatch(JSON.stringify(report), /private-paid-nano|availableRaw|depositUsd/);
   }
 });
 
