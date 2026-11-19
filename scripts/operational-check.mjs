@@ -778,46 +778,61 @@ export async function runOperationalCheck(config, deps = {}) {
         && quote.outcome === "succeeded" && quote.settlement, "near-checkout-canary-record-invalid");
       return { id, quote, refund };
     }, []);
-    if (checkout) await check("near-settled-checkout", async () => {
+    if (checkout) {
       const { payer, paymentTx } = sample;
       const { id, quote, refund } = checkout;
-      const [page, status, watch, resultResponse] = await Promise.all([
-        request(`${config.site}/pay/${id}`, { cache: "no-store" }),
-        http(`${config.site}/near/status/${id}`, { cache: "no-store" }),
-        request(`${config.site}/near/watch/${id}?run=1`, { cache: "no-store", headers: { accept: "text/event-stream" } }),
-        request(`${config.site}/near/result/${id}`, { cache: "no-store" }),
-      ]);
-      need(page.status === 200 && /^text\/html\b/.test(page.headers.get("content-type") || ""),
-        "near-settled-payment-page-invalid");
-      const html = await page.text();
-      need(html.includes('id="near-payment"') && html.includes('id="pay-result"'), "near-settled-payment-page-invalid");
-      const { receipt, workflow } = status ?? {};
-      need(status?.paymentId === id && status.status === "settled" && status.done === true
-        && receipt?.paymentId === id && receipt.rail === "near" && receipt.network === config.network
+      const amounts = [quote.paidYocto, quote.settlement.chargedYocto, refund.amountYocto];
+      const balanced = amounts.every(value => typeof value === "string" && /^\d{1,39}$/.test(value))
+        && BigInt(refund.amountYocto) > 0n && BigInt(quote.paidYocto) === BigInt(quote.settlement.chargedYocto) + BigInt(refund.amountYocto)
+        && quote.settlement.refundYocto === refund.amountYocto;
+      const matchesLedger = receipt => balanced && receipt?.paymentId === id && receipt.rail === "near" && receipt.network === config.network
         && receipt.outcome === "succeeded" && receipt.deposit?.txHash === paymentTx && receipt.deposit.yocto === quote.paidYocto
         && receipt.charged?.yocto === quote.settlement.chargedYocto && receipt.refund?.yocto === refund.amountYocto
-        && receipt.refund.to === payer && receipt.refund.status === "sent" && receipt.refund.txHash === refund.txHash,
-      "near-settled-payment-receipt-invalid");
-      const amounts = [quote.paidYocto, quote.settlement.chargedYocto, refund.amountYocto];
-      need(amounts.every(value => typeof value === "string" && /^\d{1,39}$/.test(value)),
-        "near-settled-payment-receipt-invalid");
-      const [deposited, charged, refunded] = amounts.map(BigInt);
-      need(refunded > 0n && deposited === charged + refunded && quote.settlement.refundYocto === refund.amountYocto,
-        "near-settled-payment-receipt-invalid");
-      need(workflow?.v === 1 && workflow.status === "succeeded" && Array.isArray(workflow.links)
-        && Array.isArray(workflow.nodes) && workflow.nodes.length > 0 && workflow.nodes.every(node => node?.status === "done"),
-      "near-settled-payment-workflow-missing");
-      const frame = await checkoutStreamFrame(watch, "near-settled-payment-stream-invalid");
-      need(frame?.paymentId === id && frame.status === "settled" && frame.done === true
-        && isDeepStrictEqual(frame.receipt, receipt) && isDeepStrictEqual(frame.workflow, workflow),
-        "near-settled-payment-stream-invalid");
-      need(resultResponse.status === 200, "near-settled-payment-result-invalid");
-      const result = await resultResponse.json();
-      const output = Array.isArray(result?.content) && result.content.find(part => part?.type === "text")?.text;
-      // A receipt and an eviction notice can be returned even when the paid output is gone.
-      need(!result?.isError && typeof output === "string" && /^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output.trim())
-        && isDeepStrictEqual(result.structuredContent?.receipt, receipt), "near-settled-payment-result-invalid");
-    }, []);
+        && receipt.refund.to === payer && receipt.refund.status === "sent" && receipt.refund.txHash === refund.txHash;
+      const settledView = value => value?.paymentId === id && value.status === "settled" && value.done === true;
+      const finishedGraph = workflow => workflow?.v === 1 && workflow.status === "succeeded" && Array.isArray(workflow.links)
+        && Array.isArray(workflow.nodes) && workflow.nodes.length > 0 && workflow.nodes.every(node => node?.status === "done");
+      const uncached = { cache: "no-store" };
+      const page = check("near-settled-payment-page", async () => {
+        const response = await request(`${config.site}/pay/${id}`, uncached);
+        need(response.status === 200 && /^text\/html\b/.test(response.headers.get("content-type") || ""),
+          "near-settled-payment-page-invalid");
+        const html = await response.text();
+        need(html.includes('id="near-payment"') && html.includes('id="pay-result"'), "near-settled-payment-page-invalid");
+      }, []);
+      const status = http(`${config.site}/near/status/${id}`, uncached);
+      const statusReceipt = check("near-settled-checkout", async () => {
+        const view = await status;
+        need(settledView(view) && matchesLedger(view.receipt), "near-settled-payment-receipt-invalid");
+        return view.receipt;
+      }, []);
+      const statusGraph = check("near-settled-payment-workflow", async () => {
+        const view = await status;
+        need(settledView(view) && finishedGraph(view.workflow), "near-settled-payment-workflow-missing");
+        return view.workflow;
+      }, []);
+      await Promise.all([page, statusReceipt, statusGraph,
+        check("near-settled-payment-stream", async () => {
+          const response = await request(`${config.site}/near/watch/${id}?run=1`, { ...uncached, headers: { accept: "text/event-stream" } });
+          const code = "near-settled-payment-stream-invalid";
+          const frame = await checkoutStreamFrame(response, code);
+          need(settledView(frame) && matchesLedger(frame.receipt) && finishedGraph(frame.workflow), code);
+          const [receipt, workflow] = await Promise.all([statusReceipt, statusGraph]);
+          need((!receipt || isDeepStrictEqual(frame.receipt, receipt)) && (!workflow || isDeepStrictEqual(frame.workflow, workflow)), code);
+        }, []),
+        check("near-settled-payment-result", async () => {
+          const response = await request(`${config.site}/near/result/${id}`, uncached);
+          const code = "near-settled-payment-result-invalid";
+          need(response.status === 200, code);
+          const result = await response.json(), receipt = result?.structuredContent?.receipt;
+          const statusCopy = await statusReceipt;
+          need(!result?.isError && matchesLedger(receipt) && (!statusCopy || isDeepStrictEqual(receipt, statusCopy)), code);
+          const output = Array.isArray(result.content) && result.content.find(part => part?.type === "text")?.text;
+          // An eviction notice can accompany a valid receipt after restart.
+          need(typeof output === "string" && /^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output.trim()), "near-settled-payment-output-unavailable");
+        }, []),
+      ]);
+    }
   }
   // Real checkout IDs use 12 characters after their prefix. These GETs
   // exercise public routing and stream termination without accessing a quote.
