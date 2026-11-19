@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocurrency";
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
-import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw } from "../src/operational-state.mjs";
+import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw, paidNanoRunFundingRaw } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
@@ -733,7 +733,13 @@ export async function runOperationalCheck(config, deps = {}) {
     const minimumUsd = parseUsdNano(providerReserveUsd), rateUsd = parseUsdNano(rates.xnoUsd);
     need(runtimeFunding.availableRaw * rateUsd >= minimumUsd * RAW_PER_XNO, "nano-pool-insufficient-after-reservations");
   }, []);
-  let queuedNearRaw = null;
+  const hasCapitalEvidence = () => state && nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000;
+  function hasCapital(requiredRaw) {
+    const independent = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
+      nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
+    return runtimeFunding.availableRaw >= requiredRaw && independent.ok;
+  }
+  let queuedNearRaw = null, queuedNanoRaw = config.providerUsesWallet === false ? 0n : null;
   if (state) await check("near-paid-run-funding", () => {
     // The runtime sample came first. Re-read the ledger so a quote that has
     // since acquired a live reservation is not counted again as unstarted.
@@ -741,26 +747,24 @@ export async function runOperationalCheck(config, deps = {}) {
     catch { throw new CheckError("near-paid-run-funding-unverified"); }
     const requiredRaw = queuedNearRaw;
     if (requiredRaw === 0n) return;
-    need(nano && rates && runtimeFunding && now() - runtimeFunding.checkedAt <= 60_000, "near-paid-run-funding-unverified");
-    need(runtimeFunding.availableRaw >= requiredRaw, "near-paid-run-funding-insufficient");
-    // Cross-check the durable obligations and independently confirmed balance.
-    // No extra reserve for a hypothetical new run is needed for this check.
-    const result = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
-      nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
-    need(result.ok, "near-paid-run-funding-insufficient");
+    need(hasCapitalEvidence(), "near-paid-run-funding-unverified");
+    need(hasCapital(requiredRaw), "near-paid-run-funding-insufficient");
+  }, []);
+  if (state && config.providerUsesWallet !== false) await check("nano-paid-run-funding", () => {
+    try { queuedNanoRaw = paidNanoRunFundingRaw(readNanoLedger().quotes); }
+    catch { throw new CheckError("nano-paid-run-funding-unverified"); }
+    if (queuedNanoRaw === 0n) return;
+    need(hasCapitalEvidence() && queuedNearRaw !== null, "nano-paid-run-funding-unverified");
+    need(hasCapital(queuedNanoRaw + queuedNearRaw), "nano-paid-run-funding-insufficient");
   }, []);
   async function checkRunCapital(stage, buildBudget) {
     if (config.providerUsesWallet === false) return;
     await check(stage, () => {
-      need(state && nano && rates && runtimeFunding && queuedNearRaw !== null
-        && now() - runtimeFunding.checkedAt <= 60_000, "workflow-nano-capital-unverified");
+      need(hasCapitalEvidence() && queuedNearRaw !== null && queuedNanoRaw !== null, "workflow-nano-capital-unverified");
       const { maxRaw, overheadRaw } = buildBudget();
       // A prospective run must fit alongside already paid work that has yet
       // to reserve Nano. Compare the runtime and durable balances separately.
-      const requiredRaw = maxRaw + overheadRaw + queuedNearRaw;
-      const independent = nanoLiquidityCheck({ liabilities: { ...state.liabilities, nanoRaw: state.liabilities.nanoRaw + requiredRaw },
-        nanoBalanceRaw: nano.info.confirmed_balance, xnoUsd: rates.xnoUsd, providerReserveUsd: "0" });
-      need(runtimeFunding.availableRaw >= requiredRaw && independent.ok, "workflow-nano-capital-insufficient");
+      need(hasCapital(maxRaw + overheadRaw + queuedNearRaw + queuedNanoRaw), "workflow-nano-capital-insufficient");
     }, []);
   }
   function checkNearPreviewCapital(stage, graph, content, { base, rate, step }) {

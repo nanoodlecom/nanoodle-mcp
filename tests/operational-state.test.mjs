@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
@@ -62,6 +62,20 @@ test("the paid workflow funding check keeps creator overhead and the last unit o
   const creatorCap = (600001n * raw + 1199999n) / 1200000n;
   assert.equal(total, modelCap + creatorCap);
   assert.throws(() => paidNearRunFundingRaw({ paid: { ...paid, paidYocto: "0" } }), /invalid-paid-near-amount/);
+});
+
+test("only unstarted Nano payments consume additional capital at their locked rates", () => {
+  const raw = 10n ** 30n;
+  const paid = { status: "paid", amountRaw: String(raw), usd: "0.5", pair: { usdNano: "500000000", raw: String(raw) } };
+  const rounding = { ...paid, usd: "0.3", pair: { usdNano: "700000000", raw: String(raw) } };
+  const total = paidNanoRunFundingRaw([paid, rounding, { status: "pending" }, { status: "consumed" },
+    { status: "paid", settled: true }, { status: "paid", error: "redacted" },
+    { status: "paid", result: {} }, { status: "paid", refundExpected: true },
+    { status: "paid", executionNeedsReconciliation: true }, { status: "refunded" }]);
+  assert.equal(total, raw + (3n * raw + 6n) / 7n);
+  assert.throws(() => paidNanoRunFundingRaw([{ ...paid, pair: null }]), /invalid-state-amount/);
+  assert.throws(() => paidNanoRunFundingRaw([{ ...paid, usd: null }]), /invalid-paid-nano-amount/);
+  assert.throws(() => paidNanoRunFundingRaw([{ ...paid, pair: { ...paid.pair, raw: "0" } }]), /invalid-paid-nano-rate/);
 });
 
 test("stuck work, permanently failed refunds and long-pending creator payouts remain visible and reserved", () => {

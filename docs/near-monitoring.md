@@ -276,8 +276,9 @@ Coverage:
   that wallet can reserve each advertised NEAR and USDC deposit, the custom
   sample, the tested Market listing budgets, and enabled Market bid ceilings.
   It compares the same run budget against live unreserved funds and the
-  independently confirmed balance after obligations, including paid NEAR and
-  USDC runs still waiting to reserve Nano. A creator run includes overhead
+  independently confirmed balance after obligations. It also checks the
+  combined budgets of paid Nano, NEAR and USDC runs still waiting to start,
+  using each quote's locked rate. A creator run includes overhead
   from the largest possible deposit with quote dust. These are per-workflow
   warnings. The runtime still verifies funding when each run starts.
 - NEAR and USDC share an open-quote limit. The check warns at 80% and

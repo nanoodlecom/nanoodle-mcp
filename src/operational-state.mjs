@@ -1,6 +1,6 @@
 // Read-only accounting for probes and admission checks. Never opens a ledger,
 // signs a transaction, retries an assignment, or returns customer content.
-import { parseUsdNano } from "./usd.mjs";
+import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { nanoFundingCoverage, nanoQuoteClaim, nearCreatorCoverage, marketCreatorCoverage, nearRunFundingBudget } from "./funding-liabilities.mjs";
 import { NEAR_OPERATING_RESERVE, nearRefundClaims, nearFundingNeed } from "./near/funding.mjs";
 import { holdsNearQuoteAmount, nearPaymentWatchCoverage, PAYMENT_WATCH_META, RETAIN_NEAR_QUOTE_MS } from "./near/quote-capacity.mjs";
@@ -122,6 +122,24 @@ export function paidNearRunFundingRaw(quotes) {
     if (amount(quote.paidYocto) === 0n) throw Error("invalid-paid-near-amount");
     const { maxRaw, overheadRaw } = nearRunFundingBudget(quote);
     requiredRaw += maxRaw + overheadRaw;
+  }
+  return requiredRaw;
+}
+
+/** Accepted Nano payments waiting to acquire a Nano run reservation. */
+export function paidNanoRunFundingRaw(quotes) {
+  if (!Array.isArray(quotes)) throw Error("invalid-state-shape");
+  let requiredRaw = 0n;
+  for (const quote of quotes) {
+    if (quote.status !== "paid" || quote.settled || quote.result || quote.error
+      || quote.refundExpected || quote.executionNeedsReconciliation) continue;
+    if (nanoQuoteClaim(quote) === 0n || !(knownUsd(quote.usd) > 0)) throw Error("invalid-paid-nano-amount");
+    const rateUsd = amount(quote.pair?.usdNano), rateRaw = amount(quote.pair?.raw);
+    const depositUsd = parseUsdNano(quote.usd);
+    if (rateUsd === 0n || rateRaw === 0n || depositUsd === 0n) throw Error("invalid-paid-nano-rate");
+    // Creator configuration is resolved at execution. The ceiling covers
+    // the possible combination of rounded-down model funds and rounded-up overhead.
+    requiredRaw += (depositUsd * rateRaw + rateUsd - 1n) / rateUsd;
   }
   return requiredRaw;
 }
