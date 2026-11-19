@@ -2335,6 +2335,29 @@ function marketIntakeRow(age, fields = {}) {
   job: { jobKind: "instant", title: "PRIVATE_BUYER_BRIEF" } };
 }
 
+test("the scheduled check alerts on a repeatedly retried Market hire before its SLA expires", async t => {
+  const age = 3_600_001;
+  const row = marketIntakeRow(age, { slaSeconds: 10_800, slaDeadlineAt: new Date(NOW - age + 10_800_000).toISOString() });
+  const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments" ? Response.json({ assignments: [row] }) : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = {
+    phase: "new", createdAt: NOW - age, updatedAt: NOW - 10, attempts: 12, nextAttemptAt: NOW + 30_000,
+    lastError: "PRIVATE_RETRY_DETAILS",
+  };
+
+  const invocationId = ID.replaceAll("-", "");
+  const report = await runOperationalCheck({ ...f.config, invocationId }, f.deps);
+  const stage = name => report.checks.find(c => c.stage === name);
+  assert.equal(stage("market-sla-nanoodle-image").ok, true);
+  assert.deepEqual(stage("market-work-stuck"), { stage: "market-work-stuck", ok: false, code: "market-work-stuck", domains: [] });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, report, NOW);
+  assert.match(alert.text, /market-work-stuck/);
+  assert.doesNotMatch(JSON.stringify({ report, alert }), /PRIVATE_RETRY_DETAILS|PRIVATE_BUYER_BRIEF/);
+  assert.ok(!f.calls.some(({ url, body }) => /\/(start|submit|decline)$/.test(url.pathname) || body?.params?.name === "run_noodle"));
+});
+
 test("Market intake catches unclaimed hires, remote starts missing local state and expired SLAs", async () => {
   const fresh = marketIntakeRow(40_000);
   const cases = [
