@@ -13,13 +13,14 @@ import { fileURLToPath } from "node:url";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
-import { formatCostUsd } from "../src/tools.mjs";
+import { formatCostUsd, loadTools } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 import { qrModules } from "nanoodle";
 import { qrDecode, svgToMatrix } from "./qr-decode.mjs";
+import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 
 // Any syntactically valid Nano addresses work — checkAddress validates the checksum.
 const GATE_ADDR = "nano_1qs6dkbx5336j7szmhab3i6et8qcuybx84o1er73kp88k43ct7jg3pekjaet";
@@ -218,6 +219,35 @@ test("Nano funding handoff uses the paid quote's locked pair and refuses before 
       assert.equal(result.isError, true);
       assert.equal(chain.state.transfers[0].amountRaw, p.amountRaw);
     }
+  }
+});
+
+test("Nano refunds an underfunded saved workflow before its first provider call", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-saved-budget-"));
+  const models = nanoGptMock();
+  await models.listen();
+  t.after(async () => {
+    await models.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  // The first deposit covers chat but would fail at the following image invoice.
+  // The second covers the estimate only before reserving the creator's share.
+  await writeFile(join(dir, "poster.json"), JSON.stringify({ ...WORKED_GRAPH, x402: { usd: 0.005 } }));
+  await writeFile(join(dir, "authored.json"), JSON.stringify({ ...WORKED_GRAPH, x402: { usd: 0.01, author: PAYER } }));
+  const registry = await loadTools({ dirs: [dir], apiKey: "fixture-key", baseUrl: models.url, outDir: dir });
+  const chain = fakeChain();
+  const gate = makeGate(chain, { registry, fundRun: (_terms, run) => run() });
+  t.after(() => gate.stop());
+  const { callTool } = gate.wrapRegistry(registry);
+  const args = { Idea: "a lighthouse at dawn" };
+  for (const [name, hash] of [["poster", "C"], ["authored", "D"]]) {
+    const quote = argOf(await callTool({ name, arguments: args }));
+    chain.state.receivable[hash.repeat(64)] = { amount: quote.amountRaw, source: PAYER };
+    const result = await callTool({ name, arguments: { ...args, _payment_id: quote.paymentId } });
+    assert.equal(models.runs(), 0);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /current model estimate exceeds this quote's budget/);
+    assert.equal(chain.state.transfers.at(-1).amountRaw, quote.amountRaw);
   }
 });
 

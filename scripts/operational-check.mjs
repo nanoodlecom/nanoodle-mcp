@@ -31,7 +31,7 @@ import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { createMarketFeeGuard } from "../src/market/fee-guard.mjs";
 import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
-import { computePrice } from "../src/tools.mjs";
+import { computePrice, priceSavedWorkflow } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
@@ -57,6 +57,8 @@ const MARKET_MAX_PAGES = 5;
 const MARKET_SLA_WARNINGS = ["market-sla-execution-overdue", "market-sla-start-window-ended",
   "market-sla-retry-after-cutoff", "market-sla-delivery-due"];
 const SHARED_SAVED_WORKFLOWS = ["image-model-arena", "mix-the-references", "neon-shrine-duel", "photo-to-video", "sing"];
+const EXTRA_NANO_WORKFLOW_LIMIT = 8;
+const NANO_SAVED_DEPOSIT = /Runs on NanoGPT — \$(\d+(?:\.\d+)?) deposit per call, paid in Nano \(XNO\) —/;
 const NEAR_WORKFLOW_TEMPLATE = "idea-to-3d-model";
 const CAPACITY_WARNING = 0.8;
 const BACKUP_VERIFICATION_AGE_MS = 2 * 3600_000;
@@ -236,6 +238,7 @@ export async function runOperationalCheck(config, deps = {}) {
   const now = deps.now || Date.now, read = deps.readJson || readJson;
   const request = createProbeFetch({ fetch: deps.fetch || globalThis.fetch, timeoutMs: config.timeoutMs || 12_000 });
   const priceWorkflow = deps.computePrice || computePrice;
+  const pricePublishedWorkflow = deps.priceSavedWorkflow || priceSavedWorkflow;
   const providerReserveUsd = config.providerReserveUsd || "2";
   const checks = [];
   const peerUrls = config.nanoStandby ? [...config.nanoRpcUrls, config.nanoStandby.url] : config.nanoRpcUrls;
@@ -294,9 +297,22 @@ export async function runOperationalCheck(config, deps = {}) {
     return parseUsdNano(exactUsd(charge));
   }
   async function checkSavedWorkflows(site, tools, assets, heldAmounts = null) {
-    const names = assets.includes("nano") ? SHARED_SAVED_WORKFLOWS : [...SHARED_SAVED_WORKFLOWS, NEAR_WORKFLOW_TEMPLATE];
-    for (const name of names) {
-      const template = name === NEAR_WORKFLOW_TEMPLATE;
+    const names = [...SHARED_SAVED_WORKFLOWS];
+    let additional = [];
+    if (assets.includes("nano")) {
+      const discovered = new Set(tools.filter(tool => /^[a-z0-9_-]{1,64}$/.test(tool?.name) && tool.name !== "run_noodle"
+        && !tool.pricedPerRequest && (tool.inputSchema?.properties?._payment_id || NANO_SAVED_DEPOSIT.test(tool.description))
+        && !names.includes(tool.name)).map(tool => tool.name));
+      if (discovered.size > EXTRA_NANO_WORKFLOW_LIMIT) await check("saved-nano-workflow-coverage", () => {
+        need(false, "saved-nano-workflow-scan-incomplete");
+      }, []);
+      additional = [...discovered].sort().slice(0, EXTRA_NANO_WORKFLOW_LIMIT);
+    } else {
+      names.push(NEAR_WORKFLOW_TEMPLATE);
+    }
+    for (const name of [...names, ...additional]) {
+      const savedOnly = additional.includes(name);
+      const template = !savedOnly && name === NEAR_WORKFLOW_TEMPLATE;
       // Share the published graph within this site. Run the next graph's price
       // requests after these finish so a cold catalog isn't fetched in a burst.
       const tool = tools.find(t => t?.name === name);
@@ -306,19 +322,27 @@ export async function runOperationalCheck(config, deps = {}) {
         need(Array.isArray(value?.nodes) && value.nodes.length > 0 && Array.isArray(value.links), "saved-workflow-graph-invalid");
         return value;
       })();
-      const fresh = graph.then(published => freshCharge({ graph: published }));
+      const fresh = graph.then(async published => {
+        if (!savedOnly) return freshCharge({ graph: published });
+        // Operator-installed graphs can use nodes outside the custom graph allowlist.
+        const { pricing } = await pricePublishedWorkflow(published, { fetch: request, baseUrl: config.nanoGptBase });
+        const charge = pricing.likelyChargeUsd;
+        need(pricing.unpriced.length === 0 && pricing.refusals.length === 0 && Number.isFinite(charge) && charge >= 0,
+          "workflow-provider-pricing-unavailable");
+        return parseUsdNano(exactUsd(charge));
+      });
       await Promise.all(assets.map(asset => check(`saved-workflow-${asset}-${name}`, async () => {
         const [published, charge] = await Promise.all([graph, fresh]);
-        const result = await mcp("tools/call", { name: "price_noodle", arguments: { graph: published, _pay_with: asset === "nano" ? "near" : asset } }, site);
-        const content = savedPricingContent(result);
+        const content = savedOnly ? null : savedPricingContent(await mcp("tools/call", {
+          name: "price_noodle", arguments: { graph: published, _pay_with: asset === "nano" ? "near" : asset },
+        }, site));
         if (asset === "nano") {
           // Fixed-deposit tools on the live Nano API publish the cold deposit
           // in their generated MCP description, including the payment rail.
-          const amount = typeof tool.description === "string"
-            && tool.description.match(/Runs on NanoGPT — \$(\d+(?:\.\d+)?) deposit per call, paid in Nano \(XNO\) —/)?.[1];
+          const amount = typeof tool.description === "string" && tool.description.match(NANO_SAVED_DEPOSIT)?.[1];
           need(!tool.pricedPerRequest && positiveDecimal(amount), "saved-nano-deposit-unavailable");
           const deposit = parseUsdNano(amount);
-          need(deposit >= charge && deposit >= parseUsdNano(content.pricing.likelyCharge.usd), "saved-nano-deposit-too-low");
+          need(deposit >= charge && (!content || deposit >= parseUsdNano(content.pricing.likelyCharge.usd)), "saved-nano-deposit-too-low");
           await checkUsdRunCapital(`workflow-nano-capital-nano-${name}`, amount, Boolean(authorAddress(published.x402)));
         } else {
           need(parseUsdNano(content.pricing.deposit.usd) >= charge, "saved-workflow-deposit-too-low");

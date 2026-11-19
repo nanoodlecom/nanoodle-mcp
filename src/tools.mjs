@@ -19,7 +19,8 @@ import { gzipSync } from "node:zlib";
 import { workflowExample } from "./workflow-examples.mjs";
 import { HUMANIZE_TOOL, HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, humanizeWriterRecord, checkHumanizeInputs, rebuildHumanizeResult, humanizeFetch, humanizeRunNotes, humanizeExtraProperties, humanizeGraphArgs, humanizeCallOpts, collectSpans, applyHumanizeFallback } from "./humanize.mjs";
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
-import { knownUsd } from "./usd.mjs";
+import { knownUsd, parseUsdNano } from "./usd.mjs";
+import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
@@ -890,6 +891,16 @@ function inputRefusals(workflowGraph, given) {
   return out;
 }
 
+/** Price an operator-installed graph from public catalogs without running it. */
+export async function priceSavedWorkflow(graph, { inputs, baseUrl, fetch, log, catalogTimeoutMs } = {}) {
+  const workflow = new Workflow(graph, { quiet: true });
+  if (workflow.warnings.length) throw new Error("Saved workflow contains unsupported nodes");
+  const catalogs = await fetchCatalogs(graphModelKinds(workflow.graph), {
+    baseUrl, fetch, log, requireFresh: true, ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
+  });
+  return { pricing: priceGraph(workflow.graph, catalogs, { inputs }), catalogs };
+}
+
 /**
  * The work behind price_noodle, shared with the NEAR gate: read the graph,
  * check it against the paid-server rules (report only), load the catalogs it
@@ -1308,9 +1319,17 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
         // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
         // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
         let runWf = tool.wf, hf = null;
-        if (ctx?.paidFunding === true && !tool.humanize) {
-          const bound = bindPaidGraph(tool.wf.graph, registry.catalogs || tool.wf.catalog);
-          runWf = new Workflow(bound.graph, { apiKey: apiKey ?? null, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: runtimeFetch });
+        if (ctx?.fundedMaxUsd && !tool.humanize) {
+          const { pricing, catalogs: fresh } = await priceSavedWorkflow(tool.wf.graph, { inputs, baseUrl, log, catalogTimeoutMs });
+          if (!Number.isFinite(pricing.estimatedCostUsd)
+            || parseUsdNano(pricing.estimatedCostUsd, { roundUp: true }) > parseUsdNano(ctx.fundedMaxUsd)) {
+            throw new FundingError("QUOTE_BUDGET_EXCEEDED", "The current model estimate exceeds this quote's budget. No model work started.");
+          }
+          // Preserve prior binding for operator-priced nodes that the public
+          // catalogs cannot price. Their actual invoices still need wallet approval.
+          const catalog = { ...tool.wf.catalog, ...registry.catalogs, ...fresh };
+          const graph = pricing.unpriced.length ? bindPaidGraph(tool.wf.graph, catalog).graph : pricing.boundGraph;
+          runWf = new Workflow(graph, { apiKey: apiKey ?? null, payment, baseUrl, quiet: true, catalog, fetch: runtimeFetch });
         }
         if (tool.humanize) {
           const args = params.arguments || {};

@@ -274,11 +274,15 @@ Coverage:
   The free MCP check prices a custom two-step graph separately in NEAR and USDC
   against one fresh provider estimate, so a preview failure identifies the
   affected currency.
-- Free pricing for each of the five saved MCP workflows shown on both sites and
-  the paid 3D template. It checks NEAR/USDC denomination and compares the Nano
-  site's advertised fixed deposits with the current estimated charge for the
-  same published graphs. These per-workflow alerts preserve admission for other
-  workflows.
+- Free pricing for the five saved workflows shown on both sites, the paid 3D
+  template, and up to eight more fixed-deposit workflows discovered on the Nano
+  site. It checks NEAR/USDC denomination and compares advertised Nano deposits
+  with the current estimated charge for the published graphs. It reports
+  partial coverage if more than eight additional tools are listed. These
+  warnings preserve admission for other workflows. Before running a paid saved
+  workflow on its Nano wallet, the server also checks the known model estimate
+  for the actual inputs against the quote's wallet budget, with any creator
+  payout allowance held separately.
 - When provider payments use the shared Nano wallet, the monitor checks whether
   that wallet can reserve the saved workflows' advertised Nano, NEAR and USDC
   deposits, the custom sample, the tested Market listing budgets, and enabled

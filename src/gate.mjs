@@ -1609,9 +1609,10 @@ export function createChargeGate({
             }
             try {
               note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
-              const execute = () => registry.callTool({ name, arguments: args }, fundRun ? { ...ctx, paidFunding: true } : ctx);
-              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await withHostedRun(() => fundRun
-                ? fundRun(runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(name) }), execute)
+              const budget = fundRun && runFundingBudget({ id: `nano:${q.id}`, budgetUsd: q.usd, pair: q.pair, creator: !!authors.get(name) });
+              const execute = () => registry.callTool({ name, arguments: args }, budget ? { ...ctx, fundedMaxUsd: budget.maxUsd } : ctx);
+              const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await withHostedRun(() => budget
+                ? fundRun(budget, execute)
                 : execute(), executionLimit);
               // Whether this result carries the customer's paid text output. Kept
               // on q (not inside q.result) so in-process replay is unchanged but
