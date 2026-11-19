@@ -13,13 +13,12 @@ therefore does nothing on a fresh checkout.
 
 from __future__ import annotations
 
-import asyncio
-
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
     EndSessionContent,
+    StartSessionContent,
     TextContent,
     chat_protocol_spec,
 )
@@ -65,6 +64,16 @@ def build_agent(config: Config, service: FacadeService | None = None) -> Agent:
         text = "".join(
             item.text for item in msg.content if isinstance(item, TextContent)
         )
+        if any(isinstance(item, StartSessionContent) for item in msg.content):
+            await ctx.send(
+                sender,
+                _chat_message(
+                    "Hi — I run Nanoodle AI workflows from chat. Send "
+                    "`list` to see what I can run, or paste a nanoodle.com "
+                    "share link."
+                ),
+            )
+            return
         if not text.strip():
             await ctx.send(
                 sender,

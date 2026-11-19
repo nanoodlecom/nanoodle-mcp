@@ -26,7 +26,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-SHARE_LINK_RE = re.compile(r"https://nanoodle\.com/\S*#g=\S+")
+SHARE_LINK_RE = re.compile(r"https://nanoodle\.com/\S*#[ga]=\S+")
 PAYMENT_ID_RE = re.compile(r"^[A-Za-z0-9._\-]{6,128}$")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9\-]{8,64}$")
 

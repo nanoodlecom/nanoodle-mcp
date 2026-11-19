@@ -66,6 +66,13 @@ class Job:
     created_at: float = field(default_factory=time.monotonic)
 
 
+# Payment quotes from nanoodle-mcp's gate expire in about 15 minutes;
+# keep a small grace window for the caller's `paid` reply to arrive.
+PENDING_PAYMENT_TTL_S = 20 * 60
+MAX_TRACKED_JOBS = 200
+MAX_CACHED_REPLIES = 1_000
+
+
 @dataclass
 class _PendingPayment:
     request: RunRequest
@@ -173,6 +180,7 @@ class FacadeService:
         )
         job.task = asyncio.create_task(self._execute(sender, request, arguments))
         self._jobs[job.job_id] = job
+        self._prune_jobs()
         try:
             reply = await asyncio.wait_for(
                 asyncio.shield(job.task), timeout=self._config.short_wait_s
@@ -196,6 +204,13 @@ class FacadeService:
                 "with `run <workflow>: <your input>` first — if it needs "
                 "payment I will send you its payment link."
             )
+        if time.monotonic() - pending.created_at > PENDING_PAYMENT_TTL_S:
+            self._pending_payments.pop(sender, None)
+            return (
+                "That payment quote has expired (quotes live about 15 "
+                "minutes). Start the run again and I will send a fresh "
+                "payment link."
+            )
         arguments = await self._build_arguments(pending.request)
         arguments["_payment_id"] = payment_id
         job = Job(
@@ -204,9 +219,10 @@ class FacadeService:
             label=pending.request.label or pending.request.tool,
         )
         job.task = asyncio.create_task(
-            self._execute_call(pending.request, arguments, sender, resumed=True)
+            self._execute_resumed(pending.request, arguments, sender)
         )
         self._jobs[job.job_id] = job
+        self._prune_jobs()
         try:
             reply = await asyncio.wait_for(
                 asyncio.shield(job.task), timeout=self._config.short_wait_s
@@ -220,7 +236,15 @@ class FacadeService:
         job.done = True
         job.reply = reply
         job.delivered = True
-        if not reply.startswith("That payment"):
+        return reply
+
+    async def _execute_resumed(
+        self, request: RunRequest, arguments: dict, sender: str
+    ) -> str:
+        reply, settled = await self._execute_call(
+            request, arguments, sender, resumed=True
+        )
+        if settled:
             self._pending_payments.pop(sender, None)
         return reply
 
@@ -261,7 +285,10 @@ class FacadeService:
     async def _execute(
         self, sender: str, request: RunRequest, arguments: dict
     ) -> str:
-        return await self._execute_call(request, arguments, sender, resumed=False)
+        reply, _settled = await self._execute_call(
+            request, arguments, sender, resumed=False
+        )
+        return reply
 
     async def _execute_call(
         self,
@@ -270,20 +297,23 @@ class FacadeService:
         sender: str,
         *,
         resumed: bool,
-    ) -> str:
+    ) -> tuple[str, bool]:
+        """Returns (reply, settled). ``settled`` is True only when a resumed
+        payment actually produced a terminal outcome (result or failure),
+        so the pending-payment entry can be dropped."""
         try:
             outcome = await asyncio.to_thread(
                 self._client.call_tool, request.tool, arguments
             )
         except McpError as exc:
-            return f"That run could not start: {exc}"
+            return f"That run could not start: {exc}", resumed
         if isinstance(outcome, PaymentRequired):
             if resumed:
                 return (
                     "That payment has not settled yet, or the id does not "
                     "match a paid quote. Check the payment completed, then "
                     "send `paid <payment_id>` again."
-                )
+                ), False
             self._pending_payments[sender] = _PendingPayment(request=request)
             preview_note = (
                 " This workflow is marked as a free preview, but the "
@@ -305,10 +335,12 @@ class FacadeService:
                 "The price is the run's actual metered cost plus 20%; any "
                 "deposit above that is refunded automatically, and a failed "
                 "run is refunded too." + preview_note + id_hint
-            )
+            ), False
         if outcome.is_error:
-            return f"That run failed: {self._trim(outcome.text or 'the workflow returned an error')}"
-        return self._format_result(request, outcome)
+            return (
+                f"That run failed: {self._trim(outcome.text or 'the workflow returned an error')}"
+            ), True
+        return self._format_result(request, outcome), True
 
     def _format_result(self, request: RunRequest, outcome: ToolResult) -> str:
         text = self._trim(outcome.text) or "(the workflow returned no text)"
@@ -321,7 +353,7 @@ class FacadeService:
         limit = self._config.max_reply_chars
         if len(text) <= limit:
             return text
-        return text[:limit] + "\n…[truncated — the full result lives at the links above/in the workflow output]"
+        return text[:limit] + "\n…[truncated — the full result is in the workflow's output]"
 
     # ------------------------------------------------------------------
     # background delivery + caches
@@ -354,4 +386,22 @@ class FacadeService:
 
     def _cache_put(self, key: tuple[str, str], reply: str) -> list[str]:
         self._reply_cache[key] = (time.monotonic(), reply)
+        if len(self._reply_cache) > MAX_CACHED_REPLIES:
+            now = time.monotonic()
+            expired = [
+                k
+                for k, (stored_at, _) in self._reply_cache.items()
+                if now - stored_at > self._config.dedup_ttl_s
+            ]
+            for k in expired:
+                self._reply_cache.pop(k, None)
+            while len(self._reply_cache) > MAX_CACHED_REPLIES:
+                self._reply_cache.pop(next(iter(self._reply_cache)), None)
         return [reply]
+
+    def _prune_jobs(self) -> None:
+        if len(self._jobs) <= MAX_TRACKED_JOBS:
+            return
+        delivered = [j for j in self._jobs.values() if j.delivered]
+        for job in delivered[: len(self._jobs) - MAX_TRACKED_JOBS]:
+            self._jobs.pop(job.job_id, None)
