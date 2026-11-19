@@ -12,6 +12,7 @@ const object = value => value && typeof value === "object" && !Array.isArray(val
 const U128_MAX = (1n << 128n) - 1n;
 const RAW_PER_XNO = 10n ** 30n;
 const NANO_EXECUTION_GRACE_MS = 5 * 60_000;
+const PAID_FAILURE_WINDOW_MS = 30 * 60_000;
 function amount(value) {
   if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128_MAX) throw Error("invalid-state-amount");
   return BigInt(value);
@@ -26,6 +27,26 @@ function marketReservationUsd(record) {
   const usd = record.pricing?.depositUsd ?? record.budgetUsd;
   if (!(typeof usd === "number" && Number.isFinite(usd) && usd >= 0)) throw Error("invalid-market-reservation");
   return usd;
+}
+
+export function recentPaidWorkflowFailures({ nano, near }, now = Date.now()) {
+  const failures = { nano: 0, near: 0, usdc: 0 };
+  const recent = at => Number.isSafeInteger(at) && at <= now && now - at < PAID_FAILURE_WINDOW_MS;
+  for (const quote of nano.quotes) {
+    // Late deposits can also be refunded. A failed run retains a redacted
+    // execution error and its finish time, including while the refund is owed.
+    if ((quote.status === "consumed" || quote.status === "refunded") && !quote.settled
+      && typeof quote.error === "string" && quote.error.length > 0 && recent(quote.completedAt)
+      && Number.isSafeInteger(quote.paidAt) && quote.paidAt > 0 && quote.paidAt <= quote.completedAt) {
+      failures.nano++;
+    }
+  }
+  for (const quote of values(near.quotes)) {
+    if (quote.status === "failed" && quote.outcome === "run_failed" && recent(quote.finishedAt)) {
+      failures[quote.asset === "usdc" ? "usdc" : "near"]++;
+    }
+  }
+  return failures;
 }
 
 export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now(), stuckMs = 3_600_000, debtMs = 900_000 } = {}) {
