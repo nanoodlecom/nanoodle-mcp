@@ -4,6 +4,7 @@ import { PaymentPayloadV2Schema, PaymentRequiredV2Schema } from "@x402/core/sche
 import { decodePaymentSignatureHeader, encodePaymentRequiredHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { ExactSvmScheme } from "@x402/svm/exact/server";
+import { declareDiscoveryExtension, bazaarResourceServerExtension } from "@x402/extensions/bazaar";
 import { address, getTransactionDecoder } from "@solana/kit";
 
 export const BASE = "eip155:8453";
@@ -75,7 +76,14 @@ async function bounded(fn, timeoutMs, signal) {
  * No ledger, wallet, FX operation, default facilitator or refund is created.
  */
 export function createX402ExactIngress({ registry, resolveContext, boundary, facilitator,
-  facilitatorId, routes, clock = Date.now, timeoutMs = 10_000, capabilityTtlMs = 30_000 }) {
+  facilitatorId, routes, discoveryFor, clock = Date.now, timeoutMs = 10_000, capabilityTtlMs = 30_000 }) {
+  // discoveryFor (optional) enables CDP Bazaar discovery: it maps a clean
+  // call + its registry tool to { description (<=500 chars, enforced — the
+  // CDP Facilitator rejects longer), inputSchema?, example?, output? }.
+  // Returning null leaves that call undiscoverable. Discovery metadata is
+  // descriptive only; text that reads as an instruction to an agent fails
+  // CDP's content screening and is the operator's editorial responsibility.
+  check(discoveryFor === undefined || typeof discoveryFor === "function", "INVALID_DISCOVERY");
   check(typeof registry?.prepareCall === "function" && typeof registry?.listTools === "function"
     && typeof resolveContext === "function", "MISSING_REGISTRY_CONTEXT");
   check(boundary?.contractVersion === BOUNDARY_CONTRACT, "MISSING_CANONICAL_BOUNDARY_CONTRACT");
@@ -113,6 +121,7 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
       settle: (...args) => facilitator.settle(...args),
     });
     for (const r of policy) if (supportedNetworks.has(r.network)) server.register(r.network, schemes[r.network]);
+    if (discoveryFor) server.registerExtension(bazaarResourceServerExtension);
     check(policy.some(r => supportedNetworks.has(r.network)), "NETWORK_UNAVAILABLE");
     await bounded(() => server.initialize(), timeoutMs, signal);
     return { server, supportedNetworks };
@@ -151,8 +160,26 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
       else check(validAddress(r.extra.feePayer, SOLANA), "INVALID_FEE_PAYER");
     }
   }
-  function required(q) {
-    const body = copy({ x402Version: 2, resource: q.resource, accepts: q.requirements });
+  async function discoveryExtensions(clean, signal) {
+    if (!discoveryFor) return undefined;
+    const tool = registry.listTools().find(t => t.name === clean.name);
+    const cfg = copy(await bounded(() => discoveryFor(copy(clean), tool ? copy(tool) : undefined), timeoutMs, signal));
+    if (cfg === null) return undefined;
+    check(cfg && typeof cfg.description === "string" && cfg.description.length > 0
+      && cfg.description.length <= 500, "DISCOVERY_DESCRIPTION_INVALID");
+    const inputSchema = cfg.inputSchema ?? tool?.inputSchema;
+    check(inputSchema && typeof inputSchema === "object" && !Array.isArray(inputSchema), "DISCOVERY_SCHEMA_MISSING");
+    let declared;
+    try {
+      declared = declareDiscoveryExtension({ toolName: clean.name, description: cfg.description,
+        inputSchema, ...(cfg.example !== undefined ? { example: cfg.example } : {}),
+        ...(cfg.output !== undefined ? { output: cfg.output } : {}) });
+    } catch { throw new IngressError("DISCOVERY_INVALID"); }
+    return copy(declared);
+  }
+  function required(q, extensions) {
+    const body = copy({ x402Version: 2, resource: q.resource, accepts: q.requirements,
+      ...(extensions ? { extensions } : {}) });
     check(PaymentRequiredV2Schema.safeParse(body).success, "INVALID_REQUIREMENTS");
     return { status: 402, headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(body) }, body };
   }
@@ -245,6 +272,7 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
       check(nonempty(ctx.requestId) && nonempty(ctx.customerScope) && /^[a-f0-9]{64}$/.test(ctx.workflowDigest)
         && nonempty(ctx.resource?.url), "MISSING_AUTHORITATIVE_CONTEXT");
       const request = { ...ctx, call: clean };
+      const declaredExtensions = await discoveryExtensions(clean, signal);
       const binding = hash(["nanoodle-x402-ingress/v1", request, policy, facilitatorId]);
       // Request identity deliberately excludes network, nonce, quote ID and
       // mutable workflow/price data. Requoting a request cannot fund it twice.
@@ -257,7 +285,7 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         check(now() < q.expiresAt, "QUOTE_EXPIRED");
         const { supportedNetworks } = await sdk(signal);
         check(q.requirements.every(r => supportedNetworks.has(r.network)), "NETWORK_UNAVAILABLE");
-        return required(q);
+        return required(q, declaredExtensions);
       }
       check(typeof paymentSignature === "string" && paymentSignature.length <= 16_384, "INVALID_PAYMENT_HEADER");
       const payload = copy(decodePaymentSignatureHeader(paymentSignature));
@@ -284,7 +312,7 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         check(now() < q.expiresAt, "QUOTE_EXPIRED");
         const { server, supportedNetworks } = await sdk(signal);
         check(supportedNetworks.has(r.network), "NETWORK_UNAVAILABLE");
-        const verified = await bounded(() => server.verifyPayment(payload, r), timeoutMs, signal);
+        const verified = await bounded(() => server.verifyPayment(payload, r, declaredExtensions), timeoutMs, signal);
         check(verified.isValid === true && validAddress(verified.payer, r.network)
           && (!auth.payer || normalizePayer(verified.payer, r.network) === normalizePayer(auth.payer, r.network))
           && (!payer || normalizePayer(verified.payer, r.network) === normalizePayer(payer, r.network)), "PAYMENT_REJECTED");
@@ -314,7 +342,12 @@ export function createX402ExactIngress({ registry, resolveContext, boundary, fac
         if (begun.granted !== true) return { status: 202, body: { code: "SETTLEMENT_PENDING", reservationId: reservation.reservationId } };
         check(reservation.state === "settling" && funding.state === "settling", "INVALID_SETTLEMENT_INTENT");
         try {
-          const settlement = await bounded(() => server.settlePayment(payload, r), timeoutMs, signal);
+          // Bazaar indexing keys off this call: with the bazaar extension
+          // registered, the resource server forwards the payload's resource
+          // + extensions.bazaar declaration to the facilitator on settle.
+          const settlement = await bounded(() => server.settlePayment(
+            { ...payload, resource: copy(q.resource), ...(declaredExtensions ? { extensions: declaredExtensions } : {}) },
+            r, declaredExtensions), timeoutMs, signal);
           const receipt = { ...expected, success: settlement.success, network: settlement.network,
             transaction: settlement.transaction, payer: settlement.payer ?? verified.payer,
             asset: r.asset, amountAtomic: r.amount, payTo: r.payTo, facilitatorId };
