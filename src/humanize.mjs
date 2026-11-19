@@ -21,10 +21,8 @@
  *      retried once on the fallback when the primary answers 429 or 5xx, the
  *      request errors, or it has not answered within PRIMARY_TIMEOUT_MS, as long
  *      as nothing was paid for the primary. When a fallback runs, both calls
- *      are charged. (No writer currently has one: the Cydonia → Starry Ocean
- *      entry was retired on 2026-11-18 when NanoGPT delisted Cydonia and
- *      Starry Ocean became writer C's primary.) The model that actually
- *      answered is credited in ranked[]; if the fallback fails too, the note says so.
+ *      are charged. The model that actually answered is credited in ranked[];
+ *      if the fallback fails too, the note says so.
  *    - Dashes: " — ", " – " and " - " become ", " and any other em/en dash
  *      becomes ", " in every writer output, before the decider sees it.
  *    - Near-copy: if the share of the rewrite's word trigrams that also occur in
@@ -125,11 +123,12 @@ const COMMENT_TAG = /<\s*\/?\s*comment\b/i;
 const LETTERS = ["A", "B", "C", "D", "E"];
 /**
  * Writer fallbacks by primary model (mcp only; the graph itself has no fallback).
- * Empty since 2026-11-18: the one entry (TheDrummer/Cydonia-24B-v4.3 →
- * gemma-4-12b-it-starry-ocean) was retired when NanoGPT delisted Cydonia and
- * Starry Ocean became writer C's primary. No writer currently has a fallback.
+ * Retain Cydonia's fallback for older mounted graphs. The current catalog
+ * names Starry Ocean directly, so that graph has no fallback to reserve.
  */
-export const HUMANIZE_FALLBACKS = Object.freeze({});
+export const HUMANIZE_FALLBACKS = Object.freeze({
+  "TheDrummer/Cydonia-24B-v4.3": "gemma-4-12b-it-starry-ocean",
+});
 export const NEAR_COPY_RATIO = 0.6;
 export const PRIMARY_TIMEOUT_MS = 30000;
 export const REASK_DEADLINE_MS = 35000;

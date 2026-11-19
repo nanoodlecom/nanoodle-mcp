@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { createChargeGate } from "../src/gate.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { humanizeFetch, failureMessage, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
+import { humanizeWriterRecord, humanizeFetch, failureMessage, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREFIX, MAX_CHARS_LIMIT, collectSpans, reinsertSpans, tokenUpperBound, writerForwardByteCap, requestOutputTokenCap, checkHumanizeInputs } from "../src/humanize.mjs";
 import {
   humanizeChargeUsd, humanizeDepositUsd, humanizeCeilingDepositUsd, humanizePriceTable, humanizeStageBudget,
   depositFromCharge, settledChargeUsd, HUMANIZE_DEPOSIT_FLOOR_USD, HUMANIZE_DEPOSIT_MARGIN, HUMANIZE_MODEL_PRICES,
@@ -39,6 +39,23 @@ function covers(args) {
   assert.ok(deposit + 1e-12 >= charge * (1 + HUMANIZE_DEPOSIT_MARGIN) || deposit === HUMANIZE_DEPOSIT_FLOOR_USD);
   return deposit;
 }
+
+test("the catalog and a legacy mounted graph keep their respective writer C price reserves", () => {
+  const starryOcean = "gemma-4-12b-it-starry-ocean";
+  const cydonia = "TheDrummer/Cydonia-24B-v4.3";
+  const currentWriter = humanizeWriterRecord(graph).C;
+  assert.equal(currentWriter.model, starryOcean);
+  assert.equal(currentWriter.fallbackModel, null);
+
+  const legacy = structuredClone(graph);
+  legacy.nodes.find((node) => node.id === currentWriter.nodeId).fields.model = cydonia;
+  const writerLabel = legacy.nodes.find((node) => node.fields?.sep?.includes(`[C] ${starryOcean}`));
+  writerLabel.fields.sep = writerLabel.fields.sep.replace(starryOcean, cydonia);
+  const legacyWriter = humanizeWriterRecord(legacy).C;
+  assert.equal(legacyWriter.model, cydonia);
+  assert.equal(legacyWriter.fallbackModel, starryOcean);
+  assert.equal(humanizeCeilingDepositUsd(legacy).toFixed(8), "0.05433870");
+});
 
 test("known USD amounts accept an exponent and a leading dot, and reject garbage", () => {
   assert.equal(knownUsd("1e-3"), 0.001);

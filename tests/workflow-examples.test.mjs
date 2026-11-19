@@ -221,9 +221,9 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     assert.equal(mounted.x402.usd.toFixed(8), "0.05387485");
     // Tokens are bytes / 3.5 (caller text on the decider: bytes / 2.5). Writer output is the draft length plus a small slack,
     // and the decider adds room for its ranking JSON and for GLM reasoning. No
-    // writer currently carries a fallback (the Cydonia → Starry Ocean entry was
-    // retired with Cydonia's delisting on 2026-11-18, when Starry Ocean became
-    // writer C's primary), so no fallback reserve is priced. The quote prices HUMANIZE_PRICED_REASKS
+    // writer in this fixture carries a fallback. The catalog sets Starry Ocean
+    // as writer C's primary, so the legacy fallback reserve is unused here.
+    // The quote prices HUMANIZE_PRICED_REASKS
     // extra writer calls; the run may still attempt MAX_REASKS and stops when the
     // next one would pass the deposit. At the counted Guidance cap, with no keep
     // and no repair, that charge is $0.00940824 after the 20% markup.

@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.3'
       - name: Compare the packaged version with the prior main commit
         id: qualify
         env:
@@ -53,7 +53,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.3'
       - name: Tag and release the tested source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24.22.1"
+          node-version: "24.22.3"
       - name: Restore pinned ffmpeg archive
         id: ffmpeg-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

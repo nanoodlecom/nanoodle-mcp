@@ -80,7 +80,7 @@ lands. Nothing else in the release changes the Nano or BYOK paths.
 ## 1a. Releasing 0.7.0 (owner actions, in this order)
 
 1. From a clean checkout of the release commit (the `hackathon-submission` tag or
-   `main` after it is merged), with Node 22.23.4+, 24.22.1+ or 26.12.1+:
+   `main` after it is merged), with Node 22.23.5+, 24.22.3+ or 26.13.1+:
 
    ```bash
    npm ci && npm test                         # ends with "fail 0"
