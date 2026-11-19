@@ -508,7 +508,7 @@ is then sent `max_tokens: 2000`. See [Pricing assumptions](#pricing-assumptions)
 | `noodle_guide` | no, free | How to author a graph: allowed node types, their ports and fields, a complete example, and the priced models per kind with unit prices (`kind`, `search`, `limit` filters). |
 | saved-graph tools | yes | Every graph in `--graphs` that passes the same safety checks. They are priced the same itemized way. |
 
-The built-in tools (`subnano_comment`, `sfw_check`, `humanize-comment`) are not offered in
+The built-in tools (`sfw_check`, `humanize-comment`) are not offered in
 NEAR mode.
 
 `run_noodle` and `price_noodle` are also available in the free stdio and HTTP modes, where
@@ -1112,7 +1112,7 @@ These are deliberate cuts for this version.
   operator absorbs the overrun.
 - Text results are not kept across restarts. A replay after a restart returns the receipt
   only.
-- Built-in tools (`subnano_comment`, `sfw_check`, `humanize-comment`) are not sold in
+- Built-in tools (`sfw_check`, `humanize-comment`) are not sold in
   NEAR mode.
 - The NEAR pay page connects a wallet rather than using a universal payment QR code.
   Exact transfers sent outside that page are detected by the shared RPC watcher;
