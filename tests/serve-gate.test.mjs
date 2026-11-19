@@ -1889,7 +1889,7 @@ test("no graph names an author: the page says the markup stays with the server, 
     // Says where the money actually goes today.
     assert.match(html, /None of the workflows here name one yet, so for now the markup stays with this server\./);
     assert.match(html, /No workflow here claims it yet/);
-    assert.match(txt, /No workflow on this server carries that field, so the markup stays with the operator\./);
+    assert.match(txt, /otherwise the operator keeps the markup/);
 
     // Never the unconditional claim, in either place.
     for (const [where, body] of [["landing page", html], ["/llms.txt", txt]]) {
@@ -1903,7 +1903,7 @@ test("no graph names an author: the page says the markup stays with the server, 
 
     // The genuine feature survives: a graph CAN claim it, and the page says how.
     assert.match(html, /"x402": \{"author": "nano_…"\}/);
-    assert.match(txt, /x402": \{"author": "nano_…"\}/);
+    assert.match(txt, /A graph can assign the available markup to its author/);
   } finally {
     server.close();
   }
@@ -2104,14 +2104,14 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
     const res = await fetch(`${base}/llms.txt`);
     assert.match(res.headers.get("content-type"), /text\/plain/);
     const txt = await res.text();
-    assert.match(txt, /endpoint: http:\/\/pay\.test\/mcp/);
+    assert.match(txt, /MCP endpoint: http:\/\/pay\.test\/mcp/);
     assert.match(txt, /claude mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
     assert.match(txt, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
-    assert.match(txt, /## Payment \(x402, Nano\/XNO\)/);
-    assert.match(txt, /settles at metered model cost \+ 20%/);
-    assert.match(txt, /- poster: /);
-    assert.match(txt, /graph: http:\/\/pay\.test\/graph\/poster\.json/);
-    assert.match(txt, /npx nanoodle-mcp --graphs/);
+    assert.match(txt, /Nano \(XNO\) is the default/);
+    assert.match(txt, /settle at metered model cost plus a 20% markup/);
+    assert.match(txt, /- `poster`: /);
+    assert.match(txt, /\[graph JSON\]\(http:\/\/pay\.test\/graph\/poster\.json\)/);
+    assert.match(txt, /nanoodle-mcp --graphs/);
   } finally {
     server.close();
   }
@@ -2125,8 +2125,9 @@ test("llms.txt: plain-text endpoint, payment contract, and tool list; free mode 
   const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
   try {
     const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
-    assert.doesNotMatch(txt, /Payment/);
-    assert.match(txt, /- poster: /);
+    assert.doesNotMatch(txt, /quote is not permission|payment guide/);
+    assert.match(txt, /operator’s balance/);
+    assert.match(txt, /- `poster`: /);
   } finally {
     freeServer.close();
   }
@@ -2210,12 +2211,12 @@ test("llms.txt carries a Privacy section; free mode drops the charge-specific li
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const txt = await (await fetch(`${base}/llms.txt`)).text();
-    assert.match(txt, /## Privacy/);
-    assert.match(txt, /No accounts, no API keys, no sign-ins/);
-    assert.match(txt, /Prompts and inputs are never written to disk or logs/);
-    assert.match(txt, /short hash binding a payment to its call/); // charge-only
-    assert.match(txt, /auto-deletes after 24h/);
-    assert.match(txt, /payments ledger \(usage\.jsonl\)/); // charge-only
+    assert.match(txt, /## Costs and data/);
+    assert.match(txt, /do not require a Nanoodle login or a NanoGPT API key/);
+    assert.match(txt, /ordinary invocations the server does not persist prompts or input media/);
+    assert.match(txt, /quote is not permission to spend/); // charge-only
+    assert.match(txt, /retention is 24 hours by default/);
+    assert.match(txt, /payment and receipt records/);
     assert.match(txt, /nano-gpt\.com\/privacy/);
   } finally {
     server.close();
@@ -2230,9 +2231,9 @@ test("llms.txt carries a Privacy section; free mode drops the charge-specific li
   const freeBase = `http://127.0.0.1:${freeServer.address().port}`;
   try {
     const txt = await (await fetch(`${freeBase}/llms.txt`)).text();
-    assert.match(txt, /## Privacy/);
-    assert.doesNotMatch(txt, /short hash binding a payment/);
-    assert.doesNotMatch(txt, /payments ledger \(usage\.jsonl\)/);
+    assert.match(txt, /## Costs and data/);
+    assert.doesNotMatch(txt, /quote is not permission to spend/);
+    assert.doesNotMatch(txt, /Nano payment guide/);
   } finally {
     freeServer.close();
   }
