@@ -141,17 +141,23 @@ function nanoCementationProgress(current, previous, now) {
 
   const priorLead = priorPeer > priorLocal ? priorPeer - priorLocal : 0n;
   const lead = peer - local;
-  if (lead <= priorLead) return progress;
-  // Carry the baseline only across consecutive increases. Steady historical
-  // lag, an isolated change in the peer median and telemetry gaps do not warn.
+  if (lead < priorLead) return progress;
+  // Keep a recent rise through a short plateau. Only another increase can
+  // open the trend warning, and a sustained plateau expires the baseline.
+  const increased = lead > priorLead;
   const trend = prior.wideningGap;
   const firstLead = trend?.leadAtStart === "0" ? 0n : nanoLedgerCount(trend?.leadAtStart);
+  const lastIncrease = trend?.lastIncreaseAt ?? checkedAt;
   const ongoing = Number.isSafeInteger(trend?.since) && trend.since > 0 && trend.since <= checkedAt
-    && firstLead !== null && firstLead < priorLead;
+    && Number.isSafeInteger(lastIncrease) && lastIncrease >= trend.since && lastIncrease <= checkedAt
+    && now - lastIncrease <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS && firstLead !== null && firstLead < priorLead;
+  if (!ongoing && !increased) return progress;
   const since = ongoing ? trend.since : checkedAt;
   const leadAtStart = ongoing ? firstLead : priorLead;
-  const growing = now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
-  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString() },
+  const growing = ongoing && (increased || trend.alerted === true)
+    && now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
+  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString(), lastIncreaseAt: increased ? now : lastIncrease,
+    ...(growing && { alerted: true }) },
     ...(growing && { code: "nano-ledger-confirmations-falling-behind" }) };
 }
 

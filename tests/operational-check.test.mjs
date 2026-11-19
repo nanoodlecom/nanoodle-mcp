@@ -2530,6 +2530,37 @@ test("the monitor reports a widening Nano confirmation gap even while the owned 
   assert.equal(catchingUp.ok, false, "the old absolute backlog remains visible");
 });
 
+test("a widening Nano confirmation gap can span a brief plateau", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-plateau-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [],
+    NOW + minutes * 60_000, { nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  const stage = "nano-ledger-confirmation-progress";
+  const progress = value => value.checks.find(check => check.stage === stage);
+  report(0, "1000", "9000");
+  assert.equal(progress(report(5, "1010", "9035")).ok, true);
+  assert.equal(progress(report(10, "1015", "9040")).ok, true);
+  const slower = report(15, "1020", "9075");
+  assert.equal(progress(slower).code, "nano-ledger-confirmations-falling-behind");
+  assert.equal(report(20, "1030", "9085").incidentId, slower.incidentId);
+  assert.equal(report(25, "1040", "9095").incidentId, slower.incidentId);
+  assert.equal(progress(report(30, "1050", "9105")).ok, true, "a steady gap clears the trend warning");
+  assert.equal(progress(report(35, "1060", "9115")).ok, true);
+});
+
+test("one delayed jump in the Nano peer median and subsequent flat samples never open a trend warning", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-one-jump-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [],
+    NOW + minutes * 60_000, { nanoLedgerSync: { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } });
+  report(0, "1000", "9000");
+  assert.equal(report(11, "1010", "9080").ok, true);
+  assert.equal(report(16, "1020", "9090").ok, true);
+  assert.equal(report(21, "1030", "9100").ok, true);
+  assert.equal(report(26, "1040", "9110").ok, true);
+  assert.equal(report(31, "1050", "9121").ok, true, "new growth needs a fresh baseline after the old one expires");
+});
+
 test("Nano remote counter variation, missing samples and local regression are distinguished", t => {
   const dir = mkdtempSync(join(tmpdir(), "operational-nano-regression-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
