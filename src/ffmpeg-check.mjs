@@ -51,7 +51,8 @@ export function toolsNeedingFfmpeg(tools) {
   const names = [];
   for (const t of tools) {
     const nodes = t?.wf?.graph?.nodes || [];
-    if (nodes.some((n) => LOCAL_MEDIA_TYPES.has(n.type))) names.push(t.name);
+    // sfw_check samples video with ffmpeg. A still image does not.
+    if (t?.ffmpegFor === "video" || nodes.some((n) => LOCAL_MEDIA_TYPES.has(n.type))) names.push(t.name);
   }
   return names;
 }

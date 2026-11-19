@@ -1,17 +1,22 @@
 {
   "name": "nanoodle-mcp",
-  "version": "0.6.0",
+  "version": "0.7.0",
+  "nanoodleMaintenanceProtocol": 2,
   "mcpName": "io.github.nanoodlecom/nanoodle-mcp",
-  "description": "MCP stdio server that turns saved nanoodle workflow graphs into callable tools — BYOK or accountless x402 (pay per call in Nano), runs on the NanoGPT API",
+  "description": "MCP server (stdio and HTTP) that runs nanoodle workflow graphs, saved or composed by the agent, as tools on the NanoGPT API: BYOK, pay per call in Nano (x402), or pay in native NEAR with automatic refunds",
   "type": "module",
   "bin": {
     "nanoodle-mcp": "bin/nanoodle-mcp.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^22.23.5 || ^24.22.3 || >=26.13.1"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "simulate:near": "node scripts/near-simulate.mjs",
+    "simulate:dual": "node scripts/dual-simulate.mjs",
+    "simulate:market": "node scripts/market-simulate.mjs",
+    "build:near-wallet": "node scripts/build-near-wallet.mjs"
   },
   "files": [
     "src",
@@ -22,7 +27,7 @@
   ],
   "dependencies": {
     "nanocurrency": "^2.5.0",
-    "nanoodle": "file:vendor/nanoodle-0.9.0-7a57f9b.tgz"
+    "nanoodle": "file:vendor/nanoodle-0.9.0-decider-branches.tgz"
   },
   "keywords": [
     "mcp",
@@ -40,7 +45,12 @@
     "x402",
     "nano",
     "accountless",
-    "micropayments"
+    "micropayments",
+    "near",
+    "near-protocol",
+    "agent-payments",
+    "pay-per-call",
+    "custom-workflows"
   ],
   "license": "MIT",
   "author": "255BITS",
@@ -51,5 +61,9 @@
   },
   "bugs": {
     "url": "https://github.com/nanoodlecom/nanoodle-mcp/issues"
+  },
+  "devDependencies": {
+    "@hot-labs/near-connect": "0.12.0",
+    "esbuild": "0.28.2"
   }
 }

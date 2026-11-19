@@ -2,16 +2,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serveHttp } from "../src/http.mjs";
 import { loadTools } from "../src/tools.mjs";
-import { HUMANIZE_INPUT_CAPS } from "../src/humanize.mjs";
+import { HUMANIZE_INPUT_CAPS, HUMANIZE_FALLBACKS, HUMANIZE_PRICED_REASKS, REASK_TEXT, MAX_REASKS, ONE_THREAD_PREFIX, placeholderBudget, requestOutputTokenCap, estimateTokensFromBytes, writerForwardByteCap, HUMANIZE_BYTES_PER_TOKEN, HUMANIZE_SETTLE_MARKUP, tokenUpperBound } from "../src/humanize.mjs";
+import { humanizeCeilingDepositUsd, humanizeChargeUsd, HUMANIZE_DEPOSIT_MARGIN, HUMANIZE_MODEL_PRICES } from "../src/humanize-deposit.mjs";
 import { mkdtemp, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-async function pages(toolName, structured) {
+async function pages(toolName, structured, publicBase = "https://mcp.nanoodle.com") {
   const tool = { name: toolName, description: "Generate reference and parts images.", inputSchema: { type: "object" } };
   const server = await serveHttp({
     host: "127.0.0.1", port: 0, name: "examples", version: "0",
-    publicBase: "http://example.test", log: () => {},
+    publicBase, log: () => {},
     listTools: () => [tool], callTool: async () => { throw new Error("No generation in this test"); },
     toolInfo: [{ ...tool, rawText: "{}", editorUrl: "https://nanoodle.com/#g=test",
       ...(structured ? { card: { intent: tool.description, steps: [{ kind: "image", label: "Image", n: 2 }] } } : {}),
@@ -32,19 +33,26 @@ async function pages(toolName, structured) {
 for (const structured of [true, false]) {
   test(`mounted character workflow exposes playable outcome and local skill (structured=${structured})`, async () => {
     const [html, text] = await pages("character-sprites", structured);
+    assert.match(html, /graph generates a character reference and parts sheet/);
+    assert.match(html, /local skill bakes animated sprites/);
+    assert.match(html, /coding agent adds combat, gravity and game rules/);
     for (const body of [html, text]) {
       assert.match(body, /Iron Verdict/);
       assert.match(body, /https:\/\/nanoodle\.com\/examples\/iron-verdict\//);
       assert.match(body, /https:\/\/github\.com\/nanoodlecom\/noodle-skills\/tree\/main\/skills\/character-sprites/);
-      assert.match(body, /graph generates a character reference and parts sheet/);
-      assert.match(body, /local skill bakes animated sprites/);
-      assert.match(body, /coding agent adds combat, gravity and game rules/);
     }
     assert.match(html, /href="\/graph\/character-sprites\.json"/);
     assert.match(html, /src="https:\/\/media\.nanoodle\.com\/mcp\/examples\/iron-verdict\.png"/);
-    assert.match(text, /graph: http:\/\/example\.test\/graph\/character-sprites\.json/);
+    assert.match(text, /https:\/\/mcp\.nanoodle\.com\/graph\/character-sprites\.json/);
+    assert.doesNotMatch(text, /graph generates a character reference and parts sheet/);
   });
 }
+
+test("a third-party server's discovery does not imply its identically named tool is first-party", async () => {
+  const [, text] = await pages("character-sprites", true, "http://third-party.test");
+  assert.match(text, /http:\/\/third-party\.test\/graph\/character-sprites\.json/);
+  assert.doesNotMatch(text, /Iron Verdict|skills\/character-sprites/);
+});
 
 test("servers without the character workflow do not imply the example tool is mounted", async () => {
   for (const name of ["poster", "constructor"]) {
@@ -59,33 +67,35 @@ for (const name of ["favicon", "fibo-studio-still", "night-market-postcard", "im
     for (const structured of [true, false]) {
       const [html, text] = await pages(name, structured);
       for (const body of [html, text]) {
-        assert.ok(body.includes(`https://nanoodle.com/examples/gallery/#${name}`));
-        assert.doesNotMatch(body, /undefined|agent skill:|give your agent the skill|Iron Verdict/);
+        assert.ok(body.includes(name === "sing" ? "https://mcp.nanoodle.com/examples/sing.mp3" : `https://nanoodle.com/examples/gallery/#${name}`));
+        assert.doesNotMatch(body, /undefined|agent skill:|give your agent the skill|local skill|Iron Verdict/);
       }
       assert.match(html, />See sample<\/a>/);
       assert.ok(html.includes(`id="${name}"`));
       if (["deslop", "sing"].includes(name)) assert.ok(!html.includes(`examples/gallery/${name}/preview`));
       else if (["image-model-arena", "photo-to-video", "talking-avatar"].includes(name)) assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
-      else if (name === "idea-to-3d-model") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
+      else if (name === "idea-to-3d-model") assert.ok(html.includes('poster="/examples/idea-to-3d-model.png"'));
       else if (name === "mix-the-references") assert.ok(html.includes(`src="https://media.nanoodle.com/mcp/examples/${name}.webp"`));
       else assert.ok(html.includes(`https://nanoodle.com/examples/gallery/${name}/preview.webp`));
       if (name === "sing") {
         assert.match(html, /Audio sample/);
-        assert.match(text, /model-assisted audio review, not human listening sign-off/);
+        assert.match(html, /<audio controls preload="none"/);
+        assert.match(html, /src="\/examples\/sing.mp3" type="audio\/mpeg"/);
+        assert.match(html, /Mureka 9.5/);
       }
       if (name === "talking-avatar") {
         assert.match(html, /Video sample/);
-        assert.match(text, /check precise lip-sync timing in playback/);
+        assert.match(html, /check precise lip-sync timing in playback/);
       }
       if (name === "idea-to-3d-model") {
         assert.match(html, /3D sample/);
-        assert.match(text, /holds up from every side/);
-        assert.match(text, /go soft at some angles/);
+        assert.match(html, /holds up from every side/);
+        assert.match(html, /go soft at some angles/);
       }
       if (name === "mix-the-references") {
         assert.match(html, /Composite sample/);
-        assert.match(text, /names each image by number/);
-        assert.match(text, /paper boats from the place reference mostly drop out/);
+        assert.match(html, /names each image by number/);
+        assert.match(html, /paper boats from the place reference mostly drop out/);
       }
     }
   });
@@ -118,9 +128,12 @@ test("sample calls come from saved graph inputs and omit workflows requiring upl
     assert.match(html, /Try the included sample/);
     assert.match(html, /Rewrite &lt;release notes&gt; for customers &amp; preserve dates/);
     assert.equal((html.match(/Try the included sample/g) || []).length, 1);
-    const call = JSON.parse(text.match(/example MCP call .*?: (.+)/)[1]);
+    const sample = html.match(/<pre>(\{\s*&quot;jsonrpc&quot;:[\s\S]*?\})<\/pre>/)[1];
+    const call = JSON.parse(sample.replaceAll("&quot;", '"'));
     assert.deepEqual(call, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "release-notes", arguments: {} } });
     await registry.prepareCall(call.params);
+    assert.match(text, /\x60release-notes\x60/);
+    assert.doesNotMatch(text, /Rewrite <release notes>|example MCP call/);
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
     await rm(dir, { recursive: true, force: true });
@@ -194,8 +207,8 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const tool = registry.listTools().find(tool => tool.name === "humanize-comment");
     assert.ok(tool);
     // writers + decider carry fields.locked and the labels live in join separators:
-    // only the three author-facing inputs are args, no system prompts or labels
-    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance"]);
+    // graph inputs stay Draft, Context, Guidance; keep, ending, maxChars and title are tool-level
+    assert.deepEqual(Object.keys(tool.inputSchema.properties).filter((k) => k !== "_payment_id").sort(), ["Context", "Draft", "Guidance", "ending", "keep", "maxChars", "title"]);
     assert.deepEqual(tool.inputSchema.required, ["Draft", "Context"]);
     for (const k of Object.keys(tool.inputSchema.properties)) assert.doesNotMatch(k, /system|label|writer|decider/i);
     assert.match(tool.inputSchema.properties.Guidance.description, /default: "a friendly, specific reply"; optional/);
@@ -203,45 +216,84 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     // no reviewed, published sample yet, so no example line or card
     assert.doesNotMatch(tool.description, /Example:/);
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
-    // the charge gate quotes a pinned x402.usd as the deposit (see serve-gate "pinned x402.usd")
-    assert.deepEqual(mounted.x402, { usd: 0.0133 });
-    // ESTIMATE, not a hard bound: worst case at the ENFORCED input caps (src/humanize.mjs), every
-    // writer at its 600-token cap, the decider at its 4300-token cap, the judge re-reading five
-    // full 600-token rewrites, and inputs + system prompts at 3 characters per token. That is
-    // typical for English. Result: $0.01325068 after markup, only $0.00004932 under the pin.
-    // Counting 1 token per UTF-8 byte gives $0.02062404 (ASCII) and $0.04001004 (4-byte scripts),
-    // both above the pin. Even those assume the judge sees about 3000 tokens of rewrites (5 x 600),
-    // which is not proven for multilingual text and not enforced in code.
-    // Above the deposit, the gate (src/gate.mjs settle) charges the customer at most the deposit,
-    // pays no change or author payout, and the operator absorbs the provider cost above it.
-    // GLM-5.3 $0.60/$1.10 per M; writers $0.05-$0.10 in, $0.25-$0.60 out per M (NanoGPT, 20 Oct 2026).
+    // x402.usd is the cold ceiling (longest request, after the margin). A call quotes
+    // less when its own draft, context, guidance, and maxChars cost less.
+    assert.equal(mounted.x402.usd.toFixed(8), "0.05433870");
+    // Tokens are bytes / 3.5 (caller text on the decider: bytes / 2.5). Writer output is the draft length plus a small slack,
+    // and the decider adds room for its ranking JSON and for GLM reasoning. When
+    // Cydonia fails and the Starry fallback runs, both calls are charged. This
+    // figure reserves the larger of those two rates. The quote prices HUMANIZE_PRICED_REASKS
+    // extra writer calls; the run may still attempt MAX_REASKS and stops when the
+    // next one would pass the deposit. At the counted Guidance cap, with no keep
+    // and no repair, that charge is $0.00956268 after the 20% markup.
+    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.0543387.
+    // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10, Cydonia $0.12/$0.15,
+    // Starry Ocean $0.05/$0.25, others $0.10 in and $0.35-$0.60 out.
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
     const judge = byId.get("judge");
-    assert.equal(judge.fields.maxTokens, "4300");
-    const price = { "w-a": [0.1, 0.6], "w-b": [0.1, 0.6], "w-c": [0.05, 0.25], "w-d": [0.1, 0.6], "w-e": [0.1, 0.35] };
+    assert.equal(judge.fields.maxTokens, "1600");
+    assert.equal(MAX_REASKS, 3);
+    assert.equal(HUMANIZE_PRICED_REASKS, 1);
     const bytes = (s) => Buffer.byteLength(s, "utf8");
     const { Draft, Context, Guidance } = HUMANIZE_INPUT_CAPS;
-    const CPT = 3; // characters per token (estimate)
-    let worst = 0;
-    for (const [id, [p, c]] of Object.entries(price)) {
+    const draft = "d".repeat(Draft);
+    const writerOut = requestOutputTokenCap(null, draft);
+    const judgeOut = requestOutputTokenCap(null, draft, { judge: true });
+    const echoed = writerForwardByteCap(writerOut);
+    let base = 0;
+    const reasks = [];
+    for (const id of ["w-a", "w-b", "w-c", "w-d", "w-e"]) {
       const n = byId.get(id);
       assert.equal(n.fields.maxTokens, "600");
-      worst += ((bytes(n.fields.system) + Draft + Context + Guidance + 2 * bytes(byId.get("j-in").fields.sep)) / CPT) * p + 600 * c;
+      const baseBytes = bytes(n.fields.system) + Draft + Context + Guidance + 2 * bytes(byId.get("j-in").fields.sep);
+      const call = (pc, extra = 0) => estimateTokensFromBytes(baseBytes + extra) * pc[0] + writerOut * pc[1];
+      const P = HUMANIZE_MODEL_PRICES[n.fields.model];
+      const fb = HUMANIZE_FALLBACKS[n.fields.model];
+      const retryExtra = echoed + bytes(REASK_TEXT);
+      if (fb) {
+        const F = HUMANIZE_MODEL_PRICES[fb];
+        base += Math.max(call(P), call(F));
+        reasks.push(Math.max(call(P, retryExtra), call(F, retryExtra)));
+      } else {
+        base += call(P);
+        reasks.push(call(P, retryExtra));
+      }
     }
-    const seps = ["k1", "k2", "k3", "k4", "k5", "k6"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
-    worst += ((bytes(judge.fields.system) + Draft + Context + seps) / CPT + 5 * 600) * 0.6 + Number(judge.fields.maxTokens) * 1.1;
-    worst /= 1e6;
-    assert.ok(worst * 1.2 <= mounted.x402.usd, `estimated worst case ${(worst * 1.2).toFixed(5)} > pin`);
-    assert.equal((worst * 1.2).toFixed(8), "0.01325068", "the docs quote this exact estimate");
+    const reask = reasks.sort((a, b) => b - a).slice(0, HUMANIZE_PRICED_REASKS).reduce((a, b) => a + b, 0);
+    const seps = ["k1", "k2", "k3", "k4", "k5", "k6", "j-cg"].reduce((a, k) => a + bytes(byId.get(k).fields.sep), 0);
+    // Caller text on the decider is priced at 2.5 bytes per token, the rest at 3.5.
+    const judgeTokens = estimateTokensFromBytes(bytes(judge.fields.system) + seps + 5 * echoed) + Math.ceil((Draft + Context + Guidance) / 2.5);
+    const judgeUsd = judgeTokens * 0.6 + judgeOut * 1.1;
+    const est = (x) => (x / 1e6 * 1.2).toFixed(8);
+    assert.equal(HUMANIZE_BYTES_PER_TOKEN, 3.5);
+    assert.equal(est(base + reask + judgeUsd), "0.00956268", "guidance at its cap, one priced retry, after the markup");
+    const shaped = { Draft: draft, Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) };
+    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.00956268");
+    const budget = placeholderBudget();
+    assert.ok(budget.count > 8, "repeats, not the 8-entry keep list, set the placeholder cap");
+    assert.equal(budget.writerDraftChars <= Draft, true);
+    const ceilingCharge = humanizeChargeUsd(graph, null, { ceiling: true });
+    const ceiling = humanizeCeilingDepositUsd(graph);
+    assert.equal(ceilingCharge.toFixed(8), "0.04851670", "the capped worst case, before the margin");
+    assert.equal(ceiling.toFixed(8), "0.05433870");
+    assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);
+    assert.ok(ceiling >= ceilingCharge, "the ceiling covers the worst-case charge");
+    assert.ok(ceiling <= ceilingCharge * 1.15 + 1e-9, "the margin stays inside 15%");
+    assert.equal(mounted.x402.usd.toFixed(8), ceiling.toFixed(8), "the pinned ceiling is that deposit");
+    assert.ok(ceilingCharge <= mounted.x402.usd + 1e-12, `worst case $${ceilingCharge} exceeds the deposit`);
     // the caps are enforced before any money moves and advertised in the schema
     assert.equal(tool.inputSchema.properties.Draft.maxLength, Draft);
     assert.equal(tool.inputSchema.properties.Context.maxLength, Context);
-    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance);
+    // Guidance maxLength includes the uncounted one-thread prefix; the counted cap is Guidance
+    assert.equal(tool.inputSchema.properties.Guidance.maxLength, Guidance + [...ONE_THREAD_PREFIX].length);
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "x".repeat(Draft + 1), Context: "c" } }),
       (e) => e.mcpCode === -32602 && /"Draft" is 1501 characters; humanize-comment accepts at most 1500/.test(e.message));
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c".repeat(Context + 1) } }), /"Context" is 3501 characters.*at most 3500/);
-    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), /"Guidance" is 301 characters/);
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance + 1) } }), new RegExp(`"Guidance" is ${Guidance + 1} characters`));
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: "g".repeat(Guidance) } });
+    await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: ONE_THREAD_PREFIX + "g".repeat(Guidance) } });
+    await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "d", Context: "c", Guidance: ONE_THREAD_PREFIX + "g".repeat(Guidance + 1) } }), new RegExp(`"Guidance" is ${Guidance + 1} characters`));
     // caps count code points, so a 1500-emoji draft is allowed and 1501 is not
     await registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft), Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) } });
     await assert.rejects(registry.prepareCall({ name: "humanize-comment", arguments: { Draft: "😀".repeat(Draft + 1), Context: "c" } }), /"Draft" is 1501 characters/);
@@ -253,10 +305,10 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
 
 test("humanize-comment: model credit and texts come from the writers by id, not from the decider's copy", async (t) => {
   const { createServer } = await import("node:http");
-  // exact writer outputs, with characters an LLM likes to "fix" (curly quote, double space, trailing newline)
+  // exact writer outputs, with characters an LLM likes to "fix" (curly quote, double space, trailing newline; dashes are covered by the v2.7 test)
   const outputs = {
-    "qwen/qwen3.8-27b-novelist": "Hey \u2014 that\u2019s  a big win, 14 to 6!\n",
-    "gemma-4-12b-it-starry-ocean": "Nice cut. What changed first?",
+    "qwen/qwen3.8-27b-novelist": "Hey, that\u2019s  a big win, 14 to 6!\n",
+    "TheDrummer/Cydonia-24B-v4.3": "Nice cut. What changed first?",
     "qwen/qwen3.8-27b-antislop": "Good work on the CI time.",
     "inception/mercury-3": "14 \u2192 6 min, love it.",
   };
@@ -278,7 +330,7 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
         content = JSON.stringify({ winner: "C", text: "Nice cut! What changed first?", why: "most human", ranked: [
           { writer: "C", model: "qwen/qwen3.8-27b-antislop", text: "Nice cut! What changed first?", faithful: true, disqualified: false, reason: "fresh" },
           { writer: "A", model: "deepseek/deepseek-v4.1-flash-1017", text: "Hey - that's a big win, 14 to 6!", faithful: true, disqualified: false, reason: "warm" },
-          { writer: "B", model: "gemma-4-12b-it-starry-ocean", text: "invented text", faithful: true, disqualified: false, reason: "ok" },
+          { writer: "B", model: "TheDrummer/Cydonia-24B-v4.3", text: "invented text", faithful: true, disqualified: false, reason: "ok" },
           { writer: "D", model: "inception/mercury-3", text: "Good work on CI time.", faithful: true, disqualified: true, reason: "near-copy" },
         ] });
       }
@@ -298,15 +350,15 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
     const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
     assert.deepEqual(Object.keys(json), ["winner", "text", "why", "ranked"]);
     assert.equal(json.winner, "C");
-    assert.equal(json.text, outputs["gemma-4-12b-it-starry-ocean"], "top-level text is the winner's exact output");
+    assert.equal(json.text, outputs["TheDrummer/Cydonia-24B-v4.3"], "top-level text is the winner's exact output");
     const by = Object.fromEntries(json.ranked.map((r) => [r.writer, r]));
     assert.deepEqual(json.ranked.map((r) => r.writer), ["C", "A", "B", "D", "E"]);
     assert.deepEqual(Object.fromEntries(json.ranked.map((r) => [r.writer, r.model])), {
-      A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "gemma-4-12b-it-starry-ocean",
+      A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "TheDrummer/Cydonia-24B-v4.3",
       D: "qwen/qwen3.8-27b-antislop", E: "inception/mercury-3",
     });
     assert.equal(by.A.text, outputs["qwen/qwen3.8-27b-novelist"], "byte-exact, not the decider's paraphrase");
-    assert.equal(by.C.text, outputs["gemma-4-12b-it-starry-ocean"]);
+    assert.equal(by.C.text, outputs["TheDrummer/Cydonia-24B-v4.3"]);
     assert.equal(by.D.text, outputs["qwen/qwen3.8-27b-antislop"]);
     assert.equal(by.E.text, outputs["inception/mercury-3"], "a writer the decider dropped is still listed with its text");
     assert.equal(by.E.disqualified, true);
@@ -319,7 +371,7 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
   }
 });
 
-async function runHumanizeWith(t, judgeContent) {
+async function callHumanizeWith(t, judgeContent) {
   const { createServer } = await import("node:http");
   const srv = createServer((req, res) => {
     let raw = "";
@@ -337,24 +389,225 @@ async function runHumanizeWith(t, judgeContent) {
   t.after(() => rm(dir, { recursive: true, force: true }));
   await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
   const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
-  const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+  return registry.callTool({ name: "humanize-comment", arguments: { Draft: "Thanks for sharing this.", Context: "We cut CI from 14 to 6 minutes." } });
+}
+async function runHumanizeWith(t, judgeContent) {
+  const result = await callHumanizeWith(t, judgeContent);
   assert.notEqual(result.isError, true);
   const block = result.content.find((c) => /^\{"winner"/.test(c.text || ""));
   return { json: JSON.parse(block.text), texts: result.content.map((c) => c.text || "") };
 }
-const HC_MODELS = { A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "gemma-4-12b-it-starry-ocean", D: "qwen/qwen3.8-27b-antislop", E: "inception/mercury-3" };
+const HC_MODELS = { A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "TheDrummer/Cydonia-24B-v4.3", D: "qwen/qwen3.8-27b-antislop", E: "inception/mercury-3" };
 
-test("humanize-comment: an unusable decider reply is never passed through; ORIGINAL wins with real writer texts", async (t) => {
+test("humanize-comment: an unusable decider reply is an error, not the draft returned as success", async (t) => {
   for (const bad of ['{"winner":"A","text":"oops", "ranked":[{"writer":"A"', '{"winner":"A","text":"made up","why":"x"}', "[]", "Sure! Here is my ranking: A"]) {
-    const { json, texts } = await runHumanizeWith(t, bad);
-    assert.deepEqual(Object.keys(json), ["winner", "text", "why", "ranked"]);
-    assert.equal(json.winner, "ORIGINAL");
-    assert.equal(json.text, "Thanks for sharing this.");
-    assert.deepEqual(json.ranked.map((r) => [r.writer, r.model, r.text, r.faithful, r.disqualified]),
-      Object.entries(HC_MODELS).map(([w, m]) => [w, m, "rewrite by " + m, false, true]));
-    assert.ok(json.ranked.every((r) => r.reason === "not judged: decider reply unusable"));
-    assert.ok(texts.some((x) => /^note: the decider's reply was not valid JSON with a ranked list/.test(x)), "a clear note leads the result");
-    assert.ok(!texts.some((x) => x.includes("made up") || x.includes("Sure!")), "nothing of the bad reply is passed through");
+    await assert.rejects(
+      () => callHumanizeWith(t, bad),
+      (e) => {
+        assert.match(e.message, /could not return a rewrite/);
+        assert.match(e.message, /not valid JSON with a ranked list/);
+        assert.doesNotMatch(e.message, /Nothing was charged/);
+        assert.equal(e.message.includes("made up"), false);
+        assert.equal(e.message.includes("Sure!"), false);
+        assert.equal(e.message.includes("Thanks for sharing this."), false);
+        return true;
+      },
+    );
+  }
+});
+
+test("humanize-comment: a fenced decider reply with trailing text still ranks the real rewrites", async (t) => {
+  const ranked = ["A", "B", "C", "D", "E"].map((writer) => ({
+    writer, faithful: writer === "A", disqualified: writer !== "A", reason: writer === "A" ? "ok" : "no",
+  }));
+  const body = "Here is the ranking:\n```json\n" + JSON.stringify({
+    winner: "A", text: "made up", why: "specific", ranked,
+  }) + "\n```\nThanks for asking.";
+  const { json, texts } = await runHumanizeWith(t, body);
+  assert.equal(json.winner, "A");
+  assert.equal(json.text, "rewrite by " + HC_MODELS.A);
+  assert.equal(json.why, "specific");
+  assert.equal(texts.some((x) => x.includes("made up") || x.includes("Thanks for asking")), false);
+});
+
+function chatEstimateUsd(body) {
+  const rate = HUMANIZE_MODEL_PRICES[body.model];
+  if (!rate) return 0.00001;
+  let n = 0;
+  for (const m of body.messages || []) if (m && typeof m.content === "string") n += tokenUpperBound(m.content);
+  const outT = Math.max(1, Math.floor(Number(body.max_tokens) || 1));
+  return (estimateTokensFromBytes(n) * rate[0] + outT * rate[1]) / 1e6;
+}
+
+test("hosted humanize-comment bills an exact quote and still runs the decider", async () => {
+  const { createServer } = await import("node:http");
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-exact-"));
+  const draft = "Thanks for shipping the editor today. The launch note is the one I would reply to.";
+  const context = "We shipped the editor today.";
+  const rewrite = "Glad the editor shipped.";
+  const seen = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      seen.push({ model: body.model, body });
+      let content = rewrite;
+      let finish = "stop";
+      if (body.model === "z-ai/glm-5.3") {
+        const ranked = ["A", "B", "C", "D", "E"].map((writer) => ({
+          writer, faithful: true, disqualified: false, reason: "ok",
+        }));
+        content = "Ranking:\n```json\n" + JSON.stringify({
+          winner: "A", text: "decider copy, discarded", why: "specific", ranked,
+        }) + "\n```\ntrailing prose";
+      }
+      const cost = chatEstimateUsd(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content }, finish_reason: finish }],
+        x_nanogpt_pricing: { costUsd: cost },
+      }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+  const registry = await loadTools({
+    dirs: [dir], apiKey: "test-key", hosted: true, baseUrl: "http://127.0.0.1:" + server.address().port, outDir: join(dir, "out"), log: () => {},
+  });
+  try {
+    const args = { Draft: draft, Context: context };
+    const quote = registry.quoteDeposit("humanize-comment", args);
+    const result = await registry.callTool({ name: "humanize-comment", arguments: args });
+    assert.notEqual(result.isError, true);
+    const texts = result.content.map((c) => c.text || "");
+    const json = JSON.parse(texts.find((x) => /^\{"winner"/.test(x)));
+    assert.equal(json.winner, "A");
+    assert.equal(json.text, rewrite);
+    assert.doesNotMatch(texts.join("\n"), /skipped because it would have cost more/);
+    assert.doesNotMatch(texts.join("\n"), /not valid JSON with a ranked list/);
+    assert.equal(texts.some((x) => x.includes("decider copy") || x.includes("trailing prose")), false);
+    const writers = seen.filter((r) => r.model !== "z-ai/glm-5.3");
+    assert.equal(writers.length, 5);
+    const judge = seen.find((r) => r.model === "z-ai/glm-5.3");
+    assert.ok(judge, "the decider was called");
+    assert.equal(judge.body.max_tokens, requestOutputTokenCap(null, draft, { judge: true }));
+    assert.equal(judge.body.reasoning_effort, "low");
+    const spent = seen.reduce((a, r) => a + chatEstimateUsd(r.body), 0);
+    assert.ok(spent * HUMANIZE_SETTLE_MARKUP <= quote + 1e-9, `spend ${spent} does not fit the quote ${quote}`);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hosted title rewrite confirms a fitting line when the first decider reply is cut off", async () => {
+  const { createServer } = await import("node:http");
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-title-"));
+  const guidance = "Rewrite the article title so it is shorter and clearer. Keep the facts: a paper-craft village sunset, noon to midnight, one take, 42 cents. One line only.";
+  const title = "Noon to midnight, one take, 42 cents";
+  const draft = ("How a paper village goes from noon to midnight in one continuous take. ").repeat(20).trim();
+  const seen = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      seen.push(body);
+      let content = title;
+      let finish = "stop";
+      if (body.model === "z-ai/glm-5.3") {
+        const user = (body.messages || []).filter((m) => m.role === "user").map((m) => m.content).join("\n");
+        const blocks = user.match(/\n\[([A-E])\] /g) || [];
+        if (blocks.length === 1) {
+          const letter = blocks[0].match(/\[([A-E])\]/)[1];
+          content = JSON.stringify({
+            winner: letter, text: "reviewed", why: "faithful", safe: true,
+            ranked: [{ writer: letter, faithful: true, disqualified: false, safe: true, reason: "faithful" }],
+          });
+        } else {
+          content = "{\"winner\":\"A\",\"text\":\"" + title + "\",\"ranked\":[";
+          finish = "length";
+        }
+      }
+      const cost = chatEstimateUsd(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content }, finish_reason: finish }],
+        x_nanogpt_pricing: { costUsd: cost },
+      }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+  const registry = await loadTools({
+    dirs: [dir], apiKey: "test-key", hosted: true, baseUrl: "http://127.0.0.1:" + server.address().port, outDir: join(dir, "out"), log: () => {},
+  });
+  try {
+    const args = { Draft: draft, Context: "The article is about that render.", Guidance: guidance, title: true, maxChars: 300 };
+    const quote = registry.quoteDeposit("humanize-comment", args);
+    const result = await registry.callTool({ name: "humanize-comment", arguments: args });
+    assert.notEqual(result.isError, true);
+    const texts = result.content.map((c) => c.text || "");
+    const json = JSON.parse(texts.find((x) => /^\{"winner"/.test(x)));
+    assert.equal(json.winner, "A");
+    assert.equal(json.text, title);
+    assert.equal(json.ranked.find((r) => r.writer === "A").reason, "decider confirmed faithful and safe");
+    const judges = seen.filter((r) => r.model === "z-ai/glm-5.3");
+    assert.equal(judges.length, 2, "the fitting title is checked again inside the quote");
+    assert.ok(judges.every((r) => r.max_tokens === requestOutputTokenCap(300, draft, { judge: true })));
+    const spent = seen.reduce((a, r) => a + chatEstimateUsd(r), 0);
+    assert.ok(spent * HUMANIZE_SETTLE_MARKUP <= quote + 1e-9, `spend ${spent} quote ${quote}`);
+    assert.doesNotMatch(texts.join("\n"), /not confirmed faithful/);
+    assert.doesNotMatch(texts.join("\n"), /skipped because it would have cost more/);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a truncated decider is an error, not the original draft returned as success", async () => {
+  const { createServer } = await import("node:http");
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-trunc-"));
+  const draft = "Thanks for shipping the editor today. The launch note is the one I would reply to.";
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : {};
+      let content = "A finished rewrite.";
+      let finish = "stop";
+      if (body.model === "z-ai/glm-5.3") {
+        content = "{\"winner\":\"A\",\"text\":\"Nice launch.\",\"ranked\":[";
+        finish = "length";
+      }
+      const cost = chatEstimateUsd(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content }, finish_reason: finish }],
+        x_nanogpt_pricing: { costUsd: cost },
+      }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+    const registry = await loadTools({
+      dirs: [dir], apiKey: "test-key", hosted: true, baseUrl: "http://127.0.0.1:" + server.address().port, outDir: join(dir, "out"), log: () => {},
+    });
+    await assert.rejects(
+      registry.callTool({ name: "humanize-comment", arguments: { Draft: draft, Context: "We shipped the editor today." } }),
+      (e) => {
+        assert.match(e.message, /could not return a rewrite/);
+        assert.match(e.message, /cut off before it finished a ranked list/);
+        assert.doesNotMatch(e.message, /Nice launch/);
+        assert.equal(e.message.includes(draft), false);
+        return true;
+      },
+    );
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -372,9 +625,152 @@ test("humanize-comment: an entry with faithful:false never wins, even if the dec
   assert.equal(json.winner, "ORIGINAL");
   assert.equal(json.text, "Thanks for sharing this.");
   assert.ok(json.ranked.every((r) => r.disqualified));
-  // the decider's own ORIGINAL pick stands
-  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: ["A", "B", "C", "D", "E"].map((w) => e(w, true, false)) })));
+  // a decider ORIGINAL pick is overridden while any rewrite is eligible: the first eligible ranked rewrite wins
+  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: [e("A", true, true, "near-copy"), e("B", true, false), e("C", true, false), e("D", false, false), e("E", true, true)] })));
+  assert.equal(json.winner, "B");
+  assert.equal(json.text, "rewrite by " + HC_MODELS.B);
+  assert.match(json.why, /decider chose the original; overridden to the first eligible rewrite, B/);
+  assert.match(json.why, /all near-copies/);
+  // ORIGINAL only when every rewrite is ineligible, even if the decider picked ORIGINAL
+  ({ json } = await runHumanizeWith(t, JSON.stringify({ winner: "ORIGINAL", text: "x", why: "all near-copies", ranked: [e("A", true, true), e("B", false, false), e("C", true, true), e("D", "true", false), e("E", true, true)] })));
   assert.deepEqual([json.winner, json.text, json.why], ["ORIGINAL", "Thanks for sharing this.", "all near-copies"]);
+  assert.ok(json.ranked.every((r) => r.disqualified));
+});
+
+test("humanize-comment v2.7: C falls back on 429 and is credited, dashes are fixed and a near-copy is re-asked before the decider", async (t) => {
+  const { createServer } = await import("node:http");
+  const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
+  const calls = [];
+  let judgePrompt = null;
+  const srv = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      const last = body.messages[body.messages.length - 1].content;
+      const reask = body.messages.length > 2 && /copied the draft/.test(last);
+      calls.push(body.model + (reask ? " (re-ask)" : ""));
+      const ok = (content) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } })); };
+      if (body.model === "TheDrummer/Cydonia-24B-v4.3") { res.writeHead(429, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: "model overloaded" })); }
+      if (body.model === "qwen/qwen3.8-27b-novelist") return ok("Nice one \u2014 14 to 6 is a real cut \u2013 what did you change first?");
+      if (body.model === "qwen/qwen3.8-27b-antislop") return ok(reask ? "You took CI from 14 to 6 minutes. Thanks for writing it up." : DRAFT);
+      if (body.model === "z-ai/glm-5.3") {
+        judgePrompt = last;
+        return ok(JSON.stringify({ winner: "C", text: "x", why: "peer voice", ranked: ["C", "A", "D", "B", "E"].map((w) => ({ writer: w, model: "?", text: "x", faithful: true, disqualified: false, reason: "ok" })) }));
+      }
+      return ok("rewrite by " + body.model);
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  t.after(() => srv.close());
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-v27-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes.", Guidance: "Keep the thanks." } });
+  assert.notEqual(result.isError, true);
+  const texts = result.content.map((c) => c.text || "");
+  const json = JSON.parse(texts.find((x) => /^\{"winner"/.test(x)));
+  const by = Object.fromEntries(json.ranked.map((r) => [r.writer, r]));
+  // C: Cydonia 429 → Starry Ocean answered and is the model credited
+  assert.equal(by.C.model, "gemma-4-12b-it-starry-ocean");
+  assert.equal(by.C.text, "rewrite by gemma-4-12b-it-starry-ocean");
+  assert.equal(json.winner, "C");
+  assert.equal(json.text, "rewrite by gemma-4-12b-it-starry-ocean");
+  assert.ok(texts.some((x) => /writer C \(TheDrummer\/Cydonia-24B-v4\.3\) did not answer \(HTTP 429\), so gemma-4-12b-it-starry-ocean wrote C's rewrite/.test(x)));
+  // the other writers keep their graph models
+  assert.deepEqual([by.A.model, by.B.model, by.D.model, by.E.model], ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"]);
+  // dashes fixed before the decider read them, and the result carries the same text
+  assert.equal(by.A.text, "Nice one, 14 to 6 is a real cut, what did you change first?");
+  assert.match(judgePrompt, /\[A\] qwen\/qwen3\.8-27b-novelist\nNice one, 14 to 6 is a real cut, what did you change first\?/);
+  assert.doesNotMatch(judgePrompt, /[\u2014\u2013]/);
+  // D copied the draft → re-asked once; the decider only ever saw the second answer
+  assert.equal(by.D.text, "You took CI from 14 to 6 minutes. Thanks for writing it up.");
+  assert.match(judgePrompt, /\[D\] qwen\/qwen3\.8-27b-antislop\nYou took CI/);
+  assert.ok(!judgePrompt.includes("[D] qwen/qwen3.8-27b-antislop\n" + DRAFT));
+  assert.ok(texts.some((x) => /writer D's first rewrite copied the draft \(trigram overlap 1\.00\), so it was re-asked once \(overlap now 0\.\d\d\)/.test(x)));
+  assert.deepEqual(calls.filter((c) => /antislop/.test(c)).sort(), ["qwen/qwen3.8-27b-antislop", "qwen/qwen3.8-27b-antislop (re-ask)"]);
+  assert.equal(calls.filter((c) => /re-ask/.test(c)).length, 1, "only the near-copy writer is re-asked");
+  // the decider sees the Guidance block
+  assert.match(judgePrompt, /We cut CI from 14 to 6 minutes\.\n\n=====\n\nKeep the thanks\.\n\n=====\n\n\[ORIGINAL\]\n/);
+  // cost: 6 billed writer calls (A, B, Starry, D, D re-ask, E) + decider; the 429 is not billed
+  assert.ok(texts.some((x) => x === "cost: $0.0007"), texts.find((x) => /^cost/.test(x)));
+});
+
+test("humanizeFetch: timeout fallback, no fallback on 402, no re-ask after the deadline", async () => {
+  const { humanizeFetch } = await import("../src/humanize.mjs");
+  const record = { A: { model: "a" }, B: { model: "b" }, C: { model: "TheDrummer/Cydonia-24B-v4.3", fallbackModel: "gemma-4-12b-it-starry-ocean" }, D: { model: "d" }, E: { model: "e" } };
+  const reply = (content, status = 200) => new Response(JSON.stringify(status === 200 ? { choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.001 } } : { error: "x" }), { status, headers: { "content-type": "application/json" } });
+  const url = "http://x/api/v1/chat/completions";
+  const req = (model) => ({ method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }) });
+  // a primary that never answers is abandoned after primaryTimeoutMs
+  let hf = humanizeFetch({ record, draft: "", primaryTimeoutMs: 50, fetch: (u, init) => {
+    const m = JSON.parse(init.body).model;
+    if (m === "TheDrummer/Cydonia-24B-v4.3") return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(init.signal.reason)));
+    return Promise.resolve(reply("from " + m));
+  } });
+  let r = await hf.fetch(url, req("TheDrummer/Cydonia-24B-v4.3"));
+  assert.equal((await r.json()).choices[0].message.content, "from gemma-4-12b-it-starry-ocean");
+  assert.deepEqual(hf.state.fallback.C, { from: "TheDrummer/Cydonia-24B-v4.3", to: "gemma-4-12b-it-starry-ocean", reason: "no answer in 0 s", ok: true });
+  assert.equal(hf.state.answered.C, "gemma-4-12b-it-starry-ocean");
+  // 402 (x402 payment flow) passes straight through: no fallback
+  hf = humanizeFetch({ record, draft: "", fetch: () => Promise.resolve(reply("", 402)) });
+  r = await hf.fetch(url, req("TheDrummer/Cydonia-24B-v4.3"));
+  assert.equal(r.status, 402);
+  assert.deepEqual(hf.state.fallback, {});
+  // a near-copy past the re-ask deadline is kept as is (the writer's 60 s budget comes first)
+  let t = 0, n = 0;
+  hf = humanizeFetch({ record, draft: "one two three four five six", now: () => (t += 40000), fetch: () => { n++; return Promise.resolve(reply("one two three four five six")); } });
+  r = await hf.fetch(url, req("d"));
+  assert.equal(n, 1);
+  assert.deepEqual(hf.state.reasked, {});
+  // non-writer models (the decider) and non-chat calls are untouched
+  n = 0;
+  hf = humanizeFetch({ record, draft: "one two three four five six", fetch: () => { n++; return Promise.resolve(reply("one two three four five six")); } });
+  await hf.fetch(url, req("z-ai/glm-5.3"));
+  await hf.fetch("http://x/api/v1/models", { method: "GET" });
+  assert.equal(n, 2);
+  assert.deepEqual(hf.state.answered, {});
+});
+
+test("humanize-comment v2.7: at most 3 re-asks per run; a decider reply with ids only still gets exact texts and models", async (t) => {
+  const { createServer } = await import("node:http");
+  const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
+  const calls = [];
+  const srv = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      const reask = body.messages.length > 2;
+      calls.push(body.model + (reask ? " (re-ask)" : ""));
+      let content = reask ? "Fresh words from " + body.model + " about your CI cut." : DRAFT; // every writer copies the draft
+      if (body.model === "z-ai/glm-5.3") content = JSON.stringify({ winner: "B", text: "paraphrase", why: "warm", ranked: ["B", "A", "C", "D", "E"].map((w) => ({ writer: w, faithful: true, disqualified: false, reason: "ok" })) });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  t.after(() => srv.close());
+  const dir = await mkdtemp(join(tmpdir(), "noodle-humanize-cap-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await copyFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), join(dir, "humanize-comment.noodle-graph.json"));
+  const registry = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {} });
+  const result = await registry.callTool({ name: "humanize-comment", arguments: { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
+  const texts = result.content.map((c) => c.text || "");
+  assert.equal(calls.filter((c) => /re-ask/.test(c)).length, 3, "re-asks are capped at 3 per run");
+  assert.equal(texts.filter((x) => /so it was re-asked once/.test(x)).length, 3);
+  assert.equal(texts.filter((x) => /was not re-asked \(the 3-re-ask limit for this run was reached\)/.test(x)).length, 2);
+  const json = JSON.parse(texts.find((x) => /^\{"winner"/.test(x)));
+  // the decider sent no texts or models: the rebuild fills both from the writers
+  assert.equal(json.ranked.length, 5);
+  for (const r of json.ranked) {
+    assert.equal(typeof r.model, "string");
+    assert.ok(r.text === DRAFT || r.text === "Fresh words from " + r.model + " about your CI cut.", r.text);
+  }
+  assert.equal(json.text, json.ranked.find((r) => r.writer === "B").text, "top-level text is B's exact output, not the decider's paraphrase");
+  // 5 writers + 3 re-asks + decider
+  assert.ok(texts.includes("cost: $0.0009"), texts.find((x) => /^cost/.test(x)));
 });
 
 test("humanize-comment: a failed writer is skipped and the decider still returns a result", async (t) => {
@@ -393,7 +789,7 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
       let content = "rewrite by " + body.model;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompts.push(body.messages[body.messages.length - 1].content);
-        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", model: "qwen/qwen3.8-27b-novelist", text: "rewrite by qwen/qwen3.8-27b-novelist", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", model: "gemma-4-12b-it-starry-ocean", text: "rewrite by gemma-4-12b-it-starry-ocean", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", model: "inception/mercury-3", text: "rewrite by inception/mercury-3", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", model: "qwen/qwen3.8-27b-antislop", text: "rewrite by qwen/qwen3.8-27b-antislop", faithful: true, disqualified: true, reason: "near-copy" }, { writer: "B", model: "deepseek/deepseek-v4.1-flash-1017", text: "", faithful: false, disqualified: true, reason: "missing" }] });
+        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", model: "qwen/qwen3.8-27b-novelist", text: "rewrite by qwen/qwen3.8-27b-novelist", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", model: "TheDrummer/Cydonia-24B-v4.3", text: "rewrite by TheDrummer/Cydonia-24B-v4.3", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", model: "inception/mercury-3", text: "rewrite by inception/mercury-3", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", model: "qwen/qwen3.8-27b-antislop", text: "rewrite by qwen/qwen3.8-27b-antislop", faithful: true, disqualified: true, reason: "near-copy" }, { writer: "B", model: "deepseek/deepseek-v4.1-flash-1017", text: "", faithful: false, disqualified: true, reason: "missing" }] });
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -423,7 +819,7 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.match(judgePrompts[0], /\[ORIGINAL\]\nThanks for sharing this\./);
     assert.match(judgePrompts[0], /\[A\] qwen\/qwen3\.8-27b-novelist\nrewrite by qwen\/qwen3\.8-27b-novelist/);
     assert.doesNotMatch(judgePrompts[0], /\[B\]/, "the failed writer's block is missing");
-    assert.match(judgePrompts[0], /\[C\] gemma-4-12b-it-starry-ocean\nrewrite by gemma-4-12b-it-starry-ocean/);
+    assert.match(judgePrompts[0], /\[C\] TheDrummer\/Cydonia-24B-v4\.3\nrewrite by TheDrummer\/Cydonia-24B-v4\.3/);
     assert.match(judgePrompts[0], /\[D\] qwen\/qwen3\.8-27b-antislop\nrewrite by qwen\/qwen3\.8-27b-antislop/);
     assert.match(judgePrompts[0], /\[E\] inception\/mercury-3\nrewrite by inception\/mercury-3/);
     assert.equal(json.ranked.length, 5);

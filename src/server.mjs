@@ -19,6 +19,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { WORKFLOW_META_KEY, workflowMessage } from "./workflow-progress.mjs";
 
 export const LATEST_PROTOCOL_VERSION = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
@@ -73,10 +74,15 @@ export function createDispatcher({ name, version, commit, listTools, callTool, i
       return fail(null, -32600, "invalid request — expected a single JSON-RPC 2.0 object");
     }
     const { id, method, params } = msg;
-    const isRequest = "id" in msg && id !== null && id !== undefined;
+    const hasId = Object.hasOwn(msg, "id");
+    const isRequest = hasId && (typeof id === "string" || (typeof id === "number" && Number.isFinite(id)));
+    if (hasId && !isRequest) return fail(null, -32600, "invalid request — id must be a string or number");
     if (typeof method !== "string") {
       return isRequest ? fail(id, -32600, "invalid request — missing method") : null;
     }
+    // Notifications have no response channel. In particular, tools/call must
+    // not spend money or consume a paid run when there is no request to answer.
+    if (!isRequest) return null;
 
     try {
       if (method === "initialize") {
@@ -134,11 +140,21 @@ export function serveMcp({
   const write = (msg) => output.write(JSON.stringify(msg) + "\n");
   const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
   const handle = async (msg) => {
-    const response = await dispatch(msg);
+    const token = msg?.params?._meta?.progressToken;
+    let progress = 0;
+    const announce = (message, workflow) => write({ jsonrpc: "2.0", method: "notifications/progress", params: {
+      progressToken: token, progress: ++progress, message, ...(workflow ? { _meta: { [WORKFLOW_META_KEY]: workflow } } : {}),
+    } });
+    const ctx = token === undefined ? null : {
+      report() {}, announce,
+      workflow: state => announce(workflowMessage(state), state),
+    };
+    const response = await dispatch(msg, ctx);
     if (response) write(response);
   };
 
   let buf = "";
+  const inFlight = new Set();
   input.setEncoding("utf8");
   input.on("data", (chunk) => {
     buf += chunk;
@@ -155,10 +171,14 @@ export function serveMcp({
         continue;
       }
       // async fire-and-forget: responses go out in completion order, matched by id
-      handle(msg).catch((e) => log("nanoodle-mcp: unhandled error: " + ((e && e.stack) || e)));
+      const task = handle(msg).catch((e) => log("nanoodle-mcp: unhandled error: " + ((e && e.stack) || e)));
+      inFlight.add(task);
+      task.finally(() => inFlight.delete(task));
     }
   });
-  input.on("end", onClose);
+  // EOF stops admission, but an already accepted run may have paid its
+  // provider. Deliver those outcomes before the default onClose exits Node.
+  input.on("end", () => { Promise.allSettled([...inFlight]).then(onClose); });
 
   // Tool descriptions can change mid-session (observed costs) — the host pushes
   // notifications/tools/list_changed through this. Notifications carry no id.

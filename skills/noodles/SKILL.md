@@ -19,6 +19,12 @@ files at startup and serves **each file as one MCP tool**.
 - **All inputs are strings.** Media-typed inputs (image / audio / video) accept
   a local file path or an `https://` URL. Local paths are read and sent inline
   (base64) — there is a ~4 MB cap, checked before any money is spent.
+  `humanize-comment` is the exception: `keep` is an array of strings (verbatim
+  spans that must survive exactly), `ending` is `question`, `keep_last`, or
+  `any` (default `any`), `maxChars` is an integer hard cap on the rewrite, and
+  `title` is a boolean (default false) that rejects a paragraph-length rewrite.
+  `Guidance` is at most 600 characters; a leading one-thread prefix is not counted.
+  Omit `keep`, `ending`, `maxChars`, and `title` and the call behaves as before.
 - **Text outputs** come back as text blocks. **Media outputs** are saved to the
   server's output directory and the result block gives the absolute saved path
   (e.g. `Image: saved /path/to/poster-Image-....png`). Read or open that file
@@ -42,6 +48,17 @@ mid-session. To add or edit a tool:
 2. Restart the MCP server (in Claude Code: `/mcp` → reconnect, or restart the
    session) to pick it up.
 
+`subnano_comment` and `sfw_check` are built in whenever any graph is loaded.
+`subnano_comment` needs the `humanize-comment` graph: it refines a draft, runs
+that graph, then returns a post gate and a funny score with the cost of each
+step. `sfw_check` judges an image and sampled video frames; it has no switch
+to skip the check, and video sampling needs ffmpeg. In charge mode
+`subnano_comment`'s deposit is a cap on that request: max_tokens is about
+1.5× the draft, tokens are about bytes/3.5 plus a margin, and settlement is
+min(metered cost × 1.2, the quote). The run stops before a stage the remaining
+budget cannot cover. `sfw_check`'s deposit is the same kind of cap, one
+picture at a time.
+
 Local-media graphs (resize, combine, trim, extract-audio, video-frames,
 soundtrack) load and run headlessly — this package depends on nanoodle ≥ 0.9,
 which can execute them. They need ffmpeg on PATH for formats the pure-JS
@@ -50,3 +67,18 @@ path cannot handle. Decide, Clean voice (`cleanvoice`), 3D model (`model3d`),
 not skipped at startup. A closed Decide gate is a normal result (`gated`),
 not an error. Unknown node types are still skipped at startup with a stderr
 note.
+
+# Custom workflows and paying in NEAR
+
+`run_noodle` runs a share link (`url`) or a graph you composed (`graph`, a
+`{ nodes, links }` object), with `inputs`. Call `noodle_guide` (free) for the
+node types, wiring rules, an example graph and the priced models, then
+`price_noodle` (free) with the same `graph` and `inputs` to see the estimated
+cost per node, the 20% service fee, the deposit and the likely refund — fix
+anything it lists before running. On a NEAR-paid server a paid call without
+payment returns a quote: send ONE native NEAR transfer of exactly
+`payment.amountYocto` to `payment.payTo`, then repeat the call with the same
+arguments plus `_payment_id`, `_payment_tx` (the transaction hash) and
+`_payment_sender`; the result carries a receipt, and the unused deposit is
+refunded automatically. Repeating the paying call replays the result and never
+charges twice.

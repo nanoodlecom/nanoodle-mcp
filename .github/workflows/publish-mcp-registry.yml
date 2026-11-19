@@ -13,18 +13,20 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  NODE_OPTIONS: --use-openssl-ca
+  SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+  SSL_CERT_DIR: /etc/ssl/certs
+  npm_config_cafile: /etc/ssl/certs/ca-certificates.crt
+  npm_config_strict_ssl: "true"
+
 jobs:
   publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    env:
-      NODE_OPTIONS: --use-openssl-ca
-      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
-      SSL_CERT_DIR: /etc/ssl/certs
-      npm_config_cafile: /etc/ssl/certs/ca-certificates.crt
-      npm_config_strict_ssl: "true"
     steps:
       - name: Patch system trust before dependency or release downloads
+        timeout-minutes: 2
         run: |
           sudo apt-get update
           sudo apt-get install -y --only-upgrade ca-certificates
@@ -36,8 +38,7 @@ jobs:
       # the tarball it points at. Stop before the publish, not after.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          check-latest: true
+          node-version: "24.22.3"
       - name: Guard the release manifests
         run: node --test tests/manifest-versions.test.mjs
 

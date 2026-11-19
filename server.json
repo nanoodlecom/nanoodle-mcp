@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.nanoodlecom/nanoodle-mcp",
   "title": "nanoodle",
-  "description": "Your saved nanoodle workflow graphs as MCP tools — BYOK or pay per call in Nano (x402)",
-  "version": "0.6.0",
+  "description": "Saved or agent-composed nanoodle workflows as MCP tools: BYOK, pay per call in Nano, or pay in NEAR",
+  "version": "0.7.0",
   "websiteUrl": "https://nanoodle.com",
   "repository": {
     "url": "https://github.com/nanoodlecom/nanoodle-mcp",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "nanoodle-mcp",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

@@ -1,0 +1,90 @@
+/* 255labs Brand System v1.1.0. Self-hosted fonts and shared tokens. */
+@font-face { font-family: 'Manrope Variable'; font-style: normal; font-weight: 200 800; font-display: swap; src: url('./fonts/manrope-latin-variable.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('./fonts/ibm-plex-mono-latin-400.woff2') format('woff2'); }
+:root {
+  --brand-color-signal: #D7FF3F;
+  --brand-color-ink: #101110;
+  --brand-color-paper: #F1F2EA;
+  --brand-color-graphite: #22251F;
+  --brand-color-muted: #A0A69A;
+  --brand-color-line: #35392F;
+  --brand-color-blue: #AACBFA;
+  --brand-color-lilac: #D7BDF6;
+  --brand-font-sans: "Manrope Variable", "Manrope", sans-serif;
+  --brand-font-mono: "IBM Plex Mono", monospace;
+  --brand-space-1: 4px;
+  --brand-space-2: 8px;
+  --brand-space-3: 12px;
+  --brand-space-4: 16px;
+  --brand-space-6: 24px;
+  --brand-space-8: 32px;
+  --brand-space-12: 48px;
+  --brand-space-16: 64px;
+  --brand-space-24: 96px;
+  --brand-radius-small: 4px;
+  --brand-radius-medium: 8px;
+  --brand-radius-large: 12px;
+  --brand-type-body-size: 1rem;
+  --brand-type-body-leading: 1.7;
+  --brand-type-small-size: .875rem;
+  --brand-type-label-size: .75rem;
+  --brand-type-heading-size: 1.5rem;
+  --brand-type-heading-leading: 1.2;
+  --brand-type-display-size: clamp(2.5rem, 5vw, 4.5rem);
+  --brand-type-display-leading: 1.08;
+  --brand-type-weight-body: 400;
+  --brand-type-weight-heading: 550;
+  --brand-type-weight-strong: 650;
+  --brand-control-height: 2.75rem;
+  --brand-control-border-width: 1px;
+  --brand-control-focus-width: 2px;
+  --brand-control-focus-offset: 3px;
+  --brand-motion-fast: 140ms;
+  --brand-motion-standard: 200ms;
+}
+:root, [data-brand-theme="dark"] {
+  color-scheme: dark;
+  --brand-ui-bg: #101110;
+  --brand-ui-surface: #171916;
+  --brand-ui-surface-raised: #22251F;
+  --brand-ui-text: #F1F2EA;
+  --brand-ui-text-muted: #A0A69A;
+  --brand-ui-border: #35392F;
+  --brand-ui-control-border: #7B826F;
+  --brand-ui-action: #D7FF3F;
+  --brand-ui-action-hover: #E4FF7B;
+  --brand-ui-on-action: #101110;
+  --brand-ui-focus: #D7FF3F;
+  --brand-ui-accent: #AACBFA;
+  --brand-ui-success: #B9E4A0;
+  --brand-ui-success-bg: #23351D;
+  --brand-ui-warning: #F2D18B;
+  --brand-ui-warning-bg: #362D19;
+  --brand-ui-error: #FFB4A6;
+  --brand-ui-error-bg: #3C211E;
+  --brand-ui-info: #AACBFA;
+  --brand-ui-info-bg: #1B2A3D;
+}
+[data-brand-theme="light"] {
+  color-scheme: light;
+  --brand-ui-bg: #F1F2EA;
+  --brand-ui-surface: #FFFFFF;
+  --brand-ui-surface-raised: #E6E9DE;
+  --brand-ui-text: #101110;
+  --brand-ui-text-muted: #50564A;
+  --brand-ui-border: #CDD1C5;
+  --brand-ui-control-border: #707765;
+  --brand-ui-action: #101110;
+  --brand-ui-action-hover: #30362A;
+  --brand-ui-on-action: #F1F2EA;
+  --brand-ui-focus: #4C5E00;
+  --brand-ui-accent: #234E91;
+  --brand-ui-success: #285215;
+  --brand-ui-success-bg: #E1F1D6;
+  --brand-ui-warning: #715000;
+  --brand-ui-warning-bg: #FFF0C7;
+  --brand-ui-error: #9B2E20;
+  --brand-ui-error-bg: #FCE4DD;
+  --brand-ui-info: #234E91;
+  --brand-ui-info-bg: #E2ECFC;
+}

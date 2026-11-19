@@ -119,6 +119,23 @@ function startServer({ graphs = FIXTURES, outDir, env = {} } = {}) {
 
 /* ================================ tests ================================ */
 
+test("stdio forwards the same workflow execution abstraction as HTTP when progress is requested", async () => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-progress-")), srv = startServer({ outDir });
+  try {
+    const graph = { v: 1, nodes: [{ id: "arbitrary", type: "text", name: "Brief", fields: { text: "private text" } }], links: [] };
+    const result = await srv.request("tools/call", { name: "run_noodle", arguments: { graph }, _meta: { progressToken: "stdio-run" } });
+    assert.equal(result.result.isError, undefined);
+    const updates = srv.messages.filter(m => m.method === "notifications/progress");
+    assert.ok(updates.length >= 3);
+    assert.ok(updates.every(m => m.params.progressToken === "stdio-run"));
+    const snapshots = updates.map(m => m.params._meta["com.nanoodle/workflow"]);
+    assert.equal(snapshots[0].nodes[0].status, "pending");
+    assert.equal(snapshots.at(-1).nodes[0].status, "done");
+    assert.equal(snapshots.at(-1).status, "succeeded");
+    assert.doesNotMatch(JSON.stringify(snapshots), /private text/);
+  } finally { await srv.close(); }
+});
+
 test("full handshake: initialize → initialized → tools/list → tools/call", async () => {
   const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-out-"));
   const srv = startServer({ outDir });
@@ -145,8 +162,8 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     const list = await srv.request("tools/list");
     assert.equal(srv.messages.length, framesBefore + 1, "notifications/initialized must not be answered");
     const tools = list.result.tools;
-    // one tool per fixture graph, plus the always-present run_noodle share-link tool
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "poster", "restyle", "run_noodle"]);
+    // one tool per fixture graph, plus the always-present run_noodle tool and its free helpers
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "noodle_guide", "poster", "price_noodle", "restyle", "run_noodle", "sfw_check", "subnano_comment"]);
 
     // media-typed input advertises "file path or https URL"
     const restyle = tools.find((t) => t.name === "restyle");
@@ -348,15 +365,17 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
 
 /* ============================= run_noodle ============================= */
 
-test("run_noodle is always listed, with a url-required schema and the spend warning", async () => {
+test("run_noodle is always listed, with a url-or-graph schema and the spend warning", async () => {
   const srv = startServer();
   try {
     await srv.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
     const list = await srv.request("tools/list");
     const rn = list.result.tools.find((t) => t.name === "run_noodle");
     assert.ok(rn, "run_noodle must always be in tools/list");
-    assert.deepEqual(rn.inputSchema.required, ["url"]);
+    // url OR graph: neither is schema-required; the handler rejects none/both with -32602
+    assert.equal(rn.inputSchema.required, undefined);
     assert.equal(rn.inputSchema.properties.url.type, "string");
+    assert.deepEqual(rn.inputSchema.properties.graph.type, ["object", "string"]);
     assert.equal(rn.inputSchema.properties.inputs.type, "object");
     assert.match(rn.description, /spends real credit from your API key's balance/);
     assert.match(rn.description, /decode locally/); // documents the no-credentials network note
@@ -687,7 +706,7 @@ test("multiple --graphs dirs merge into one tool set, each tool tagged with its 
 
   const reg = await loadTools({ dirs: [a, b], apiKey: "test-key", outDir: a });
   assert.deepEqual(reg.failures, []);
-  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta"]);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta", "sfw_check", "subnano_comment"]);
   // each tool remembers which dir it came from (keeps same-named files distinguishable)
   assert.equal(reg.tools.find((t) => t.name === "alpha").dir, a);
   assert.equal(reg.tools.find((t) => t.name === "beta").dir, b);
@@ -716,7 +735,7 @@ test("single --graphs dir behaves exactly as before (bare names, no suffixes)", 
   await writeGraph(dir, "two.json");
 
   const reg = await loadTools({ dirs: [dir], apiKey: "test-key", outDir: dir });
-  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "two"]);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "sfw_check", "subnano_comment", "two"]);
 });
 
 test("an unreadable --graphs dir is a hard error naming the specific dir", async () => {
