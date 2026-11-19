@@ -2554,6 +2554,39 @@ test("Nano confirmation trend uses the counter observation time even when later 
   assert.equal(progress(report(14, 14, "1030", "9100")).code, "nano-ledger-confirmations-falling-behind");
 });
 
+test("a missed Nano telemetry sample preserves recent confirmation trend evidence", async t => {
+  const unavailable = { stage: "nano-ledger-sync", ok: false, code: "nano-ledger-peer-telemetry-insufficient", domains: [] };
+  const progress = report => report.checks.find(check => check.stage === "nano-ledger-confirmation-progress");
+  for (const [second, resumed, reason] of [["1000", "1000", "stalled"], ["1010", "1030", "falling-behind"]]) {
+    await t.test(reason, t => {
+      const dir = mkdtempSync(join(tmpdir(), "operational-nano-telemetry-gap-"));
+      t.after(() => rmSync(dir, { recursive: true, force: true }));
+      const sample = (minutes, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [], NOW + minutes * 60_000, {
+        nanoLedgerSync: { observedAt: NOW + minutes * 60_000, localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 },
+      });
+      sample(0, "1000", "9000");
+      assert.equal(progress(sample(5, second, "9040")).ok, true);
+      const missing = finishOperationalReport(dir, [unavailable], NOW + 10 * 60_000);
+      assert.deepEqual(missing.checks, [unavailable]);
+      assert.equal(missing.nanoLedgerSync, undefined);
+      assert.equal(missing.nanoLedgerBaseline.observedAt, NOW + 5 * 60_000);
+      const returned = sample(15, resumed, "9090");
+      assert.equal(progress(returned).code, `nano-ledger-confirmations-${reason}`);
+      assert.equal(returned.admission.nano, true);
+      assert.equal(returned.nanoLedgerBaseline, undefined);
+
+      for (const minutes of [20, 25]) {
+        const absent = finishOperationalReport(dir, [unavailable], NOW + minutes * 60_000);
+        assert.equal(absent.nanoLedgerBaseline.observedAt, NOW + 15 * 60_000);
+        assert.deepEqual(absent.checks, [unavailable]);
+      }
+      const expired = finishOperationalReport(dir, [unavailable], NOW + 28 * 60_000);
+      assert.equal(expired.nanoLedgerBaseline, undefined);
+      assert.equal(progress(sample(30, resumed, "9200")).ok, true);
+    });
+  }
+});
+
 test("Nano remote counter variation, missing samples and local regression are distinguished", t => {
   const dir = mkdtempSync(join(tmpdir(), "operational-nano-regression-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
