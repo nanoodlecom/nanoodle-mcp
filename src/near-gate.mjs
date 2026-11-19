@@ -604,7 +604,7 @@ export function createNearGate({
 
   /* ---------------- pay → run → settle ---------------- */
 
-  async function acceptPayment(q0, tx, sender, ctx = null) {
+  async function acceptPayment(q0, tx, sender, ctx = null, { receiptDiscovered = false, verifiedTransfer = null } = {}) {
     ledger.assertDurable();
     if (q0.status === "paid" || q0.status === "running" || FINAL.has(q0.status)) return null;
     if (typeof tx !== "string" || !tx.trim() || typeof sender !== "string" || !sender.trim()) {
@@ -627,10 +627,14 @@ export function createNearGate({
       else if (ctx && typeof ctx.report === "function") ctx.report(s);
     };
     note(`checking ${symbol(q0)} payment ${q0.id} on ${network}`);
+    const tokenContract = assetOf(q0) === "usdc" ? q0.tokenContract : null;
     let t;
     try {
-      t = await readPaymentTransfer({ rpc, txHash, senderId, merchantId,
-        ...(assetOf(q0) === "usdc" ? { tokenContract: q0.tokenContract } : {}), ...(txTimeoutMs ? { txTimeoutMs } : {}) });
+      if (verifiedTransfer && (verifiedTransfer.txHash !== txHash || (verifiedTransfer.tokenContract ?? null) !== tokenContract)) {
+        throw new NearError("TX_MISMATCH", "The verified payment does not match this quote");
+      }
+      t = verifiedTransfer ?? await readPaymentTransfer({ rpc, txHash, senderId, merchantId, receiptDiscovered,
+        tokenContract, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
     } catch (e) {
       if (!(e instanceof NearError)) throw e;
       const why = {
@@ -733,11 +737,16 @@ export function createNearGate({
     return ledger.quotes().filter(q => holdsNearQuoteAmount(q, t, expiredRetainMs, coverage) || ledger.hasUnattachedPayment(q.id));
   }
 
-  async function confirmDiscoveredPayment(id, txHash, senderId) {
-    const result = await confirmPayment(id, txHash, senderId);
-    if (result.error && !result.txHash) {
-      throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
-    }
+  async function confirmDiscoveredPayment(id, txHash, senderId, verifiedTransfer = null) {
+    return withLock(id, async () => {
+      const q = ledger.getQuote(id);
+      // Reuse a FINAL proof only after this private watcher has found the
+      // matching quote. An older unattached claim still needs that proof.
+      const result = q && await acceptPayment(q, txHash, senderId, null, { receiptDiscovered: true, verifiedTransfer });
+      if (!q || (result?.isError && !ledger.getQuote(id)?.payTx)) {
+        throw new NearError("WATCH_CONFIRM_FAILED", "The discovered payment could not yet be confirmed");
+      }
+    });
   }
 
   /** Discovered receipts are only hints: verify FINAL, then match an exact quote. */
@@ -749,11 +758,15 @@ export function createNearGate({
     }
     let transfer;
     try {
-      transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
+      transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, receiptDiscovered: true,
+        ...(txTimeoutMs ? { txTimeoutMs } : {}) });
     } catch (e) {
       if (["NOT_A_SINGLE_TRANSFER", "WRONG_RECEIVER"].includes(e.code)) {
         if (!usdcToken || !pendingQuotes().some((q) => q.asset === "usdc")) return;
-        try { transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract: usdcToken, ...(txTimeoutMs ? { txTimeoutMs } : {}) }); }
+        try {
+          transfer = await readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract: usdcToken,
+            receiptDiscovered: true, ...(txTimeoutMs ? { txTimeoutMs } : {}) });
+        }
         catch (ftError) {
           if (["NOT_A_SINGLE_TRANSFER", "WRONG_RECEIVER", "TX_FAILED"].includes(ftError.code)) return;
           throw ftError;
@@ -763,7 +776,7 @@ export function createNearGate({
     }
     const q = pendingQuotes().find((q) => assetOf(q) === (transfer.asset || "near") && q.amountYocto === transfer.amountYocto.toString()
       && transfer.blockTimeMs >= q.createdAt && transfer.blockTimeMs <= q.expiresAt + expiredRetainMs);
-    if (q && !ledger.hasUnattachedPayment(q.id)) await confirmDiscoveredPayment(q.id, txHash, senderId);
+    if (q && !ledger.hasUnattachedPayment(q.id)) await confirmDiscoveredPayment(q.id, txHash, senderId, transfer);
   }
 
   function waitForPayment(id, timeoutMs = 25_000, { signal, previous } = {}) {
