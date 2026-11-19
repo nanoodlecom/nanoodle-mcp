@@ -5,6 +5,8 @@
 // working directory.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir, hostname } from "node:os";
 import { join, isAbsolute } from "node:path";
@@ -82,6 +84,78 @@ test("a fresh hire (startedAt null, no worker message) on an empty state directo
   assert.equal(market.rows.get(id).assignment.status, "submitted");
   A.store.close();
   await market.close();
+});
+
+function syncFault(t, shouldFail) {
+  const sync = fs.fsyncSync;
+  t.mock.method(fs, "fsyncSync", fd => {
+    if (shouldFail(fs.fstatSync(fd))) throw Object.assign(Error("simulated state write failure"), { code: "EIO" });
+    return sync(fd);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+}
+
+test("a failed phase write does not let a later poll start an uncommitted hire", async t => {
+  let diskFailed = false, failOnPrice = true;
+  syncFault(t, stat => diskFailed && stat.isFile());
+  const market = createMarketMock();
+  await market.listen();
+  const real = createWorkflowRunner({ apiKey: NANO_KEY, budgetUsd: 0.5, baseUrl: nano.url });
+  const r = await rig({ market, runner: { ...real, async price(...args) {
+    const result = await real.price(...args);
+    if (failOnPrice && !args[1]?.refreshCatalogs) diskFailed = true;
+    return result;
+  } } });
+  t.after(async () => { r.store.close(); await market.close(); });
+  const id = market.hire({ description: WORKED() }), runs = nano.runs();
+
+  await r.once();
+  await r.once();
+  assert.equal(market.calls("POST", /\/start$/).length, 0);
+  assert.equal(nano.runs(), runs);
+  assert.equal(r.store.get(id).phase, "new");
+  assert.equal(JSON.parse(readFileSync(r.store.file, "utf8")).assignments[id].phase, "new");
+  assert.equal(r.store.persistenceStatus().ok, false);
+
+  diskFailed = failOnPrice = false;
+  await r.once();
+  assert.equal(r.store.get(id).phase, "submitted");
+  assert.equal(market.calls("POST", /\/start$/).length, 1);
+  assert.equal(nano.runs(), runs + 1);
+  assert.equal(r.store.persistenceStatus().ok, true);
+});
+
+test("a replacement with an unsynced directory halts Market work until the ledger is reopened", async t => {
+  let diskFailed = false;
+  syncFault(t, stat => diskFailed && stat.isDirectory());
+  const market = createMarketMock();
+  await market.listen();
+  const r = await rig({ market });
+  t.after(async () => { r.store.close(); await market.close(); });
+  const id = market.hire({ description: WORKED() }), runs = nano.runs();
+  r.store.create(id, { phase: "started" });
+  diskFailed = true;
+
+  assert.throws(() => r.store.update(id, { phase: "running" }), { code: "STATE_DURABILITY_UNCERTAIN" });
+  const replacement = readFileSync(r.store.file, "utf8");
+  assert.equal(JSON.parse(replacement).assignments[id].phase, "running");
+  assert.equal(r.store.get(id).phase, "started");
+  assert.deepEqual(r.store.persistenceStatus(), { ok: false, pendingWrites: 0, durabilityUncertain: true });
+  await assert.rejects(r.once(), { code: "STATE_DURABILITY_UNCERTAIN" });
+  assert.equal(nano.runs(), runs);
+  r.store.close();
+  assert.throws(() => openMarketState({ dir: r.stateDir }), { code: "STATE_DURABILITY_UNCERTAIN" });
+  assert.equal(existsSync(join(r.stateDir, "worker.lock")), false);
+
+  diskFailed = false;
+  const recovered = await rig({ market, dir: r.stateDir });
+  t.after(() => recovered.store.close());
+  assert.equal(readFileSync(recovered.store.file, "utf8"), replacement);
+  await recovered.once();
+  assert.equal(recovered.store.get(id).decline?.code, "INTERRUPTED");
+  assert.equal(nano.runs(), runs);
+  assert.equal(market.calls("POST", /\/start$/).length, 0);
 });
 
 test("lock: losing a takeover race is detected; a write after the lock moved stops; close() leaves another owner's lock", () => {

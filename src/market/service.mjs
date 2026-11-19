@@ -513,12 +513,14 @@ function createListing({ maintenance, agent, token, store, cfg, funding, log, cu
   async function bidTick() {
     if (!agent.bids || !worker) return;
     try {
+      store.assertDurable();
       if (!bidder) {
         try { bidState = openBidState(join(cfg.stateDir, agent.handle, "bids.json")); bidReadFailed = false; }
         catch (error) { bidReadFailed = true; throw error; }
         bidder = createBidder({
           client, runner, state: bidState,
-          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd, checkFee, log: (line) => L(`bids: ${line}`),
+          priceFor: (depositUsd) => recommendPrice({ depositUsd }), budgetFor: budgetFromPrice, maxBidUsd: agent.maxBidUsd,
+          checkFee: async () => { await checkFee(); store.assertDurable(); }, log: (line) => L(`bids: ${line}`),
         });
       }
       await bidder.tick();
