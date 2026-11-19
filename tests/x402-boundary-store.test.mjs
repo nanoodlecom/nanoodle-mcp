@@ -274,3 +274,19 @@ test("state files missing a required map fail closed at load", async t => {
   await writeFile(s.file, JSON.stringify(broken));
   assert.throws(() => s.make(), /BOUNDARY_STATE_CORRUPT/);
 });
+
+test("a built requirement for the wrong network is rejected, and reservations cannot outlive the v2 quote bound", async t => {
+  const s = await setup(t);
+  await assert.rejects(s.boundary.issueQuote({
+    request: { requestId: "r", customerScope: "c", resource: { url: "https://x.invalid/" } },
+    binding: hex("3"),
+    buildRequirements: async () => ({ scheme: "exact", network: "solana:wrong", asset: "USDC", payTo: "x", amount: "1", maxTimeoutSeconds: 60, extra: {} }),
+  }), /BOUNDARY_PRICING_INVALID/);
+  assert.equal(await s.boundary.lookupQuote({ binding: hex("3") }), null);
+  const id = s.identity();
+  await s.quote();
+  id.quoteId = (await s.boundary.lookupQuote({ binding: id.binding })).quoteId;
+  await assert.rejects(
+    s.boundary.reserve({ ...id, now: s.now(), expiresAt: s.now() + 3_600_000 }),
+    /BOUNDARY_RESERVATION_EXPIRED/);
+});

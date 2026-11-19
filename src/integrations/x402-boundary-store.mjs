@@ -164,9 +164,11 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
         if (new Set(priced.prices.map(p => p?.network)).size !== priced.prices.length) fail("BOUNDARY_PRICING_INVALID");
         const requirements = [];
         for (const p of priced.prices) {
-          requirements.push(await buildRequirements({
+          const built = await buildRequirements({
             network: p.network, amountAtomic: p.amountAtomic, maxTimeoutSeconds: ttlSeconds,
-          }));
+          });
+          if (!built || built.network !== p.network) fail("BOUNDARY_PRICING_INVALID");
+          requirements.push(built);
         }
         let quote;
         persist(s => {
@@ -199,7 +201,7 @@ export function createDurableX402Boundary({ file, priceQuote, execute, now = Dat
         if (!quote || quote.quoteId !== input.quoteId) fail("BOUNDARY_QUOTE_MISMATCH");
         const existing = state.reservationsByAuth[input.authorizationKey];
         if (existing) { assertIdentity(existing, input); return clone(existing); }
-        if (!(input.now < input.expiresAt)) fail("BOUNDARY_RESERVATION_EXPIRED");
+        if (!(input.now < input.expiresAt) || input.expiresAt - input.now > 300_000) fail("BOUNDARY_RESERVATION_EXPIRED");
         let record;
         persist(s => {
           record = {
