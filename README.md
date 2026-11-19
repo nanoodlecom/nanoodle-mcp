@@ -1411,6 +1411,16 @@ procedure, and the one-command registry publish
 (`npm run publish:registry -- --execute`, dry-run without `--execute`) live in
 [docs/agent-identity.md](docs/agent-identity.md).
 
+## Optional integrations
+
+- **ASI Agentverse (inactive by default)** — a Python uAgent sidecar in
+  [`integrations/agentverse/`](integrations/agentverse/) that exposes this
+  server's workflows to ASI:One / Agentverse chat via the Agent Chat
+  Protocol, settling paid runs through this server's existing payment
+  links. Registration is a deliberate operator step; see its README and
+  RUNBOOK.
+
+
 ## Which repo do I want?
 
 This server exposes saved workflows as typed MCP tools. If your agent supports
