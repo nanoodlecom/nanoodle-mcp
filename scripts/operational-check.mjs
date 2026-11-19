@@ -130,6 +130,14 @@ function currentNanoPaymentPeers(rows) {
   return current.filter(row => row.paymentReads && row.view.confirmedHeight === latestConfirmed.confirmedHeight);
 }
 
+async function readDiscoveryStep(step, read) {
+  try { return await read(); }
+  catch (error) {
+    if (error?.code === "RPC_TIMEOUT") throw new CheckError(`near-discovery-${step}-timeout`);
+    throw error;
+  }
+}
+
 function backupVerificationProof(file, read, now, stage) {
   let record;
   try { record = read(file); }
@@ -656,18 +664,18 @@ export async function runOperationalCheck(config, deps = {}) {
       const { paymentTx, payer } = sample;
       const accounts = [config.merchant, USDC_CONTRACTS[config.network]];
       const witnessed = await Promise.all(nearNodes.map(({ index, rpc, identity }) => check(`near-discovery-peer-${index}`, async () => {
-        const tx = await rpc.txStatus({ txHash: paymentTx, senderId: payer });
+        const tx = await readDiscoveryStep("transaction", () => rpc.txStatus({ txHash: paymentTx, senderId: payer }));
         const receipt = Array.isArray(tx.receipts_outcome)
           && tx.receipts_outcome.find(row => row.outcome?.executor_id === config.merchant);
         need(tx.final_execution_status === "FINAL" && Object.hasOwn(tx.status ?? {}, "SuccessValue")
           && tx.transaction?.hash === paymentTx && tx.transaction.signer_id === payer && tx.transaction.receiver_id === config.merchant
           && typeof receipt?.id === "string" && typeof receipt.block_hash === "string"
           && Object.hasOwn(receipt.outcome.status ?? {}, "SuccessValue"), "near-discovery-canary-transaction-unverified");
-        const block = nearBlockIdentity(await rpc.block({ blockId: receipt.block_hash }));
+        const block = nearBlockIdentity(await readDiscoveryStep("block", () => rpc.block({ blockId: receipt.block_hash })));
         need(block.hash === receipt.block_hash && block.height <= identity.height, "near-discovery-canary-block-mismatch");
-        const ids = await readNearPaymentReceipts(rpc, block.hash, accounts);
+        const ids = await readDiscoveryStep("account-changes", () => readNearPaymentReceipts(rpc, block.hash, accounts));
         need(ids.has(receipt.id), "near-discovery-canary-receipt-missing");
-        const resolved = await readNearReceiptTransaction(rpc, receipt.id, block.height);
+        const resolved = await readDiscoveryStep("receipt-lookup", () => readNearReceiptTransaction(rpc, receipt.id, block.height));
         need(resolved.transaction_hash === paymentTx && resolved.sender_account_id === payer, "near-discovery-canary-receipt-mismatch");
         return true;
       }, [])));

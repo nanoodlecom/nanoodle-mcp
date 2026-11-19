@@ -246,6 +246,8 @@ Coverage:
   If the watcher is still scanning historical blocks five minutes after the
   first observation, the same alert route reports delayed payment detection.
   The report distinguishes this from a failure to follow the live chain tip.
+  The historical canary reports which RPC step timed out for each peer,
+  from fetching the transaction to resolving the receipt.
   Historical blocks must match the requested hash, and recovery records a
   decreasing height bound across restarts. An invalid predecessor leaves
   coverage at the last verified block and marks the watcher unready.
