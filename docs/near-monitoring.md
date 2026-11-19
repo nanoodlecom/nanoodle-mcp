@@ -257,10 +257,10 @@ Coverage:
   them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
   clear the trend. The elapsed time comes from the counter observations.
   Wallet read quorum determines Nano payment readiness.
-- Recent paid workflow execution failures from the Nano and NEAR/USDC
-  ledgers. The report includes aggregate counts for the last 30 minutes.
-  Two or more failed runs raise an advisory while payment admission
-  continues. Refunds for late or wrong-amount transfers are outside this check.
+- Recent paid workflow execution failures from the Nano, NEAR/USDC and
+  Market ledgers. Two or more failed runs in 30 minutes across these sources
+  raise an advisory while payment admission continues. Late or wrong-amount
+  transfers and Market jobs declined before execution are excluded.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the

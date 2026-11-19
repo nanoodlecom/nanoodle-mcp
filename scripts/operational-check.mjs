@@ -427,8 +427,8 @@ export async function runOperationalCheck(config, deps = {}) {
     const checkedAt = now();
     const liabilities = paymentLiabilities({ nano, near, market }, { now: checkedAt });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
-    const failures = recentPaidWorkflowFailures({ nano, near }, checkedAt);
-    const ok = failures.nano + failures.near + failures.usdc < 2;
+    const failures = recentPaidWorkflowFailures({ nano, near, market }, checkedAt);
+    const ok = failures.nano + failures.near + failures.usdc + failures.market < 2;
     checks.push({ stage: "paid-workflow-execution", ok, failures,
       ...(ok ? {} : { code: "paid-workflow-failures-repeated", domains: [] }) });
     return { liabilities, near };
