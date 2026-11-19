@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
@@ -1527,6 +1527,69 @@ test("mismatched or malformed cooldown observations cannot hide live peer failur
     assert.ok(f.calls.some(call => call.url.hostname === "nano-0.example"));
     assert.equal(report.admission.nano, false);
   }
+});
+
+test("retained paid output checks file metadata on both payment rails without disclosing URLs", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-retained-media-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const video = `run_noodle-Clip-${NOW - 1000}-1-012345abcdef.mp4`;
+  const audio = `sing-Song-${NOW - 1000}-2-012345abcdef.mp3`;
+  const expired = `sing-Expired-${NOW - 4000}-3-012345abcdef.mp3`;
+  const image = `run_noodle-Image-${NOW - 1000}-4-012345abcdef.png`;
+  writeFileSync(join(dir, video), "synthetic video");
+  writeFileSync(join(dir, audio), "synthetic audio");
+  writeFileSync(join(dir, image), "synthetic image");
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const funding = f.states["/state/funding-health.json"];
+  funding.mediaRetentionMs = 2000;
+  const content = text => ({ type: "text", text });
+  const paymentTx = base58Encode(Buffer.alloc(32, 3)), id = "nq_recentMedia1";
+  const usdcTx = base58Encode(Buffer.alloc(32, 4)), usdcId = "nq_recentMedia2";
+  const near = f.states["/state/near-state.json"];
+  near.consumedTx = { [paymentTx]: id, [usdcTx]: usdcId };
+  near.quotes[id] = { id, status: "settled", outcome: "succeeded", payTx: paymentTx, paidYocto: "1",
+    result: { content: [content(`Clip: ${f.config.site}/out/${video}`)] } };
+  near.quotes[usdcId] = { ...near.quotes[id], id: usdcId, asset: "usdc", payTx: usdcTx, tokenContract: USDC_CONTRACTS.mainnet,
+    result: { content: [content(`Image: ${f.config.site}/out/${image}`)] } };
+  const nano = f.states["/state/gate-state.json"];
+  nano.quotes.push({ id: "pay_private", status: "consumed", settled: true, result: { content: [
+    content(`Song: ${f.config.nanoSite}/out/${audio}`),
+    content(`Expired: ${f.config.nanoSite}/out/${expired}`),
+    content(`External: https://external.example/out/${audio}`),
+    content(`Traversal: ${f.config.nanoSite}/out/../${video}`),
+  ] } });
+  const seen = [];
+  f.deps.lstat = (file, options) => {
+    seen.push(file);
+    return lstatSync(join(dir, basename(file)), options);
+  };
+  const verify = async (ok, code = undefined) => {
+    seen.length = 0;
+    const report = await runOperationalCheck(f.config, f.deps);
+    const check = report.checks.find(({ stage }) => stage === "retained-paid-media");
+    assert.equal(check?.ok, ok);
+    assert.equal(check?.code, code);
+    if (!ok) assert.deepEqual(check.domains, []);
+    assert.doesNotMatch(JSON.stringify(report), /012345abcdef|pay_private|external\.example/);
+  };
+  await verify(true);
+  assert.deepEqual(seen, [audio, video, image].map(file => join(f.config.outDir, file)));
+  rmSync(join(dir, video));
+  await verify(false, "paid-media-file-unavailable");
+  symlinkSync(join(dir, audio), join(dir, video));
+  await verify(false, "paid-media-file-unavailable");
+  rmSync(join(dir, video));
+  writeFileSync(join(dir, video), "");
+  funding.ok = false;
+  funding.code = "funding-underfunded";
+  await verify(false, "paid-media-file-unavailable");
+  funding.mediaRetentionMs = 500;
+  await verify(true);
+  assert.deepEqual(seen, []);
+  funding.mediaRetentionMs = 0;
+  await verify(false, "paid-media-file-unavailable");
+  assert.ok(seen.includes(join(f.config.outDir, expired)));
 });
 
 test("the no-inference check distinguishes wallet read refusal from missing funding enforcement", async () => {

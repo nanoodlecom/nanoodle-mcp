@@ -732,6 +732,7 @@ async function main() {
       const { startFundingReport } = await import("../src/funding-report.mjs");
       await startFundingReport({ outDir: resolvedOut, snapshot: wallet.ops.fundingReport, rpcStatus: wallet.ops.fundingReadStatus,
         sources: fundingSources, durableState: moneyState,
+        mediaRetentionMs: Number.isFinite(outTtlMs) ? outTtlMs : 0,
         writerProtection: () => {
           writerLocks.assertHeld();
           return { enforced: true, requiredState: requiredState?.requireExisting === true };
