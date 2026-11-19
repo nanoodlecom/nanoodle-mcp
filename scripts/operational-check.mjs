@@ -25,7 +25,7 @@ import {
 } from "../src/near/quote-capacity.mjs";
 import { authorAddress, resolveWalletKey, isThrottleError } from "../src/wallet.mjs";
 import { rpcPeerSetId, selectRpcCooldowns } from "../src/rpc-backoff.mjs";
-import { parseUsdNano } from "../src/gate.mjs";
+import { LIVE_RATE_MAX_AGE_MS, parseUsdNano } from "../src/gate.mjs";
 import { readCatalog, fetchListingPrice, budgetFromPrice, marketEscrowTerms, listingWorkflowPriceSample } from "../src/market/catalog.mjs";
 import { createMarketClient, MarketApiError } from "../src/market/client.mjs";
 import { createMarketFeeGuard } from "../src/market/fee-guard.mjs";
@@ -731,19 +731,28 @@ export async function runOperationalCheck(config, deps = {}) {
       need(fundingHealth[key] === true, code);
     }, [asset]);
   }
-  const rates = await check("exchange-rates", async () => {
+  const rateView = await check("exchange-rates", async () => {
     const result = await http(config.site + "/rates");
-    need(result.quoting && parseUsdNano(result.nearUsd) > 0n && parseUsdNano(result.xnoUsd) > 0n, "exchange-rate-not-usable");
-    for (const name of ["nearUsd", "xnoUsd"]) {
-      const source = result.sources?.[name];
-      need(source?.usable === true, "exchange-rate-not-usable");
-      if (source.live) {
-        const age = now() - Date.parse(source.at);
-        need(Number.isFinite(age) && age <= 300_000 && age >= -30_000, "exchange-rate-stale");
-      } else checks.push({ stage: `static-rate-${name}`, ok: false, code: "static-rate-needs-operator-review", domains: [] });
-    }
+    need(typeof result?.quoting === "boolean", "exchange-rate-not-usable");
     return result;
   });
+  function verifyRate(name) {
+    const source = rateView.sources?.[name];
+    need(source?.usable === true && parseUsdNano(rateView[name]) > 0n, "exchange-rate-not-usable");
+    if (source.live) {
+      const age = now() - Date.parse(source.at);
+      need(age >= -30_000 && age < LIVE_RATE_MAX_AGE_MS, "exchange-rate-stale");
+    } else checks.push({ stage: `static-rate-${name}`, ok: false, code: "static-rate-needs-operator-review", domains: [] });
+  }
+  const rates = rateView && await check("exchange-rate-xno", () => {
+    verifyRate("xnoUsd");
+    return rateView;
+  });
+  if (rateView) await check("exchange-rate-near", () => {
+    verifyRate("nearUsd");
+    // The aggregate quoting flag can also be down because XNO is unavailable.
+    if (rates || rateView.xnoRequired === false) need(rateView.quoting, "exchange-rate-not-usable");
+  }, ["near"]);
   if (state && nano && rates) await check("nano-liquidity", async () => {
     const result = nanoLiquidityCheck({ liabilities: state.liabilities, nanoBalanceRaw: nano.info.confirmed_balance,
       xnoUsd: rates.xnoUsd, providerReserveUsd });
