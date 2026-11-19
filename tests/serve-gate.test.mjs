@@ -270,21 +270,26 @@ test("Nano refunds an underfunded saved workflow before its first provider call"
   await writeFile(join(dir, "authored.json"), JSON.stringify({ ...WORKED_GRAPH, x402: { usd: 0.01, author: PAYER } }));
   await writeFile(join(dir, "drifted.json"), JSON.stringify({ ...WORKED_GRAPH, x402: { usd: 0.5 } }));
   await writeFile(join(dir, "offline.json"), JSON.stringify({ ...WORKED_GRAPH, x402: { usd: 0.5 } }));
+  await writeFile(join(dir, "live-price.json"), JSON.stringify({ ...WORKED_GRAPH, x402: { usd: 0.005 } }));
   const registry = await loadTools({ dirs: [dir], apiKey: "fixture-key", baseUrl: models.url, outDir: dir });
   const chain = fakeChain();
   const gate = makeGate(chain, { registry, fundRun: (_terms, run) => run() });
   t.after(() => gate.stop());
   const { callTool } = gate.wrapRegistry(registry);
   const args = { Idea: "a lighthouse at dawn" };
-  for (const [name, hash] of [["poster", "C"], ["authored", "D"], ["drifted", "E"], ["offline", "F"]]) {
+  for (const [name, hash] of [["poster", "C"], ["authored", "D"], ["drifted", "E"], ["live-price", "7"], ["offline", "F"]]) {
     const quote = argOf(await callTool({ name, arguments: args }));
     if (name === "drifted") catalogs.image[0].pricing.per_image["1024x1024"] = 1;
+    if (name === "live-price") {
+      catalogs.image[0].pricing.per_image["1024x1024"] = 0.001;
+      catalogs.image[0].pricing.note = "Exact price set by live quote";
+    }
     if (name === "offline") catalogs.image = [];
     chain.state.receivable[hash.repeat(64)] = { amount: quote.amountRaw, source: PAYER };
     const result = await callTool({ name, arguments: { ...args, _payment_id: quote.paymentId } });
     assert.equal(models.runs(), 0);
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, name === "offline"
+    assert.match(result.content[0].text, ["live-price", "offline"].includes(name)
       ? /current model catalogs could not verify this quote's budget/
       : /current model estimate exceeds this quote's budget/);
     assert.equal(chain.state.transfers.at(-1).amountRaw, quote.amountRaw);

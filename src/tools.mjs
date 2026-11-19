@@ -1324,7 +1324,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           const { pricing, catalogs: fresh } = await priceSavedWorkflow(tool.wf.graph, {
             inputs, baseUrl, fetch: runtimeFetch, log, catalogTimeoutMs, catalogMaxAgeMs: 0,
           });
-          if (pricing.unpriced.some(node => node.catalogMissing)) {
+          if (pricing.refusals.length || pricing.unpriced.some(node => node.catalogMissing)) {
             throw new FundingError("QUOTE_CATALOG_UNAVAILABLE", "The current model catalogs could not verify this quote's budget. No model work started.");
           }
           if (!Number.isFinite(pricing.estimatedCostUsd)
