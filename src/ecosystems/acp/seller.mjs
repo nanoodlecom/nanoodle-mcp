@@ -108,7 +108,12 @@ export function createAcpSeller({ enabled = false, mode = 'disabled', sdk, journ
       && (entry.kind !== 'system' || entry.event?.jobId === session.jobId), 'ACP_ENTRY_MISMATCH');
     let r = journal.get(key);
     try {
-      const job = await bounded(key, () => readJob(session.jobId));
+      // A cancelled job gets one read-only pass so a terminal chain state
+      // (completed / rejected / expired) can still be recorded from chain
+      // evidence. Every effectful operation stays blocked: bounded() refuses
+      // cancelled keys, and the guard below stops any further progress.
+      const job = await (cancelled.has(key) && r ? readJob(session.jobId)
+        : bounded(key, () => readJob(session.jobId)));
       const binding = bindJob(job, session), bindingHash = hash(binding);
       if (r) check(r.bindingHash === bindingHash, 'ACP_JOB_CHANGED');
       if (r) {
@@ -117,6 +122,7 @@ export function createAcpSeller({ enabled = false, mode = 'disabled', sdk, journ
         if (r.state.endsWith('_intent')) return save(key, r, 'review_required', { reviewCode: 'ACP_EFFECT_OUTCOME_UNKNOWN' });
         if (r.state === 'review_required' || r.state === 'submitted') return r;
       }
+      check(!cancelled.has(key), 'ACP_OPERATION_INTERRUPTED');
       check(Number(job.expiredAt) * 1000 > now(), 'ACP_JOB_EXPIRED');
       if (!r) {
         // First requirement must be buyer-authored. Funding arriving first does

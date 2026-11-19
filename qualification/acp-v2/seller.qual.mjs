@@ -176,6 +176,20 @@ test('timeout and cancellation retain uncertainty and block later ignored-abort 
   }
 });
 
+test('cancel after submission blocks effects but terminal chain evidence still reconciles', async t => {
+  const f = await fixture(); t.after(() => f.close()); await funded(f); await event(f);
+  assert.equal(f.journal.get('8453:7').state, 'submitted');
+  f.seller.cancel(8453, '7');
+  assert.equal(f.journal.get('8453:7').state, 'review_required');
+  // No terminal evidence yet: a cancelled job makes no further progress.
+  assert.equal((await event(f)).state, 'review_required');
+  assert.deepEqual(f.state.count, { quote: 1, reserve: 1, dispatch: 1, budget: 1, submit: 1, publish: 1 });
+  completeLogs(f);
+  const done = await f.seller.handle(f.session, system('job.completed'));
+  assert.equal(done.state, 'completed'); assert.equal(done.evaluatorReceipt.releasedAtomic, '950000');
+  assert.deepEqual(f.state.count, { quote: 1, reserve: 1, dispatch: 1, budget: 1, submit: 1, publish: 1 });
+});
+
 test('uncertain SDK submission resolves only from finalized evaluator and matching deliverable evidence', async t => {
   const f = await fixture(); t.after(() => f.close()); await funded(f); f.state.submitError = true;
   assert.equal((await event(f)).state, 'review_required'); assert.equal(f.state.count.submit, 1);
