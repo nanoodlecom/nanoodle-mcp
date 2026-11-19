@@ -113,7 +113,16 @@ class FacadeService:
         try:
             command = parse_message(text, max_input_chars=self._config.max_input_chars)
         except ParseError as exc:
-            return self._cache_put(cache_key, str(exc))
+            if self._config.default_workflow and not text.strip().lower().startswith(
+                ("run ", "paid ", "status ")
+            ):
+                command = RunRequest(
+                    tool=self._config.default_workflow,
+                    free_text=text.strip(),
+                    label=self._config.default_workflow,
+                )
+            else:
+                return self._cache_put(cache_key, str(exc))
 
         if isinstance(command, HelpRequest):
             return self._cache_put(cache_key, HELP_TEXT)

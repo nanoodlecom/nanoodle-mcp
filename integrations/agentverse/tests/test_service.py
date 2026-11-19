@@ -302,6 +302,33 @@ def test_sweeper_skips_claimed_jobs():
     run(scenario())
 
 
+def test_natural_language_uses_default_workflow_when_configured():
+    seen = {}
+
+    def result_handler(payload):
+        seen.update(payload["params"]["arguments"])
+        return ok_result("nl result")
+
+    service = make_service(
+        dispatch(result_handler), default_workflow="character-sprites"
+    )
+    replies = run(
+        service.handle_text(
+            sender=SENDER, msg_id="n1", text="please draw me a furnace knight"
+        )
+    )
+    assert replies == ["nl result"]
+    assert seen == {"Character": "please draw me a furnace knight"}
+
+
+def test_natural_language_without_default_workflow_gets_usage():
+    service = make_service(tools_handler)
+    replies = run(
+        service.handle_text(sender=SENDER, msg_id="n2", text="draw me a knight")
+    )
+    assert "Try `list`" in replies[0]
+
+
 def test_oversized_input_rejected_before_any_call():
     called = []
     service = make_service(lambda payload: called.append(payload) or tools_handler(payload))

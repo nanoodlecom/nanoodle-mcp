@@ -76,6 +76,13 @@ class Config:
     # pay-per-call endpoint they fall back to a payment deep link like
     # everything else — this facade never pays on a caller's behalf.
     free_workflows: tuple[str, ...] = ()
+    # Optional: a workflow that plain natural-language messages (no
+    # command prefix) are run against as free text. ASI:One routes
+    # conversational prompts, and its agent tester probes with natural
+    # language — without a default workflow those all bounce with usage
+    # instructions. Unset by default; the operator opts in deliberately
+    # because every such message spends a run.
+    default_workflow: str | None = None
     # Seconds a single tools/call may take before the caller is told the
     # run is continuing in the background instead of being left hanging.
     short_wait_s: float = 10.0
@@ -119,6 +126,10 @@ class Config:
             workflows=_parse_csv(source.get("NANOODLE_AGENTVERSE_WORKFLOWS")),
             free_workflows=_parse_csv(
                 source.get("NANOODLE_AGENTVERSE_FREE_WORKFLOWS")
+            ),
+            default_workflow=(
+                source.get("NANOODLE_AGENTVERSE_DEFAULT_WORKFLOW", "").strip()
+                or None
             ),
             text_input_key=source.get(
                 "NANOODLE_AGENTVERSE_TEXT_INPUT_KEY", "Idea"
