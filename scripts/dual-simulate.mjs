@@ -35,7 +35,7 @@ const PAYER = "payer.testnet";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A Nano node stand-in: an opened account with no receivables; work requests are refused. */
-export async function nanoNode() {
+export async function nanoNode({ balanceRaw = "0" } = {}) {
   const frontier = "B".repeat(64);
   let historyAvailable = true;
   const server = createServer(async (req, res) => {
@@ -43,9 +43,10 @@ export async function nanoNode() {
     for await (const c of req) chunks.push(c);
     let body = {};
     try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { body = {}; }
-    const history = [{ type: "open", hash: frontier, height: "1", confirmed: "true", account: body.account, amount: "1" }];
+    const history = [{ type: "open", hash: frontier, height: "1", confirmed: "true", account: body.account,
+      amount: balanceRaw === "0" ? "1" : balanceRaw }];
     const answer = {
-      account_info: nanoAccountInfo({ frontier, balance: "0", representative: body.account, height: 1 }),
+      account_info: nanoAccountInfo({ frontier, balance: balanceRaw, representative: body.account, height: 1 }),
       block_info: body.hash === NANO_GENESIS_HASH ? NANO_GENESIS_REPLY : { error: "Block not found" },
       receivable: { blocks: "" },
       account_history: historyAvailable
