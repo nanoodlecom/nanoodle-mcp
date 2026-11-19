@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain } from "../src/gate.mjs";
+import { wrapNanoCustomWorkflow } from "../src/custom-mcp.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd, loadTools } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
@@ -130,6 +131,40 @@ function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300
 const GRAIN = 10n ** 22n; // 1e-8 XNO, the wallet-typeable resolution — mirrors the gate's constant
 
 const argOf = (result) => result.structuredContent.x402;
+
+test("private Nano workflows bind a quote to their profile and settle only once", async () => {
+  const chain = fakeChain();
+  const provider = nanoGptMock();
+  const baseUrl = "https://custom-nano.provider.invalid";
+  let starts = 0;
+  const registry = {
+    prepareRunNoodle: async (_args, { read }) => assert.equal(read.source, "graph"),
+    async callTool(params) {
+      assert.equal(params.name, "run_noodle");
+      assert.equal(params.arguments.graph.nodes.find(n => n.type === "llm").fields.maxTokens, 2000);
+      starts++;
+      return { content: [{ type: "text", text: "Private synthetic output" }], costUsd: 0.00941, costExact: true, textOutput: true };
+    },
+  };
+  const gate = makeGate(chain);
+  const call = wrapNanoCustomWorkflow({ gate, registry, baseUrl, fetch: provider.fetch });
+  const scope = { paymentScope: "private-profile", paymentAlias: "poster-ideas" };
+  const args = { graph: WORKED_GRAPH, inputs: { Idea: "a lighthouse" } };
+  const payment = argOf(await call(args, scope));
+  assert.equal(starts, 0);
+  assert.equal(gate.hasOpenProfileQuotes(scope.paymentScope), true);
+  assert.equal((await call({ ...args, _payment_id: payment.paymentId }, { ...scope, paymentScope: "another-profile" })).isError, true);
+  assert.equal((await call({ ...args, _payment_id: payment.paymentId }, { ...scope, paymentAlias: "different-alias" })).isError, true);
+  chain.state.receivable["E".repeat(64)] = { amount: payment.amountRaw, source: PAYER };
+  const resume = { ...args, _payment_id: payment.paymentId };
+  const results = await Promise.all([call(resume, scope), call(resume, scope)]);
+  for (const result of results) {
+    assert.ok(!result.isError, JSON.stringify(result));
+    assert.match(result.content[0].text, /Private synthetic output/);
+  }
+  assert.equal(starts, 1);
+  assert.equal(gate.hasOpenProfileQuotes(scope.paymentScope), false);
+});
 
 test("live liabilities retain change while a settlement transfer is still in flight", async () => {
   const chain = fakeChain(); let release;

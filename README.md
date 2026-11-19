@@ -282,6 +282,45 @@ already live — add `https://mcp.nanoodle.com/mcp` (paid per call in Nano, no
 API key). Local stdio (`npx nanoodle-mcp --graphs …`) stays BYOK and is not
 reachable from ChatGPT.
 
+### Custom MCP
+
+Use **Add a Custom MCP** on the [Nano landing page](https://nano.nanoodle.com/)
+or [NEAR landing page](https://near.nanoodle.com/) to create a personal MCP
+profile. Select built-in tools and optionally upload native Nanoodle JSON
+exports as named tools. Save the profile, then generate a client token. Each
+host keeps its own tool choices and connection. Your recovery key can reopen
+the profile on either host. The available built-ins follow each host's current
+catalog. Retired tools stay unavailable in saved profiles. Rename any private
+workflow that uses a retired tool name to make it callable again.
+
+Use Streamable HTTP with the displayed endpoint and send the client token as
+an `Authorization: Bearer` header. Use your client's secret configuration to
+provide it. For Codex, set the token environment variable shown on the setup
+page, then run the displayed `codex mcp add` command. The URL stays the same
+when you edit the profile or replace the token. Replacing or revoking the token
+disconnects clients using it. Save your recovery key separately in a password
+manager. Recovery keys manage profiles, and client tokens only connect to the
+profile's MCP endpoint.
+
+The private workflow tools use the hosted graph policy and the payment assets
+listed in their schemas. They accept supported Nanoodle exports with text or
+choice inputs. Workflows may contain saved defaults and locked prompts.
+External workflow URLs and media uploads are unavailable in this flow.
+A quote follows the same payment and refund rules as the selected rail. Keep the
+original arguments and payment ID, and resume through the same profile. Finish
+outstanding payments before removing or replacing tools or deleting a profile.
+Deleting a profile removes its settings and disconnects the client for that host.
+Private NEAR checkout pages show payment and refund status. The MCP client
+receives the workflow result.
+
+The standard install at `/mcp` still connects to the public catalog. Use
+`/creators` on the NEAR host to publish a workflow for other people.
+
+Hosted servers keep profiles in `custom-mcp-profiles/` under the private,
+persistent `--out` directory. Include that directory in protected backup and
+restore procedures. Profile state contains private workflow definitions and
+credential hashes.
+
 ## ⚠️ This spends real money
 
 The server runs on **your** money — either a nano-gpt.com API key (BYOK) or,

@@ -44,11 +44,13 @@ function render(state) {
   status.textContent = checking ? state.next || "Checking for your original transfer…" : messages[state.status] || state.status;
   const final = ["settled", "failed", "rejected"].includes(state.status);
   document.querySelector("#near-title").textContent = canPay ? `Pay in ${asset}` : checking ? "Checking payment"
-    : final ? state.receipt?.outcome === "succeeded" ? "Your result" : "Run finished" : "Your workflow";
+    : final ? (!quote.resultInClient && state.receipt?.outcome === "succeeded" ? "Your result" : "Run finished") : "Your workflow";
   document.querySelector("#near-deposit").open = canPay;
   document.querySelector("#near-manual").hidden = !canPay && state.status !== "expired";
   document.querySelector("#near-transfer-instructions").hidden = !canPay || !!saved;
-  document.querySelector("#near-note").textContent = checking
+  document.querySelector("#near-note").textContent = quote.resultInClient
+    ? "Your workflow and result are in your Custom MCP client. This page shows payment and refund status."
+    : checking
     ? "This page will show your workflow as soon as your original payment is confirmed."
     : canPay
     ? "Keep this page open for the live workflow, result and receipt. Your agent continues automatically after payment."

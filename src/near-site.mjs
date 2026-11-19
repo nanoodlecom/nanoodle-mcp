@@ -22,7 +22,7 @@ for (const [name, stages] of Object.entries({
   "sing": [["text", "Song idea"], ["llm", "Lyrics"], ["llm", "Arrangement"], ["music", "Finished song"]],
 })) nearWorkflowCopy[name].steps = stages.map(([kind, label]) => ({ kind, label, n: 1 }));
 
-export function nearSitePage({ version, publicBase, merchant, network, tools, cards, notes = "", usdc, hosting = false, scriptUrl = "/near-site.js" }) {
+export function nearSitePage({ version, publicBase, merchant, network, tools, cards, notes = "", usdc, hosting = false, customMcp = false, scriptUrl = "/near-site.js" }) {
   const assets = usdc?.enabled ? "NEAR or USDC" : "NEAR";
   const config = { publicBase, merchant, tools: tools.map(t => ({ name: t.name, title: t.title || nearWorkflowCopy[t.name]?.title, schema: t.inputSchema, ...(t.graph ? { graph: t.graph, defaults: t.defaults } : {}) })), usdc };
   const title = `nanoodle — Give your agents new abilities, paid in ${assets}`;
@@ -45,7 +45,7 @@ export function nearSitePage({ version, publicBase, merchant, network, tools, ca
       </section>
       <section id="connect" class="connect-section" aria-label="Connect your agent"><div class="connect-heading"><b>One connection gives your agent the toolkit.</b><label for="connect-client" class="sr-only">MCP client</label><select id="connect-client"><option value="claude">Claude Code</option><option value="grok">Grok</option><option value="url">Any MCP client · URL</option></select></div>
         <div class="connect"><pre id="connect-command">${esc(`claude mcp add --transport http nanoodle ${publicBase}/mcp`)}</pre><button type="button" id="connect-copy">Copy</button></div>
-        <p class="form-help">Works with Claude Code, Grok, Cursor and any MCP client. You can also <a href="#studio">try a workflow in this browser</a>.</p></section>
+        <p class="form-help">${customMcp ? '<a href="/custom-mcp">Add a Custom MCP ↗</a> · ' : ""}Works with Claude Code, Grok, Cursor and any MCP client. You can also <a href="#studio">try a workflow in this browser</a>.</p></section>
       <section id="workflows" class="near-section"><div class="section-heading"><p class="eyebrow">START WITH SOMETHING THAT RUNS</p><h2>What do you want to make?</h2><p>These are real Nanoodle graphs. Use the saved inputs, change the brief, or open the graph to see how it works. Getting a quote never starts a paid generation.</p></div><ul class="tools">${cards}</ul></section>
       <section class="cost-section near-section" aria-labelledby="cost-title"><div class="section-heading"><p class="eyebrow">PAY PER RUN</p><h2 id="cost-title">Know the cost before you start.</h2><p>Your wallet pays for the whole pipeline, with no prepaid Nanoodle balance. Get an itemized quote and pay the exact deposit in ${esc(assets)} to <code>${esc(merchant)}</code>. The server detects your payment and your agent continues automatically.</p></div>
         <div class="cost-rules"><p><b>Model cost + 20%</b><span>The quote includes the service fee. Your deposit is the most you can be charged.</span></p><p><b>The change is yours</b><span>Unused funds return to the paying wallet in the same asset. A failed run refunds the whole deposit.</span></p></div>
