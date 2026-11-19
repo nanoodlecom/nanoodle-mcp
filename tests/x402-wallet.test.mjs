@@ -345,6 +345,13 @@ test("guarded funded payments use the corroborated primary and leave the standby
     } });
   let state = await wallet.ops.fundingReport();
   assert.equal(state.nanoRpc.standby.inUse, true);
+  const beforeReuse = calls.filter(call => call.url === standby).length;
+  at += 5_000;
+  state = await wallet.ops.fundingReport();
+  assert.equal(state.nanoRpc.lastReadAt, 1_000);
+  assert.equal(state.nanoRpc.fundingEvidenceExpiresAt, 31_000);
+  assert.equal(state.balanceRaw, mock.state.balance);
+  assert.equal(calls.filter(call => call.url === standby).length, beforeReuse);
   assert.equal(mock.state.processed.length, 0);
   await wallet.ops.withFunding({ id: "standby-payment", maxUsd: 0.01, maxRaw: BigInt(AMOUNT) }, () => wallet.payment(invoice()));
   assert.deepEqual(calls.filter(call => call.action === "process"), [{ action: "process", url: primary }]);
@@ -358,6 +365,51 @@ test("guarded funded payments use the corroborated primary and leave the standby
   assert.equal(state.nanoRpc.standby.inUse, false);
   assert.equal(calls.filter(call => call.url === standby).length, lastStandbyCallCount);
   assert.doesNotMatch(JSON.stringify(state), /SYNTHETIC|standby\.example/);
+});
+
+test("an already funded run or journaled refund can pocket its deposit and send within four standby reads", async () => {
+  for (const operation of ["run", "refund"]) {
+    const primary = "https://owned.example", offline = "https://offline.example", standby = "https://standby.example";
+    const deposit = "D".repeat(64), calls = [];
+    const pending = state => state.processed.some(body => body.subtype === "receive") ? "0" : AMOUNT;
+    let prepared = null;
+    const mock = fakeRpc({
+      account_info: (_body, state, reply) => reply(nanoAccountInfo({ frontier: state.frontier,
+        balance: state.balance, representative: ADDRESS, height: state.processed.length + 1, pending: pending(state) })),
+      receivable: (_body, state, reply) => reply({ blocks: pending(state) === "0" ? "" : { [deposit]: AMOUNT } }),
+      block_info: ({ hash }, state, reply) => {
+        const index = state.processed.findIndex(({ block }) => hashBlock(block) === hash);
+        return index >= 0 ? reply({ confirmed: "true", contents: state.processed[index].block, height: String(index + 2) })
+          : reply({ error: "Block not found" });
+      },
+    });
+    mock.state.balance = "1";
+    const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: [primary, offline].join(","),
+      rpcStandby: { url: standby, requestsPerMinute: 4 }, verifyRpcReads: true, protectTransfers: true,
+      requireFunding: true, localWork: false, fundingLiabilities: () => operation === "refund" ? BigInt(AMOUNT) : 0n,
+      fetch: async (url, init) => {
+        const body = JSON.parse(init.body);
+        calls.push({ url, action: body.action });
+        if (url === offline) throw Error("fixture ordinary fallback offline");
+        if (body.action === "process") {
+          assert.equal(url, primary);
+          if (operation === "refund" && body.subtype === "send") assert.equal(hashBlock(body.block), prepared?.hash);
+        }
+        return mock.fetch(url, init);
+      } });
+    if (operation === "run") {
+      await wallet.ops.withFunding({ id: "standby-funded-run", maxUsd: 0.01, maxRaw: BigInt(AMOUNT) }, () => wallet.payment(invoice()));
+    } else {
+      await wallet.ops.rpc({ action: "account_info", account: ADDRESS });
+      const confirmed = await wallet.ops.transferOnce(PAY_TO, AMOUNT, { liabilityRaw: AMOUNT, transferId: "fixture-refund",
+        onPrepared: intent => { prepared = intent; } });
+      assert.equal(confirmed, prepared.hash);
+    }
+    assert.deepEqual(mock.state.processed.map(body => body.subtype), ["receive", "send"]);
+    assert.equal(mock.state.balance, "1");
+    assert.deepEqual(calls.filter(call => call.url === standby).map(call => call.action),
+      ["block_info", "account_info", "receivable", "account_info"], operation);
+  }
 });
 
 test("the hosted wallet honors numeric rate limits through funding, provider settlement and recovery", async () => {

@@ -6,6 +6,7 @@ export const NANO_HISTORY_PAGE = 100;
 export const NANO_PAYMENT_GRAIN = 10n ** 22n;
 export const isNanoHistoryHash = value => typeof value === "string" && /^[a-fA-F0-9]{64}$/.test(value) && !/^0+$/.test(value);
 export const isNanoHistoryHeight = value => typeof value === "string" && /^\d{1,20}$/.test(value);
+export const isNanoBlockHeight = value => isNanoHistoryHeight(value) && BigInt(value) > 0n && BigInt(value) < 2n ** 64n;
 const canon = address => typeof address === "string" ? address.replace(/^xrb_/, "nano_") : "";
 const rawTypes = new Set(["send", "receive", "open", "change", "epoch"]);
 const previousHash = value => {
@@ -31,11 +32,11 @@ export function checkedAnchoredNanoHistory(page, { account, head, count }, check
   const history = [], seen = new Set();
   for (const row of page.history) {
     if (!isNanoHistoryHash(row?.hash) || row.hash.toUpperCase() !== expected || ![true, "true"].includes(row.confirmed)
-      || seen.has(expected) || !isNanoHistoryHeight(row.height)) throw badHistory();
+      || seen.has(expected) || !isNanoBlockHeight(row.height)) throw badHistory();
     const at = BigInt(row.height);
     const kind = nanoHistoryKind(row);
     const previous = row.type === "open" && row.previous == null ? null : previousHash(row.previous);
-    if (at < 1n || (expectedHeight !== null && at !== expectedHeight) || !rawTypes.has(kind)
+    if ((expectedHeight !== null && at !== expectedHeight) || !rawTypes.has(kind)
       || previous === undefined || (at === 1n) !== (previous === null) || (kind === "open" && at !== 1n)) throw badHistory();
     if (["receive", "open"].includes(kind) && (!checkAddress(canon(row.account)) || typeof row.amount !== "string"
       || !/^\d{1,39}$/.test(row.amount) || BigInt(row.amount) <= 0n || BigInt(row.amount) >= 2n ** 128n)) throw badHistory();
@@ -55,12 +56,19 @@ export function readNanoPaymentHistory(value) {
     || (value.coveredAt !== null && !stamp(value.coveredAt))) throw Error("invalid Nano payment history checkpoint");
   const replay = value.backfill;
   if (replay !== null && (!replay || !isNanoHistoryHash(replay.next) || (replay.newest !== null && !isNanoHistoryHash(replay.newest))
-    || !stamp(replay.startedAt) || typeof replay.fullReceivableWindow !== "boolean")) throw Error("invalid Nano history backfill checkpoint");
+    || !stamp(replay.startedAt) || typeof replay.fullReceivableWindow !== "boolean"
+    || (replay.quotaDeferred !== undefined && typeof replay.quotaDeferred !== "boolean")
+    || ((replay.nextHeight !== undefined || replay.advancedAt !== undefined)
+      && (!isNanoBlockHeight(replay.nextHeight) || !stamp(replay.advancedAt) || replay.advancedAt < replay.startedAt)))) {
+    throw Error("invalid Nano history backfill checkpoint");
+  }
   return {
     through: value.through?.toUpperCase() ?? null,
     coveredAt: value.coveredAt,
     backfill: replay && { newest: replay.newest?.toUpperCase() ?? null, next: replay.next.toUpperCase(),
-      startedAt: replay.startedAt, fullReceivableWindow: replay.fullReceivableWindow },
+      startedAt: replay.startedAt, fullReceivableWindow: replay.fullReceivableWindow,
+      ...(replay.quotaDeferred === true && { quotaDeferred: true }),
+      ...(replay.nextHeight !== undefined && { nextHeight: BigInt(replay.nextHeight).toString(), advancedAt: replay.advancedAt }) },
   };
 }
 

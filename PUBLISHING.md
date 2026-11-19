@@ -2,8 +2,9 @@
 
 Merges to `main` run the offline suite, then build and install the npm tarball
 in a clean directory. The bundle includes the pinned Nanoodle engine. The workflow
-publishes a new npm version through Trusted Publishing, then registers the same
-version in the official MCP Registry. It skips versions that already exist.
+publishes through Trusted Publishing on version-changing main pushes or an
+explicit main dispatch. It then registers that same npm version in the official
+MCP Registry. Each publishing job skips an already registered version.
 
 ## Prepare a release
 
@@ -32,12 +33,14 @@ direct `npm publish`. The GitHub `npm` environment accepts the `main` branch.
 
 For the first release with the re-pinned executor, run
 `npm view nanoodle@0.13.1 dist.integrity` and compare the result with the public
-SDK archive integrity in [vendor/README.md](vendor/README.md) before merging.
-The first eligible merge can publish the already-declared `nanoodle-mcp@0.7.0`.
+SDK archive integrity in [vendor/README.md](vendor/README.md). To publish the
+already-declared `nanoodle-mcp@0.7.0`, dispatch the `test` workflow on `main`
+with version `0.7.0` after enabling the npm Trusted Publisher.
 
 If npm succeeded and Registry publishing needs a retry, rerun the failed jobs
-or dispatch `publish-mcp-registry` on `main`. To verify the exact npm version
-independently, run `node scripts/assert-npm-version.mjs`.
+or dispatch `publish-mcp-registry` on `main` with the already published version.
+To verify the exact npm version independently, run
+`node scripts/assert-npm-version.mjs`.
 
 ## 2. Optional later: the `com.nanoodle/*` namespace
 

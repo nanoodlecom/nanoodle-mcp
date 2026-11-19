@@ -2,7 +2,16 @@ name: publish-mcp-registry
 
 on:
   workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published MCP version to register
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -38,8 +47,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24.22.3'
-      - name: Guard the release manifests
-        run: node --test tests/manifest-versions.test.mjs
+      - name: Guard the release manifests and requested version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          node --test tests/manifest-versions.test.mjs
+          if [[ "$(jq -er '.version' server.json)" != "$REQUESTED_VERSION" ]]; then
+            echo "Requested version must match server.json on the tested main revision" >&2
+            exit 1
+          fi
       - name: Assert the release is published on npm
         run: node scripts/assert-npm-version.mjs
       - name: Check the exact MCP Registry version

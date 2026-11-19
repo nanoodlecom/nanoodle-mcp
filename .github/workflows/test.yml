@@ -7,6 +7,12 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact MCP version on main to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -166,12 +172,18 @@ jobs:
           node-version: '24.22.3'
       - name: Build and install the release tarball outside the checkout
         id: pack
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           npm ci --omit=dev --ignore-scripts
           mkdir "$RUNNER_TEMP/consumer"
           version="$(node -p 'require("./package.json").version')"
           sdk_version="$(node -p 'require("./package-lock.json").packages["node_modules/nanoodle"].version')"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$REQUESTED_VERSION" != "$version" ]]; then
+            echo "Requested version must match package.json on the tested main revision" >&2
+            exit 1
+          fi
           npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
           mv "$RUNNER_TEMP/nanoodle-mcp-$version.tgz" "$RUNNER_TEMP/nanoodle-mcp.tgz"
           cd "$RUNNER_TEMP/consumer"
@@ -181,7 +193,7 @@ jobs:
           test "$(node_modules/.bin/nanoodle-mcp --version)" = "nanoodle-mcp $version"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         with:
           name: npm-distribution
           path: ${{ runner.temp }}/nanoodle-mcp.tgz
@@ -189,8 +201,12 @@ jobs:
 
   publish-npm:
     name: Publish the tested npm package
-    if: github.repository == 'nanoodlecom/nanoodle-mcp' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: package
+    if: >-
+      github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && needs.qualify-github-source.outputs.version != '' &&
+      needs.qualify-github-source.outputs.version == needs.package.outputs.version))
+    needs: [package, qualify-github-source]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:
@@ -238,8 +254,10 @@ jobs:
 
   publish-registry:
     name: Publish to the MCP Registry
-    needs: publish-npm
+    needs: [package, publish-npm]
     uses: ./.github/workflows/publish-mcp-registry.yml
+    with:
+      version: ${{ needs.package.outputs.version }}
     permissions:
       contents: read
       id-token: write

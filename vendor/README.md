@@ -1,18 +1,15 @@
 # Vendored executor
 
-The active executor is `nanoodle-0.13.1.tgz`, packed from Nanoodle JS commit
-`bcf2561d980ffc058281afb1d8ace5662e7bb196`. The archive keeps the file set from
-the proposed 0.13.1 re-pin, including the SDK fixtures used by MCP tests. Its
-SHA-256 is `162638cb2280f5b8a868bcff96b32056e51bac196946f109ed14befcf3c3c5b8`.
+The active executor is `nanoodle-0.13.1.tgz`. Its runtime files come from
+[nanoodle@0.13.1 on npm](https://www.npmjs.com/package/nanoodle/v/0.13.1) at SDK
+commit `5029a858f7ee4a8d726931315fbd3d7c1fd4f20b`. The vendored archive has
+SHA-256 `f4693fcfaacb7fea7a1a30a0eea87a192547c8e47420603f7806d80495d15e66`.
 
-The public SDK archive from
-[the v0.13.1 main build](https://github.com/nanoodlecom/nanoodle-js/actions/runs/44442280983)
-at `722ca7817211db0a44b354c3db906517f4346ba3` has integrity
-`sha512-xMHyXm5gd24y5AiKUwY6fpsJEV9p2TmWsrXEOA+SuI8oPJmwRpJgEX1EVokfCmz05kTQmF7UA6w4lr4FvQONGw==`.
-The public and vendored archives have byte-identical executable files,
-starter graph, and license. The public README includes the SDK release
-documentation already on main, and the vendored package manifest omits
-only npm's `files` allowlist to include the tests and fixtures needed by MCP.
+The public archive has integrity
+`sha512-Ljwp8Ggiasl5hYME5sZp4zWWI4gHfAS45/QzfkOYpSornMovHYpRpaG0TNRvDoiavCq8uMmhqwWS9rOqbm3mew==`.
+Every published file and its executable mode matches the vendored copy, except
+`package.json`, where the vendored manifest omits the `files` allowlist.
+The additional files are the tests and fixtures from the same SDK commit.
 
 ## Rebuild the retained 0.9.0 archive
 
