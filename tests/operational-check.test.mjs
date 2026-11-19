@@ -688,7 +688,50 @@ test("a formerly adequate deposit fails when fresh provider pricing rises or a m
     assert.deepEqual(outcome(`saved-workflow-${asset}-sing`).domains, []);
   }
   assert.equal(localCalls.filter(name => name === "sing").length, 2);
-  assert.equal(outcome("custom-workflow-pricing").code, "custom-workflow-deposit-too-low");
+  for (const asset of ["near", "usdc"]) {
+    assert.equal(outcome(`custom-workflow-pricing-${asset}`).code, "custom-workflow-deposit-too-low");
+  }
+});
+
+test("one custom workflow preview can fail without hiding the other asset or reporting a Market outage", async t => {
+  for (const failedAsset of ["near", "usdc"]) {
+    const otherAsset = failedAsset === "near" ? "usdc" : "near";
+    const f = fixture(({ url, body }) => {
+      const args = body?.params?.arguments;
+      if (url.hostname === "site.example" && args?.inputs?.Marker && args._pay_with === failedAsset) {
+        return new Response("PRIVATE_PRICE_ERROR", { status: 503 });
+      }
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    assert.deepEqual(report.admission, { nano: true, near: failedAsset !== "near", usdc: failedAsset !== "usdc", market: true });
+    assert.deepEqual(report.checks.filter(c => !c.ok), [
+      { stage: `custom-workflow-pricing-${failedAsset}`, ok: false, code: "http-503", domains: [failedAsset] },
+    ]);
+    for (const stage of [`custom-workflow-pricing-${otherAsset}`, `workflow-nano-capital-${otherAsset}-custom`, "workflow-price-nanoodle-image"]) {
+      assert.ok(report.checks.find(c => c.stage === stage)?.ok, stage);
+    }
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_PRICE_ERROR/);
+  }
+});
+
+test("missing provider pricing for the custom graph invalidates both previews without affecting Market", async t => {
+  const f = fixture(), price = f.deps.computePrice;
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  let providerSamples = 0;
+  f.deps.computePrice = async (args, options) => {
+    if (!args.inputs?.Marker) return price(args, options);
+    providerSamples++;
+    return { safety: { ok: false }, pricing: null };
+  };
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(providerSamples, 1);
+  assert.deepEqual(report.admission, { nano: true, near: false, usdc: false, market: true });
+  assert.deepEqual(report.checks.filter(c => !c.ok), [
+    { stage: "custom-workflow-pricing", ok: false, code: "workflow-provider-pricing-unavailable", domains: ["near", "usdc"] },
+  ]);
+  assert.equal(f.calls.some(({ body }) => body?.params?.arguments?.inputs?.Marker), false);
 });
 
 test("saved NEAR deposit conversion includes the quoted spread and rounds up to a microNEAR", async t => {

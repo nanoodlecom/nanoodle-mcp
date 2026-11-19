@@ -1163,13 +1163,46 @@ const GUIDE_PORTS = {
   model3d: { text: ["prompt"], media: "image", fields: "model (a model3d model; default tripo3d/v2.5)" },
 };
 
+/** Editor node type to hosted pricing catalog. Workflow normalizes the branch alias. */
+export const GUIDE_NODE_MODEL_KIND = Object.freeze(Object.fromEntries([
+  ...Object.keys(NODE_POLICY).filter(type => NODE_POLICY[type].allowed), "decide-branch",
+].map(type => [type, KIND_OF({ type })])));
+
+const GUIDE_CAPABILITIES = {
+  image: ["image_generation"], edit: ["image_to_image"],
+  tvideo: ["text_to_video"], ivideo: ["image_to_video"],
+  music: ["text_to_music", "song_generation"], tts: ["text_to_speech"],
+};
+
+/** Probe baseline pricing without making an inference call or creating a quote. */
+function guideSupports(type, kind, entry) {
+  const caps = entry.capabilities;
+  const flags = (GUIDE_CAPABILITIES[type] || []).map(k => caps?.[k]);
+  // Some older catalog rows omit capabilities. Use the pricer for those.
+  if (caps && flags.length && !flags.includes(true)) return false;
+  const media = entry.architecture?.input_modalities;
+  // The image node has no source image port. The video nodes offered here
+  // cannot extend a source clip or supply its duration for pricing.
+  if (type === "image" && Array.isArray(media) && media.length && !media.includes("text")) return false;
+  if ((type === "tvideo" || type === "ivideo") && Array.isArray(media) && media.includes("video") && entry.pricing?.input_video_per_second != null) return false;
+  const graph = {
+    nodes: [{ id: "model", type, fields: { model: String(entry.id), prompt: "Make a small sample.", ...(type === "llm" ? { maxTokens: 64 } : {}) } }],
+    links: [],
+  };
+  const safety = checkGraphSafety(graph);
+  if (!safety.ok) return false;
+  const pricing = priceGraph(safety.workflowGraph, { [kind]: [entry] });
+  return pricing.items.length === 1 && !pricing.refusals.length && !pricing.unpriced.length &&
+    Number.isFinite(pricing.estimatedCostUsd) && pricing.estimatedCostUsd >= 0;
+}
+
 const MODEL_KINDS_LINE = "Model kinds: chat -> llm; decision -> decide, decide-branch; image -> image, edit; video -> tvideo, ivideo; audio -> music, tts; model3d -> model3d.";
 
 const WIRING_RULES = [
   "A wire into a text port (prompt, system, a join's a/b, a decide's text) replaces that field at run time. An unwired prompt, or a text node's text, becomes a caller input keyed by the node's name.",
   "To run exactly one branch, use a node of type decide-branch with the same model and question as Decide. Wire its yes and no outputs to branch entry points. The selected port forwards its text input, or the answer when no text was supplied.",
   "A link may feed a media port (image, endframe, or a numbered img*, image*, ref* port) only from a media output (image, video, audio, model3d) of an allowed NanoGPT node, and a media output may feed only a media port.",
-  "No link may target a pricing or URL field: model, size, variations, duration, resolution, maxTokens, modelOpts, loraUrl, loras, url, image, mask, audio, video. Set those in the node's fields.",
+  "Set pricing and provider options as literal fields, not edges: model, size, variations, duration, resolution and maxTokens. Leave media fields empty and wire to a declared media input from an upstream generated output.",
   "No node field may hold a value starting with http:, https:, data:, file: or blob:. The exception is a LoRA URL on tvideo or ivideo, which must be https:.",
   `fields.modelOpts and fields.extraJson are refused. maxTokens must be a whole number (an llm without one is limited to ${DEFAULT_CHAT_OUTPUT_TOKENS} output tokens, the most it is priced for). duration must be a number of seconds.`,
   "Every paid node must use a model the NanoGPT catalog can price; models whose catalog price is set by a live quote at run time are refused. Each refusal names the node and the model.",
@@ -1225,7 +1258,7 @@ function modelSummary(kind, m) {
 }
 
 /** How to write a graph this server will run, plus priced models. */
-export function authoringGuide({ catalogs = {}, kind = null, search = null, limit = 20 } = {}) {
+export function authoringGuide({ catalogs = {}, kind = null, search = null, limit = 20, nodeType = null, formatOnly = false } = {}) {
   const nodeTypes = Object.keys(NODE_TYPES).map((type) => {
     const t = NODE_TYPES[type], pol = NODE_POLICY[type] || { allowed: false, why: "Not on this server's allowlist." };
     const gp = pol.allowed ? GUIDE_PORTS[type] || { text: [] } : null;
@@ -1241,26 +1274,49 @@ export function authoringGuide({ catalogs = {}, kind = null, search = null, limi
   });
 
   const cap = Math.max(1, Math.min(50, Math.floor(Number(limit)) || 20));
-  const kinds = kind ? [kind] : KINDS;
+  const kinds = formatOnly ? [] : nodeType ? [GUIDE_NODE_MODEL_KIND[nodeType]].filter(Boolean) : kind ? [kind] : KINDS;
   const q = search ? String(search).toLowerCase() : null;
   const pool = [];
   for (const k of kinds) {
     for (const m of (catalogs && Array.isArray(catalogs[k]) ? catalogs[k] : [])) {
       if (!m || m.id == null) continue;
       const id = String(m.id);
-      if (q && !id.toLowerCase().includes(q)) continue;
+      if (!id || id.length > 240 || (q && !id.toLowerCase().includes(q))) continue;
+      const nodeTypes = (nodeType ? [nodeType] : Object.keys(GUIDE_NODE_MODEL_KIND)).filter(type =>
+        GUIDE_NODE_MODEL_KIND[type] === k && guideSupports(type, k, m));
+      if (!nodeTypes.length) continue;
       const s = modelSummary(k, m);
-      pool.push({ kind: k, id, unitPrice: s.unitPrice, _sort: s.sort });
+      pool.push({ kind: k, id, unitPrice: s.unitPrice, nodeTypes, _sort: s.sort });
     }
   }
   pool.sort((a, b) => (a._sort == null) - (b._sort == null) || (a._sort ?? 0) - (b._sort ?? 0) || a.id.localeCompare(b.id));
-  const models = pool.slice(0, cap).map(({ kind: k, id, unitPrice }) => ({ kind: k, id, unitPrice }));
+  const models = pool.slice(0, cap).map(({ _sort, ...model }) => model);
+  const minimalExample = {
+    graph: {
+      v: 1,
+      nodes: [
+        { id: "idea", type: "text", name: "Idea", fields: { text: "" } },
+        { id: "write", type: "llm", fields: { model: models.find(m => m.kind === "chat")?.id || EXAMPLE_GRAPH.nodes[1].fields.model, maxTokens: 64 } },
+      ],
+      links: [{ id: "l1", from: { node: "idea", port: "text" }, to: { node: "write", port: "prompt" } }],
+    },
+    inputs: { Idea: "Write a one-sentence postcard from a lighthouse." },
+  };
+  const graphFormat = {
+    version: 1,
+    node: '{ "id": "unique-id", "type": "llm", "name": "Optional label", "fields": {} }',
+    link: '{ "id": "l1", "from": { "node": "source-id", "port": "text" }, "to": { "node": "target-id", "port": "prompt" } }',
+    inputValues: "Strings keyed by the workflow input name. A node's type and output port determine which input ports can be wired.",
+  };
 
   const allowed = nodeTypes.filter((t) => t.allowed), refused = nodeTypes.filter((t) => !t.allowed);
   const lines = [
     "How to write a nanoodle workflow graph for this server.",
     "",
-    'A graph is { "nodes": [{ "id", "type", "name"?, "fields": {...} }], "links": [{ "from": { "node", "port" }, "to": { "node", "port" } }] }. Pass it as "graph" with "inputs" (strings keyed by input name).',
+    'A graph is a JSON object with "v": 1, "nodes" and "links" arrays. Nodes have unique IDs; links connect an output port to an input port. Graphs must be acyclic.',
+    `Node shape: ${graphFormat.node}`,
+    `Link shape: ${graphFormat.link}`,
+    'Pass the object as "graph" with "inputs" (strings keyed by input name). This is the hosted graph contract, not the full editor inventory.',
     "",
     "Allowed node types:",
     ...allowed.map((t) => [
@@ -1277,16 +1333,20 @@ export function authoringGuide({ catalogs = {}, kind = null, search = null, limi
     "Wiring and field rules:",
     ...WIRING_RULES.map((r) => `- ${r}`),
     "",
-    "Example (text -> llm -> image; input \"Idea\"):",
-    JSON.stringify(EXAMPLE_GRAPH),
+    "Minimal example (text → llm; use price_noodle before running):",
+    JSON.stringify(minimalExample),
     "",
-    `Priced models${kind ? ` (${kind})` : ""}${q ? ` matching "${search}"` : ""}, cheapest first:`,
-    ...(models.length ? models.map((m) => `- ${m.kind} ${m.id}: ${m.unitPrice}`) : ["- none matched (the catalog may be unavailable, or try another search)"]),
+    ...(formatOnly ? ["Models omitted by request. Remove format_only to list models."] : [
+      `Priced models${nodeType ? ` for ${nodeType}` : kind ? ` (${kind})` : ""}, cheapest first:`,
+      ...(models.length ? models.map((m) => `- ${m.kind} ${m.id} [${m.nodeTypes.join(", ")}]: ${m.unitPrice}`) :
+        ["- none matched (the catalog may be unavailable; try another filter)"]),
+      "These are catalog-backed baseline candidates, not a quote or a guarantee for your settings.",
+    ]),
     "",
     "Check a design for free with price_noodle (same graph and inputs as run_noodle): it returns the itemized price and every problem, without creating a quote.",
   ];
   return {
     text: lines.join("\n"),
-    structured: { nodeTypes, wiringRules: [...WIRING_RULES], example: structuredClone(EXAMPLE_GRAPH), models },
+    structured: { nodeTypes, wiringRules: [...WIRING_RULES], example: structuredClone(EXAMPLE_GRAPH), models, graphFormat, minimalExample },
   };
 }
