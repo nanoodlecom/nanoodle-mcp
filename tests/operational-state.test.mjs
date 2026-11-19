@@ -1,12 +1,35 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw, marketRunFunding } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw, marketRunFunding,
+  recentPaidWorkflowFailures } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
 const balances = liabilities => ({ liabilities, nanoBalanceRaw: (10n ** 31n).toString(), nearBalanceYocto: (10n ** 24n).toString(),
   storageUsage: 500, usdcBalanceAtomic: "1000000000", xnoUsd: "1", providerReserveUsd: "2",
   costs: { storagePriceYocto: 10_000_000_000_000_000_000n, nativeRefundFeeYocto: 200_000_000_000_000_000_000n, tokenRefundFeeYocto: 6_000_000_000_000_000_000_001n } });
+
+test("recent paid failures count execution outcomes and exclude stale or unrelated refunds", () => {
+  const s = snapshots();
+  const failed = { status: "refunded", paidAt: NOW - 120_000, completedAt: NOW - 60_000, error: "private diagnostic" };
+  s.nano.quotes.push(failed,
+    { ...failed, status: "consumed", completedAt: NOW },
+    { ...failed, error: null },
+    { ...failed, settled: true },
+    { ...failed, paidAt: NOW + 1 },
+    { ...failed, completedAt: NOW + 1 },
+    { ...failed, paidAt: NOW - 3_600_000, completedAt: NOW - 30 * 60_000 });
+  s.near.quotes = {
+    native: { status: "failed", outcome: "run_failed", finishedAt: NOW - 30_000 },
+    token: { status: "failed", outcome: "run_failed", finishedAt: NOW, asset: "usdc" },
+    late: { status: "rejected", outcome: "late_payment", finishedAt: NOW },
+    old: { status: "failed", outcome: "run_failed", finishedAt: NOW - 30 * 60_000 },
+    future: { status: "failed", outcome: "run_failed", finishedAt: NOW + 10 },
+  };
+  const original = JSON.stringify(s);
+  assert.deepEqual(recentPaidWorkflowFailures(s, NOW), { nano: 2, near: 1, usdc: 1 });
+  assert.equal(JSON.stringify(s), original);
+});
 
 test("the monitor recognizes overdue Nano recovery windows without making an unknown late refund spendable", () => {
   const s = snapshots(), expiresAt = NOW - 3_600_001;
