@@ -289,10 +289,11 @@ Coverage:
 - Disk/inode headroom and a write/fsync probe; disabled/overdue check timers and
   failed scheduled services, including the paid canary and alert-queue retry.
 - The ordinary Nano fallbacks must serve confirmed receivables and continuous
-  raw history from the wallet's confirmed head. Raw history includes
-  representative changes and epoch blocks. The hosted watcher rejects a gap,
-  wrong account, or truncated page before committing coverage. Its completed
-  cursor stays on a block that the older, filtered history can still find.
+  raw history at the newest confirmed wallet head seen during the probe.
+  Each history request uses the head from that node's account read. Raw history
+  includes representative changes and epoch blocks. The hosted watcher rejects
+  a gap, wrong account, or truncated page before committing coverage. Its
+  completed cursor stays on a block that the older, filtered history can find.
 
 Install `ops/nanoodle-operational-check.{service,timer}`, reload systemd, start
 the service once, inspect its report, then enable the timer. It runs at every
