@@ -2644,6 +2644,52 @@ test("a gap or invalid prior Nano telemetry starts a new comparison", t => {
   assert.equal(rebuilt.nanoLedgerSync.peerMedianAtStart, "4600");
 });
 
+test("a missed Nano telemetry sample preserves the last observation without reporting it as current", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-missed-sample-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const unavailable = { stage: "nano-ledger-sync", ok: false, code: "request-timeout", domains: [] };
+  const report = (minute, peerMedianConfirmed) => finishOperationalReport(dir, peerMedianConfirmed ? [] : [unavailable], NOW + minute * 60_000,
+    { nanoLedgerSync: peerMedianConfirmed ? { observedAt: NOW + minute * 60_000,
+      localBlocks: "9800", localConfirmed: "1000", peerMedianConfirmed, peers: 7 } : null });
+
+  report(0, "9000");
+  const latest = join(dir, "latest.json"), saved = JSON.parse(readFileSync(latest, "utf8"));
+  saved.nanoLedgerSync.unexpected = "PRIVATE_PEER_DATA";
+  writeFileSync(latest, JSON.stringify(saved));
+  const missed = report(5, null);
+  assert.deepEqual(missed.checks, [unavailable]);
+  assert.equal(missed.nanoLedgerSync, undefined);
+  assert.deepEqual(missed.lastNanoLedgerObservation, { observedAt: NOW, localConfirmed: "1000", peerMedianConfirmed: "9000",
+    unchangedSince: NOW, peerMedianAtStart: "9000" });
+  assert.doesNotMatch(JSON.stringify(missed), /PRIVATE_PEER_DATA/);
+
+  const stalled = report(10, "9060");
+  assert.equal(stalled.lastNanoLedgerObservation, undefined);
+  assert.equal(stalled.nanoLedgerSync.unchangedSince, NOW);
+  assert.deepEqual(stalled.checks, [{ stage: "nano-ledger-confirmation-progress", ok: false,
+    code: "nano-ledger-confirmations-stalled", domains: [] }]);
+  assert.deepEqual(stalled.admission, { nano: true, near: true, usdc: true, market: true });
+
+  assert.equal(report(15, null).lastNanoLedgerObservation.observedAt, NOW + 600_000);
+  assert.equal(report(20, null).lastNanoLedgerObservation.observedAt, NOW + 600_000);
+  assert.equal(report(25, null).lastNanoLedgerObservation, undefined);
+  assert.equal(report(30, "9250").ok, true, "an expired observation cannot prove continued stalling");
+});
+
+test("the widening Nano confirmation gap keeps its baseline through a missed sample", t => {
+  const dir = mkdtempSync(join(tmpdir(), "operational-nano-slowdown-gap-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const report = (minute, localConfirmed, peerMedianConfirmed) => finishOperationalReport(dir, [], NOW + minute * 60_000, {
+    nanoLedgerSync: localConfirmed ? { localBlocks: "9800", localConfirmed, peerMedianConfirmed, peers: 7 } : null,
+  });
+  report(0, "1000", "9000");
+  const widening = report(5, "1010", "9040");
+  const missed = report(10);
+  assert.deepEqual(missed.lastNanoLedgerObservation.wideningGap, widening.nanoLedgerSync.wideningGap);
+  const slowing = report(15, "1030", "9100");
+  assert.equal(slowing.checks[0].code, "nano-ledger-confirmations-falling-behind");
+});
+
 test("the monitor reports a widening Nano confirmation gap even while the owned node advances", t => {
   const dir = mkdtempSync(join(tmpdir(), "operational-nano-slowdown-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

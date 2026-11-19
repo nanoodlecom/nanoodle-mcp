@@ -112,23 +112,33 @@ function nanoPeerLedgerBaseline(metrics, now) {
   return { median: counts[Math.floor((counts.length - 1) / 2)], peers: counts.length };
 }
 
-function nanoCementationProgress(current, previous, now) {
-  const prior = previous?.nanoLedgerSync;
-  const checkedAt = prior?.observedAt ?? Date.parse(previous?.checkedAt);
-  const continuous = Number.isSafeInteger(checkedAt) && checkedAt < now && now - checkedAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS;
+function recentNanoLedgerObservation(report, now) {
+  const sample = report?.nanoLedgerSync ?? report?.lastNanoLedgerObservation;
+  const observedAt = sample?.observedAt ?? Date.parse(report?.checkedAt);
+  if (!Number.isSafeInteger(observedAt) || observedAt >= now || now - observedAt > NANO_CEMENTATION_SAMPLE_MAX_AGE_MS
+    || nanoLedgerCount(sample?.localConfirmed) === null || nanoLedgerCount(sample?.peerMedianConfirmed) === null) return null;
+  // Carry only validated aggregates. A failed probe reports no live counters.
+  const observation = { observedAt, localConfirmed: sample.localConfirmed, peerMedianConfirmed: sample.peerMedianConfirmed };
+  const { unchangedSince, peerMedianAtStart } = sample;
+  if (Number.isSafeInteger(unchangedSince) && unchangedSince > 0 && unchangedSince <= observedAt
+    && nanoLedgerCount(peerMedianAtStart) !== null) Object.assign(observation, { unchangedSince, peerMedianAtStart });
+  const { since, leadAtStart, lastIncreaseAt = observedAt, alerted } = sample.wideningGap ?? {};
+  if (Number.isSafeInteger(since) && since > 0 && since <= observedAt
+    && Number.isSafeInteger(lastIncreaseAt) && lastIncreaseAt >= since && lastIncreaseAt <= observedAt
+    && (leadAtStart === "0" || nanoLedgerCount(leadAtStart) !== null)) {
+    observation.wideningGap = { since, leadAtStart, lastIncreaseAt, ...(alerted === true && { alerted: true }) };
+  }
+  return observation;
+}
+
+function nanoCementationProgress(current, prior, now) {
   let unchangedSince = now, peerMedianAtStart = current.peerMedianConfirmed;
-  if (continuous && prior?.localConfirmed === current.localConfirmed) {
-    const since = prior.unchangedSince;
-    if (Number.isSafeInteger(since) && since > 0 && since <= checkedAt && nanoLedgerCount(prior.peerMedianAtStart) !== null) {
-      unchangedSince = since;
-      peerMedianAtStart = prior.peerMedianAtStart;
-    } else if (nanoLedgerCount(prior.peerMedianConfirmed) !== null) {
-      unchangedSince = checkedAt;
-      peerMedianAtStart = prior.peerMedianConfirmed;
-    }
+  if (prior && prior.localConfirmed === current.localConfirmed) {
+    unchangedSince = prior.unchangedSince ?? prior.observedAt;
+    peerMedianAtStart = prior.peerMedianAtStart ?? prior.peerMedianConfirmed;
   }
   const progress = { unchangedSince, peerMedianAtStart };
-  const priorLocal = continuous ? nanoLedgerCount(prior?.localConfirmed) : null;
+  const priorLocal = prior ? BigInt(prior.localConfirmed) : null;
   const local = BigInt(current.localConfirmed), peer = BigInt(current.peerMedianConfirmed);
   if (priorLocal !== null && local < priorLocal) {
     return { ...progress, code: "nano-ledger-local-confirmations-regressed" };
@@ -136,8 +146,8 @@ function nanoCementationProgress(current, previous, now) {
   const stalled = now - unchangedSince >= NANO_CEMENTATION_WINDOW_MS
     && BigInt(current.peerMedianConfirmed) - BigInt(peerMedianAtStart) >= NANO_PEER_ADVANCE_BLOCKS;
   if (stalled) return { ...progress, code: "nano-ledger-confirmations-stalled" };
-  const priorPeer = nanoLedgerCount(prior?.peerMedianConfirmed);
-  if (priorLocal === null || priorPeer === null) return progress;
+  if (priorLocal === null) return progress;
+  const priorPeer = BigInt(prior.peerMedianConfirmed);
 
   const priorLead = priorPeer > priorLocal ? priorPeer - priorLocal : 0n;
   const lead = peer - local;
@@ -146,17 +156,14 @@ function nanoCementationProgress(current, previous, now) {
   // open the trend warning, and a sustained plateau expires the baseline.
   const increased = lead > priorLead;
   const trend = prior.wideningGap;
-  const firstLead = trend?.leadAtStart === "0" ? 0n : nanoLedgerCount(trend?.leadAtStart);
-  const lastIncrease = trend?.lastIncreaseAt ?? checkedAt;
-  const ongoing = Number.isSafeInteger(trend?.since) && trend.since > 0 && trend.since <= checkedAt
-    && Number.isSafeInteger(lastIncrease) && lastIncrease >= trend.since && lastIncrease <= checkedAt
-    && now - lastIncrease <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS && firstLead !== null && firstLead < priorLead;
+  const ongoing = trend && now - trend.lastIncreaseAt <= NANO_CEMENTATION_SAMPLE_MAX_AGE_MS
+    && BigInt(trend.leadAtStart) < priorLead;
   if (!ongoing && !increased) return progress;
-  const since = ongoing ? trend.since : checkedAt;
-  const leadAtStart = ongoing ? firstLead : priorLead;
+  const since = ongoing ? trend.since : prior.observedAt;
+  const leadAtStart = ongoing ? BigInt(trend.leadAtStart) : priorLead;
   const growing = ongoing && (increased || trend.alerted === true)
     && now - since >= NANO_CEMENTATION_WINDOW_MS && lead - leadAtStart >= NANO_PEER_ADVANCE_BLOCKS;
-  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString(), lastIncreaseAt: increased ? now : lastIncrease,
+  return { ...progress, wideningGap: { since, leadAtStart: leadAtStart.toString(), lastIncreaseAt: increased ? now : trend.lastIncreaseAt,
     ...(growing && { alerted: true }) },
     ...(growing && { code: "nano-ledger-confirmations-falling-behind" }) };
 }
@@ -282,8 +289,10 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), {
       checks = [...checks, { stage: "near-watcher-backfill", ok: false, code: "near-watcher-backfill-delayed", domains: [] }];
     }
   }
+  const nanoObservedAt = nanoLedgerSync?.observedAt ?? now;
+  const lastNanoLedgerObservation = recentNanoLedgerObservation(previous, nanoObservedAt);
   if (nanoLedgerSync) {
-    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, previous, nanoLedgerSync.observedAt ?? now);
+    const { code, ...progress } = nanoCementationProgress(nanoLedgerSync, lastNanoLedgerObservation, nanoObservedAt);
     nanoLedgerSync = { ...nanoLedgerSync, ...progress };
     const check = code
       ? { stage: "nano-ledger-confirmation-progress", ok: false, code, domains: [] }
@@ -300,6 +309,7 @@ export function finishOperationalReport(stateDir, checks, now = Date.now(), {
     admission, checks, ...(/^[a-f0-9]{32}$/.test(invocationId || "") && { invocationId }),
     ...(failed.length ? { fingerprint, firstSeenAt, incidentId } : {}), ...(fundingPause && { fundingPause }),
     ...(nearBackfillSince !== null && { nearBackfillSince }), ...(nanoLedgerSync && { nanoLedgerSync }),
+    ...(!nanoLedgerSync && lastNanoLedgerObservation && { lastNanoLedgerObservation }),
     ...(nanoPaymentReadPeers !== null && { nanoPaymentReadPeers }) };
   mkdirSync(stateDir, { recursive: true, mode: 0o755 }); atomicJson(latest, report);
   // This file contains ONLY fixed probe names/codes and aggregate observations.
