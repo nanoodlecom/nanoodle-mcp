@@ -313,6 +313,9 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
           attempted = true;
         });
         if (method === "status") checkStatus(ep, result);
+        if (method === "tx" && opts?.receiptDiscovered === true && result.final_execution_status !== "FINAL") {
+          throw new NearError("TX_NOT_FINAL", "NEAR RPC has no finalized outcome for the discovered transaction");
+        }
         if (maxHeadAgeMs !== null && method === "block" && params?.finality) {
           assertFreshBlock(result, freshness());
           if (params.finality === "final") {
@@ -336,7 +339,7 @@ export function createNearRpcPool({ urls, chainId = null, fetch = globalThis.fet
       } catch (e) {
         if (e?.code === "RPC_WRONG_NETWORK" && ep.wrongChain) continue;
         if (method === "tx" && attempted && opts?.receiptDiscovered === true
-            && (e?.code === "UNKNOWN_TRANSACTION" || e?.code === "TIMEOUT_ERROR")) {
+            && (e?.code === "UNKNOWN_TRANSACTION" || e?.code === "TIMEOUT_ERROR" || e?.code === "TX_NOT_FINAL")) {
           // This peer may lack the historical outcome while its live chain
           // reads remain healthy. A receipt is only a hint to keep looking.
           lastErr = e;

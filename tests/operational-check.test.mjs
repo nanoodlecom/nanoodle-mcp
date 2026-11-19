@@ -1908,7 +1908,7 @@ test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a
   const receiptId = base58Encode(Buffer.alloc(32, 4)), receiptBlock = base58Encode(Buffer.alloc(32, 5));
   const timeoutMethods = { transaction: "tx", block: "block", "account-changes": "EXPERIMENTAL_changes",
     "receipt-lookup": "EXPERIMENTAL_receipt_to_tx" };
-  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof", ...Object.keys(timeoutMethods)]) {
+  for (const scenario of ["complete", "empty-changes", "wrong-transaction", "stale-proof", "no-history", ...Object.keys(timeoutMethods)]) {
     const f = fixture(({ url, body }, config) => {
       if (!url.hostname.startsWith("near-") || !body) return null;
       const json = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
@@ -1918,7 +1918,10 @@ test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a
         throw new DOMException("PRIVATE_TIMEOUT_DETAIL", "TimeoutError");
       }
       if (body.method === "tx") {
-        assert.deepEqual(body.params, { tx_hash: paymentTx, sender_account_id: payer, wait_until: "FINAL" });
+        assert.deepEqual(body.params, { tx_hash: paymentTx, sender_account_id: payer, wait_until: "NONE" });
+        if (scenario === "no-history" && url.hostname === "near-1.example") {
+          return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32000, cause: { name: "UNKNOWN_TRANSACTION" } } });
+        }
         return json({ final_execution_status: "FINAL", status: { SuccessValue: "" },
           transaction: { hash: paymentTx, signer_id: payer, receiver_id: merchant, actions: [{ Transfer: { deposit: "1" } }] },
           receipts_outcome: [{ id: receiptId, block_hash: receiptBlock, outcome: { executor_id: merchant, status: { SuccessValue: "" } } }] });
@@ -1955,6 +1958,7 @@ test("a healthy idle NEAR watcher still needs proof that its RPCs can discover a
       assert.equal(find("near-payment-discovery")?.ok, scenario !== "empty-changes");
       assert.equal(find("near-discovery-peer-1")?.ok, scenario === "complete");
       if (scenario !== "complete") assert.deepEqual(find("near-discovery-peer-1").domains, []);
+      if (scenario === "no-history") assert.equal(find("near-discovery-peer-1").code, "UNKNOWN_TRANSACTION");
       if (timeoutMethods[scenario]) assert.equal(find("near-discovery-peer-1").code, `near-discovery-${scenario}-timeout`);
     }
     assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
