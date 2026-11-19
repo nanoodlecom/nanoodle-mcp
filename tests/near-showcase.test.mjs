@@ -27,8 +27,9 @@ test("3D showcase reuses the mounted graph as a safe custom template while retai
     assert.match(html, /poster="\/examples\/idea-to-3d-model.png"/);
     assert.deepEqual(await (await fetch(base + "/examples/idea-to-3d-model.json")).json(), template.graph);
     const llms = await (await fetch(base + "/llms.txt")).text();
-    assert.match(llms, /Featured ready-made template: idea-to-3d-model/);
-    assert.match(llms, /amountAtomic/); assert.match(llms, /ft_transfer/);
+    assert.match(llms, /3D graph template.*examples\/idea-to-3d-model\.json/);
+    assert.match(llms, /not a separately callable tool/);
+    assert.match(llms, /NEAR payment guide/);
   } finally { await new Promise(resolve => server.close(resolve)); }
 });
 

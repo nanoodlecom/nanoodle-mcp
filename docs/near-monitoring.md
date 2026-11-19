@@ -270,8 +270,10 @@ Coverage:
   delivery is due within ten minutes or the last quarter of a shorter SLA,
   a worker's retry would miss its cutoff, or model work has reached its
   execution cutoff. The report identifies the listing and the fixed outcome.
-- Catalog pricing and Market net-price coverage for all four predefined graphs,
-  plus free MCP pricing of a custom two-step graph in NEAR and USDC.
+- Catalog pricing and Market net-price coverage for all four predefined graphs.
+  The free MCP check prices a custom two-step graph separately in NEAR and USDC
+  against one fresh provider estimate, so a preview failure identifies the
+  affected currency.
 - Free pricing for each of the five saved MCP workflows shown on both sites and
   the paid 3D template. It checks NEAR/USDC denomination and compares the Nano
   site's advertised fixed deposits with the current estimated charge for the

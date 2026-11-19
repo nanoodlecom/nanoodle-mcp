@@ -145,8 +145,8 @@ test("NEAR mode serves llms.txt and the landing page with the NEAR payment note"
   try {
     const base = `http://127.0.0.1:${port}`;
     const llms = await (await fetch(base + "/llms.txt")).text();
-    assert.match(llms, /## Payment\n\nEvery call is paid in native NEAR on testnet/);
-    assert.doesNotMatch(llms, /Payment \(x402, Nano\/XNO\)/, "no Nano payment story on a NEAR server");
+    assert.match(llms, /takes native NEAR on NEAR testnet/);
+    assert.doesNotMatch(llms, /Nano payment guide/, "no Nano payment guide on a NEAR server");
     const landing = await (await fetch(base + "/")).text();
     assert.match(landing, /Give your agents/);
     assert.match(landing, /id="near-studio"/);
@@ -205,12 +205,13 @@ test("NEAR mode refuses unsafe configurations at startup", { timeout: 60_000 }, 
   testnet.addAccount("merchant.testnet", 1n); // no access key for our throwaway key
   await testnet.listen();
   try {
-    r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", "--near-rpc", mainnet.url], { NEAR_PRIVATE_KEY: key.secretKey });
+    const testEnv = { NEAR_PRIVATE_KEY: key.secretKey, NANOODLE_WRITER_LOCK_DIR: join(outDir, "writer-locks") };
+    r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", "--near-rpc", mainnet.url], testEnv);
     assert.equal(r.code, 1);
     assert.match(r.stderr, /is on "mainnet", not testnet/);
     assert.ok(!r.stderr.includes(key.secretKey), "the secret key is never printed");
 
-    r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", "--near-rpc", testnet.url], { NEAR_PRIVATE_KEY: key.secretKey });
+    r = await runBin([...base, "--serve", "127.0.0.1:1", "--near-merchant", "merchant.testnet", "--near-rpc", testnet.url], testEnv);
     assert.equal(r.code, 1);
     assert.match(r.stderr, /is not an access key of merchant\.testnet on testnet/);
     assert.ok(!r.stderr.includes(key.secretKey));
@@ -300,7 +301,7 @@ test("NEAR hostname shares one process: wallet page, confirmation, monitor, auto
     assert.match(walletHtml, /src="\/near-wallet\.js\?v=[a-f0-9]{12}"/);
     assert.equal((await fetch(base + "/near-wallet.js")).status, 200);
     assert.match(await (await fetch(base + "/")).text(), /Give your agents/);
-    assert.match(await (await fetch(base + "/llms.txt")).text(), /No transaction hash needs to be copied/);
+    assert.match(await (await fetch(base + "/llms.txt")).text(), /resume the same tool and arguments/);
     const txHash = chain.transfer("payer.testnet", "merchant.testnet", BigInt(p.amountYocto));
     const submit = (body, headers = {}) => fetch(`${base}/near/pay/${p.paymentId}`, {
       method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body),
@@ -423,15 +424,21 @@ test("USDC over real HTTP: custom and saved workflows detect token payments, exe
     const llms = await (await fetch(base + "/llms.txt")).text();
     const init = await (await fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "initialize", params: {} }) })).json();
-    for (const text of [llms, init.result.instructions]) {
-      assert.match(text, /Agent quickstart: NEAR and USDC on NEAR/);
-      for (const field of ["amountYocto", "amountAtomic", "tokenContract", "ft_transfer", "_payment_id", "progressToken"]) assert.ok(text.includes(field));
-      assert.match(text, /do not wait for a follow-up/);
-    }
-    const primaryLanding = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+    const instructions = init.result.instructions;
+    assert.match(instructions, /Agent quickstart: NEAR and USDC on NEAR/);
+    for (const field of ["amountYocto", "amountAtomic", "tokenContract", "ft_transfer", "_payment_id", "progressToken"]) assert.ok(instructions.includes(field));
+    assert.match(instructions, /do not wait for a follow-up/);
+    assert.match(llms, /Circle-issued USDC on NEAR/);
+    assert.doesNotMatch(llms, /ft_transfer|amountAtomic/);
+    const primaryBase = `http://127.0.0.1:${port}`;
+    const primaryLanding = await (await fetch(primaryBase + "/")).text();
     assert.match(primaryLanding, /paid in Nano over x402/);
-    assert.doesNotMatch(primaryLanding, /\bNEAR\b|\bUSDC\b/, "the Nano page describes only Nano payments");
-    assert.doesNotMatch(await (await fetch(`http://127.0.0.1:${port}/llms.txt`)).text(), /\bNEAR\b|\bUSDC\b/);
+    assert.doesNotMatch(primaryLanding, /\bNEAR\b|\bUSDC\b/, "the Nano page emphasizes its default payment");
+    const primaryGuide = await (await fetch(primaryBase + "/llms.txt")).text();
+    assert.match(primaryGuide, /Nano \(XNO\) is the default.*Circle-issued USDC/);
+    const catalogNames = text => [...text.matchAll(/^- \`([^\`]+)\`: (?:mounted graph|server tool|custom graph);/gm)].map(m => m[1]);
+    assert.deepEqual(catalogNames(primaryGuide), (await mcpClient(primaryBase).list()).map(t => t.name));
+    assert.deepEqual(catalogNames(llms), (await mcp.list()).map(t => t.name));
     const landing = await (await fetch(base + "/")).text();
     assert.match(landing, /option value="usdc">USDC on NEAR/);
     const script = landing.match(/src="(\/near-site\.js\?v=[a-f0-9]{12})"/)?.[1];
