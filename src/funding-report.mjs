@@ -69,6 +69,7 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
         report = { balanceRaw: balance.toString(), liabilitiesRaw: liabilities.toString(), reservedRaw: reserved.toString(),
           activeRuns: value.activeRuns, oldestStartedAt: value.oldestStartedAt,
           enforced: value.enforced === true, protectTransfers: value.protectTransfers === true,
+          ...(value.creatorReservations === true && { creatorReservations: true }),
           ok: balance >= liabilities + reserved };
         if (!report.ok) report.code = "funding-underfunded";
         if (value.nanoRpc) {

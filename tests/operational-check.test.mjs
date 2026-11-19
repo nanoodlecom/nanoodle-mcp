@@ -201,6 +201,11 @@ function fixture(override = () => null) {
   return { config, deps, calls, states };
 }
 
+function useApiProvider(f) {
+  f.config.providerUsesWallet = false;
+  Object.assign(f.states["/state/funding-health.json"], { enforced: false, creatorReservations: true });
+}
+
 function bindFixturePayments(ledger, ...ids) {
   ledger.consumedTx ??= {};
   for (const id of ids) {
@@ -727,7 +732,7 @@ test("fixed Nano workflows need working capital at their advertised deposit and 
         id: "private-accepted-listing", phase: "started", pricing: { depositUsd: 0.4 }, updatedAt: NOW,
       };
     }
-    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    if (mode === "provider-key") useApiProvider(f);
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
     for (const stage of ["nano-liquidity", "nano-unreserved-liquidity", "saved-workflow-nano-sing"]) assert.ok(check(stage)?.ok, mode);
@@ -1070,7 +1075,7 @@ test("API-funded NEAR and USDC combine pending creator payouts at their locked r
   for (const shortfall of [0n, 1n]) {
     const f = fixture(), author = f.config.nanoAddress;
     t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
-    f.config.providerUsesWallet = false;
+    useApiProvider(f);
     const nearState = f.states["/state/near-state.json"];
     nearState.quotes = {
       near: { status: "paid", asset: "near", author, depositUsd: "1.2", paidYocto: "400000000000000000000000",
@@ -1099,7 +1104,7 @@ test("API-funded authored previews check creator Nano against the runtime and on
       x402: { author: NANO_GENESIS_REPLY.contents.account },
     }) : null);
     t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
-    f.config.providerUsesWallet = false;
+    useApiProvider(f);
     const low = raw / 1000n, enough = raw / 100n;
     Object.assign(f.states["/state/funding-health.json"], { liabilitiesRaw: "0",
       reservedRaw: String(10n * raw - (mode === "runtime-short" ? low : enough)), activeRuns: 1, oldestStartedAt: NOW - 1000 });
@@ -1143,7 +1148,7 @@ test("waiting Nano, NEAR and USDC work must fit the same available pool", async 
         return structuredClone(read(path));
       };
     }
-    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    if (mode === "provider-key") useApiProvider(f);
     bindFixturePayments(f.states["/state/near-state.json"], "near", "usdc");
     const report = await runOperationalCheck(f.config, f.deps);
     const check = stage => report.checks.find(row => row.stage === stage);
@@ -1197,7 +1202,7 @@ test("accepted Market work must fit the live and confirmed Nano available alongs
       }
       return structuredClone(read(path));
     };
-    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    if (mode === "provider-key") useApiProvider(f);
     bindFixturePayments(f.states["/state/near-state.json"], "near", "usdc");
     const report = await runOperationalCheck(f.config, f.deps);
     const stages = Object.fromEntries(report.checks.map(row => [row.stage, row]));
@@ -1248,7 +1253,7 @@ test("profitable Market listings and bid caps still need spendable Nano upfront"
     const f = fixture(({ url }) => url.pathname === `/v1/agents/${ID}/pricing-plans`
       ? Response.json([{ is_default: true, price_amount: "4.00", listing_status: "live" }]) : null);
     t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
-    f.config.providerUsesWallet = providerUsesWallet;
+    if (!providerUsesWallet) useApiProvider(f);
     const agent = f.config.agents[0];
     Object.assign(agent, { bids: true, maxBidUsd: 4 });
     const original = f.deps.computePrice;
@@ -1797,6 +1802,19 @@ test("stuck scope observations use the operator's execution limit plus reconcili
   state.oldestStartedAt = NOW - 136 * 60_000;
   const report = await runOperationalCheck(f.config, f.deps);
   assert.ok(report.checks.some(c => c.stage === "runtime-funding" && c.code === "funding-run-stuck"));
+});
+
+test("API-funded readiness requires proof of live Nano creator reservations", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  useApiProvider(f);
+  const funding = report => report.checks.find(c => c.stage === "runtime-funding");
+  assert.equal(funding(await runOperationalCheck(f.config, f.deps)).ok, true);
+  delete f.states["/state/funding-health.json"].creatorReservations;
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.equal(funding(report).code, "funding-not-enforced");
+  assert.equal(report.admission.near, false);
+  assert.equal(report.admission.usdc, false);
 });
 
 test("disabled, stale or insufficient Nano read enforcement cannot be hidden by fresh funding telemetry", async () => {
@@ -2523,7 +2541,7 @@ test("fresh Market prices and waiting USDC work must fit the same Nano pool", as
     Object.assign(f.states["/state/funding-health.json"], {
       liabilitiesRaw: "0", reservedRaw: String(10n * raw - available), activeRuns: 1, oldestStartedAt: NOW - 1000,
     });
-    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    if (mode === "provider-key") useApiProvider(f);
     const original = f.deps.computePrice;
     f.deps.computePrice = async (args, options) => {
       if (args.inputs?.Idea !== privateIdea) return original(args, options);

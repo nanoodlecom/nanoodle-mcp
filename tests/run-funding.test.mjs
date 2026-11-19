@@ -64,6 +64,19 @@ test("customer and creator debts remain reserved even when the nominal balance c
   assert.equal(w.sent.length, 0);
 });
 
+test("creator-only reservations grant no provider spend authority", async () => {
+  const w = world({ initial: 70n });
+  await w.pool.run({ id: "creator", maxUsd: "0", maxRaw: 0n, overheadRaw: 70n }, async () => {
+    assert.equal(w.pool.snapshot().reservedRaw, "70");
+    await assert.rejects(w.pay(1n, 0.01), { code: "FUNDING_OVER_BUDGET" });
+    assert.equal(w.sent.length, 0);
+  });
+  for (const maxUsd of ["0", "1"]) {
+    await assert.rejects(w.pool.run({ id: "empty", maxUsd, maxRaw: 0n }, () => assert.fail("unexpected run")),
+      { code: "FUNDING_INVALID" });
+  }
+});
+
 test("admission rechecks liabilities after awaiting the chain balance", async () => {
   let liabilities = 0n;
   const pool = createRunFunding({ serial: fn => fn(), liabilitiesRaw: () => liabilities,

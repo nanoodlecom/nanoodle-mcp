@@ -502,7 +502,8 @@ export async function runOperationalCheck(config, deps = {}) {
     need(Number.isFinite(age) && age < FUNDING_REPORT_MAX_AGE_MS && age >= -30_000, "funding-report-stale");
     mediaRetentionMs = value.mediaRetentionMs;
     if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
-    need(value.enforced === true && value.protectTransfers === true, "funding-not-enforced");
+    need(value.protectTransfers === true && (providerUsesWallet ? value.enforced === true : value.creatorReservations === true),
+      "funding-not-enforced");
     need(value.writerProtection?.enforced === true, "writer-protection-not-enforced");
     need(value.writerProtection.requiredState === true, "required-state-policy-not-enforced");
     need([value.balanceRaw, value.liabilitiesRaw, value.reservedRaw].every(v => typeof v === "string" && /^\d{1,39}$/.test(v)), "funding-report-invalid");
@@ -1034,8 +1035,8 @@ export async function runOperationalCheck(config, deps = {}) {
         // This preview includes the maximum unique payment dust.
         paidYocto: (base + BigInt(QUOTE_DUST_SLOTS) * step).toString(),
         rate: { usdNano: rate.usdNano.toString(), yocto: rate.yocto.toString(), xnoUsd },
-      });
-      return overheadRaw + (providerUsesWallet ? maxRaw : 0n);
+      }, { providerUsesWallet });
+      return overheadRaw + maxRaw;
     });
   }
   function checkUsdRunCapital(stage, budgetUsd, creator) {
