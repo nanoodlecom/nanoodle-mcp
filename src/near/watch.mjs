@@ -134,14 +134,21 @@ export function createNearWatcher({
         saveProgress({ ...state, height: nextHeight, hash: block.header.hash });
         nextHeight++;
       }
-      // Backfill runs newest-first without delaying live transfers at the tip.
+      // Walk the existing historical gap newest-first.
       let budget = Math.max(0, remaining);
       while (state.backfill && budget-- > 0) {
         const { nextHash, cutoffMs, maxHeight = state.height - Number(nextHash !== state.hash) } = state.backfill;
         const block = await rpc.block({ blockId: nextHash });
         const step = nearBlockIdentity(block);
         if (step.hash !== nextHash || step.height > maxHeight) throw new NearError("RPC_BAD_RESPONSE", "NEAR watcher backfill block mismatch");
-        if (nearBlockTime(block) < cutoffMs) { saveProgress({ ...state, backfill: null }); break; }
+        const blockAt = nearBlockTime(block);
+        if (blockAt < cutoffMs) {
+          // A first boot with pending quotes has no earlier coverage stamp.
+          // If the forward scan still trails the tip, retain only the proven
+          // lower bound until both scans finish.
+          saveProgress({ ...state, backfill: null, coveredThroughMs: state.coveredThroughMs ?? Math.min(blockAt, headAt) });
+          break;
+        }
         const next = previousBlockHash(block);
         await inspect(block);
         save({ ...state, backfill: { nextHash: next, cutoffMs, maxHeight: step.height - 1 } });

@@ -185,6 +185,34 @@ test("repeated finalized head jumps leave room for older NEAR payments across a 
   assert.ok(w.ledger.getMeta("paymentWatch").coveredThroughMs > originalCoverage);
 });
 
+test("first-boot backfill can finish before the forward scan and still reopen safely", async t => {
+  const w = await world(), opts = { ...w.opts, maxBlocksPerTick: 1 };
+  const boundary = await w.rpc.block({ finality: "final" });
+  const boundaryAt = Number(BigInt(boundary.header.timestamp_nanosec) / 1_000_000n);
+  w.quote();
+  const older = [w.pay(), w.pay(), w.pay()];
+  let watcher = createNearWatcher(opts);
+  t.after(() => watcher.stop());
+  await watcher.start();
+  assert.equal(w.ledger.getMeta("paymentWatch").coveredThroughMs, null);
+  const newer = [w.pay(), w.pay(), w.pay()];
+  const head = await w.rpc.block({ finality: "final" });
+
+  for (let i = 0; i < older.length && watcher.status().backfilling; i++) await watcher.tick();
+  assert.equal(watcher.status().backfilling, false);
+  assert.ok(watcher.status().height < head.header.height);
+  assert.deepEqual(new Set(w.observed.map(p => p.hash)), new Set(older));
+  assert.equal(w.ledger.getMeta("paymentWatch").coveredThroughMs, boundaryAt);
+
+  await watcher.stop();
+  watcher = createNearWatcher(opts);
+  await watcher.start();
+  for (let i = 0; i < older.length + newer.length && watcher.status().backfilling; i++) await watcher.tick();
+  assert.equal(watcher.status().height, head.header.height);
+  assert.equal(watcher.status().backfilling, false);
+  assert.deepEqual(new Set(w.observed.map(p => p.hash)), new Set([...older, ...newer]));
+});
+
 test("an invalid backfill predecessor cannot advance coverage, including after restart", async t => {
   for (const scenario of ["repeated-block", "self-parent", "missing-parent", "legacy-cursor"]) {
     const w = await world(), options = { ...w.opts, maxBlocksPerTick: 1 };
