@@ -1,1 +1,25 @@
-{"description":"Run multi-model AI workflows built on nanoodle.com from chat: image generation, video, audio, 3D and text pipelines exposed as single runs. Send a workflow name or a nanoodle.com share link; get the finished result and its media links back.","handle_suggestion":"@nanoodle","keywords":["ai workflows","image generation","video generation","text to image","ai pipeline","multi-model","nanoodle","mcp","media generation","workflow automation"],"name":"Nanoodle — AI Workflow Runner","tags":["workflows","image-generation","video-generation","media","mcp","nanoodle"]}
+{
+    "description": "Run multi-model AI workflows built on nanoodle.com from chat: image generation, video, audio, 3D and text pipelines exposed as single runs. Send a workflow name or a nanoodle.com share link; get the finished result and its media links back.",
+    "handle_suggestion": "@nanoodle",
+    "keywords": [
+        "ai workflows",
+        "image generation",
+        "video generation",
+        "text to image",
+        "ai pipeline",
+        "multi-model",
+        "nanoodle",
+        "mcp",
+        "media generation",
+        "workflow automation"
+    ],
+    "name": "Nanoodle \u2014 AI Workflow Runner",
+    "tags": [
+        "workflows",
+        "image-generation",
+        "video-generation",
+        "media",
+        "mcp",
+        "nanoodle"
+    ]
+}
