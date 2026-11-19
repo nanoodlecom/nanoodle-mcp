@@ -168,8 +168,12 @@ export function createNearGate({
 
   /** Full results (incl. text) of finished calls in this process, by payment id. */
   const results = new Map();
-  // Safe execution snapshots only, in memory like paid output. Never persist prompts.
+  // Stream live snapshots in memory. The terminal snapshot joins the receipt.
   const workflows = new Map();
+  function finishedWorkflow(id) {
+    const state = workflows.get(id);
+    return Number.isSafeInteger(state?.finishedAt) ? { workflow: state } : {};
+  }
   /** Per-payment-id serialization: one paying call at a time per id. */
   const locks = new Map();
   const waiters = new Map();
@@ -709,13 +713,14 @@ export function createNearGate({
       : "If you already paid, confirm the original transaction on this quote. Otherwise ask for a fresh quote.";
     else if (status === "pending") next = "Pay this deposit in your wallet; keep monitoring until payment is confirmed.";
     else if (paid) next = `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`;
+    const workflow = q.workflow ?? workflows.get(id);
     return {
       paymentId: q.id, tool: q.resumeTool || q.tool, network, payTo: merchantId,
       ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
       done: status !== "pending" && !checkingPayment,
       ...(checkingPayment && { checkingPayment: true }),
-      ...(workflows.has(id) ? { workflow: workflows.get(id) } : {}),
+      ...(workflow && { workflow }),
       next,
       ...(q.payTx ? { txHash: q.payTx } : {}),
       ...(FINAL.has(status) ? { receipt: receiptFor(q).structured.receipt } : {}),
@@ -875,7 +880,10 @@ export function createNearGate({
         ? "The current model estimate exceeds this quote's budget. No model work started. The full deposit is being returned. Request a new quote to try again."
         : "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
       // Persist the failure before the refund goes out, so a restart never re-runs it.
-      q = ledger.updateQuote(q.id, { status: "failed", outcome: "run_failed", error, finishedAt: now() });
+      q = ledger.updateQuote(q.id, {
+        status: "failed", outcome: "run_failed", error, finishedAt: now(), ...finishedWorkflow(q.id),
+      });
+      workflows.delete(q.id);
       results.set(q.id, { details: `Details: ${msg}` });
       const rf = await refundFor(q, q.payer, BigInt(q.paidYocto), "run_failed");
       q = ledger.updateQuote(q.id, refundReference(rf));
@@ -901,9 +909,12 @@ export function createNearGate({
     });
     const costUsd = s.known ? knownUsd(settleUsd) : null;
     const authorRaw = q.author ? authorPayoutRaw(s, q.rate, parseUsdNano(q.rate.xnoUsd)) : 0n;
-    // The settlement is on disk before the refund intent: a restart in between
-    // finishes this settlement instead of refunding the whole deposit.
+    // Keep the media-only result and terminal progress with the settlement so
+    // the payment page can recover them even if the refund is still pending.
+    const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
     q = ledger.updateQuote(q.id, {
+      ...finishedWorkflow(q.id),
+      result: persisted,
       settlement: {
         costUsd, exact: s.known ? res.costExact !== false && billedAs === "reported" : false,
         billedAs, reportedUsd: reportedUsd ?? null,
@@ -912,12 +923,11 @@ export function createNearGate({
         ...(authorRaw > 0n ? { authorPayout: { to: q.author, amountRaw: authorRaw.toString() } } : {}),
       },
     });
+    workflows.delete(q.id);
     ensureAuthorPayout(q);
     results.set(q.id, body);
     const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change", ...refundAsset(q) });
-    // Media-only results (links) may be kept; text output is the caller's paid content and stays in memory.
-    const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
-    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), result: persisted, finishedAt: now() });
+    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), finishedAt: now() });
     ev("change", {
       paymentId: q.id, tool: name, to: q.payer, costUsd,
       chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(), status: rf.status, hash: rf.txHash || null,
@@ -939,8 +949,8 @@ export function createNearGate({
           ensureAuthorPayout(q);
           // The run finished and was settled; only the refund intent may be missing.
           const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change", ...refundAsset(q) });
-          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), result: null, finishedAt: t });
-          log(`NEAR payment ${q.id}: settled after a restart (the result text was not kept)`);
+          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), finishedAt: t });
+          log(`NEAR payment ${q.id}: settled after a restart`);
         } else {
           const error = "The server restarted while this run was in progress.";
           const done = ledger.updateQuote(q.id, { status: "failed", outcome: "interrupted", error, finishedAt: t });

@@ -48,7 +48,7 @@ async function fixtureDirs() {
   return { graphsDir, outDir };
 }
 
-for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receives real node progress before the paid result, and reload can attach`, { timeout: 30_000 }, async () => {
+for (const name of ["idea-poster", "run_noodle"]) test(`${name}: payment page streams progress and retains the finished graph across restart`, { timeout: 60_000 }, async () => {
   const { graphsDir, outDir } = await fixtureDirs();
   const chain = createFakeChain(), key = await throwawayNearKey();
   chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
@@ -59,7 +59,8 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receive
   const nano = nanoGptMock({ beforeChat: () => held });
   await chain.listen(); await nano.listen();
   const port = await freePort();
-  const srv = await startServer({ graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: key.secretKey, port });
+  const serverOptions = { graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: key.secretKey, port };
+  let srv = await startServer(serverOptions);
   const base = `http://127.0.0.1:${port}`, snapshots = [];
   try {
     const args = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "PRIVATE BRIEF" } } : { Idea: "PRIVATE BRIEF" };
@@ -112,9 +113,25 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: browser receive
     assert.equal(done.structuredContent.receipt.outcome, "succeeded");
     assert.equal(snapshots.at(-1).status, "succeeded");
     assert.ok(snapshots.at(-1).nodes.every(n => n.status === "done"));
+    const beforeRestart = runFrames.at(-1);
+    await srv.kill();
+    srv = null;
+    srv = await startServer(serverOptions);
+    const restored = await (await fetch(p.statusUrl)).json();
+    assert.equal(restored.status, "settled");
+    assert.deepEqual(restored.workflow, beforeRestart.workflow);
+    assert.deepEqual(restored.receipt, beforeRestart.receipt);
+    assert.doesNotMatch(JSON.stringify(restored.workflow), /PRIVATE BRIEF|fields|prompt|runId/);
+    const terminalStream = await (await fetch(`${base}/near/watch/${p.paymentId}?run=1`)).text();
+    const data = terminalStream.split("\n").find(line => line.startsWith("data: "));
+    assert.deepEqual(JSON.parse(data.slice(6)).workflow, restored.workflow);
+    const restoredResult = await (await fetch(`${base}/near/result/${p.paymentId}`)).json();
+    const media = done.content.find(part => part.type === "text" && part.text.includes("/out/"));
+    assert.ok(media);
+    assert.ok(restoredResult.content.some(part => part.text === media.text));
     await mcpClient(base).call(name, { ...args, _payment_id: p.paymentId });
     assert.equal(nano.runs(), 1, "reconnecting or replaying never starts another model call");
-  } finally { releaseChat(); await srv.kill(); await chain.close(); await nano.close(); }
+  } finally { releaseChat(); await srv?.kill(); await chain.close(); await nano.close(); }
 });
 
 /** Run the bin to completion (for configurations it must refuse). */

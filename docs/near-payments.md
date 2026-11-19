@@ -939,6 +939,7 @@ Quote record:
 | `finishedAt` | number \| null | When the quote reached a final status. |
 | `settlement` | object \| null | `{ costUsd, exact, billedAs, reportedUsd, costYocto, feeYocto, chargedYocto, refundYocto }`. Written while the quote is still `running`, before the refund intent. |
 | `refundId` | string \| null | Links to the refund record. |
+| `workflow` | object (optional) | Completed execution graph for the payment page. Includes steps, links and status. Workflow input values and provider output stay out of the graph. |
 | `result` | object \| null | Media-only results (files and links, plus the receipt). Text output is never written to disk; see below. |
 | `error` | string \| null | The gate-authored failure sentence only, never upstream error text. |
 
