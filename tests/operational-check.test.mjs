@@ -209,6 +209,25 @@ function bindFixturePayments(ledger, ...ids) {
   }
 }
 
+test("two recent paid workflow failures warn while checkout lanes stay open", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const state = f.states["/state/gate-state.json"];
+  const quote = { status: "refunded", amountRaw: "10", paidAt: NOW - 2000, completedAt: NOW - 1000,
+    createdAt: NOW - 5000, expiresAt: NOW + 60_000, error: "PRIVATE_WORKFLOW_ERROR" };
+  state.quotes.push({ ...quote, id: "private-workflow-one" });
+  const stage = report => report.checks.find(c => c.stage === "paid-workflow-execution");
+  let report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: true, failures: { nano: 1, near: 0, usdc: 0 } });
+
+  state.quotes.push({ ...quote, id: "private-workflow-two" });
+  report = await runOperationalCheck(f.config, f.deps);
+  assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: false,
+    failures: { nano: 2, near: 0, usdc: 0 }, code: "paid-workflow-failures-repeated", domains: [] });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_WORKFLOW_ERROR|private-workflow-/);
+});
+
 test("operational probes cover live readiness with no inference, signing or Market mutation and a redacted report", async () => {
   const f = fixture(), before = JSON.stringify(f.states);
   const report = await runOperationalCheck(f.config, f.deps);
