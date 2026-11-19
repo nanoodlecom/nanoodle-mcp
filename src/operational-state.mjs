@@ -169,13 +169,14 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
 }
 
 /** Accepted NEAR and USDC payments waiting to acquire a Nano run reservation. */
-export function paidNearRunFundingRaw(quotes) {
+export function paidNearRunFundingRaw(quotes, { providerUsesWallet = true } = {}) {
   let requiredRaw = 0n;
   for (const quote of values(quotes)) {
     if (quote.status !== "paid" || quote.settlement || quote.fundingOutcomeReady === true) continue;
+    if (!providerUsesWallet && !quote.author) continue;
     if (amount(quote.paidYocto) === 0n) throw Error("invalid-paid-near-amount");
     const { maxRaw, overheadRaw } = nearRunFundingBudget(quote);
-    requiredRaw += maxRaw + overheadRaw;
+    requiredRaw += overheadRaw + (providerUsesWallet ? maxRaw : 0n);
   }
   return requiredRaw;
 }

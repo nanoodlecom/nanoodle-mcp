@@ -45,6 +45,9 @@ endpoints. Configure independently operated mainnet nodes: with multiple endpoin
 each account read needs at least two readable mainnet peers. An explicitly single
 endpoint retains validation and monotonic account checks but has no independent
 peer comparison. Ordinary local wallet use keeps its existing opt-in behavior.
+The wallet guard and scheduled check reject equivalent RPC URLs before probing
+them. Default ports, host capitalization, DNS root dots and URL fragments cannot
+create a second vote. Distinct URLs still require independently operated nodes.
 
 Each endpoint must expose the confirmed mainnet genesis block and modern
 `account_info` fields, including current and confirmed frontier, height, balance,
