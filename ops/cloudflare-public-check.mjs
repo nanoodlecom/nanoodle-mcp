@@ -19,7 +19,9 @@ export default {
     const failures = [...mcp.checks, ...market.checks].filter(check => !check.ok)
       .map(({ stage, code, error }) => ({ stage, code: code ?? error }));
     console.log(JSON.stringify({ service: "nanoodle-public-availability", scheduledAt: new Date(controller.scheduledTime).toISOString(),
-      checkedAt: mcp.checkedAt, ok: !failures.length, checks: mcp.checks.length + market.checks.length, failures }));
+      checkedAt: mcp.checkedAt, ok: !failures.length, checks: mcp.checks.length + market.checks.length, failures,
+      nearArchive: mcp.checks.find(check => check.stage === "near-archival-history").peers,
+      nearArchiveDiscovery: mcp.checks.find(check => check.stage === "near-archival-payment-discovery").peers }));
     if (failures.length) throw new Error("Nanoodle public availability check failed");
   },
 };

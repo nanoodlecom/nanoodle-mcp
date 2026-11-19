@@ -1,10 +1,18 @@
 import { createProbeFetch } from "./probe-http.mjs";
+import { createNearRpc } from "./near/rpc.mjs";
+import { readNearPaymentReceipts, readNearReceiptTransaction } from "./near/watch.mjs";
 
 const NANO = "https://mcp.nanoodle.com";
 const NANO_ALIAS = "https://nano.nanoodle.com";
 const NEAR = "https://near.nanoodle.com";
 const NEAR_ALIAS = "https://mcp-near.nanoodle.com";
 const BABEL = "https://babel.255bits.com";
+const NEAR_ARCHIVES = ["https://archival-rpc.mainnet.fastnear.com", "https://archival-rpc.mainnet.near.org"];
+// Published mainnet fixture from https://docs.fastnear.com/rpc/transaction/tx.
+const ARCHIVE_SAMPLE = { tx: "34E7weKCDqXh3xPKdBgSWRqo44yTWjbka9deMK8JbAxx", signer: "escrow.ai.near",
+  block: "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL", height: 194263441,
+  receipt: { id: "EmdtjzQtQWvmbkeZrgSQwqbyAuevicEYTVUxLhAmUEe4",
+    block: "3bssBpNw6rN4sbthUgELgdT4xpkWL2ZDUnrt9yddDB8q", height: 194263443 } };
 const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
@@ -49,8 +57,28 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     return result;
   }
 
-  // Discovery and free pricing only. A paid tool is never called by a probe.
+  // All probes are read-only, including price_noodle and archive reads.
   function rpc(method, params) { return { jsonrpc: "2.0", id: 1, method, params }; }
+  async function readArchive(site) {
+    const fixture = ARCHIVE_SAMPLE;
+    const tx = await json(site, { body: rpc("tx", { tx_hash: fixture.tx, sender_account_id: fixture.signer, wait_until: "NONE" }) });
+    if (tx.error?.cause?.name === "UNKNOWN_TRANSACTION") throw new ProbeError("near-history-transaction-missing");
+    need(tx.jsonrpc === "2.0" && tx.id === 1 && !tx.error && tx.result?.final_execution_status === "FINAL"
+      && tx.result.transaction?.hash === fixture.tx && tx.result.transaction?.signer_id === fixture.signer
+      && tx.result.transaction_outcome?.block_hash === fixture.block
+      && Object.hasOwn(tx.result.status ?? {}, "Failure"), "near-history-transaction-unverified");
+    const block = await json(site, { body: rpc("block", { block_id: fixture.block }) });
+    need(block.jsonrpc === "2.0" && block.id === 1 && !block.error && block.result?.header?.hash === fixture.block
+      && block.result.header.height === fixture.height, "near-history-block-unverified");
+  }
+  async function readArchiveDiscovery(site) {
+    const { signer, tx, receipt } = ARCHIVE_SAMPLE;
+    const client = createNearRpc({ url: site, fetch: request, timeoutMs: 6000 });
+    const changes = await readNearPaymentReceipts(client, receipt.block, [signer]).catch(() => null);
+    need(changes?.has(receipt.id), "near-history-account-change-unverified");
+    const origin = await readNearReceiptTransaction(client, receipt.id, receipt.height).catch(() => null);
+    need(origin?.transaction_hash === tx && origin.sender_account_id === signer, "near-history-receipt-origin-unverified");
+  }
   async function discover(site) {
     const hello = await json(site + "/mcp", { body: rpc("initialize", INIT) });
     need(hello.jsonrpc === "2.0" && hello.id === 1 && !hello.error && hello.result?.serverInfo?.name === "nanoodle-mcp",
@@ -127,12 +155,22 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       }
     }
   }
+  async function archiveCheck(stage, probe, unavailable) {
+    const results = await Promise.all(NEAR_ARCHIVES.map(site => check(new URL(site).hostname, () => probe(site))));
+    const peers = results.map(({ stage: host, ...result }) => ({ host, ...result }));
+    const ok = peers.some(peer => peer.ok);
+    return { stage, ok, peers, ...(!ok && { code: unavailable }) };
+  }
   const checks = await Promise.all(Object.entries(probes).map(([stage, probe]) => check(stage, probe)));
   checks.push(...await Promise.all([
     check("nano-conditional-graph-pricing", () => conditionalPrice(NANO)),
     check("nano-alias-conditional-graph-pricing", () => conditionalPrice(NANO_ALIAS)),
     check("near-conditional-pricing", () => conditionalPrice(NEAR, "near")),
     check("usdc-conditional-pricing", () => conditionalPrice(NEAR, "usdc")),
+  ]));
+  checks.push(...await Promise.all([
+    archiveCheck("near-archival-history", readArchive, "near-no-readable-archive"),
+    archiveCheck("near-archival-payment-discovery", readArchiveDiscovery, "near-no-archive-payment-discovery"),
   ]));
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }

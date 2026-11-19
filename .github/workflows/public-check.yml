@@ -14,6 +14,8 @@ on:
       - src/public-mcp-check.mjs
       - src/market/fee-guard.mjs
       - src/market/public-availability.mjs
+      - src/near/rpc.mjs
+      - src/near/watch.mjs
       - tests/market-check.test.mjs
       - tests/public-mcp-check.test.mjs
 
