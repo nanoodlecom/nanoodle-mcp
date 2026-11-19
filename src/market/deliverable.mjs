@@ -184,7 +184,7 @@ export function startedMessage(p, { budgetUsd, defaultLabel = null, fields = [],
   const which = defaultLabel
     ? `I selected this agent's default workflow (${mdEscape(defaultLabel)}) with your brief as its input${fieldsPhrase(fields)}.`
     : "Your workflow passed the safety checks.";
-  return `Preparing your run. ${which} Estimated model cost is $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"}, within a budget of $${exactUsd(budgetUsd)}. ${notesPhrase(notes)}Once funding is confirmed, the workflow runs once. Delivery includes the result and an itemized cost report.`;
+  return `Preparing your run. ${which} Estimated model cost is $${estUsd(p.estimatedCostUsd)} across ${p.items.length} paid step${p.items.length === 1 ? "" : "s"} (this agent's per-job budget is $${exactUsd(budgetUsd)}). ${notesPhrase(notes)}Once funding is confirmed, the workflow runs once. Delivery includes the result and an itemized cost report.`;
 }
 
 /** The thread message when the buyer asks for changes (or a dispute redo sends the job back). */
