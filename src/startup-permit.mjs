@@ -8,6 +8,7 @@ import { selectNanoCheckpoint } from "./nano-checkpoint.mjs";
 import { readOperatorJson } from "./operator-file.mjs";
 
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const SEALED_NODE_VERSIONS = new Set(["22.23.4", "22.23.5"]);
 const exact = (value, keys) => value && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).sort().join(",") === keys.sort().join(",");
 const hex = (value, length) => typeof value === "string" && new RegExp(`^[a-f0-9]{${length}}$`).test(value);
@@ -34,7 +35,7 @@ export function qualifyStartupPermit({ file, ownerUid, request, releaseRoot = PA
     const m = manifest.value;
     if (!exact(m, ["v", "revision", "repository", "node", "ci", "sourceTree", "tree", "files", "installScripts", "devDependencies"])
       || m.v !== 1 || m.revision !== value.release.revision || m.tree !== value.release.tree
-      || m.repository !== "https://github.com/nanoodlecom/nanoodle-mcp.git" || m.node !== "22.23.4"
+      || m.repository !== "https://github.com/nanoodlecom/nanoodle-mcp.git" || !SEALED_NODE_VERSIONS.has(m.node)
       || !hex(m.sourceTree, 64) || !Number.isSafeInteger(m.files) || m.files < 1
       || !exact(m.ci, ["v", "repository", "revision", "workflow", "runId", "attempt"])
       || m.ci.v !== 1 || m.ci.revision !== m.revision || m.ci.repository !== "nanoodlecom/nanoodle-mcp"
