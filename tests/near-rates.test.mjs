@@ -13,11 +13,13 @@ import { createNearUsdRate } from "../src/near/rate.mjs";
 import { usdToYocto, settleYocto, depositYocto } from "../src/near/amount.mjs";
 
 const CG = '{"near":{"usd":3.64,"last_updated_at":1794262198},"nano":{"usd":0.8,"last_updated_at":1794262190}}';
+const CG_NOW = 1_794_262_200_000;
+const CG_UNSTAMPED = '{"near":{"usd":3.64},"nano":{"usd":0.8}}';
 // NanoGPT's 402 invoice: 0.01 XNO (1e28 raw) for $0.0095, so 1 XNO = $0.95.
 const PROBE = { accepts: [{ scheme: "nano", maxAmountRequired: "10000000000000000000000000000", maxAmountRequiredUSD: "0.0095" }] };
 
 /** A scripted network: CoinGecko and the NanoGPT x402 probe, each a list of answers (the last repeats). */
-function net({ cg = [{ text: CG }], probe = [{ status: 402, json: PROBE }] } = {}) {
+function net({ cg = [{ text: CG_UNSTAMPED }], probe = [{ status: 402, json: PROBE }] } = {}) {
   const calls = { cg: 0, probe: 0, urls: [] };
   const next = (list) => (list.length > 1 ? list.shift() : list[0]);
   const fetch = async (url, init = {}) => {
@@ -87,8 +89,8 @@ test("swap margin shows the effective NEAR/USD and enlarges the pair", async () 
 });
 
 test("live: CoinGecko NEAR/USD and the NanoGPT x402 pair for XNO/USD (preferred over CoinGecko's nano)", async () => {
-  const { fetch, calls } = net();
-  const r = createNearRates({ fetch, now: () => 1_794_262_200_000, ...noTimer });
+  const { fetch, calls } = net({ cg: [{ text: CG }] });
+  const r = createNearRates({ fetch, now: () => CG_NOW, ...noTimer });
   const a = await r.current();
   assert.equal(a.nearUsd, "3.64");
   assert.equal(a.source, "coingecko");
@@ -140,7 +142,7 @@ test("TTL: one fetch within the TTL, a lazy refresh at it; concurrent quotes sha
 
 test("fail closed: no fresh NEAR/USD, no quote; stale-but-young is served until maxStale", async () => {
   let t = 0;
-  const { fetch } = net({ cg: [{ text: CG }, new Error("network down")] });
+  const { fetch } = net({ cg: [{ text: CG_UNSTAMPED }, new Error("network down")] });
   const r = createNearRates({ fetch, now: () => t, ...noTimer });
   const first = await r.current();
   t = 61_000;
@@ -151,6 +153,41 @@ test("fail closed: no fresh NEAR/USD, no quote; stale-but-young is served until 
   assert.equal(v.nearUsd, null);
   assert.equal(v.quoting, false);
   assert.match(v.sources.nearUsd.lastError, /network down/);
+});
+
+test("a frozen NEAR price expires by observation time while USDC keeps its fresh XNO funding rate", async () => {
+  let t = CG_NOW, response = CG;
+  const { fetch, calls } = net({ cg: [() => new Response(response)] });
+  const r = createNearRates({ fetch, now: () => t, xnoRequired: true, ...noTimer });
+  const first = await r.current();
+  t += 297_999; // The published NEAR price was observed two seconds before the first fetch.
+  await r.refresh();
+  assert.equal((await r.current()).nearUsd, first.nearUsd);
+  t++;
+  await r.refresh(); // The transport still returns HTTP 200 and the same old observation.
+  assert.ok(calls.cg >= 3);
+  await assert.rejects(r.current(), e => e.code === "RATE_UNAVAILABLE" && e.data.pair === "NEAR/USD");
+  assert.equal((await r.currentUsdc()).xnoUsd, "0.95");
+  assert.equal((await r.view()).sources.nearUsd.usable, false);
+  response = JSON.stringify({ near: { usd: 4, last_updated_at: Math.floor(t / 1000) } });
+  await r.refresh();
+  assert.equal((await r.current()).nearUsd, "4");
+});
+
+test("future price timestamps do not replace a sound sample and stale funding fallback expires", async () => {
+  let t = CG_NOW, response = CG;
+  const { fetch } = net({ cg: [() => new Response(response)], probe: [new Error("oracle unavailable")] });
+  const r = createNearRates({ fetch, now: () => t, xnoRequired: true, ...noTimer });
+  assert.equal((await r.currentUsdc()).xnoUsd, "0.8");
+  response = JSON.stringify({ near: { usd: 4, last_updated_at: Math.floor(t / 1000) },
+    nano: { usd: 8, last_updated_at: Math.floor(t / 1000) + 31 } });
+  await r.refresh();
+  assert.equal((await r.currentUsdc()).xnoUsd, "0.8");
+  response = CG;
+  t += 290_000;
+  await r.refresh();
+  await assert.rejects(r.currentUsdc(), e => e.code === "RATE_UNAVAILABLE" && e.data.pair === "XNO/USD");
+  assert.equal((await r.view()).sources.xnoUsd.usable, false);
 });
 
 test("XNO/USD: required when runs are paid from the Nano wallet, informational with an API key", async () => {

@@ -1739,6 +1739,23 @@ test("disagreeing Nano frontiers, an underfunded pool and stale exchange rates c
   }
 });
 
+test("a stale NEAR spot price leaves the fresh XNO capital checks and other lanes available", async t => {
+  for (const stale of ["near", "xno"]) {
+    const sources = Object.fromEntries(["near", "xno"].map(asset => [
+      `${asset}Usd`, { usable: true, live: true, at: new Date(NOW - (asset === stale ? 300_000 : 0)).toISOString() },
+    ]));
+    const f = fixture(({ url }) => url.pathname === "/rates"
+      ? Response.json({ quoting: false, nearUsd: "3", xnoUsd: "1", xnoRequired: true, sources }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    const report = await runOperationalCheck(f.config, f.deps);
+    const failed = report.checks.filter(c => !c.ok && c.domains?.length);
+    assert.deepEqual(failed, [{ stage: `exchange-rate-${stale}`, ok: false, code: "exchange-rate-stale",
+      domains: stale === "near" ? ["near"] : ["nano", "near", "usdc", "market"] }]);
+    assert.deepEqual(report.admission, { nano: stale === "near", near: false, usdc: stale === "near", market: stale === "near" });
+    assert.equal(report.checks.some(c => c.stage === "nano-liquidity" && c.ok), stale === "near");
+  }
+});
+
 test("a readable endpoint on the wrong Nano network cannot satisfy operational readiness", async () => {
   const f = fixture(({ url, body }) => url.hostname === "nano-0.example" && body?.action === "block_info"
     ? Response.json({ confirmed: "true", contents: { ...NANO_GENESIS_REPLY.contents, source: "0".repeat(64) } }) : null);

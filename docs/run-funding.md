@@ -17,6 +17,10 @@ The wallet checks current liabilities again right before publishing a provider
 payment. A send rebuilt on a fresher frontier must still fit the balance after
 covering other reservations and claims.
 
+During an XNO rate-oracle outage, Nano checkout and wallet-funded Market
+pricing can use a cached rate for up to five minutes after the last successful
+probe. Already issued quotes retain their locked rate.
+
 Concurrent nodes inherit one opaque async scope. The wallet captures the
 enqueuer's scope before entering the queue, so another caller's queue drainer
 cannot substitute its budget. Duplicate invoice identities, nested runs and
@@ -51,6 +55,8 @@ authorizations; read-only recovery can resume after storage recovers. The
 five-minute operational check requires fresh enforcement telemetry, tests its
 own atomic balance against liabilities plus reservations, and flags old scopes.
 It also checks both public MCP listeners without executing a workflow.
+The monitor evaluates NEAR/USD separately from XNO/USD so a stale NEAR spot
+price leaves the Nano funding checks available.
 
 ## Verification and remaining recovery limits
 

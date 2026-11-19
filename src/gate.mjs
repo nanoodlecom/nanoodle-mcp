@@ -47,6 +47,7 @@ import { gateNanoTransferClaims, nanoGateTransferId } from "./nano-transfer-jour
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
+export const LIVE_RATE_MAX_AGE_MS = 300_000;
 const QUOTE_READ_PROOF_TTL_MS = 30_000;
 const QUOTE_READ_RETRY_MS = 5_000;
 const QUOTE_READ_UNAVAILABLE = "Nano payment detection is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
@@ -118,8 +119,7 @@ const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
  * The XNO/USD rate oracle: a keyless request with `x-x402: true` answers 402
  * with the invoice pair (raw XNO amount + USD value) NanoGPT settles x402
  * payments at. Returns that exact pair { usdNano, raw }. The probe invoice is
- * never paid; it expires on their side. `signal` is optional (the charge gate
- * passes none).
+ * never paid; it expires on their side. The signal bounds the probe request.
  */
 export async function probeX402Pair({ fetch, url, signal }) {
   const r = await fetch(url, {
@@ -195,7 +195,7 @@ function settlementReceipt(q, journaled = false) {
  * @param {(params) => Promise<void>} [opts.validate]  registry arg validation — quotes are only
  *                                        issued for calls that would actually run (never charge for a typo)
  * @param {number|null} [opts.xnoUsd]     static XNO/USD rate override; null (default) → NanoGPT's own
- *                                        x402 invoices are the oracle (60s cache, stale-tolerant)
+ *                                        x402 invoices are the oracle (60s cache, 5min maximum age)
  * @param {string} [opts.oracleBase]      NanoGPT API base for the rate probe (default https://nano-gpt.com)
  * @param {string|null} [opts.wsUrl]      Nano node websocket (wss://…) for push confirmations
  * @param {string} opts.publicBase        absolute base URL for pay links (no trailing slash)
@@ -265,28 +265,34 @@ export function createChargeGate({
   // answers 402 with the SAME invoice pair (raw XNO amount + USD value) they
   // settle our downstream payments at — so we quote callers at the rate we pay,
   // not a market feed's. The probe invoice is never paid; it expires on their
-  // side, and the 60s cache keeps probes to at most one a minute while quoting.
+  // side. Successful probes are reused for 60 seconds.
   const oracleUrl = x402ProbeUrl(oracleBase);
-  const nanoGptPair = () => probeX402Pair({ fetch, url: oracleUrl });
+  const nanoGptPair = () => probeX402Pair({ fetch, url: oracleUrl, signal: AbortSignal.timeout(8_000) });
 
   let rate = Number.isFinite(xnoUsd) && xnoUsd > 0
     ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: 10n ** 30n }, at: Infinity, source: "static" }
     : null;
   let rateProbe = null; // in-flight oracle probe — concurrent cold quoters share one request
+  function rateYoungerThan(limit) {
+    if (!rate) return false;
+    if (rate.at === Infinity) return true;
+    const age = monotonicNow() - rate.at;
+    return age >= 0 && age < limit;
+  }
   async function ratePair() {
-    if (rate && (rate.at === Infinity || now() - rate.at < 60_000)) return rate.pair;
+    if (rateYoungerThan(60_000)) return rate.pair;
     try {
       if (!rateProbe) rateProbe = nanoGptPair().finally(() => { rateProbe = null; });
       const pair = await rateProbe;
-      rate = { pair, at: now(), source: "nanogpt-x402" };
+      rate = { pair, at: monotonicNow(), source: "nanogpt-x402" };
       return pair;
     } catch (e) {
-      if (rate) {
+      if (rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
         log(`NanoGPT rate oracle failed (${e.message}) — using stale cached pair`);
         return rate.pair;
       }
       throw new Error("cannot price this call: the NanoGPT x402 rate probe failed " +
-        `(${e.message}) and there is no cached rate or --xno-usd override`);
+        `(${e.message}) and there is no current cached rate or --xno-usd override`);
     }
   }
   const rateSource = () => (rate ? rate.source : null);
