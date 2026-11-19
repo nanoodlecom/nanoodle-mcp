@@ -29,7 +29,7 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
       if (body.action === "account_info" && p.accountRead) return p.accountRead();
       if (body.action === "account_info") return p.info;
       if (body.action === "receivable") { assert.equal(body.include_only_confirmed, "true"); return p.receivable; }
-      if (body.action === "account_history") return p.history;
+      if (body.action === "account_history") return p.historyRead ? p.historyRead(body) : p.history;
       if (body.action === "block_info") { const value = p.blocks[body.hash]; if (value instanceof Error) throw value; if (!value) throw absent(); return value; }
       assert.fail("not a read-only request");
     } });
@@ -214,6 +214,37 @@ test("funding refreshes and quote preflights leave the next standby window for a
   w.tick(60_000);
   await w.pool.readFundingInfo();
   assert.equal(standbyRequests(), 10, "a complete scan releases priority");
+});
+
+test("a deferred history continuation reserves the next budget window and is proved by both peers", async () => {
+  const w = world(2, 4), [owned, spare, standby] = w.peers;
+  const head = owned.info.confirmed_frontier;
+  const earlier = "D".repeat(64);
+  const newest = { account: ACCOUNT, previous: OTHER, history: [
+    { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+  ] };
+  const continuation = { account: ACCOUNT, previous: earlier, history: [
+    { hash: OTHER, type: "state", subtype: "change", confirmed: "true", height: "9", previous: earlier },
+  ] };
+  const historyRequests = [];
+  for (const peer of [owned, standby]) {
+    peer.historyRead = body => {
+      assert.equal(body.raw, "true");
+      historyRequests.push({ base: peer.base, head: body.head });
+      return body.head === head ? newest : continuation;
+    };
+  }
+  spare.down = true;
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true })).history, newest);
+  await assert.rejects(w.pool.readPaymentHistory({ action: "account_history", account: ACCOUNT, head: OTHER, raw: "true", count: "100" }),
+    { code: "NANO_RPC_STANDBY_BUDGET" });
+  w.tick(60_000);
+  await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_STANDBY_BUDGET" });
+  assert.deepEqual((await w.pool.readPaymentWindow({ existingPayments: true, historyHead: OTHER })).history, continuation);
+  assert.deepEqual(historyRequests.filter(call => call.base === standby.base).map(call => call.head), [head, OTHER]);
+  assert.deepEqual(w.calls.filter(call => call.base === standby.base).map(call => call.action),
+    ["block_info", "receivable", "account_info", "account_history", "block_info", "receivable", "account_info", "account_history"]);
+  await assert.rejects(w.pool.readPaymentWindow({ historyHead: OTHER }), { code: "NANO_RPC_UNPROVEN_HISTORY" });
 });
 
 test("funding can reuse a matching payment account proof only through its original expiry", async () => {

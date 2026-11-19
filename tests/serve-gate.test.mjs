@@ -992,6 +992,91 @@ test("Nano history resumes beyond the page cap after a restart and still discove
   assert.equal(registry.callCount(), 0);
 });
 
+test("Nano standby quota saves the next history page and resumes it across restarts", { timeout: 8_000 }, async t => {
+  const chain = fakeChain(), registry = fakeRegistry(), gates = [];
+  const dir = await mkdtemp(join(tmpdir(), "nano-quota-cursor-")), file = join(dir, "gate-state.json");
+  t.after(async () => { for (const gate of gates) await gate.stop(); await rm(dir, { recursive: true }); });
+  const firstAt = 8_000_000;
+  let now = firstAt, latest, mode = "opening";
+  const block = (height, type, terms = {}) => ({ hash: testHash(height), height: String(height), type,
+    confirmed: "true", previous: height === 1 ? "0".repeat(64) : testHash(height - 1), ...terms });
+  const open = block(1, "open", { account: PAYER, amount: "1" });
+  const page = (...history) => ({ account: GATE_ADDR,
+    previous: history.at(-1).height === "1" ? null : history.at(-1).previous, history });
+  const [middle, head] = [block(3, "send"), block(4, "send")];
+  const lookups = [], refused = [], savedPages = new Map();
+  latest = page(open);
+  chain.ops.checkpoint = () => ({ confirmed: { hash: latest.history[0].hash, blockCount: latest.history[0].height } });
+  chain.ops.readPaymentWindow = async ({ existingPayments, historyHead }) => {
+    if (existingPayments) lookups.push(historyHead);
+    const history = historyHead === null ? latest : savedPages.get(historyHead);
+    assert.ok(history, "the combined scan must request the saved continuation");
+    return { receivable: { blocks: chain.state.receivable }, history };
+  };
+  chain.ops.rpc = async (body, _base, options) => {
+    assert.equal(body.action, "account_history");
+    assert.equal(options?.existingPaymentHistory, true);
+    assert.equal(mode, "limited");
+    refused.push(body.head);
+    throw Object.assign(Error("fixture standby window exhausted"), { code: "NANO_RPC_STANDBY_BUDGET" });
+  };
+  const start = () => {
+    const gate = makeGate(chain, { registry, stateFile: file, now: () => now, pollMs: 1_000, verifyPaymentReads: true });
+    gates.push(gate);
+    return gate;
+  };
+  const original = start(), { callTool } = original.wrapRegistry(registry);
+  const quote = async Text => argOf(await callTool({ name: "poster", arguments: { Text } }));
+  const old = await quote("pocketed before failover");
+  const incoming = await quote("receivable during replay");
+  const recent = await quote("pocketed during replay");
+  const initial = await untilState(file, "the first completed history checkpoint", s => s.historyScan?.through === open.hash);
+  await original.stop();
+
+  now += 1_000;
+  latest = page(head);
+  mode = "limited";
+  lookups.length = 0;
+  const firstRecovery = start();
+  const waiting = await untilState(file, "a quota-deferred continuation", s => s.historyScan?.backfill?.quotaDeferred);
+  await firstRecovery.stop();
+  assert.deepEqual(lookups, [null]);
+  assert.equal(refused[0], middle.hash);
+  assert.equal(waiting.historyScan.through, open.hash);
+  assert.equal(waiting.historyScan.coveredAt, initial.historyScan.coveredAt);
+  assert.deepEqual(waiting.historyScan.backfill, { newest: head.hash, next: middle.hash, startedAt: now,
+    fullReceivableWindow: false, quotaDeferred: true });
+
+  const paid = block(2, "receive", { account: PAYER, amount: old.amountRaw });
+  const fresh = block(5, "receive", { account: PAYER, amount: recent.amountRaw });
+  now += 60_000;
+  latest = page(fresh, head);
+  savedPages.set(middle.hash, page(middle));
+  savedPages.set(paid.hash, page(paid, open));
+  const incomingHash = testHash(20);
+  chain.state.receivable[incomingHash] = { source: PAYER, amount: incoming.amountRaw };
+  lookups.length = 0;
+  const secondRecovery = start();
+  const advanced = await untilState(file, "the next saved page after another quota refusal", s => s.historyScan?.backfill?.next === paid.hash);
+  await secondRecovery.stop();
+  assert.deepEqual(lookups, [middle.hash]);
+  assert.equal(refused[1], paid.hash);
+  assert.equal(advanced.historyScan.coveredAt, initial.historyScan.coveredAt);
+  assert.equal(quoteIn(incoming.paymentId)(advanced).payHash, incomingHash);
+  assert.equal(secondRecovery.quote(recent.paymentId).status, "pending");
+
+  now += 60_000;
+  lookups.length = 0;
+  const lastRecovery = start();
+  const completed = await untilState(file, "the resumed batch to reach the old checkpoint", s => s.historyScan?.through === head.hash);
+  assert.equal(completed.historyScan.backfill, null);
+  assert.equal(completed.historyScan.coveredAt, waiting.historyScan.backfill.startedAt);
+  assert.equal(quoteIn(old.paymentId)(completed).payHash, paid.hash);
+  assert.equal(await lastRecovery.waitForPayment(recent.paymentId, 2_500), "paid");
+  assert.deepEqual(lookups.slice(0, 2), [paid.hash, null], "the normal latest scan resumes after the backfill");
+  assert.equal(registry.callCount(), 0);
+});
+
 test("Nano history screens unconfirmed and pre-quote deposits before matching a confirmed receipt", async t => {
   const chain = fakeChain(), registry = fakeRegistry();
   let highest = { blockCount: "7", hash: testHash(7) };

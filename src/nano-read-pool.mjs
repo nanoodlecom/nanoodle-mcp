@@ -289,7 +289,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       throw error;
     }
   }
-  async function readAccount(body, anchor = null, { paymentWindow = null, background = false, fundingReport = false } = {}) {
+  async function readAccount(body, anchor = null, { paymentWindow = null, existingPayments = false, background = false, fundingReport = false } = {}) {
     if (!["account_info", "receivable", "account_history"].includes(body.action)) throw fail("NANO_RPC_READ_ACTION");
     if (body.account !== account) throw fail("NANO_RPC_ACCOUNT_SCOPE");
     const eligible = await networkBases(), errors = [], primaryViews = [];
@@ -312,9 +312,12 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         }
         let history = null;
         if (paymentWindow) {
-          const request = { action: "account_history", account, head: view.confirmedFrontier, count: String(NANO_HISTORY_PAGE), raw: "true" };
+          const head = paymentWindow.historyHead ?? view.confirmedFrontier;
+          const request = { action: "account_history", account, head, count: String(NANO_HISTORY_PAGE), raw: "true" };
           try {
-            history = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, view.confirmedHeight);
+            const height = head === view.confirmedFrontier ? view.confirmedHeight : null;
+            const proved = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, height);
+            if (BigInt(proved.history[0].height) <= view.confirmedHeight) history = proved;
           } catch (error) {
             if (error?.rateLimited === true) paymentWindow.historyRefusals.push({ base, error });
           }
@@ -385,7 +388,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
           readPeers = 0; throw fail("NANO_RPC_STANDBY_DISAGREES");
         }
         return finish([...rows, other]);
-      }, { existingPayments: paymentWindow?.existingPayments, background });
+      }, { existingPayments, background });
       if (confirmed) return confirmed;
     }
     return finish(rows);
@@ -420,11 +423,14 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   return {
     read: (body, anchor) => read(body, anchor),
     readFundingInfo: () => read(infoRequest(), null, { background: true, fundingReport: true }),
-    async readPaymentWindow({ existingPayments = false } = {}) {
+    readPaymentHistory: body => read(body, null, { existingPayments: true }),
+    async readPaymentWindow({ existingPayments = false, historyHead = null } = {}) {
+      if (historyHead !== null && (!existingPayments || !hash(historyHead))) throw fail("NANO_RPC_UNPROVEN_HISTORY");
       const historyRefusals = [];
       try {
         const window = await read({ action: "receivable", account, count: String(NANO_RECEIVABLE_COUNT), threshold: "1",
-          source: "true" }, null, { paymentWindow: { existingPayments, historyRefusals }, background: !existingPayments });
+          source: "true" }, null, { paymentWindow: { historyHead: historyHead?.toUpperCase(), historyRefusals }, existingPayments,
+          background: !existingPayments });
         if (existingPayments && window.history) paymentWindowPriorityUntil = -Infinity;
         return window;
       } finally {

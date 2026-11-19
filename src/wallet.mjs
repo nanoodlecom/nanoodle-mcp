@@ -245,6 +245,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
       if (isPublish) checkpointStore.assertCurrent();
     }
     if (readPool && base === rpcBases) {
+      if (body.action === "account_history" && opts.existingPaymentHistory) return readPool.readPaymentHistory(body);
       if (["account_info", "receivable", "account_history"].includes(body.action)) return readPool.read(body);
       if (body.action === "block_info") return readPool.block(body);
     }

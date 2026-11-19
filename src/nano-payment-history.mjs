@@ -55,12 +55,14 @@ export function readNanoPaymentHistory(value) {
     || (value.coveredAt !== null && !stamp(value.coveredAt))) throw Error("invalid Nano payment history checkpoint");
   const replay = value.backfill;
   if (replay !== null && (!replay || !isNanoHistoryHash(replay.next) || (replay.newest !== null && !isNanoHistoryHash(replay.newest))
-    || !stamp(replay.startedAt) || typeof replay.fullReceivableWindow !== "boolean")) throw Error("invalid Nano history backfill checkpoint");
+    || !stamp(replay.startedAt) || typeof replay.fullReceivableWindow !== "boolean"
+    || (replay.quotaDeferred !== undefined && typeof replay.quotaDeferred !== "boolean"))) throw Error("invalid Nano history backfill checkpoint");
   return {
     through: value.through?.toUpperCase() ?? null,
     coveredAt: value.coveredAt,
     backfill: replay && { newest: replay.newest?.toUpperCase() ?? null, next: replay.next.toUpperCase(),
-      startedAt: replay.startedAt, fullReceivableWindow: replay.fullReceivableWindow },
+      startedAt: replay.startedAt, fullReceivableWindow: replay.fullReceivableWindow,
+      ...(replay.quotaDeferred === true && { quotaDeferred: true }) },
   };
 }
 
