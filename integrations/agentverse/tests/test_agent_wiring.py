@@ -33,6 +33,22 @@ def test_build_agent_constructs_with_chat_protocol():
     assert agent.address.startswith("agent1q")
 
 
+def test_chat_message_shape():
+    from uagents_core.contrib.protocols.chat import EndSessionContent, TextContent
+
+    from nanoodle_agentverse.agent import _chat_message
+
+    msg = _chat_message("hello", end_session=True)
+    # defaults must fill msg_id + timezone-aware timestamp (ASI:One
+    # rejects messages without them)
+    assert msg.msg_id is not None
+    assert msg.timestamp is not None and msg.timestamp.tzinfo is not None
+    assert isinstance(msg.content[0], TextContent)
+    assert isinstance(msg.content[1], EndSessionContent)
+    plain = _chat_message("hi")
+    assert len(plain.content) == 1
+
+
 def test_committed_manifest_matches_installed_spec():
     from uagents_core.contrib.protocols.chat import chat_protocol_spec
 
