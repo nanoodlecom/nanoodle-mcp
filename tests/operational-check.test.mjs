@@ -16,6 +16,7 @@ import { parseNearSecretKey, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { signTransfer } from "../src/near/tx.mjs";
 import { base58Encode } from "../src/near/base58.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundCosts } from "../src/near/funding.mjs";
+import { SETTLED_NEAR_QUOTE_RETENTION_MS } from "../src/near/ledger.mjs";
 
 const NOW = Date.parse("2026-11-17T01:00:00Z"), ID = "00000000-0000-0000-0000-000000000001";
 
@@ -2011,6 +2012,78 @@ test("scheduled readiness separates watcher failure from refund proof, shortfall
     assert.ok(report.checks.some(c => c.stage === "near-payment-watcher" && c.code === "near-watcher-stale"));
     assert.ok(report.checks.some(c => c.stage === "near-refund-funding" && c.code === expected));
     assert.doesNotMatch(JSON.stringify(report), /PRIVATE_UPSTREAM_DETAIL/);
+  }
+});
+
+test("the monitor verifies the completed canary checkout with read-only, redacted requests", async t => {
+  const id = "nq_settledTest1", payer = "private-canary.near";
+  const paymentTx = base58Encode(Buffer.alloc(32, 3)), refundTx = base58Encode(Buffer.alloc(32, 4));
+  const marker = "3afd12ab9de1a228", lostOutput = "The result text was not retained across a server restart; the run is not repeated.";
+  const checkoutPaths = [`/pay/${id}`, `/near/status/${id}`, `/near/watch/${id}`, `/near/result/${id}`];
+  for (const [scenario, code] of [
+    ["complete", null], ["older-marker", null], ["receipt-only", "near-settled-payment-result-invalid"],
+    ["page", "near-settled-payment-page-invalid"],
+    ["status", "near-settled-payment-receipt-invalid"], ["unbalanced", "near-settled-payment-receipt-invalid"],
+    ["stream", "near-settled-payment-stream-invalid"], ["result", "near-settled-payment-result-invalid"],
+    ["different-graph", "near-settled-payment-stream-invalid"], ["missing-graph", "near-settled-payment-workflow-missing"],
+    ["pruned", null], ["missing", "near-checkout-canary-record-invalid"],
+  ]) {
+    const charged = scenario === "unbalanced" ? "21" : "20";
+    const receipt = { rail: "near", network: "mainnet", paymentId: id, outcome: "succeeded",
+      deposit: { txHash: paymentTx, yocto: "100" }, charged: { yocto: charged },
+      refund: { status: "sent", txHash: refundTx, yocto: "80", to: payer } };
+    const workflow = { v: 1, status: "succeeded", nodes: [{ id: "extract", status: "done" }], links: [] };
+    const view = { paymentId: id, status: "settled", done: true, receipt,
+      ...(scenario !== "missing-graph" && { workflow }) };
+    const f = fixture(({ url, init, body }) => {
+      if (url.hostname.startsWith("near-") && body?.method === "tx") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32000, cause: { name: "UNKNOWN_TRANSACTION" } } });
+      }
+      if (!checkoutPaths.includes(url.pathname)) return null;
+      assert.equal(init.method || "GET", "GET");
+      assert.equal(body, null);
+      if (url.pathname.startsWith("/pay/")) return new Response(scenario === "page"
+        ? "<h1>Wrong page</h1>" : '<div id="near-payment"><div id="pay-result"></div></div>',
+      { headers: { "content-type": "text/html" } });
+      if (url.pathname.startsWith("/near/status/")) return Response.json(scenario === "status" ? { ...view, receipt: null } : view);
+      if (url.pathname.startsWith("/near/watch/")) {
+        assert.equal(url.search, "?run=1");
+        const frame = scenario === "stream" ? { ...view, done: false } : view;
+        const streamView = scenario === "different-graph" ? { ...frame, workflow: { ...workflow, links: [1] } } : frame;
+        return new Response(`event: status\ndata: ${JSON.stringify(streamView)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+      }
+      const text = scenario === "receipt-only" ? lostOutput : scenario === "older-marker" ? `NANOODLE_OK:${marker}` : marker;
+      return Response.json(scenario === "result" ? { status: "settled" } : {
+        content: [{ type: "text", text }, { type: "text", text: "PRIVATE_RECEIPT_TEXT" }], structuredContent: { receipt },
+      }, { status: scenario === "result" ? 202 : 200 });
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.canaryPayer = { accountId: payer, maxNear: "0.01", publicKey: "ed25519:private-canary-key" };
+    f.config.nearDiscoveryReport = "/discovery/latest.json";
+    f.states[f.config.nearDiscoveryReport] = { v: 1, paymentTx, checkedAt: new Date(NOW - 60_000).toISOString() };
+    const ledger = f.states[join(f.config.outDir, "near-state.json")];
+    const finishedAt = NOW - (scenario === "pruned" ? SETTLED_NEAR_QUOTE_RETENTION_MS + 1 : 120_000);
+    const quote = { id, payTx: paymentTx, payer, status: "settled", outcome: "succeeded", paidYocto: "100", finishedAt,
+      refundId: id, settlement: { chargedYocto: charged, refundYocto: "80" } };
+    ledger.consumedTx = { [paymentTx]: id };
+    ledger.quotes = ["missing", "pruned"].includes(scenario) ? {} : { [id]: quote };
+    ledger.refunds = { [id]: { id, paymentId: id, amountYocto: "80", reason: "change", to: payer,
+      status: "sent", txHash: refundTx, sentAt: finishedAt } };
+    const report = await runOperationalCheck(f.config, f.deps);
+    const proof = report.checks.find(({ stage }) => stage === "near-settled-checkout-proof");
+    const row = report.checks.find(({ stage }) => stage === "near-settled-checkout");
+    assert.equal(proof?.ok, scenario !== "missing", scenario);
+    if (scenario === "missing") assert.equal(proof.code, code);
+    if (["pruned", "missing"].includes(scenario)) assert.equal(row, undefined);
+    else {
+      assert.equal(row?.code ?? null, code, scenario);
+      assert.equal(row?.ok, code === null, scenario);
+      assert.deepEqual(row?.domains, code ? [] : undefined, scenario);
+    }
+    const requests = f.calls.filter(({ url }) => checkoutPaths.includes(url.pathname));
+    assert.deepEqual(requests.map(({ url }) => url.pathname), ["pruned", "missing"].includes(scenario) ? [] : checkoutPaths);
+    const reportText = JSON.stringify(report);
+    for (const value of [id, payer, paymentTx, refundTx, marker, lostOutput, "PRIVATE_RECEIPT_TEXT"]) assert.ok(!reportText.includes(value));
   }
 });
 
