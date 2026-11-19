@@ -129,6 +129,82 @@ def test_paid_flow_link_then_resume():
     assert state["paid"]
 
 
+def test_free_preview_executes_directly_on_funded_endpoint():
+    service = make_service(
+        dispatch(lambda payload: ok_result("preview image https://h.example/out/p.png")),
+        free_workflows=("character-sprites",),
+    )
+    replies = run(
+        service.handle_text(sender=SENDER, msg_id="f1", text="run character-sprites: a")
+    )
+    assert "preview image" in replies[0]
+    assert "Pay here" not in replies[0]
+
+
+def test_free_preview_on_hosted_endpoint_still_returns_payment_link_with_note():
+    def result_handler(payload):
+        return ok_result(
+            'PAYMENT REQUIRED — link: https://mcp.nanoodle.com/pay/p77777 '
+            '"_payment_id": "p77777"',
+            structuredContent={
+                "paymentId": "p77777",
+                "payUrl": "https://mcp.nanoodle.com/pay/p77777",
+                "watchUrl": "https://mcp.nanoodle.com/x402/watch/p77777",
+            },
+        )
+
+    service = make_service(
+        dispatch(result_handler), free_workflows=("character-sprites",)
+    )
+    replies = run(
+        service.handle_text(sender=SENDER, msg_id="f2", text="run character-sprites: a")
+    )
+    assert "https://mcp.nanoodle.com/pay/p77777" in replies[0]
+    assert "free preview" in replies[0]
+    assert "pay-per-call" in replies[0]
+
+
+def test_resume_when_payment_not_settled_keeps_pending():
+    calls = {"n": 0}
+
+    def result_handler(payload):
+        calls["n"] += 1
+        return ok_result(
+            'PAYMENT REQUIRED — link: https://mcp.nanoodle.com/pay/p31337 '
+            '"_payment_id": "p31337"',
+            structuredContent={
+                "paymentId": "p31337",
+                "payUrl": "https://mcp.nanoodle.com/pay/p31337",
+                "watchUrl": "https://mcp.nanoodle.com/x402/watch/p31337",
+            },
+        )
+
+    service = make_service(dispatch(result_handler))
+    run(service.handle_text(sender=SENDER, msg_id="u1", text="run character-sprites: a"))
+    replies = run(service.handle_text(sender=SENDER, msg_id="u2", text="paid p31337"))
+    assert "has not settled yet" in replies[0]
+    # pending kept: a second `paid` attempt reaches the endpoint again
+    replies = run(service.handle_text(sender=SENDER, msg_id="u3", text="paid p31337"))
+    assert "has not settled yet" in replies[0]
+    assert calls["n"] == 3
+
+
+def test_pending_payment_expires():
+    import time as time_module
+
+    from nanoodle_agentverse.service import PENDING_PAYMENT_TTL_S, _PendingPayment
+    from nanoodle_agentverse.parsing import RunRequest
+
+    service = make_service(tools_handler)
+    service._pending_payments[SENDER] = _PendingPayment(
+        request=RunRequest(tool="character-sprites"),
+        created_at=time_module.monotonic() - PENDING_PAYMENT_TTL_S - 1,
+    )
+    replies = run(service.handle_text(sender=SENDER, msg_id="x1", text="paid p12345"))
+    assert "expired" in replies[0]
+    assert SENDER not in service._pending_payments
+
+
 def test_paid_without_pending_run():
     service = make_service(tools_handler)
     replies = run(service.handle_text(sender=SENDER, msg_id="p9", text="paid p12345"))
