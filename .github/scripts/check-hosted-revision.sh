@@ -30,3 +30,8 @@ for origin in https://mcp.nanoodle.com https://near.nanoodle.com; do
     exit 1
   fi
 done
+
+curl -q --proto '=https' --connect-timeout 4 --max-time 15 --max-filesize 1048576 --fail \
+  --silent --show-error -H 'Cache-Control: no-cache' https://mcp.nanoodle.com/rates/nano |
+  jq -es '(length == 1) and (.[0] | .usable == true and (.xnoUsd | type == "number" and . > 0))' >/dev/null
+printf 'Verified a usable XNO/USD rate from the live Nano checkout\n'

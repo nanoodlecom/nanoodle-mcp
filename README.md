@@ -505,14 +505,13 @@ flat ceiling. Size the ceiling generously; over-covering costs callers
 nothing since the difference comes back as change, while an under-sized
 deposit means runs can cost more than was collected and *you* eat the
 difference (the gate warns at startup when a graph's deposit is below its
-last observed cost + 20%). The XNO conversion comes from **NanoGPT itself**:
-the gate fires a keyless `x-x402` probe and keeps the invoice's exact
-raw-XNO/USD pair — the same rate your downstream payments settle at, so
-quotes and costs can never drift apart on FX, and no market-data service is
-involved (probe invoices are never paid; they just expire). Cached 60s, stale
-cache rides out probe outages, and `--xno-usd` forces a static rate if you
-ever need one. Per-graph overrides are a hand-added top-level block in the
-graph JSON:
+last observed cost + 20%). The gate prefers the exact raw-XNO/USD pair from
+an unpaid NanoGPT invoice. It refreshes the rate after 60 seconds and can
+keep using that observation for up to five minutes during an outage.
+CoinGecko and Kraken provide timestamped XNO/USD fallbacks within the same
+freshness limit. `GET /rates/nano` checks the rate the Nano checkout would
+use. `--xno-usd` pins an operator-configured rate. Set per-graph overrides in
+the top-level block shown below.
 
 ```json
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
@@ -1153,7 +1152,7 @@ should send from its key.
 | `--near-rpc <url[,url]>` | `NEAR_RPC_URL` | fastnear's public RPC, then near.org's | RPC endpoint(s) you trust to report finality, tried in order with failover. The shared watcher detects exact transfers through finalized account changes and receipt-to-transaction lookup; no node or indexer is needed. |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key: `ed25519:…` in the env, or a JSON key file with `account_id`, `public_key` and `private_key` (legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes). near-cli-rs key files have no `account_id`; use `NEAR_PRIVATE_KEY` for those. Never accepted on argv, never logged. |
 | `--near-usd <n>` | `NEAR_USD` (env or `--env-file`) | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
-| `--xno-usd <n>` | | live (NanoGPT x402 invoices, else CoinGecko) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet; informational with an API key. |
+| `--xno-usd <n>` | | live (NanoGPT x402 invoices, then CoinGecko or Kraken) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet. Informational with an API key. |
 | `--near-swap-spread-bps <n>` | `NEAR_SWAP_SPREAD_BPS` (env or `--env-file`) | `0` | Swap margin, 0–2000 basis points: NEAR amounts are computed at a NEAR/USD rate that much worse for the caller, to cover swapping NEAR to XNO. |
 | `--near-quote-ttl-min <n>` | `NEAR_QUOTE_TTL_MIN` | `30` | Quote lifetime, 1–120 minutes; the quote's rates stay locked for all of it. |
 | `--near-rates-refresh-s <n>` | `NEAR_RATES_REFRESH_S` | `60` | Background refresh of live rates; `0` turns the timer off. |

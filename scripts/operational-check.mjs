@@ -879,6 +879,14 @@ export async function runOperationalCheck(config, deps = {}) {
     verifyRate("xnoUsd");
     return rateView;
   });
+  await check("nano-checkout-rate", async () => {
+    const checkout = await http(config.nanoSite + "/rates/nano");
+    need(checkout.usable === true && parseUsdNano(checkout.xnoUsd) > 0n, "nano-checkout-rate-unavailable");
+    if (checkout.source !== "static") {
+      const age = now() - Date.parse(checkout.observedAt);
+      need(age >= -30_000 && age < LIVE_RATE_MAX_AGE_MS, "nano-checkout-rate-stale");
+    }
+  }, ["nano"]);
   if (rateView) await check("exchange-rate-near", () => {
     verifyRate("nearUsd");
     // The aggregate quoting flag can also be down because XNO is unavailable.
