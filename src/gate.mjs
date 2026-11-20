@@ -28,6 +28,7 @@
  * payment (observed live 2026-07-22).
  */
 import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
+import { fetchCoinGeckoRates, fetchKrakenNanoRate, marketRateFresh, LIVE_RATE_MAX_AGE_MS, RAW_PER_XNO } from "./market-rates.mjs";
 import { randomBytes, randomInt, createHash } from "node:crypto";
 import { readFileSync, constants } from "node:fs";
 import { open, rename, mkdir } from "node:fs/promises";
@@ -49,7 +50,7 @@ import { NANO_STANDBY_BUDGET_MS } from "./nano-read-pool.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 
 const QUOTE_TTL_MS = 15 * 60 * 1000;
-export const LIVE_RATE_MAX_AGE_MS = 300_000;
+export { LIVE_RATE_MAX_AGE_MS };
 const QUOTE_READ_PROOF_TTL_MS = 30_000;
 const QUOTE_READ_RETRY_MS = 5_000;
 const QUOTE_READ_UNAVAILABLE = "Nano payment detection is temporarily unavailable. Try again shortly. Nothing was quoted or charged.";
@@ -139,15 +140,19 @@ export async function probeX402Pair({ fetch, url, signal }) {
     ...(Array.isArray(body && body.accepts) ? body.accepts : []),
     ...(Array.isArray(pay && pay.accepted) ? pay.accepted : []),
   ];
-  const nano = pool.find((a) => a && a.scheme === "nano");
-  const rawStr = String((nano && (nano.maxAmountRequired || nano.amount)) || "");
-  const usdVal = nano && (nano.maxAmountRequiredUSD ?? nano.amountUsd ?? (pay && pay.amountUsd));
-  if (!/^\d+$/.test(rawStr) || BigInt(rawStr) <= 0n || usdVal == null) {
-    throw new Error("402 carried no usable XNO/USD pair");
+  for (const item of pool) {
+    if (item?.scheme !== "nano" &&
+        !(["exact", "nano-exact"].includes(item?.scheme) && item.network === "nano:mainnet" && item.asset === "XNO")) continue;
+    const raw = item.maxAmountRequired ?? item.amount;
+    const usd = item.maxAmountRequiredUSD ?? item.amountUsd ?? pay?.amountUsd;
+    // Require the rail's own raw amount and a bounded decimal USD value.
+    if ((typeof raw !== "string" && !Number.isSafeInteger(raw)) || !/^\d{1,39}$/.test(raw)) continue;
+    if ((typeof usd !== "string" && typeof usd !== "number") ||
+        !/^\d{1,12}(?:\.\d{1,30})?(?:e[+-]?\d{1,2})?$/i.test(usd)) continue;
+    const usdNano = parseUsdNano(usd);
+    if (usdNano > 0n && BigInt(raw) > 0n) return { usdNano, raw: BigInt(raw) };
   }
-  const usdNano = parseUsdNano(usdVal);
-  if (usdNano <= 0n) throw new Error("402 USD amount parsed to zero");
-  return { usdNano, raw: BigInt(rawStr) };
+  throw new Error("402 carried no usable XNO/USD pair");
 }
 
 /**
@@ -266,36 +271,64 @@ export function createChargeGate({
   // The rate oracle is NanoGPT itself: any keyless request with `x-x402: true`
   // answers 402 with the SAME invoice pair (raw XNO amount + USD value) they
   // settle our downstream payments at — so we quote callers at the rate we pay,
-  // not a market feed's. The probe invoice is never paid; it expires on their
-  // side. Successful probes are reused for 60 seconds.
+  // and prefer that rate. The probe invoice is never paid. Keep a recent
+  // provider rate through brief outages, then try independent market data.
   const oracleUrl = x402ProbeUrl(oracleBase);
   const nanoGptPair = () => probeX402Pair({ fetch, url: oracleUrl, signal: AbortSignal.timeout(8_000) });
 
   let rate = Number.isFinite(xnoUsd) && xnoUsd > 0
-    ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: 10n ** 30n }, at: Infinity, source: "static" }
+    ? { pair: { usdNano: parseUsdNano(xnoUsd), raw: RAW_PER_XNO }, at: Infinity, source: "static" }
     : null;
-  let rateProbe = null; // in-flight oracle probe — concurrent cold quoters share one request
+  let rateProbe = null;
+  let rateFailure = null;
   function rateYoungerThan(limit) {
     if (!rate) return false;
     if (rate.at === Infinity) return true;
     const age = monotonicNow() - rate.at;
-    return age >= 0 && age < limit;
+    return age >= 0 && age < limit && marketRateFresh(rate.observedAt, now());
+  }
+  async function refreshRate() {
+    try {
+      const pair = await nanoGptPair();
+      rate = { pair, at: monotonicNow(), observedAt: now(), source: "nanogpt-x402" };
+      return pair;
+    } catch {
+      if (rate?.source === "nanogpt-x402" && rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
+        rate.at = monotonicNow();
+        log("NanoGPT XNO/USD probe failed. Using the recent NanoGPT rate.");
+        return rate.pair;
+      }
+    }
+
+    const signals = await Promise.allSettled([
+      fetchCoinGeckoRates(fetch).then(prices => prices.nano),
+      fetchKrakenNanoRate(fetch),
+    ]);
+    const fallback = signals.map(result => result.status === "fulfilled" ? result.value : null)
+      .find(value => value && marketRateFresh(value.observedAt, now()));
+    if (fallback) {
+      const pair = { usdNano: fallback.usdNano, raw: RAW_PER_XNO };
+      if (rate?.source !== fallback.source) log(`NanoGPT XNO/USD probe failed. Using ${fallback.source}.`);
+      rate = { pair, at: monotonicNow(), observedAt: fallback.observedAt, source: fallback.source };
+      return pair;
+    }
+    if (rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
+      rate.at = monotonicNow();
+      return rate.pair;
+    }
+    throw new Error("Cannot price this call: the NanoGPT x402 rate probe failed and no fresh CoinGecko or Kraken XNO/USD rate was available. Try again shortly.");
   }
   async function ratePair() {
     if (rateYoungerThan(60_000)) return rate.pair;
-    try {
-      if (!rateProbe) rateProbe = nanoGptPair().finally(() => { rateProbe = null; });
-      const pair = await rateProbe;
-      rate = { pair, at: monotonicNow(), source: "nanogpt-x402" };
+    if (rateFailure && monotonicNow() - rateFailure.at < 5_000) throw rateFailure.error;
+    rateProbe ??= refreshRate().then(pair => {
+      rateFailure = null;
       return pair;
-    } catch (e) {
-      if (rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
-        log(`NanoGPT rate oracle failed (${e.message}) — using stale cached pair`);
-        return rate.pair;
-      }
-      throw new Error("cannot price this call: the NanoGPT x402 rate probe failed " +
-        `(${e.message}) and there is no current cached rate or --xno-usd override`);
-    }
+    }, error => {
+      rateFailure = { error, at: monotonicNow() };
+      throw error;
+    }).finally(() => { rateProbe = null; });
+    return rateProbe;
   }
   const rateSource = () => (rate ? rate.source : null);
   /** Display-only float view of the pair — never used for money. */
@@ -1261,6 +1294,15 @@ export function createChargeGate({
   const gate = {
     address,
     fundingPair: ratePair,
+    async rateView() {
+      try {
+        const pair = await ratePair();
+        return { usable: true, source: rateSource(), xnoUsd: rateDisplay(pair),
+          observedAt: rate.observedAt == null ? null : new Date(rate.observedAt).toISOString() };
+      } catch {
+        return { usable: false, code: "xno-rate-unavailable" };
+      }
+    },
     persistenceStatus: () => ({ enabled: !!stateFile, ok: !persistenceFailed, pendingWrites }),
     fundingLiabilitiesRaw: () => nanoFundingLiabilities({ quotes: [...quotes.values()], owed }),
     nanoTransferClaims: () => gateNanoTransferClaims({ quotes: quotes.values(), owed }),

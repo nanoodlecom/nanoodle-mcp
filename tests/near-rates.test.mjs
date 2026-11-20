@@ -105,8 +105,8 @@ test("live: CoinGecko NEAR/USD and the NanoGPT x402 pair for XNO/USD (preferred 
 });
 
 test("probe fails: XNO/USD falls back to CoinGecko nano; with a static NEAR/USD CoinGecko is asked only then", async () => {
-  const live = net({ probe: [new Error("down")] });
-  const a = await createNearRates({ fetch: live.fetch, ...noTimer }).current();
+  const live = net({ cg: [{ text: CG }], probe: [new Error("down")] });
+  const a = await createNearRates({ fetch: live.fetch, now: () => CG_NOW, ...noTimer }).current();
   assert.equal(a.xnoUsd, "0.8");
   assert.equal(a.xnoSource, "coingecko");
   assert.equal(a.xnoPerNear, "4.55");
@@ -118,12 +118,23 @@ test("probe fails: XNO/USD falls back to CoinGecko nano; with a static NEAR/USD 
   const b = await rb.current();
   assert.equal(b.xnoSource, "nanogpt-x402");
   assert.equal(pinned.calls.cg, 0, "probe worked: no CoinGecko call");
-  const fallback = net({ probe: [{ status: 200, json: {} }] });
-  const rc = createNearRates({ nearUsd: "3.64", fetch: fallback.fetch, ...noTimer });
+  const fallback = net({ cg: [{ text: CG }], probe: [{ status: 200, json: {} }] });
+  const rc = createNearRates({ nearUsd: "3.64", fetch: fallback.fetch, now: () => CG_NOW, ...noTimer });
   await rc.refresh();
   const c = await rc.current();
   assert.equal(c.xnoSource, "coingecko");
   assert.equal(fallback.calls.cg, 1);
+});
+
+test("NEAR and USDC wallet quotes can use a fresh Kraken XNO trade", async () => {
+  const { fetch } = net({ probe: [new Error("down")] });
+  const rates = createNearRates({ now: () => CG_NOW, xnoRequired: true, ...noTimer,
+    fetch: (url, init) => new URL(url).hostname === "api.kraken.com"
+      ? Response.json({ error: [], result: { NANOUSD: [["0.5", "10", CG_NOW / 1000 - 5]] } })
+      : fetch(url, init),
+  });
+  assert.equal((await rates.current()).xnoSource, "kraken");
+  assert.equal((await rates.currentUsdc()).xnoUsd, "0.5");
 });
 
 test("TTL: one fetch within the TTL, a lazy refresh at it; concurrent quotes share one refresh", async () => {

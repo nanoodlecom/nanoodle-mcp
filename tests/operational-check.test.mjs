@@ -154,6 +154,7 @@ function fixture(override = () => null) {
       }
       if (url.hostname === "site.example" || url.hostname === "nano-site.example") {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
+        if (url.pathname === "/rates/nano") return json({ usable: true, source: "nanogpt-x402", xnoUsd: 1, observedAt: new Date(NOW).toISOString() });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
           funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
         const near = url.hostname === "site.example";
@@ -2156,6 +2157,16 @@ test("a stale NEAR spot price leaves the fresh XNO capital checks and other lane
     assert.deepEqual(report.admission, { nano: stale === "near", near: false, usdc: stale === "near", market: stale === "near" });
     assert.equal(report.checks.some(c => c.stage === "nano-liquidity" && c.ok), stale === "near");
   }
+});
+
+test("the Nano checkout probe catches an outage even when the shared rate display works", async t => {
+  const f = fixture(({ url }) => url.pathname === "/rates/nano"
+    ? Response.json({ usable: false, code: "xno-rate-unavailable" }, { status: 503 }) : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.ok(report.checks.some(c => c.stage === "exchange-rate-xno" && c.ok));
+  assert.ok(report.checks.some(c => c.stage === "nano-checkout-rate" && !c.ok && c.code === "http-503"));
+  assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
 });
 
 test("a readable endpoint on the wrong Nano network cannot satisfy operational readiness", async () => {
