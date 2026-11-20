@@ -184,10 +184,19 @@ export function createCustomMcp({ store, key, listTools, callTool,
     const builtins = new Set(current.builtins);
     const catalogNow = catalog();
     const selected = catalogNow.filter(t => builtins.has(t.name)).map(tool => ({ tool }));
-    const reserved = new Set([...RESERVED, ...selected.map(({ tool }) => tool.name.toLowerCase())]);
+    // A saved workflow never shadows a tool this host offers now (selected or
+    // not), a reserved name, or an earlier workflow in the same profile —
+    // stale state bypasses update()'s name checks, so enforce them here too.
+    const reserved = new Set([...RESERVED, ...catalogNow.map(t => t.name.toLowerCase()),
+      ...selected.map(({ tool }) => tool.name.toLowerCase())]);
     for (const workflow of current.workflows) {
       if (reserved.has(workflow.name.toLowerCase())) continue;
-      const shape = describeGraph(workflow.graph);
+      reserved.add(workflow.name.toLowerCase());
+      // A stale graph the current library can no longer describe is
+      // unavailable like a stale built-in; it must not brick the profile.
+      let shape;
+      try { shape = describeGraph(workflow.graph); }
+      catch { continue; }
       const payments = nearTools?.listTools().find(t => t.name === "run_noodle")?.inputSchema.properties;
       const rails = [...(nanoWorkflow ? ["nano"] : []), ...(nearTools?.assets ?? [])];
       const properties = { ...shape.schema.properties, _payment_id: { type: "string" },

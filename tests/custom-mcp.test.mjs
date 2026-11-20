@@ -307,3 +307,122 @@ test("stale built-ins and retired subnano_comment aliases are refused before quo
   }
   assert.equal(provider.runs(), 0);
 });
+
+test("stale workflows cannot squat tool names, duplicate each other, or brick the profile", { timeout: 35_000 }, async t => {
+  const { nanoBase, nearBase, out } = await dualHost(t);
+  const key = owner(), token = client();
+  const installed = [];
+  for (const base of [nanoBase, nearBase]) {
+    const profile = (await manage(base, "profile", config, { key })).data.profile;
+    const connection = await manage(base, "connection", { revision: profile.revision, token }, { key });
+    assert.equal(connection.status, 200);
+    installed.push({ base, profile: connection.data.profile });
+  }
+
+  // Reopen a real profile with stale workflow entries update() would never
+  // accept today: one squatting an unselected built-in's name, a duplicate
+  // pair differing only by case, and one whose inputs the current library
+  // can no longer describe (an upload input is not Text or Choice).
+  const file = join(out, "custom-mcp-profiles", installed[0].profile.id + ".json");
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  const poison = { name: "poison", description: "", graph: { nodes: [
+    { id: "p1", type: "upload", fields: {} },
+    { id: "p2", type: "llm", fields: { model: "z-ai/glm-5.3-flash", system: "x" } },
+  ], links: [{ id: "pl1", from: { node: "p1", port: "image" }, to: { node: "p2", port: "prompt" } }] } };
+  for (const { base } of installed) {
+    const host = saved.hosts[base];
+    host.workflows = [poison, ...host.workflows,
+      { ...workflow, name: "other" }, { ...workflow, name: "dup" }, { ...workflow, name: "DUP" }];
+  }
+  await writeFile(file, JSON.stringify(saved));
+
+  for (const { base, profile } of installed) {
+    const url = base + profile.endpoint;
+    assert.deepEqual(names(await rpc(url, "tools/list", {}, { token })), ["poster", "my-poster", "dup"]);
+    for (const hidden of ["other", "DUP", "poison"]) {
+      assert.deepEqual((await call(url, hidden, input, { token })).data.error,
+        { code: -32602, message: "This tool is unavailable in your Custom MCP profile." });
+    }
+    // The poisoned entry must not brick token rotation for the whole profile.
+    const current = (await manage(base, "profile", undefined, { key })).data.profile;
+    const rotated = client();
+    assert.equal((await manage(base, "connection", { revision: current.revision, token: rotated }, { key })).status, 200);
+    assert.deepEqual(names(await rpc(url, "tools/list", {}, { token: rotated })), ["poster", "my-poster", "dup"]);
+    assert.equal((await rpc(url, "tools/list", {}, { token })).status, 401);
+  }
+});
+
+test("payments stay bound to their profile across hosts, revocation, rotation and concurrent resumes", { timeout: 60_000 }, async t => {
+  const { nanoBase, nearBase, provider, near } = await dualHost(t);
+  const keyA = owner(), tokenA = client(), keyB = owner(), tokenB = client();
+  const setup = async (base, key, token) => {
+    const created = await manage(base, "profile", config, { key });
+    assert.equal(created.status, 200, JSON.stringify(created.data));
+    const connected = await manage(base, "connection", { revision: created.data.profile.revision, token }, { key });
+    assert.equal(connected.status, 200, JSON.stringify(connected.data));
+    return connected.data.profile;
+  };
+  const nanoA = await setup(nanoBase, keyA, tokenA), nanoB = await setup(nanoBase, keyB, tokenB);
+  const nearA = await setup(nearBase, keyA, tokenA), nearB = await setup(nearBase, keyB, tokenB);
+  const urlNanoA = nanoBase + nanoA.endpoint, urlNanoB = nanoBase + nanoB.endpoint;
+  const urlNearA = nearBase + nearA.endpoint, urlNearB = nearBase + nearB.endpoint;
+
+  // Nano rail: the checkout surface carries no private profile material, and
+  // another profile cannot resume this profile's quote.
+  const nanoQuote = await call(urlNanoA, "my-poster", input, { token: tokenA });
+  const nanoPaymentId = nanoQuote.data.result.structuredContent.x402.paymentId;
+  assert.match(nanoPaymentId, /^pay_/);
+  const payPage = await (await fetch(nanoBase + "/pay/" + nanoPaymentId)).text();
+  const status = await (await fetch(nanoBase + "/x402/status/" + nanoPaymentId)).text();
+  for (const leak of ["my-poster", "Make a poster privately", "lighthouse", "Write one vivid"]) {
+    assert.ok(!payPage.includes(leak), "Nano pay page leaks " + leak);
+    assert.ok(!status.includes(leak), "Nano status leaks " + leak);
+  }
+  const crossNano = await call(urlNanoB, "my-poster", { ...input, _payment_id: nanoPaymentId }, { token: tokenB });
+  assert.match(crossNano.data.result.content[0].text, /different call/);
+  assert.equal(provider.runs(), 0);
+
+  // An open Nano quote blocks removing tools or deleting the profile on its
+  // own host, while an additive save still goes through.
+  const openProfile = (await manage(nanoBase, "profile", undefined, { key: keyA })).data.profile;
+  assert.equal((await manage(nanoBase, "profile", { revision: openProfile.revision, builtins: [], workflows: [] }, { key: keyA })).status, 409);
+  assert.equal((await manage(nanoBase, "delete", { revision: openProfile.revision }, { key: keyA })).status, 409);
+  assert.equal((await manage(nanoBase, "profile", { revision: openProfile.revision, builtins: ["poster", "other"], workflows: [workflow] }, { key: keyA })).status, 200);
+
+  // NEAR rail: a paid quote cannot be consumed by another profile; revoking
+  // the client token blocks resume, and a replacement token on the same
+  // profile resumes it exactly once.
+  const nearQuote = await call(urlNearA, "my-poster", { ...input, _pay_with: "near" }, { token: tokenA });
+  const payment = nearQuote.data.result.structuredContent.payment;
+  const tx = near.transfer("payer.testnet", "merchant.testnet", BigInt(payment.amountYocto));
+  const paidArgs = { ...input, _payment_id: payment.paymentId, _payment_tx: tx, _payment_sender: "payer.testnet" };
+  const crossNear = await call(urlNearB, "my-poster", paidArgs, { token: tokenB });
+  assert.match(crossNear.data.result.content[0].text, /different call/);
+  assert.equal(provider.runs(), 0);
+  const beforeRevoke = (await manage(nearBase, "profile", undefined, { key: keyA })).data.profile;
+  assert.equal((await manage(nearBase, "connection", { revision: beforeRevoke.revision, token: null }, { key: keyA })).status, 200);
+  assert.equal((await call(urlNearA, "my-poster", paidArgs, { token: tokenA })).status, 401);
+  assert.equal(provider.runs(), 0);
+  const beforeRotate = (await manage(nearBase, "profile", undefined, { key: keyA })).data.profile;
+  const tokenA2 = client();
+  assert.equal((await manage(nearBase, "connection", { revision: beforeRotate.revision, token: tokenA2 }, { key: keyA })).status, 200);
+  const completed = await call(urlNearA, "my-poster", paidArgs, { token: tokenA2 });
+  assert.equal(completed.data.result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(provider.runs(), 1);
+  const replay = await call(urlNearA, "my-poster", paidArgs, { token: tokenA2 });
+  assert.equal(replay.data.result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(provider.runs(), 1);
+
+  // Two concurrent resumes of a second paid quote run the workflow once.
+  const secondQuote = await call(urlNearA, "my-poster", { ...input, _pay_with: "near" }, { token: tokenA2 });
+  const secondPayment = secondQuote.data.result.structuredContent.payment;
+  const secondTx = near.transfer("payer.testnet", "merchant.testnet", BigInt(secondPayment.amountYocto));
+  const secondArgs = { ...input, _payment_id: secondPayment.paymentId, _payment_tx: secondTx, _payment_sender: "payer.testnet" };
+  const [first, second] = await Promise.all([
+    call(urlNearA, "my-poster", secondArgs, { token: tokenA2 }),
+    call(urlNearA, "my-poster", secondArgs, { token: tokenA2 }),
+  ]);
+  assert.equal(first.data.result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(second.data.result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(provider.runs(), 2);
+});
