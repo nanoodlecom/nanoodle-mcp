@@ -6,7 +6,7 @@
       "type": "comment",
       "name": "humanize-comment",
       "fields": {
-        "text": "Draft + Context + Guidance \u2192 5 writers (Qwen3.8 Novelist/friend, DeepSeek V4.1 Flash/forum, Gemma-4-12B Starry Ocean/peer (was Cydonia-24B v4.3 until its 2026-11-18 delisting; Starry Ocean was the mcp fallback), Qwen3.8 antislop/plain, Clover 2/quick), each with a different voice prompt \u2192 GLM-5.3 decider (also sees the Guidance) checks faithfulness (who said/did what, no new facts) per rewrite, ranks them, and picks the most human faithful one, or ORIGINAL. v2.8: optional keep (verbatim spans, put back exactly; a repaired span is checked again by the decider), ending (question, keep_last, or any), maxChars, optional title (paragraph-length rewrites are dropped only when title is true), Guidance at most 600 characters with a leading one-thread prefix not counted, and writer replies that echo the guidance are dropped. Output: one JSON object {winner, text (the winning rewrite), why, ranked:[{writer,faithful,disqualified,reason}]}, ranked always has all 5 writers (mcp.nanoodle.com adds each writer's model and exact text)."
+        "text": "Draft + Context + Guidance \u2192 5 writers (Qwen3.8 Novelist/friend, DeepSeek V4.1 Flash/forum, Gemma-4-12B Starry Ocean/peer (was Cydonia-24B v4.3 until its 2026-11-18 delisting; Starry Ocean was the mcp fallback), Qwen3.8 antislop/plain, Hy4 Flash/quick), each with a different voice prompt \u2192 GLM-5.3 decider (also sees the Guidance) checks faithfulness (who said/did what, no new facts) per rewrite, ranks them, and picks the most human faithful one, or ORIGINAL. v2.8: optional keep (verbatim spans, put back exactly; a repaired span is checked again by the decider), ending (question, keep_last, or any), maxChars, optional title (paragraph-length rewrites are dropped only when title is true), Guidance at most 600 characters with a leading one-thread prefix not counted, and writer replies that echo the guidance are dropped. Output: one JSON object {winner, text (the winning rewrite), why, ranked:[{writer,faithful,disqualified,reason}]}, ranked always has all 5 writers (mcp.nanoodle.com adds each writer's model and exact text)."
       }
     },
     {
@@ -108,9 +108,9 @@
     {
       "id": "w-e",
       "type": "llm",
-      "name": "Writer E (Clover 2, voice: quick)",
+      "name": "Writer E (Hy4 Flash, voice: quick)",
       "fields": {
-        "model": "kitani/clover-2",
+        "model": "tencent/hy4-flash",
         "reasoningEffort": "none",
         "maxTokens": "600",
         "system": "You rewrite comments for \"Nano Maxi\", an openly AI agent account on Subnano (a pay-per-post blogging site where humans and AI agents publish and pay each other in Nano/XNO). Nano Maxi is part of Nanoodle (nanoodle.com) and is a friendly Nano fan.\n\nRewrite the draft from scratch the way a real regular would type it. Don't keep the draft's sentence structure or its order. 1-4 sentences, shorter than the draft. Drop minor details rather than cram them in.\n\nStructure is free: you do NOT have to open with a welcome or a compliment, and you do NOT have to end with a question. Avoid the template \"compliment, then my experience, then question\". A plain point, an answer, or one specific reaction is often better. Keep a question only if it's the point of the draft (if the draft's main purpose is to ask something, keep that question). Friendliness comes from tone and from engaging with the specifics, not from praise words.\n\nFaithfulness (most important):\n- Keep every fact, number, name and link exactly, including qualifiers (\"one or two\", \"about\"). Never overstate. Add no facts, numbers, claims, @mentions or links that aren't in the draft or context.\n- Keep who did and said what. Never move a quote, joke, action or opinion to a different person (e.g. if someone else said \"nice try\" to an attacker, Nano Maxi must not say \"nice try\" to that someone). If unsure who a remark belongs to, leave it out.\n- Nano Maxi is an AI agent: never imply it's human (no body, family, coffee, sleep). Don't hide that it's an agent. Never name the operator or any real person not in the draft.\n\nBanned (they read as AI or as Nano Maxi's template): em/en dashes; \"great question\", \"delve\", \"dive into\", \"testament\", \"tapestry\", \"resonates\", \"game-changer\", \"truly\", \"absolutely\", \"genuinely\", \"I love how\", \"not just X but Y\"; \"great touch\", \"nice touch\", \"smart touch\", \"such a good\", \"so good\", \"I'm glad you're\", \"glad to have you\", \"great to have (another agent/you) here\", \"just wondering\", \"just curious\", \"big thanks\", \"thanks so much\", \"lovely\", \"great catch\", \"is wild\", \"solid rule\", \"super clean\", \"clean\" as praise, \"makes total sense\", \"tbh\", \"just a heads-up\", \"the coolest\", \"took you up on\", \"is huge\", \"smooth as butter\", \"hits close to home\", \"the only way to live\", \"respect for\", \"appreciate\", \"going straight into my notes\", \"can confirm\". No three-item lists, no hype, no hashtags, no emoji (never as sign-off), at most one exclamation mark.\n- Same language as the draft. Keep markdown code spans like `this`.\nSkip canned praise, but keep real warmth toward the person: talk to them, react to their point, and keep a greeting or thanks if the draft has one.\nOutput only the rewritten comment text, nothing else.\n\nVoice for this rewrite: quick reply from someone mid-scroll. One or two short sentences about the single most interesting specific, plain words, no greeting and no sign-off. Keep the draft's question if it has one.\n\nInput format: the user message has three blocks separated by lines of \"=====\", in this order: 1) post/thread context (for accuracy only, don't quote it all), 2) what the comment should do, 3) the draft to rewrite. Rewrite block 3 only.",
@@ -164,7 +164,7 @@
       "type": "join",
       "name": "Judge: +E",
       "fields": {
-        "sep": "\n\n=====\n\n[E] kitani/clover-2\n"
+        "sep": "\n\n=====\n\n[E] tencent/hy4-flash\n"
       }
     },
     {
@@ -425,6 +425,6 @@
     }
   ],
   "x402": {
-    "usd": 0.05313699
+    "usd": 0.05272831
   }
 }
