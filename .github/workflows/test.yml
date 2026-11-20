@@ -17,6 +17,9 @@ on:
         description: Recover a missing GitHub source release
         type: boolean
         default: false
+      deployed_revision:
+        description: Exact hosted revision when dispatched by the deployment workflow
+        type: string
 
 permissions:
   contents: read
@@ -29,7 +32,7 @@ env:
   npm_config_strict_ssl: "true"
 
 jobs:
-  # Main version changes publish automatically. A source-only dispatch recovers a missed release.
+  # Main pushes qualify the release. Publication and recovery run after hosted activation.
   qualify-github-source:
     name: Qualify GitHub source release
     if: github.event_name == 'pull_request' || (github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main')
@@ -58,15 +61,34 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24.22.3'
+      - name: Verify hosted activation before publication or recovery
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEPLOYED_REVISION: ${{ inputs.deployed_revision }}
+        run: |
+          if [[ -n "$DEPLOYED_REVISION" ]]; then test "$DEPLOYED_REVISION" = "$GITHUB_SHA"; fi
+          bash .github/scripts/check-hosted-revision.sh "$GITHUB_SHA"
       - name: Qualify the packaged version for a GitHub source release
         id: qualify
         env:
           BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
-          SOURCE_ONLY: ${{ inputs.github_source_only }}
+          SOURCE_ONLY: ${{ inputs.github_source_only || inputs.deployed_revision != '' }}
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/source-pack.json"
           node .github/scripts/publish_source.mjs qualify "$RUNNER_TEMP/source-pack.json" >> "$GITHUB_OUTPUT"
+      - name: Record a qualified version change for the deployment workflow
+        if: github.event_name == 'push' && steps.qualify.outputs.source_version != ''
+        env:
+          RELEASE_VERSION: ${{ steps.qualify.outputs.source_version }}
+        run: printf '%s\n' "$RELEASE_VERSION" > "$RUNNER_TEMP/hosted-release-version"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && steps.qualify.outputs.source_version != ''
+        continue-on-error: true
+        with:
+          name: hosted-release-intent
+          path: ${{ runner.temp }}/hosted-release-version
+          if-no-files-found: error
 
   publish-github-source:
     name: Publish tested GitHub source release
@@ -74,7 +96,8 @@ jobs:
       github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main' &&
       needs.qualify-github-source.outputs.version != '' &&
       needs.qualify-github-source.outputs.version == needs.package.outputs.version &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.github_source_only))
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.github_source_only || inputs.deployed_revision != '')
     needs: [package, qualify-github-source]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -104,7 +127,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_VERSION: ${{ needs.qualify-github-source.outputs.version }}
-          SOURCE_ONLY: ${{ inputs.github_source_only }}
+          SOURCE_ONLY: ${{ inputs.github_source_only || inputs.deployed_revision != '' }}
           REQUESTED_VERSION: ${{ inputs.version }}
         run: node .github/scripts/publish_source.mjs publish "$SOURCE_VERSION"
 
@@ -223,7 +246,7 @@ jobs:
           test "$(node_modules/.bin/nanoodle-mcp --version)" = "nanoodle-mcp $version"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch'
         with:
           name: npm-distribution
           path: ${{ runner.temp }}/nanoodle-mcp.tgz
@@ -233,9 +256,7 @@ jobs:
     name: Publish the tested npm package
     if: >-
       github.repository == 'nanoodlecom/nanoodle-mcp' && github.ref == 'refs/heads/main' &&
-      ((github.event_name == 'workflow_dispatch' && !inputs.github_source_only) ||
-      (github.event_name == 'push' && needs.qualify-github-source.outputs.version != '' &&
-      needs.qualify-github-source.outputs.version == needs.package.outputs.version))
+      github.event_name == 'workflow_dispatch' && !inputs.github_source_only
     needs: [package, qualify-github-source]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
