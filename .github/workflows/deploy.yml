@@ -10,6 +10,7 @@ permissions:
   contents: read
 concurrency:
   group: nanoodle-production-deploy
+  queue: max
   cancel-in-progress: false
 jobs:
   deploy:
@@ -37,10 +38,18 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           echo "159.195.17.119 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHcFN8/48EuW9f6MXgGx9a/syadihZ4XpY+EazT2KbQe" > ~/.ssh/known_hosts
-          if ! receipt=$(ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp $TESTED_REVISION"); then
-            printf '%s\n' "$receipt" | jq -c 'select(.ok == false) | {code}' >&2 || true
-            exit 1
-          fi
+          for attempt in 1 2 3 4; do
+            if receipt=$(ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp $TESTED_REVISION"); then
+              break
+            fi
+            code=$(jq -ers 'select(length == 1) | .[0] | select(.ok == false) | .code |
+              select(type == "string" and test("^[a-z0-9-]{1,80}$"))' <<<"$receipt" 2>/dev/null || true)
+            if [[ "$code" != maintenance-lock-busy || "$attempt" == 4 ]]; then
+              printf 'Production deploy failed (%s)\n' "${code:-missing host receipt}" >&2
+              exit 1
+            fi
+            sleep 10
+          done
           phase=$(jq -ers --arg revision "$TESTED_REVISION" '
             select(length == 1) | .[0] | select(.ok == true and .revision == $revision) |
             select(.phase == "superseded" or
