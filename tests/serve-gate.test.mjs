@@ -1731,7 +1731,7 @@ test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async ()
   // 0.2 XNO priced at $0.05 → $0.25/XNO → a $0.05 quote should be ~0.2 XNO
   const fetch = async (url, opts) => {
     probes.push(url);
-    assert.match(url, /nano-gpt\.com\/api\/v1\/chat\/completions/);
+    assert.match(url, /^https:\/\/api\.nano-gpt\.com\/api\/v1\/chat\/completions$/);
     assert.equal(opts.headers["x-x402"], "true");
     return {
       status: 402,

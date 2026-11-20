@@ -27,6 +27,7 @@
  * a deploy landing between "customer paid" and "run replied" must never eat the
  * payment (observed live 2026-07-22).
  */
+import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
 import { randomBytes, randomInt, createHash } from "node:crypto";
 import { readFileSync, constants } from "node:fs";
 import { open, rename, mkdir } from "node:fs/promises";
@@ -109,9 +110,9 @@ function usdToRaw(usdValue, pair, mode = "floor") {
   return mode === "ceil" ? (num + pair.usdNano - 1n) / pair.usdNano : num / pair.usdNano;
 }
 
-/** The NanoGPT endpoint the XNO/USD rate probe asks (default base https://nano-gpt.com). */
+/** The NanoGPT endpoint the XNO/USD rate probe asks (default base https://api.nano-gpt.com). */
 export function x402ProbeUrl(base) {
-  return `${String(base || "https://nano-gpt.com").replace(/\/+$/, "")}/api/v1/chat/completions`;
+  return `${String(base || NANOGPT_API_ORIGIN).replace(/\/+$/, "")}/api/v1/chat/completions`;
 }
 
 const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
@@ -197,7 +198,7 @@ function settlementReceipt(q, journaled = false) {
  *                                        issued for calls that would actually run (never charge for a typo)
  * @param {number|null} [opts.xnoUsd]     static XNO/USD rate override; null (default) → NanoGPT's own
  *                                        x402 invoices are the oracle (60s cache, 5min maximum age)
- * @param {string} [opts.oracleBase]      NanoGPT API base for the rate probe (default https://nano-gpt.com)
+ * @param {string} [opts.oracleBase]      NanoGPT API base for the rate probe (default https://api.nano-gpt.com)
  * @param {string|null} [opts.wsUrl]      Nano node websocket (wss://…) for push confirmations
  * @param {string} opts.publicBase        absolute base URL for pay links (no trailing slash)
  * @param {number} [opts.pollMs]          receivable poll interval while quotes are pending

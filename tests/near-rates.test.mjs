@@ -101,7 +101,7 @@ test("live: CoinGecko NEAR/USD and the NanoGPT x402 pair for XNO/USD (preferred 
   assert.equal(calls.cg, 1);
   assert.equal(calls.probe, 1);
   assert.ok(calls.urls.includes(COINGECKO_RATES_URL));
-  assert.ok(calls.urls.includes("https://nano-gpt.com/api/v1/chat/completions"));
+  assert.ok(calls.urls.includes("https://api.nano-gpt.com/api/v1/chat/completions"));
 });
 
 test("probe fails: XNO/USD falls back to CoinGecko nano; with a static NEAR/USD CoinGecko is asked only then", async () => {
