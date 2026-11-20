@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
+import { NANOGPT_API_ORIGIN } from "../src/nanogpt-origin.mjs";
 import { readFileSync, mkdirSync, mkdtempSync, chmodSync, statfsSync, rmSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1241,7 +1242,7 @@ async function productionConfig(env = process.env) {
     nanoRpcUrls, nanoStandby, nanoLedgerTelemetry: env.OPERATIONAL_NANO_LEDGER_TELEMETRY === "1",
     nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
-    nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
+    nanoGptBase: env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
     agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 
