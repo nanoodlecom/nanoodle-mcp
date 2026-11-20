@@ -172,6 +172,8 @@ jobs:
           key: ffmpeg-7.0.2-linux-amd64-abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
       - run: npm ci
       - run: npm test
+      - name: Simulate Market hires with local stand-ins
+        run: npm run simulate:market
 
   package:
     name: Pack and install the MCP release
@@ -267,19 +269,32 @@ jobs:
         env:
           VERSION: ${{ needs.package.outputs.version }}
         run: |
+          set -euo pipefail
+          registry_url="https://registry.npmjs.org/nanoodle-mcp/$VERSION"
+          registry_metadata="$RUNNER_TEMP/npm-version.json"
+          archive_integrity="sha512-$(openssl dgst -sha512 -binary nanoodle-mcp.tgz | openssl base64 -A)"
+          verify_registry_archive() {
+            if ! jq -e --arg version "$VERSION" --arg integrity "$archive_integrity" \
+              '.name == "nanoodle-mcp" and .version == $version and .mcpName == "io.github.nanoodlecom/nanoodle-mcp" and .dist.integrity == $integrity' \
+              "$registry_metadata" >/dev/null; then
+              echo "npm metadata for nanoodle-mcp@$VERSION does not match the tested archive" >&2
+              return 1
+            fi
+          }
           status="$(curl --silent --show-error --retry 2 --max-time 30 \
-            --output "$RUNNER_TEMP/npm-version.json" --write-out '%{http_code}' \
-            "https://registry.npmjs.org/nanoodle-mcp/$VERSION")"
+            --output "$registry_metadata" --write-out '%{http_code}' "$registry_url")"
           case "$status" in
             200)
-              jq -e --arg version "$VERSION" '.name == "nanoodle-mcp" and .version == $version and .mcpName == "io.github.nanoodlecom/nanoodle-mcp"' \
-                "$RUNNER_TEMP/npm-version.json" >/dev/null
-              echo "nanoodle-mcp@$VERSION is already published"
+              verify_registry_archive
+              echo "The tested nanoodle-mcp@$VERSION archive is already published"
               ;;
             404)
               flags=()
               if [[ "$VERSION" == *-* ]]; then flags+=(--tag next); fi
               npm publish ./nanoodle-mcp.tgz --ignore-scripts --access public "${flags[@]}"
+              curl --fail --silent --show-error --retry 4 --retry-all-errors --retry-delay 2 \
+                --retry-max-time 30 --max-time 10 --output "$registry_metadata" "$registry_url"
+              verify_registry_archive
               ;;
             *) echo "npm version lookup returned HTTP $status" >&2; exit 1 ;;
           esac
