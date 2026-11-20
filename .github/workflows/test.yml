@@ -86,7 +86,7 @@ jobs:
         if: github.event_name == 'push' && steps.qualify.outputs.source_version != ''
         continue-on-error: true
         with:
-          name: hosted-release-intent
+          name: hosted-release-intent-v${{ steps.qualify.outputs.source_version }}
           path: ${{ runner.temp }}/hosted-release-version
           if-no-files-found: error
 

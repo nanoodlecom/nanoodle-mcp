@@ -82,40 +82,61 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Check for a version change qualified by the main push
-        id: intent
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TEST_RUN: ${{ github.event.workflow_run.id }}
-        run: |
-          [[ "$TEST_RUN" =~ ^[0-9]+$ ]]
-          count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$TEST_RUN/artifacts?name=hosted-release-intent" --jq .total_count)
-          case "$count" in
-            0) echo 'This deployment has no package version change.' ;;
-            1) printf 'present=true\n' >> "$GITHUB_OUTPUT" ;;
-            *) exit 1 ;;
-          esac
-      - uses: actions/download-artifact@v4
-        if: steps.intent.outputs.present == 'true'
-        with:
-          name: hosted-release-intent
-          path: ${{ runner.temp }}/hosted-release-intent
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
       - name: Start publication for the exact activated revision
-        if: steps.intent.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TESTED_REVISION: ${{ github.event.workflow_run.head_sha }}
+          TEST_RUN: ${{ github.event.workflow_run.id }}
         run: |
-          file="$RUNNER_TEMP/hosted-release-intent/hosted-release-version"
-          test "$(wc -c < "$file")" -le 100
-          version=$(cat "$file")
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          set -euo pipefail
+          [[ "$TESTED_REVISION" =~ ^[0-9a-f]{40}$ && "$TEST_RUN" =~ ^[0-9]+$ ]]
           current=$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)
           if [[ "$current" != "$TESTED_REVISION" ]]; then
             echo 'Main advanced after activation. Publication follows the current revision.'
             exit 0
+          fi
+          version=$(gh api "repos/$GITHUB_REPOSITORY/contents/package.json?ref=$TESTED_REVISION" --jq .content |
+            base64 --decode | jq -er 'select(.name == "nanoodle-mcp") | .version | strings')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+
+          intents=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-release-intent-v$version&per_page=30" \
+            --jq '.artifacts[] | select(.expired == false and .workflow_run.head_branch == "main") | .workflow_run.id')
+          if ! grep -Fxq "$TEST_RUN" <<<"$intents"; then
+            # Carry forward a version bump whose own deploy was superseded by another main push.
+            inherited=false
+            while IFS= read -r run; do
+              [[ "$run" =~ ^[0-9]+$ ]] || continue
+              source=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" | jq -r --arg repo "$GITHUB_REPOSITORY" '
+                select(.repository.full_name == $repo and .head_repository.full_name == $repo and
+                  .event == "push" and .head_branch == "main" and .path == ".github/workflows/test.yml" and
+                  .status == "completed" and .conclusion == "success") | .head_sha')
+              [[ "$source" =~ ^[0-9a-f]{40}$ ]] || continue
+              relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source...$TESTED_REVISION" --jq .status)
+              if [[ "$relation" == ahead || "$relation" == identical ]]; then
+                inherited=true
+                break
+              fi
+            done <<<"$intents"
+            if [[ "$inherited" != true ]]; then
+              echo "No qualified main push requested publication of $version."
+              exit 0
+            fi
+            status=$(curl -q --proto '=https' --connect-timeout 5 --max-time 15 --max-filesize 1048576 \
+              --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              "https://registry.npmjs.org/nanoodle-mcp/$version")
+            case "$status" in
+              200) echo "Package version $version is already published."; exit 0 ;;
+              404) ;;
+              *) echo "Package version lookup returned HTTP $status." >&2; exit 1 ;;
+            esac
+          fi
+          tag="refs/tags/v$version"
+          refs=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "$tag" "$tag^{}")
+          tagged=$(awk -v tag="$tag" '$2 == tag { direct=$1 } $2 == tag "^{}" { peeled=$1 }
+            END { print peeled ? peeled : direct }' <<<"$refs")
+          if [[ -n "$tagged" && "$tagged" != "$TESTED_REVISION" ]]; then
+            printf 'Release %s is already pinned to %s. Publication requires that revision.\n' "$version" "$tagged" >&2
+            exit 1
           fi
           gh workflow run test.yml --repo "$GITHUB_REPOSITORY" --ref main \
             -f version="$version" -f deployed_revision="$TESTED_REVISION"
