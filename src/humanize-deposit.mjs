@@ -50,7 +50,10 @@ export const HUMANIZE_MODEL_PRICES = Object.freeze({
   // deposit at all, so this row carries the writer-class floor (Starry
   // Ocean's rates) as a conservative bound. Settlement meters the actual
   // reported cost, and a positive catalog rate overrides this row.
+  // Replaced as Writer E on 2026-11-19 (humanize-opt cycle 1b: repeated
+  // provider overload/429 failures under load); row retained for stale mounts.
   "kitani/clover-2": [0.05, 0.25],
+  "tencent/hy4-flash": [0.035, 0.1405],
   "z-ai/glm-5.3": [0.6, 1.1],
 });
 
