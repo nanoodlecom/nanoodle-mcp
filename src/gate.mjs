@@ -116,7 +116,7 @@ export function x402ProbeUrl(base) {
   return `${String(base || NANOGPT_API_ORIGIN).replace(/\/+$/, "")}/api/v1/chat/completions`;
 }
 
-const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
+const ORACLE_MODELS = ["glm-5.2", "glm-5.3"];
 
 /**
  * The XNO/USD rate oracle: a keyless request with `x-x402: true` answers 402
@@ -125,12 +125,18 @@ const ORACLE_MODEL = "glm-5.2"; // any keyless-quotable model works
  * never paid; it expires on their side. The signal bounds the probe request.
  */
 export async function probeX402Pair({ fetch, url, signal }) {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-x402": "true" },
-    body: JSON.stringify({ model: ORACLE_MODEL, messages: [{ role: "user", content: "x402 rate probe" }] }),
-    ...(signal ? { signal } : {}),
-  });
+  let r;
+  for (const model of ORACLE_MODELS) {
+    r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-x402": "true" },
+      body: JSON.stringify({ model, max_tokens: 256, messages: [{ role: "user", content: "x402 rate probe" }] }),
+      ...(signal ? { signal } : {}),
+    });
+    // A retired model may reject the request before the provider issues a quote.
+    if (![400, 404, 410].includes(r.status)) break;
+    await r.body?.cancel();
+  }
   if (r.status !== 402) throw new Error(`expected 402 from x402 probe, got HTTP ${r.status}`);
   const body = await r.json();
   // Extract the pair straight off the wire, before anything Number()s it —

@@ -1806,6 +1806,24 @@ test("rate oracle accepts a valid Nano invoice after an unusable invoice and ign
   await assert.rejects(probeX402Pair({ fetch, url: "https://api.nano-gpt.com" }), /no usable XNO\/USD pair/);
 });
 
+test("rate oracle keeps using NanoGPT when its primary probe model is retired", async () => {
+  const calls = [];
+  const signal = AbortSignal.timeout(1_000);
+  const fetch = async (_url, options) => {
+    const { model, max_tokens } = JSON.parse(options.body);
+    calls.push(model);
+    assert.equal(max_tokens, 256);
+    assert.equal(options.signal, signal);
+    if (model === "glm-5.2") return Response.json({ error: "model retired" }, { status: 410 });
+    return Response.json({ accepts: [
+      { scheme: "nano", maxAmountRequired: "1000000000000000000000000000", maxAmountRequiredUSD: "0.0003" },
+    ] }, { status: 402 });
+  };
+  assert.deepEqual(await probeX402Pair({ fetch, url: "https://api.nano-gpt.com", signal }),
+    { usdNano: 300_000n, raw: 10n ** 27n });
+  assert.deepEqual(calls, ["glm-5.2", "glm-5.3"]);
+});
+
 test("Nano checkout uses fresh independent rates on cold start and prefers NanoGPT when it recovers", async (t) => {
   const chain = fakeChain();
   const registry = fakeRegistry();
