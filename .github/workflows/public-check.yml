@@ -12,7 +12,16 @@ on:
       - scripts/atomic-json.mjs
       - src/probe-http.mjs
       - src/public-mcp-check.mjs
+      - src/market/fee-guard.mjs
       - src/market/public-availability.mjs
+      - src/near/account.mjs
+      - src/near/base58.mjs
+      - src/near/errors.mjs
+      - src/near/freshness.mjs
+      - src/near/quote-capacity.mjs
+      - src/near/rpc.mjs
+      - src/near/watch.mjs
+      - tests/market-check.test.mjs
       - tests/public-mcp-check.test.mjs
 
 permissions:

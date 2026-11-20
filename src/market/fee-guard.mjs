@@ -11,7 +11,9 @@ export function createMarketFeeGuard({ baseUrl, fetch = globalThis.fetch, maxFee
   async function check() {
     let body;
     try {
-      const response = await request(new URL("/v1/platform/config", baseUrl));
+      const response = await request(new URL("/v1/platform/config", baseUrl), {
+        headers: { "cache-control": "no-cache, no-store" },
+      });
       if (!response.ok) throw Error("unavailable");
       body = await response.json();
       if (!Number.isSafeInteger(body.platform_fee_bps) || body.platform_fee_bps < 0 || body.platform_fee_bps > 10_000) throw Error("malformed");

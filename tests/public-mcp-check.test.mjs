@@ -4,15 +4,53 @@ import { runPublicMcpCheck } from "../scripts/public-mcp-check.mjs";
 
 const NOW = Date.parse("2026-11-18T04:30:00Z");
 const stamp = new Date(NOW).toISOString();
+const archives = ["archival-rpc.mainnet.fastnear.com", "archival-rpc.mainnet.near.org"];
+const archivedTx = "34E7weKCDqXh3xPKdBgSWRqo44yTWjbka9deMK8JbAxx";
+const archivedBlock = "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL";
+const archivedReceipt = "EmdtjzQtQWvmbkeZrgSQwqbyAuevicEYTVUxLhAmUEe4";
+const receiptBlock = "3bssBpNw6rN4sbthUgELgdT4xpkWL2ZDUnrt9yddDB8q";
 
 function fixture({ missingTool = false, scanAt = stamp, funded = true, usdcUnavailable = false, lostHost, transientRates = false,
-  missingDecision = false, missingNanoBranch = false, invalidDeposit = false } = {}) {
+  missingDecision = false, missingNanoBranch = false, invalidDeposit = false, missingHistory = [], wrongHistoricalBlock = [],
+  missingReceiptChanges = [], wrongReceiptOrigin = [] } = {}) {
   const calls = [];
   async function fetch(url, init) {
     const { hostname, pathname } = new URL(url);
     const body = init.body ? JSON.parse(init.body) : null;
     calls.push({ hostname, pathname, method: body?.method, tool: body?.params?.name });
     if (hostname === lostHost) throw Error("private transport details");
+    if (archives.includes(hostname)) {
+      assert.equal(init.method, "POST");
+      assert.equal(new Headers(init.headers).has("authorization"), false);
+      assert.equal(body.jsonrpc, "2.0");
+      const reply = result => Response.json({ jsonrpc: "2.0", id: body.id, result });
+      if (body.method === "EXPERIMENTAL_changes") {
+        assert.deepEqual(body.params, { changes_type: "account_changes", account_ids: ["escrow.ai.near"], block_id: receiptBlock });
+        return reply({ block_hash: receiptBlock, changes: missingReceiptChanges.includes(hostname) ? [] : [
+          { cause: { type: "receipt_processing", receipt_hash: archivedReceipt }, change: { account_id: "escrow.ai.near" } },
+        ] });
+      }
+      if (body.method === "EXPERIMENTAL_receipt_to_tx") {
+        assert.deepEqual(body.params, { receipt_id: archivedReceipt, block_height: 194263443 });
+        return reply({ transaction_hash: archivedTx,
+          sender_account_id: wrongReceiptOrigin.includes(hostname) ? "other.near" : "escrow.ai.near" });
+      }
+      assert.equal(body.id, 1);
+      if (body.method === "tx") {
+        assert.deepEqual(body.params, { tx_hash: archivedTx, sender_account_id: "escrow.ai.near", wait_until: "NONE" });
+        if (missingHistory.includes(hostname)) {
+          return Response.json({ jsonrpc: "2.0", id: 1, error: { cause: { name: "UNKNOWN_TRANSACTION" }, details: "private provider details" } });
+        }
+        return Response.json({ jsonrpc: "2.0", id: 1, result: { final_execution_status: "FINAL",
+          status: { Failure: {} }, transaction: { hash: archivedTx, signer_id: "escrow.ai.near" },
+          transaction_outcome: { block_hash: archivedBlock } } });
+      }
+      assert.equal(body.method, "block");
+      assert.deepEqual(body.params, { block_id: archivedBlock });
+      return Response.json({ jsonrpc: "2.0", id: 1, result: { header: {
+        hash: archivedBlock, height: wrongHistoricalBlock.includes(hostname) ? 194263440 : 194263441,
+      } } });
+    }
     if (hostname === "babel.255bits.com" && pathname === "/mcp/v1") {
       return Response.json({ error: "private challenge details" }, { status: 401 });
     }
@@ -64,13 +102,47 @@ test("public availability uses discovery, status and free pricing, and retries a
   const { calls, run } = fixture({ transientRates: true });
   const report = await run();
   assert.equal(report.ok, true);
-  assert.equal(report.checks.length, 12);
+  assert.equal(report.checks.length, 14);
   assert.equal(report.checks.find(check => check.stage === "nano-rates").attempts, 2);
-  assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(), ["initialize", "tools/call", "tools/list"]);
+  assert.deepEqual([...new Set(calls.filter(call => call.method).map(call => call.method))].sort(),
+    ["EXPERIMENTAL_changes", "EXPERIMENTAL_receipt_to_tx", "block", "initialize", "tools/call", "tools/list", "tx"]);
   assert.deepEqual(calls.filter(call => call.tool === "price_noodle").map(call => call.hostname), [
     "mcp.nanoodle.com", "nano.nanoodle.com", "near.nanoodle.com", "near.nanoodle.com",
   ]);
-  assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/mcp", "/mcp/v1", "/near/health", "/rates"]);
+  assert.deepEqual([...new Set(calls.map(call => call.pathname))].sort(), ["/", "/mcp", "/mcp/v1", "/near/health", "/rates"]);
+});
+
+test("archival history distinguishes missing redundancy from complete history loss", async () => {
+  const check = report => report.checks.find(row => row.stage === "near-archival-history");
+  const single = await fixture({ missingHistory: [archives[0]] }).run();
+  assert.equal(single.ok, true);
+  assert.deepEqual(check(single).peers, [
+    { host: archives[0], ok: false, attempts: 2, code: "near-history-transaction-missing" },
+    { host: archives[1], ok: true, attempts: 1 },
+  ]);
+  const lost = await fixture({ missingHistory: [archives[0]], wrongHistoricalBlock: [archives[1]] }).run();
+  assert.equal(lost.ok, false);
+  assert.deepEqual(lost.checks.filter(row => !row.ok).map(row => row.code), ["near-no-readable-archive"]);
+  assert.equal(check(lost).peers[1].code, "near-history-block-unverified");
+  assert.doesNotMatch(JSON.stringify(lost), /private provider details/);
+});
+
+test("archival payment discovery requires the expected account change and receipt origin", async () => {
+  const discovery = report => report.checks.find(row => row.stage === "near-archival-payment-discovery");
+  const single = await fixture({ missingReceiptChanges: [archives[0]] }).run();
+  assert.equal(single.ok, true);
+  assert.deepEqual(discovery(single).peers, [
+    { host: archives[0], ok: false, attempts: 2, code: "near-history-account-change-unverified" },
+    { host: archives[1], ok: true, attempts: 1 },
+  ]);
+  const { calls, run } = fixture({ missingReceiptChanges: [archives[0]], wrongReceiptOrigin: [archives[1]] });
+  const lost = await run();
+  assert.equal(lost.ok, false);
+  assert.equal(lost.checks.find(row => row.stage === "near-archival-history").ok, true);
+  assert.equal(discovery(lost).code, "near-no-archive-payment-discovery");
+  assert.equal(discovery(lost).peers[1].code, "near-history-receipt-origin-unverified");
+  assert.equal(calls.filter(call => call.hostname === archives[0] && call.method === "EXPERIMENTAL_receipt_to_tx").length, 0);
+  assert.doesNotMatch(JSON.stringify(lost), /escrow\.ai\.near|other\.near/);
 });
 
 test("public readiness reports missing USDC proof as a token-specific check failure", async () => {

@@ -400,7 +400,13 @@ Nanoodle listings. The free `price_noodle` probes check that the decision model
 and both branches are priced in NEAR and USDC, and the estimated charge fits
 the deposit. All probes use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
-during an npm outage. The probes use public discovery, status and pricing.
+during an npm outage. The archival NEAR checks read a published historical
+transaction and its block, then check for a known receipt in its account
+changes and resolve that receipt to the original transaction and signer.
+Each check records both archive results and fails when neither peer can
+verify it.
+The probes use public discovery, status, pricing and historical reads.
+[FastNEAR public transaction fixture](https://docs.fastnear.com/rpc/transaction/tx)
 
 Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
 or use **Run workflow** to check from a separate network. GitHub routes scheduled
@@ -419,12 +425,23 @@ failed probe marks the scheduled event failed. Check the Worker's logs or Cron
 Events in the Cloudflare dashboard for execution evidence. This deployment has
 no notification integration. [Cloudflare Cron Events](https://developers.cloudflare.com/workers/configuration/cron-triggers/#view-past-events)
 
-Run the Worker against the production public URLs from the local Workers runtime
-before deploying.
+The [Worker release workflow](../.github/workflows/deploy-public-availability.yml)
+tests the public probes and builds the Worker for PRs. After a merge to `main`
+that changes an input, it publishes the tested bundle, verifies the active
+Worker version has the merge SHA, and checks the schedule and disabled public
+subdomain. The `cloudflare-availability` GitHub environment uses
+`CLOUDFLARE_ACCOUNT_ID` and a dedicated Worker credential named
+`CLOUDFLARE_AVAILABILITY_API_TOKEN`.
+
+To exercise the scheduled handler locally against the public endpoints:
 
 ```sh
 npx wrangler@4.164.0 dev --local --test-scheduled --config ops/cloudflare-public-check.jsonc
 curl -fsS 'http://127.0.0.1:8787/cdn-cgi/local/scheduled?format=json'
-npx wrangler@4.164.0 deploy --config ops/cloudflare-public-check.jsonc
 npx wrangler@4.164.0 tail nanoodle-public-availability --format json
 ```
+
+After the first release, check that the next scheduled event logs the expected
+probe count. The deployment job records the previous Cloudflare deployment for
+rollback. Restore its version in Cloudflare and revert the change in Git if a
+release fails the scheduled check.

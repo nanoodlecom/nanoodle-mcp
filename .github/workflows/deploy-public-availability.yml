@@ -1,0 +1,149 @@
+name: deploy public availability Worker
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/deploy-public-availability.yml
+      - ops/cloudflare-public-check.*
+      - scripts/atomic-json.mjs
+      - scripts/market-check.mjs
+      - scripts/public-mcp-check.mjs
+      - src/probe-http.mjs
+      - src/public-mcp-check.mjs
+      - src/market/fee-guard.mjs
+      - src/market/public-availability.mjs
+      - src/near/account.mjs
+      - src/near/base58.mjs
+      - src/near/errors.mjs
+      - src/near/freshness.mjs
+      - src/near/quote-capacity.mjs
+      - src/near/rpc.mjs
+      - src/near/watch.mjs
+      - tests/probe-http.test.mjs
+      - tests/public-mcp-check.test.mjs
+      - tests/market-check.test.mjs
+      - tests/market-fee-guard.test.mjs
+      - tests/near-rpc.test.mjs
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/deploy-public-availability.yml
+      - ops/cloudflare-public-check.*
+      - scripts/atomic-json.mjs
+      - scripts/market-check.mjs
+      - scripts/public-mcp-check.mjs
+      - src/probe-http.mjs
+      - src/public-mcp-check.mjs
+      - src/market/fee-guard.mjs
+      - src/market/public-availability.mjs
+      - src/near/account.mjs
+      - src/near/base58.mjs
+      - src/near/errors.mjs
+      - src/near/freshness.mjs
+      - src/near/quote-capacity.mjs
+      - src/near/rpc.mjs
+      - src/near/watch.mjs
+      - tests/probe-http.test.mjs
+      - tests/public-mcp-check.test.mjs
+      - tests/market-check.test.mjs
+      - tests/market-fee-guard.test.mjs
+      - tests/near-rpc.test.mjs
+
+permissions:
+  contents: read
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.3"
+      - name: Test the public probes
+        run: >-
+          node --test tests/probe-http.test.mjs tests/public-mcp-check.test.mjs
+          tests/market-check.test.mjs tests/market-fee-guard.test.mjs tests/near-rpc.test.mjs
+      - name: Build the Worker without credentials
+        run: |
+          npx --yes wrangler@4.164.0 deploy --dry-run --strict \
+            --config ops/cloudflare-public-check.jsonc --outdir "$RUNNER_TEMP/availability"
+          node --check "$RUNNER_TEMP/availability/cloudflare-public-check.js"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: public-availability-${{ github.sha }}
+          path: ${{ runner.temp }}/availability/cloudflare-public-check.js*
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: cloudflare-availability
+    concurrency:
+      group: nanoodle-public-availability
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.3"
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-availability-${{ github.sha }}
+          path: ${{ runner.temp }}/availability
+      - name: Check for newer Worker inputs
+        id: source
+        shell: bash
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin refs/heads/main
+          git diff --name-only "$GITHUB_SHA" FETCH_HEAD -- \
+            .github/workflows/deploy-public-availability.yml 'ops/cloudflare-public-check.*' \
+            scripts/{atomic-json,market-check,public-mcp-check}.mjs \
+            src/probe-http.mjs src/public-mcp-check.mjs src/market/{fee-guard,public-availability}.mjs \
+            src/near/{account,base58,errors,freshness,quote-capacity,rpc,watch}.mjs \
+            tests/{probe-http,public-mcp-check,market-check,market-fee-guard,near-rpc}.test.mjs \
+            > "$RUNNER_TEMP/availability-changes"
+          if [[ -s "$RUNNER_TEMP/availability-changes" ]]; then
+            echo "Main contains newer availability inputs. Their workflow will deploy."
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish the Worker and verify the exact version and cron
+        if: steps.source.outputs.current == 'true'
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_AVAILABILITY_API_TOKEN }}
+        run: |
+          : "${CLOUDFLARE_ACCOUNT_ID:?Set the account for the cloudflare-availability environment}"
+          : "${CLOUDFLARE_API_TOKEN:?Set the Worker credential for the cloudflare-availability environment}"
+          config=ops/cloudflare-public-check.jsonc
+          worker="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/nanoodle-public-availability"
+          api() { curl -fsS --max-time 20 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$worker/$1"; }
+          previous=$(api deployments | jq -er '
+            .result.deployments | max_by(.created_on) |
+            "Previous deployment `\(.id)` serving version(s) `\([.versions[].version_id] | join(", "))`"
+          ')
+          printf '%s\n' "$previous" >> "$GITHUB_STEP_SUMMARY"
+
+          npx --yes wrangler@4.164.0 deploy "$RUNNER_TEMP/availability/cloudflare-public-check.js" \
+            --no-bundle --strict --config "$config" --tag "$GITHUB_SHA" --message "Merge $GITHUB_SHA"
+
+          deployment=$(api deployments | jq -ce '.result.deployments | max_by(.created_on)')
+          version=$(jq -er '.versions | select(length == 1 and .[0].percentage == 100) | .[0].version_id' <<< "$deployment")
+          api "versions/$version" | jq -e --arg sha "$GITHUB_SHA" '.result.annotations["workers/tag"] == $sha'
+          api schedules | jq -e --slurpfile config "$config" '([.result.schedules[].cron] | sort) == ($config[0].triggers.crons | sort)'
+          api subdomain | jq -e '.result.enabled == false and .result.previews_enabled != true'
+          printf 'Worker version `%s` serves commit `%s`\n' "$version" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
