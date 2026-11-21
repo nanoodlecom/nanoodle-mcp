@@ -795,6 +795,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   }
   if (typeof result.costUsd === "number" && Number.isFinite(result.costUsd)) {
     content.push({ type: "text", text: `cost: $${formatCostUsd(result.costUsd)}${result.costExact === false ? " (a lower bound — some calls did not report a price, so the actual cost may be higher)" : ""}` });
+  } else if (result.costUsd === null && result.costExact === false) {
+    content.push({ type: "text", text: "cost: unavailable (some provider calls did not report a price)" });
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput
@@ -1405,6 +1407,8 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
           if (hf.state.unreportedUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.unreportedUsd;
           if (hf.state.reviewUsd > 0) result.costUsd = (knownUsd(result.costUsd) ?? 0) + hf.state.reviewUsd;
           if (hf.state.costUnknown) result.costExact = false;
+          // The executor starts its lower bound at zero even when no charge is known.
+          if (result.costExact === false && result.costUsd === 0) result.costUsd = null;
         }
         await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
         return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
