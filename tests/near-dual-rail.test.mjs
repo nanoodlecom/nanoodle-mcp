@@ -148,6 +148,15 @@ test("three-leg receipt and operator accounting: wallet-funded runs derive the X
   assert.ok(JSON.parse(JSON.stringify(settle)), "the ledger line is plain JSON");
 });
 
+test("a backup-key-capable NeAR checkout reports model cost without inferring an XNO charge", async () => {
+  const w = await world({ modelPayment: "wallet_with_key_backup" });
+  const { call } = await nearPay(w.wrapped.callTool, "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }, w.chain);
+  const model = (await call()).structuredContent.receipt.legs[1];
+  assert.equal(model.fundedBy, "wallet_with_key_backup");
+  assert.equal(model.usd, "0.00941");
+  assert.equal(model.xno, null);
+});
+
 test("receipt legs: API-key funding, a failed run (unknown, never zero) and a wrong amount (nothing ran)", async () => {
   const w = await world({ modelPayment: "api_key" });
   const ok = await (await nearPay(w.wrapped.callTool, "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS }, w.chain)).call();

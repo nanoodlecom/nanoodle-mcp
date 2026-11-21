@@ -23,6 +23,7 @@ import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUs
 import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
+import { nanoGptBackupFetch } from "./nanogpt-backup.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
@@ -824,7 +825,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * @returns {Promise<{ graph: object, workflowGraph: object, inputs: object, wf: Workflow, catalogs: object, source: string, url: string|null }>}
  */
 export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
-  allowShortLinks = true, read = null, requireFreshCatalogs = false } = {}) {
+  allowShortLinks = true, read = null, requireFreshCatalogs = false, executionFetch = hostedRunFetch(fetch) } = {}) {
   if (args == null) args = {};
   if (typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError("tools/call arguments must be an object");
@@ -848,7 +849,7 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: requireFreshCatalogs ? ", so graphs using it cannot be quoted" : ", so this link runs with whatever payload it asked for",
   });
-  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs, fetch: hostedRunFetch(fetch) });
+  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs, fetch: executionFetch });
   if (wf.warnings.length) {
     // unknown node types: the graph decodes but run() would always refuse
     throw new Error(`this ${r.source === "graph" ? "graph" : "share link"} can't run headlessly — ${wf.warnings.join("; ")}`);
@@ -857,8 +858,8 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
   return { graph: r.graph, workflowGraph: wf.graph, inputs, wf, catalogs, source: r.source, url: r.url };
 }
 
-async function runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx }) {
-  const { wf, inputs } = await prepareRunNoodle(params.arguments, { apiKey, payment, baseUrl, log, catalogTimeoutMs, allowShortLinks: true });
+async function runNoodle(params, { prepare, outDir, publicBase, ctx }) {
+  const { wf, inputs } = await prepare(params.arguments, { allowShortLinks: true });
   const { onProgress, notices, finish } = runNotices(wf, ctx);
   const result = await wf.run(inputs, hostedRunOptions({ onProgress })).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
   finish(result);
@@ -1071,9 +1072,12 @@ export class HumanizeUnpriceableError extends Error {
   constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
 }
 
-export async function loadTools({ dirs, apiKey, payment, baseUrl = NANOGPT_API_ORIGIN, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
+export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBackup, baseUrl = NANOGPT_API_ORIGIN, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
   const executionLimit = hosted || remote ? hostedRunTimeout(runTimeoutMs ?? undefined) : null;
-  const runtimeFetch = hostedRunFetch();
+  if (backupKey && (apiKey || !payment)) throw new TypeError("NanoGPT backup requires x402 as the primary funding method");
+  if (backupKey) apiKey = null; // Keep the executor from loading a primary key from its own environment.
+  const scopedFetch = hostedRunFetch();
+  const runtimeFetch = backupKey ? nanoGptBackupFetch({ baseUrl, key: backupKey, authorize: authorizeBackup, fetch: scopedFetch }) : scopedFetch;
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Last-observed-cost sidecar: purely informational, so it must never block startup.
@@ -1287,14 +1291,15 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl = NANOGPT_API_O
      * (see prepareRunNoodle). The NEAR gate calls it at quote time.
      */
     prepareRunNoodle(args, opts = {}) {
-      return prepareRunNoodle(args, { apiKey, payment, baseUrl, log, catalogTimeoutMs, ...opts });
+      return prepareRunNoodle(args, { apiKey, payment, baseUrl, log, catalogTimeoutMs,
+        ...(backupKey && { executionFetch: runtimeFetch }), ...opts });
     },
 
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
     async callTool(params, ctx = null) {
       const execute = async () => {
         if (params != null && typeof params === "object" && !Array.isArray(params)) {
-          if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { apiKey, payment, baseUrl, outDir, publicBase, log, catalogTimeoutMs, ctx });
+          if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { prepare: registry.prepareRunNoodle, outDir, publicBase, ctx });
           if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
           if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
         }

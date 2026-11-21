@@ -1492,7 +1492,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   const failCost = (rec, x402) => {
     if (!rec) return 0;
     if (rec.paid) { rec.counted = true; return rec.usd; }
-    if (rec.paymentStarted) return null;
+    if (rec.paymentStarted || rec.backupChargePossible) return null;
     if (rec.status !== "request error" && rec.status != null && rec.usd != null) return rec.usd;
     if (x402) return 0;
     return rec.beforeSend ? 0 : null;
@@ -1592,7 +1592,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         let r;
         try { r = await fetch(url, { ...init, body: sentBody }); }
         catch (e) {
-          finishPaid(held, failedBeforeSend(e, init.signal) ? 0 : null);
+          const usd = e?.code === "x402-backup" ? (e.backupChargePossible ? null : 0)
+            : failedBeforeSend(e, init.signal) ? 0 : null;
+          finishPaid(held, usd);
+          if (e?.backupChargePossible) state.costUnknown = true;
           throw e;
         }
         const x402Judge = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
@@ -1729,7 +1732,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       let r;
       if (signal && signal.aborted) { rec.status = "request error"; rec.beforeSend = true; throw signal.reason; } // never sent
       try { r = await fetch(url, req); }
-      catch (e) { rec.status = "request error"; rec.beforeSend = failedBeforeSend(e, signal); throw e; }
+      catch (e) {
+        rec.status = "request error";
+        rec.beforeSend = failedBeforeSend(e, signal);
+        if (e?.backupChargePossible) rec.backupChargePossible = true;
+        throw e;
+      }
       if (r.status === 402 && !x402) await rememberUnpaid(r, bodyStr);
       if (r.status === 402 && x402) {
         const raw = await r.text();
@@ -2075,7 +2083,12 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (signal && signal.aborted) { rec.status = "request error"; rec.beforeSend = true; throw signal.reason; }
     let r;
     try { r = await fetch(url, init); }
-    catch (e) { rec.status = "request error"; rec.beforeSend = failedBeforeSend(e, signal); throw e; }
+    catch (e) {
+      rec.status = "request error";
+      rec.beforeSend = failedBeforeSend(e, signal);
+      if (e?.backupChargePossible) rec.backupChargePossible = true;
+      throw e;
+    }
     let paidUsd = null;
     const x402 = !!payment && String(hget(init.headers, "x-x402")) === "true" && !hget(init.headers, "authorization");
     if (r.status === 402 && !x402) await rememberUnpaid(r, sentBody);

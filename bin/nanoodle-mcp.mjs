@@ -85,7 +85,7 @@ function usage(code = 1) {
                  customers' generations), off in stdio mode (local files are yours to keep).
                  Only media artifacts are ever deleted — never costs.json/gate-state.json/usage.jsonl
   --key K        NanoGPT API key (defaults to NANOGPT_API_KEY)
-  --env-file p   read NANOGPT_API_KEY / NANO_SEED / NANO_PRIVATE_KEY / NEAR_PRIVATE_KEY from a .env-style file
+  --env-file p   read NanoGPT API keys and Nano / NEAR wallet secrets from a .env-style file
                  (--key wins over its NANOGPT_API_KEY if both given)
   --nano-rpc u   Nano RPC node(s) for wallet reads/publishes, comma-separated,
                  tried in order with failover so one throttling node can't end a
@@ -314,6 +314,7 @@ async function main() {
 
   // key precedence: --key > --env-file > NANOGPT_API_KEY (mirrors the nanoodle CLI)
   let apiKey = keyFlag ?? process.env.NANOGPT_API_KEY;
+  let backupKey = process.env.NANOGPT_FALLBACK_API_KEY?.trim();
   // wallet material: --env-file > environment; never argv (it leaks via `ps`)
   let nanoSeed = process.env.NANO_SEED, nanoKey = process.env.NANO_PRIVATE_KEY;
   let workUrl = workRpcFlag || process.env.NANO_WORK_URL || null;
@@ -328,7 +329,9 @@ async function main() {
       return m ? m[1].trim() : undefined;
     };
     const fileKey = entry("NANOGPT_API_KEY");
+    const fileBackupKey = entry("NANOGPT_FALLBACK_API_KEY");
     if (fileKey && keyFlag == null) apiKey = fileKey;
+    backupKey = fileBackupKey ?? backupKey;
     nanoSeed = entry("NANO_SEED") ?? nanoSeed;
     nanoKey = entry("NANO_PRIVATE_KEY") ?? nanoKey;
     if (!workRpcFlag) workUrl = entry("NANO_WORK_URL") ?? workUrl;
@@ -338,8 +341,8 @@ async function main() {
     if (nearUsdFlag == null) nearUsdText = entry("NEAR_USD") ?? nearUsdText;
     if (nearSpreadFlag == null) nearSpreadText = entry("NEAR_SWAP_SPREAD_BPS") ?? nearSpreadText;
     if (nearMode && nearUsdText != null) positive("--near-usd (NEAR_USD)", nearUsdText);
-    if (!fileKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined && !(nearMode && /^\s*(?:export\s+)?NEAR_PRIVATE_KEY\s*=/m.test(envText))) {
-      console.error(`--env-file: no NANOGPT_API_KEY, NANO_SEED, or NANO_PRIVATE_KEY entry in ${envFile}`);
+    if (!fileKey && !fileBackupKey && entry("NANO_SEED") === undefined && entry("NANO_PRIVATE_KEY") === undefined && !(nearMode && /^\s*(?:export\s+)?NEAR_PRIVATE_KEY\s*=/m.test(envText))) {
+      console.error(`--env-file: no NanoGPT API key or wallet credential entry in ${envFile}`);
       process.exit(1);
     }
   }
@@ -373,6 +376,10 @@ async function main() {
       });
     }
     const paidFunding = serveSpec !== null && (chargeUsd != null || nearMode);
+    if (backupKey && (!paidFunding || apiKey || !(nanoKey || nanoSeed))) {
+      console.error("nanoodle-mcp: NANOGPT_FALLBACK_API_KEY requires hosted payments and a Nano wallet as the primary model funding source");
+      process.exit(1);
+    }
     const marketEnabled = serveSpec !== null && !!(process.env.MARKET_AGENTS_FILE || process.env.MARKET_AGENT_TOKEN_FILE || process.env.MARKET_AGENT_TOKEN);
     // A configured rail/worker that failed initialization cannot qualify a
     // maintenance handoff. Runtime funding still observes the active writers.
@@ -502,6 +509,8 @@ async function main() {
       dirs: graphDirs,
       apiKey,
       payment: wallet && !apiKey ? wallet.payment : undefined,
+      backupKey,
+      authorizeBackup: wallet?.ops.authorizeBackup,
       baseUrl: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN,
       outDir: resolvedOut,
       publicBase: serveSpec !== null ? publicBase : null,
@@ -624,7 +633,7 @@ async function main() {
           registry, merchant: nearMerchant, network: nearNetwork, rpcFlag: nearRpcFlag, keyFile: nearKeyFile,
           envText, envFile, usdText: nearUsdText, usdFlag: nearUsdFlag != null, spreadText: nearSpreadText, spreadFlag: nearSpreadFlag != null,
           xnoUsdText: xnoUsdFlag, quoteTtlMin: nearQuoteTtlMin, refreshS: nearRefreshS,
-          modelPayment: apiKey ? "api_key" : wallet ? "wallet" : null,
+          modelPayment: apiKey ? "api_key" : backupKey ? "wallet_with_key_backup" : wallet ? "wallet" : null,
           nanoOps: wallet?.ops,
           fundingSources, maintenance,
           requireExistingState: requiredState?.requireExisting === true,

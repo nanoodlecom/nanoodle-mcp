@@ -102,6 +102,13 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     };
     checkBalance(balanceRaw);
     if (!scope) return checkBalance;
+    debitInvoice(scope, invoice, amount);
+    // The draw is no longer in held() but remains in the account until its
+    // block publishes. Check it alongside fresh liabilities on every attempt.
+    return balance => checkBalance(balance, amount);
+  }
+
+  function debitInvoice(scope, invoice, amount) {
     const invoiceUsd = usd(invoice.amountUsd, true);
     if (typeof invoice.paymentId !== "string" || !invoice.paymentId || invoice.paymentId.length > 256) {
       throw new FundingError("FUNDING_INVALID", "Provider invoice needs a payment identity");
@@ -115,9 +122,17 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     scope.invoices.add(invoice.paymentId);
     scope.drawnUsd += invoiceUsd;
     scope.drawnRaw += amount;
-    // The draw is no longer in held() but remains in the account until its
-    // block publishes. Check it alongside fresh liabilities on every attempt.
-    return balance => checkBalance(balance, amount);
+  }
+
+  function authorizeBackup(invoice, signal) {
+    const scope = context.getStore();
+    return serial(() => {
+      signal?.throwIfAborted();
+      open(scope);
+      // The provider may charge the key once dispatched. Reserve the quote
+      // against the same USD cap as Nano sends, without debiting Nano capital.
+      debitInvoice(scope, invoice, 0n);
+    });
   }
 
   function requiredForPayment(scope, amountRaw) {
@@ -152,7 +167,7 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
   }
 
   return {
-    run, capture: () => context.getStore() || null, authorize, requiredForPayment, requiredForTransfer, authorizeTransfer,
+    run, capture: () => context.getStore() || null, authorize, authorizeBackup, requiredForPayment, requiredForTransfer, authorizeTransfer,
     snapshot: () => ({ activeRuns: active.size, reservedRaw: held().toString() }),
     report: () => ({ activeRuns: active.size, reservedRaw: held().toString(), liabilitiesRaw: obligations(null, true).toString(),
       oldestStartedAt: active.size ? Math.min(...[...active.values()].map(s => s.startedAt)) : null, enforced: requireScope }),
