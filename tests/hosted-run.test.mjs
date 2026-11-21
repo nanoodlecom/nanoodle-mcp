@@ -98,19 +98,32 @@ test("synchronous work cannot extend its deadline by delaying timer callbacks", 
   assert.equal(requests, 0);
 });
 
-test("video polling is cancelled even when the library's video timeout is unlimited", async () => {
+test("video polling is cancelled even when the library's video timeout is unlimited", { timeout: 10_000 }, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const firstPoll = deferred();
   let polls = 0;
   const wf = new Workflow({ v: 1, nodes: [{ id: "v", type: "tvideo", fields: { model: "example/video", prompt: "a river", duration: "5" } }], links: [] }, {
     apiKey: "fixture", fetch: hostedRunFetch(async url => {
       if (String(url).includes("generate-video")) return Response.json({ runId: "v1" });
-      polls++; return Response.json({ status: "PROCESSING" });
+      polls++;
+      firstPoll.resolve();
+      return Response.json({ status: "PROCESSING" });
     }), quiet: true,
   });
   wf.client.pollIntervals.video = 1;
   assert.equal(wf.client.timeouts.video, Infinity);
-  await assert.rejects(withHostedRun(() => wf.run({}, hostedRunOptions()), 50), /hosted execution limit/);
+  const deadline = 60_000;
+  const cancelled = assert.rejects(withHostedRun(() => wf.run({}, hostedRunOptions()), deadline), { code: "HOSTED_RUN_TIMEOUT" });
+  // Let the mocked submission finish and schedule the first status poll.
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1);
+  await firstPoll.promise;
+  t.mock.timers.tick(deadline - 1);
+  await cancelled;
   const stopped = polls;
-  await new Promise(resolve => setTimeout(resolve, 10)); assert.equal(polls, stopped); assert.ok(polls > 0);
+  t.mock.timers.tick(10);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(polls, stopped);
 });
 
 test("timing out waits for an in-flight payment before releasing its reservation", async t => {
