@@ -679,6 +679,7 @@ async function main() {
         requireExistingState: requiredState?.requireExisting === true,
         fundRun: !apiKey ? wallet.ops.withFunding : null,
         canQuote: () => !fundingSources || fundingSources.ready(),
+        canFundQuote: fundingSources?.canFundQuote ?? null,
         verifyPaymentReads: guardedFunding,
         log: (line) => console.error("nanoodle-mcp: " + line),
         usage: usageLog, maintenance,
@@ -730,8 +731,11 @@ async function main() {
     let creators = null, creatorPayments = null;
     if (fundingSources) {
       const { startFundingReport } = await import("../src/funding-report.mjs");
-      await startFundingReport({ outDir: resolvedOut, snapshot: wallet.ops.fundingReport, rpcStatus: wallet.ops.fundingReadStatus,
+      await startFundingReport({ outDir: resolvedOut,
+        snapshot: async () => ({ ...await wallet.ops.fundingReport(), creatorReservations: near?.creatorReservations === true }),
+        rpcStatus: wallet.ops.fundingReadStatus,
         sources: fundingSources, durableState: moneyState,
+        mediaRetentionMs: Number.isFinite(outTtlMs) ? outTtlMs : 0,
         writerProtection: () => {
           writerLocks.assertHeld();
           return { enforced: true, requiredState: requiredState?.requireExisting === true };
@@ -997,13 +1001,16 @@ async function startNearMode({
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
   const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance,
     marketPayoutMatches: payout => fundingSources?.marketPayoutMatches(payout) ?? true }) : null;
+  const fundRun = modelPayment === "wallet" || modelPayment === "api_key" ? nanoOps?.withFunding ?? null : null;
+  const creatorReservations = modelPayment === "api_key" && fundRun !== null;
   let watcher = null;
   const gate = createNearGate({
     merchantId: merchant, network, rpc, ledger, rate: rates, refunder, usdcToken, usdcEnabled, authorPayouts,
     limits: maxDepositUsd != null ? { maxDepositUsd } : undefined,
     baseUrl: catalogBase, log, usage, quoteTtlMs: quoteTtlMin * 60_000, modelPayment, publicBase,
     canQuote: () => watcher?.status().listening === true && (!fundingSources || fundingSources.ready()),
-    fundRun: modelPayment === "wallet" ? nanoOps.withFunding : null, refundFunding, maintenance,
+    canFundQuote: fundingSources?.canFundQuote ?? null,
+    fundRun, refundFunding, maintenance,
   });
   fundingSources?.registerNear(gate.fundingLiabilitiesRaw, () => authorPayouts?.records() ?? []);
   const wrapped = gate.wrapRegistry(registry);
@@ -1057,7 +1064,7 @@ async function startNearMode({
     "You pay actual model cost plus a 20% service fee; unused funds return to the paying wallet in the same asset. " +
     "Failed runs refund the whole deposit. price_noodle and noodle_guide are free; run_noodle runs workflows you compose yourself." +
     (usdcEnabled ? ` Choose _pay_with: "usdc" for Circle-issued USDC on NEAR, including USDC change and refunds; otherwise the quote is in native NEAR.` : "") + ratesLine;
-  return { listTools, callTool, wrapped, gate, watcher, rates, usdc, instructions: dual ? instructions : nearInstructions,
+  return { listTools, callTool, wrapped, gate, watcher, rates, usdc, creatorReservations, instructions: dual ? instructions : nearInstructions,
     paymentNote: dual ? paymentNote : nearPaymentNote, nearInstructions, nearPaymentNote, nearInfo: { network, merchant, funding: refundFunding.status }, usagePath, usageStatus: usageWriter.status, persistenceStatus: ledger.persistenceStatus };
 }
 

@@ -14,7 +14,8 @@ import { USDC_CONTRACTS } from "../src/near/ft.mjs";
 for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, execution, change and replay ${optedIn ? "with creator payout" : "without creator payout"}`, { timeout: 30_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-e2e-")); await mkdir(join(dir, "graphs"));
   await writeFile(join(dir, "graphs", "poster.json"), JSON.stringify(WORKED_GRAPH));
-  const chain = createFakeChain(), key = await throwawayNearKey(), provider = nanoGptMock(), node = await nanoNode();
+  const chain = createFakeChain(), key = await throwawayNearKey(), provider = nanoGptMock();
+  const node = await nanoNode({ balanceRaw: optedIn ? (10n ** 30n).toString() : "0" });
   chain.addAccount("merchant.testnet", 10n ** 25n, key.publicKey); chain.addAccount("payer.testnet", 10n ** 25n);
   chain.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 10_000_000n });
   await chain.listen(); await provider.listen();
@@ -41,7 +42,9 @@ for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, ex
     const price = await request("price_workflow", { Idea: "a lighthouse" }); assert.ok(price.structuredContent.pricing); assert.equal(provider.runs(), 0);
     assert.ok(!JSON.stringify(price).includes("Write one vivid image prompt"));
     for (const asset of ["near", "usdc"]) {
-      const args = { Idea: "A lighthouse at dawn", _pay_with: asset }, quote = await request("run_workflow", args), payment = quote.structuredContent.payment;
+      const args = { Idea: "A lighthouse at dawn", _pay_with: asset }, quote = await request("run_workflow", args);
+      assert.ok(quote.structuredContent?.payment, JSON.stringify(quote.content));
+      const { payment } = quote.structuredContent;
       assert.equal(provider.runs(), asset === "near" ? 0 : 1, "quote cannot execute a model before payment");
       assert.ok(BigInt(payment.amountAtomic || payment.amountYocto) > 0n);
       assert.equal(!!payment.authorPayout, optedIn);

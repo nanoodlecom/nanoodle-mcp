@@ -246,6 +246,10 @@ is written, fsynced and removed in the output directory to verify persistence.
 
 Coverage:
 
+- Local media referenced by completed Nano, NEAR, and USDC payments. The
+  check uses the server's active media retention period and alerts if a
+  recent output is missing, empty, or a symlink. It reads file metadata
+  only. Filenames and checkout details stay out of alerts.
 - Nano mainnet identity, confirmed wallet height/frontier agreement across
   configured nodes, and the running wallet's fresh multi-peer read enforcement.
   See [Nano RPC freshness](nano-rpc-freshness.md).
@@ -327,7 +331,12 @@ Coverage:
   included at the sampled Nano rate. Running jobs already affect the runtime
   balance through reservations. A creator run includes overhead
   from the largest possible deposit with quote dust. These are per-workflow
-  warnings. The runtime still verifies funding when each run starts.
+  warnings. Quote admission uses the latest healthy funding sample to compare
+  the requested workflow's locked Nano budget against wallet funds after
+  existing obligations and active reservations. NEAR and USDC quotes include
+  the creator payout allowance for the exact displayed payment where applicable.
+  Unpaid quotes leave the balance available to existing work. The runtime
+  rechecks funding when every run starts.
 - NEAR and USDC share an open-quote limit. The check warns at 80% and
   reports both quote lanes unavailable at the limit. The saved-workflow probes
   also check capacity for their current exact payment amounts. Expired quotes
