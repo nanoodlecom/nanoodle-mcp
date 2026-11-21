@@ -275,6 +275,7 @@ export function createMarketWorker({
     const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
     const refused = await feeRefusal(rec, "rejected"); if (refused) return refused;
     const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
+    store.assertDurable();
     try {
       const r = await client.start(rec.id);
       return set(rec.id, ok({ phase: "started", startedAt: (r && r.startedAt) || new Date(now()).toISOString() }));
@@ -512,6 +513,7 @@ export function createMarketWorker({
   async function advance(id, row) {
     let rec = store.get(id);
     for (let step = 0; step < 12 && rec && !TERMINAL.has(rec.phase) && (rec.nextAttemptAt || 0) <= now(); step++) {
+      store.assertDurable();
       const before = rec.updatedAt + rec.phase;
       switch (rec.phase) {
         case "new": rec = await phaseNew(rec, row); break;
@@ -562,12 +564,14 @@ export function createMarketWorker({
       rec = set(rec.id, { creator: { ...rec.creator, amountRaw, status: amountRaw === "0" ? "none" : "owed" } });
     }
     if (rec.creator.status === "owed") {
+      store.assertDurable();
       creatorPayments.enqueue(rec.id, rec.creator);
       set(rec.id, { creator: { ...rec.creator, status: "queued" } });
     }
   }
 
   async function tick() {
+    store.assertDurable();
     let rows = null;
     try { rows = await client.listActionable(); } catch (e) {
       log(`poll failed: ${errText(e)}`);
