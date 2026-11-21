@@ -868,6 +868,7 @@ export function createNearGate({
         ctx?.announce?.(`payment verified — running ${name}`);
         const result = await registry.callTool(prepared.run, {
           ...ctx,
+          xnoUsd: q.rate?.xnoUsd,
           workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
         });
         // Money-only checkpoint before the funding scope releases creator

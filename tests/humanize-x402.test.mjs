@@ -21,7 +21,7 @@ delete process.env.NANOGPT_API_KEY; // keyless runs only: never fall back to an 
 
 /** Stub NanoGPT speaking x402. `plan(body, phase)` → { status } to fail, or { content }.
  * `priceOf(body)` null omits a price. `invoiceUsd(body)` is the 402 amount. */
-async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRICE, priceOf = () => PRICE, backup = false }) {
+async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRICE, priceOf = () => PRICE, backup = false, billingOf = () => ({}) }) {
   const invoices = new Map(); // paymentId → { body (exact string), paid, completed }
   const log = { chat: [], complete: [], replays: [], backup: [] };
   let n = 0;
@@ -37,7 +37,7 @@ async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRIC
         const payload = { model: b.model, choices: [{ message: { content: p.content } }] };
         const usd = priceOf(b);
         if (usd != null) payload.x_nanogpt_pricing = { costUsd: usd };
-        return send(200, payload);
+        return send(200, { ...payload, ...billingOf(b, req.headers) });
       };
       const m = req.url.match(/^\/api\/x402\/complete\/(.+)$/);
       if (m) {
@@ -100,8 +100,8 @@ async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRIC
     outDir: join(dir, "out"), log: () => {}, humanizeFallbacks: { [CYD]: STARRY },
     ...(backup && { backupKey: "fixture-backup", authorizeBackup: async () => {} }) });
   let hook = null;
-  const run = async (args) => {
-    const result = await registry.callTool({ name: "humanize-comment", arguments: args || { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
+  const run = async (args, ctx) => {
+    const result = await registry.callTool({ name: "humanize-comment", arguments: args || { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } }, ctx);
     const texts = result.content.map((c) => c.text || "");
     const jt = texts.find((x) => /^\{"winner"/.test(x));
     return { result, texts, json: jt ? JSON.parse(jt) : null };
@@ -160,6 +160,38 @@ test("unpriced backup-key results do not appear free, and reported zero is prese
     assert.match(texts.find(line => line.startsWith("cost:")), providerPrice === null
       ? /unavailable/ : /^cost: \$0\.0000$/);
   }
+});
+
+test("the funded backup requests paid usage and sums five writers and the decider in USD", async t => {
+  const glm = "z-ai/glm-5.3";
+  const s = await stub(t, {
+    backup: true,
+    priceOf: () => 0,
+    plan: b => ({ content: b.model === glm ? judge("A") : "rewrite by " + b.model }),
+    billingOf: (body, headers) => {
+      if (!body.include_usage || headers["x-billing-mode"] !== "paygo") return {};
+      return { usage: body.model === glm ? { cost: "0.002", currency: "XNO" } : { cost: 0.0004, currency: "USD" } };
+    },
+  });
+  const { result, texts, json } = await s.run(undefined, { xnoUsd: 0.3 });
+  assert.equal(json.winner, "A");
+  assert.equal(s.log.backup.length, 6);
+  assert.equal(s.paid.length, 0);
+  assert.equal(result.costExact, true);
+  assert.ok(near(result.costUsd, 0.0026), String(result.costUsd));
+  assert.equal(texts.find(line => line.startsWith("cost:")), "cost: $0.0026");
+});
+
+test("a pricing estimate is never settled as a known Humanizer charge", async t => {
+  const s = await stub(t, {
+    backup: true,
+    plan: b => ({ content: b.model === "z-ai/glm-5.3" ? judge("A") : "rewrite by " + b.model }),
+    billingOf: () => ({ x_nanogpt_pricing: { costUsd: PRICE, isEstimate: true } }),
+  });
+  const { result, json } = await s.run();
+  assert.equal(json.winner, "A");
+  assert.equal(result.costExact, false);
+  assert.equal(result.costUsd, null);
 });
 
 test("x402 fallback: Cydonia 429 before any invoice → Starry invoice paid and replayed with Starry's own body, never Cydonia's", async (t) => {

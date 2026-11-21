@@ -1703,7 +1703,9 @@ export function createChargeGate({
             try {
               note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
               const budget = fundRun && fundingTerms(q);
-              const execute = () => registry.callTool({ name, arguments: args }, budget ? { ...ctx, fundedMaxUsd: budget.maxUsd } : ctx);
+              const execute = () => registry.callTool({ name, arguments: args }, {
+                ...ctx, xnoUsd: rateDisplay(q.pair), ...(budget && { fundedMaxUsd: budget.maxUsd }),
+              });
               const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await withHostedRun(() => budget
                 ? fundRun(budget, execute)
                 : execute(), executionLimit);

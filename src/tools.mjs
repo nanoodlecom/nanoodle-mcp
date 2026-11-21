@@ -1372,6 +1372,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
             fetch: runtimeFetch,
             record: tool.humanize,
             hosted,
+            xnoUsd: knownUsd(ctx?.xnoUsd),
             draft: cleanDraft,
             writerDraft: spans.length ? writerDraft : null,
             spans,

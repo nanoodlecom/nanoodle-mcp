@@ -1217,23 +1217,32 @@ function parsePricedInvoice(body, baseUrl) {
   return { ...inv, amountUsd: knownUsd(invoiceUsdRaw(body)) };
 }
 
-const usdOf = (j, r) => {
-  const p = j && j.x_nanogpt_pricing;
-  const pUsd = p && (p.costUsd != null ? p.costUsd : p.cost != null ? p.cost : p.amount);
-  const mUsd = j && j.metadata && j.metadata.cost;
-  const top = j && j.cost != null ? knownUsd(j.cost) : null;
+function chargeInUsd(cost, currency, xnoUsd) {
+  const amount = knownUsd(cost);
+  if (amount === 0 || currency === "USD") return amount;
+  if (amount != null && currency === "XNO" && xnoUsd > 0) return knownUsd(amount * xnoUsd);
+  return null;
+}
+
+const usdOf = (j, r, xnoUsd) => {
+  const usage = j?.usage;
+  const pricing = j?.x_nanogpt_pricing;
+  const p = pricing?.isEstimate === true ? null : pricing;
+  const explicitUsd = knownUsd(p?.costUsd);
+  // The usage charge is final and carries its own currency. A legacy
+  // placeholder zero must never override a known positive usage charge.
+  if (knownUsd(usage?.cost) != null) {
+    const usageUsd = chargeInUsd(usage.cost, usage.currency, xnoUsd);
+    return usageUsd ?? (explicitUsd > 0 ? explicitUsd : null);
+  }
+  const top = knownUsd(j?.cost);
   if (top != null && top > 0) return top;
-  if (pUsd != null) {
-    const n = knownUsd(pUsd);
-    if (n != null) return n;
-  }
-  if (mUsd != null) {
-    const n = knownUsd(mUsd);
-    if (n != null) return n;
-  }
-  if (top != null) return top;
+  const pricingUsd = explicitUsd ?? chargeInUsd(p?.cost ?? p?.amount, p?.currency ?? p?.paymentSource ?? "USD", xnoUsd);
+  if (pricingUsd != null) return pricingUsd;
+  const metadataUsd = knownUsd(j?.metadata?.cost);
+  if (metadataUsd != null) return metadataUsd;
   const header = r && r.headers && r.headers.get ? (r.headers.get("x-cost") || r.headers.get("x-nano-cost")) : null;
-  return header == null ? null : knownUsd(header);
+  return knownUsd(header) ?? top;
 };
 
 /**
@@ -1286,7 +1295,7 @@ export function failedBeforeSend(e, signal) {
  * that invoice was issued for. Once a primary's invoice is paid there is no fallback:
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = NANOGPT_API_ORIGIN, pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0, hosted = false }) {
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = NANOGPT_API_ORIGIN, pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0, hosted = false, xnoUsd = null }) {
   // null is "no cap". An explicit amount, including 0, stays that amount.
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
@@ -1498,6 +1507,15 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     return rec.beforeSend ? 0 : null;
   };
   const jsonResponse = (j, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
+  // Give the workflow engine a single USD value that it already understands.
+  const costResponse = (json, usd, status) => {
+    const out = { ...json };
+    delete out.cost;
+    delete out.metadata;
+    delete out.x_nanogpt_pricing;
+    if (usd != null) out.x_nanogpt_pricing = { costUsd: usd };
+    return jsonResponse(out, status);
+  };
   const messageBytes = (messages) => {
     let n = 0;
     for (const m of messages || []) if (m && typeof m.content === "string") n += tokenUpperBound(m.content);
@@ -1584,7 +1602,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (body && body.model === "z-ai/glm-5.3" && !state.judgeReq) {
         const user = (body.messages || []).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).join("\n");
         const outCap = sizedCap(true);
-        body = { ...body, max_tokens: outCap };
+        body = { ...body, max_tokens: outCap, include_usage: true };
         const held = hold("decider", null, body.model, body.messages, body.max_tokens);
         if (held == null) return skippedResponse();
         state.judgeReq = { url: String(url), headers: init.headers, body, user, signal: init.signal || null };
@@ -1635,7 +1653,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
               if (cr.ok) {
                 let cj = null;
                 try { cj = await cr.clone().json(); } catch { cj = null; }
-                if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { settled = jsonResponse(cj); break; }
+                if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { settled = cr; break; }
                 settled = await fetch(url, { ...init, body: replayBody, headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId } });
                 if (settled.status === 402) {
                   rec.status = 402;
@@ -1664,14 +1682,14 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
             let judged = null;
             try { judged = await settled.clone().json(); } catch { judged = null; }
             noteJudgeFinish(judged);
-            const reported = usdOf(judged, settled);
+            const reported = usdOf(judged, settled, xnoUsd);
             if (reported != null) rec.usd = reported;
             else if (rec.paid) {
               state.costUnknown = true;
               state.unreportedUsd += rec.usd ?? 0;
             }
             finishPaid(held, reported == null ? (settled.ok ? null : rec.usd) : reported, rec.invoiceCommitted);
-            return settled;
+            return settled.ok && judged ? costResponse(judged, reported, settled.status) : settled;
           } catch (e) {
             if (e && (e.budgetRefused || e.priceUnknown)) {
               rec.paymentStarted = false;
@@ -1701,9 +1719,9 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
         let judged = null;
         try { judged = await r.clone().json(); } catch { judged = null; }
         noteJudgeFinish(judged);
-        const reported = usdOf(judged, r);
+        const reported = usdOf(judged, r, xnoUsd);
         finishPaid(held, reported == null ? (r.ok ? null : 0) : reported);
-        return r;
+        return r.ok && judged ? costResponse(judged, reported, r.status) : r;
       }
       return fetch(url, init);
     }
@@ -1713,7 +1731,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     // max_tokens follows the request (maxChars, or the draft length) plus a small
     // slack. The model's own output cap is not what this call can spend.
     const tokenCap = sizedCap();
-    body = { ...body, max_tokens: tokenCap };
+    body = { ...body, max_tokens: tokenCap, include_usage: true };
     const forwardCap = writerForwardByteCap(tokenCap);
     const t0 = now();
     const x402 = !!payment && String(hdr(init.headers, "x-x402")) === "true" && !hdr(init.headers, "authorization");
@@ -1786,8 +1804,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
           }
           if (cr.ok) {
             let cj = null;
-            try { cj = await cr.json(); } catch { cj = null; }
-            if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { r = jsonResponse(cj); break; }
+            try { cj = await cr.clone().json(); } catch { cj = null; }
+            if (cj && typeof cj === "object" && (cj.choices || cj.error == null && cj.data)) { r = cr; break; }
             // settle-only receipt: replay THIS attempt's exact billed body, stamped with its own payment id
             const replayBody = billedBodies.get(String(inv.paymentId)) || bodyStr;
             r = await fetch(url, { ...req, body: replayBody, headers: { ...(init.headers || {}), "x-x402-payment-id": inv.paymentId } });
@@ -1811,7 +1829,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       rec.status = r.status;
       let j = null;
       try { j = await r.clone().json(); } catch { j = null; }
-      const reported = usdOf(j, r); // error answers can carry a price too (kept, not dropped)
+      const reported = usdOf(j, r, xnoUsd); // error answers can carry a price too (kept, not dropped)
       if (reported != null) rec.usd = reported;
       else if (!rec.paid) rec.usd = r.ok ? null : 0; // an error answer with no price is not billed
       if (!r.ok) j = null;
@@ -2043,10 +2061,8 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
       if (text) state.answered[letter] = model;
     }
     const out = { ...j, choices: [{ ...j.choices[0], message: { ...msg, content: text } }] };
-    delete out.cost; delete out.metadata;
-    if (usdKnown) out.x_nanogpt_pricing = { costUsd: usd };
-    else { delete out.x_nanogpt_pricing; state.unreportedUsd += usd; state.costUnknown = true; }
-    return jsonResponse(out);
+    if (!usdKnown) { state.unreportedUsd += usd; state.costUnknown = true; }
+    return costResponse(out, usdKnown ? usd : null);
   };
 
   const headerCopy = (h) => {
@@ -2077,7 +2093,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     const sentBody = JSON.stringify(body);
     const init = { method: "POST", headers: headerCopy(headers), body: sentBody, signal };
     const chatPrice = (j, r, paidUsd) => {
-      const usd = usdOf(j, r);
+      const usd = usdOf(j, r, xnoUsd);
       const n = knownUsd(usd);
       const paid = knownUsd(paidUsd);
       if (n == null) return { known: false, usd: null, paidUsd: paid };

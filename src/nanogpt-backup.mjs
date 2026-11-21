@@ -63,6 +63,7 @@ export function nanoGptBackupFetch({ baseUrl, key, authorize, fetch = globalThis
         : "NanoGPT backup could not reserve the quoted cost.");
     }
     headers.delete("x-x402");
+    headers.set("X-Billing-Mode", "paygo");
     headers.set("Authorization", "Bearer " + key);
     headers.set("x-api-key", key);
     let retry;

@@ -48,9 +48,11 @@ test("Lightning-only quotes authorize one same-body API request and preserve rep
   const [initial, debit, backup] = calls;
   assert.equal(initial.headers.get("x-x402"), "true");
   assert.equal(initial.headers.has("authorization"), false);
+  assert.equal(initial.headers.has("x-billing-mode"), false);
   assert.deepEqual(debit, { paymentId: "quote", amountUsd: 0.10 });
   assert.equal(backup.body, initial.body);
   assert.equal(backup.headers.has("x-x402"), false);
+  assert.equal(backup.headers.get("x-billing-mode"), "paygo");
   assert.equal(backup.headers.get("authorization"), "Bearer " + key);
   assert.equal(backup.redirect, "error");
   assert.deepEqual(costs, [{ usd: 0.02, balance: null }]);
