@@ -407,7 +407,13 @@ hub and NEAR demo. It checks image headers and reads one byte from each audio
 or video sample to verify that the player can load a byte range. All probes
 use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
-during an npm outage. The probes use public discovery, status and pricing.
+during an npm outage. The archival NEAR checks read a published historical
+transaction and its block, then check for a known receipt in its account
+changes and resolve that receipt to the original transaction and signer.
+Each check records both archive results and fails when neither peer can
+verify it.
+The probes use public discovery, status, pricing and historical reads.
+[FastNEAR public transaction fixture](https://docs.fastnear.com/rpc/transaction/tx)
 
 Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
 or use **Run workflow** to check from a separate network. GitHub routes scheduled
