@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
+import { NANOGPT_API_ORIGIN } from "../src/nanogpt-origin.mjs";
 import { readFileSync, mkdirSync, mkdtempSync, chmodSync, statfsSync, rmSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -882,6 +883,14 @@ export async function runOperationalCheck(config, deps = {}) {
     verifyRate("xnoUsd");
     return rateView;
   });
+  await check("nano-checkout-rate", async () => {
+    const checkout = await http(config.nanoSite + "/rates/nano");
+    need(checkout.usable === true && parseUsdNano(checkout.xnoUsd) > 0n, "nano-checkout-rate-unavailable");
+    if (checkout.source !== "static") {
+      const age = now() - Date.parse(checkout.observedAt);
+      need(age >= -30_000 && age < LIVE_RATE_MAX_AGE_MS, "nano-checkout-rate-stale");
+    }
+  }, ["nano"]);
   if (rateView) await check("exchange-rate-near", () => {
     verifyRate("nearUsd");
     // The aggregate quoting flag can also be down because XNO is unavailable.
@@ -1245,7 +1254,7 @@ async function productionConfig(env = process.env) {
     nanoRpcUrls, nanoStandby, nanoLedgerTelemetry: env.OPERATIONAL_NANO_LEDGER_TELEMETRY === "1",
     nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
-    nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
+    nanoGptBase: env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
     agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 

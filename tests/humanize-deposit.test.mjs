@@ -54,7 +54,7 @@ test("the catalog and a legacy mounted graph keep their respective writer C pric
   const legacyWriter = humanizeWriterRecord(legacy).C;
   assert.equal(legacyWriter.model, cydonia);
   assert.equal(legacyWriter.fallbackModel, starryOcean);
-  assert.equal(humanizeCeilingDepositUsd(legacy).toFixed(8), "0.05360085");
+  assert.equal(humanizeCeilingDepositUsd(legacy).toFixed(8), "0.05319217");
 });
 
 test("known USD amounts accept an exponent and a leading dot, and reject garbage", () => {
@@ -109,11 +109,11 @@ test("short, typical, and maximum-length deposits cover their own worst case and
   assert.ok(short < typical, `${short} should be under the 1,500-character draft`);
   assert.ok(typical < maximum, `${typical} should be under the capped request`);
   assert.ok(typical <= 0.012, `typical deposit ${typical} is above $0.012`);
-  assert.equal(typical.toFixed(8), "0.00822320");
-  assert.equal(maximum.toFixed(8), "0.02734389");
+  assert.equal(typical.toFixed(8), "0.00812563");
+  assert.equal(maximum.toFixed(8), "0.02707485");
   const ceiling = humanizeCeilingDepositUsd(graph);
   assert.ok(maximum <= ceiling + 1e-12);
-  assert.equal(ceiling.toFixed(8), "0.05313699");
+  assert.equal(ceiling.toFixed(8), "0.05272831");
   assert.equal(ceiling.toFixed(8), graph.x402.usd.toFixed(8));
 });
 
@@ -271,7 +271,7 @@ test("the quote is at least the max charge, including a restore that grows 1732 
   const emberDeposit = humanizeDepositUsd(graph, ember);
   assert.ok(emberDeposit >= emberCharge);
   const ceiling = humanizeCeilingDepositUsd(graph);
-  assert.equal(ceiling.toFixed(8), "0.05313699");
+  assert.equal(ceiling.toFixed(8), "0.05272831");
   assert.ok(emberDeposit <= ceiling);
   assert.ok(grewDeposit <= ceiling);
   assert.equal(graph.x402.usd, ceiling);

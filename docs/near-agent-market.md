@@ -620,7 +620,7 @@ node scripts/market-worker.mjs --budget-usd 0.50 --listing-price-usd 1.00 --stat
 | `--default-input <name>` | `MARKET_DEFAULT_INPUT` | the graph's only named text node | Which input of the default graph receives the brief. |
 | | `MARKET_NOTIFY_URL` | none | Env only. A webhook that receives `{"text": "…"}` when a job is hired (with the price), delivered, declined, fails or needs the operator. A Slack incoming webhook works as is. The URL is a credential: it is never logged. Buyer-written text is escaped. |
 | `--base-url <url>` | `MARKET_BASE_URL` | `https://market.near.ai` | Market API; tests point it at the stand-in. |
-| `--nanogpt-base <url>` | `NANOGPT_BASE_URL` | `https://nano-gpt.com` | NanoGPT API. |
+| `--nanogpt-base <url>` | `NANOGPT_BASE_URL` | `https://api.nano-gpt.com` | NanoGPT API. |
 | `--state-dir <dir>` | `MARKET_STATE_DIR` | `$XDG_STATE_HOME/nanoodle-market`, else `~/.local/state/nanoodle-market` | Durable state; created 0700. One worker per directory. Always absolute, never relative to the working directory: a restart must find the same records (the path is printed at startup). |
 | `--poll-seconds <n>` | `MARKET_POLL_SECONDS` | `45` | The market asks for 30–60 s. |
 | `--concurrency <n>` | | `2` | Assignments handled at once (max 8). |

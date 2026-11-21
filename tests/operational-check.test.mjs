@@ -154,6 +154,7 @@ function fixture(override = () => null) {
       }
       if (url.hostname === "site.example" || url.hostname === "nano-site.example") {
         if (url.pathname === "/rates") return json({ quoting: true, nearUsd: "3", xnoUsd: "1", sources: Object.fromEntries(["nearUsd", "xnoUsd"].map(name => [name, { usable: true, live: true, at: new Date(NOW).toISOString() }])) });
+        if (url.pathname === "/rates/nano") return json({ usable: true, source: "nanogpt-x402", xnoUsd: 1, observedAt: new Date(NOW).toISOString() });
         if (url.pathname === "/near/health") return json({ active: true, network: "mainnet", merchant: "nanoodle.near",
           funding: { enforced: true, ok: true, checkedAt: NOW, canQuoteNear: true, canQuoteUsdc: true }, watcher: { listening: true, lastScanAt: new Date(NOW).toISOString(), height: 100, backfilling: false } });
         const near = url.hostname === "site.example";
@@ -208,21 +209,6 @@ function bindFixturePayments(ledger, ...ids) {
     ledger.consumedTx[hash] = id;
   }
 }
-
-test("the scheduled check refuses equivalent Nano endpoints before probing them", async t => {
-  const f = fixture();
-  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
-  f.config.nanoRpcUrls = ["https://nano-0.example/rpc", "https://NANO-0.example.:443/v1/../rpc#ignored"];
-
-  const report = await runOperationalCheck(f.config, f.deps);
-  const configuration = report.checks.find(row => row.stage === "nano-rpc-peers");
-  assert.equal(configuration.ok, false);
-  assert.equal(configuration.code, "NANO_RPC_DUPLICATE_PEER");
-  assert.equal(report.admission.nano, false);
-  assert.equal(report.nanoPaymentReadPeers, undefined);
-  assert.ok(f.calls.every(({ url }) => !url.hostname.startsWith("nano-0.example")));
-  assert.ok(report.checks.some(row => row.stage === "near-payment-watcher" && row.ok));
-});
 
 test("operational probes cover live readiness with no inference, signing or Market mutation and a redacted report", async () => {
   const f = fixture(), before = JSON.stringify(f.states);
@@ -1217,6 +1203,21 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_URL|configuration|cooldowns/);
 });
 
+test("the scheduled check refuses equivalent Nano endpoints before probing them", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.nanoRpcUrls = ["https://nano-0.example/rpc", "https://NANO-0.example.:443/v1/../rpc#ignored"];
+
+  const report = await runOperationalCheck(f.config, f.deps);
+  const configuration = report.checks.find(row => row.stage === "nano-rpc-peers");
+  assert.equal(configuration.ok, false);
+  assert.equal(configuration.code, "NANO_RPC_DUPLICATE_PEER");
+  assert.equal(report.admission.nano, false);
+  assert.equal(report.nanoPaymentReadPeers, undefined);
+  assert.ok(f.calls.every(({ url }) => !url.hostname.startsWith("nano-0.example")));
+  assert.ok(report.checks.some(row => row.stage === "near-payment-watcher" && row.ok));
+});
+
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
   for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "stale-history", "inconsistent-newer-view"]) {
     const f = fixture(({ url, body }) => {
@@ -2171,6 +2172,16 @@ test("a stale NEAR spot price leaves the fresh XNO capital checks and other lane
     assert.deepEqual(report.admission, { nano: stale === "near", near: false, usdc: stale === "near", market: stale === "near" });
     assert.equal(report.checks.some(c => c.stage === "nano-liquidity" && c.ok), stale === "near");
   }
+});
+
+test("the Nano checkout probe catches an outage even when the shared rate display works", async t => {
+  const f = fixture(({ url }) => url.pathname === "/rates/nano"
+    ? Response.json({ usable: false, code: "xno-rate-unavailable" }, { status: 503 }) : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  const report = await runOperationalCheck(f.config, f.deps);
+  assert.ok(report.checks.some(c => c.stage === "exchange-rate-xno" && c.ok));
+  assert.ok(report.checks.some(c => c.stage === "nano-checkout-rate" && !c.ok && c.code === "http-503"));
+  assert.deepEqual(report.admission, { nano: false, near: true, usdc: true, market: true });
 });
 
 test("a readable endpoint on the wrong Nano network cannot satisfy operational readiness", async () => {

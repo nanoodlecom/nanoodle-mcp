@@ -995,14 +995,14 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
     "deepseek/deepseek-v4.1-flash-1017": "DEEPSEEK-LINE",
     "gemma-4-12b-it-starry-ocean": "STARRY-LINE",
     "qwen/qwen3.8-27b-antislop": "ANTISLOP-LINE",
-    "kitani/clover-2": "CLOVER-LINE",
+    "tencent/hy4-flash": "HY4-LINE",
   };
   const labels = {
     "qwen/qwen3.8-27b-novelist": "A",
     "deepseek/deepseek-v4.1-flash-1017": "B",
     "gemma-4-12b-it-starry-ocean": "C",
     "qwen/qwen3.8-27b-antislop": "D",
-    "kitani/clover-2": "E",
+    "tencent/hy4-flash": "E",
   };
   const nodes = { A: "w-a", B: "w-b", C: "w-c", D: "w-d", E: "w-e" };
   const rankedIds = {
