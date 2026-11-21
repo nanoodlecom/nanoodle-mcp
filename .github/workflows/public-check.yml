@@ -12,7 +12,9 @@ on:
       - scripts/atomic-json.mjs
       - src/probe-http.mjs
       - src/public-mcp-check.mjs
+      - src/market/fee-guard.mjs
       - src/market/public-availability.mjs
+      - tests/market-check.test.mjs
       - tests/public-mcp-check.test.mjs
 
 permissions:

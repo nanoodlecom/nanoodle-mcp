@@ -7,7 +7,9 @@ test("fee checks share concurrent reads but revalidate the next execution phase"
   let fee = 500, requests = 0;
   const guard = createMarketFeeGuard({ baseUrl: "https://market.fixture", fetch: async (url, init) => {
     requests++; assert.equal(new URL(url).pathname, "/v1/platform/config");
-    assert.equal(new Headers(init.headers).has("authorization"), false);
+    const headers = new Headers(init.headers);
+    assert.equal(headers.has("authorization"), false);
+    assert.equal(headers.get("cache-control"), "no-cache, no-store");
     assert.equal(init.redirect, "error");
     return new Response(JSON.stringify({ platform_fee_bps: fee }));
   } });
