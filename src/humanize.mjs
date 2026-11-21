@@ -1666,7 +1666,10 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
             noteJudgeFinish(judged);
             const reported = usdOf(judged, settled);
             if (reported != null) rec.usd = reported;
-            else if (rec.paid) state.costUnknown = true;
+            else if (rec.paid) {
+              state.costUnknown = true;
+              state.unreportedUsd += rec.usd ?? 0;
+            }
             finishPaid(held, reported == null ? (settled.ok ? null : rec.usd) : reported, rec.invoiceCommitted);
             return settled;
           } catch (e) {

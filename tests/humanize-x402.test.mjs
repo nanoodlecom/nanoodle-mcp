@@ -21,9 +21,9 @@ delete process.env.NANOGPT_API_KEY; // keyless runs only: never fall back to an 
 
 /** Stub NanoGPT speaking x402. `plan(body, phase)` → { status } to fail, or { content }.
  * `priceOf(body)` null omits a price. `invoiceUsd(body)` is the 402 amount. */
-async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRICE, priceOf = () => PRICE }) {
+async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRICE, priceOf = () => PRICE, backup = false }) {
   const invoices = new Map(); // paymentId → { body (exact string), paid, completed }
-  const log = { chat: [], complete: [], replays: [] };
+  const log = { chat: [], complete: [], replays: [], backup: [] };
   let n = 0;
   const srv = createServer((req, res) => {
     let raw = "";
@@ -52,6 +52,14 @@ async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRIC
       }
       if (req.url !== "/api/v1/chat/completions") return send(404, {});
       const b = JSON.parse(raw);
+      if (backup && req.headers.authorization === "Bearer fixture-backup") {
+        log.backup.push(b.model);
+        return answer(raw);
+      }
+      if (backup) {
+        return send(402, { payment: { paymentId: "backup-" + (++n), amountUsd: PRICE,
+          accepted: [{ scheme: "lightning-l402" }] } });
+      }
       const pid = req.headers["x-x402-payment-id"];
       if (pid) { // replay after a settle-only receipt: must be the exact invoiced body, once
         const inv = invoices.get(pid);
@@ -88,7 +96,9 @@ async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRIC
   // and the judge's [C] label move together), and inject the synthetic fallback.
   const graphPath = join(dir, "humanize-comment.noodle-graph.json");
   await writeFile(graphPath, (await readFile(graphPath, "utf8")).split(STARRY).join(CYD));
-  const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port, outDir: join(dir, "out"), log: () => {}, humanizeFallbacks: { [CYD]: STARRY } });
+  const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port,
+    outDir: join(dir, "out"), log: () => {}, humanizeFallbacks: { [CYD]: STARRY },
+    ...(backup && { backupKey: "fixture-backup", authorizeBackup: async () => {} }) });
   let hook = null;
   const run = async (args) => {
     const result = await registry.callTool({ name: "humanize-comment", arguments: args || { Draft: DRAFT, Context: "We cut CI from 14 to 6 minutes." } });
@@ -118,6 +128,38 @@ test("x402 normal: writer invoices are settled by the wrapper, dashes fixed, one
   paidOncePerInvoice(s);
   assert.equal(s.log.replays.length, 0);
   assert.ok(near(result.costUsd, 6 * PRICE), String(result.costUsd));
+});
+
+test("a paid decider invoice is counted once when its response has no price", async t => {
+  const glm = "z-ai/glm-5.3";
+  const s = await stub(t, {
+    plan: b => ({ content: b.model === glm ? judge("A") : "rewrite by " + b.model }),
+    priceOf: b => b.model === glm ? null : PRICE,
+  });
+  const { result, json } = await s.run();
+  assert.equal(json.winner, "A");
+  assert.equal(s.paid.length, 6);
+  paidOncePerInvoice(s);
+  assert.equal(result.costExact, false);
+  assert.ok(near(result.costUsd, 6 * PRICE), String(result.costUsd));
+});
+
+test("unpriced backup-key results do not appear free, and reported zero is preserved", async t => {
+  for (const providerPrice of [null, 0]) {
+    const s = await stub(t, {
+      backup: true,
+      priceOf: () => providerPrice,
+      plan: b => ({ content: b.model === "z-ai/glm-5.3" ? judge("A") : "rewrite by " + b.model }),
+    });
+    const { result, texts, json } = await s.run();
+    assert.equal(json.winner, "A");
+    assert.equal(s.log.backup.length, 6, "all five writers and the decider used the backup key");
+    assert.equal(s.paid.length, 0, "the backup quote authorized a budget, not a Nano transfer");
+    assert.equal(result.costUsd, providerPrice);
+    assert.equal(result.costExact, providerPrice !== null);
+    assert.match(texts.find(line => line.startsWith("cost:")), providerPrice === null
+      ? /unavailable/ : /^cost: \$0\.0000$/);
+  }
 });
 
 test("x402 fallback: Cydonia 429 before any invoice → Starry invoice paid and replayed with Starry's own body, never Cydonia's", async (t) => {
