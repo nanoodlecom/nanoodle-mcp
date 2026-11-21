@@ -20,7 +20,7 @@ async function setup(t, options = {}) {
 test("funding health is private aggregate telemetry and insufficient funds pause new quotes", async t => {
   const w = await setup(t); let balanceRaw = "100";
   const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000, mediaRetentionMs: 86_400_000,
-    snapshot: async () => ({ ...value, balanceRaw, process: { pid: -1, secret: "PROVIDER_PRIVATE" } }) });
+    snapshot: async () => ({ ...value, balanceRaw, creatorReservations: true, process: { pid: -1, secret: "PROVIDER_PRIVATE" } }) });
   t.after(report.stop);
   assert.equal(w.sources.ready(), true);
   assert.equal((await stat(w.file)).mode & 0o777, 0o600);
@@ -28,6 +28,7 @@ test("funding health is private aggregate telemetry and insufficient funds pause
   assert.doesNotMatch(saved, /SECRET|privateExtra/);
   assert.equal(JSON.parse(saved).checkedAt, new Date(2000).toISOString());
   assert.equal(JSON.parse(saved).mediaRetentionMs, 86_400_000);
+  assert.equal(JSON.parse(saved).creatorReservations, true);
   const identity = JSON.parse(saved).process;
   assert.equal(identity.pid, process.pid); assert.equal(identity.uid, process.getuid());
   assert.match(identity.startTicks, /^[1-9][0-9]*$/);
@@ -38,6 +39,25 @@ test("funding health is private aggregate telemetry and insufficient funds pause
   const underfunded = JSON.parse(await readFile(w.file, "utf8"));
   assert.equal(underfunded.ok, false);
   assert.equal(underfunded.mediaRetentionMs, 86_400_000);
+});
+
+test("quote budgets use current unreserved funds under the existing funding lease", async t => {
+  let clock = 2_000, balanceRaw = "100";
+  const w = await setup(t, { now: () => clock });
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => clock,
+    snapshot: async () => ({ ...value, balanceRaw }) });
+  t.after(report.stop);
+  assert.equal(w.sources.ready(), true);
+  assert.equal(w.sources.canFundQuote(1n), false);
+  balanceRaw = "125";
+  await report.refresh();
+  assert.equal(w.sources.canFundQuote(25n), true);
+  assert.equal(w.sources.canFundQuote(26n), false);
+  clock += 60_000;
+  assert.equal(w.sources.canFundQuote(1n), false);
+  balanceRaw = "99";
+  await report.refresh();
+  assert.equal(w.sources.canFundQuote(1n), false);
 });
 
 test("unreadable financial state fails closed and later recovery can resume quote readiness", async t => {
