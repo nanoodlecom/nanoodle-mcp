@@ -30,10 +30,12 @@ threshold together. The operational service's payer key file remains inaccessibl
 When the successful canary's discovery proof is configured, the five-minute
 probe also reads that run's settled payment page, status, event stream, and
 result. It checks that the deposit equals the charge plus the refund, verifies
-the completed graph in the status and event stream, and expects a canary marker
-in the result. The alert omits the checkout ID, receipt, and output. At the
-checkout retention limit, the probe stops reporting a checkout result and
-continues on-chain discovery for the lifetime of the proof.
+the completed graph in the status and event stream, and compares the result to
+the canary marker's SHA-256 digest. Older proofs check the marker format until
+the next successful daily canary publishes a digest. The alert omits the
+checkout ID, receipt, and output. At the checkout retention limit, the probe
+stops reporting a checkout result and continues on-chain discovery for the
+lifetime of the proof.
 
 ## Installation on the production box
 
@@ -111,6 +113,13 @@ and replay can preserve the receipt and refund while losing replayable text.
 This check reports that as a failure. Finish paid checks before restarting the
 app, and inspect the retained original result and on-chain receipt before
 archiving an interrupted manual check.
+
+The five-minute read-only check reports the retained canary's checkout page,
+receipt, graph, event stream and result separately. It can report a missing
+result even when the graph or event stream is also missing. Each receipt is
+checked against the local deposit, charge and refund records, and the
+readable copies must agree. These checks use the existing canary data and
+leave payment admission to the funding and watcher checks.
 
 ## Babel failure alerts
 
