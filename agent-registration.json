@@ -1,0 +1,56 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  "name": "nanoodle",
+  "description": "Saved or agent-composed nanoodle workflows as MCP tools: BYOK, pay per call in Nano, or pay in NEAR",
+  "image": "https://nanoodle.com/icon-512.png",
+  "services": [
+    {
+      "name": "web",
+      "endpoint": "https://nanoodle.com"
+    },
+    {
+      "name": "MCP",
+      "endpoint": "https://mcp.nanoodle.com/mcp",
+      "version": "0.7.0"
+    },
+    {
+      "name": "A2A",
+      "endpoint": "https://mcp.nanoodle.com/.well-known/agent-card.json",
+      "version": "1.0.0"
+    }
+  ],
+  "x402Support": true,
+  "active": true,
+  "registrations": [],
+  "supportedTrust": [],
+  "payments": [
+    {
+      "rail": "nano-x402",
+      "status": "live",
+      "note": "Hosted server charges per call in Nano over x402; the payTo address is held in the hosted server's wallet configuration, not published here.",
+      "payTo": "REPLACE_WITH_NANO_PAYTO_ADDRESS"
+    },
+    {
+      "rail": "near",
+      "status": "live",
+      "note": "Native NEAR deposit-minus-actual-cost with on-chain refund, including agent-composed custom workflows.",
+      "payTo": "nanoodle.near"
+    },
+    {
+      "rail": "base-usdc-x402",
+      "status": "pending",
+      "note": "Base USDC x402 ingress is qualified offline only; it goes live with the durable payment-authority work, and only then does this payTo get filled.",
+      "network": "eip155:8453",
+      "asset": "USDC",
+      "payTo": "REPLACE_WITH_BASE_USDC_PAYTO_ADDRESS"
+    },
+    {
+      "rail": "solana-usdc-x402",
+      "status": "pending",
+      "note": "Solana USDC x402 ingress is qualified offline only, same gate as Base.",
+      "network": "solana:mainnet",
+      "asset": "USDC",
+      "payTo": "REPLACE_WITH_SOLANA_USDC_PAYTO_ADDRESS"
+    }
+  ]
+}

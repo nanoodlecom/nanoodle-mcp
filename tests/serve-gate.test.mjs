@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
-import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain } from "../src/gate.mjs";
+import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain, probeX402Pair } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd, loadTools } from "../src/tools.mjs";
 import { rawToXno } from "../src/wallet.mjs";
@@ -1731,7 +1731,7 @@ test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async ()
   // 0.2 XNO priced at $0.05 → $0.25/XNO → a $0.05 quote should be ~0.2 XNO
   const fetch = async (url, opts) => {
     probes.push(url);
-    assert.match(url, /nano-gpt\.com\/api\/v1\/chat\/completions/);
+    assert.match(url, /^https:\/\/api\.nano-gpt\.com\/api\/v1\/chat\/completions$/);
     assert.equal(opts.headers["x-x402"], "true");
     return {
       status: 402,
@@ -1760,8 +1760,9 @@ test("rate oracle: cached prices expire during an outage and recover with a fres
   const registry = fakeRegistry();
   let t = 1_000_000, probeOk = true, probes = 0;
   const signals = [];
-  const fetch = async (_url, { signal }) => {
+  const fetch = async (url, { signal }) => {
     signals.push(signal);
+    if (new URL(url).hostname !== "api.nano-gpt.com") return new Response("{}", { status: 503 });
     probes++;
     if (!probeOk) return { status: 500, json: async () => ({}) };
     return {
@@ -1783,6 +1784,7 @@ test("rate oracle: cached prices expire during an outage and recover with a fres
   await assert.rejects(() => callTool({ name: "poster", arguments: { Text: "c" } }), /rate probe failed/);
   assert.equal(registry.callCount(), 0);
   probeOk = true;
+  t += 5_000;
   assert.deepEqual(await gate.fundingPair(), { usdNano: 50_000_000n, raw: 10n ** 29n });
 
   // a gate that never got a rate refuses to quote, readably
@@ -1790,6 +1792,73 @@ test("rate oracle: cached prices expire during an outage and recover with a fres
   const cold = makeGate(fakeChain(), { registry, xnoUsd: null, fetch }).wrapRegistry(fakeRegistry());
   await assert.rejects(() => cold.callTool({ name: "poster", arguments: { Text: "a" } }), /rate probe failed/);
   assert.ok(signals.every(signal => signal instanceof AbortSignal), "the quote oracle has a request deadline");
+});
+
+test("rate oracle accepts a valid Nano invoice after an unusable invoice and ignores other rails", async () => {
+  const body = { payment: { accepted: [
+    { scheme: "nano", amount: "1", amountUsd: "0" },
+    { scheme: "lightning-l402", amount: "2", amountUsd: "0.2" },
+    { scheme: "nano-exact", network: "nano:mainnet", asset: "XNO", amount: "3", amountUsd: "0.3" },
+  ] } };
+  const fetch = async () => Response.json(body, { status: 402 });
+  assert.deepEqual(await probeX402Pair({ fetch, url: "https://api.nano-gpt.com" }), { usdNano: 300_000_000n, raw: 3n });
+  body.payment.accepted.pop();
+  await assert.rejects(probeX402Pair({ fetch, url: "https://api.nano-gpt.com" }), /no usable XNO\/USD pair/);
+});
+
+test("rate oracle keeps using NanoGPT when its primary probe model is retired", async () => {
+  const calls = [];
+  const signal = AbortSignal.timeout(1_000);
+  const fetch = async (_url, options) => {
+    const { model, max_tokens } = JSON.parse(options.body);
+    calls.push(model);
+    assert.equal(max_tokens, 256);
+    assert.equal(options.signal, signal);
+    if (model === "glm-5.2") return Response.json({ error: "model retired" }, { status: 410 });
+    return Response.json({ accepts: [
+      { scheme: "nano", maxAmountRequired: "1000000000000000000000000000", maxAmountRequiredUSD: "0.0003" },
+    ] }, { status: 402 });
+  };
+  assert.deepEqual(await probeX402Pair({ fetch, url: "https://api.nano-gpt.com", signal }),
+    { usdNano: 300_000n, raw: 10n ** 27n });
+  assert.deepEqual(calls, ["glm-5.2", "glm-5.3"]);
+});
+
+test("Nano checkout uses fresh independent rates on cold start and prefers NanoGPT when it recovers", async (t) => {
+  const chain = fakeChain();
+  const registry = fakeRegistry();
+  let now = 1_795_196_000_000, coinGeckoFresh = false, oracleReady = false;
+  let probes = 0;
+  const fetchRate = async (url) => {
+    const host = new URL(url).hostname;
+    if (host === "api.coingecko.com") return Response.json({ nano: { usd: 0.4,
+      last_updated_at: now / 1000 - (coinGeckoFresh ? 5 : 301) } });
+    if (host === "api.kraken.com") return Response.json({ error: [], result: { NANOUSD: [["0.5", "10", now / 1000 - 1]] } });
+    assert.equal(host, "api.nano-gpt.com");
+    probes++;
+    return Response.json({ accepts: oracleReady
+      ? [{ scheme: "nano", maxAmountRequired: "100000000000000000000000000000", maxAmountRequiredUSD: "0.025" }]
+      : [{ scheme: "lightning-l402", maxAmountRequired: "1", maxAmountRequiredUSD: "0.025" }] }, { status: 402 });
+  };
+  const gate = makeGate(chain, { registry, fetch: fetchRate, xnoUsd: null, now: () => now, monotonicNow: () => now });
+  const { callTool, listTools } = gate.wrapRegistry(registry);
+  const server = await serveHttp({ host: "127.0.0.1", port: 0, name: "nanoodle-mcp", version: "0.7.0",
+    listTools, callTool, gate, publicBase: "http://pay.test", log: () => {} });
+  t.after(() => server.close());
+  const { port } = server.address();
+  const rateRequest = () => fetch(`http://127.0.0.1:${port}/rates/nano`).then(res => res.json());
+  const [health, first] = await Promise.all([rateRequest(), callTool({ name: "poster", arguments: { Text: "a" } })]);
+  assert.equal(health.source, "kraken");
+  assert.equal(health.xnoUsd, 0.5);
+  assert.equal(BigInt(argOf(first).amountRaw) / 10n ** 26n, 1_000n);
+  assert.equal(probes, 1);
+  assert.equal(registry.callCount(), 0);
+  now += 60_000;
+  coinGeckoFresh = true;
+  assert.equal((await rateRequest()).source, "coingecko");
+  now += 60_000;
+  oracleReady = true;
+  assert.equal((await rateRequest()).source, "nanogpt-x402");
 });
 
 test("hashArgs is order-insensitive and value-sensitive", () => {

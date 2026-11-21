@@ -1,6 +1,6 @@
 {
   "name": "a-files",
-  "url": "https://nanoodle.com/play.html#a=H4sIAAAAAAAAA4WSUW7bMAyGr8LxWXFtp9kAIeghhj2sGPqgRqxNVKIES03iBAZ2iJ1wJxkUJ3ALFNibLen_f_Ijz7hH3SjsBhN71OfrrwRLCfWvM7JFjdKgwjxGQo2ZjhkVHlF_rRWOqJt1rfCFydlUDC73Gg3swmmEwXgSSH2IEAQMDIZlBOGuzzgpPKBu23pSt5x2yXHOzzHr-znn24cYHyw51HgyvApDd9c5v9pURZ_GlMmjxsfwBoeBMwF70xHEIfiYUwU_3gaB3BOwJQMsOUAQgj3v2SqwlA07sh9U8Pf3H0g7ElLgSvUsnQIfglWQ8uiogu8U3QgHzv3F-6oL4sbq1uqmVpj4RJcObnU2bT0tBNYLgUv-FfXmyrr-FIIYCatnI0bMql05zkVWglBj84oK92ZgkzlIKidLOdOTQsfy-m7Wrsz6ZQi-BJQ9uM0_hiHf5j8pzOH9g3Z5MDeOS0-u_cSx_Z_j-hPHJ4VSLDelaov6XuGe6VBk0chP1GVVopHHeTnTzjhC3UxTgeZm7CyWjlWffQG3_WLDruCGcvCwzZwdPeTt3fyBCk2M1S4VbM_Bjmdvho5F1xNO0z_t-KHmPAMAAA",
+  "url": "https://nanoodle.com/play.html#a=H4sIAAAAAAAAA4WSQW7bMBBFrzKdNa1IctwChJFDFF00KLJgxLFEhBwSJGNbNgT0ED1hT1LQsqEEMNCdRHL-n3l_zrhH2QjsowoDyvP1l72mhPLXGY1GidygwDwGQomZjhkFHlF-rQWOKJt1LXBnyOpUBC73EhV0_jRCVI4Y0uADeAYFURkegU0_ZJwEHlC2bT2Jm0-7-FjrZpv14-zz7ZON85osSjwps_Kxf-itW22qUp_GlMmhxGf_DodoMoFxqicI0buQUwU_3iNDHgiMJgWGswfPBHuzN1qApqyMJf2pCv7-_gOpIyYBtnRvuBfgvNcCUh4tVfCdgh3hYPJw0b7WebZjdRt1UwtM5kSXCW59Nm09LQTWC4GL_xX15sq6vguBFfvVq2LFatWudiqVhIoRSmzeUOBeRaOy8ZzKydLO9CLQGn77kLUtWe-id8Wg7MEt_-BjvuU_Ccz-44N2eTAPjstMtr2j2P5PcX1H8UUgF8lN6VqjfBS4N3QoZUHxT5RlVYLi53k5U6csoWymqUCzM3bDmo7VkF0Bt_2ifVdwQzl42maTLT3l7cP8gQJVCFWXCrZXr8ezU7E3LOsJp-kfa8EWTTwDAAA",
   "graph": {
     "v": 1,
     "nodes": [
@@ -34,7 +34,7 @@
         "x": 650,
         "y": 100,
         "fields": {
-          "model": "nano-banana-2-lite",
+          "model": "nano-banana-2-fast",
           "size": "1k",
           "variations": "1"
         },

@@ -27,6 +27,14 @@ ID. For a named payer, set `CHECK_PAYER_PUBLIC_KEY` in the canary environment
 file. `CHECK_MAX_NEAR` configures the canary's default cap and the monitoring
 threshold together. The operational service's payer key file remains inaccessible.
 
+When the successful canary's discovery proof is configured, the five-minute
+probe also reads that run's settled payment page, status, event stream, and
+result. It checks that the deposit equals the charge plus the refund, verifies
+the completed graph in the status and event stream, and expects a canary marker
+in the result. The alert omits the checkout ID, receipt, and output. At the
+checkout retention limit, the probe stops reporting a checkout result and
+continues on-chain discovery for the lifetime of the proof.
+
 ## Installation on the production box
 
 Create a `nanoodle-check` system user. Generate a dedicated key with
@@ -245,8 +253,14 @@ Coverage:
   enabled. The probe distinguishes a local counter regression, a stalled
   confirmed count and a gap that keeps growing. A widening gap of at least
   50 blocks over at least ten minutes warns even while both counts advance.
-  Stable historical lag and missing samples do not carry a widening trend
-  forward. Wallet read quorum still determines Nano payment readiness.
+  The warning needs two increases and tolerates short plateaus between
+  them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
+  clear the trend. The elapsed time comes from the counter observations.
+  Wallet read quorum determines Nano payment readiness.
+- Recent paid workflow execution failures from the Nano and NEAR/USDC
+  ledgers. The report includes aggregate counts for the last 30 minutes.
+  Two or more failed runs raise an advisory while payment admission
+  continues. Refunds for late or wrong-amount transfers are outside this check.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the
@@ -388,7 +402,10 @@ and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund fundin
 the Babel authentication challenge, and NEAR AI Market's public site, API and
 Nanoodle listings. The free `price_noodle` probes check that the decision model
 and both branches are priced in NEAR and USDC, and the estimated charge fits
-the deposit. All probes use bounded retries and record only check results.
+the deposit. The hosted runner also checks rendered preview images on the Nano
+hub and NEAR demo. It checks image headers and reads one byte from each audio
+or video sample to verify that the player can load a byte range. All probes
+use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
 during an npm outage. The probes use public discovery, status and pricing.
 

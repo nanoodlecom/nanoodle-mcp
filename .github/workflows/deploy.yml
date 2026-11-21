@@ -10,18 +10,23 @@ permissions:
   contents: read
 concurrency:
   group: nanoodle-production-deploy
+  queue: max
   cancel-in-progress: false
 jobs:
   deploy:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.path == '.github/workflows/test.yml' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      activated: ${{ steps.release.outputs.activated }}
     steps:
       - name: Deploy to 255labs box
+        id: release
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           TESTED_REVISION: ${{ github.event.workflow_run.head_sha }}
@@ -33,4 +38,105 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           echo "159.195.17.119 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHcFN8/48EuW9f6MXgGx9a/syadihZ4XpY+EazT2KbQe" > ~/.ssh/known_hosts
-          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp $TESTED_REVISION"
+          for attempt in 1 2 3 4; do
+            if receipt=$(ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts root@159.195.17.119 "nanoodle-mcp $TESTED_REVISION"); then
+              break
+            fi
+            code=$(jq -ers 'select(length == 1) | .[0] | select(.ok == false) | .code |
+              select(type == "string" and test("^[a-z0-9-]{1,80}$"))' <<<"$receipt" 2>/dev/null || true)
+            if [[ "$code" != maintenance-lock-busy || "$attempt" == 4 ]]; then
+              printf 'Production deploy failed (%s)\n' "${code:-missing host receipt}" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          phase=$(jq -ers --arg revision "$TESTED_REVISION" '
+            select(length == 1) | .[0] | select(.ok == true and .revision == $revision) |
+            select(.phase == "superseded" or
+              ((.phase == "open" or .phase == "already-running") and (.pid | type == "number" and . > 0))) |
+            .phase
+          ' <<<"$receipt")
+          if [[ "$phase" == superseded ]]; then
+            printf 'A newer main revision superseded %s\n' "$TESTED_REVISION" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'activated=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.release.outputs.activated == 'true'
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Verify the deployed revision on Nano and NEAR
+        if: steps.release.outputs.activated == 'true'
+        env:
+          TESTED_REVISION: ${{ github.event.workflow_run.head_sha }}
+        run: bash .github/scripts/check-hosted-revision.sh "$TESTED_REVISION" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Dispatch publication after hosted deployment
+    needs: deploy
+    if: needs.deploy.outputs.activated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Start publication for the exact activated revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_REVISION: ${{ github.event.workflow_run.head_sha }}
+          TEST_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          [[ "$TESTED_REVISION" =~ ^[0-9a-f]{40}$ && "$TEST_RUN" =~ ^[0-9]+$ ]]
+          current=$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)
+          if [[ "$current" != "$TESTED_REVISION" ]]; then
+            echo 'Main advanced after activation. Publication follows the current revision.'
+            exit 0
+          fi
+          version=$(gh api "repos/$GITHUB_REPOSITORY/contents/package.json?ref=$TESTED_REVISION" --jq .content |
+            base64 --decode | jq -er 'select(.name == "nanoodle-mcp") | .version | strings')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+
+          intents=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-release-intent-v$version&per_page=30" \
+            --jq '.artifacts[] | select(.expired == false and .workflow_run.head_branch == "main") | .workflow_run.id')
+          if ! grep -Fxq "$TEST_RUN" <<<"$intents"; then
+            # Carry forward a version bump whose own deploy was superseded by another main push.
+            inherited=false
+            while IFS= read -r run; do
+              [[ "$run" =~ ^[0-9]+$ ]] || continue
+              source=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" | jq -r --arg repo "$GITHUB_REPOSITORY" '
+                select(.repository.full_name == $repo and .head_repository.full_name == $repo and
+                  .event == "push" and .head_branch == "main" and .path == ".github/workflows/test.yml" and
+                  .status == "completed" and .conclusion == "success") | .head_sha')
+              [[ "$source" =~ ^[0-9a-f]{40}$ ]] || continue
+              relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source...$TESTED_REVISION" --jq .status)
+              if [[ "$relation" == ahead || "$relation" == identical ]]; then
+                inherited=true
+                break
+              fi
+            done <<<"$intents"
+            if [[ "$inherited" != true ]]; then
+              echo "No qualified main push requested publication of $version."
+              exit 0
+            fi
+            status=$(curl -q --proto '=https' --connect-timeout 5 --max-time 15 --max-filesize 1048576 \
+              --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              "https://registry.npmjs.org/nanoodle-mcp/$version")
+            case "$status" in
+              200) echo "Package version $version is already published."; exit 0 ;;
+              404) ;;
+              *) echo "Package version lookup returned HTTP $status." >&2; exit 1 ;;
+            esac
+          fi
+          tag="refs/tags/v$version"
+          refs=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "$tag" "$tag^{}")
+          tagged=$(awk -v tag="$tag" '$2 == tag { direct=$1 } $2 == tag "^{}" { peeled=$1 }
+            END { print peeled ? peeled : direct }' <<<"$refs")
+          if [[ -n "$tagged" && "$tagged" != "$TESTED_REVISION" ]]; then
+            printf 'Release %s is already pinned to %s. Publication requires that revision.\n' "$version" "$tagged" >&2
+            exit 1
+          fi
+          gh workflow run test.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f version="$version" -f deployed_revision="$TESTED_REVISION"

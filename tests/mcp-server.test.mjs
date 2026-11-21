@@ -163,7 +163,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.equal(srv.messages.length, framesBefore + 1, "notifications/initialized must not be answered");
     const tools = list.result.tools;
     // one tool per fixture graph, plus the always-present run_noodle tool and its free helpers
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "noodle_guide", "poster", "price_noodle", "restyle", "run_noodle", "sfw_check", "subnano_comment"]);
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["greeting-card", "hello-noodle", "noodle_guide", "poster", "price_noodle", "restyle", "run_noodle", "sfw_check"]);
 
     // media-typed input advertises "file path or https URL"
     const restyle = tools.find((t) => t.name === "restyle");
@@ -506,7 +506,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
       t("n2", "Style guide"),
       { id: "n3", type: "join", x: 0, y: 0, fields: {} },
       { id: "n4", type: "llm", x: 0, y: 0, fields: { model: "test-model" } },
-      { id: "n5", type: "image", x: 0, y: 0, name: "Mockup", fields: { model: "openai/nano-banana-2-lite", size: "1024x1024" } },
+      { id: "n5", type: "image", x: 0, y: 0, name: "Mockup", fields: { model: "openai/nano-banana-2-fast", size: "1024x1024" } },
     ],
     [
       link("l1", ["n1", "text"], ["n3", "a"]),
@@ -533,7 +533,7 @@ test("tool descriptions: chain annotations, ×N collapsing, and the returns cont
 
   assert.equal(desc.named,
     "text:Feature -> text:Style guide -> join -> llm -> image:Mockup; " +
-    "returns image (nano-banana-2-lite, 1024×1024) saved to disk (file path in result). " +
+    "returns image (nano-banana-2-fast, 1024×1024) saved to disk (file path in result). " +
     "Runs on NanoGPT — every call spends real credit from your API key's balance.");
   assert.equal(desc.collapse,
     "text×2 -> join -> llm; returns text. " +
@@ -706,7 +706,7 @@ test("multiple --graphs dirs merge into one tool set, each tool tagged with its 
 
   const reg = await loadTools({ dirs: [a, b], apiKey: "test-key", outDir: a });
   assert.deepEqual(reg.failures, []);
-  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta", "sfw_check", "subnano_comment"]);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["alpha", "beta", "sfw_check"]);
   // each tool remembers which dir it came from (keeps same-named files distinguishable)
   assert.equal(reg.tools.find((t) => t.name === "alpha").dir, a);
   assert.equal(reg.tools.find((t) => t.name === "beta").dir, b);
@@ -735,7 +735,7 @@ test("single --graphs dir behaves exactly as before (bare names, no suffixes)", 
   await writeGraph(dir, "two.json");
 
   const reg = await loadTools({ dirs: [dir], apiKey: "test-key", outDir: dir });
-  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "sfw_check", "subnano_comment", "two"]);
+  assert.deepEqual(reg.tools.map((t) => t.name).sort(), ["one", "sfw_check", "two"]);
 });
 
 test("an unreadable --graphs dir is a hard error naming the specific dir", async () => {

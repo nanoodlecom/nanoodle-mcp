@@ -12,7 +12,7 @@
  *   NEAR/USD  static (--near-usd / NEAR_USD), else CoinGecko's public price
  *   XNO/USD   static (--xno-usd), else NanoGPT's own x402 invoice pair (the
  *             rate the float is actually spent at, the same probe the Nano
- *             gate uses), else CoinGecko's `nano` price
+ *             gate uses), else a fresh CoinGecko or Kraken price
  *
  * Refresh: a background timer (refreshMs, unref'd), a lazy refresh when a
  * quote finds a live rate older than ttlMs, and a forced refresh (SIGHUP in
@@ -27,12 +27,13 @@
  * fraction: the locked pair is { usdNano, yocto: 10^24 * (10000 + bps) / 10000 },
  * exact in BigInt. With 0 the pair is exactly { usdNano, 10^24 }, as before.
  */
-import { LIVE_RATE_MAX_AGE_MS, parseUsdNano, probeX402Pair, x402ProbeUrl } from "../gate.mjs";
+import { parseUsdNano, probeX402Pair, x402ProbeUrl } from "../gate.mjs";
+import { COINGECKO_RATES_URL, RAW_PER_XNO, LIVE_RATE_MAX_AGE_MS, fetchCoinGeckoRates,
+  fetchKrakenNanoRate, marketRateFresh } from "../market-rates.mjs";
 import { YOCTO_PER_NEAR } from "./amount.mjs";
 import { NearError } from "./errors.mjs";
 
-export const COINGECKO_RATES_URL = "https://api.coingecko.com/api/v3/simple/price?ids=near,nano&vs_currencies=usd&include_last_updated_at=true";
-export const RAW_PER_XNO = 10n ** 30n;
+export { COINGECKO_RATES_URL, RAW_PER_XNO };
 export const MAX_SPREAD_BPS = 2000;
 const NANO_PER_USD = 1_000_000_000n;
 const MAX_RATE_CLOCK_SKEW_MS = 30_000;
@@ -70,18 +71,6 @@ function positiveUsd(text, what) {
   try { nano = parseUsdNano(typeof text === "string" ? text.trim() : text); } catch { nano = 0n; }
   if (nano <= 0n) throw new NearError("BAD_RATE", `the ${what} rate must be a positive decimal, got ${JSON.stringify(String(text).slice(0, 32))}`);
   return nano;
-}
-
-function cgField(text, id) {
-  const block = text.match(new RegExp(`"${id}"\\s*:\\s*\\{([^}]*)\\}`));
-  if (!block) return null;
-  const usd = block[1].match(/"usd"\s*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)/);
-  if (!usd) return null;
-  let usdNano;
-  try { usdNano = parseUsdNano(usd[1]); } catch { return null; }
-  if (usdNano <= 0n) return null;
-  const upd = block[1].match(/"last_updated_at"\s*:\s*([0-9]{1,13})\b/);
-  return { usd: usd[1], usdNano, updatedMs: upd ? Number(upd[1]) * 1000 : null };
 }
 
 const errText = (e) => String((e && e.message) || e).slice(0, 200);
@@ -159,20 +148,14 @@ export function createNearRates({
   const freshAt = (at, t) => t - at >= -MAX_RATE_CLOCK_SKEW_MS && t - at < maxStaleMs;
   const usable = (rec, t) => !!rec && (rec.fetchedAt === Infinity || freshAt(rec.fetchedAt, t) && freshAt(rec.observedAt, t));
 
-  function coinGeckoRate(value, t) {
+  function marketObservation(value, t, { requireTimestamp = false } = {}) {
     if (!value) return null;
-    const { usd, usdNano, updatedMs } = value;
-    const observedAt = updatedMs ?? t;
-    if (!freshAt(observedAt, t)) return null;
-    return { usd, usdNano, source: "coingecko", at: iso(observedAt), observedAt, fetchedAt: t };
+    const observedAt = value.observedAt ?? (requireTimestamp ? null : t);
+    if (!marketRateFresh(observedAt, t, maxStaleMs)) return null;
+    return { ...value, at: iso(observedAt), observedAt, fetchedAt: t };
   }
 
-  async function fetchCoinGecko() {
-    const res = await fetch(coingeckoUrl, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(timeoutMs), redirect: "error" });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`CoinGecko answered HTTP ${res.status}`);
-    return { near: cgField(text, "near"), nano: cgField(text, "nano") };
-  }
+  const fetchCoinGecko = () => fetchCoinGeckoRates(fetch, { url: coingeckoUrl, timeoutMs });
 
   async function doRefresh() {
     if (!anyLive()) return;
@@ -183,12 +166,22 @@ export function createNearRates({
       wantNear ? fetchCoinGecko() : Promise.resolve({ near: null, nano: null }),
       wantXno ? probeX402Pair({ fetch, url: probeUrl, signal: AbortSignal.timeout(timeoutMs) }) : Promise.resolve(null),
     ]);
-    if (wantXno && !wantNear && probe.status === "rejected") [cg] = await Promise.allSettled([fetchCoinGecko()]);
+    const failedProbe = wantXno && probe.status === "rejected";
+    const providerCache = failedProbe && xno?.source === "nanogpt-x402" && usable(xno, now());
+    if (failedProbe && !providerCache && !wantNear) [cg] = await Promise.allSettled([fetchCoinGecko()]);
+    let fallback = null;
+    if (failedProbe && !providerCache) {
+      fallback = cg.status === "fulfilled" ? marketObservation(cg.value.nano, now(), { requireTimestamp: true }) : null;
+      if (!fallback) {
+        const kraken = await fetchKrakenNanoRate(fetch, { timeoutMs: Math.min(timeoutMs, 3_000) }).catch(() => null);
+        fallback = marketObservation(kraken, now(), { requireTimestamp: true });
+      }
+    }
     const t = now();
     lastRefreshAt = t;
     // The configuration may have changed while the fetches ran (SIGHUP): only fill sides still live.
     if (wantNear && nearLive()) {
-      const v = cg.status === "fulfilled" ? coinGeckoRate(cg.value.near, t) : null;
+      const v = cg.status === "fulfilled" ? marketObservation(cg.value.near, t) : null;
       if (v) {
         near = v;
         nearError = null;
@@ -203,13 +196,15 @@ export function createNearRates({
           source: "nanogpt-x402", at: iso(t), observedAt: t, fetchedAt: t };
         xnoError = null;
       } else {
-        const v = cg.status === "fulfilled" ? coinGeckoRate(cg.value.nano, t) : null;
         const why = `NanoGPT x402 probe: ${probe.status === "rejected" ? errText(probe.reason) : "no answer"}`;
-        if (v) {
-          xno = { ...v, pair: { usdNano: v.usdNano, raw: RAW_PER_XNO } };
-          xnoError = `${why}; using CoinGecko`;
+        if (providerCache && usable(xno, t)) {
+          xno = { ...xno, fetchedAt: t };
+          xnoError = `${why}; using the recent NanoGPT rate`;
+        } else if (fallback && usable(fallback, t)) {
+          xno = { ...fallback, pair: { usdNano: fallback.usdNano, raw: RAW_PER_XNO } };
+          xnoError = `${why}; using ${fallback.source === "coingecko" ? "CoinGecko" : "Kraken"}`;
         } else {
-          xnoError = `${why}; CoinGecko: ${cg.status === "rejected" ? errText(cg.reason) : "no fresh XNO/USD price"}`;
+          xnoError = `${why}; no fresh XNO/USD price from CoinGecko or Kraken`;
         }
       }
     }

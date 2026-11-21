@@ -162,6 +162,38 @@ test("a blocking alert can pass older advisories and unreadable outbox records",
   assert.deepEqual([retry.ok, retry.queued, retry.pending, retry.invalid], [false, 1, 0, 2]);
 });
 
+test("a large alert outbox preserves and rotates pending failures after a bounded retry", async t => {
+  const config = setup();
+  t.after(() => rmSync(config.stateDir, { recursive: true, force: true }));
+  let at = Date.now(), unavailable = true;
+  const requests = [], firstRequest = new Map();
+  const now = () => at;
+  for (let n = 1; n <= 12; n++) {
+    await deliverAlerts(config, { env: { ...invocation, MONITOR_UNIT: MARKET_UNIT,
+      MONITOR_INVOCATION_ID: n.toString(16).padStart(32, "0") }, now, enqueueOnly: true });
+  }
+  const call = async (_name, args) => {
+    requests.push(args.message_id);
+    if (firstRequest.has(args.message_id)) assert.deepEqual(args, firstRequest.get(args.message_id));
+    else firstRequest.set(args.message_id, args);
+    if (unavailable) throw Error("synthetic Babel outage");
+    return { message: { id: args.message_id, recipient: EMBER, source: config.sender, status: "queued" } };
+  };
+  const deliver = () => deliverAlerts(config, { env: {}, call, now });
+  const first = await deliver();
+  assert.deepEqual([requests.length, first.ok, first.pending], [8, false, 12]);
+  at += 300_000;
+  const second = await deliver();
+  assert.deepEqual([requests.length, second.ok, second.pending], [16, false, 12]);
+  assert.equal(new Set(requests).size, 12, "an outage does not starve alerts outside the first batch");
+
+  unavailable = false;
+  const partial = await deliver();
+  assert.deepEqual([partial.ok, partial.queued, partial.pending], [false, 8, 4]);
+  const recovered = await deliver();
+  assert.deepEqual([recovered.ok, recovered.queued, recovered.pending], [true, 4, 0]);
+});
+
 test("drafts and incorrect recipient responses remain pending, without bypassing bridge approval", async () => {
   for (const override of [{ status: "draft" }, { recipient: "other" }]) {
     const config = setup();
