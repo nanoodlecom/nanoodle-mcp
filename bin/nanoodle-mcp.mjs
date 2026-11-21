@@ -416,6 +416,7 @@ async function main() {
           requireFunding: paidFunding && !apiKey,
           protectTransfers: guardedFunding,
           verifyRpcReads: guardedFunding,
+          trustOwnedPrimary: process.env.NANO_RPC_TRUST_OWNED_PRIMARY === "1",
           checkpointFile,
           fundingReportFile: guardedFunding ? join(resolvedOut, "funding-health.json") : null,
           assertWriter: () => {

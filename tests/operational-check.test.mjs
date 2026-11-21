@@ -1298,6 +1298,36 @@ test("the scheduled check refuses equivalent Nano endpoints before probing them"
   assert.ok(report.checks.some(row => row.stage === "near-payment-watcher" && row.ok));
 });
 
+test("owner RPC qualification keeps Nano checkout open during public RPC failure", async t => {
+  for (const scenario of ["owned", "fallback", "unavailable"]) {
+    const f = fixture(({ url, body }) => {
+      if (url.hostname === "100.100.0.1") {
+        if (scenario !== "owned") return new Response(null, { status: 503 });
+        if (body.action === "block_info") return Response.json(NANO_GENESIS_REPLY);
+        if (body.action === "account_history") return Response.json(rawHistory(body));
+        if (body.action === "receivable") return Response.json({ blocks: "" });
+        return Response.json(nanoAccountInfo({ frontier: "A".repeat(64), balance: "10000000000000000000000000000000" }));
+      }
+      if (url.hostname === "nano-2.example" && scenario !== "fallback") return new Response(null, { status: 429 });
+      return null;
+    });
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.nanoRpcUrls = ["http://100.100.0.1:7077", "https://nano-1.example", "https://nano-2.example"];
+    f.config.trustOwnedPrimary = true;
+    const owned = scenario === "owned", peers = owned ? 1 : 2;
+    Object.assign(f.states["/state/funding-health.json"].nanoRpc, {
+      configuredPeers: 3, ownedPrimaryInUse: owned, minimumPeers: peers, readablePeers: peers, networkPeers: peers,
+    });
+    const report = await runOperationalCheck(f.config, f.deps);
+    const stage = name => report.checks.find(row => row.stage === name);
+    assert.equal(report.admission.nano, scenario !== "unavailable", scenario);
+    assert.equal(stage("nano-owned-payment-read").ok, owned, scenario);
+    assert.equal(stage("nano-fallback-payment-reads").ok, scenario === "fallback", scenario);
+    if (!owned) assert.deepEqual(stage("nano-owned-payment-read").domains, []);
+    assert.equal(report.nanoPaymentReadPeers, scenario === "unavailable" ? undefined : peers);
+  }
+});
+
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
   for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "stale-history", "inconsistent-newer-view"]) {
     const f = fixture(({ url, body }) => {

@@ -78,6 +78,11 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
           report.nanoRpc = { enforced: n.enforced === true, configuredPeers: n.configuredPeers, minimumPeers: n.minimumPeers,
             readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt,
             checkpoint: selectNanoCheckpoint(n.checkpoint) };
+          if (n.ownedPrimaryInUse !== undefined) {
+            if (typeof n.ownedPrimaryInUse !== "boolean" || n.configuredPeers < 3
+                || (n.ownedPrimaryInUse && (n.readablePeers !== 1 || n.standby?.inUse))) throw Error("invalid owned Nano primary observation");
+            report.nanoRpc.ownedPrimaryInUse = n.ownedPrimaryInUse;
+          }
           if (n.standby !== undefined) {
             const { inUse, requestsPerMinute, coldPaymentScanRequests } = n.standby;
             if (typeof inUse !== "boolean" || !Number.isSafeInteger(requestsPerMinute) || requestsPerMinute < 3 || requestsPerMinute > 120
@@ -101,7 +106,8 @@ export async function startFundingReport({ outDir, snapshot, sources, rpcStatus 
           const age = observedAt - n.lastReadAt;
           readExpiresAt = Math.min(n.lastReadAt + FUNDING_REPORT_MAX_AGE_MS, expiresAt ?? Infinity);
           const rpcHealthy = report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
-            && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
+            && n.minimumPeers === (n.ownedPrimaryInUse ? 1 : Math.min(2, n.configuredPeers))
+            && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
             && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers
             && age >= -30_000 && observedAt < readExpiresAt;
           if (!rpcHealthy) { report.ok = false; report.code = "nano-read-guard-unhealthy"; }

@@ -45,6 +45,19 @@ export function assertDistinctNanoRpcPeers(bases) {
   }
 }
 
+export function nanoOwnedPrimary(bases, enabled) {
+  if (!enabled) return null;
+  const url = URL.parse(bases[0]);
+  // Trust is explicitly assigned to the first RPC on the private tailnet.
+  const octets = url?.hostname.split(".").map(Number);
+  if (!url || !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash
+      || octets.length !== 4 || octets[0] !== 100 || octets[1] < 64 || octets[1] > 127
+      || bases.length < 3) {
+    throw new TypeError("An owned Nano primary requires a first RPC at a Tailscale IPv4 address and two fallback endpoints");
+  }
+  return bases[0];
+}
+
 export function nanoStandbyConfig(bases, { url, requestsPerMinute } = {}) {
   if (url === undefined && requestsPerMinute === undefined) return null;
   const endpoint = URL.parse(String(url ?? "").trim().replace(/\/+$/, ""));
@@ -154,9 +167,11 @@ export function checkedHistory(value, checkAddress) {
 
 /** Read-only account ordering, shared by hosted wallet paths. No PoW, signing,
  * publication, inference or balance aggregation across different snapshots. */
-export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBlock, standby: standbyOptions,
+export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBlock, standby: standbyOptions, trustOwnedPrimary = false,
   persistConfirmed = null, previousFundingReport = null, now = Date.now, monotonicNow = () => performance.now(), networkTtlMs = 30_000 }) {
   assertDistinctNanoRpcPeers(bases);
+  const ownedPrimary = nanoOwnedPrimary(bases, trustOwnedPrimary);
+  const fallbackBases = ownedPrimary ? bases.slice(1) : bases;
   if (typeof checkAddress !== "function" || typeof hashBlock !== "function") throw new TypeError("Nano read pool needs wallet-owned address and hash validators");
   const standby = nanoStandbyConfig(bases, standbyOptions), standbyUrl = standby?.url;
   const allBases = standby ? [...bases, standbyUrl] : bases;
@@ -173,7 +188,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     } catch { /* Unusable advisory data confers no authority on any peer. */ }
   }
   let high = null, final = null, blocked = false, lastReadAt = null, readPeers = 0, preferred = [], inflightNetwork = null;
-  let standbyInUse = false, standbyTail = Promise.resolve();
+  let standbyInUse = false, ownedPrimaryInUse = false, lastReadBases = [], standbyTail = Promise.resolve();
   let paymentWindowPriorityUntil = -Infinity;
   let standbyAccountEvidence = null;
   const standbyAttempts = [];
@@ -219,8 +234,8 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   async function networkBases() {
     if (inflightNetwork) return inflightNetwork;
     inflightNetwork = (async () => {
-      await Promise.all(bases.map(proveNetwork));
-      return bases.filter(availableProof);
+      await Promise.all(fallbackBases.map(proveNetwork));
+      return fallbackBases.filter(availableProof);
     })().finally(() => { inflightNetwork = null; });
     return inflightNetwork;
   }
@@ -247,10 +262,10 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     return attempt;
   }
   const infoRequest = () => ({ action: "account_info", account, representative: "true", include_confirmed: "true", receivable: "true" });
-  function select(rows) {
+  function select(rows, required = minimum) {
     readPeers = 0;
     if (blocked) throw fail("NANO_RPC_CONFLICT");
-    if (rows.length < minimum) throw fail("NANO_RPC_READ_QUORUM", "Not enough readable mainnet Nano peers; new spending is paused");
+    if (rows.length < required) throw fail("NANO_RPC_READ_QUORUM", "Not enough readable mainnet Nano peers; new spending is paused");
     const latestConfirmed = rows.reduce((a, b) => a.view.confirmedHeight >= b.view.confirmedHeight ? a : b).view;
     if (final && (latestConfirmed.confirmedHeight < final.confirmedHeight
         || (latestConfirmed.confirmedHeight === final.confirmedHeight && latestConfirmed.confirmedFrontier !== final.confirmedFrontier))) throw fail("NANO_RPC_REGRESSION");
@@ -263,20 +278,23 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     if (high && (v.height < high.height || (v.height === high.height && (v.frontier !== high.frontier || v.balance !== high.balance
         || (high.pending != null && v.pending < high.pending))))) throw fail("NANO_RPC_REGRESSION");
     if (persistConfirmed) {
-      // A merely readable peer can lag. A frontier that survives restarts
-      // must have two witnesses for the same confirmed block.
-      if (rows.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight).length < 2) throw unprovenCheckpoint();
+      // A readable fallback can still lag. Each required witness must
+      // confirm the same block before the new checkpoint is persisted.
+      const witnesses = required === 1 && best.base === ownedPrimary ? 1 : 2;
+      if (rows.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight).length < witnesses) throw unprovenCheckpoint();
       const head = { hash: latestConfirmed.confirmedFrontier, blockCount: latestConfirmed.confirmedHeight.toString() };
       persistConfirmed({ v: 1, networkGenesis: NANO_GENESIS, account, head, confirmed: head });
     }
     high = { ...v, local: knownLocal }; final = { ...latestConfirmed }; lastReadAt = now(); readPeers = rows.length;
+    lastReadBases = rows.map(row => row.base);
+    ownedPrimaryInUse = ownedPrimary !== null && best.base === ownedPrimary;
     standbyInUse = rows.some(r => r.base === standbyUrl);
     preferred = rows.filter(r => r.base !== standbyUrl && r.view.height === v.height && r.view.pending === v.pending).map(r => r.base);
     standbyAccountEvidence = standbyInUse ? { base: preferred[0], view: v, monotonicAt: monotonicNow() } : null;
     return best;
   }
-  async function anchoredRows(rows, anchor) {
-    if (rows.length < 2) throw unprovenCheckpoint();
+  async function anchoredRows(rows, anchor, required = minimum) {
+    if (rows.length < required) throw unprovenCheckpoint();
     const height = BigInt(anchor.blockCount);
     const newest = rows.reduce((best, row) => row.view.confirmedHeight > best ? row.view.confirmedHeight : best, 0n);
     if (newest < height) throw unprovenCheckpoint();
@@ -284,7 +302,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       throw conflictingCheckpoint();
     }
     const current = rows.filter(({ view }) => view.confirmedHeight === newest);
-    if (current.length < 2) throw unprovenCheckpoint();
+    if (current.length < required) throw unprovenCheckpoint();
     if (!current.every(({ view }) => view.confirmedFrontier === current[0].view.confirmedFrontier
         && view.confirmedBalance === current[0].view.confirmedBalance
         && view.confirmedRepresentative === current[0].view.confirmedRepresentative)) {
@@ -299,8 +317,14 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         return matchesNanoConfirmedBlock(historic, { account, anchor, hashBlock }) ? row : null;
       } catch (error) { rateLimit(row.base, error); return null; }
     }))).filter(row => row && hasProof(row.base));
-    if (witnesses.length < 2) throw unprovenCheckpoint();
+    if (witnesses.length < required) throw unprovenCheckpoint();
     return witnesses;
+  }
+  function currentAnchor(confirmedHeight) {
+    if (high && (!final || high.height > final.confirmedHeight) && confirmedHeight >= high.height) {
+      return { hash: high.frontier, blockCount: high.height.toString() };
+    }
+    return final && { hash: final.confirmedFrontier, blockCount: final.confirmedHeight.toString() };
   }
   function reusedFundingView(primary) {
     const evidence = standbyAccountEvidence;
@@ -330,10 +354,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
   } = {}) {
     if (!["account_info", "receivable", "account_history"].includes(body.action)) throw fail("NANO_RPC_READ_ACTION");
     if (body.account !== account) throw fail("NANO_RPC_ACCOUNT_SCOPE");
-    const eligible = await networkBases(), errors = [], primaryViews = [];
-    if (eligible.length < minimum && (!standby || eligible.length !== 1)) {
-      readPeers = 0; throw fail("NANO_RPC_NETWORK_QUORUM");
-    }
+    const errors = [], primaryViews = [];
     async function readPeer(base) {
       if (!hasProof(base)) return null;
       const priorCooldown = cooldowns.get(base);
@@ -341,7 +362,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         let data = body.action === "account_info" ? null : await readRpc({ ...body, ...(body.action === "receivable" ? { include_only_confirmed: "true" } : {}) }, base);
         const info = await readRpc(infoRequest(), base), view = nanoAccountView(info, checkAddress);
         const row = { base, info, view };
-        if (base !== standbyUrl) primaryViews.push(row);
+        if (base !== standbyUrl && base !== ownedPrimary) primaryViews.push(row);
         if (body.action === "receivable") data = checkedReceivable(data, body, view, checkAddress);
         if (body.action === "account_history") {
           data = body.head && yes(body.raw)
@@ -373,6 +394,33 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       } catch (error) { rateLimit(base, error); errors.push(error); }
       return null;
     }
+    function result(best, candidates, required) {
+      if (fundingReport) return { info: best.info, nanoRpc: status() };
+      if (receivableState) return { info: best.info, receivable: best.data };
+      if (paymentWindow) {
+        const complete = candidates.filter(row => row.history && row.view.confirmedFrontier === final.confirmedFrontier
+          && row.view.confirmedHeight === final.confirmedHeight);
+        return { receivable: best.data, history: complete.length >= required ? complete[0].history : null };
+      }
+      return body.action === "account_info" ? best.info : best.data;
+    }
+    let ownedError;
+    if (ownedPrimary) {
+      await proveNetwork(ownedPrimary);
+      const row = await readPeer(ownedPrimary);
+      if (row && hasProof(ownedPrimary) && (!paymentWindow || row.history)) {
+        try {
+          const floor = anchor ?? currentAnchor(row.view.confirmedHeight);
+          const verified = floor ? await anchoredRows([row], floor, 1) : [row];
+          return result(select(verified, 1), verified, 1);
+        } catch (error) { ownedError = error; }
+      }
+      errors.length = 0;
+    }
+    const eligible = await networkBases();
+    if (eligible.length < minimum && (!standby || eligible.length !== 1)) {
+      readPeers = 0; throw ownedError ?? fail("NANO_RPC_NETWORK_QUORUM");
+    }
     const replies = (await Promise.all(eligible.map(readPeer))).filter(row => row && hasProof(row.base));
     if (replies.length === 0 && eligible.length >= minimum && errors.length === eligible.length
         && errors.every(e => e.authoritative && /Account not found/i.test(e.message))) {
@@ -396,16 +444,11 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
       if (!anchor && valid.length < minimum) {
         if (persistConfirmed && current.some(row => !confirmedNow(row))) throw unprovenCheckpoint();
         if (lagging.length) throw fail("NANO_RPC_LAGGING_PEERS", "Not enough Nano peers have a current confirmed account view");
+        if (ownedPrimary) throw fail("NANO_RPC_READ_QUORUM", "Not enough readable mainnet Nano peers; new spending is paused");
       }
-      const best = select(anchor ? await anchoredRows(valid, anchor) : valid);
-      if (fundingReport) return { info: best.info, nanoRpc: status() };
-      if (receivableState) return { info: best.info, receivable: best.data };
-      if (paymentWindow) {
-        const complete = valid.filter(row => row.history && row.view.confirmedFrontier === final.confirmedFrontier
-          && row.view.confirmedHeight === final.confirmedHeight);
-        return { receivable: best.data, history: complete.length >= minimum ? complete[0].history : null };
-      }
-      return body.action === "account_info" ? best.info : best.data;
+      const floor = anchor ?? (ownedPrimary && latestConfirmed ? currentAnchor(latestConfirmed.confirmedHeight) : null);
+      const verified = floor ? await anchoredRows(valid, floor) : valid;
+      return result(select(verified), verified, minimum);
     }
     if (rows.length === 1 && standby && !blocked) {
       const { base, view: primary } = rows[0];
@@ -425,7 +468,8 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         }
       }
       const readRequests = paymentWindow ? NANO_COLD_STANDBY_SCAN_REQUESTS - 1 : body.action === "account_info" ? 1 : 2;
-      const historicWitness = anchor !== null && primary.confirmedHeight > BigInt(anchor.blockCount);
+      const floor = anchor ?? (ownedPrimary ? currentAnchor(primary.confirmedHeight) : null);
+      const historicWitness = floor !== null && primary.confirmedHeight > BigInt(floor.blockCount);
       const confirmed = await withStandbyReads(readRequests + Number(historicWitness), async () => {
         if (!hasProof(base)) return null;
         const other = await readPeer(standbyUrl);
@@ -456,10 +500,12 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     return true;
   }
   function status() {
-    return { enforced: true, configuredPeers: allBases.length, minimumPeers: minimum,
-      readablePeers: standbyInUse && !hasStandbyQuorum() ? 0 : readPeers,
+    const availableReads = ownedPrimary ? Math.min(readPeers, lastReadBases.filter(availableProof).length) : readPeers;
+    return { enforced: true, configuredPeers: allBases.length, minimumPeers: ownedPrimaryInUse ? 1 : minimum,
+      readablePeers: standbyInUse && !hasStandbyQuorum() ? 0 : availableReads,
       networkPeers: bases.filter(availableProof).length + Number(standbyInUse && hasStandbyQuorum()), lastReadAt,
       configuration, cooldowns: allBases.flatMap((base, peer) => cooling(base) ? [{ peer, until: cooldowns.get(base).until }] : []),
+      ...(ownedPrimary && { ownedPrimaryInUse }),
       ...(standby && { standby: { inUse: standbyInUse && hasStandbyQuorum(), requestsPerMinute: standby.requestsPerMinute,
         coldPaymentScanRequests: NANO_COLD_STANDBY_SCAN_REQUESTS } }),
       checkpoint: high && final && !blocked ? { v: 1, networkGenesis: NANO_GENESIS, account,
@@ -504,7 +550,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     isCooling: base => bases.includes(base) && requestBlocked(base),
     async block(body) {
       if (body.action !== "block_info" || !hash(body.hash)) throw fail("NANO_RPC_READ_ACTION");
-      const primary = await networkBases(), found = [], missing = [];
+      const found = [], missing = [];
       async function lookup(base) {
         if (requestBlocked(base)) return;
         const priorCooldown = cooldowns.get(base);
@@ -520,25 +566,39 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
           if (cooldowns.get(base) === priorCooldown) cooldowns.delete(base);
         } catch (e) { rateLimit(base, e); if (e.authoritative && /block not found|unknown block/i.test(e.message)) missing.push(e); }
       }
-      let eligible = primary;
-      if (primary.length === 1 && standby) {
-        // With both network proofs still fresh, a positive confirmation on
-        // the primary already meets block outcome policy. A negative answer
-        // still needs the standby before it can justify a replacement.
-        const lookedUpPrimary = hasProof(standbyUrl);
-        if (lookedUpPrimary) await lookup(primary[0]);
-        if (!(hasProof(primary[0]) && hasProof(standbyUrl) && found.some(row => yes(row.data.confirmed)))) {
-          const checked = await withStandbyReads(1, async () => {
-            if (!hasProof(primary[0])) return false;
-            await Promise.all(lookedUpPrimary ? [lookup(standbyUrl)] : [lookup(primary[0]), lookup(standbyUrl)]);
-            return true;
-          });
-          if (!checked) throw fail("NANO_RPC_NETWORK_QUORUM");
+      let eligible;
+      if (ownedPrimary) {
+        await proveNetwork(ownedPrimary);
+        if (availableProof(ownedPrimary)) {
+          await lookup(ownedPrimary);
+          if (availableProof(ownedPrimary) && (found.some(row => yes(row.data.confirmed))
+              || (ownedPrimaryInUse && readPeers === 1 && (found.length || missing.length)))) {
+            eligible = [ownedPrimary];
+          }
         }
-        eligible = [...primary, standbyUrl];
-      } else {
-        if (eligible.length < minimum) throw fail("NANO_RPC_NETWORK_QUORUM");
-        await Promise.all(eligible.map(lookup));
+        if (!eligible) { found.length = 0; missing.length = 0; }
+      }
+      if (!eligible) {
+        const primary = await networkBases();
+        eligible = primary;
+        if (primary.length === 1 && standby) {
+          // With both network proofs still fresh, a positive confirmation
+          // already meets policy. Absence still needs the standby.
+          const lookedUpPrimary = hasProof(standbyUrl);
+          if (lookedUpPrimary) await lookup(primary[0]);
+          if (!(hasProof(primary[0]) && hasProof(standbyUrl) && found.some(row => yes(row.data.confirmed)))) {
+            const checked = await withStandbyReads(1, async () => {
+              if (!hasProof(primary[0])) return false;
+              await Promise.all(lookedUpPrimary ? [lookup(standbyUrl)] : [lookup(primary[0]), lookup(standbyUrl)]);
+              return true;
+            });
+            if (!checked) throw fail("NANO_RPC_NETWORK_QUORUM");
+          }
+          eligible = [...primary, standbyUrl];
+        } else {
+          if (eligible.length < minimum) throw fail("NANO_RPC_NETWORK_QUORUM");
+          await Promise.all(eligible.map(lookup));
+        }
       }
       const confirmed = found.find(d => yes(d.data.confirmed));
       if (confirmed) {
@@ -560,10 +620,21 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
     },
     async publishBases() {
       if (blocked) throw fail("NANO_RPC_CONFLICT");
+      if (ownedPrimaryInUse) {
+        await proveNetwork(ownedPrimary);
+        if (readPeers !== 1 || !availableProof(ownedPrimary)) throw fail("NANO_RPC_NETWORK_QUORUM");
+        return [ownedPrimary];
+      }
       const eligible = (await networkBases()).filter(base => !laggingPeers.has(base));
       const validated = preferred.filter(b => eligible.includes(b));
       if (standbyInUse) {
         if (!hasStandbyQuorum() || !validated.length) throw fail("NANO_RPC_NETWORK_QUORUM");
+        return validated;
+      }
+      if (ownedPrimary) {
+        if (readPeers < minimum || lastReadBases.filter(availableProof).length < minimum || !validated.length) {
+          throw fail("NANO_RPC_NETWORK_QUORUM");
+        }
         return validated;
       }
       if (!eligible.length) throw fail("NANO_RPC_NETWORK_QUORUM");

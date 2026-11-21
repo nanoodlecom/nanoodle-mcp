@@ -39,7 +39,7 @@ import { computePrice, priceSavedWorkflow } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { MEDIA_EXTS } from "../src/sweep.mjs";
 import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
-  qualifyNanoAccountViews, checkedReceivable, assertDistinctNanoRpcPeers, parseNanoRpcUrls } from "../src/nano-read-pool.mjs";
+  qualifyNanoAccountViews, checkedReceivable, assertDistinctNanoRpcPeers, nanoOwnedPrimary, parseNanoRpcUrls } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { FUNDING_REPORT_MAX_AGE_MS, fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
@@ -328,6 +328,7 @@ export async function runOperationalCheck(config, deps = {}) {
   const providerReserveUsd = config.providerReserveUsd || (providerUsesWallet ? "2" : "0");
   const checks = [];
   const peerUrls = config.nanoStandby ? [...config.nanoRpcUrls, config.nanoStandby.url] : config.nanoRpcUrls;
+  let ownedPrimary;
   let nanoCooldowns = [];
   let standbyCheckpoint = null;
   const check = async (stage, fn, domains = ALL) => {
@@ -336,6 +337,7 @@ export async function runOperationalCheck(config, deps = {}) {
   };
   const nanoRpcConfig = await check("nano-rpc-peers", () => {
     assertDistinctNanoRpcPeers(peerUrls);
+    ownedPrimary = nanoOwnedPrimary(config.nanoRpcUrls, config.trustOwnedPrimary);
     return true;
   });
   const backup = config.backupExportReport &&
@@ -516,9 +518,11 @@ export async function runOperationalCheck(config, deps = {}) {
     need(value.activeRuns === 0 ? value.oldestStartedAt === null : Number.isSafeInteger(value.oldestStartedAt)
       && value.oldestStartedAt <= now() + 30_000 && now() - value.oldestStartedAt <= limit + 15 * 60_000, "funding-run-stuck");
     need(rpc?.enforced === true && rpc.configuredPeers === peerUrls.length, "nano-read-guard-not-enforced");
-    const minimum = Math.min(2, config.nanoRpcUrls.length);
+    need(rpc.ownedPrimaryInUse === undefined || (ownedPrimary && typeof rpc.ownedPrimaryInUse === "boolean"),
+      "nano-read-guard-policy-mismatch");
+    const minimum = rpc.ownedPrimaryInUse ? 1 : Math.min(2, config.nanoRpcUrls.length);
     need([rpc.networkPeers, rpc.readablePeers].every(n => Number.isSafeInteger(n) && n >= minimum && n <= peerUrls.length)
-      && rpc.minimumPeers === minimum, "nano-read-guard-no-quorum");
+      && rpc.minimumPeers === minimum && (!rpc.ownedPrimaryInUse || rpc.readablePeers === 1), "nano-read-guard-no-quorum");
     const readAge = observedAt - rpc.lastReadAt;
     need(Number.isSafeInteger(rpc.lastReadAt) && readAge < FUNDING_REPORT_MAX_AGE_MS && readAge >= -30_000, "nano-read-guard-stale");
     if (rpc.fundingEvidenceExpiresAt !== undefined) {
@@ -543,7 +547,7 @@ export async function runOperationalCheck(config, deps = {}) {
     const pause = selectFundingPause(value.pause, Math.min(now(), checkedAt));
     const expiresAt = Math.min(checkedAt + FUNDING_REPORT_MAX_AGE_MS, rpc.lastReadAt + FUNDING_REPORT_MAX_AGE_MS,
       rpc.fundingEvidenceExpiresAt ?? Infinity);
-    return { availableRaw, expiresAt, checkpoint, coldPaymentScanRequests,
+    return { availableRaw, expiresAt, checkpoint, coldPaymentScanRequests, trustOwnedPrimary: rpc.ownedPrimaryInUse !== undefined,
       fundingPause: pause?.recoveredAt != null ? pause : null };
   });
   if (state && mediaRetentionMs !== undefined) await check("retained-paid-media", () => {
@@ -593,6 +597,9 @@ export async function runOperationalCheck(config, deps = {}) {
       need(service.ActiveState !== "failed" && (!service.Result || service.Result === "success" || service.ActiveState === "activating"), "scheduled-check-failed");
     }, []);
   }
+  // A separately deployed monitor can observe the previous wallet release
+  // during rollout. Apply its runtime policy until the wallet opts in.
+  const useOwnedPrimary = runtimeFunding?.trustOwnedPrimary === true;
   const nanoAnchor = runtimeFunding?.checkpoint.confirmed;
   const nanoAnchorHeight = nanoAnchor ? BigInt(nanoAnchor.blockCount) : null;
   const nanoNodes = (await Promise.all((nanoRpcConfig ? config.nanoRpcUrls : []).map(async (url, index) => {
@@ -631,8 +638,12 @@ export async function runOperationalCheck(config, deps = {}) {
     need(network.median - local.blocks < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-blocks-behind");
     need(network.median - local.confirmed < NANO_LEDGER_LAG_BLOCKS, "nano-ledger-confirmations-behind");
   }, []);
-  const nano = await check("nano-frontier-agreement", () => {
-    const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(nanoNodes);
+  const ownedView = useOwnedPrimary && nanoNodes.find(row => row.peer === 0 && row.witnessed
+    && (row.view.height === row.view.confirmedHeight || (runtimeFunding?.checkpoint.head.hash === row.view.frontier
+      && runtimeFunding.checkpoint.head.blockCount === row.view.height.toString())));
+  const fallbackNodes = useOwnedPrimary ? nanoNodes.filter(row => row.peer !== 0) : nanoNodes;
+  function fallbackFrontier() {
+    const { current, lagging, latestConfirmed } = qualifyNanoAccountViews(fallbackNodes);
     const behind = current.filter(({ view }) => nanoAnchor && view.confirmedHeight < nanoAnchorHeight);
     for (const { peer } of [...lagging, ...behind]) {
       checks.push({ stage: `nano-node-${peer}-lag`, ok: false, code: "nano-rpc-peer-lagging", domains: [] });
@@ -646,18 +657,24 @@ export async function runOperationalCheck(config, deps = {}) {
     }
     if (nanoAnchor) {
       need(latestConfirmed.confirmedHeight >= nanoAnchorHeight, "nano-confirmed-checkpoint-regressed");
-      need(nanoNodes.every(({ view }) => view.confirmedHeight !== nanoAnchorHeight || view.confirmedFrontier === nanoAnchor.hash),
+      need(fallbackNodes.every(({ view }) => view.confirmedHeight !== nanoAnchorHeight || view.confirmedFrontier === nanoAnchor.hash),
         "nano-confirmed-checkpoint-disagrees");
     }
     const witnesses = current.filter(row => row.witnessed);
     const currentWitnesses = witnesses.filter(({ view }) => view.confirmedHeight === latestConfirmed.confirmedHeight);
     const [newest] = currentWitnesses;
-    need(newest && witnesses.length + Number(Boolean(standbyMatches)) >= minimum, "nano-confirmed-checkpoint-unverified");
+    const confirmedWitnesses = useOwnedPrimary ? currentWitnesses : witnesses;
+    need(newest && confirmedWitnesses.length + Number(Boolean(standbyMatches)) >= minimum, "nano-confirmed-checkpoint-unverified");
     return { ...newest, peers: currentWitnesses.map(row => row.peer) };
-  });
+  }
+  const nano = await check("nano-frontier-agreement", () => ownedView
+    ? { ...ownedView, peers: [0] } : fallbackFrontier());
   if (standbyCheckpoint) checks.push({ stage: "nano-standby", ok: false, code: "nano-standby-covering-quorum", domains: [] });
-  const paymentViews = nano ? (await Promise.all(nano.peers.map(async index => {
-    const account = config.nanoAddress, head = nano.view.confirmedFrontier;
+  const fallback = ownedView && await check("nano-fallback-frontier", fallbackFrontier, []);
+  const paymentTargets = nano ? nano.peers.map(index => [index, nano]) : [];
+  if (fallback) paymentTargets.push(...fallback.peers.map(index => [index, fallback]));
+  const paymentViews = (await Promise.all(paymentTargets.map(async ([index, selected]) => {
+    const account = config.nanoAddress, head = selected.view.confirmedFrontier;
     let view;
     const paymentReads = await check(`nano-payment-read-peer-${index}`, async () => {
       const url = config.nanoRpcUrls[index];
@@ -668,8 +685,13 @@ export async function runOperationalCheck(config, deps = {}) {
       const pending = await rpc(receivableRequest);
       const info = await rpc({ action: "account_info", account, representative: "true", include_confirmed: "true", receivable: "true" });
       view = nanoAccountView(info, checkAddress);
-      need(view.confirmedHeight >= nano.view.confirmedHeight
-        && (view.confirmedHeight !== nano.view.confirmedHeight || view.confirmedFrontier === head), "nano-payment-read-anchor-moved");
+      need(view.confirmedHeight >= selected.view.confirmedHeight
+        && (view.confirmedHeight !== selected.view.confirmedHeight || view.confirmedFrontier === head), "nano-payment-read-anchor-moved");
+      if (useOwnedPrimary && view.confirmedHeight > selected.view.confirmedHeight) {
+        const anchor = { hash: head, blockCount: selected.view.confirmedHeight.toString() };
+        const block = await rpc({ action: "block_info", hash: head, json_block: "true" });
+        need(matchesNanoConfirmedBlock(block, { account, anchor, hashBlock }), "nano-confirmed-checkpoint-unverified");
+      }
       checkedReceivable(pending, receivableRequest, view, checkAddress);
       const historyRequest = { action: "account_history", account, head: view.confirmedFrontier, count: String(NANO_HISTORY_PAGE), raw: "true" };
       checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, view.confirmedHeight);
@@ -678,10 +700,17 @@ export async function runOperationalCheck(config, deps = {}) {
     // A valid but newer account view still matters when its payment window
     // failed validation. Two older windows cannot then prove current reads.
     return view && { view, peer: index, paymentReads: paymentReads === true };
-  }))).filter(Boolean) : [];
+  }))).filter(Boolean);
+  const ownedPayment = useOwnedPrimary && await check("nano-owned-payment-read", () => {
+    const row = paymentViews.find(row => row.peer === 0 && row.paymentReads);
+    need(row, "nano-owned-payment-read-unavailable");
+    return row;
+  }, []);
+  const fallbackPaymentViews = useOwnedPrimary ? paymentViews.filter(row => row.peer !== 0) : paymentViews;
   const activePaymentPeers = await check("nano-payment-read-quorum", () => {
     need(nano, "nano-payment-read-anchor-unavailable");
-    const ready = currentNanoPaymentPeers(paymentViews);
+    if (ownedPayment) return [ownedPayment];
+    const ready = currentNanoPaymentPeers(fallbackPaymentViews);
     const standbyMatches = ready.length === 1 && standbyCheckpoint?.hash === ready[0].view.confirmedFrontier
       && standbyCheckpoint.blockCount === ready[0].view.confirmedHeight.toString();
     need(ready.length >= Math.min(2, config.nanoRpcUrls.length),
@@ -692,7 +721,8 @@ export async function runOperationalCheck(config, deps = {}) {
     need(nano, "nano-fallback-payment-read-anchor-unavailable");
     // A fallback pair must cover the newest observed confirmed head, even
     // when only the first peer reported it or its own history read failed.
-    need(activePaymentPeers?.filter(row => row.peer !== 0).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
+    const ready = useOwnedPrimary ? currentNanoPaymentPeers(fallbackPaymentViews) : activePaymentPeers;
+    need(ready?.filter(row => row.peer !== 0).length >= 2, "nano-fallback-payment-read-quorum-unavailable");
     return true;
   }, []);
   if (config.nanoStandby && !fallbackPaymentReads) await check("nano-standby-cold-scan-budget", () => {
@@ -1359,7 +1389,8 @@ async function productionConfig(env = process.env) {
     outDir: "/srv/nanoodle-mcp/out",
     marketStateDir: env.MARKET_STATE_DIR, merchant, network: env.NEAR_NETWORK, canaryPayer,
     nanoAddress: deriveAddress(derivePublicKey(secret), { useNanoPrefix: true }), nearPublicKey: signer.publicKey,
-    nanoRpcUrls, nanoStandby, nanoLedgerTelemetry: env.OPERATIONAL_NANO_LEDGER_TELEMETRY === "1",
+    nanoRpcUrls, nanoStandby, trustOwnedPrimary: env.NANO_RPC_TRUST_OWNED_PRIMARY === "1",
+    nanoLedgerTelemetry: env.OPERATIONAL_NANO_LEDGER_TELEMETRY === "1",
     nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
     nanoGptBase: env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),

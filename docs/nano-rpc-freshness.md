@@ -45,6 +45,16 @@ endpoints. Configure independently operated mainnet nodes: with multiple endpoin
 each account read needs at least two readable mainnet peers. An explicitly single
 endpoint retains validation and monotonic account checks but has no independent
 peer comparison. Ordinary local wallet use keeps its existing opt-in behavior.
+
+For a hosted wallet with a durable checkpoint, set `NANO_RPC_TRUST_OWNED_PRIMARY=1`
+to authorize the node you operate at the first `NANO_RPC_URL` entry. Use its
+Tailscale IPv4 address and configure at least two independent fallbacks. The
+owned node must prove mainnet and the saved wallet checkpoint, then pass the
+same account, receivable and history validation as other RPCs. When the owned
+node cannot qualify a read, a fallback quorum must prove the wallet checkpoint.
+New publications use the node or fallback set that verified the wallet view.
+The readiness monitor reports degraded primary or failover coverage even while
+another path can verify checkout.
 The wallet guard and scheduled check reject equivalent RPC URLs before probing
 them. Default ports, host capitalization, DNS root dots and URL fragments cannot
 create a second vote. Distinct URLs still require independently operated nodes.
