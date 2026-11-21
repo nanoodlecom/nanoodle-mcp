@@ -19,7 +19,7 @@ async function setup(t, options = {}) {
 
 test("funding health is private aggregate telemetry and insufficient funds pause new quotes", async t => {
   const w = await setup(t); let balanceRaw = "100";
-  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000,
+  const report = await startFundingReport({ outDir: w.dir, sources: w.sources, now: () => 2000, mediaRetentionMs: 86_400_000,
     snapshot: async () => ({ ...value, balanceRaw, creatorReservations: true, process: { pid: -1, secret: "PROVIDER_PRIVATE" } }) });
   t.after(report.stop);
   assert.equal(w.sources.ready(), true);
@@ -27,6 +27,7 @@ test("funding health is private aggregate telemetry and insufficient funds pause
   const saved = await readFile(w.file, "utf8");
   assert.doesNotMatch(saved, /SECRET|privateExtra/);
   assert.equal(JSON.parse(saved).checkedAt, new Date(2000).toISOString());
+  assert.equal(JSON.parse(saved).mediaRetentionMs, 86_400_000);
   assert.equal(JSON.parse(saved).creatorReservations, true);
   const identity = JSON.parse(saved).process;
   assert.equal(identity.pid, process.pid); assert.equal(identity.uid, process.getuid());
@@ -35,7 +36,9 @@ test("funding health is private aggregate telemetry and insufficient funds pause
   assert.doesNotMatch(saved, /PROVIDER_PRIVATE/);
   balanceRaw = "99"; await report.refresh();
   assert.equal(w.sources.ready(), false);
-  assert.equal(JSON.parse(await readFile(w.file, "utf8")).ok, false);
+  const underfunded = JSON.parse(await readFile(w.file, "utf8"));
+  assert.equal(underfunded.ok, false);
+  assert.equal(underfunded.mediaRetentionMs, 86_400_000);
 });
 
 test("quote budgets use current unreserved funds under the existing funding lease", async t => {

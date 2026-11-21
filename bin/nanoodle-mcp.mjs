@@ -733,6 +733,7 @@ async function main() {
       await startFundingReport({ outDir: resolvedOut,
         snapshot: async () => ({ ...await wallet.ops.fundingReport(), creatorReservations: near?.creatorReservations === true }),
         sources: fundingSources, durableState: moneyState,
+        mediaRetentionMs: Number.isFinite(outTtlMs) ? outTtlMs : 0,
         writerProtection: () => {
           writerLocks.assertHeld();
           return { enforced: true, requiredState: requiredState?.requireExisting === true };

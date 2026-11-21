@@ -246,6 +246,10 @@ is written, fsynced and removed in the output directory to verify persistence.
 
 Coverage:
 
+- Local media referenced by completed Nano, NEAR, and USDC payments. The
+  check uses the server's active media retention period and alerts if a
+  recent output is missing, empty, or a symlink. It reads file metadata
+  only. Filenames and checkout details stay out of alerts.
 - Nano mainnet identity, confirmed wallet height/frontier agreement across
   configured nodes, and the running wallet's fresh multi-peer read enforcement.
   See [Nano RPC freshness](nano-rpc-freshness.md).

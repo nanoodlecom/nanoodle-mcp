@@ -2,7 +2,7 @@
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
 import { NANOGPT_API_ORIGIN } from "../src/nanogpt-origin.mjs";
-import { readFileSync, mkdirSync, mkdtempSync, chmodSync, statfsSync, rmSync, realpathSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, chmodSync, lstatSync, statfsSync, rmSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -37,6 +37,7 @@ import { marketDeliveryWindow } from "../src/market/deadline.mjs";
 import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice, priceSavedWorkflow } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
+import { MEDIA_EXTS } from "../src/sweep.mjs";
 import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
   qualifyNanoAccountViews, checkedReceivable, assertDistinctNanoRpcPeers, parseNanoRpcUrls } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
@@ -209,6 +210,28 @@ function savedPricingContent(result) {
   need(amounts.every(positiveDecimal) && Number(amounts[0]) <= Number(amounts[1])
     && Number(amounts[1]) <= Number(amounts[2]), "saved-workflow-preview-invalid");
   return content;
+}
+
+function retainedMediaNames(quotes, bases, now, retentionMs) {
+  const names = new Set();
+  for (const quote of quotes) {
+    for (const block of quote.result?.content ?? []) {
+      if (block?.type !== "text" || typeof block.text !== "string") continue;
+      const divider = block.text.lastIndexOf(": ");
+      if (divider < 0) continue;
+      const url = block.text.slice(divider + 2);
+      const base = bases.find(prefix => url.startsWith(prefix));
+      if (!base) continue;
+      const name = url.slice(base.length);
+      // emitResult names hosted media with the creation time, sequence and random suffix.
+      const match = /^[\w.-]+-(\d{13})-\d+-[a-f0-9]{12}\.([a-z0-9]+)$/.exec(name);
+      if (!match || !MEDIA_EXTS.has(match[2]) || match[0] !== name) continue;
+      const age = now - Number(match[1]);
+      need(age >= -30_000, "paid-media-timestamp-ahead");
+      if (retentionMs === 0 || age < retentionMs) names.add(name);
+    }
+  }
+  return names;
 }
 
 function previewDeposit(content, asset, network) {
@@ -437,7 +460,7 @@ export async function runOperationalCheck(config, deps = {}) {
     const ok = failures.nano + failures.near + failures.usdc < 2;
     checks.push({ stage: "paid-workflow-execution", ok, failures,
       ...(ok ? {} : { code: "paid-workflow-failures-repeated", domains: [] }) });
-    return { liabilities, near };
+    return { liabilities, near, nano };
   });
   if (state) await check("near-payment-replay-coverage", () => {
     need(!hasUnverifiedNearPaymentClaim(state.near.quotes, state.near.consumedTx ?? {}), "near-payment-replay-unverified");
@@ -452,11 +475,13 @@ export async function runOperationalCheck(config, deps = {}) {
     const coveredThroughMs = nearPaymentWatchCoverage(state.near.meta?.[PAYMENT_WATCH_META]);
     return Object.fromEntries(["near", "usdc"].map(asset => [asset, heldNearQuoteAmounts(quotes, asset, checkedAt, RETAIN_NEAR_QUOTE_MS, { coveredThroughMs })]));
   }, ["near", "usdc"]);
+  let mediaRetentionMs;
   const runtimeFunding = await check("runtime-funding", async () => {
     const value = read(join(config.outDir, "funding-health.json"));
     need(value?.v === 1, "funding-report-missing");
     const observedAt = now(), checkedAt = Date.parse(value.checkedAt), age = observedAt - checkedAt;
     need(Number.isFinite(age) && age < FUNDING_REPORT_MAX_AGE_MS && age >= -30_000, "funding-report-stale");
+    mediaRetentionMs = value.mediaRetentionMs;
     if (value.ok === false && Object.hasOwn(value, "code")) throw new CheckError(fundingReportFailure(value.code));
     need(value.protectTransfers === true && (providerUsesWallet ? value.enforced === true : value.creatorReservations === true),
       "funding-not-enforced");
@@ -506,6 +531,16 @@ export async function runOperationalCheck(config, deps = {}) {
     return { availableRaw, expiresAt, checkpoint, coldPaymentScanRequests,
       fundingPause: pause?.recoveredAt != null ? pause : null };
   });
+  if (state && mediaRetentionMs !== undefined) await check("retained-paid-media", () => {
+    need(Number.isFinite(mediaRetentionMs) && mediaRetentionMs >= 0, "paid-media-retention-invalid");
+    const bases = [config.site, config.nanoSite].map(site => site.replace(/\/+$/, "") + "/out/");
+    const quotes = [...state.nano.quotes.filter(quote => quote.status === "consumed" && quote.settled === true),
+      ...Object.values(state.near.quotes).filter(quote => quote.status === "settled" && quote.outcome === "succeeded")];
+    for (const name of retainedMediaNames(quotes, bases, now(), mediaRetentionMs)) {
+      const stat = (deps.lstat || lstatSync)(join(config.outDir, name), { throwIfNoEntry: false });
+      need(stat?.isFile() && stat.size > 0, "paid-media-file-unavailable");
+    }
+  }, []);
   await check("state-disk-space", async () => {
     const fs = (deps.statfs || statfsSync)(config.outDir);
     need(fs.bavail * fs.bsize >= 512 * 1024 * 1024 && fs.bavail / fs.blocks >= 0.05, "state-disk-low");
