@@ -38,7 +38,7 @@ import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice, priceSavedWorkflow } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
-  qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
+  qualifyNanoAccountViews, checkedReceivable, assertDistinctNanoRpcPeers, parseNanoRpcUrls } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { FUNDING_REPORT_MAX_AGE_MS, fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
@@ -300,6 +300,10 @@ export async function runOperationalCheck(config, deps = {}) {
     try { const value = await fn(); checks.push({ stage, ok: true }); return value; }
     catch (e) { checks.push({ stage, ok: false, code: safeCode(e), domains }); return null; }
   };
+  const nanoRpcConfig = await check("nano-rpc-peers", () => {
+    assertDistinctNanoRpcPeers(peerUrls);
+    return true;
+  });
   const backup = config.backupExportReport &&
     await check("backup-export-proof", () => backupVerificationProof(config.backupExportReport, read, now(), "backup-export"), []);
   if (backup) {
@@ -539,7 +543,7 @@ export async function runOperationalCheck(config, deps = {}) {
   }
   const nanoAnchor = runtimeFunding?.checkpoint.confirmed;
   const nanoAnchorHeight = nanoAnchor ? BigInt(nanoAnchor.blockCount) : null;
-  const nanoNodes = (await Promise.all(config.nanoRpcUrls.map(async (url, index) => {
+  const nanoNodes = (await Promise.all((nanoRpcConfig ? config.nanoRpcUrls : []).map(async (url, index) => {
     let observation;
     await check(`nano-node-${index}`, async () => {
       need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
@@ -1244,7 +1248,7 @@ async function productionConfig(env = process.env) {
   const payer = env.CHECK_PAYER;
   const canaryPayer = payer ? { accountId: payer, maxNear: env.CHECK_MAX_NEAR || DEFAULT_CHECK_MAX_NEAR,
     publicKey: env.CHECK_PAYER_PUBLIC_KEY || (/^[a-f0-9]{64}$/.test(payer) ? "ed25519:" + base58Encode(Buffer.from(payer, "hex")) : null) } : null;
-  const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
+  const nanoRpcUrls = parseNanoRpcUrls(env.NANO_RPC_URL);
   const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", invocationId: env.INVOCATION_ID,
     backupExportReport: env.OPERATIONAL_BACKUP_EXPORT_REPORT, backupCopyReport: env.OPERATIONAL_BACKUP_COPY_REPORT,

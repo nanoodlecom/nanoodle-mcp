@@ -1222,6 +1222,21 @@ test("a fresh runtime cooldown prevents monitor retries while other independent 
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_URL|configuration|cooldowns/);
 });
 
+test("the scheduled check refuses equivalent Nano endpoints before probing them", async t => {
+  const f = fixture();
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.config.nanoRpcUrls = ["https://nano-0.example/rpc", "https://NANO-0.example.:443/v1/../rpc#ignored"];
+
+  const report = await runOperationalCheck(f.config, f.deps);
+  const configuration = report.checks.find(row => row.stage === "nano-rpc-peers");
+  assert.equal(configuration.ok, false);
+  assert.equal(configuration.code, "NANO_RPC_DUPLICATE_PEER");
+  assert.equal(report.admission.nano, false);
+  assert.equal(report.nanoPaymentReadPeers, undefined);
+  assert.ok(f.calls.every(({ url }) => !url.hostname.startsWith("nano-0.example")));
+  assert.ok(report.checks.some(row => row.stage === "near-payment-watcher" && row.ok));
+});
+
 test("Nano fallback peers must serve the payment reads even while the preferred node is healthy", async t => {
   for (const failure of [null, "history-http", "wrong-head", "cut-short", "inconsistent-receivable", "stale-history", "inconsistent-newer-view"]) {
     const f = fixture(({ url, body }) => {
