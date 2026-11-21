@@ -83,7 +83,7 @@ The separate public Nano MCP ingress now has a free discovery probe in addition
 to the canonical NEAR listener. It performs initialization and tool discovery,
 never a quote requiring payment or an inference call.
 
-The upstream [x402 endpoint manifest](https://nano-gpt.com/api/v1/x402/endpoints)
+The upstream [x402 endpoint manifest](https://api.nano-gpt.com/api/v1/x402/endpoints)
 lists text/image/data contracts. [Its public x402 page](https://nano-gpt.com/x402)
 does not promise stable long-running video support. Our audio/video adapters use
 legacy paths; absence from the manifest is not proof they are broken. Fifteen

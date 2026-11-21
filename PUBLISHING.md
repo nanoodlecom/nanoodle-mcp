@@ -42,6 +42,12 @@ or dispatch `publish-mcp-registry` on `main` with the already published version.
 To verify the exact npm version independently, run
 `node scripts/assert-npm-version.mjs`.
 
+A manual local publish (dry run by default) wraps the same preflight plus the
+`mcp-publisher` steps in one command: `npm run publish:registry` — see
+[docs/agent-identity.md](docs/agent-identity.md) for the full identity/refresh
+picture, including the A2A agent card and ERC-8004 registration generated from
+`server.json`.
+
 ## 2. Optional later: the `com.nanoodle/*` namespace
 
 `io.github.nanoodlecom/nanoodle-mcp` works today with plain GitHub auth. If we

@@ -978,6 +978,11 @@ export async function serveHttp({
         return send(200, guide, "text/plain; charset=utf-8");
       }
 
+      if (url.pathname === "/rates/nano" && gate) {
+        const view = await gate.rateView();
+        res.setHeader("Cache-Control", "no-store");
+        return send(view.usable ? 200 : 503, JSON.stringify(view));
+      }
       if (url.pathname === "/rates" && rates) {
         const force = ["1", "true", "yes"].includes(url.searchParams.get("refresh") || "");
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });

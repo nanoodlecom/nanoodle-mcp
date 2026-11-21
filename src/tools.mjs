@@ -11,6 +11,7 @@
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
+import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
 import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -86,7 +87,7 @@ const CATALOG_TIMEOUT_MS = 8000;
  * `consequence` is appended to the failure log line, so each caller can name
  * what its own users lose.
  */
-export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {},
+export async function fetchCatalogs(kinds, { baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {},
   requireFresh = false, maxAgeMs = requireFresh ? PAID_CATALOG_TTL_MS : CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const base = String(baseUrl).replace(/\/+$/, "");
   const catalogs = {};
@@ -152,7 +153,7 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
  * Best-effort: a catalog that won't load leaves those tools unclamped, i.e.
  * exactly today's behavior, and never blocks startup.
  */
-export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
+export async function attachCatalogs(registry, { baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const needed = new Set();
   for (const t of registry.tools) {
     if (!t.wf) continue; // Built-in tools have no graph.
@@ -187,7 +188,7 @@ export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com
  * Re-callable — a periodic refresh keeps estimates AND catalogs fresh; it
  * refetches rather than reusing the cached copy a per-call path would take.
  */
-export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {} } = {}) {
+export async function attachEstimates(registry, { baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {} } = {}) {
   const catalogs = await attachCatalogs(registry, {
     baseUrl, fetch, maxAgeMs: 0,
     consequence: ", and quote the flat opening deposit until they've run",
@@ -822,7 +823,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * checked the graph first does not decode it twice.
  * @returns {Promise<{ graph: object, workflowGraph: object, inputs: object, wf: Workflow, catalogs: object, source: string, url: string|null }>}
  */
-export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
+export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
   allowShortLinks = true, read = null, requireFreshCatalogs = false } = {}) {
   if (args == null) args = {};
   if (typeof args !== "object" || Array.isArray(args)) {
@@ -1070,7 +1071,7 @@ export class HumanizeUnpriceableError extends Error {
   constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
 }
 
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl = NANOGPT_API_ORIGIN, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
   const executionLimit = hosted || remote ? hostedRunTimeout(runTimeoutMs ?? undefined) : null;
   const runtimeFetch = hostedRunFetch();
   // Wallet mode (payment callback, no key) changes only where money comes from.
@@ -1372,7 +1373,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
             guidance: opts.guidance,
             title: opts.title === true,
             payment: apiKey ? null : payment,
-            baseUrl: baseUrl || "https://nano-gpt.com",
+            baseUrl: baseUrl || NANOGPT_API_ORIGIN,
             // An unpriceable request falls back to the worst-case ceiling, never a stale pin.
             budgetUsd: hosted ? (quoted ?? humanizeQuoteOrCeiling(tool, null, prices)) : null,
             deciderReserveUsd: hosted ? deciderReserveUsd : 0,
