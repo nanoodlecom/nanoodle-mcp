@@ -468,7 +468,7 @@ export function createNearGate({
     return { pricing, author, run: { name: RUN_NOODLE, arguments: { graph: pricing.boundGraph, inputs } } };
   }
 
-  async function quote(registry, name, args, tool, asset = "near", resumeTool = null) {
+  async function quote(registry, name, args, tool, asset, resumeTool, ctx) {
     ledger.assertDurable();
     if (asset === "usdc" && !usdcEnabled) throw new GraphArgsError("USDC payments are not enabled on this server.");
     const { pricing, author } = await prepare(registry, name, args, tool);
@@ -513,7 +513,8 @@ export function createNearGate({
       const expiresAt = createdAt + quoteTtlMs;
       // Only what payment and settlement need is stored; the itemized pricing is in the answer.
       const record = {
-        id, tool: name, ...(resumeTool ? { resumeTool } : {}), argsHash: hashArgs(name, args), status: "pending", author,
+        id, tool: name, ...(resumeTool ? { resumeTool } : {}), argsHash: hashArgs(name, args, ctx), status: "pending", author,
+        ...(ctx?.paymentScope && { paymentScope: ctx.paymentScope }),
         ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
         amountYocto: amountYocto.toString(),
         depositUsd: exactUsd(pricing.depositUsd),
@@ -717,14 +718,18 @@ export function createNearGate({
       ? "The quote expired while the watcher was checking for payments. Keep monitoring this quote or confirm the original transfer if you already paid."
       : "If you already paid, confirm the original transaction on this quote. Otherwise ask for a fresh quote.";
     else if (status === "pending") next = "Pay this deposit in your wallet; keep monitoring until payment is confirmed.";
-    else if (paid) next = `Payment confirmed. Call ${q.resumeTool || q.tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`;
-    const workflow = q.workflow ?? workflows.get(id);
+    else if (paid) {
+      const tool = q.paymentScope ? "the original tool on your Custom MCP endpoint" : q.resumeTool || q.tool;
+      next = `Payment confirmed. Call ${tool} now with the original arguments plus _payment_id: "${q.id}" to receive the result. Do not pay again.`;
+    }
+    const workflow = q.paymentScope ? null : q.workflow ?? workflows.get(id);
     return {
-      paymentId: q.id, tool: q.resumeTool || q.tool, network, payTo: merchantId,
+      paymentId: q.id, tool: q.paymentScope ? "Custom MCP" : q.resumeTool || q.tool, network, payTo: merchantId,
       ...(assetOf(q) === "usdc" ? amountFields(q, q.amountYocto) : { amountYocto: q.amountYocto, amountNear: formatYoctoAsNear(BigInt(q.amountYocto)) }),
       depositUsd: q.depositUsd, expiresAt: new Date(q.expiresAt).toISOString(), status,
       done: status !== "pending" && !checkingPayment,
       ...(checkingPayment && { checkingPayment: true }),
+      ...(q.paymentScope && { resultInClient: true }),
       ...(workflow && { workflow }),
       next,
       ...(q.payTx ? { txHash: q.payTx } : {}),
@@ -868,7 +873,13 @@ export function createNearGate({
         ctx?.announce?.(`payment verified — running ${name}`);
         const result = await registry.callTool(prepared.run, {
           ...ctx,
-          workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
+          workflow(state) {
+            if (!q.paymentScope) {
+              workflows.set(q.id, state);
+              changed(q.id);
+            }
+            ctx?.workflow?.(state);
+          },
         });
         // Money-only checkpoint before the funding scope releases creator
         // overhead. No result text is persisted by this handoff.
@@ -1063,13 +1074,13 @@ export function createNearGate({
           if (_payment_tx != null || _payment_sender != null) {
             throw new GraphArgsError("_payment_tx and _payment_sender go with _payment_id: call without all three to get a quote first");
           }
-          return await quote(registry, name, args, tool, _pay_with || "near", /^[a-zA-Z0-9_-]{1,64}$/.test(ctx?.paymentTool || "") ? ctx.paymentTool : null);
+          return await quote(registry, name, args, tool, _pay_with || "near", /^[a-zA-Z0-9_-]{1,64}$/.test(ctx?.paymentTool || "") ? ctx.paymentTool : null, ctx);
         }
         const paymentId = String(_payment_id);
         const existing = ledger.getQuote(paymentId);
         if (_pay_with != null && existing && _pay_with !== assetOf(existing)) throw new GraphArgsError("The payment asset cannot change after quoting. Resume with the quoted asset or omit _pay_with.");
         return await withLock(paymentId, () => pay(registry, {
-          name, args, argsHash: hashArgs(name, args), paymentId, tx: _payment_tx, sender: _payment_sender, ctx, tool,
+          name, args, argsHash: hashArgs(name, args, ctx), paymentId, tx: _payment_tx, sender: _payment_sender, ctx, tool,
         }));
       } catch (e) {
         if (e instanceof GraphRefusedError) return refusedResult(e.refusals);
@@ -1088,11 +1099,17 @@ export function createNearGate({
   return { wrapRegistry, resume: maintenance ? () => maintenance.run(resume, "background") : resume, authorPayouts,
     fundingLiabilitiesRaw: context => nearCreatorLiabilities({ quotes: ledger.quotes(), payouts: ledger.payouts() }, context),
     quote: paymentView,
+    hasOpenProfileQuotes(scope) {
+      const t = now(), coverage = ledger.paymentWatchCoverage();
+      return ledger.quotes().some(q => q.paymentScope === scope &&
+        (q.status === "paid" || q.status === "running" || ledger.hasUnattachedPayment(q.id)
+          || (!q.payTx && ["pending", "expired"].includes(q.status) && (t <= q.expiresAt || coverage <= q.expiresAt))));
+    },
     confirmPayment: maintenance ? (...args) => maintenance.run(() => confirmPayment(...args)) : confirmPayment,
     observeTransfer: maintenance ? (...args) => maintenance.run(() => observeTransfer(...args), "background") : observeTransfer,
     waitForPayment, waitForUpdate, pendingQuotes,
     // The private payment URL is also the capability to read this paid result.
     // This getter never runs a workflow, accepts payment or changes settlement.
-    result(id) { const q = ledger.getQuote(id); return q && FINAL.has(q.status) ? replay(q) : null; },
+    result(id) { const q = ledger.getQuote(id); return q && !q.paymentScope && FINAL.has(q.status) ? replay(q) : null; },
   };
 }

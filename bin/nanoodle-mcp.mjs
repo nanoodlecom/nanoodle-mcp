@@ -761,6 +761,20 @@ async function main() {
         publicBase: (nearServePort ? nearPublicUrl : publicBase).replace(/\/+$/, ""), merchant: nearInfo.merchant,
         network: nearInfo.network, usdc: near.usdc, maxDepositUsd: nearMaxDeposit ?? 2, baseUrl: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN });
     }
+    const { createCustomMcp, createCustomMcpStore, wrapNanoCustomWorkflow } = await import("../src/custom-mcp.mjs");
+    let customStore = null;
+    if (gate || near) {
+      try { customStore = createCustomMcpStore({ dir: join(resolvedOut, "custom-mcp-profiles") }); }
+      catch { console.error("nanoodle-mcp: Custom MCP is unavailable because profile storage could not be opened."); }
+    }
+    const privateGraphPolicy = { baseUrl: process.env.NANOGPT_BASE_URL,
+      limits: nearMaxDeposit == null ? undefined : { maxDepositUsd: nearMaxDeposit } };
+    const nanoWorkflow = gate && wrapNanoCustomWorkflow({ gate, registry, ...privateGraphPolicy });
+    const customMcpFor = (base, tools, call, nearTools, nano) => createCustomMcp({
+      store: customStore, key: new URL(base).origin,
+      listTools: tools, callTool: call, nearTools, nanoWorkflow: nano, ...privateGraphPolicy,
+      hasOpenPayments: scope => gate?.hasOpenProfileQuotes(scope) || near?.gate.hasOpenProfileQuotes(scope),
+    });
     if (serviceLifecycle.isStopping()) return;
     httpServers.push(await serveHttp({
       host: serveHost,
@@ -781,6 +795,7 @@ async function main() {
       publicBase,
       marketWebhook,
       creators: !gate ? creators : null, maintenance,
+      customMcp: customStore && customMcpFor(publicBase, listTools, callTool, near?.wrapped, nanoWorkflow),
       log: (...a) => console.error(...a),
     }));
     if (nearServePort) {
@@ -800,6 +815,7 @@ async function main() {
           toolInfo: registry.tools, costs: registry.costs, outDir: resolvedOut,
           publicBase: nearPublicUrl.replace(/\/+$/, ""),
           creators, maintenance,
+          customMcp: customStore && near && customMcpFor(nearPublicUrl.replace(/\/+$/, ""), near.wrapped.listTools, near.wrapped.callTool, near.wrapped, null),
           log: (...a) => console.error(...a),
         }));
         console.error(`nanoodle-mcp: NEAR endpoint ${nearPublicUrl}/mcp on ${nearServeHost}:${nearServePort} — shared Nano funding pool${near ? "" : "; NEAR payments unavailable"}`);

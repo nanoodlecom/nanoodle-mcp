@@ -9,12 +9,12 @@ export function monitorPaymentRun({ initial, update, fetch: request = globalThis
   let current = initial, result = null, reading = null, polling = false, stopped = false, watch;
   const final = state => ["settled", "failed", "rejected"].includes(state?.status);
   const finished = () => current?.status === "unknown" || isExpiredPayment(current)
-    || final(current) && current.receipt?.refund?.status !== "pending" && result;
+    || final(current) && current.receipt?.refund?.status !== "pending" && (current.resultInClient || result);
   const stop = () => { stopped = true; watch?.close(); };
   async function apply(state) {
     if (stopped) return;
     current = state; update(current, result);
-    if (final(current) && !result) {
+    if (final(current) && !current.resultInClient && !result) {
       if (!reading) reading = (async () => {
         const response = await request(`/near/result/${id}`, { cache: "no-store", signal: AbortSignal.timeout(30_000) });
         if (!response.ok) throw new Error("The result is not available yet. Reconnecting to the same paid run…");

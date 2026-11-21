@@ -168,13 +168,16 @@ export async function probeX402Pair({ fetch, url, signal }) {
 const FREE_DESIGN_TOOLS = new Set(["price_noodle", "noodle_guide"]);
 
 /** Deterministic hash of (tool, arguments) — a payment id is bound to exactly this call. */
-export function hashArgs(name, args) {
+export function hashArgs(name, args, ctx = null) {
   const stable = (v) => {
     if (v === null || typeof v !== "object") return JSON.stringify(v);
     if (Array.isArray(v)) return "[" + v.map(stable).join(",") + "]";
     return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stable(v[k])).join(",") + "}";
   };
-  return createHash("sha256").update(name + "\n" + stable(args)).digest("hex").slice(0, 16);
+  // Preserve public and creator quote hashes across updates. Scoped quotes
+  // also bind the private profile and advertised alias, neither read from RPC params.
+  const prefix = ctx?.paymentScope ? "custom-mcp\n" + ctx.paymentScope + "\n" + ctx.paymentAlias + "\n" : "";
+  return createHash("sha256").update(prefix + name + "\n" + stable(args)).digest("hex").slice(0, prefix ? 32 : 16);
 }
 
 const fmtUsd = (n) => "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2)).replace(/(\.\d\d\d*?)0+$/, "$1");
@@ -586,6 +589,7 @@ export function createChargeGate({
           const error = q.error ? (q.errorPersist ?? "run failed: (error details not retained across restarts)") : null;
           return {
             id: q.id, tool: q.tool, argsHash: q.argsHash, usd: q.usd,
+            ...(q.paymentScope && { paymentScope: q.paymentScope }),
             pair: { usdNano: q.pair.usdNano.toString(), raw: q.pair.raw.toString() },
             amountRaw: q.amountRaw, createdAt: q.createdAt, expiresAt: q.expiresAt,
             status: q.refundCompletedAt != null ? "refunded" : q.status === "consumed" && q.settled && !result && !error ? "paid" : q.status,
@@ -1315,6 +1319,12 @@ export function createChargeGate({
     fundingLiabilitiesRaw: () => nanoFundingLiabilities({ quotes: [...quotes.values()], owed }),
     nanoTransferClaims: () => gateNanoTransferClaims({ quotes: quotes.values(), owed }),
     resume: recordRestoredState,
+    hasOpenProfileQuotes(scope) {
+      return [...quotes.values()].some(q => q.paymentScope === scope && !q.settled &&
+        (q.depositPending || q.status === "paid" || (q.status === "consumed" && !q.completedAt)
+          || (q.status === "pending" && now() <= q.expiresAt) || historyPending(q)
+          || nanoQuoteNeedsHistory(q, historyScan.coveredAt, now())));
+    },
 
     /** Quote/pay state for the HTTP pay page + status/watch endpoints. */
     quote(id) {
@@ -1387,7 +1397,7 @@ export function createChargeGate({
      * run_noodle is withdrawn (arbitrary share links can't be priced up front),
      * and callTool enforces quote → pay → run-once → replay.
      */
-    wrapRegistry(registry, { runNoodleName = "run_noodle" } = {}) {
+    wrapRegistry(registry, { runNoodleName = "run_noodle", quoteCall = null } = {}) {
       const pinned = new Map(registry.tools.map((t) => {
         const v = t.x402 ? knownUsd(t.x402.usd) : null;
         return [t.name, v != null && v > 0 ? v : null];
@@ -1571,7 +1581,7 @@ export function createChargeGate({
         if (typeof rawArgs !== "object" || Array.isArray(rawArgs)) return registry.callTool(params);
         const { _payment_id, ...args } = rawArgs;
         const name = params.name;
-        const argsHash = hashArgs(name, args);
+        const argsHash = hashArgs(name, args, ctx);
 
         let q;
         if (_payment_id == null) {
@@ -1583,12 +1593,16 @@ export function createChargeGate({
           if (!offered.some((t) => t.name === name)) {
             throw new ParamsError(`unknown tool "${name}" — available: ${offered.map((t) => t.name).join(", ")}`);
           }
-          if (validate) await validate({ name, arguments: args });
+          let quoted;
+          if (quoteCall) {
+            quoted = await quoteCall({ name, arguments: args });
+            if (!(Number.isFinite(quoted) && quoted > 0)) throw new Error("Cannot price this workflow.");
+          } else if (validate) await validate({ name, arguments: args });
           if (persistenceFailed && !await persist()) return errResult("Cannot issue a Nano quote while payment storage is unavailable. Try again shortly.");
           if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
-          const price = priceFor(name, args);
+          const price = quoted ?? priceFor(name, args);
           const pair = await ratePair();
           if (verifyPaymentReads) {
             if (!await paymentReadsReady()) return errResult(QUOTE_READ_UNAVAILABLE);
@@ -1606,6 +1620,7 @@ export function createChargeGate({
           q = {
             id: "pay_" + randomBytes(9).toString("base64url"),
             tool: name, argsHash, usd: price,
+            ...(ctx?.paymentScope && { paymentScope: ctx.paymentScope }),
             pair, // settle math must use the exact pair the deposit was priced at
             amountRaw,
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
@@ -1703,7 +1718,10 @@ export function createChargeGate({
             try {
               note(`payment received — running ${name}` + (q.etaMs ? ` (typically ~${fmtDur(q.etaMs)})` : ""));
               const budget = fundRun && fundingTerms(q);
-              const execute = () => registry.callTool({ name, arguments: args }, budget ? { ...ctx, fundedMaxUsd: budget.maxUsd } : ctx);
+              const executionContext = quoteCall || budget ? { ...ctx,
+                ...(budget && { fundedMaxUsd: budget.maxUsd }), ...(quoteCall && { quoteUsd: q.usd }),
+              } : ctx;
+              const execute = () => registry.callTool({ name, arguments: args }, executionContext);
               const { costUsd, costExact, providerUsd, providerExact, billedUsd, textOutput, ...result } = await withHostedRun(() => budget
                 ? fundRun(budget, execute)
                 : execute(), executionLimit);

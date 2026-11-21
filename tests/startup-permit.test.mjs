@@ -143,7 +143,7 @@ function copyRelease(w) {
   for (const folder of ['src', 'bin']) cpSync(join(packageRoot, folder), join(w.release, folder), { recursive: true });
   cpSync(join(packageRoot, 'package.json'), join(w.release, 'package.json'));
   mkdirSync(join(w.release, 'assets'));
-  for (const name of ['near-site.js', 'near-wallet.js', 'creator-site.js']) cpSync(join(packageRoot, 'assets', name), join(w.release, 'assets', name));
+  for (const name of ['near-site.js', 'near-wallet.js', 'creator-site.js', 'custom-mcp.js']) cpSync(join(packageRoot, 'assets', name), join(w.release, 'assets', name));
   mkdirSync(join(w.release, 'node_modules'));
   const lock = JSON.parse(readFileSync(join(packageRoot, 'package-lock.json'), 'utf8'));
   for (const [path, value] of Object.entries(lock.packages)) if (path.startsWith('node_modules/') && !value.dev) cpSync(join(packageRoot, path), join(w.release, path), { recursive: true });
