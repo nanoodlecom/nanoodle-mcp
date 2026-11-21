@@ -263,10 +263,10 @@ Coverage:
   Shrinking lag or a plateau longer than 12 minutes clears the trend. The
   elapsed time comes from the counter observations.
   Wallet read quorum determines Nano payment readiness.
-- Recent paid workflow execution failures from the Nano and NEAR/USDC
-  ledgers. The report includes aggregate counts for the last 30 minutes.
-  Two or more failed runs raise an advisory while payment admission
-  continues. Refunds for late or wrong-amount transfers are outside this check.
+- Recent paid workflow execution failures from the Nano, NEAR/USDC and
+  Market ledgers. Two or more failed runs in 30 minutes across these sources
+  raise an advisory while payment admission continues. Late or wrong-amount
+  transfers and Market jobs declined before execution are excluded.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the
@@ -332,8 +332,10 @@ Coverage:
   independently confirmed balance after obligations. It also checks the
   combined budgets of paid Nano, NEAR and USDC runs still waiting to start,
   using each quote's locked rate. Accepted Market jobs waiting to start are
-  included at the sampled Nano rate. Running jobs already affect the runtime
-  balance through reservations. A creator run includes overhead
+  included at the sampled Nano rate. If fresh pricing raises a waiting job's
+  cost within its escrow, the monitor rechecks the combined queue at that
+  higher cost. Running jobs already affect the runtime balance through
+  reservations. A creator run includes overhead
   from the largest possible deposit with quote dust. These are per-workflow
   warnings. Quote admission uses the latest healthy funding sample to compare
   the requested workflow's locked Nano budget against wallet funds after

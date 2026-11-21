@@ -29,8 +29,24 @@ function marketReservationUsd(record) {
   return usd;
 }
 
-export function recentPaidWorkflowFailures({ nano, near }, now = Date.now()) {
-  const failures = { nano: 0, near: 0, usdc: 0 };
+function overdueMarketWork(record, now, timeoutMs) {
+  const rework = record.phase === "reworking" || (record.phase === "submitting" && record.reworkEpoch);
+  if (rework) {
+    // Older records only saved the rework's due date. Neither their original
+    // hire time nor the previous paid run describes this delivery window.
+    const deadline = Date.parse(record.reworkEpoch);
+    if (deadline <= now) return true;
+    const startedAt = record.reworkStartedAt ?? record.updatedAt;
+    return Number.isFinite(startedAt) && now - startedAt > timeoutMs;
+  }
+  // A retry updates updatedAt even when the buyer is still waiting on the
+  // first delivery or a refund. Use the immutable hire record when available.
+  const startedAt = record.createdAt ?? record.runStartedAt ?? record.updatedAt;
+  return Number.isFinite(startedAt) && now - startedAt > timeoutMs;
+}
+
+export function recentPaidWorkflowFailures({ nano, near, market = [] }, now = Date.now()) {
+  const failures = { nano: 0, near: 0, usdc: 0, market: 0 };
   const recent = at => Number.isSafeInteger(at) && at <= now && now - at < PAID_FAILURE_WINDOW_MS;
   for (const quote of nano.quotes) {
     // Late deposits can also be refunded. A failed run retains a redacted
@@ -44,6 +60,14 @@ export function recentPaidWorkflowFailures({ nano, near }, now = Date.now()) {
   for (const quote of values(near.quotes)) {
     if (quote.status === "failed" && quote.outcome === "run_failed" && recent(quote.finishedAt)) {
       failures[quote.asset === "usdc" ? "usdc" : "near"]++;
+    }
+  }
+  for (const ledger of market) {
+    for (const record of marketAssignments(ledger)) {
+      if (record.outcome === "run_failed" && recent(record.runFinishedAt)
+        && Number.isSafeInteger(record.runStartedAt) && record.runStartedAt > 0 && record.runStartedAt <= record.runFinishedAt) {
+        failures.market++;
+      }
     }
   }
   return failures;
@@ -135,7 +159,7 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     for (const rec of assignments) {
       if (rec.phase === "stuck") issues.add("market-assignment-stuck");
       if (["new", "reworking", "running", "submitting", "delivering", "started", "starting", "pricing", "declining"].includes(rec.phase)
-        && old(rec.runStartedAt ?? rec.updatedAt ?? rec.createdAt, stuckMs)) issues.add("market-work-stuck");
+        && overdueMarketWork(rec, now, stuckMs)) issues.add("market-work-stuck");
       const budgetUsd = marketReservationUsd(rec);
       if (budgetUsd > 0) marketUsdNano += parseUsdNano(budgetUsd);
     }
@@ -176,17 +200,20 @@ export function paidNanoRunFundingRaw(quotes) {
 }
 
 /** Accepted Market launches and running work, priced at the sampled Nano rate. */
-export function marketRunFunding(market, xnoUsd) {
+export function marketRunFunding(market, xnoUsd, { pendingPrices = [] } = {}) {
   const pair = { usdNano: xnoUsd == null ? null : parseUsdNano(xnoUsd), raw: RAW_PER_XNO };
   let waitingRaw = 0n, totalRaw = 0n;
-  for (const state of market) {
+  for (const [index, state] of market.entries()) {
     for (const rec of marketAssignments(state)) {
-      const budgetUsd = marketReservationUsd(rec);
-      if (budgetUsd === 0) continue;
+      const recordedUsd = marketReservationUsd(rec);
+      if (recordedUsd === 0) continue;
+      const waiting = rec.phase !== "running";
+      const refreshedUsd = waiting ? pendingPrices[index]?.get(rec.id) : undefined;
+      const budgetUsd = Math.max(recordedUsd, refreshedUsd ?? 0);
       const { maxRaw, overheadRaw } = runFundingBudget({ id: rec.id, budgetUsd, pair, creator: !!rec.creator });
       const requiredRaw = maxRaw + overheadRaw;
       totalRaw += requiredRaw;
-      if (rec.phase !== "running") waitingRaw += requiredRaw;
+      if (waiting) waitingRaw += requiredRaw;
     }
   }
   return { waitingRaw, totalRaw };

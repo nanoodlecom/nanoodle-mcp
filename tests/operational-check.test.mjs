@@ -224,12 +224,16 @@ test("two recent paid workflow failures warn while checkout lanes stay open", as
   state.quotes.push({ ...quote, id: "private-workflow-one" });
   const stage = report => report.checks.find(c => c.stage === "paid-workflow-execution");
   let report = await runOperationalCheck(f.config, f.deps);
-  assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: true, failures: { nano: 1, near: 0, usdc: 0 } });
+  assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: true,
+    failures: { nano: 1, near: 0, usdc: 0, market: 0 } });
 
-  state.quotes.push({ ...quote, id: "private-workflow-two" });
+  f.states["/jobs/nanoodle-image/market-state.json"].assignments["private-workflow-two"] = {
+    phase: "declined", outcome: "run_failed", runStartedAt: NOW - 3000, runFinishedAt: NOW - 500,
+    run: { error: "PRIVATE_WORKFLOW_ERROR" },
+  };
   report = await runOperationalCheck(f.config, f.deps);
   assert.deepEqual(stage(report), { stage: "paid-workflow-execution", ok: false,
-    failures: { nano: 2, near: 0, usdc: 0 }, code: "paid-workflow-failures-repeated", domains: [] });
+    failures: { nano: 1, near: 0, usdc: 0, market: 1 }, code: "paid-workflow-failures-repeated", domains: [] });
   assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_WORKFLOW_ERROR|private-workflow-/);
 });
@@ -2390,6 +2394,29 @@ function marketIntakeRow(age, fields = {}) {
   job: { jobKind: "instant", title: "PRIVATE_BUYER_BRIEF" } };
 }
 
+test("the scheduled check alerts on a repeatedly retried Market hire before its SLA expires", async t => {
+  const age = 3_600_001;
+  const row = marketIntakeRow(age, { slaSeconds: 10_800, slaDeadlineAt: new Date(NOW - age + 10_800_000).toISOString() });
+  const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments" ? Response.json({ assignments: [row] }) : null);
+  t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+  f.states["/jobs/nanoodle-image/market-state.json"].assignments[ID] = {
+    phase: "new", createdAt: NOW - age, updatedAt: NOW - 10, attempts: 12, nextAttemptAt: NOW + 30_000,
+    lastError: "PRIVATE_RETRY_DETAILS",
+  };
+
+  const invocationId = ID.replaceAll("-", "");
+  const report = await runOperationalCheck({ ...f.config, invocationId }, f.deps);
+  const stage = name => report.checks.find(c => c.stage === name);
+  assert.equal(stage("market-sla-nanoodle-image").ok, true);
+  assert.deepEqual(stage("market-work-stuck"), { stage: "market-work-stuck", ok: false, code: "market-work-stuck", domains: [] });
+  assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+  const alert = failureEvent({ MONITOR_UNIT: "nanoodle-operational-check.service", MONITOR_INVOCATION_ID: invocationId,
+    MONITOR_SERVICE_RESULT: "exit-code", MONITOR_EXIT_CODE: "exited", MONITOR_EXIT_STATUS: "1" }, report, NOW);
+  assert.match(alert.text, /market-work-stuck/);
+  assert.doesNotMatch(JSON.stringify({ report, alert }), /PRIVATE_RETRY_DETAILS|PRIVATE_BUYER_BRIEF/);
+  assert.ok(!f.calls.some(({ url, body }) => /\/(start|submit|decline)$/.test(url.pathname) || body?.params?.name === "run_noodle"));
+});
+
 test("Market intake catches unclaimed hires, remote starts missing local state and expired SLAs", async () => {
   const fresh = marketIntakeRow(40_000);
   const cases = [
@@ -2453,6 +2480,59 @@ test("accepted Market jobs are repriced locally against the smaller of escrow an
     if (expected) assert.deepEqual(finding.domains, []);
     assert.equal(report.admission.market, true);
     assert.doesNotMatch(JSON.stringify({ report, calls: f.calls }), /PRIVATE_ACCEPTED_MARKET_WORKFLOW/);
+  }
+});
+
+test("fresh Market prices and waiting USDC work must fit the same Nano pool", async t => {
+  const raw = 10n ** 30n, otherId = "5f5fe889-cd2d-4cf2-852b-d7dfca700eed";
+  const privateIdea = "PRIVATE_REPRICED_MARKET_WORK";
+  for (const mode of ["exact", "short-one-raw", "started-during-repricing", "provider-key"]) {
+    const rows = [ID, otherId].map(assignmentId => {
+      const row = marketIntakeRow(60_000, { assignmentId });
+      row.job.description = JSON.stringify({ graph: { v: 1, nodes: [], links: [] }, inputs: { Idea: privateIdea } });
+      return row;
+    });
+    const f = fixture(({ url }) => url.pathname === "/v1/agents/me/assignments"
+      ? Response.json({ assignments: rows }) : null);
+    t.after(() => rmSync(f.config.stateDir, { recursive: true, force: true }));
+    f.config.agents[0].custom = true;
+    const assignments = f.states["/jobs/nanoodle-image/market-state.json"].assignments;
+    for (const { assignment } of rows) assignments[assignment.assignmentId] = {
+      id: assignment.assignmentId, phase: "starting", pricing: { depositUsd: 0.1 }, budgetUsd: 0.95,
+    };
+    const near = f.states["/state/near-state.json"];
+    near.quotes.usdc = { status: "paid", asset: "usdc", depositUsd: "0.3", paidAtBlockMs: NOW,
+      paidYocto: "300000", rate: { xnoUsd: "1" } };
+    bindFixturePayments(near, "usdc");
+    const available = mode === "started-during-repricing" ? 9n * raw / 10n : 3n * raw / 2n - BigInt(mode === "short-one-raw");
+    Object.assign(f.states["/state/funding-health.json"], {
+      liabilitiesRaw: "0", reservedRaw: String(10n * raw - available), activeRuns: 1, oldestStartedAt: NOW - 1000,
+    });
+    if (mode === "provider-key") useApiProvider(f);
+    const original = f.deps.computePrice;
+    f.deps.computePrice = async (args, options) => {
+      if (args.inputs?.Idea !== privateIdea) return original(args, options);
+      if (mode === "started-during-repricing") {
+        Object.assign(assignments[otherId], { phase: "running", pricing: { depositUsd: 0.6 } });
+      }
+      return { safety: { ok: true }, pricing: { estimatedCostUsd: 0.5 } };
+    };
+
+    const report = await runOperationalCheck(f.config, f.deps);
+    const stage = name => report.checks.find(row => row.stage === name);
+    assert.equal(stage("market-pending-pricing-nanoodle-image")?.ok, true, mode);
+    const refreshed = stage("market-repriced-run-funding");
+    if (mode === "provider-key") {
+      assert.equal(refreshed, undefined);
+    } else {
+      assert.equal(stage("market-paid-run-funding")?.ok, true, mode);
+      assert.equal(refreshed?.ok, mode !== "short-one-raw", mode);
+      if (mode === "short-one-raw") assert.deepEqual(refreshed, { stage: "market-repriced-run-funding",
+        ok: false, code: "market-repriced-run-funding-insufficient", domains: [] });
+    }
+    assert.deepEqual(report.admission, { nano: true, near: true, usdc: true, market: true });
+    assert.doesNotMatch(JSON.stringify({ report, calls: f.calls }), /PRIVATE_REPRICED_MARKET_WORK/);
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(otherId));
   }
 });
 
