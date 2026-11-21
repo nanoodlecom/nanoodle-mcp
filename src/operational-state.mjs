@@ -12,6 +12,7 @@ const object = value => value && typeof value === "object" && !Array.isArray(val
 const U128_MAX = (1n << 128n) - 1n;
 const RAW_PER_XNO = 10n ** 30n;
 const NANO_EXECUTION_GRACE_MS = 5 * 60_000;
+const PAID_FAILURE_WINDOW_MS = 30 * 60_000;
 function amount(value) {
   if (typeof value !== "string" || !/^\d{1,39}$/.test(value) || BigInt(value) > U128_MAX) throw Error("invalid-state-amount");
   return BigInt(value);
@@ -26,6 +27,50 @@ function marketReservationUsd(record) {
   const usd = record.pricing?.depositUsd ?? record.budgetUsd;
   if (!(typeof usd === "number" && Number.isFinite(usd) && usd >= 0)) throw Error("invalid-market-reservation");
   return usd;
+}
+
+function overdueMarketWork(record, now, timeoutMs) {
+  const rework = record.phase === "reworking" || (record.phase === "submitting" && record.reworkEpoch);
+  if (rework) {
+    // Older records only saved the rework's due date. Neither their original
+    // hire time nor the previous paid run describes this delivery window.
+    const deadline = Date.parse(record.reworkEpoch);
+    if (deadline <= now) return true;
+    const startedAt = record.reworkStartedAt ?? record.updatedAt;
+    return Number.isFinite(startedAt) && now - startedAt > timeoutMs;
+  }
+  // A retry updates updatedAt even when the buyer is still waiting on the
+  // first delivery or a refund. Use the immutable hire record when available.
+  const startedAt = record.createdAt ?? record.runStartedAt ?? record.updatedAt;
+  return Number.isFinite(startedAt) && now - startedAt > timeoutMs;
+}
+
+export function recentPaidWorkflowFailures({ nano, near, market = [] }, now = Date.now()) {
+  const failures = { nano: 0, near: 0, usdc: 0, market: 0 };
+  const recent = at => Number.isSafeInteger(at) && at <= now && now - at < PAID_FAILURE_WINDOW_MS;
+  for (const quote of nano.quotes) {
+    // Late deposits can also be refunded. A failed run retains a redacted
+    // execution error and its finish time, including while the refund is owed.
+    if ((quote.status === "consumed" || quote.status === "refunded") && !quote.settled
+      && typeof quote.error === "string" && quote.error.length > 0 && recent(quote.completedAt)
+      && Number.isSafeInteger(quote.paidAt) && quote.paidAt > 0 && quote.paidAt <= quote.completedAt) {
+      failures.nano++;
+    }
+  }
+  for (const quote of values(near.quotes)) {
+    if (quote.status === "failed" && quote.outcome === "run_failed" && recent(quote.finishedAt)) {
+      failures[quote.asset === "usdc" ? "usdc" : "near"]++;
+    }
+  }
+  for (const ledger of market) {
+    for (const record of marketAssignments(ledger)) {
+      if (record.outcome === "run_failed" && recent(record.runFinishedAt)
+        && Number.isSafeInteger(record.runStartedAt) && record.runStartedAt > 0 && record.runStartedAt <= record.runFinishedAt) {
+        failures.market++;
+      }
+    }
+  }
+  return failures;
 }
 
 export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now(), stuckMs = 3_600_000, debtMs = 900_000 } = {}) {
@@ -114,7 +159,7 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
     for (const rec of assignments) {
       if (rec.phase === "stuck") issues.add("market-assignment-stuck");
       if (["new", "reworking", "running", "submitting", "delivering", "started", "starting", "pricing", "declining"].includes(rec.phase)
-        && old(rec.runStartedAt ?? rec.updatedAt ?? rec.createdAt, stuckMs)) issues.add("market-work-stuck");
+        && overdueMarketWork(rec, now, stuckMs)) issues.add("market-work-stuck");
       const budgetUsd = marketReservationUsd(rec);
       if (budgetUsd > 0) marketUsdNano += parseUsdNano(budgetUsd);
     }
@@ -124,13 +169,14 @@ export function paymentLiabilities({ nano, near, market = [] }, { now = Date.now
 }
 
 /** Accepted NEAR and USDC payments waiting to acquire a Nano run reservation. */
-export function paidNearRunFundingRaw(quotes) {
+export function paidNearRunFundingRaw(quotes, { providerUsesWallet = true } = {}) {
   let requiredRaw = 0n;
   for (const quote of values(quotes)) {
     if (quote.status !== "paid" || quote.settlement || quote.fundingOutcomeReady === true) continue;
+    if (!providerUsesWallet && !quote.author) continue;
     if (amount(quote.paidYocto) === 0n) throw Error("invalid-paid-near-amount");
-    const { maxRaw, overheadRaw } = nearRunFundingBudget(quote);
-    requiredRaw += maxRaw + overheadRaw;
+    const { maxRaw, overheadRaw } = nearRunFundingBudget(quote, { providerUsesWallet });
+    requiredRaw += overheadRaw + maxRaw;
   }
   return requiredRaw;
 }
@@ -154,17 +200,20 @@ export function paidNanoRunFundingRaw(quotes) {
 }
 
 /** Accepted Market launches and running work, priced at the sampled Nano rate. */
-export function marketRunFunding(market, xnoUsd) {
+export function marketRunFunding(market, xnoUsd, { pendingPrices = [] } = {}) {
   const pair = { usdNano: xnoUsd == null ? null : parseUsdNano(xnoUsd), raw: RAW_PER_XNO };
   let waitingRaw = 0n, totalRaw = 0n;
-  for (const state of market) {
+  for (const [index, state] of market.entries()) {
     for (const rec of marketAssignments(state)) {
-      const budgetUsd = marketReservationUsd(rec);
-      if (budgetUsd === 0) continue;
+      const recordedUsd = marketReservationUsd(rec);
+      if (recordedUsd === 0) continue;
+      const waiting = rec.phase !== "running";
+      const refreshedUsd = waiting ? pendingPrices[index]?.get(rec.id) : undefined;
+      const budgetUsd = Math.max(recordedUsd, refreshedUsd ?? 0);
       const { maxRaw, overheadRaw } = runFundingBudget({ id: rec.id, budgetUsd, pair, creator: !!rec.creator });
       const requiredRaw = maxRaw + overheadRaw;
       totalRaw += requiredRaw;
-      if (rec.phase !== "running") waitingRaw += requiredRaw;
+      if (waiting) waitingRaw += requiredRaw;
     }
   }
   return { waitingRaw, totalRaw };

@@ -60,12 +60,28 @@ test("landing page images are same-origin or on media.nanoodle.com", async () =>
   }
 });
 
+// A live-network HEAD can die in transport (proxy resets, socket closes) without
+// the origin ever answering. Retry ONLY a thrown fetch — a response, any response,
+// is data and is never retried, so a real 404 / wrong type / CORP still fails hard.
+async function headWithRetry(src, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetch(src, { method: "HEAD", headers: { Origin: PUBLIC_BASE }, signal: AbortSignal.timeout(15000) });
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 test("landing page media images return 200, an image type and no same-origin CORP", { skip: OFFLINE && "NANOODLE_OFFLINE=1" }, async () => {
   const { srcs } = await landingImgSrcs();
   const media = srcs.filter(src => new URL(src, PUBLIC_BASE + "/").origin === MEDIA_ORIGIN);
   assert.equal(media.length, 6, `expected 6 media images, got ${JSON.stringify(media)}`);
   for (const src of media) {
-    const res = await fetch(src, { method: "HEAD", headers: { Origin: PUBLIC_BASE }, signal: AbortSignal.timeout(15000) });
+    const res = await headWithRetry(src);
     assert.equal(res.status, 200, `${src} -> ${res.status}`);
     assert.match(res.headers.get("content-type") || "", /^image\//, `${src} content-type`);
     const corp = (res.headers.get("cross-origin-resource-policy") || "").trim().toLowerCase();

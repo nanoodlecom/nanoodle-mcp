@@ -109,7 +109,7 @@ function fakeRegistry({ author = null, onCall } = {}) {
 }
 
 function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300, pollMs = 10, usage,
-  xnoUsd = 1.0, fetch, stateFile, fundRun, canQuote, verifyPaymentReads, maintenance } = {}) {
+  xnoUsd = 1.0, fetch, stateFile, fundRun, canQuote, canFundQuote, verifyPaymentReads, maintenance } = {}) {
   const gate = createChargeGate({
     address: GATE_ADDR,
     ops: chain.ops,
@@ -123,7 +123,7 @@ function makeGate(chain, { usd = 0.05, registry, now, monotonicNow, waitMs = 300
     now, monotonicNow,
     fetch,
     stateFile,
-    fundRun, canQuote, verifyPaymentReads, maintenance,
+    fundRun, canQuote, canFundQuote, verifyPaymentReads, maintenance,
   });
   return gate;
 }
@@ -297,6 +297,29 @@ test("a Nano refund at the retry limit remains queued after a standby quota defe
   start();
   await untilState(file, "the original refund to settle", state => state.owed.length === 0);
   assert.equal(attempts, 2);
+});
+
+test("Nano refuses a quote when its required funding does not fit the shared pool", async t => {
+  const chain = fakeChain(), registry = fakeRegistry(), events = [];
+  const expected = 5n * 10n ** 28n;
+  let funds = expected - 1n;
+  const gate = makeGate(chain, { registry,
+    canFundQuote: required => { assert.equal(required, expected); return required <= funds; },
+    fundRun: () => assert.fail("A quote must not reserve or run"),
+    usage: event => events.push(event),
+  });
+  t.after(() => gate.stop());
+  const { callTool } = gate.wrapRegistry(registry);
+  const request = { name: "poster", arguments: { Text: "test" } };
+  const refused = await callTool(request);
+  assert.equal(refused.isError, true);
+  assert.equal(refused.structuredContent?.x402, undefined);
+  assert.deepEqual(events, []);
+  funds++;
+  assert.ok(argOf(await callTool(request)).paymentId);
+  assert.deepEqual(events, ["quote"]);
+  assert.equal(registry.callCount(), 0);
+  assert.deepEqual(chain.state.transfers, []);
 });
 
 test("Nano funding handoff uses the paid quote's locked pair and refuses before inference", async () => {

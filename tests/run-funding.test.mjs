@@ -42,6 +42,21 @@ test("parallel paid nodes share one cumulative USD and raw budget", async () => 
   assert.deepEqual(w.pool.snapshot(), { activeRuns: 0, reservedRaw: "0" });
 });
 
+test("backup key requests draw from the same USD budget as Nano invoices", async () => {
+  const w = world();
+  const quote = { paymentId: "backup-quote", amountUsd: "0.60" };
+  await assert.rejects(w.pool.authorizeBackup(quote), { code: "FUNDING_CLOSED" });
+  await w.pool.run(budget("mixed"), async () => {
+    await w.pool.authorizeBackup(quote);
+    assert.equal(w.pool.snapshot().reservedRaw, "100");
+    await assert.rejects(w.pool.authorizeBackup(quote), { code: "FUNDING_INVOICE_USED" });
+    await assert.rejects(w.pay(20n, "0.41"), { code: "FUNDING_OVER_BUDGET" });
+    await w.pay(20n, "0.40", "nano-quote");
+    await assert.rejects(w.pool.authorizeBackup({ ...quote, paymentId: "new" }), { code: "FUNDING_OVER_BUDGET" });
+  });
+  assert.deepEqual(w.sent, ["nano-quote"]);
+});
+
 test("another run cannot spend reserved working capital; draws and actual balance both decrease", async () => {
   const w = world({ initial: 100n }), entered = deferred(), finish = deferred();
   const first = w.pool.run(budget("first", 80n), async () => { await w.pay(60n, 0.6); entered.resolve(); await finish.promise; });
@@ -62,6 +77,19 @@ test("customer and creator debts remain reserved even when the nominal balance c
   await assert.rejects(w.pool.run(budget("debt", 50n), () => { ran = true; }), { code: "FUNDING_INSUFFICIENT" });
   assert.equal(ran, false);
   assert.equal(w.sent.length, 0);
+});
+
+test("creator-only reservations grant no provider spend authority", async () => {
+  const w = world({ initial: 70n });
+  await w.pool.run({ id: "creator", maxUsd: "0", maxRaw: 0n, overheadRaw: 70n }, async () => {
+    assert.equal(w.pool.snapshot().reservedRaw, "70");
+    await assert.rejects(w.pay(1n, 0.01), { code: "FUNDING_OVER_BUDGET" });
+    assert.equal(w.sent.length, 0);
+  });
+  for (const maxUsd of ["0", "1"]) {
+    await assert.rejects(w.pool.run({ id: "empty", maxUsd, maxRaw: 0n }, () => assert.fail("unexpected run")),
+      { code: "FUNDING_INVALID" });
+  }
 });
 
 test("admission rechecks liabilities after awaiting the chain balance", async () => {

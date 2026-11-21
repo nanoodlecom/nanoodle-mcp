@@ -98,19 +98,32 @@ test("synchronous work cannot extend its deadline by delaying timer callbacks", 
   assert.equal(requests, 0);
 });
 
-test("video polling is cancelled even when the library's video timeout is unlimited", async () => {
+test("video polling is cancelled even when the library's video timeout is unlimited", { timeout: 10_000 }, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const firstPoll = deferred();
   let polls = 0;
   const wf = new Workflow({ v: 1, nodes: [{ id: "v", type: "tvideo", fields: { model: "example/video", prompt: "a river", duration: "5" } }], links: [] }, {
     apiKey: "fixture", fetch: hostedRunFetch(async url => {
       if (String(url).includes("generate-video")) return Response.json({ runId: "v1" });
-      polls++; return Response.json({ status: "PROCESSING" });
+      polls++;
+      firstPoll.resolve();
+      return Response.json({ status: "PROCESSING" });
     }), quiet: true,
   });
   wf.client.pollIntervals.video = 1;
   assert.equal(wf.client.timeouts.video, Infinity);
-  await assert.rejects(withHostedRun(() => wf.run({}, hostedRunOptions()), 50), /hosted execution limit/);
+  const deadline = 60_000;
+  const cancelled = assert.rejects(withHostedRun(() => wf.run({}, hostedRunOptions()), deadline), { code: "HOSTED_RUN_TIMEOUT" });
+  // Let the mocked submission finish and schedule the first status poll.
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1);
+  await firstPoll.promise;
+  t.mock.timers.tick(deadline - 1);
+  await cancelled;
   const stopped = polls;
-  await new Promise(resolve => setTimeout(resolve, 10)); assert.equal(polls, stopped); assert.ok(polls > 0);
+  t.mock.timers.tick(10);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(polls, stopped);
 });
 
 test("timing out waits for an in-flight payment before releasing its reservation", async t => {
@@ -149,6 +162,47 @@ test("saved, custom and Market execution use the same hosted timeout", async t =
   const runner = createWorkflowRunner({ apiKey: "fixture", baseUrl: nano.url, budgetUsd: 1, runTimeoutMs: 200 });
   const priced = await runner.price({ graph }); assert.equal(priced.ok, true);
   await assert.rejects(runner.run({ pricing: priced.pricing, inputs: priced.inputs, outDir: dir }), /hosted execution limit/);
+});
+
+test("hosted saved and custom graphs use a backup key only after an unpaid provider quote", async t => {
+  const providerCalls = [];
+  let quotes = 0;
+  const baseUrl = await server(t, async (req, res) => {
+    let body = "";
+    for await (const part of req) body += part;
+    res.setHeader("Content-Type", "application/json");
+    if (req.url !== "/api/v1/chat/completions") {
+      res.end(JSON.stringify({ data: [{ id: "z-ai/glm-5.3-flash", pricing: { prompt: 0.1, completion: 0.3 } }] }));
+      return;
+    }
+    providerCalls.push({ body, key: req.headers["x-api-key"], x402: req.headers["x-x402"] });
+    if (req.headers["x-x402"] === "true") {
+      res.writeHead(402);
+      res.end(JSON.stringify({ payment: { paymentId: `quote-${++quotes}`, amountUsd: "0.01",
+        accepted: [{ scheme: "lightning-l402" }] } }));
+    } else {
+      res.end(JSON.stringify({ choices: [{ message: { content: "Backup model result" } }],
+        x_nanogpt_pricing: { costUsd: 0.008 } }));
+    }
+  });
+  const dir = await mkdtemp(join(tmpdir(), "hosted-backup-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const graph = { v: 1, nodes: [{ id: "l", type: "llm", name: "Answer",
+    fields: { model: "z-ai/glm-5.3-flash", prompt: "Hello", maxTokens: 32 } }], links: [] };
+  await writeFile(join(dir, "backed.json"), JSON.stringify(graph));
+  const pool = createRunFunding({ serial: async fn => fn(), balance: async () => 100n, requireScope: true });
+  const registry = await loadTools({ dirs: [dir], baseUrl, outDir: dir, hosted: true, remote: true,
+    payment: () => assert.fail("unexpected Nano payment"), backupKey: "fixture-key", authorizeBackup: pool.authorizeBackup });
+  for (const params of [{ name: "backed", arguments: {} }, { name: "run_noodle", arguments: { graph } }]) {
+    const result = await pool.run({ id: params.name, maxUsd: 0.05, maxRaw: 30n }, () => registry.callTool(params));
+    assert.match(JSON.stringify(result), /Backup model result/);
+  }
+  assert.equal(providerCalls.length, 4);
+  for (const i of [0, 2]) {
+    const [initial, backup] = providerCalls.slice(i, i + 2);
+    assert.deepEqual(initial, { body: backup.body, key: undefined, x402: "true" });
+    assert.deepEqual(backup, { body: initial.body, key: "fixture-key", x402: undefined });
+  }
 });
 
 test("the Market assignment can shorten the actual hosted run deadline", { timeout: 5_000 }, async t => {

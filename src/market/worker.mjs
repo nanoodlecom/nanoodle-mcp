@@ -159,14 +159,15 @@ export function createMarketWorker({
       code: expired ? "MARKET_SLA_EXPIRED" : "MARKET_SLA_TOO_CLOSE",
       detail: `${reason} No model was run. Your payment will be refunded in full.` } }));
   }
+  function refuseFee(rec, reason, error) {
+    if (error.code !== "MARKET_FEE_CHANGED") return backoff(rec, error);
+    return set(rec.id, ok({ phase: "declining", decline: { reason, code: error.code,
+      detail: "The marketplace fee changed beyond this listing's pricing allowance. No model was run; your payment is refunded in full." } }));
+  }
   async function feeRefusal(rec, reason) {
     if (!checkFee) return null;
     try { await checkFee(); return null; }
-    catch (error) {
-      if (error.code !== "MARKET_FEE_CHANGED") return backoff(rec, error);
-      return set(rec.id, ok({ phase: "declining", decline: { reason, code: error.code,
-        detail: "The marketplace fee changed beyond this listing's pricing allowance. No model was run; your payment is refunded in full." } }));
-    }
+    catch (error) { return refuseFee(rec, reason, error); }
   }
 
   async function progress(id, message, percent) {
@@ -275,6 +276,7 @@ export function createMarketWorker({
     const deadlineStop = deadlineRefusal(rec, timing); if (deadlineStop) return deadlineStop;
     const refused = await feeRefusal(rec, "rejected"); if (refused) return refused;
     const afterFee = deadlineRefusal(rec, timing); if (afterFee) return afterFee;
+    store.assertDurable();
     try {
       const r = await client.start(rec.id);
       return set(rec.id, ok({ phase: "started", startedAt: (r && r.startedAt) || new Date(now()).toISOString() }));
@@ -337,7 +339,6 @@ export function createMarketWorker({
     const finalBudget = Math.min(jobBudget, current.terms.budgetUsd);
     if (prep.pricing.depositUsd > finalBudget) return declineEscrow(rec, "failed", "MARKET_ESCROW_TOO_LOW");
     const executionDeadlineAt = Math.min(timing.executionDeadlineAt, current.timing.executionDeadlineAt);
-    prepared.delete(rec.id);
     // Durable BEFORE the first paid call: a crash from here on is never re-run.
     rec = set(rec.id, ok({ phase: "running", pricing: pricingSummary(prep.pricing), runStartedAt: now(),
       executionDeadlineAt, budgetUsd: finalBudget, listingPriceUsd: current.terms.priceUsd,
@@ -345,9 +346,16 @@ export function createMarketWorker({
     }));
     log(`assignment ${short(rec.id)}: running the workflow`);
     let run;
+    let finalFeeError = null;
     try {
       run = await runner.run({ pricing: prep.pricing, inputs: prep.inputs, outDir: store.outDir(rec.id),
         fundingId: `market:${rec.id}`, creator: !!rec.creator, executionDeadlineAt,
+        beforeInference: checkFee && (async () => {
+          // Wallet preparation can queue behind other jobs. Recheck the fee
+          // after securing the reservation and before the first model request.
+          try { await checkFee(); }
+          catch (error) { finalFeeError = error; throw error; }
+        }),
         onRunComplete(result) {
           if (!rec.creator || !creatorPayments) return;
           const empty = result.outputs.length > 0 && result.outputs.every(o => o.kind === "text" && !String(o.text || "").trim());
@@ -356,6 +364,13 @@ export function createMarketWorker({
         },
       });
     } catch (e) {
+      if (finalFeeError && e === finalFeeError) {
+        // This exact rejection happened before inference. Only then may a
+        // transient fee lookup error return to the retryable started phase.
+        rec = set(rec.id, { phase: "started", runStartedAt: null, executionDeadlineAt: null });
+        return refuseFee(rec, "failed", e);
+      }
+      prepared.delete(rec.id);
       log(`assignment ${short(rec.id)}: run failed (${errText(e)}); handing it back`);
       // Only the provider's own per-step message (runner.mjs marks it buyerMessage) goes to the
       // buyer. Anything else (a local file-system error, a bug) can name this machine's paths:
@@ -366,6 +381,7 @@ export function createMarketWorker({
         decline: { reason: "failed", code: "RUN_FAILED", detail: failureDeclineDetail("failed", forBuyer) },
       }));
     }
+    prepared.delete(rec.id);
     log(`assignment ${short(rec.id)}: run finished — actual cost ${run.costUsd == null ? "not reported" : `$${run.costUsd}`}${run.costExact ? "" : " (lower bound)"}`);
     // A run whose every output is empty text is not a result to charge for (seen live:
     // a reasoning model that spends its whole maxTokens thinking returns ""). The buyer
@@ -512,6 +528,7 @@ export function createMarketWorker({
   async function advance(id, row) {
     let rec = store.get(id);
     for (let step = 0; step < 12 && rec && !TERMINAL.has(rec.phase) && (rec.nextAttemptAt || 0) <= now(); step++) {
+      store.assertDurable();
       const before = rec.updatedAt + rec.phase;
       switch (rec.phase) {
         case "new": rec = await phaseNew(rec, row); break;
@@ -562,12 +579,14 @@ export function createMarketWorker({
       rec = set(rec.id, { creator: { ...rec.creator, amountRaw, status: amountRaw === "0" ? "none" : "owed" } });
     }
     if (rec.creator.status === "owed") {
+      store.assertDurable();
       creatorPayments.enqueue(rec.id, rec.creator);
       set(rec.id, { creator: { ...rec.creator, status: "queued" } });
     }
   }
 
   async function tick() {
+    store.assertDurable();
     let rows = null;
     try { rows = await client.listActionable(); } catch (e) {
       log(`poll failed: ${errText(e)}`);
@@ -607,7 +626,8 @@ export function createMarketWorker({
         const epoch = String(a.slaDeadlineAt || "");
         if ((a.submittedAt || a.deliverableUrl) && epoch !== rec.epoch && !(rec.reworks || []).includes(epoch)) {
           log(`assignment ${short(a.assignmentId)}: sent back by the buyer (or a dispute redo)`);
-          store.update(a.assignmentId, ok({ phase: "reworking", reworkEpoch: epoch, epoch, reworks: [...(rec.reworks || []), epoch] }));
+          store.update(a.assignmentId, ok({ phase: "reworking", reworkEpoch: epoch, reworkStartedAt: now(),
+            epoch, reworks: [...(rec.reworks || []), epoch] }));
         }
       }
     }

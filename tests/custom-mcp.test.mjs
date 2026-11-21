@@ -190,7 +190,9 @@ test("Custom MCP on both listeners saves, isolates, resumes and revokes private 
     assert.equal(completed.data.result.structuredContent.receipt.outcome, "succeeded");
     assert.equal(completed.data.result.structuredContent.receipt.refund.status, "sent");
     assert.equal((await fetch(nearBase + "/near/result/" + payment.paymentId)).status, 404);
-    assert.equal((await (await fetch(nearBase + "/near/status/" + payment.paymentId)).json()).resultInClient, true);
+    const publicStatus = await (await fetch(nearBase + "/near/status/" + payment.paymentId)).json();
+    assert.equal(publicStatus.resultInClient, true);
+    assert.equal(publicStatus.workflow, undefined);
     const checkout = await (await fetch(nearBase + "/pay/" + payment.paymentId)).text();
     assert.match(checkout, /Your workflow continues in your Custom MCP client/);
   }
@@ -218,6 +220,12 @@ test("Custom MCP on both listeners saves, isolates, resumes and revokes private 
     assert.match(quote.argsHash, /^[a-f0-9]{32}$/);
   }
   await restart();
+  for (const quote of nearQuotes) {
+    assert.equal(quote.workflow, undefined);
+    const publicStatus = await (await fetch(nearBase + "/near/status/" + quote.id)).json();
+    assert.equal(publicStatus.resultInClient, true);
+    assert.equal(publicStatus.workflow, undefined);
+  }
   assert.deepEqual(names(await rpc(privateNear, "tools/list", {}, { token })), ["other", "my-poster"]);
   const latest = (await manage(nearBase, "profile", undefined, { key })).data.profile;
   const revoked = await manage(nearBase, "connection", { revision: latest.revision, token: null }, { key });

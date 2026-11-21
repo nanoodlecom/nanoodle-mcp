@@ -165,8 +165,12 @@ Wrong-amount payments can still be confirmed explicitly for a full refund.
 
 The processed block cursor is durable. If an RPC returns malformed discovery
 data or lacks the requested receipt or historical block hash, the watcher
-tries another configured RPC. When no peer can complete the read, the cursor
-stays unchanged and the watcher retries with backoff. Restarts catch up, and an existing quote is backfilled when
+tries another configured RPC. It also tries another peer when a transaction
+found through a finalized receipt is unknown to the first peer or its
+transaction lookup times out. The watcher still verifies FINAL status, the
+transfer, and the matching quote before accepting payment. When no peer can
+complete the read, the cursor stays unchanged and the watcher retries with backoff.
+Restarts catch up, and an existing quote is backfilled when
 the watcher is first introduced. Re-reading a receipt cannot spend twice: the
 payment gate keeps the consumed transaction hashes. `GET /near/health` reports
 the watcher cursor and status without exposing workflow inputs.
@@ -935,6 +939,7 @@ Quote record:
 | `finishedAt` | number \| null | When the quote reached a final status. |
 | `settlement` | object \| null | `{ costUsd, exact, billedAs, reportedUsd, costYocto, feeYocto, chargedYocto, refundYocto }`. Written while the quote is still `running`, before the refund intent. |
 | `refundId` | string \| null | Links to the refund record. |
+| `workflow` | object (optional) | Completed execution graph for the payment page. Includes steps, links and status. Workflow input values and provider output stay out of the graph. |
 | `result` | object \| null | Media-only results (files and links, plus the receipt). Text output is never written to disk; see below. |
 | `error` | string \| null | The gate-authored failure sentence only, never upstream error text. |
 

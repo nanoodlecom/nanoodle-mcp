@@ -65,7 +65,12 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
       throw new FundingError("FUNDING_INVALID", "Funding needs a stable run identity and an execution function");
     }
     if (context.getStore()) throw new FundingError("FUNDING_NESTED", "A nested run cannot reset an existing funding budget");
-    const scope = { id, maxUsd: usd(maxUsd), maxRaw: raw(maxRaw, true), overheadRaw: raw(overheadRaw),
+    const modelRaw = raw(maxRaw), creatorRaw = raw(overheadRaw);
+    const creatorOnly = modelRaw === 0n && creatorRaw > 0n && (maxUsd === 0 || maxUsd === "0");
+    if (modelRaw === 0n && !creatorOnly) {
+      throw new FundingError("FUNDING_INVALID", "A run must reserve model or creator funds");
+    }
+    const scope = { id, maxUsd: creatorOnly ? 0n : usd(maxUsd), maxRaw: modelRaw, overheadRaw: creatorRaw,
       drawnUsd: 0n, drawnRaw: 0n, overheadDrawnRaw: 0n, invoices: new Set(), closed: false, startedAt: Date.now() };
     await serial(async () => {
       if (active.has(id)) throw new FundingError("FUNDING_DUPLICATE", "This run already has a funding reservation");
@@ -97,6 +102,13 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     };
     checkBalance(balanceRaw);
     if (!scope) return checkBalance;
+    debitInvoice(scope, invoice, amount);
+    // The draw is no longer in held() but remains in the account until its
+    // block publishes. Check it alongside fresh liabilities on every attempt.
+    return balance => checkBalance(balance, amount);
+  }
+
+  function debitInvoice(scope, invoice, amount) {
     const invoiceUsd = usd(invoice.amountUsd, true);
     if (typeof invoice.paymentId !== "string" || !invoice.paymentId || invoice.paymentId.length > 256) {
       throw new FundingError("FUNDING_INVALID", "Provider invoice needs a payment identity");
@@ -110,14 +122,24 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
     scope.invoices.add(invoice.paymentId);
     scope.drawnUsd += invoiceUsd;
     scope.drawnRaw += amount;
-    // The draw is no longer in held() but remains in the account until its
-    // block publishes. Check it alongside fresh liabilities on every attempt.
-    return balance => checkBalance(balance, amount);
+  }
+
+  function authorizeBackup(invoice, signal) {
+    const scope = context.getStore();
+    return serial(() => {
+      signal?.throwIfAborted();
+      open(scope);
+      // The provider may charge the key once dispatched. Reserve the quote
+      // against the same USD cap as Nano sends, without debiting Nano capital.
+      debitInvoice(scope, invoice, 0n);
+    });
   }
 
   function requiredForPayment(scope, amountRaw) {
-    if (scope) open(scope);
-    else if (requireScope) throw new FundingError("FUNDING_REQUIRED", "Provider payment requires an approved run budget");
+    if (scope) {
+      open(scope);
+      if (scope.maxRaw === 0n) throw new FundingError("FUNDING_OVER_BUDGET", "This run has no Nano model budget");
+    } else if (requireScope) throw new FundingError("FUNDING_REQUIRED", "Provider payment requires an approved run budget");
     return obligations() + held() + (scope ? 0n : raw(amountRaw, true));
   }
   function requiredForTransfer({ amountRaw, liabilityRaw = 0n }) {
@@ -145,7 +167,7 @@ export function createRunFunding({ serial, balance, liabilitiesRaw = () => 0n, r
   }
 
   return {
-    run, capture: () => context.getStore() || null, authorize, requiredForPayment, requiredForTransfer, authorizeTransfer,
+    run, capture: () => context.getStore() || null, authorize, authorizeBackup, requiredForPayment, requiredForTransfer, authorizeTransfer,
     snapshot: () => ({ activeRuns: active.size, reservedRaw: held().toString() }),
     report: () => ({ activeRuns: active.size, reservedRaw: held().toString(), liabilitiesRaw: obligations(null, true).toString(),
       oldestStartedAt: active.size ? Math.min(...[...active.values()].map(s => s.startedAt)) : null, enforced: requireScope }),

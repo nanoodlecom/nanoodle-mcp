@@ -1,12 +1,45 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw, marketRunFunding } from "../src/operational-state.mjs";
+import { paymentLiabilities, liquidityChecks, paidNearRunFundingRaw, paidNanoRunFundingRaw, marketRunFunding,
+  recentPaidWorkflowFailures } from "../src/operational-state.mjs";
 
 const snapshots = () => ({ nano: { v: 2, quotes: [], owed: [] }, near: { v: 1, quotes: {}, refunds: {}, payouts: {} }, market: [] });
 const NOW = 10_000_000;
 const balances = liabilities => ({ liabilities, nanoBalanceRaw: (10n ** 31n).toString(), nearBalanceYocto: (10n ** 24n).toString(),
   storageUsage: 500, usdcBalanceAtomic: "1000000000", xnoUsd: "1", providerReserveUsd: "2",
   costs: { storagePriceYocto: 10_000_000_000_000_000_000n, nativeRefundFeeYocto: 200_000_000_000_000_000_000n, tokenRefundFeeYocto: 6_000_000_000_000_000_000_001n } });
+
+test("recent paid failures count execution outcomes and exclude stale or unrelated refunds", () => {
+  const s = snapshots();
+  const failed = { status: "refunded", paidAt: NOW - 120_000, completedAt: NOW - 60_000, error: "private diagnostic" };
+  s.nano.quotes.push(failed,
+    { ...failed, status: "consumed", completedAt: NOW },
+    { ...failed, error: null },
+    { ...failed, settled: true },
+    { ...failed, paidAt: NOW + 1 },
+    { ...failed, completedAt: NOW + 1 },
+    { ...failed, paidAt: NOW - 3_600_000, completedAt: NOW - 30 * 60_000 });
+  s.near.quotes = {
+    native: { status: "failed", outcome: "run_failed", finishedAt: NOW - 30_000 },
+    token: { status: "failed", outcome: "run_failed", finishedAt: NOW, asset: "usdc" },
+    late: { status: "rejected", outcome: "late_payment", finishedAt: NOW },
+    old: { status: "failed", outcome: "run_failed", finishedAt: NOW - 30 * 60_000 },
+    future: { status: "failed", outcome: "run_failed", finishedAt: NOW + 10 },
+  };
+  const marketFailure = { phase: "declining", outcome: "run_failed", runStartedAt: NOW - 60_000, runFinishedAt: NOW - 1 };
+  s.market.push({ v: 1, assignments: {
+    failed: marketFailure,
+    declined: { ...marketFailure, phase: "declined" },
+    rejected: { phase: "declined", finishedAt: NOW },
+    successful: { ...marketFailure, outcome: "ran" },
+    unstarted: { ...marketFailure, runStartedAt: null },
+    future: { ...marketFailure, runFinishedAt: NOW + 1 },
+    old: { ...marketFailure, runStartedAt: NOW - 3_600_000, runFinishedAt: NOW - 30 * 60_000 },
+  } });
+  const original = JSON.stringify(s);
+  assert.deepEqual(recentPaidWorkflowFailures(s, NOW), { nano: 2, near: 1, usdc: 1, market: 2 });
+  assert.equal(JSON.stringify(s), original);
+});
 
 test("the monitor recognizes overdue Nano recovery windows without making an unknown late refund spendable", () => {
   const s = snapshots(), expiresAt = NOW - 3_600_001;
@@ -89,6 +122,39 @@ test("stuck work, permanently failed refunds and long-pending creator payouts re
   const l = paymentLiabilities(s, { now: NOW });
   assert.equal(l.nanoRaw, 80n); assert.equal(l.nearYocto, 70n);
   assert.deepEqual(l.issues, ["creator-payout-stuck", "market-assignment-stuck", "market-work-stuck", "nano-paid-work-stuck", "nano-settlement-stuck", "near-paid-work-stuck", "near-refund-failed"]);
+});
+
+test("Market retries preserve the age of an undelivered hire or a pending decline", () => {
+  const s = snapshots(), hour = 3_600_000;
+  const record = { phase: "new", budgetUsd: 0.09, createdAt: NOW - hour - 1, updatedAt: NOW - 1, attempts: 10 };
+  s.market.push({ v: 1, assignments: { hire: record } });
+  for (const phase of ["new", "starting", "started", "declining", "submitted", "declined"]) {
+    record.phase = phase;
+    const expected = ["submitted", "declined"].includes(phase) ? [] : ["market-work-stuck"];
+    assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, expected, phase);
+  }
+  record.phase = "running";
+  record.runStartedAt = NOW - 2000;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, ["market-work-stuck"]);
+  record.createdAt++;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+});
+
+test("a Market change request gets its own waiting window through delivery retries", () => {
+  const s = snapshots();
+  const record = { phase: "reworking", createdAt: NOW - 8_000_000, runStartedAt: NOW - 7_000_000,
+    updatedAt: NOW - 1, reworkStartedAt: NOW - 20_000, reworkEpoch: new Date(NOW + 300_000).toISOString() };
+  s.market.push({ v: 1, assignments: { hire: record } });
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+  record.phase = "submitting";
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, []);
+  record.reworkStartedAt = NOW - 3_600_001;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, ["market-work-stuck"]);
+
+  delete record.reworkStartedAt;
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, [], "legacy rework is still within its saved delivery window");
+  record.reworkEpoch = new Date(NOW).toISOString();
+  assert.deepEqual(paymentLiabilities(s, { now: NOW }).issues, ["market-work-stuck"], "legacy rework reached its saved deadline");
 });
 
 test("the Nano debt alert uses the original age when the next retry is in the future", () => {

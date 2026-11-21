@@ -1,5 +1,6 @@
 // Public availability only: no credentials, hires, inference or payments.
 import { createProbeFetch } from "../probe-http.mjs";
+import { MARKET_PLATFORM_FEE_BPS } from "./fee-guard.mjs";
 
 // The custom-workflow profile is still unpublished. Add it after it goes live.
 export const MARKET_HANDLES = ["nanoodle-song", "nanoodle-image", "nanoodle-character", "nanoodle-clip"];
@@ -14,7 +15,8 @@ export async function checkMarketAvailability({ url = "https://market.near.ai", 
   const base = new URL(url).origin, checkedAt = new Date(now()).toISOString();
   async function get(path, json = true) {
     const response = await request(base + path, { method: "GET",
-      headers: { accept: json ? "application/json" : "text/html", "user-agent": "Nanoodle-Market-Availability/1.0" } });
+      headers: { accept: json ? "application/json" : "text/html", "cache-control": "no-cache, no-store",
+        "user-agent": "Nanoodle-Market-Availability/1.0" } });
     requireProbe(response.status === 200, `http-${response.status}`);
     if (!json) {
       requireProbe(/text\/html/i.test(response.headers.get("content-type") || "") && /NEAR AI Agent Market/.test(await response.text()), "unexpected-page");
@@ -41,6 +43,7 @@ export async function checkMarketAvailability({ url = "https://market.near.ai", 
       const config = await get("/v1/platform/config");
       requireProbe(config?.public_host === new URL(base).host && Number.isInteger(config.platform_fee_bps)
         && config.platform_fee_bps >= 0 && config.platform_fee_bps <= 10000, "unexpected-config");
+      requireProbe(config.platform_fee_bps <= MARKET_PLATFORM_FEE_BPS, "market-fee-assumption-changed");
     }),
     ...MARKET_HANDLES.map(handle => probe(`listing-${handle}`, async () => {
       const agent = await get(`/v1/agents/${handle}`);

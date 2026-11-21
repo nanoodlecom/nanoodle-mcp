@@ -30,10 +30,12 @@ threshold together. The operational service's payer key file remains inaccessibl
 When the successful canary's discovery proof is configured, the five-minute
 probe also reads that run's settled payment page, status, event stream, and
 result. It checks that the deposit equals the charge plus the refund, verifies
-the completed graph in the status and event stream, and expects a canary marker
-in the result. The alert omits the checkout ID, receipt, and output. At the
-checkout retention limit, the probe stops reporting a checkout result and
-continues on-chain discovery for the lifetime of the proof.
+the completed graph in the status and event stream, and compares the result to
+the canary marker's SHA-256 digest. Older proofs check the marker format until
+the next successful daily canary publishes a digest. The alert omits the
+checkout ID, receipt, and output. At the checkout retention limit, the probe
+stops reporting a checkout result and continues on-chain discovery for the
+lifetime of the proof.
 
 ## Installation on the production box
 
@@ -111,6 +113,13 @@ and replay can preserve the receipt and refund while losing replayable text.
 This check reports that as a failure. Finish paid checks before restarting the
 app, and inspect the retained original result and on-chain receipt before
 archiving an interrupted manual check.
+
+The five-minute read-only check reports the retained canary's checkout page,
+receipt, graph, event stream and result separately. It can report a missing
+result even when the graph or event stream is also missing. Each receipt is
+checked against the local deposit, charge and refund records, and the
+readable copies must agree. These checks use the existing canary data and
+leave payment admission to the funding and watcher checks.
 
 ## Babel failure alerts
 
@@ -246,6 +255,10 @@ is written, fsynced and removed in the output directory to verify persistence.
 
 Coverage:
 
+- Local media referenced by completed Nano, NEAR, and USDC payments. The
+  check uses the server's active media retention period and alerts if a
+  recent output is missing, empty, or a symlink. It reads file metadata
+  only. Filenames and checkout details stay out of alerts.
 - Nano mainnet identity, confirmed wallet height/frontier agreement across
   configured nodes, and the running wallet's fresh multi-peer read enforcement.
   See [Nano RPC freshness](nano-rpc-freshness.md).
@@ -254,16 +267,24 @@ Coverage:
   confirmed count and a gap that keeps growing. A widening gap of at least
   50 blocks over at least ten minutes warns even while both counts advance.
   The warning needs two increases and tolerates short plateaus between
-  them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
-  clear the trend. The elapsed time comes from the counter observations.
+  them. A missing sample still warns about unavailable telemetry. Trend
+  comparisons can resume from the last valid sample for up to 12 minutes.
+  Shrinking lag or a plateau longer than 12 minutes clears the trend. The
+  elapsed time comes from the counter observations.
   Wallet read quorum determines Nano payment readiness.
+- Recent paid workflow execution failures from the Nano, NEAR/USDC and
+  Market ledgers. Two or more failed runs in 30 minutes across these sources
+  raise an advisory while payment admission continues. Late or wrong-amount
+  transfers and Market jobs declined before execution are excluded.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the
   first observation, the same alert route reports delayed payment detection.
   The report distinguishes this from a failure to follow the live chain tip.
-  The historical canary reports which RPC step timed out for each peer,
-  from fetching the transaction to resolving the receipt.
+  The historical canary asks each peer for the existing transaction outcome
+  immediately and requires a finalized result. A peer with no record returns
+  that status promptly. Timeouts identify the failed step from reading the
+  transaction to resolving the receipt.
   Historical blocks must match the requested hash, and recovery records a
   decreasing height bound across restarts. An invalid predecessor leaves
   coverage at the last verified block and marks the watcher unready.
@@ -320,10 +341,17 @@ Coverage:
   independently confirmed balance after obligations. It also checks the
   combined budgets of paid Nano, NEAR and USDC runs still waiting to start,
   using each quote's locked rate. Accepted Market jobs waiting to start are
-  included at the sampled Nano rate. Running jobs already affect the runtime
-  balance through reservations. A creator run includes overhead
+  included at the sampled Nano rate. If fresh pricing raises a waiting job's
+  cost within its escrow, the monitor rechecks the combined queue at that
+  higher cost. Running jobs already affect the runtime balance through
+  reservations. A creator run includes overhead
   from the largest possible deposit with quote dust. These are per-workflow
-  warnings. The runtime still verifies funding when each run starts.
+  warnings. Quote admission uses the latest healthy funding sample to compare
+  the requested workflow's locked Nano budget against wallet funds after
+  existing obligations and active reservations. NEAR and USDC quotes include
+  the creator payout allowance for the exact displayed payment where applicable.
+  Unpaid quotes leave the balance available to existing work. The runtime
+  rechecks funding when every run starts.
 - NEAR and USDC share an open-quote limit. The check warns at 80% and
   reports both quote lanes unavailable at the limit. The saved-workflow probes
   also check capacity for their current exact payment amounts. Expired quotes
@@ -398,9 +426,18 @@ and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund fundin
 the Babel authentication challenge, and NEAR AI Market's public site, API and
 Nanoodle listings. The free `price_noodle` probes check that the decision model
 and both branches are priced in NEAR and USDC, and the estimated charge fits
-the deposit. All probes use bounded retries and record only check results.
+the deposit. The hosted runner also checks rendered preview images on the Nano
+hub and NEAR demo. It checks image headers and reads one byte from each audio
+or video sample to verify that the player can load a byte range. All probes
+use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
-during an npm outage. The probes use public discovery, status and pricing.
+during an npm outage. The archival NEAR checks read a published historical
+transaction and its block, then check for a known receipt in its account
+changes and resolve that receipt to the original transaction and signer.
+Each check records both archive results and fails when neither peer can
+verify it.
+The probes use public discovery, status, pricing and historical reads.
+[FastNEAR public transaction fixture](https://docs.fastnear.com/rpc/transaction/tx)
 
 Review the run summary under [public availability in GitHub Actions](https://github.com/nanoodlecom/nanoodle-mcp/actions/workflows/public-check.yml)
 or use **Run workflow** to check from a separate network. GitHub routes scheduled

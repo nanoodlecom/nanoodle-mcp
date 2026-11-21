@@ -313,8 +313,9 @@ jobs:
               flags=()
               if [[ "$VERSION" == *-* ]]; then flags+=(--tag next); fi
               npm publish ./nanoodle-mcp.tgz --ignore-scripts --access public "${flags[@]}"
-              curl --fail --silent --show-error --retry 4 --retry-all-errors --retry-delay 2 \
-                --retry-max-time 30 --max-time 10 --output "$registry_metadata" "$registry_url"
+              # npm can acknowledge a publish before the version is visible to reads.
+              curl --fail --silent --show-error --retry 36 --retry-all-errors --retry-delay 5 \
+                --retry-max-time 180 --max-time 10 --output "$registry_metadata" "$registry_url"
               verify_registry_archive
               ;;
             *) echo "npm version lookup returned HTTP $status" >&2; exit 1 ;;

@@ -1,23 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { createBlock, checkAddress, hashBlock } from "nanocurrency";
 import { createNanoReadPool, nanoStandbyConfig, NANO_COLD_STANDBY_SCAN_REQUESTS } from "../src/nano-read-pool.mjs";
+import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
 const ACCOUNT = NANO_GENESIS_REPLY.contents.account, PAYER = "nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7";
 const SEND = "A".repeat(64), OTHER = "C".repeat(64);
 const absent = () => Object.assign(Error("Block not found"), { authoritative: true });
 const pending = amount => ({ blocks: { [SEND]: { amount: String(amount), source: PAYER } } });
-function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfirmed = null) {
+function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfirmed = null, previousFundingReport = null, trustOwnedPrimary = false) {
   let at = 1_000, elapsed = 0;
   const peers = Array.from({ length: count + Number(requestsPerMinute > 0) }, (_, index) => ({
-    base: requestsPerMinute ? `https://peer-${index}.example` : String(index),
+    base: index === 0 && trustOwnedPrimary ? "http://100.100.0.1:7077" : requestsPerMinute ? `https://peer-${index}.example` : String(index),
     info: nanoAccountInfo(), receivable: { blocks: "" }, history: { history: [] }, blocks: {}, network: true,
   }));
   const calls = [];
   const standby = requestsPerMinute ? { url: peers[count].base, requestsPerMinute } : undefined;
   const pool = createNanoReadPool({ bases: peers.slice(0, count).map(p => p.base), account, checkAddress, hashBlock, standby, persistConfirmed,
-    now: () => at, monotonicNow: () => elapsed,
+    now: () => at, monotonicNow: () => elapsed, previousFundingReport, trustOwnedPrimary,
     rpc: async (body, base) => {
       calls.push({ action: body.action, base });
       const p = peers.find(p => p.base === base);
@@ -38,6 +40,67 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
 const receivable = { action: "receivable", account: ACCOUNT, count: "50", threshold: "1", source: "true" };
 const info = { action: "account_info", account: ACCOUNT };
 
+test("a reachable owned Nano primary verifies the stored checkpoint without consulting public RPCs", async () => {
+  const persisted = [];
+  const w = world(3, 0, ACCOUNT, checkpoint => persisted.push(checkpoint), null, true);
+  const [owned, unavailable, conflicting] = w.peers;
+  unavailable.down = true;
+  conflicting.info = nanoAccountInfo({ frontier: OTHER });
+  const head = { hash: owned.info.confirmed_frontier, blockCount: owned.info.confirmed_height };
+  const checkpoint = { v: 1, networkGenesis: NANO_GENESIS_HASH, account: ACCOUNT, head, confirmed: head };
+  await w.pool.verifyCheckpoint(checkpoint);
+  const funding = await w.pool.readFundingInfo();
+  assert.equal(funding.nanoRpc.ownedPrimaryInUse, true);
+  assert.equal(funding.nanoRpc.minimumPeers, 1);
+  assert.equal(funding.nanoRpc.readablePeers, 1);
+  assert.deepEqual(persisted.at(-1), checkpoint);
+  assert.deepEqual(await w.pool.publishBases(), [owned.base]);
+  await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), { authoritative: true });
+  assert.ok(w.calls.every(call => call.base === owned.base));
+});
+
+test("an owned Nano outage requires two fallbacks and recovers when the owned node returns", async () => {
+  const w = world(3, 0, ACCOUNT, () => {}, null, true);
+  const [owned, fallbackA, fallbackB] = w.peers;
+  await w.pool.read(info);
+  owned.down = true;
+  await w.pool.read(info);
+  assert.equal(w.pool.status().ownedPrimaryInUse, false);
+  assert.deepEqual(await w.pool.publishBases(), [fallbackA.base, fallbackB.base]);
+  fallbackB.down = true;
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_READ_QUORUM" });
+  await assert.rejects(w.pool.publishBases(), { code: "NANO_RPC_NETWORK_QUORUM" });
+  owned.down = false;
+  await w.pool.read(info);
+  assert.deepEqual(await w.pool.publishBases(), [owned.base]);
+});
+
+test("neither the owned node nor agreeing fallback nodes can jump past an unproven checkpoint", async () => {
+  const w = world(3, 0, ACCOUNT, () => {}, null, true);
+  const head = { hash: w.peers[0].info.confirmed_frontier, blockCount: w.peers[0].info.confirmed_height };
+  await w.pool.read(info);
+  for (const peer of w.peers) peer.info = nanoAccountInfo({ height: 11, frontier: OTHER });
+  await assert.rejects(w.pool.read(info), { code: "NANO_RPC_CHECKPOINT_UNPROVEN" });
+  assert.deepEqual(w.pool.status().checkpoint.confirmed, head);
+});
+
+test("an exact prior report preserves a provider cooldown across restart without restoring read quorum", async () => {
+  const until = 1_000 + 5 * 86_400_000;
+  const previous = { v: 1, checkedAt: new Date(900).toISOString(), ok: false,
+    nanoRpc: { configuration: rpcPeerSetId(["0", "1", "2"]), configuredPeers: 3, cooldowns: [{ peer: 1, until }] } };
+  const w = world(3, 0, ACCOUNT, null, previous);
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 1, until }]);
+  assert.equal(w.pool.status().readablePeers, 0);
+  assert.equal(w.pool.status().networkPeers, 0);
+  await w.pool.read(info);
+  assert.ok(w.calls.every(call => call.base !== "1"));
+  w.tick(until - 1_000);
+  await w.pool.read(info);
+  assert.ok(w.calls.some(call => call.base === "1"));
+  const reordered = { ...previous, nanoRpc: { ...previous.nanoRpc, configuration: rpcPeerSetId(["1", "0", "2"]) } };
+  assert.deepEqual(world(3, 0, ACCOUNT, null, reordered).pool.status().cooldowns, []);
+});
+
 test("the optional standby requires two primaries, an independent hostname and an explicit quota", () => {
   const bases = ["https://primary.example", "http://other.example:7077"];
   const url = "https://standby.example/rpc?api_key=PRIVATE";
@@ -50,6 +113,18 @@ test("the optional standby requires two primaries, an independent hostname and a
   assert.throws(() => nanoStandbyConfig(bases, { url: "http://PRIMARY.example.:7077/proxy", requestsPerMinute: 4 }), /different hostname/);
   assert.throws(() => nanoStandbyConfig(bases, { url: "https://PRIVATE@standby.example", requestsPerMinute: 4 }), error =>
     error instanceof TypeError && !error.message.includes("PRIVATE"));
+});
+
+test("equivalent Nano RPC URLs cannot supply two wallet peer votes", () => {
+  const opts = { account: ACCOUNT, checkAddress, hashBlock, rpc: () => assert.fail("unexpected RPC") };
+  for (const bases of [
+    ["https://peer.example/rpc?token=fixture", "https://PEER.example.:443/api/../rpc?token=fixture#ignored"],
+    ["http://127.0.0.1:7077", "http://127.1:7077/"],
+  ]) {
+    assert.throws(() => createNanoReadPool({ ...opts, bases }), { code: "NANO_RPC_DUPLICATE_PEER" });
+  }
+  const pool = createNanoReadPool({ ...opts, bases: ["http://127.0.0.1:7077/a", "http://127.0.0.1:7077/b"] });
+  assert.equal(pool.status().configuredPeers, 2);
 });
 
 test("the Nano standby stays idle at quorum and only corroborates an eligible primary", async () => {
@@ -306,6 +381,42 @@ test("unproven standby history leaves only the independently verified receivable
   }
 });
 
+test("a history refusal suppresses new RPCs while another peer is still finishing the window", async () => {
+  const w = world(2), [owned, metered] = w.peers;
+  for (const peer of w.peers) {
+    peer.info = nanoAccountInfo({ pending: "7" });
+    peer.receivable = pending(7);
+  }
+  const heldHistory = Promise.withResolvers(), refusal = Promise.withResolvers();
+  const head = owned.info.confirmed_frontier;
+  owned.historyRead = () => heldHistory.promise;
+  metered.historyRead = () => {
+    refusal.resolve();
+    throw Object.assign(new Error("RPC refused"), { rateLimited: true, retryAfterMs: 60_000 });
+  };
+  const window = w.pool.readPaymentWindow({ existingPayments: true });
+  await refusal.promise;
+  await nextTurn();
+  const before = w.calls.filter(call => call.base === metered.base).length;
+  try {
+    assert.equal(w.pool.isCooling(metered.base), true);
+    assert.ok(!(await w.pool.publishBases()).includes(metered.base));
+    await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_NETWORK_QUORUM" });
+    assert.equal(w.calls.filter(call => call.base === metered.base).length, before);
+  } finally {
+    heldHistory.resolve({ account: ACCOUNT, previous: OTHER, history: [
+      { hash: head, type: "state", subtype: "epoch", confirmed: "true", height: "10", previous: OTHER },
+    ] });
+    assert.deepEqual(await window, { receivable: pending(7), history: null });
+  }
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 1, until: 61_000 }]);
+  w.tick(59_999);
+  await assert.rejects(w.pool.readFundingInfo(), { code: "NANO_RPC_NETWORK_QUORUM" });
+  w.tick(1);
+  await w.pool.readFundingInfo();
+  assert.equal(w.pool.isCooling(metered.base), false);
+});
+
 test("a standby rate limit remains private and prevents attempts until its retry time", async () => {
   const w = world(2, 6), [, spare, standby] = w.peers;
   spare.down = true; standby.error = Object.assign(Error("PRIVATE"), { rateLimited: true, retryAfterMs: 90_000 });
@@ -378,6 +489,21 @@ test("a throttled block lookup cannot be mistaken for an authoritative absence",
   const before = w.calls.filter(call => call.base === "0").length;
   await assert.rejects(w.pool.block({ action: "block_info", hash: SEND }), e => e.authoritative === true);
   assert.equal(w.calls.filter(call => call.base === "0").length, before);
+});
+
+test("overlapping provider refusals preserve the longest retry deadline", async () => {
+  const w = world();
+  await w.pool.read(info);
+  const refusals = [];
+  w.peers[0].accountRead = () => new Promise((_, reject) => refusals.push(reject));
+  const first = w.pool.read(info), second = w.pool.read(info);
+  while (refusals.length < 2) await new Promise(resolve => setImmediate(resolve));
+  const longDelay = 5 * 86_400_000;
+  refusals[0](Object.assign(Error("429"), { rateLimited: true, retryAfterMs: longDelay }));
+  await first;
+  refusals[1](Object.assign(Error("429"), { rateLimited: true, retryAfterMs: 30_000 }));
+  await second;
+  assert.deepEqual(w.pool.status().cooldowns, [{ peer: 0, until: 1_000 + longDelay }]);
 });
 
 test("a frozen first peer cannot hide a confirmed payment behind an empty list", async () => {

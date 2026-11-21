@@ -1,10 +1,22 @@
 import { createProbeFetch } from "./probe-http.mjs";
+import { createNearRpc } from "./near/rpc.mjs";
+import { readNearPaymentReceipts, readNearReceiptTransaction } from "./near/watch.mjs";
 
 const NANO = "https://mcp.nanoodle.com";
 const NANO_ALIAS = "https://nano.nanoodle.com";
 const NEAR = "https://near.nanoodle.com";
 const NEAR_ALIAS = "https://mcp-near.nanoodle.com";
 const BABEL = "https://babel.255bits.com";
+const MEDIA = "https://media.nanoodle.com";
+const DEMO_ASSETS = /^\/(?:examples|hub-assets)\//;
+const CDN_ASSETS = /^\/(?:mcp\/examples|subnano)\//;
+const NEAR_ARCHIVES = ["https://archival-rpc.mainnet.fastnear.com", "https://archival-rpc.mainnet.near.org"];
+// Published mainnet fixture from https://docs.fastnear.com/rpc/transaction/tx.
+const ARCHIVE_SAMPLE = { tx: "34E7weKCDqXh3xPKdBgSWRqo44yTWjbka9deMK8JbAxx", signer: "escrow.ai.near",
+  block: "7p16wv59nxnrVWD9zwzD1XN9F6z9ZiEMXe26piwnAbUL", height: 194263441,
+  // The same transaction's successful refund receipt changes the signer's balance.
+  receipt: { id: "EmdtjzQtQWvmbkeZrgSQwqbyAuevicEYTVUxLhAmUEe4",
+    block: "3bssBpNw6rN4sbthUgELgdT4xpkWL2ZDUnrt9yddDB8q", height: 194263443 } };
 const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
@@ -35,7 +47,27 @@ function positiveUsd(value) {
   return typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value)) && Number(value) > 0;
 }
 
-export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 } = {}) {
+function demoAssets(html, site) {
+  const assets = new Map();
+  // Read the server-rendered tags. Ignore markup in scripts and comments.
+  const rendered = html.replace(/<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+  for (const [tag, element] of rendered.matchAll(/<(img|audio|video|source)(?=[\s/>])[^>]*>/gi)) {
+    for (const [, attribute, doubleQuoted, singleQuoted] of tag.matchAll(/\s(src|poster)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
+      let url;
+      try { url = new URL(doubleQuoted ?? singleQuoted, site + "/"); } catch { continue; }
+      const allowed = url.origin === site ? DEMO_ASSETS : url.origin === MEDIA ? CDN_ASSETS : null;
+      if (!allowed?.test(url.pathname) || url.username || url.password || url.search || url.hash) continue;
+      const type = /\.mp3$/i.test(url.pathname) ? "audio/mpeg" : /\.mp4$/i.test(url.pathname) ? "video/mp4" : "image/";
+      if (type === "image/") {
+        if (!/\.(?:webp|png|jpe?g|gif|svg|avif)$/i.test(url.pathname)) continue;
+      } else if (attribute.toLowerCase() !== "src" || !["source", type.split("/")[0]].includes(element.toLowerCase())) continue;
+      assets.set(url.href, { url, type });
+    }
+  }
+  return [...assets.values()];
+}
+
+export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000, demoMedia = false } = {}) {
   const request = createProbeFetch({ fetch, timeoutMs: 6000, maxBytes: 512 * 1024 });
   async function json(url, { body, status = 200 } = {}) {
     const headers = { accept: "application/json", "cache-control": "no-cache" };
@@ -51,6 +83,26 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
 
   // Discovery and free pricing only. A paid tool is never called by a probe.
   function rpc(method, params) { return { jsonrpc: "2.0", id: 1, method, params }; }
+  async function readArchive(site) {
+    const fixture = ARCHIVE_SAMPLE;
+    const tx = await json(site, { body: rpc("tx", { tx_hash: fixture.tx, sender_account_id: fixture.signer, wait_until: "NONE" }) });
+    if (tx.error?.cause?.name === "UNKNOWN_TRANSACTION") throw new ProbeError("near-history-transaction-missing");
+    need(tx.jsonrpc === "2.0" && tx.id === 1 && !tx.error && tx.result?.final_execution_status === "FINAL"
+      && tx.result.transaction?.hash === fixture.tx && tx.result.transaction?.signer_id === fixture.signer
+      && tx.result.transaction_outcome?.block_hash === fixture.block
+      && Object.hasOwn(tx.result.status ?? {}, "Failure"), "near-history-transaction-unverified");
+    const block = await json(site, { body: rpc("block", { block_id: fixture.block }) });
+    need(block.jsonrpc === "2.0" && block.id === 1 && !block.error && block.result?.header?.hash === fixture.block
+      && block.result.header.height === fixture.height, "near-history-block-unverified");
+  }
+  async function readArchiveDiscovery(site) {
+    const { signer, tx, receipt } = ARCHIVE_SAMPLE;
+    const client = createNearRpc({ url: site, fetch: request, timeoutMs: 6000 });
+    const changes = await readNearPaymentReceipts(client, receipt.block, [signer]).catch(() => null);
+    need(changes?.has(receipt.id), "near-history-account-change-unverified");
+    const origin = await readNearReceiptTransaction(client, receipt.id, receipt.height).catch(() => null);
+    need(origin?.transaction_hash === tx && origin.sender_account_id === signer, "near-history-receipt-origin-unverified");
+  }
   async function discover(site) {
     const hello = await json(site + "/mcp", { body: rpc("initialize", INIT) });
     need(hello.jsonrpc === "2.0" && hello.id === 1 && !hello.error && hello.result?.serverInfo?.name === "nanoodle-mcp",
@@ -79,6 +131,36 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       "conditional-price-branch-missing");
     need([estimate.usd, likely, deposit].every(positiveUsd) && Number(estimate.usd) <= Number(likely)
       && Number(likely) <= Number(deposit), "conditional-price-deposit-invalid");
+  }
+
+  async function demo(site) {
+    const page = await request(site + "/");
+    need(page.status === 200, `landing-http-${page.status}`);
+    need(/^text\/html\b/i.test(page.headers.get("content-type") || ""), "landing-type-invalid");
+    const assets = demoAssets(await page.text(), site);
+    need(assets.some(({ type }) => type === "image/"), "demo-images-missing");
+    need(assets.length <= 32, "demo-asset-limit");
+    if (site === NEAR) {
+      need(assets.some(({ type }) => type === "audio/mpeg"), "demo-audio-missing");
+      need(assets.some(({ type }) => type === "video/mp4"), "demo-video-missing");
+    }
+    const readByte = createProbeFetch({ fetch, timeoutMs: 6000, maxBytes: 1 });
+    await Promise.all(assets.map(async ({ url, type }) => {
+      const image = type === "image/", kind = type.split("/")[0];
+      const headers = { origin: site };
+      const response = image ? await request(url.href, { method: "HEAD", headers })
+        : await readByte(url.href, { headers: { ...headers, range: "bytes=0-0" } }).catch(error => {
+          if (error?.message === "probe-response-too-large") throw new ProbeError(`demo-${kind}-range-invalid`);
+          throw error;
+        });
+      need(response.status === (image ? 200 : 206), `demo-${kind}-http-${response.status}`);
+      const mime = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() || "";
+      need(image ? mime.startsWith(type) : mime === type, `demo-${kind}-type-invalid`);
+      const policy = response.headers.get("cross-origin-resource-policy")?.trim().toLowerCase();
+      need(url.origin === site || policy !== "same-origin", `demo-${kind}-cross-origin-blocked`);
+      if (!image) need(/^bytes 0-0\/[1-9]\d*$/.test(response.headers.get("content-range") || "")
+        && (await response.arrayBuffer()).byteLength === 1, `demo-${kind}-range-invalid`);
+    }));
   }
 
   const probes = {
@@ -113,6 +195,7 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       const result = await json(BABEL + "/mcp/v1", { body: rpc("initialize", INIT), status: 401 });
       need(result.error, "invalid-babel-challenge");
     },
+    ...(demoMedia && { "nano-demo-media": () => demo(NANO), "near-demo-media": () => demo(NEAR) }),
   };
   const checkedAt = new Date(now()).toISOString();
   async function check(stage, probe) {
@@ -127,6 +210,12 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
       }
     }
   }
+  async function archiveCheck(stage, probe, unavailable) {
+    const results = await Promise.all(NEAR_ARCHIVES.map(site => check(new URL(site).hostname, () => probe(site))));
+    const peers = results.map(({ stage, ...result }) => ({ host: stage, ...result }));
+    const ok = peers.some(peer => peer.ok);
+    return { stage, ok, peers, ...(!ok && { code: unavailable }) };
+  }
   const checks = await Promise.all(Object.entries(probes).map(([stage, probe]) => check(stage, probe)));
   checks.push(...await Promise.all([
     check("nano-conditional-graph-pricing", () => conditionalPrice(NANO)),
@@ -134,5 +223,8 @@ export async function runPublicMcpCheck({ fetch, now = Date.now, retryMs = 2000 
     check("near-conditional-pricing", () => conditionalPrice(NEAR, "near")),
     check("usdc-conditional-pricing", () => conditionalPrice(NEAR, "usdc")),
   ]));
+  // Start each archive batch after the previous requests have drained.
+  checks.push(await archiveCheck("near-archival-history", readArchive, "near-no-readable-archive"));
+  checks.push(await archiveCheck("near-archival-payment-discovery", readArchiveDiscovery, "near-no-archive-payment-discovery"));
   return { checkedAt, ok: checks.every(check => check.ok), checks };
 }

@@ -15,6 +15,7 @@ import { deriveAddress, derivePublicKey, deriveSecretKey, verifyBlock, hashBlock
 import { createMarketMock, MOCK_TOKEN } from "./fixtures/market-mock.mjs";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNanoWallet, resolveWalletKey, DEFAULT_NANO_RPC } from "../src/wallet.mjs";
+import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH, WORKED_CATALOGS } from "./fixtures/near-fake-chain.mjs";
 import { USDC_CONTRACTS, parseNearToYocto } from "../src/near/index.mjs";
 import { mcpClient, freePort, stopServerChild } from "../scripts/near-simulate.mjs";
@@ -439,6 +440,27 @@ test("the hosted wallet honors numeric rate limits through funding, provider set
     assert.deepEqual(recovered.nanoRpc.cooldowns, []); assert.equal(recovered.nanoRpc.readablePeers, 3);
     assert.equal(mock.state.processed.length, 1, "read-only recovery does not publish another transfer");
   }
+});
+
+test("the hosted wallet loads saved retry deadlines before its first RPC", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "hosted-wallet-cooldowns-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const fundingReportFile = join(dir, "funding-health.json");
+  const peers = ["https://owned", "https://limited", "https://other"], until = 86_401_000;
+  await writeFile(fundingReportFile, JSON.stringify({ v: 1, checkedAt: new Date(950).toISOString(), ok: false,
+    nanoRpc: { configuration: rpcPeerSetId(peers), configuredPeers: peers.length, cooldowns: [{ peer: 1, until }] },
+  }), { mode: 0o600 });
+  const mock = fakeRpc(), calls = [];
+  const wallet = createNanoWallet({ secretKey: SECRET, rpcUrl: peers.join(","), verifyRpcReads: true, fundingReportFile,
+    now: () => 1000, fetch: (url, init) => {
+      calls.push(url);
+      return mock.fetch(url, init);
+    } });
+  const funding = await wallet.ops.fundingReport();
+  assert.deepEqual(funding.nanoRpc.cooldowns, [{ peer: 1, until }]);
+  assert.equal(funding.nanoRpc.readablePeers, 2);
+  assert.deepEqual(new Set(calls), new Set([peers[0], peers[2]]));
+  assert.equal(mock.state.processed.length, 0);
 });
 
 test("a separately authenticated work service retains its own quota during public RPC cooldown", async () => {

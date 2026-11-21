@@ -44,8 +44,8 @@ export function selectFundingPause(pause, now) {
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
-export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, durableState = null,
-  intervalMs = 5_000, now = Date.now, monotonicNow = () => performance.now(), log = () => {} }) {
+export async function startFundingReport({ outDir, snapshot, sources, rpcStatus = null, writerProtection = null,
+  durableState = null, mediaRetentionMs, intervalMs = 5_000, now = Date.now, monotonicNow = () => performance.now(), log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
   const identity = maintenanceProcessIdentity();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
@@ -57,10 +57,11 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
   function refresh() {
     if (pending) return pending;
     pending = (async () => {
-      let report, readExpiresAt = Infinity;
+      let report, readExpiresAt = Infinity, availableRaw = null;
       try {
         const value = await snapshot();
         const balance = fundingRaw(value.balanceRaw), liabilities = fundingRaw(value.liabilitiesRaw), reserved = fundingRaw(value.reservedRaw);
+        availableRaw = balance - liabilities - reserved;
         if (!Number.isSafeInteger(value.activeRuns) || value.activeRuns < 0 ||
             !(value.oldestStartedAt === null || (Number.isSafeInteger(value.oldestStartedAt) && value.oldestStartedAt > 0))) throw Error("invalid snapshot");
         // Select aggregate fields and the public-chain handoff checkpoint
@@ -68,6 +69,7 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         report = { balanceRaw: balance.toString(), liabilitiesRaw: liabilities.toString(), reservedRaw: reserved.toString(),
           activeRuns: value.activeRuns, oldestStartedAt: value.oldestStartedAt,
           enforced: value.enforced === true, protectTransfers: value.protectTransfers === true,
+          ...(value.creatorReservations === true && { creatorReservations: true }),
           ok: balance >= liabilities + reserved };
         if (!report.ok) report.code = "funding-underfunded";
         if (value.nanoRpc) {
@@ -76,6 +78,11 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           report.nanoRpc = { enforced: n.enforced === true, configuredPeers: n.configuredPeers, minimumPeers: n.minimumPeers,
             readablePeers: n.readablePeers, networkPeers: n.networkPeers, lastReadAt: n.lastReadAt,
             checkpoint: selectNanoCheckpoint(n.checkpoint) };
+          if (n.ownedPrimaryInUse !== undefined) {
+            if (typeof n.ownedPrimaryInUse !== "boolean" || n.configuredPeers < 3
+                || (n.ownedPrimaryInUse && (n.readablePeers !== 1 || n.standby?.inUse))) throw Error("invalid owned Nano primary observation");
+            report.nanoRpc.ownedPrimaryInUse = n.ownedPrimaryInUse;
+          }
           if (n.standby !== undefined) {
             const { inUse, requestsPerMinute, coldPaymentScanRequests } = n.standby;
             if (typeof inUse !== "boolean" || !Number.isSafeInteger(requestsPerMinute) || requestsPerMinute < 3 || requestsPerMinute > 120
@@ -99,7 +106,8 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
           const age = observedAt - n.lastReadAt;
           readExpiresAt = Math.min(n.lastReadAt + FUNDING_REPORT_MAX_AGE_MS, expiresAt ?? Infinity);
           const rpcHealthy = report.nanoRpc.enforced && n.configuredPeers >= 1 && n.configuredPeers <= 8
-            && n.minimumPeers === Math.min(2, n.configuredPeers) && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
+            && n.minimumPeers === (n.ownedPrimaryInUse ? 1 : Math.min(2, n.configuredPeers))
+            && n.readablePeers >= n.minimumPeers && n.networkPeers >= n.minimumPeers
             && n.readablePeers <= n.configuredPeers && n.networkPeers <= n.configuredPeers
             && age >= -30_000 && observedAt < readExpiresAt;
           if (!rpcHealthy) { report.ok = false; report.code = "nano-read-guard-unhealthy"; }
@@ -122,6 +130,13 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         }
       } catch (error) {
         report = { ok: false, code: fundingReportFailure(readFailureCodes.get(error?.code)) };
+        try {
+          const rpc = rpcStatus?.();
+          if (rpc && typeof rpc.configuration === "string" && /^[a-f0-9]{64}$/.test(rpc.configuration)) {
+            report.nanoRpc = { configuration: rpc.configuration, configuredPeers: rpc.configuredPeers,
+              cooldowns: selectRpcCooldowns(rpc.cooldowns, rpc.configuredPeers, now()) };
+          }
+        } catch { /* Preserve the funding failure even if advisory data cannot be read. */ }
       }
       const checkedAt = now();
       const expiresAt = Math.min(checkedAt + FUNDING_REPORT_MAX_AGE_MS, readExpiresAt);
@@ -131,7 +146,8 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
       else if (lastWriteHealthy && !sources.ready()) {
         pause = { lastFailedAt: checkedAt, recoveredAt: checkedAt, code: "funding-report-stale" };
       } else if (pause?.recoveredAt === null) pause = { ...pause, recoveredAt: checkedAt };
-      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(checkedAt).toISOString(), ...(pause && { pause }) };
+      report = { ...report, process: identity, runTimeoutMs, v: 1, checkedAt: new Date(checkedAt).toISOString(),
+        ...(mediaRetentionMs !== undefined && { mediaRetentionMs }), ...(pause && { pause }) };
       try {
         const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
         try { await handle.chmod(0o600); await handle.writeFile(JSON.stringify(report) + "\n"); }
@@ -140,7 +156,7 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         // Publishing can take time. A clock adjustment or delayed write
         // cannot give the original chain read a new checkout lease.
         const readyForMs = Math.min(expiresAt - now(), monotonicDeadline - monotonicNow());
-        sources.setStorageReady(true); sources.setReady(report.ok, readyForMs);
+        sources.setStorageReady(true); sources.setReady(report.ok, readyForMs, availableRaw);
         lastWriteHealthy = report.ok;
       } catch (error) {
         lastWriteHealthy = false;

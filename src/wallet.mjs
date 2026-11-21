@@ -33,9 +33,10 @@ import {
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
 import { createRunFunding, FundingError } from "./run-funding.mjs";
-import { createNanoReadPool } from "./nano-read-pool.mjs";
+import { createNanoReadPool, parseNanoRpcUrls } from "./nano-read-pool.mjs";
 import { createNanoCheckpointStore } from "./nano-checkpoint-store.mjs";
 import { rpcRetryAfterMs } from "./rpc-backoff.mjs";
+import { readOperatorJson } from "./operator-file.mjs";
 
 export const DEFAULT_NANO_RPC = "https://rpc.nano.to";
 
@@ -121,13 +122,14 @@ export function resolveWalletKey({ privateKey, seed } = {}) {
  * @param {{ secretKey: string, rpcUrl?: string, workUrl?: string|null, workKey?: string|null, workTimeoutMs?: number, fetch?: typeof fetch, maxUsd?: number|null, log?: (line: string) => void }} opts
  * @returns {{ address: string, payment: (invoice: object) => Promise<void> }}
  */
-export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, nanoTransferClaimed = () => false, requireFunding = false, protectTransfers = false, verifyRpcReads = false, checkpointFile = null, assertWriter = () => {}, maintenance = null, now = Date.now, log = () => {} }) {
+export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl = null, workKey = null, workTimeoutMs = 120_000, rpcTimeoutMs = 10_000, localWork = true, fetch = globalThis.fetch, maxUsd = null, fundingLiabilities = () => 0n, nanoTransferClaimed = () => false, requireFunding = false, protectTransfers = false, verifyRpcReads = false, trustOwnedPrimary = false, checkpointFile = null, fundingReportFile = null, assertWriter = () => {}, maintenance = null, now = Date.now, log = () => {} }) {
   if (!checkKey(secretKey)) throw new Error("wallet secret key must be a 64-hex-character Nano secret key");
   if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs <= 0 || rpcTimeoutMs > 300_000) throw new TypeError("rpcTimeoutMs must be between 1 and 300000");
   if (maxUsd != null && !(Number.isFinite(maxUsd) && maxUsd > 0)) throw new TypeError("maxUsd must be a finite positive number");
   if (typeof protectTransfers !== "boolean") throw new TypeError("protectTransfers must be a boolean");
   if (typeof verifyRpcReads !== "boolean") throw new TypeError("verifyRpcReads must be a boolean");
   if (rpcStandby && !verifyRpcReads) throw new TypeError("Nano RPC standby requires verified reads");
+  if (trustOwnedPrimary && (!verifyRpcReads || checkpointFile === null)) throw new TypeError("An owned Nano primary requires verified reads and a durable wallet checkpoint");
   if (typeof assertWriter !== "function") throw new TypeError("assertWriter must be a function");
   if (maintenance !== null && typeof maintenance.capture !== "function") throw new TypeError("maintenance must provide operation capture");
   const publicKey = derivePublicKey(secretKey);
@@ -135,9 +137,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
   // proxy throttling or dropping does not end a settlement. Empty/unset falls
   // back to the resilient default chain rather than a single node.
-  const rpcBases = (rpcUrl ? String(rpcUrl).split(",") : DEFAULT_NANO_RPCS)
-    .map((u) => u.trim().replace(/\/+$/, ""))
-    .filter(Boolean);
+  const rpcBases = rpcUrl ? parseNanoRpcUrls(String(rpcUrl)) : [...DEFAULT_NANO_RPCS];
   if (!rpcBases.length) rpcBases.push(DEFAULT_NANO_RPC);
   // workUrl accepts a comma-separated list, tried in order — e.g. a GPU box on
   // the tailnet first, a public work API second. `workKey` (if set) goes to
@@ -212,7 +212,8 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
   if (checkpointFile !== null && (!verifyRpcReads || rpcBases.length < 2)) throw new TypeError("A durable Nano checkpoint requires two RPC peers");
   const checkpointStore = checkpointFile !== null ? createNanoCheckpointStore(checkpointFile, address, assertWriter) : null;
   let restartFloors = null, verifiedFloor = null, floorCheck = null;
-  const readPool = verifyRpcReads ? createNanoReadPool({ bases: rpcBases, standby: rpcStandby, account: address, checkAddress, hashBlock, now,
+  const readPool = verifyRpcReads ? createNanoReadPool({ bases: rpcBases, standby: rpcStandby, trustOwnedPrimary, account: address, checkAddress, hashBlock, now,
+    previousFundingReport: fundingReportFile && readOperatorJson(fundingReportFile, process.getuid(), 16_384).value,
     persistConfirmed: checkpointStore ? checkpoint => {
       if (restartFloors.length) verifiedFloor = checkpoint;
       else checkpointStore.save(checkpoint);
@@ -728,7 +729,9 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         return readPool.readPaymentWindow(options);
       } }),
       withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
+      authorizeBackup: funding.authorizeBackup,
       fundingStatus: funding.snapshot,
+      fundingReadStatus: readPool?.status,
       checkpoint: () => readPool?.status().checkpoint ?? null,
       loadRestartCheckpoint: async permit => {
         if (!checkpointStore) return;

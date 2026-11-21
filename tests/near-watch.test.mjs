@@ -140,6 +140,79 @@ test("a long outage keeps new payments live while old payments backfill within o
   restarted.stop();
 });
 
+test("repeated finalized head jumps leave room for older NEAR payments across a restart", async t => {
+  const w = await world(), budget = 3;
+  let inspected = 0;
+  const rpc = { ...w.rpc, call: async (method, ...args) => {
+    if (method === "EXPERIMENTAL_changes") inspected++;
+    return w.rpc.call(method, ...args);
+  } };
+  const opts = { ...w.opts, rpc, maxBlocksPerTick: budget };
+  let watcher = createNearWatcher(opts);
+  t.after(() => watcher.stop());
+  await watcher.start();
+  w.quote();
+  const payments = Array.from({ length: 14 }, () => w.pay());
+  await watcher.tick();
+  const originalCoverage = w.ledger.getMeta("paymentWatch").coveredThroughMs;
+  for (const added of [budget + 2, budget, budget + 2]) {
+    const before = w.ledger.getMeta("paymentWatch").backfill;
+    const newPayments = Array.from({ length: added }, () => w.pay());
+    payments.push(...newPayments);
+    inspected = 0;
+    await watcher.tick();
+    const after = w.ledger.getMeta("paymentWatch");
+    assert.ok(after.backfill.maxHeight < before.maxHeight, "live scans cannot reset or starve older work");
+    assert.equal(after.coveredThroughMs, originalCoverage, "partial scans cannot prove complete coverage");
+    assert.ok(w.observed.some(o => o.hash === newPayments.at(-1)), "a payment at the new tip is discovered");
+    assert.ok(inspected <= budget);
+  }
+  const checkpoint = w.ledger.getMeta("paymentWatch").backfill.maxHeight;
+  await watcher.stop();
+  watcher = createNearWatcher(opts);
+  await watcher.start();
+  assert.ok(w.ledger.getMeta("paymentWatch").backfill.maxHeight < checkpoint);
+
+  const head = await w.rpc.block({ finality: "final" });
+  const complete = () => watcher.status().height === head.header.height && !watcher.status().backfilling;
+  for (let i = 0; i < payments.length * 2 && !complete(); i++) {
+    inspected = 0;
+    await watcher.tick();
+    assert.ok(inspected <= budget);
+  }
+  assert.equal(complete(), true);
+  assert.deepEqual(new Set(w.observed.map(o => o.hash)), new Set(payments));
+  assert.ok(w.ledger.getMeta("paymentWatch").coveredThroughMs > originalCoverage);
+});
+
+test("first-boot backfill can finish before the forward scan and still reopen safely", async t => {
+  const w = await world(), opts = { ...w.opts, maxBlocksPerTick: 1 };
+  const boundary = await w.rpc.block({ finality: "final" });
+  const boundaryAt = Number(BigInt(boundary.header.timestamp_nanosec) / 1_000_000n);
+  w.quote();
+  const older = [w.pay(), w.pay(), w.pay()];
+  let watcher = createNearWatcher(opts);
+  t.after(() => watcher.stop());
+  await watcher.start();
+  assert.equal(w.ledger.getMeta("paymentWatch").coveredThroughMs, null);
+  const newer = [w.pay(), w.pay(), w.pay()];
+  const head = await w.rpc.block({ finality: "final" });
+
+  for (let i = 0; i < older.length && watcher.status().backfilling; i++) await watcher.tick();
+  assert.equal(watcher.status().backfilling, false);
+  assert.ok(watcher.status().height < head.header.height);
+  assert.deepEqual(new Set(w.observed.map(p => p.hash)), new Set(older));
+  assert.equal(w.ledger.getMeta("paymentWatch").coveredThroughMs, boundaryAt);
+
+  await watcher.stop();
+  watcher = createNearWatcher(opts);
+  await watcher.start();
+  for (let i = 0; i < older.length + newer.length && watcher.status().backfilling; i++) await watcher.tick();
+  assert.equal(watcher.status().height, head.header.height);
+  assert.equal(watcher.status().backfilling, false);
+  assert.deepEqual(new Set(w.observed.map(p => p.hash)), new Set([...older, ...newer]));
+});
+
 test("an invalid backfill predecessor cannot advance coverage, including after restart", async t => {
   for (const scenario of ["repeated-block", "self-parent", "missing-parent", "legacy-cursor"]) {
     const w = await world(), options = { ...w.opts, maxBlocksPerTick: 1 };

@@ -383,6 +383,19 @@ test("cost flag through tools: an ambiguous writer payment makes the tool's cost
 const keyed = (model, messages = [{ role: "user", content: "hi" }]) => ({ method: "POST", headers: { Authorization: "Bearer k" }, body: JSON.stringify({ model, messages }) });
 const fetchFailed = (code) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(code), { code }) });
 
+test("an ambiguous backup-key charge is not retried on a different writer or counted as free", async () => {
+  let calls = 0;
+  const hf = humanizeFetch({ record: REC, draft: "", payment: () => assert.fail("unexpected Nano send"),
+    fetch: async () => {
+      calls++;
+      throw Object.assign(new Error("backup response lost"), { code: "x402-backup", backupChargePossible: true });
+    } });
+  const init = { method: "POST", headers: { "x-x402": "true" }, body: JSON.stringify({ model: CYD, messages: [] }) };
+  await assert.rejects(hf.fetch(CHAT, init), { code: "x402-backup" });
+  assert.equal(calls, 1);
+  assert.equal(hf.state.costUnknown, true);
+});
+
 test("keyed mode: a reset after send flags the cost as uncertain; a refused-before-write failure is free", async () => {
   const { humanizeFetch } = await import("../src/humanize.mjs");
   let hf = humanizeFetch({ record: REC, draft: "", fetch: async () => { throw fetchFailed("ECONNRESET"); } });
