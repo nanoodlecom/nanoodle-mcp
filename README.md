@@ -649,6 +649,14 @@ key — also pays NanoGPT per call via x402, making the whole service
 nano-in/nano-out. With an API key, runs spend from the key and the wallet only
 handles the customer side.
 
+For hosted wallet-funded MCP workflows, set `NANOGPT_FALLBACK_API_KEY` in the
+service's secret environment or `--env-file` to add a funded NanoGPT account as
+a backup. Leave `NANOGPT_API_KEY` unset to keep the Nano wallet first. For
+synchronous model requests, Nanoodle uses the backup only when an initial,
+priced x402 quote offers a different payment method. Both methods draw from
+the run's approved USD budget. Customer checkout and refunds still use the
+configured payment rail.
+
 ### Payment detection
 
 Polling `receivable` on your Nano RPC node (1s while quotes are pending) is

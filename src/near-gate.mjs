@@ -100,7 +100,7 @@ function strip(res) {
  * @param {object} [opts.limits]     custom-workflow caps, incl. maxDepositUsd
  * @param {string} [opts.baseUrl]    NanoGPT base for the public model catalogs
  * @param {number} [opts.quoteTtlMs] quote lifetime (30 min); the quote's rates stay locked for all of it
- * @param {"wallet"|"api_key"|null} [opts.modelPayment]  how this server pays NanoGPT for runs:
+ * @param {"wallet"|"api_key"|"wallet_with_key_backup"|null} [opts.modelPayment]  how this server pays NanoGPT for runs:
  *                                   from its Nano wallet (XNO) or its API key's balance; shown in receipts
  * @param {number} [opts.skewMs]     tolerated clock skew between the chain and this server
  * @param {(line: string) => void} [opts.log]
@@ -207,21 +207,23 @@ export function createNearGate({
    */
   function modelSpend(q) {
     const s = q.settlement;
+    const fundedBy = s?.modelPayment ?? (s && modelPayment === "wallet_with_key_backup" ? "wallet" : modelPayment);
     const ran = q.outcome === "succeeded" || q.outcome === "run_failed" || q.outcome === "interrupted";
     const usd = s && s.costUsd != null ? exactUsd(s.costUsd) : null;
     let xno = null;
-    if (usd != null && modelPayment === "wallet" && q.rate && q.rate.xnoUsd) {
+    if (usd != null && fundedBy === "wallet" && q.rate && q.rate.xnoUsd) {
       try {
         const xnoNano = parseUsdNano(q.rate.xnoUsd);
         if (xnoNano > 0n) xno = ratioXno(parseUsdNano(usd), xnoNano);
       } catch { xno = null; }
     }
-    return { ran, usd, xno };
+    return { ran, usd, xno, fundedBy };
   }
 
   /** The three money legs of a receipt, each with its own honest status. */
   function receiptLegs(q, r) {
     const m = modelSpend(q);
+    const { fundedBy } = m;
     const caller = {
       leg: "caller payment", asset: symbol(q),
       amount: amountText(q, r.deposit.amountAtomic ?? r.deposit.yocto),
@@ -231,17 +233,17 @@ export function createNearGate({
     };
     let model;
     if (!m.ran) {
-      model = { leg: "model payment", status: "none", usd: "0", xno: null, basis: "nothing ran", fundedBy: modelPayment };
+      model = { leg: "model payment", status: "none", usd: "0", xno: null, basis: "nothing ran", fundedBy };
     } else if (m.usd == null) {
-      model = { leg: "model payment", status: "unknown", usd: null, xno: null, basis: q.outcome === "succeeded" ? "the provider reported no cost" : "the run did not complete; any provider cost is unknown and the operator's", fundedBy: modelPayment };
+      model = { leg: "model payment", status: "unknown", usd: null, xno: null, basis: q.outcome === "succeeded" ? "the provider reported no cost" : "the run did not complete; any provider cost is unknown and the operator's", fundedBy };
     } else {
       model = {
         leg: "model payment", status: "paid", usd: m.usd,
         xno: m.xno,
-        basis: modelPayment === "wallet"
+        basis: fundedBy === "wallet"
           ? (m.xno != null ? "XNO derived from the reported cost at the locked XNO/USD rate" : "paid in XNO from the operator's Nano wallet; XNO amount unknown (no XNO/USD rate was locked)")
-          : modelPayment === "api_key" ? "paid from the operator's NanoGPT balance" : "paid by the operator",
-        fundedBy: modelPayment,
+          : fundedBy === "api_key" ? "paid from the operator's NanoGPT balance" : "paid by the operator",
+        fundedBy,
       };
     }
     const refund = {
@@ -393,7 +395,7 @@ export function createNearGate({
       paidYocto: q.paidYocto,
       ...(assetOf(q) === "usdc" ? { asset: "USDC", chargedUsdc: formatUsdc(charged), refundUsdc: formatUsdc(refunded) }
         : { chargedNear: formatYoctoAsNear(charged), refundNear: formatYoctoAsNear(refunded) }),
-      modelUsd: m.usd, modelPayment, modelXno: m.xno, modelXnoBasis: m.xno != null ? "derived" : null,
+      modelUsd: m.usd, modelPayment: m.fundedBy, modelXno: m.xno, modelXnoBasis: m.xno != null ? "derived" : null,
       rate: rateView(q),
     };
   }
@@ -919,6 +921,7 @@ export function createNearGate({
       result: persisted,
       settlement: {
         costUsd, exact: s.known ? res.costExact !== false && billedAs === "reported" : false,
+        modelPayment,
         billedAs, reportedUsd: reportedUsd ?? null,
         costYocto: s.costYocto.toString(), feeYocto: s.feeYocto.toString(),
         chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(),

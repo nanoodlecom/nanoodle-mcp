@@ -729,6 +729,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
         return readPool.readPaymentWindow(options);
       } }),
       withFunding: maintenance ? (terms, execute) => maintenance.run(() => funding.run(terms, execute)) : funding.run,
+      authorizeBackup: funding.authorizeBackup,
       fundingStatus: funding.snapshot,
       fundingReadStatus: readPool?.status,
       checkpoint: () => readPool?.status().checkpoint ?? null,
