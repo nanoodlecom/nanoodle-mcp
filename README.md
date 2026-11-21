@@ -360,6 +360,12 @@ once and draw down a balance, that's exactly what a NanoGPT account is:
 (Nano included) into an account, take its API key, and run the server in
 normal BYOK mode — same tools, one payment instead of many.
 
+An experimental [Base/Solana x402 exact ingress](docs/x402-exact-ingress.md)
+ships with its durable payment-authority store and CDP Bazaar discovery
+support, qualified offline only. It is not enabled by the CLI or hosted
+server, and no live payment path exists until an operator wires a route,
+a facilitator and a `payTo` address.
+
 ## Serve mode — host your noodles as a service (`--serve`)
 
 Everything above speaks MCP over stdio to *your own* agent. `--serve` speaks
@@ -499,14 +505,13 @@ flat ceiling. Size the ceiling generously; over-covering costs callers
 nothing since the difference comes back as change, while an under-sized
 deposit means runs can cost more than was collected and *you* eat the
 difference (the gate warns at startup when a graph's deposit is below its
-last observed cost + 20%). The XNO conversion comes from **NanoGPT itself**:
-the gate fires a keyless `x-x402` probe and keeps the invoice's exact
-raw-XNO/USD pair — the same rate your downstream payments settle at, so
-quotes and costs can never drift apart on FX, and no market-data service is
-involved (probe invoices are never paid; they just expire). Cached 60s, stale
-cache rides out probe outages, and `--xno-usd` forces a static rate if you
-ever need one. Per-graph overrides are a hand-added top-level block in the
-graph JSON:
+last observed cost + 20%). The gate prefers the exact raw-XNO/USD pair from
+an unpaid NanoGPT invoice. It refreshes the rate after 60 seconds and can
+keep using that observation for up to five minutes during an outage.
+CoinGecko and Kraken provide timestamped XNO/USD fallbacks within the same
+freshness limit. `GET /rates/nano` checks the rate the Nano checkout would
+use. `--xno-usd` pins an operator-configured rate. Set per-graph overrides in
+the top-level block shown below.
 
 ```json
 "x402": { "usd": 0.10, "author": "nano_1abc…" }
@@ -880,36 +885,16 @@ just `./noodles`, since `~` is not expanded in MCP args). Cursor
 (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`) take the same `args` in
 the config shapes shown under [Install](#install).
 
-## Hosted subnano tools
+## Built-in safe-for-work check
 
-When at least one graph is loaded, the server also exposes two built-in tools
-(they are not graph files, and an empty `--graphs` directory still refuses to
-start):
+When at least one graph is loaded, `sfw_check` checks a still image, evenly
+sampled video frames, or both. It passes only if the model
+(`perplexity/pplx-decider-v1.2`) answers yes for every picture.
+Video sampling needs ffmpeg.
 
-- **`subnano_comment`** — one call that rewrites a draft with `liquid/lfm-2.5-2.6b`
-  (Liquid d1 is a decision model and cannot write the comment), runs the mounted
-  `humanize-comment` graph on that rewrite, then asks `liquid/d1` whether the
-  result is safe to post and how funny it is. Needs `humanize-comment` in
-  `--graphs`. A "no" from the gate is returned with the comment; it does not
-  discard it.
-- **`sfw_check`** — one yes/no safe-for-work decision per still image and per
-  evenly sampled video frame (`perplexity/pplx-decider-v1.2`). The check passes
-  only when every picture is yes. There is no argument that turns it off.
-  Sampling a video needs ffmpeg; checking a still image does not.
-
-In charge mode each call's deposit is quoted before payment and is a cap on
-the charge. `subnano_comment` sizes every stage's max_tokens from that draft
-(about 1.5× its length, plus a little slack), estimates input at about one
-token per 3.5 bytes plus a small margin, and caps re-asks at the same output
-size. The decider keeps 256 ranking-JSON tokens and 512 GLM reasoning tokens
-on top of that writer cap, and the humanize hold inside the call is quoted at
-those caps. The gate and the funny judge read the comment clipped to that size.
-Settlement is the metered cost plus 20%, and never more than the quote. Before
-each paid stage the run stops when the remaining budget cannot cover it,
-returns what already finished, and charges only the calls that ran.
-`sfw_check` is the same kind of cap: the quote is the pictures that request
-asks to check, a picture that would exceed the remaining budget is not sent,
-and settlement cannot exceed the quote. The difference is returned.
+In charge mode, the number of pictures determines the deposit. The run stops
+before any check the remaining budget cannot cover. The service charges metered
+cost plus 20%, capped at the deposit, and returns the difference.
 
 ## Run any share link
 
@@ -1167,7 +1152,7 @@ should send from its key.
 | `--near-rpc <url[,url]>` | `NEAR_RPC_URL` | fastnear's public RPC, then near.org's | RPC endpoint(s) you trust to report finality, tried in order with failover. The shared watcher detects exact transfers through finalized account changes and receipt-to-transaction lookup; no node or indexer is needed. |
 | `--near-key-file <path>` | `NEAR_PRIVATE_KEY` (env or `--env-file`) | required | The merchant's full-access key: `ed25519:…` in the env, or a JSON key file with `account_id`, `public_key` and `private_key` (legacy near-cli credentials, or what `scripts/near-testnet-accounts.mjs` writes). near-cli-rs key files have no `account_id`; use `NEAR_PRIVATE_KEY` for those. Never accepted on argv, never logged. |
 | `--near-usd <n>` | `NEAR_USD` (env or `--env-file`) | live (CoinGecko, 60 s cache) | Pin the NEAR/USD rate. Without a fresh live rate the server stops quoting rather than guess. |
-| `--xno-usd <n>` | | live (NanoGPT x402 invoices, else CoinGecko) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet; informational with an API key. |
+| `--xno-usd <n>` | | live (NanoGPT x402 invoices, then CoinGecko or Kraken) | Pin the XNO/USD rate (the same flag the Nano charge mode uses). Required to quote when the server pays NanoGPT from its Nano wallet. Informational with an API key. |
 | `--near-swap-spread-bps <n>` | `NEAR_SWAP_SPREAD_BPS` (env or `--env-file`) | `0` | Swap margin, 0–2000 basis points: NEAR amounts are computed at a NEAR/USD rate that much worse for the caller, to cover swapping NEAR to XNO. |
 | `--near-quote-ttl-min <n>` | `NEAR_QUOTE_TTL_MIN` | `30` | Quote lifetime, 1–120 minutes; the quote's rates stay locked for all of it. |
 | `--near-rates-refresh-s <n>` | `NEAR_RATES_REFRESH_S` | `60` | Background refresh of live rates; `0` turns the timer off. |
@@ -1399,11 +1384,41 @@ workflow, not in `npm test`: `scripts/assert-npm-version.mjs` fails the registry
 publish unless `server.json`'s version is really on npm. See
 [PUBLISHING.md](PUBLISHING.md).
 
+The optional [ACP v2 seller qualification](docs/acp-v2-seller.md) has its own
+pinned SDK dependencies and offline test command. Its adapter is disabled by
+default and has no live wallet, registry or payment integration.
+
 ## Registry
 
 `server.json` is the [official MCP registry](https://registry.modelcontextprotocol.io)
 manifest (`io.github.nanoodlecom/nanoodle-mcp`); see [PUBLISHING.md](PUBLISHING.md)
 for the release checklist.
+
+## Agent identity
+
+One identity, every directory. `server.json` is the source of truth; two
+further documents are generated from it (`npm run build:identity`) and checked
+for drift on every `npm test`:
+
+- `agent-card.json` — the A2A Agent Card, for serving at
+  `https://mcp.nanoodle.com/.well-known/agent-card.json`
+- `agent-registration.json` — the ERC-8004 / Solana 8004 registration file,
+  for serving at `https://mcp.nanoodle.com/.well-known/agent-registration.json`
+
+Where nanoodle is listed (NEAR Agent Market, MCP Registry, npm), the refresh
+procedure, and the one-command registry publish
+(`npm run publish:registry -- --execute`, dry-run without `--execute`) live in
+[docs/agent-identity.md](docs/agent-identity.md).
+
+## Optional integrations
+
+- **ASI Agentverse (inactive by default)** — a Python uAgent sidecar in
+  [`integrations/agentverse/`](integrations/agentverse/) that exposes this
+  server's workflows to ASI:One / Agentverse chat via the Agent Chat
+  Protocol, settling paid runs through this server's existing payment
+  links. Registration is a deliberate operator step; see its README and
+  RUNBOOK.
+
 
 ## Which repo do I want?
 

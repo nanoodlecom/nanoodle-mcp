@@ -11,6 +11,7 @@
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
+import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
 import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -23,7 +24,7 @@ import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
-import { SUBNANO_TOOL, SFW_TOOL, builtinTools, refreshBuiltinDeposits } from "./subnano.mjs";
+import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
 import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GUIDE_NODE_MODEL_KIND, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
 
@@ -86,7 +87,7 @@ const CATALOG_TIMEOUT_MS = 8000;
  * `consequence` is appended to the failure log line, so each caller can name
  * what its own users lose.
  */
-export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {},
+export async function fetchCatalogs(kinds, { baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {},
   requireFresh = false, maxAgeMs = requireFresh ? PAID_CATALOG_TTL_MS : CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const base = String(baseUrl).replace(/\/+$/, "");
   const catalogs = {};
@@ -152,10 +153,10 @@ export async function fetchCatalogs(kinds, { baseUrl = "https://nano-gpt.com", f
  * Best-effort: a catalog that won't load leaves those tools unclamped, i.e.
  * exactly today's behavior, and never blocks startup.
  */
-export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
+export async function attachCatalogs(registry, { baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {}, maxAgeMs = CATALOG_TTL_MS, timeoutMs = CATALOG_TIMEOUT_MS, consequence = "" } = {}) {
   const needed = new Set();
   for (const t of registry.tools) {
-    if (!t.wf) continue; // built-ins (subnano_comment, sfw_check) have no graph
+    if (!t.wf) continue; // Built-in tools have no graph.
     for (const k of graphModelKinds(t.wf.graph)) needed.add(k);
   }
   if (!needed.size) {
@@ -187,7 +188,7 @@ export async function attachCatalogs(registry, { baseUrl = "https://nano-gpt.com
  * Re-callable — a periodic refresh keeps estimates AND catalogs fresh; it
  * refetches rather than reusing the cached copy a per-call path would take.
  */
-export async function attachEstimates(registry, { baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, log = () => {} } = {}) {
+export async function attachEstimates(registry, { baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {} } = {}) {
   const catalogs = await attachCatalogs(registry, {
     baseUrl, fetch, maxAgeMs: 0,
     consequence: ", and quote the flat opening deposit until they've run",
@@ -822,7 +823,7 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
  * checked the graph first does not decode it twice.
  * @returns {Promise<{ graph: object, workflowGraph: object, inputs: object, wf: Workflow, catalogs: object, source: string, url: string|null }>}
  */
-export async function prepareRunNoodle(args, { apiKey, payment, baseUrl, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
+export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, log = () => {}, catalogTimeoutMs,
   allowShortLinks = true, read = null, requireFreshCatalogs = false } = {}) {
   if (args == null) args = {};
   if (typeof args !== "object" || Array.isArray(args)) {
@@ -1070,7 +1071,7 @@ export class HumanizeUnpriceableError extends Error {
   constructor(m) { super(m); this.name = "HumanizeUnpriceableError"; this.refuse = true; }
 }
 
-export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
+export async function loadTools({ dirs, apiKey, payment, baseUrl = NANOGPT_API_ORIGIN, outDir, publicBase = null, log = (line) => console.error("nanoodle-mcp: " + line), catalogTimeoutMs, hosted = false, remote = false, runTimeoutMs = null, humanizeFallbacks = null }) {
   const executionLimit = hosted || remote ? hostedRunTimeout(runTimeoutMs ?? undefined) : null;
   const runtimeFetch = hostedRunFetch();
   // Wallet mode (payment callback, no key) changes only where money comes from.
@@ -1086,9 +1087,8 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
   const failures = [];
   // Seed the reserved run_noodle name so a file that sanitizes to it gets suffixed, not shadowed.
   // Shared across every dir, so the first-scanned occurrence of a name wins it.
-  // Built-in tool names are reserved the same way as run_noodle: a graph file
-  // that sanitizes to one of them is suffixed (-2), it does not replace the tool.
-  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [PRICE_NOODLE_NAME, 1], [NOODLE_GUIDE_NAME, 1], [SUBNANO_TOOL, 1], [SFW_TOOL, 1]]);
+  // Reserve the retired name so no graph can take over its outstanding checkout IDs.
+  const usedNames = new Map([[RUN_NOODLE_NAME, 1], [PRICE_NOODLE_NAME, 1], [NOODLE_GUIDE_NAME, 1], ["subnano_comment", 1], [SFW_TOOL, 1]]);
 
   for (const dir of dirs) {
     let entries;
@@ -1166,12 +1166,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
     }
     Object.assign(t.inputSchema.properties, humanizeExtraProperties());
   }
-  // Built-ins ship in the package so a deploy does not need a new graph file.
-  // They stay off an empty directory: with no graph loaded there is nothing to serve.
-  if (tools.length) {
-    const humanize = tools.find((t) => t.name === HUMANIZE_TOOL);
-    for (const b of builtinTools({ spendSource, humanize, hosted, remote })) tools.push(b);
-  }
+  if (tools.length) tools.push(createSfwTool({ spendSource, hosted, remote }));
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
@@ -1349,9 +1344,7 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
           // Hosted payments cap provider spend at the quote, and the gate refunds the difference.
           // A direct wallet pays each invoice. Direct-wallet spending has no cap and is not refunded.
           const prices = humanizePriceTable(registry.catalogs);
-          // subnano_comment passes the caps it will send. The deposit has to
-          // reserve those caps even when the refined draft is shorter than the
-          // original, or the decider hold is skipped inside an exact quote.
+          // Reserve explicit caps for the whole run, including the decider hold.
           const writerOutTokens = Number(params.maxTokens) > 0 ? Math.floor(Number(params.maxTokens)) : 0;
           const judgeOutTokens = Number(params.judgeMaxTokens) > 0 ? Math.floor(Number(params.judgeMaxTokens)) : 0;
           const quoted = humanizeDepositUsd(tool.wf.graph, args, {
@@ -1380,13 +1373,12 @@ export async function loadTools({ dirs, apiKey, payment, baseUrl, outDir, public
             guidance: opts.guidance,
             title: opts.title === true,
             payment: apiKey ? null : payment,
-            baseUrl: baseUrl || "https://nano-gpt.com",
+            baseUrl: baseUrl || NANOGPT_API_ORIGIN,
             // An unpriceable request falls back to the worst-case ceiling, never a stale pin.
             budgetUsd: hosted ? (quoted ?? humanizeQuoteOrCeiling(tool, null, prices)) : null,
             deciderReserveUsd: hosted ? deciderReserveUsd : 0,
             prices,
-            // subnano_comment sizes this humanize run from the request. A normal
-            // humanize-comment call leaves these unset, and the v2.8 caps apply.
+            // Use the standard caps when the caller leaves these unset.
             ...(Number(params.maxTokens) > 0 ? { writerTokenCap: Math.floor(Number(params.maxTokens)) } : {}),
             ...(Number(params.judgeMaxTokens) > 0 ? { judgeTokenCap: Math.floor(Number(params.judgeMaxTokens)) } : {}),
           });

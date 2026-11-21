@@ -27,7 +27,7 @@
  *
  * API key: NANOGPT_API_KEY env var, --key <key>, or --env-file <path> (.env-style file).
  * Precedence: --key > --env-file > NANOGPT_API_KEY (same as the nanoodle CLI).
- * NANOGPT_BASE_URL overrides the API host.
+ * NANOGPT_BASE_URL overrides the default https://api.nano-gpt.com.
  *
  * Wallet mode (accountless x402, used only when no API key is set):
  * NANO_PRIVATE_KEY (64-hex secret key) or NANO_SEED (64-hex seed, account 0), from the
@@ -35,6 +35,7 @@
  * leaks via `ps`. NANO_RPC_URL / --nano-rpc picks the Nano node (default rpc.nano.to);
  * --max-usd refuses any single invoice above $n.
  */
+import { NANOGPT_API_ORIGIN } from "../src/nanogpt-origin.mjs";
 import { nearAgentGuide } from "../src/near/agent-guide.mjs";
 import { readFile, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
@@ -499,7 +500,7 @@ async function main() {
       dirs: graphDirs,
       apiKey,
       payment: wallet && !apiKey ? wallet.payment : undefined,
-      baseUrl: process.env.NANOGPT_BASE_URL || undefined,
+      baseUrl: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN,
       outDir: resolvedOut,
       publicBase: serveSpec !== null ? publicBase : null,
       // hosted is billing (--charge-usd). remote is the HTTP transport: every
@@ -540,7 +541,7 @@ async function main() {
     // Best-effort: no catalog just means no clamp, exactly as before.
     if (chargeUsd == null && !nearMode) {
       const catalogOpts = {
-        baseUrl: process.env.NANOGPT_BASE_URL || undefined,
+        baseUrl: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN,
         log: (line) => console.error("nanoodle-mcp: " + line),
       };
       // Fire-and-forget: the catalog is an optimization, and Workflow reads
@@ -650,7 +651,7 @@ async function main() {
       // slack). Best-effort — a catalog that won't load just leaves the flat opening
       // deposit in place. Refreshed hourly so estimates track catalog/price changes;
       // the timer is unref()'d so it never holds the process open.
-      const catalogBase = process.env.NANOGPT_BASE_URL || "https://nano-gpt.com";
+      const catalogBase = process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN;
       const refreshEstimates = () => attachEstimates(registry, {
         baseUrl: catalogBase,
         log: (line) => console.error("nanoodle-mcp: " + line),
@@ -669,7 +670,7 @@ async function main() {
         usd: chargeUsd,
         validate: (p) => registry.prepareCall(p),
         xnoUsd,
-        oracleBase: process.env.NANOGPT_BASE_URL || undefined,
+        oracleBase: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN,
         wsUrl: nanoWs,
         publicBase,
         // In-flight money (pending quotes, queued refunds) survives restarts here.
@@ -742,7 +743,7 @@ async function main() {
       creatorPayments = createMarketCreatorPayments({ rates: near.rates, payouts: near.gate.authorPayouts });
       creators = createHostedWorkflows({ dir: join(resolvedOut, "hosted-workflows"), callTool: near.wrapped.callTool,
         publicBase: (nearServePort ? nearPublicUrl : publicBase).replace(/\/+$/, ""), merchant: nearInfo.merchant,
-        network: nearInfo.network, usdc: near.usdc, maxDepositUsd: nearMaxDeposit ?? 2, baseUrl: process.env.NANOGPT_BASE_URL });
+        network: nearInfo.network, usdc: near.usdc, maxDepositUsd: nearMaxDeposit ?? 2, baseUrl: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN });
     }
     if (serviceLifecycle.isStopping()) return;
     httpServers.push(await serveHttp({
@@ -929,7 +930,7 @@ async function startNearMode({
 
   // Catalogs clamp payloads and price every quote; refreshed hourly as in charge mode
   // (which does the same refresh itself when both rails run).
-  const catalogBase = process.env.NANOGPT_BASE_URL || "https://nano-gpt.com";
+  const catalogBase = process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN;
   if (!dual) {
     const refresh = () => attachEstimates(registry, { baseUrl: catalogBase, log }).catch(() => {});
     await refresh();
@@ -948,7 +949,7 @@ async function startNearMode({
   try {
     rates = near.createNearRates({
       nearUsd: usdText, xnoUsd: xnoUsdText, spreadBps: spreadText, xnoRequired: modelPayment === "wallet",
-      refreshMs: refreshS * 1000, nanoGptBase: process.env.NANOGPT_BASE_URL || undefined, log,
+      refreshMs: refreshS * 1000, nanoGptBase: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, log,
     });
   } catch (e) { fail(e.message); }
   await rates.start(); // first fetch before serving, so the first quote is warm (bounded by the fetch timeouts)

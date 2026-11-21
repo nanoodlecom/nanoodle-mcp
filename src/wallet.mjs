@@ -33,7 +33,7 @@ import {
 } from "nanocurrency";
 import { redactUrl } from "./redact.mjs";
 import { createRunFunding, FundingError } from "./run-funding.mjs";
-import { createNanoReadPool } from "./nano-read-pool.mjs";
+import { createNanoReadPool, parseNanoRpcUrls } from "./nano-read-pool.mjs";
 import { createNanoCheckpointStore } from "./nano-checkpoint-store.mjs";
 import { rpcRetryAfterMs } from "./rpc-backoff.mjs";
 
@@ -135,9 +135,7 @@ export function createNanoWallet({ secretKey, rpcUrl = null, rpcStandby, workUrl
   // rpcUrl accepts a comma-separated list, tried in order with failover — so one
   // proxy throttling or dropping does not end a settlement. Empty/unset falls
   // back to the resilient default chain rather than a single node.
-  const rpcBases = (rpcUrl ? String(rpcUrl).split(",") : DEFAULT_NANO_RPCS)
-    .map((u) => u.trim().replace(/\/+$/, ""))
-    .filter(Boolean);
+  const rpcBases = rpcUrl ? parseNanoRpcUrls(String(rpcUrl)) : [...DEFAULT_NANO_RPCS];
   if (!rpcBases.length) rpcBases.push(DEFAULT_NANO_RPC);
   // workUrl accepts a comma-separated list, tried in order — e.g. a GPU box on
   // the tailnet first, a public work API second. `workKey` (if set) goes to

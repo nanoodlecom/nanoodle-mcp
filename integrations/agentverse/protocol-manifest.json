@@ -1,0 +1,288 @@
+{
+  "version": "1.0",
+  "metadata": {
+    "name": "AgentChatProtocol",
+    "version": "0.3.0",
+    "digest": "proto:30a801ed3a83f9a0ff0a9f1e6fe958cb91da1fc2218b153df7b6cbf87bd33d62"
+  },
+  "models": [
+    {
+      "digest": "model:2601825997203ee07dbb9ff6e7c71ae7bdaf6a7c8b817361f2f88f4b29c68d0c",
+      "schema": {
+        "title": "ChatMessage",
+        "type": "object",
+        "properties": {
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "string",
+            "format": "date-time"
+          },
+          "msg_id": {
+            "title": "Msg Id",
+            "type": "string",
+            "format": "uuid4"
+          },
+          "content": {
+            "title": "Content",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TextContent"
+                },
+                {
+                  "$ref": "#/definitions/ResourceContent"
+                },
+                {
+                  "$ref": "#/definitions/MetadataContent"
+                },
+                {
+                  "$ref": "#/definitions/StartSessionContent"
+                },
+                {
+                  "$ref": "#/definitions/EndSessionContent"
+                },
+                {
+                  "$ref": "#/definitions/StartStreamContent"
+                },
+                {
+                  "$ref": "#/definitions/EndStreamContent"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "timestamp",
+          "msg_id",
+          "content"
+        ],
+        "definitions": {
+          "TextContent": {
+            "title": "TextContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "text"
+                ],
+                "type": "string"
+              },
+              "text": {
+                "title": "Text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ]
+          },
+          "Resource": {
+            "title": "Resource",
+            "type": "object",
+            "properties": {
+              "uri": {
+                "title": "Uri",
+                "type": "string"
+              },
+              "metadata": {
+                "title": "Metadata",
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "uri",
+              "metadata"
+            ]
+          },
+          "ResourceContent": {
+            "title": "ResourceContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "resource"
+                ],
+                "type": "string"
+              },
+              "resource_id": {
+                "title": "Resource Id",
+                "type": "string",
+                "format": "uuid4"
+              },
+              "resource": {
+                "title": "Resource",
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/Resource"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/definitions/Resource"
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "resource_id",
+              "resource"
+            ]
+          },
+          "MetadataContent": {
+            "title": "MetadataContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "metadata"
+                ],
+                "type": "string"
+              },
+              "metadata": {
+                "title": "Metadata",
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "metadata"
+            ]
+          },
+          "StartSessionContent": {
+            "title": "StartSessionContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "start-session"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "EndSessionContent": {
+            "title": "EndSessionContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "end-session"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "StartStreamContent": {
+            "title": "StartStreamContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "start-stream"
+                ],
+                "type": "string"
+              },
+              "stream_id": {
+                "title": "Stream Id",
+                "type": "string",
+                "format": "uuid4"
+              }
+            },
+            "required": [
+              "type",
+              "stream_id"
+            ]
+          },
+          "EndStreamContent": {
+            "title": "EndStreamContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "title": "Type",
+                "enum": [
+                  "end-stream"
+                ],
+                "type": "string"
+              },
+              "stream_id": {
+                "title": "Stream Id",
+                "type": "string",
+                "format": "uuid4"
+              }
+            },
+            "required": [
+              "type",
+              "stream_id"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "digest": "model:741eb75692abbeb43c131e364ad939af23f14e8288ba0ec3df130843ef79bd7f",
+      "schema": {
+        "title": "ChatAcknowledgement",
+        "type": "object",
+        "properties": {
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "string",
+            "format": "date-time"
+          },
+          "acknowledged_msg_id": {
+            "title": "Acknowledged Msg Id",
+            "type": "string",
+            "format": "uuid4"
+          },
+          "metadata": {
+            "title": "Metadata",
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "timestamp",
+          "acknowledged_msg_id"
+        ]
+      }
+    }
+  ],
+  "interactions": [
+    {
+      "type": "normal",
+      "request": "model:2601825997203ee07dbb9ff6e7c71ae7bdaf6a7c8b817361f2f88f4b29c68d0c",
+      "responses": [
+        "model:741eb75692abbeb43c131e364ad939af23f14e8288ba0ec3df130843ef79bd7f"
+      ]
+    },
+    {
+      "type": "normal",
+      "request": "model:741eb75692abbeb43c131e364ad939af23f14e8288ba0ec3df130843ef79bd7f",
+      "responses": []
+    }
+  ]
+}

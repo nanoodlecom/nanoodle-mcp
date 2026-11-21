@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Read-only production readiness. No Workflow.run, payment, work generation,
 // signing, receive sweep, assignment start, bid, submission or price mutation.
+import { NANOGPT_API_ORIGIN } from "../src/nanogpt-origin.mjs";
 import { readFileSync, mkdirSync, mkdtempSync, chmodSync, statfsSync, rmSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +14,7 @@ import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocur
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw, paidNanoRunFundingRaw,
-  marketRunFunding } from "../src/operational-state.mjs";
+  marketRunFunding, recentPaidWorkflowFailures } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
@@ -37,7 +38,7 @@ import { marketNeedUsd } from "../src/market/runner.mjs";
 import { computePrice, priceSavedWorkflow } from "../src/tools.mjs";
 import { DEFAULT_HOSTED_RUN_MS } from "../src/hosted-run.mjs";
 import { NANO_COLD_STANDBY_SCAN_REQUESTS, NANO_LEGACY_COLD_STANDBY_SCAN_REQUESTS, NANO_FUNDING_EVIDENCE_MS, NANO_GENESIS, checkNanoGenesis, matchesNanoConfirmedBlock, nanoAccountView, nanoStandbyConfig,
-  qualifyNanoAccountViews, checkedReceivable } from "../src/nano-read-pool.mjs";
+  qualifyNanoAccountViews, checkedReceivable, assertDistinctNanoRpcPeers, parseNanoRpcUrls } from "../src/nano-read-pool.mjs";
 import { selectNanoCheckpoint } from "../src/nano-checkpoint.mjs";
 import { FUNDING_REPORT_MAX_AGE_MS, fundingReportFailure, selectFundingPause } from "../src/funding-report.mjs";
 import { nearFundingNeed, nearRefundClaims, nearRefundFinalHeight, readNearFunding, readNearTransferFunding } from "../src/near/funding.mjs";
@@ -299,6 +300,10 @@ export async function runOperationalCheck(config, deps = {}) {
     try { const value = await fn(); checks.push({ stage, ok: true }); return value; }
     catch (e) { checks.push({ stage, ok: false, code: safeCode(e), domains }); return null; }
   };
+  const nanoRpcConfig = await check("nano-rpc-peers", () => {
+    assertDistinctNanoRpcPeers(peerUrls);
+    return true;
+  });
   const backup = config.backupExportReport &&
     await check("backup-export-proof", () => backupVerificationProof(config.backupExportReport, read, now(), "backup-export"), []);
   if (backup) {
@@ -424,8 +429,13 @@ export async function runOperationalCheck(config, deps = {}) {
   const readMarketLedgers = () => config.agents.map(a => read(join(config.marketStateDir, a.handle, "market-state.json")));
   const state = await check("payment-state", async () => {
     const nano = readNanoLedger(), near = readNearLedger(), market = readMarketLedgers();
-    const liabilities = paymentLiabilities({ nano, near, market }, { now: now() });
+    const checkedAt = now();
+    const liabilities = paymentLiabilities({ nano, near, market }, { now: checkedAt });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
+    const failures = recentPaidWorkflowFailures({ nano, near }, checkedAt);
+    const ok = failures.nano + failures.near + failures.usdc < 2;
+    checks.push({ stage: "paid-workflow-execution", ok, failures,
+      ...(ok ? {} : { code: "paid-workflow-failures-repeated", domains: [] }) });
     return { liabilities, near };
   });
   if (state) await check("near-payment-replay-coverage", () => {
@@ -533,7 +543,7 @@ export async function runOperationalCheck(config, deps = {}) {
   }
   const nanoAnchor = runtimeFunding?.checkpoint.confirmed;
   const nanoAnchorHeight = nanoAnchor ? BigInt(nanoAnchor.blockCount) : null;
-  const nanoNodes = (await Promise.all(config.nanoRpcUrls.map(async (url, index) => {
+  const nanoNodes = (await Promise.all((nanoRpcConfig ? config.nanoRpcUrls : []).map(async (url, index) => {
     let observation;
     await check(`nano-node-${index}`, async () => {
       need(!nanoCooldowns.some(item => item.peer === index), "nano-rpc-rate-limited");
@@ -878,6 +888,14 @@ export async function runOperationalCheck(config, deps = {}) {
     verifyRate("xnoUsd");
     return rateView;
   });
+  await check("nano-checkout-rate", async () => {
+    const checkout = await http(config.nanoSite + "/rates/nano");
+    need(checkout.usable === true && parseUsdNano(checkout.xnoUsd) > 0n, "nano-checkout-rate-unavailable");
+    if (checkout.source !== "static") {
+      const age = now() - Date.parse(checkout.observedAt);
+      need(age >= -30_000 && age < LIVE_RATE_MAX_AGE_MS, "nano-checkout-rate-stale");
+    }
+  }, ["nano"]);
   if (rateView) await check("exchange-rate-near", () => {
     verifyRate("nearUsd");
     // The aggregate quoting flag can also be down because XNO is unavailable.
@@ -1230,7 +1248,7 @@ async function productionConfig(env = process.env) {
   const payer = env.CHECK_PAYER;
   const canaryPayer = payer ? { accountId: payer, maxNear: env.CHECK_MAX_NEAR || DEFAULT_CHECK_MAX_NEAR,
     publicKey: env.CHECK_PAYER_PUBLIC_KEY || (/^[a-f0-9]{64}$/.test(payer) ? "ed25519:" + base58Encode(Buffer.from(payer, "hex")) : null) } : null;
-  const nanoRpcUrls = env.NANO_RPC_URL.split(",").map(s => s.trim());
+  const nanoRpcUrls = parseNanoRpcUrls(env.NANO_RPC_URL);
   const nanoStandby = nanoStandbyConfig(nanoRpcUrls, { url: env.NANO_RPC_STANDBY_URL, requestsPerMinute: env.NANO_RPC_STANDBY_REQUESTS_PER_MINUTE });
   return { stateDir: env.OPERATIONAL_CHECK_STATE_DIR || "/var/lib/nanoodle-operational-check", invocationId: env.INVOCATION_ID,
     backupExportReport: env.OPERATIONAL_BACKUP_EXPORT_REPORT, backupCopyReport: env.OPERATIONAL_BACKUP_COPY_REPORT,
@@ -1241,7 +1259,7 @@ async function productionConfig(env = process.env) {
     nanoRpcUrls, nanoStandby, nanoLedgerTelemetry: env.OPERATIONAL_NANO_LEDGER_TELEMETRY === "1",
     nearRpcUrls: env.NEAR_RPC_URL.split(",").map(s => s.trim()),
     site: env.NEAR_PUBLIC_URL || "https://near.nanoodle.com", nanoSite: env.NANO_PUBLIC_URL || "https://mcp.nanoodle.com", marketUrl: env.MARKET_BASE_URL || "https://market.near.ai",
-    nanoGptBase: env.NANOGPT_BASE_URL || "https://nano-gpt.com", providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
+    nanoGptBase: env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, providerUsesWallet: !env.NANOGPT_API_KEY?.trim(),
     agents: readCatalog(env.MARKET_AGENTS_FILE).agents };
 }
 

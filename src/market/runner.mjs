@@ -16,6 +16,7 @@
  *     (pricing.boundGraph from priceGraph/bindPaidGraph), through
  *     prepareRunNoodle() and the engine, exactly as the NEAR gate runs it.
  */
+import { NANOGPT_API_ORIGIN } from "../nanogpt-origin.mjs";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MediaRef } from "nanoodle";
@@ -46,7 +47,7 @@ export function isOperatorSideFailure(message) {
  * @returns {Promise<{ ok: boolean, status: number|null, detail: string }>} ok=false only on a
  *   definite rejection (401/403); a network error or any other status is "unknown" and ok.
  */
-export async function checkNanoGptKey({ apiKey, baseUrl = "https://nano-gpt.com", fetch = globalThis.fetch, timeoutMs = 15_000 }) {
+export async function checkNanoGptKey({ apiKey, baseUrl = NANOGPT_API_ORIGIN, fetch = globalThis.fetch, timeoutMs = 15_000 }) {
   try {
     const res = await fetch(new URL("/api/check-balance", baseUrl), {
       method: "POST", headers: { "x-api-key": apiKey }, signal: AbortSignal.timeout(timeoutMs), redirect: "error",

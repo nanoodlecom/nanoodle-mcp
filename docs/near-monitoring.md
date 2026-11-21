@@ -257,6 +257,10 @@ Coverage:
   them. Shrinking lag, missing samples, or a plateau longer than 12 minutes
   clear the trend. The elapsed time comes from the counter observations.
   Wallet read quorum determines Nano payment readiness.
+- Recent paid workflow execution failures from the Nano and NEAR/USDC
+  ledgers. The report includes aggregate counts for the last 30 minutes.
+  Two or more failed runs raise an advisory while payment admission
+  continues. Refunds for late or wrong-amount transfers are outside this check.
 - NEAR network, syncing, finalized head age and cross-node consistency;
   payment-watcher age/lag and the merchant's current refund-key permission.
   If the watcher is still scanning historical blocks five minutes after the
@@ -398,7 +402,10 @@ and both NEAR hostnames, Nano rate freshness, the NEAR watcher and refund fundin
 the Babel authentication challenge, and NEAR AI Market's public site, API and
 Nanoodle listings. The free `price_noodle` probes check that the decision model
 and both branches are priced in NEAR and USDC, and the estimated charge fits
-the deposit. All probes use bounded retries and record only check results.
+the deposit. The hosted runner also checks rendered preview images on the Nano
+hub and NEAR demo. It checks image headers and reads one byte from each audio
+or video sample to verify that the player can load a byte range. All probes
+use bounded retries and record only check results.
 The hosted workflow runs both checks with Node and can still probe Market
 during an npm outage. The probes use public discovery, status and pricing.
 

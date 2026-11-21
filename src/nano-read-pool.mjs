@@ -23,6 +23,28 @@ const yes = value => value === true || value === "true";
 const canonical = account => String(account || "").replace(/^xrb_/, "nano_");
 const sameAccountView = (a, b) => Object.keys(a).every(key => a[key] === b[key]);
 
+export function parseNanoRpcUrls(value) {
+  return value.split(",").map(url => url.trim().replace(/\/+$/, "")).filter(Boolean);
+}
+
+export function assertDistinctNanoRpcPeers(bases) {
+  if (!Array.isArray(bases) || !bases.length || bases.length > 8 || bases.some(base => typeof base !== "string" || !base)) {
+    throw new TypeError("Nano read pool needs between one and eight endpoint identifiers");
+  }
+  const destinations = bases.map(base => {
+    const url = URL.parse(base);
+    if (!url || !["http:", "https:"].includes(url.protocol)) return base;
+    // Fragments never reach the endpoint. The URL parser normalizes host case,
+    // default ports and dot segments before a request is sent.
+    url.hash = "";
+    url.hostname = url.hostname.replace(/\.$/, "");
+    return url.href;
+  });
+  if (new Set(destinations).size !== bases.length) {
+    throw Object.assign(new TypeError("Duplicate Nano RPC endpoints are not independent peers"), { code: "NANO_RPC_DUPLICATE_PEER" });
+  }
+}
+
 export function nanoStandbyConfig(bases, { url, requestsPerMinute } = {}) {
   if (url === undefined && requestsPerMinute === undefined) return null;
   const endpoint = URL.parse(String(url ?? "").trim().replace(/\/+$/, ""));
@@ -134,8 +156,7 @@ export function checkedHistory(value, checkAddress) {
  * publication, inference or balance aggregation across different snapshots. */
 export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBlock, standby: standbyOptions,
   persistConfirmed = null, now = Date.now, monotonicNow = () => performance.now(), networkTtlMs = 30_000 }) {
-  if (!Array.isArray(bases) || !bases.length || bases.length > 8 || bases.some(b => typeof b !== "string" || !b)) throw new TypeError("Nano read pool needs between one and eight endpoint identifiers");
-  if (new Set(bases).size !== bases.length) throw new TypeError("Duplicate Nano RPC endpoints are not independent peers");
+  assertDistinctNanoRpcPeers(bases);
   if (typeof checkAddress !== "function" || typeof hashBlock !== "function") throw new TypeError("Nano read pool needs wallet-owned address and hash validators");
   const standby = nanoStandbyConfig(bases, standbyOptions), standbyUrl = standby?.url;
   const allBases = standby ? [...bases, standbyUrl] : bases;
