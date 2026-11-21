@@ -1,6 +1,6 @@
 {
   "name": "g-starter",
-  "url": "http://localhost:41593/index.html#g=H4sIAAAAAAAAA4VSQW7bMBD8ymLOlCvJcQvwGUEPDYocWGtjL0ItBZGRIxsC-oi-sC8paFlQAhjoldyZ2ZnZCwbYykBDwxH25wXSwEIrGKSxY1gkfk8weIf9WhqMsNW2NHgR9k2Evcz_Fo724TxS71pWisfQUVBy1DvRkVQOx4TJ4ARb1-VkFp161fG-nWW2D7POt08ybWjYw-LspAj94cvBt8Vuk_FxjIlbWDyFNzr1kpikdQemrg9tl-KGvr_1SunIJA07Ek2BgjINMkhjqOHkxHPzCUV_f_-huGdlQz5vL3ow1IbQGIpp9LyhR-78SCdJxyv3DRfUj5vF6q40iHLmq4Nlz6oupzWB7ZrAVf8W9e6WdXk3BHUail9OnbqiLrykDMtCsKheYTC4XlySoDG_rOtMzwZe9PVD1z53_dKHNgvkO1j670Kflv4ngxQ-DtTrwGwcqydf32Gs_8e4vcP4bKCZcpe3bmAfDAbhU4Z1Tn_A5lPpnD7Nxxn3zjNsNU3_AB6APizYAgAA",
+  "url": "http://localhost:37091/index.html#g=H4sIAAAAAAAAA4VSQW7bMBD8ymLOlCvJcQvwGUEPDYIcGHMtE6GWgsjIkQ0BfURf2JcUtCwoAQz0Su7M7MzsBQN0pSDBcoR-vsBZaEgFhTR2DI3EHwkKH9DfS4URutqWCgfH3kboy_yvYWgfziP1pmWheAwdBSFDvXEykrjmmDApnKDrupzUolOvOt63s8z2Ydb58UWmDZY9NM7GFaFvvjW-LXabjI9jTNxC4ym806l3icm1pmHq-tB2KW7o53svlI5MzrIhJylQEKbBDc4qspyM82y_oOjv7z8U9yysyOftnTSK2hCsophGzxt65M6PdHLpeOW-4YL4cbNY3ZUK0Z356mDZs6rLaU1guyZw1b9FvbtlXd4NQYyE4tWIEVPUxcHE3FAWgkb1BoXB9M4kFyTml3Wd6UXBO3n71LXPXR_60GaBfAdL_13o09L_pJDC54F6HZiNY_Xk6zuM9f8Yt3cYXxQkU-7y1hb6QWFwfMqwzsgv6HwqnZGn-Tjj3niGrqbpH084SebYAgAA",
   "graph": {
     "v": 1,
     "nodes": [
@@ -34,7 +34,7 @@
         "x": 650,
         "y": 100,
         "fields": {
-          "model": "nano-banana-2-lite",
+          "model": "nano-banana-2-fast",
           "size": "1k",
           "variations": "1"
         },

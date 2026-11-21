@@ -61,7 +61,7 @@ Options:
   MARKET_NOTIFY_URL         (env only) a webhook that receives {"text": "…"} when a job is hired,
                             delivered, declined, fails or needs the operator (Slack-style incoming webhook)
   --base-url <url>          market API (env MARKET_BASE_URL, default https://market.near.ai)
-  --nanogpt-base <url>      NanoGPT API (env NANOGPT_BASE_URL, default https://nano-gpt.com)
+  --nanogpt-base <url>      NanoGPT API (env NANOGPT_BASE_URL, default https://api.nano-gpt.com)
   --state-dir <dir>         durable state (env MARKET_STATE_DIR, default $XDG_STATE_HOME/nanoodle-market,
                             else ~/.local/state/nanoodle-market); the same directory on every start
   --poll-seconds <n>        poll interval (env MARKET_POLL_SECONDS, default 45; the market asks for 30-60)

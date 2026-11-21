@@ -17,10 +17,8 @@
  * Output tokens are sized from the request (maxChars,
  * or the draft length) plus a small slack, not from the model's output cap.
  * The decider's cap adds the ranking JSON and GLM reasoning tokens, which
- * share max_tokens. A caller that already chose writer and judge caps
- * (subnano_comment sizes them from the original draft) is priced at those
- * caps, so a shorter refined draft cannot shrink the hold below the request
- * that will actually be sent. Token counts are a realistic estimate, bytes /
+ * share max_tokens. Pricing honors explicit writer and judge caps so the hold
+ * covers the request that will be sent. Token counts are a realistic estimate, bytes /
  * 3.5. The deposit is that
  * charge times HUMANIZE_DEPOSIT_MARGIN, at least the floor, rounded up, and
  * never below the charge. Prices are USD per million tokens: the public
@@ -44,7 +42,18 @@ export const HUMANIZE_MODEL_PRICES = Object.freeze({
   "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15],
   "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
   "qwen/qwen3.8-27b-antislop": [0.1, 0.6],
+  // Replaced as Writer E on 2026-11-19 (humanize-opt cycle 1: Mercury 3 was
+  // already answering 503s ahead of its 2026-12-28 shutdown); row retained so
+  // a stale mounted graph still prices instead of failing every quote.
   "inception/mercury-3": [0.1, 0.35],
+  // Catalog price is $0/$0 today; rate() needs positive rates to price a
+  // deposit at all, so this row carries the writer-class floor (Starry
+  // Ocean's rates) as a conservative bound. Settlement meters the actual
+  // reported cost, and a positive catalog rate overrides this row.
+  // Replaced as Writer E on 2026-11-19 (humanize-opt cycle 1b: repeated
+  // provider overload/429 failures under load); row retained for stale mounts.
+  "kitani/clover-2": [0.05, 0.25],
+  "tencent/hy4-flash": [0.035, 0.1405],
   "z-ai/glm-5.3": [0.6, 1.1],
 });
 

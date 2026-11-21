@@ -1,26 +1,4 @@
-/**
- * Built-in hosted tools for Nano Maxi's subnano work.
- *
- * subnano_comment — one paid call: refine (a text model; liquid/d1 cannot write
- * prose), then the mounted humanize-comment graph, then a liquid/d1 yes/no gate,
- * then a liquid/d1 funny score. The comment is returned either way; a "no" from
- * the gate does not discard it.
- *
- * sfw_check — one yes/no safe-for-work decision per still image and per sampled
- * video frame. There is no argument that turns the check off.
- *
- * The deposit is a cap, not a padded worst case. Each stage's max_tokens is
- * about 1.5× the draft's length plus a little slack, input tokens are about
- * bytes/3.5 plus a small margin, and re-asks use that same output cap. The
- * decider adds the ranking JSON and GLM reasoning on top of that writer cap,
- * and the humanize deposit inside the call is quoted at those same caps, so a
- * shorter refined draft cannot shrink the hold below the request that is sent.
- * The text the gate and the funny judge read is the comment clipped to that cap.
- * Settlement is min(metered cost × 1.2, the quoted deposit). Before each paid
- * stage the run stops when the remaining budget cannot cover that stage, and
- * returns what already finished, charged only for the calls that ran. The same
- * cap applies to sfw_check, one picture at a time. No $0.001 floor.
- */
+// Built-in still image and video safe-for-work checks.
 import { spawn } from "node:child_process";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { existsSync, statSync } from "node:fs";
@@ -30,13 +8,7 @@ import https from "node:https";
 import { isIP } from "node:net";
 import { bytesToDataUrl, sniffMime, NanoClient } from "nanoodle";
 import { ParamsError, formatCostUsd } from "./tools.mjs";
-import {
-  HUMANIZE_TOOL, HUMANIZE_INPUT_CAPS, REASK_TEXT, MAX_REASKS,
-  HUMANIZE_JUDGE_JSON_TOKENS, HUMANIZE_JUDGE_REASONING_TOKENS,
-  checkHumanizeInputs, humanizeWriterRecord, capUtf8,
-} from "./humanize.mjs";
 
-export const SUBNANO_TOOL = "subnano_comment";
 export const SFW_TOOL = "sfw_check";
 
 /** Same margin the humanize v2.8 deposit uses (PR #77). Charge mode is not that branch. */
@@ -49,16 +21,6 @@ export const BYTES_PER_TOKEN = 3.5;
 export const TOKEN_MARGIN = 1.1;
 /** Role markers and a little template overhead, per chat message. */
 export const MESSAGE_TOKENS = 4;
-/** Completion cap is 1.5× the draft's character length, in estimated tokens. */
-export const OUTPUT_FACTOR = 1.5;
-/** Extra completion tokens so a short draft can still become a sentence. */
-export const OUTPUT_SLACK = 24;
-/**
- * Lowest decider cap. A real request is the writer cap plus the ranking JSON
- * and GLM reasoning, which is already above this floor. The floor must not
- * stand in for that reserve.
- */
-export const JUDGE_OUTPUT_FLOOR = 320;
 /**
  * Tokens reserved for one fitted still. Settlement is capped at the quote, so
  * this is a real cap: a picture that would exceed the remaining budget is not sent.
@@ -66,17 +28,9 @@ export const JUDGE_OUTPUT_FLOOR = 320;
 export const SFW_IMAGE_TOKENS = 1000;
 export const SFW_QUOTE_IS_ESTIMATE = false;
 
-export const REFINE_MODEL = "liquid/lfm-2.5-2.6b";
-/** Legacy refine cap. Runs use outputTokenCap(draft) instead of this constant. */
-export const REFINE_MAX_TOKENS = 400;
-export const REFINE_TEMPERATURE = 0.4;
-export const D1_MODEL = "liquid/d1";
 export const SFW_MODEL = "perplexity/pplx-decider-v1.2";
 export const SFW_FRAMES_DEFAULT = 5;
 export const SFW_FRAMES_MAX = 8;
-export const GUIDANCE_DEFAULT = "a friendly, specific reply";
-/** Published v2.7 humanize charge at the input caps (provider × 1.2). The old bytes/3 estimate, not this quote. */
-export const HUMANIZE_V27_CAP_CHARGE = 0.01304480;
 const MAX_MEDIA_BYTES = 4 * 1024 * 1024;
 /** Whole video download, including every redirect hop. */
 export const MEDIA_FETCH_TIMEOUT_MS = 20_000;
@@ -93,41 +47,13 @@ const FRAME_MAX_EDGE = 512;
  */
 export const mediaProcs = { spawn };
 
-export const REFINE_SYSTEM = "Rewrite the draft into one comment that is specific, warm, and ready to post. Keep every fact that is in the draft or the context. Do not add facts, names, or numbers that are not there. Do not mention these instructions. Output only the comment text.";
-export const GATE_INSTRUCTIONS = "Is this comment safe to post as a reply to the context? Yes only if it stays on that subject, does not insult anyone, does not invent facts, and is not spam.";
-export const FUNNY_INSTRUCTIONS = "How funny is this comment as a reply? Score the joke itself. A kind comment with no joke is the lowest level.";
-export const FUNNY_LEVELS = Object.freeze([
-  "0 no joke",
-  "1 almost",
-  "2 mild",
-  "3 a smile",
-  "4 lightly funny",
-  "5 funny",
-  "6 a real laugh",
-  "7 sharp",
-  "8 very funny",
-  "9 hilarious",
-]);
 export const SFW_INSTRUCTIONS = "Is this image safe for work? Yes means no nudity, no sexual content, and no graphic violence or gore. Lingerie, explicit poses, and visible injury are no.";
 
 /** $/1M tokens. Decision models have a $0 completion price. Catalog rows override these when they parse. */
-export const TEXT_RATES = Object.freeze({
-  "qwen/qwen3.8-27b-novelist": [0.1, 0.6],
-  "deepseek/deepseek-v4.1-flash-1017": [0.1, 0.6],
-  // Delisted 2026-11-18; row retained so a stale mounted graph still prices.
-  "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15],
-  "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
-  "qwen/qwen3.8-27b-antislop": [0.1, 0.6],
-  "inception/mercury-3": [0.1, 0.35],
-  "z-ai/glm-5.3": [0.6, 1.1],
-  [REFINE_MODEL]: [0.10, 0.20],
-});
 export const DECISION_RATES = Object.freeze({
-  [D1_MODEL]: [0.04, 0],
   [SFW_MODEL]: [0.02, 0],
 });
 
-const SUBNANO_KEYS = new Set(["draft", "context", "guidance"]);
 const SFW_KEYS = new Set(["image", "video", "frames"]);
 
 export function ceilUsd(n) {
@@ -139,19 +65,6 @@ export function ceilUsd(n) {
 export function depositFromCharge(charge) {
   if (!(charge > 0) || !Number.isFinite(charge)) throw new Error("cannot price a call with no cost");
   return ceilUsd(charge * (1 + DEPOSIT_MARGIN));
-}
-
-export function exactUsd(n) {
-  const s = Number(n).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
-  return "$" + s;
-}
-
-
-export function refineUser(context, guidance, draft) {
-  return `Context:\n${context}\n\nGuidance:\n${guidance}\n\nDraft:\n${draft}`;
-}
-export function commentState(context, comment) {
-  return `Context:\n${context}\n\nComment:\n${comment}`;
 }
 
 function pick(args, name) {
@@ -198,43 +111,10 @@ export function textBytes(s) {
   return Buffer.byteLength(String(s ?? ""), "utf8");
 }
 
-export function codePoints(s) {
-  return [...String(s ?? "")].length;
-}
-
 /** bytes/3.5, rounded up, then the small margin. */
 export function estimateTokensFromBytes(bytes) {
   const n = Math.max(0, Number(bytes) || 0);
   return Math.ceil(n / BYTES_PER_TOKEN * TOKEN_MARGIN);
-}
-
-/**
- * Completion cap for a draft of `chars` characters: about 1.5× that length
- * in tokens, plus OUTPUT_SLACK. Not the graph's generic 600/1600.
- */
-export function outputTokenCap(chars) {
-  const n = Math.max(0, Number(chars) || 0);
-  return Math.max(1, Math.ceil(n * OUTPUT_FACTOR / BYTES_PER_TOKEN) + OUTPUT_SLACK);
-}
-
-/** Bytes of generated text the next stage is allowed to read. */
-export function outputByteCap(tokens) {
-  const n = Math.max(0, Number(tokens) || 0);
-  return Math.max(1, Math.ceil(n * BYTES_PER_TOKEN));
-}
-
-export function judgeTokenCap(outTokens) {
-  // The graph's 1600 is the model's own ceiling, not this request. GLM-5.3
-  // thinking shares max_tokens with the ranking JSON, so both are reserved on
-  // top of the writer cap. The floor is only a minimum under that sum.
-  const writer = Math.max(0, Math.floor(Number(outTokens) || 0));
-  return Math.max(JUDGE_OUTPUT_FLOOR, writer + HUMANIZE_JUDGE_JSON_TOKENS + HUMANIZE_JUDGE_REASONING_TOKENS);
-}
-
-/** Provider USD for one chat call. Output is the max_tokens this request sends. */
-export function chatCallUsd(rates, inputBytes, messages, outTokens) {
-  const inTok = estimateTokensFromBytes(inputBytes) + Math.max(0, messages) * MESSAGE_TOKENS;
-  return (inTok * rates[0] + outTokens * rates[1]) / 1e6;
 }
 
 /**
@@ -274,210 +154,19 @@ export function openBudget(quote) {
   };
 }
 
-/**
- * Byte length of the text wired into `nodeId`'s `port`, walking joins.
- * `leaves` maps a text or llm node id to the bytes that node contributes.
- * Join separators are the exact strings the runner sends.
- */
-export function wiredTextBytes(graph, nodeId, port, leaves) {
-  const byId = new Map((graph.nodes || []).map((n) => [n.id, n]));
-  const walk = (id, p) => {
-    const link = (graph.links || []).find((l) => l.to && l.to.node === id && l.to.port === p);
-    if (!link) return 0;
-    const src = byId.get(link.from.node);
-    if (!src) return 0;
-    if (src.type === "join") {
-      const a = walk(src.id, "a");
-      const b = walk(src.id, "b");
-      const sep = textBytes(String(src.fields && src.fields.sep != null ? src.fields.sep : " ").replace(/\\n/g, "\n"));
-      if (!(a > 0)) return b;
-      if (!(b > 0)) return a;
-      return a + sep + b;
-    }
-    return leaves.get(src.id) || 0;
-  };
-  return walk(nodeId, port);
-}
-
-const LETTERS = ["A", "B", "C", "D", "E"];
-
-function textLeafBytes(graph, { draftBytes, contextBytes, guidanceBytes }) {
-  const leaves = new Map();
-  for (const n of graph.nodes || []) {
-    if (n.type !== "text") continue;
-    const name = String(n.name || "").toLowerCase();
-    if (name === "draft") leaves.set(n.id, draftBytes);
-    else if (name === "context") leaves.set(n.id, contextBytes);
-    else if (name === "guidance") leaves.set(n.id, guidanceBytes);
-  }
-  return leaves;
-}
-
-/**
- * Byte sizes the humanize graph feeds each model when every writer is clipped
- * to `outTokens`. Writer prompts are measured before those output leaves are
- * installed, so a writer is not priced as reading its own completion.
- * The judge user message is the joined clipped writer texts.
- */
-export function humanizeTextBytes(graph, { draftBytes, contextBytes, guidanceBytes, outTokens }) {
-  const record = humanizeWriterRecord(graph);
-  if (!record) throw new Error("humanize-comment graph cannot be priced");
-  const leaves = textLeafBytes(graph, { draftBytes, contextBytes, guidanceBytes });
-  const writers = {};
-  for (const letter of LETTERS) {
-    const rec = record[letter];
-    writers[letter] = { nodeId: rec.nodeId, userBytes: wiredTextBytes(graph, rec.nodeId, "prompt", leaves) };
-  }
-  let writerOut = 0;
-  for (const letter of LETTERS) {
-    const rec = record[letter];
-    const graphW = rec.maxTokens || 600;
-    const W = Math.min(graphW, outTokens);
-    const cap = outputByteCap(W);
-    writerOut += cap;
-    leaves.set(rec.nodeId, cap);
-  }
-  return {
-    writers,
-    writerOutBytes: writerOut,
-    judgeUserBytes: wiredTextBytes(graph, "judge", "prompt", leaves),
-  };
-}
-
-/**
- * Provider USD (no settle markup) for one humanize-comment run.
- * Input tokens are bytes/3.5 plus the margin. Each writer's completion cap
- * is this request's outTokens (never the graph's 600). Re-asks use that same
- * cap, and at most MAX_REASKS of them are reserved. The judge is priced on
- * the clipped writer texts.
- */
-export function humanizeProviderUsd(graph, { draftBytes, contextBytes, guidanceBytes, outTokens }, catalogs) {
-  const record = humanizeWriterRecord(graph);
-  if (!record) throw new Error("humanize-comment graph cannot be priced");
-  const nodes = new Map((graph.nodes || []).map((n) => [n.id, n]));
-  const judge = nodes.get("judge");
-  if (!judge) throw new Error("humanize-comment graph cannot be priced");
-  const sized = humanizeTextBytes(graph, { draftBytes, contextBytes, guidanceBytes, outTokens });
-  const rates = (model) => chatRates(catalogs, model, TEXT_RATES[model]);
-  let base = 0;
-  const reasks = [];
-  for (const letter of LETTERS) {
-    const rec = record[letter];
-    const n = nodes.get(rec.nodeId);
-    const graphW = Number(n && n.fields && n.fields.maxTokens) || 600;
-    const W = Math.min(graphW, outTokens);
-    const system = String(n && n.fields && n.fields.system || "").trim();
-    const messages = system ? 2 : 1;
-    const inputBytes = textBytes(system) + sized.writers[letter].userBytes;
-    const P = rates(rec.model);
-    const call = (pc, extraBytes = 0, extraMessages = 0) => chatCallUsd(pc, inputBytes + extraBytes, messages + extraMessages, W);
-    const re = (pc) => call(pc, outputByteCap(W) + textBytes(REASK_TEXT), 2);
-    if (rec.fallbackModel) {
-      const FP = rates(rec.fallbackModel);
-      base += call(P) + call(FP);
-      reasks.push(Math.max(re(P), re(FP)));
-    } else {
-      base += call(P);
-      reasks.push(re(P));
-    }
-  }
-  const reask = reasks.sort((a, b) => b - a).slice(0, MAX_REASKS).reduce((a, b) => a + b, 0);
-  const system = String(judge.fields && judge.fields.system || "").trim();
-  const JP = rates(judge.fields.model);
-  const judgeUsd = chatCallUsd(
-    JP,
-    textBytes(system) + sized.judgeUserBytes,
-    system ? 2 : 1,
-    judgeTokenCap(outTokens),
-  );
-  return base + reask + judgeUsd;
-}
-
-export function refineProviderUsd({ draftBytes, contextBytes, guidanceBytes, outTokens }, catalogs) {
-  const [pin, pout] = chatRates(catalogs, REFINE_MODEL, TEXT_RATES[REFINE_MODEL]);
-  const userBytes = textBytes(refineUser("", "", "")) + draftBytes + contextBytes + guidanceBytes;
-  return chatCallUsd([pin, pout], textBytes(REFINE_SYSTEM) + userBytes, 2, outTokens);
-}
-
 function noulQuestionBytes(instructions) {
   return textBytes(JSON.stringify({ type: "noul", instructions: String(instructions).trim() }));
 }
-function scoreQuestionBytes(instructions, levels) {
-  return textBytes(JSON.stringify({
-    type: "score",
-    instructions: String(instructions).trim(),
-    criteria: [...levels],
-  }));
-}
-
 /**
  * Provider USD for one decision. Text is bytes/3.5 plus the margin.
  * Each image adds SFW_IMAGE_TOKENS. A $0 completion price bills no output.
  */
 export function decideProviderUsd({ model, questionBytes = 0, stateBytes = 0, images = 0 }, catalogs) {
-  const fallback = DECISION_RATES[model] || TEXT_RATES[model];
+  const fallback = DECISION_RATES[model];
   const [pin, pout] = chatRates(catalogs, model, fallback);
   const inTok = estimateTokensFromBytes(questionBytes + stateBytes) + MESSAGE_TOKENS + (images > 0 ? images * SFW_IMAGE_TOKENS : 0);
   const outTok = pout > 0 ? 32 : 0;
   return (inTok * pin + outTok * pout) / 1e6;
-}
-
-function guidanceOf(args, humanize) {
-  const raw = pick(args, "guidance");
-  if (typeof raw === "string" && raw.length) return raw;
-  const inputs = humanize && humanize.wf && humanize.wf.inputs;
-  const inp = Array.isArray(inputs) ? inputs.find((i) => String(i.key).toLowerCase() === "guidance") : null;
-  if (inp && inp.def != null && String(inp.def) !== "") return String(inp.def);
-  return GUIDANCE_DEFAULT;
-}
-
-function subnanoLengths(args, humanize) {
-  const draft = pick(args, "draft");
-  const context = pick(args, "context");
-  const guidance = guidanceOf(args, humanize);
-  return {
-    draftChars: codePoints(draft),
-    draftBytes: textBytes(draft),
-    contextBytes: textBytes(context),
-    guidanceBytes: textBytes(guidance),
-  };
-}
-
-/**
- * Per-stage provider USD and the settled (× 1.2) amount the budget checks.
- * Humanize's draft is the refine output, clipped to this request's output cap.
- * The gate and funny judge read that same clipped comment, not every writer.
- */
-export function subnanoStages({ graph, draftChars, draftBytes, contextBytes, guidanceBytes, catalogs }) {
-  if (!graph) throw new Error("humanize-comment graph cannot be priced");
-  const outTokens = outputTokenCap(draftChars);
-  const commentBytes = outputByteCap(outTokens);
-  const humanize = humanizeProviderUsd(graph, {
-    draftBytes: commentBytes,
-    contextBytes,
-    guidanceBytes,
-    outTokens,
-  }, catalogs);
-  const refine = refineProviderUsd({ draftBytes, contextBytes, guidanceBytes, outTokens }, catalogs);
-  const stateBytes = textBytes(commentState("", "")) + contextBytes + commentBytes;
-  const gate = decideProviderUsd({ model: D1_MODEL, questionBytes: noulQuestionBytes(GATE_INSTRUCTIONS), stateBytes }, catalogs);
-  const funny = decideProviderUsd({
-    model: D1_MODEL, questionBytes: scoreQuestionBytes(FUNNY_INSTRUCTIONS, FUNNY_LEVELS), stateBytes,
-  }, catalogs);
-  const provider = { refine, humanize, gate, funny };
-  const settled = {
-    refine: refine * SETTLE_MARKUP,
-    humanize: humanize * SETTLE_MARKUP,
-    gate: gate * SETTLE_MARKUP,
-    funny: funny * SETTLE_MARKUP,
-  };
-  const charge = settled.refine + settled.humanize + settled.gate + settled.funny;
-  return { outTokens, commentBytes, judgeTokens: judgeTokenCap(outTokens), provider, settled, charge };
-}
-
-/** Metered cost × 1.2 for one subnano_comment request, before the 12% deposit margin. */
-export function subnanoChargeUsd(opts) {
-  return subnanoStages(opts).charge;
 }
 
 export function sfwChargeUsd({ images = 0, frames = 0 }, catalogs) {
@@ -489,39 +178,9 @@ export function sfwChargeUsd({ images = 0, frames = 0 }, catalogs) {
   return one * n * SETTLE_MARKUP;
 }
 
-function humanizeGraph(humanize) {
-  return humanize && humanize.humanize && humanize.wf && humanize.wf.graph;
-}
-
 function requireArgs(args, tool) {
   if (args == null || typeof args !== "object" || Array.isArray(args)) {
     throw new ParamsError(`${tool} arguments must be an object. Nothing was charged.`);
-  }
-}
-
-function prepareSubnano(args, humanize) {
-  requireArgs(args, SUBNANO_TOOL);
-  unknownKeys(args, SUBNANO_KEYS, SUBNANO_TOOL);
-  for (const name of ["draft", "context", "guidance"]) {
-    const v = pick(args, name);
-    if (v == null) continue;
-    if (typeof v !== "string") throw new ParamsError(`input "${name}" must be a string. Nothing was charged.`);
-  }
-  const draft = pick(args, "draft");
-  const context = pick(args, "context");
-  if (typeof draft !== "string" || !draft.trim()) {
-    throw new ParamsError(`missing required input "Draft" for ${SUBNANO_TOOL}. Nothing was charged.`);
-  }
-  if (typeof context !== "string" || !context.trim()) {
-    throw new ParamsError(`missing required input "Context" for ${SUBNANO_TOOL}. Nothing was charged.`);
-  }
-  try {
-    checkHumanizeInputs({ Draft: draft, Context: context, ...(pick(args, "guidance") != null ? { Guidance: String(pick(args, "guidance")) } : {}) });
-  } catch (e) {
-    throw new ParamsError(String(e.message).replaceAll(HUMANIZE_TOOL, SUBNANO_TOOL));
-  }
-  if (!humanizeGraph(humanize)) {
-    throw new ParamsError(`${SUBNANO_TOOL} needs the ${HUMANIZE_TOOL} graph mounted in --graphs. Nothing was charged.`);
   }
 }
 
@@ -604,11 +263,6 @@ function dataUrlSize(url) {
   }
 }
 
-function clipCodePoints(s, n) {
-  const chars = [...String(s)];
-  return chars.length > n ? chars.slice(0, n).join("") : chars.join("");
-}
-
 function stepFail(step, e) {
   const err = new Error(`${step} failed: ${e && e.message ? e.message : e}`);
   err.cause = e;
@@ -635,160 +289,6 @@ function clientFor(ctx) {
 
 async function loadDecide() {
   return import("../node_modules/nanoodle/src/decide.mjs");
-}
-
-function commentFromHumanize(result) {
-  const notes = [];
-  let parsed = null;
-  for (const block of (result && result.content) || []) {
-    if (!block || block.type !== "text" || typeof block.text !== "string") continue;
-    const text = block.text;
-    if (text.startsWith("cost:")) continue;
-    if (text.startsWith("note:") || text.startsWith("gated:")) { notes.push(text); continue; }
-    try {
-      const j = JSON.parse(text);
-      if (j && typeof j === "object" && typeof j.text === "string" && j.winner) parsed = j;
-    } catch { /* a notice that is not the rebuilt JSON */ }
-  }
-  if (!parsed) throw new Error("humanize-comment returned no comment");
-  return { text: parsed.text, notes, usd: result.costUsd, exact: result.costExact !== false };
-}
-
-function stoppedResult(stopped, payload, budget) {
-  return finishResult({
-    ...payload,
-    partial: true,
-    stopped,
-  }, Object.values(payload.steps || {}), budget.quote);
-}
-
-async function runSubnano(args, ctx) {
-  const humanize = ctx.humanize;
-  prepareSubnano(args, humanize);
-  const draft = String(pick(args, "draft"));
-  const context = String(pick(args, "context"));
-  const guidance = guidanceOf(args, humanize);
-  const graph = humanizeGraph(humanize);
-  const lens = subnanoLengths({ draft, context, guidance }, humanize);
-  const stages = subnanoStages({ graph, ...lens, catalogs: ctx.catalogs });
-  const budget = openBudget(depositFromCharge(stages.charge));
-  const client = clientFor(ctx);
-  const steps = {};
-
-  if (!budget.fits(stages.settled.refine)) {
-    return stoppedResult("refine", { comment: null, steps }, budget);
-  }
-  let refined;
-  try {
-    const cost = takeCost();
-    refined = await client.chat(
-      [
-        { role: "system", content: REFINE_SYSTEM },
-        { role: "user", content: refineUser(context, guidance, draft) },
-      ],
-      REFINE_MODEL,
-      { temperature: REFINE_TEMPERATURE, max_tokens: stages.outTokens },
-      { onCost: cost.onCost },
-    );
-    steps.refine = { usd: cost.usd, model: REFINE_MODEL };
-    budget.add(cost.usd);
-  } catch (e) {
-    throw stepFail("refine", e);
-  }
-  refined = clipCodePoints(String(refined).trim(), HUMANIZE_INPUT_CAPS.Draft);
-  if (!refined) throw new Error("refine returned an empty comment");
-  refined = capUtf8(refined, stages.commentBytes);
-
-  if (!budget.fits(stages.settled.humanize)) {
-    return stoppedResult("humanize", { comment: refined, steps }, budget);
-  }
-  let human;
-  try {
-    const sent = { Draft: refined, Context: context };
-    if (pick(args, "guidance") != null) sent.Guidance = String(pick(args, "guidance"));
-    human = commentFromHumanize(await ctx.registry.callTool({
-      name: HUMANIZE_TOOL,
-      arguments: sent,
-      maxTokens: stages.outTokens,
-      judgeMaxTokens: stages.judgeTokens,
-      clipBytes: stages.commentBytes,
-    }));
-    steps.humanize = { usd: typeof human.usd === "number" ? human.usd : null, exact: human.exact };
-    budget.add(human.usd);
-  } catch (e) {
-    throw stepFail("humanize", e);
-  }
-
-  const comment = capUtf8(human.text, stages.commentBytes);
-  if (!budget.fits(stages.settled.gate)) {
-    return stoppedResult("gate", {
-      comment, steps, ...(human.notes.length ? { notes: human.notes } : {}),
-    }, budget);
-  }
-  const state = commentState(context, comment);
-  let gate;
-  let funny;
-  try {
-    const { decideRun } = await loadDecide();
-    const send = (bucket) => async (body) => {
-      const cost = takeCost();
-      const j = await client.decide(body, { onCost: cost.onCost });
-      bucket.usd = cost.usd;
-      return j;
-    };
-    const gateCost = { usd: null };
-    const gateOut = await decideRun(
-      { mode: "yesno", question: GATE_INSTRUCTIONS },
-      D1_MODEL,
-      state,
-      [],
-      null,
-      send(gateCost),
-      async () => { throw new Error("text decision"); },
-    );
-    const yes = gateOut.decision.yes;
-    gate = { verdict: yes >= 0.5 ? "yes" : "no", yes };
-    steps.gate = { usd: gateCost.usd, model: D1_MODEL, verdict: gate.verdict };
-    budget.add(gateCost.usd);
-
-    if (!budget.fits(stages.settled.funny)) {
-      return stoppedResult("funny", {
-        comment, gate, steps, ...(human.notes.length ? { notes: human.notes } : {}),
-      }, budget);
-    }
-
-    const funnyCost = { usd: null };
-    const funnyOut = await decideRun(
-      { mode: "score", question: FUNNY_INSTRUCTIONS, levels: FUNNY_LEVELS.join("\n") },
-      D1_MODEL,
-      state,
-      [],
-      null,
-      send(funnyCost),
-      async () => { throw new Error("text decision"); },
-    );
-    const rows = funnyOut.decision.rows || [];
-    // An all-zero probability vector leaves the library's win flag on level 0.
-    // The model's own score is the winner in that case. score on the decision
-    // is 1-based; the tool returns the 0-based level.
-    const ranked = rows.some((r) => r.p > 0);
-    const win = ranked ? rows.findIndex((r) => r.win) : -1;
-    const score = win >= 0 ? win : Math.max(0, Math.round(Number(funnyOut.decision.score) || 1) - 1);
-    const idx = Math.max(0, Math.min(FUNNY_LEVELS.length - 1, score));
-    funny = { score: idx, max: FUNNY_LEVELS.length - 1, label: FUNNY_LEVELS[idx] };
-    steps.funny = { usd: funnyCost.usd, model: D1_MODEL, score: idx };
-    budget.add(funnyCost.usd);
-  } catch (e) {
-    throw stepFail(steps.gate ? "funny" : "gate", e);
-  }
-
-  return finishResult({
-    comment,
-    gate,
-    funny,
-    steps,
-    ...(human.notes.length ? { notes: human.notes } : {}),
-  }, [steps.refine, steps.humanize, steps.gate, steps.funny], budget.quote);
 }
 
 async function runSfw(args, ctx) {
@@ -1359,84 +859,15 @@ export async function sampleVideoFrames(source, count, opts = {}) {
   return frames;
 }
 
-const SUBNANO_NOTE = "a deposit is quoted for each request from its context and guidance and is a cap on the charge; it settles at the metered cost plus 20% or the quote, whichever is less, and the run stops before a stage the remaining budget cannot cover; the difference is returned";
 const SFW_NOTE = "a deposit is quoted for each request from how many pictures it checks and is a cap on the charge; it settles at the metered cost plus 20% or the quote, whichever is less, and a picture that would exceed the remaining budget is not checked; the difference is returned";
 
 function spendLine(spendSource) {
   return `Runs on NanoGPT — every call spends real credit from ${spendSource}.`;
 }
 
-/**
- * The two built-ins. Registered only once some graph loaded, so an empty
- * --graphs directory still exits with "no runnable graphs".
- * `deps` is how tests replace the video sampler and the image fitter.
- */
-export function builtinTools({ spendSource, humanize, hosted = false, remote = false }) {
+// The registry offers this built-in only when at least one graph loads.
+export function createSfwTool({ spendSource, hosted = false, remote = false }) {
   const noLocal = remote || hosted;
-  const caps = HUMANIZE_INPUT_CAPS;
-  const subnano = {
-    name: SUBNANO_TOOL,
-    builtin: true,
-    pricedPerRequest: true,
-    depositNote: SUBNANO_NOTE,
-    file: "(built-in)",
-    dir: "",
-    x402: { usd: 0 },
-    card: {
-      intent: "Rewrite a comment, humanize it, then say if it is safe to post and how funny it is.",
-      steps: [
-        { kind: "llm", label: "refine", n: 1 },
-        { kind: "llm", label: "humanize", n: 1 },
-        { kind: "decide", label: "gate", n: 1 },
-        { kind: "decide", label: "funny", n: 1 },
-      ],
-      sample: null,
-    },
-    description:
-      `Rewrite a draft, run ${HUMANIZE_TOOL} on that rewrite, then ask whether the result is safe to post and how funny it is. ` +
-      `Order is refine (${REFINE_MODEL}), then ${HUMANIZE_TOOL}, then a ${D1_MODEL} yes/no gate, then a ${D1_MODEL} funny score. ` +
-      `Returns the comment, the gate verdict, the funny score, and the cost of each step. A "no" gate does not discard the comment. ` +
-      `${spendLine(spendSource)} Needs the ${HUMANIZE_TOOL} graph mounted.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        Draft: { type: "string", maxLength: caps.Draft, description: `* required; the comment to rewrite, at most ${caps.Draft} characters` },
-        Context: { type: "string", maxLength: caps.Context, description: `* required; the post or thread being replied to, at most ${caps.Context} characters` },
-        Guidance: { type: "string", maxLength: caps.Guidance, description: `optional; what the comment should do, at most ${caps.Guidance} characters. default: ${JSON.stringify(GUIDANCE_DEFAULT)}` },
-      },
-      required: ["Draft", "Context"],
-    },
-    quote(args, ctx) {
-      const h = (ctx && ctx.humanize) || humanize;
-      prepareSubnano(args, h);
-      const lens = subnanoLengths(args, h);
-      const graph = humanizeGraph(h);
-      return depositFromCharge(subnanoChargeUsd({ graph, ...lens, catalogs: ctx && ctx.catalogs }));
-    },
-    coldDeposit(ctx) {
-      const h = (ctx && ctx.humanize) || humanize;
-      const graph = humanizeGraph(h);
-      return depositFromCharge(subnanoChargeUsd({
-        graph,
-        draftChars: caps.Draft,
-        draftBytes: caps.Draft * 4,
-        contextBytes: caps.Context * 4,
-        guidanceBytes: caps.Guidance * 4,
-        catalogs: ctx && ctx.catalogs,
-      }));
-    },
-    prepare(args, ctx) {
-      prepareSubnano(args, (ctx && ctx.humanize) || humanize);
-    },
-    run(args, ctx) {
-      return runSubnano(args, { ...ctx, humanize: ctx.humanize || humanize });
-    },
-  };
-  // A directory with graphs but no humanize-comment still registers the tool.
-  // Its quote and prepare refuse until that graph is mounted, so there is no
-  // cold ceiling to pin yet.
-  subnano.x402 = { usd: humanizeGraph(humanize) ? subnano.coldDeposit({ humanize }) : 0 };
-
   const sfw = {
     name: SFW_TOOL,
     builtin: true,
@@ -1497,16 +928,15 @@ export function builtinTools({ spendSource, humanize, hosted = false, remote = f
   };
   sfw.x402 = { usd: sfw.coldDeposit({}) };
 
-  return [subnano, sfw];
+  return sfw;
 }
 
 /** After a catalog refresh, re-pin each built-in's cold ceiling so a failed per-request quote still covers catalog prices. */
 export function refreshBuiltinDeposits(registry) {
-  const humanize = registry.tools.find((t) => t.name === HUMANIZE_TOOL);
   for (const t of registry.tools) {
     if (typeof t.coldDeposit !== "function") continue;
     try {
-      const usd = t.coldDeposit({ catalogs: registry.catalogs, humanize });
+      const usd = t.coldDeposit({ catalogs: registry.catalogs });
       if (Number.isFinite(usd) && usd > 0) t.x402 = { ...(t.x402 || {}), usd };
     } catch { /* keep the deposit pinned when the tool was built */ }
   }

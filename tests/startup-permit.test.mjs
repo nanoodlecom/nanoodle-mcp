@@ -19,10 +19,10 @@ const revision = 'b'.repeat(40), tree = 'c'.repeat(64), request = { v: 1, token:
 const json = (file, value, mode = 0o600) => writeFileSync(file, JSON.stringify(value), { mode });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-function fixture(t) {
+function fixture(t, nodeVersion = '22.23.5') {
   const root = mkdtempSync(join(tmpdir(), 'startup-permit-')), release = join(root, 'release'), file = join(root, 'control.json'), startupFile = join(root, 'startup.json');
   mkdirSync(release);
-  const manifest = { v: 1, revision, repository: 'https://github.com/nanoodlecom/nanoodle-mcp.git', node: '22.23.4',
+  const manifest = { v: 1, revision, repository: 'https://github.com/nanoodlecom/nanoodle-mcp.git', node: nodeVersion,
     ci: { v: 1, repository: 'nanoodlecom/nanoodle-mcp', revision, workflow: '.github/workflows/test.yml', runId: 12, attempt: 1 },
     sourceTree: 'd'.repeat(64), tree, files: 1, installScripts: false, devDependencies: false };
   json(join(release, '.nanoodle-release.json'), manifest, 0o444); chmodSync(release, 0o555);
@@ -69,6 +69,13 @@ test('old PID reuse identity, wrong request/release, malformed grants and writab
   await assert.rejects(w.barrier().start(() => assert.fail('Unsealed release initialized')), { code: 'MAINTENANCE_STARTUP_UNAVAILABLE' });
   chmodSync(w.release, 0o555); chmodSync(join(w.release, '.nanoodle-release.json'), 0o644);
   await assert.rejects(w.barrier().start(() => assert.fail('Writable manifest initialized')), { code: 'MAINTENANCE_STARTUP_UNAVAILABLE' });
+});
+
+test('startup accepts the previous sealed runtime and refuses an unqualified runtime', async t => {
+  const legacy = fixture(t, '22.23.4'); legacy.put();
+  await legacy.barrier().start(() => assert.equal(legacy.barrier().accepting(), false));
+  const unknown = fixture(t, '22.23.3'); unknown.put();
+  await assert.rejects(unknown.barrier().start(() => assert.fail('Unqualified runtime initialized')), { code: 'MAINTENANCE_STARTUP_UNAVAILABLE' });
 });
 
 test('special/link permit files fail promptly and disclose no private payload', async t => {

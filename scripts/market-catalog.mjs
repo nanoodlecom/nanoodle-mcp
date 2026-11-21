@@ -25,7 +25,7 @@ const USAGE = `Usage: node scripts/market-catalog.mjs plan|check [--agents-file 
 
   --agents-file   the catalog (env MARKET_AGENTS_FILE; default scripts/market-catalog.json)
   --base-url      market API (env MARKET_BASE_URL; default https://market.near.ai)
-  --nanogpt-base  NanoGPT API (env NANOGPT_BASE_URL; default https://nano-gpt.com)`;
+  --nanogpt-base  NanoGPT API (env NANOGPT_BASE_URL; default https://api.nano-gpt.com)`;
 
 export async function plan({ file, baseUrl, nanogptBase, out = (l) => process.stdout.write(l + "\n"), fetch = globalThis.fetch }) {
   const catalog = readCatalog(file);

@@ -100,6 +100,7 @@
  *    Direct-wallet spending has no cap and is not refunded. A skipped writer
  *    step ends as a partial result. A skipped or failed decider is an error.
  */
+import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
 import { ParamsError } from "./tools.mjs";
 import { budgetCap, knownUsd } from "./usd.mjs";
 import { parseNanoInvoice } from "nanoodle";
@@ -1285,12 +1286,12 @@ export function failedBeforeSend(e, signal) {
  * that invoice was issued for. Once a primary's invoice is paid there is no fallback:
  * a paid call that then fails is reported as failed, never re-sent to another model and paid again.
  */
-export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = "https://nano-gpt.com", pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0, hosted = false }) {
+export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment = null, baseUrl = NANOGPT_API_ORIGIN, pollMs = 3000, now = Date.now, primaryTimeoutMs = PRIMARY_TIMEOUT_MS, reaskDeadlineMs = REASK_DEADLINE_MS, reaskEndMs = REASK_END_MS, maxReasks = MAX_REASKS, spans = [], writerDraft = null, ending = "any", maxChars = null, guidance = "", title = false, budgetUsd = null, deciderReserveUsd = 0, prices = null, writerTokenCap = 0, judgeTokenCap = 0, hosted = false }) {
   // null is "no cap". An explicit amount, including 0, stays that amount.
   // A value that does not parse throws here, so it cannot become "no cap".
   const budget = budgetCap(budgetUsd);
   const state = { answered: {}, fallback: {}, reasked: {}, dashes: {}, skippedReask: {}, skippedGuard: {}, paidFailed: {}, attempts: [], paidIds: new Set(), reconcile: [], unreportedUsd: 0, reviewUsd: 0, costUnknown: false, spans: spans || [], ending: ending || "any", maxChars: maxChars || null, guidance: guidance || "", draft: draft || "", title: !!title, billing: hosted ? "hosted" : payment ? "wallet" : "key", stash: [], dropped: {}, judgeReq: null, budgetUsd: budget, meteredUsd: 0, reservedUsd: 0, committedUsd: 0, skippedForBudget: [], deciderReserveUsd: Math.max(0, knownUsd(deciderReserveUsd) ?? 0), judgeFinish: null, judgeTruncated: false };
-  // Optional caps from a caller that already sized this run (subnano_comment).
+  // Optional caps from a caller that already sized this run.
   // Unset, both stay 0 and every call uses requestOutputTokenCap, which includes
   // the decider's ranking JSON and GLM reasoning reserve.
   const sizedCap = (judge = false) => {
