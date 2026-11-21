@@ -1,3 +1,4 @@
+import { isIPv4 } from "node:net";
 import { performance } from "node:perf_hooks";
 import { MAX_RPC_RETRY_MS, rpcPeerSetId, selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
@@ -49,11 +50,13 @@ export function nanoOwnedPrimary(bases, enabled) {
   if (!enabled) return null;
   const url = URL.parse(bases[0]);
   // Trust is explicitly assigned to the first RPC on the private tailnet.
-  const octets = url?.hostname.split(".").map(Number);
   if (!url || !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash
-      || octets.length !== 4 || octets[0] !== 100 || octets[1] < 64 || octets[1] > 127
-      || bases.length < 3) {
+      || !isIPv4(url.hostname) || bases.length < 3) {
     throw new TypeError("An owned Nano primary requires a first RPC at a Tailscale IPv4 address and two fallback endpoints");
+  }
+  const [first, second] = url.hostname.split(".").map(Number);
+  if (first !== 100 || second < 64 || second > 127) {
+    throw new TypeError("An owned Nano primary must use a Tailscale IPv4 address");
   }
   return bases[0];
 }
