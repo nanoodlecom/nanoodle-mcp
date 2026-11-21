@@ -14,7 +14,7 @@ import { deriveAddress, derivePublicKey, checkAddress, hashBlock } from "nanocur
 import { createProbeFetch } from "../src/probe-http.mjs";
 import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw, paidNanoRunFundingRaw,
-  marketRunFunding } from "../src/operational-state.mjs";
+  marketRunFunding, recentPaidWorkflowFailures } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
 import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
@@ -425,8 +425,13 @@ export async function runOperationalCheck(config, deps = {}) {
   const readMarketLedgers = () => config.agents.map(a => read(join(config.marketStateDir, a.handle, "market-state.json")));
   const state = await check("payment-state", async () => {
     const nano = readNanoLedger(), near = readNearLedger(), market = readMarketLedgers();
-    const liabilities = paymentLiabilities({ nano, near, market }, { now: now() });
+    const checkedAt = now();
+    const liabilities = paymentLiabilities({ nano, near, market }, { now: checkedAt });
     for (const code of liabilities.issues) checks.push({ stage: code, ok: false, code, domains: [] });
+    const failures = recentPaidWorkflowFailures({ nano, near }, checkedAt);
+    const ok = failures.nano + failures.near + failures.usdc < 2;
+    checks.push({ stage: "paid-workflow-execution", ok, failures,
+      ...(ok ? {} : { code: "paid-workflow-failures-repeated", domains: [] }) });
     return { liabilities, near };
   });
   if (state) await check("near-payment-replay-coverage", () => {
