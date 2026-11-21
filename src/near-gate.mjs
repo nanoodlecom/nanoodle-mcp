@@ -136,15 +136,18 @@ export function createNearGate({
   usdcEnabled = false,
   authorPayouts = null,
   canQuote = () => true,
+  canFundQuote = null,
   fundRun = null,
   maintenance = null,
   runTimeoutMs = undefined,
   refundFunding = null,
 }) {
   const executionLimit = hostedRunTimeout(runTimeoutMs);
+  const providerUsesWallet = modelPayment !== "api_key";
   if (!isNearAccountId(merchantId)) throw new TypeError("createNearGate needs a valid merchant account id");
   if (network !== "testnet" && network !== "mainnet") throw new TypeError('network must be "testnet" or "mainnet"');
   if (typeof canQuote !== "function") throw new TypeError("canQuote must be a function");
+  if (canFundQuote !== null && typeof canFundQuote !== "function") throw new TypeError("canFundQuote must be a function or null");
   if (fundRun !== null && typeof fundRun !== "function") throw new TypeError("fundRun must be a function or null");
   if (maintenance !== null && typeof maintenance.run !== "function") throw new TypeError("maintenance must provide operation admission and accounting");
   if (refundFunding !== null && ["quote", "run"].some(k => typeof refundFunding[k] !== "function")) throw new TypeError("refundFunding needs quote and run checks");
@@ -515,6 +518,15 @@ export function createNearGate({
         payTx: null, payer: null, paidYocto: null, paidAtBlockMs: null,
         settlement: null, refundId: null, result: null, error: null, outcome: null, finishedAt: null,
       };
+      const reserveModels = Boolean(fundRun) && providerUsesWallet;
+      if (canFundQuote && (reserveModels || author)) {
+        const { maxRaw, overheadRaw } = nearRunFundingBudget({ ...record, paidYocto: record.amountYocto },
+          { providerUsesWallet: reserveModels });
+        const requiredRaw = maxRaw + overheadRaw;
+        if (canFundQuote(requiredRaw) !== true) {
+          return errResult("Cannot quote right now: the shared Nano wallet cannot cover this workflow. Try again shortly. Nothing was quoted or charged.");
+        }
+      }
       ledger.putQuote(record);
       ev("quote", { paymentId: id, tool: name, depositUsd: record.depositUsd, amountYocto: record.amountYocto, nearUsd: r.nearUsd, rateSource: r.source, ...rateExtras(r) });
       const likelyCharge = usdToYocto(pricing.likelyChargeUsd, r, "ceil");
@@ -816,9 +828,9 @@ export function createNearGate({
     let prepared = null, budget = null, prepError = null;
     try {
       prepared = await prepare(registry, name, args, tool);
-      if (fundRun) {
-        budget = nearRunFundingBudget(q);
-        if (parseUsdNano(prepared.pricing.estimatedCostUsd, { roundUp: true }) > parseUsdNano(budget.maxUsd)) {
+      if (fundRun && (providerUsesWallet || q.author)) {
+        budget = nearRunFundingBudget(q, { providerUsesWallet });
+        if (providerUsesWallet && parseUsdNano(prepared.pricing.estimatedCostUsd, { roundUp: true }) > parseUsdNano(budget.maxUsd)) {
           throw new FundingError("QUOTE_BUDGET_EXCEEDED", "The current model estimate exceeds the budget of this quote.");
         }
       }
@@ -828,22 +840,19 @@ export function createNearGate({
       catch { return errResult("Your payment is verified. The run is paused while the operator restores NEAR refund funding. Retry this same payment id; no model work was started and no new payment is needed.",
         { payment: { paymentId: q.id, status: "paid", retryable: true, code: "NEAR_FUNDING_UNAVAILABLE" } }); }
     }
-    if (!prepError) {
-      q = ledger.updateQuote(q.id, { status: "running" });
-      if (ctx?.announce) ctx.announce(`payment verified — running ${name}`);
-    }
-
     let res;
     try {
       if (prepError) throw prepError;
       const execute = async () => {
+        q = ledger.updateQuote(q.id, { status: "running" });
+        ctx?.announce?.(`payment verified — running ${name}`);
         const result = await registry.callTool(prepared.run, {
-        ...ctx,
-        workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
+          ...ctx,
+          workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
         });
         // Money-only checkpoint before the funding scope releases creator
         // overhead. No result text is persisted by this handoff.
-        if (fundRun) q = ledger.updateQuote(q.id, { fundingOutcomeReady: true });
+        if (budget) q = ledger.updateQuote(q.id, { fundingOutcomeReady: true });
         return result;
       };
       res = await withHostedRun(() => budget ? fundRun(budget, execute) : execute(), executionLimit);
@@ -851,6 +860,8 @@ export function createNearGate({
       const msg = String((e && e.message) || e);
       const error = prepError?.code === "QUOTE_BUDGET_EXCEEDED"
         ? "The current model estimate exceeds this quote's budget. No model work started. The full deposit is being returned. Request a new quote to try again."
+        : q.status === "paid" && budget?.maxRaw === 0n && e?.code === "FUNDING_INSUFFICIENT"
+          ? "The shared Nano wallet cannot cover the creator payout. No model work started. The full deposit is being returned."
         : "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
       // Persist the failure before the refund goes out, so a restart never re-runs it.
       q = ledger.updateQuote(q.id, { status: "failed", outcome: "run_failed", error, finishedAt: now() });

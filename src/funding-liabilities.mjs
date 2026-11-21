@@ -150,8 +150,12 @@ function nearCreatorMaximum(q) {
   return full > base ? full : base;
 }
 
-export function nearRunFundingBudget(q) {
-  const terms = runFundingBudget({ id: `near:${q.id}`, budgetUsd: q.depositUsd,
+export function nearRunFundingBudget(q, { providerUsesWallet = true } = {}) {
+  const id = `near:${q.id}`;
+  if (!providerUsesWallet) {
+    return { id, maxUsd: "0", maxRaw: 0n, overheadRaw: q.author ? nearCreatorMaximum(q) : 0n };
+  }
+  const terms = runFundingBudget({ id, budgetUsd: q.depositUsd,
     pair: { usdNano: parseUsdNano(q.rate?.xnoUsd), raw: 10n ** 30n }, creator: !!q.author });
   if (q.author) terms.overheadRaw = nearCreatorMaximum(q);
   return terms;

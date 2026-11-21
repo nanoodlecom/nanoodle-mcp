@@ -27,6 +27,7 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
   }
   let nanoLive = null, nanoTransfersLive = null, nearLive = null, payoutsLive = null;
   let quoteReady = false, storageReady = true, readyAt = null, readyForMs = 0;
+  let quoteFundsRaw = null;
   const marketLive = new Map();
   function nanoDisk() {
     const s = readState(nanoFile);
@@ -62,22 +63,27 @@ export function createHostedFundingSources({ nanoFile, nearFile, marketRoot, now
       }
     }
   }
+  function ready() {
+    if (!quoteReady || !storageReady) return false;
+    // Expire even when the refresh task is stuck on the wallet queue. Use a
+    // monotonic clock so wall-clock changes cannot extend a healthy lease.
+    const age = now() - readyAt;
+    if (!Number.isFinite(age) || age < 0 || age >= readyForMs) {
+      quoteReady = false; readyAt = null;
+    }
+    return quoteReady;
+  }
   return {
     requireFiles(files) { requiredFiles = new Set(files.map(file => resolve(file))); },
-    ready() {
-      if (!quoteReady || !storageReady) return false;
-      // Expire even when the refresh task is stuck on the wallet queue. Use a
-      // monotonic clock so wall-clock changes cannot extend a healthy lease.
-      const age = now() - readyAt;
-      if (!Number.isFinite(age) || age < 0 || age >= readyForMs) {
-        quoteReady = false; readyAt = null;
-      }
-      return quoteReady;
+    ready,
+    canFundQuote(requiredRaw) {
+      return ready() && quoteFundsRaw !== null && typeof requiredRaw === "bigint" && requiredRaw > 0n && requiredRaw <= quoteFundsRaw;
     },
-    setReady(value, maxAgeMs = MAX_READY_AGE_MS) {
+    setReady(value, maxAgeMs = MAX_READY_AGE_MS, availableRaw = null) {
       quoteReady = storageReady && value === true && Number.isFinite(maxAgeMs) && maxAgeMs > 0;
       readyForMs = quoteReady ? Math.min(maxAgeMs, MAX_READY_AGE_MS) : 0;
       readyAt = quoteReady ? now() : null;
+      quoteFundsRaw = quoteReady && typeof availableRaw === "bigint" && availableRaw >= 0n ? availableRaw : null;
     },
     setStorageReady(value) { storageReady = value === true; if (!storageReady) { quoteReady = false; readyAt = null; } },
     registerNano(reader, transfers) { nanoLive = reader; nanoTransfersLive = transfers; },
