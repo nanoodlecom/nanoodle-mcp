@@ -8,7 +8,7 @@ import { createHostedWorkflows } from "../src/hosted-workflows.mjs";
 import { creatorPage } from "../src/creator-site.mjs";
 import { serveHttp } from "../src/http.mjs";
 import { computePrice, prepareRunNoodle } from "../src/tools.mjs";
-import { startMockServer, PNG_B64 } from "../node_modules/nanoodle/tests/harness/mock-server.mjs";
+import { startMockServer, PNG_B64 } from "./fixtures/sdk/mock-server.mjs";
 import { WORKED_GRAPH, WORKED_CATALOGS } from "./fixtures/near-fake-chain.mjs";
 
 const author = "nano_1111111111111111111111111111111111111111111111111111hifc8npp";

@@ -6,8 +6,9 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { loadTools, editorShareUrl, noodleGuide } from "../src/tools.mjs";
 import { createChargeGate } from "../src/gate.mjs";
@@ -27,6 +28,27 @@ before(async () => {
 after(() => { globalThis.fetch = realFetch; });
 
 const text = (r) => r.content.map((c) => c.text || "").join("\n");
+
+test("a local model file drives both the sprite preview and turntable MP4", async () => {
+  const inputs = { Character: fileURLToPath(new URL("./fixtures/triangle.gltf", import.meta.url)) };
+  const graph = {
+    v: 1,
+    nodes: [
+      { id: "source", type: "mupload", name: "Character", fields: {} },
+      { id: "slice", type: "slice-3d", fields: { resolution: 16, slices: 8 } },
+      { id: "view", type: "sprite-stack-render", name: "View", fields: { scale: 1, turntable: true, duration: 0.25, fps: 8 } },
+    ],
+    links: [
+      { id: "model", from: { node: "source", port: "model" }, to: { node: "slice", port: "model" } },
+      { id: "layers", from: { node: "slice", port: "sheet" }, to: { node: "view", port: "sheet" } },
+    ],
+  };
+  const result = await registry.callTool({ name: "run_noodle", arguments: { graph, inputs } });
+  assert.match(text(result), /^View: saved .*\.png$/m);
+  const video = text(result).match(/^View\.video: saved (.*\.mp4)$/m);
+  assert.ok(video, text(result));
+  assert.equal((await readFile(video[1])).toString("ascii", 4, 8), "ftyp");
+});
 
 test("free mode: run_noodle runs an inline graph object (and the same graph as a JSON string)", async () => {
   const runs = mock.runs();
@@ -122,6 +144,35 @@ test("noodle_guide format-only reads no model catalog; node type fetches only it
   await assert.rejects(noodleGuide({ node_type: "endpoint" }, options), (e) => e.mcpCode === -32602);
   await assert.rejects(noodleGuide({ node_type: "llm", kind: "image" }, options), (e) => e.mcpCode === -32602);
   await assert.rejects(noodleGuide({ format_only: "true" }, options), (e) => e.mcpCode === -32602);
+});
+
+test("noodle_guide advertises the local sprite workflow and its engine ports and settings", async () => {
+  const tool = registry.listTools().find(t => t.name === "noodle_guide");
+  const enumTypes = tool.inputSchema.properties.node_type.enum;
+  const guide = await registry.callTool({ name: tool.name, arguments: { format_only: true } });
+  const byType = Object.fromEntries(guide.structuredContent.nodeTypes.map(t => [t.type, t]));
+  for (const type of ["slice-3d", "sprite-stack-render"]) {
+    assert.ok(enumTypes.includes(type));
+    assert.equal(byType[type].allowed, false, "paid custom graphs exclude local media processing");
+    assert.equal(byType[type].exampleUrl, "https://nanoodle.com/guide/examples/slice-3d");
+    const detail = await registry.callTool({ name: tool.name, arguments: { node_type: type } });
+    assert.deepEqual(detail.structuredContent.models, []);
+    assert.match(text(detail), new RegExp(type + " runs locally"));
+    assert.ok(text(guide).includes(byType[type].fields));
+  }
+  const slicer = byType["slice-3d"], render = byType["sprite-stack-render"];
+  assert.deepEqual(slicer.inputs, ["model", "paletteImage"]);
+  assert.deepEqual(slicer.outputs.map(p => p.name), ["sheet", "layout", "image"]);
+  assert.deepEqual(render.inputs, ["sheet"]);
+  assert.deepEqual(render.outputs.map(p => p.name), ["image", "video"]);
+  assert.match(slicer.fields, /model3d\.model/);
+  assert.match(slicer.fields, /resolution=128, slices=80, palette=0/);
+  assert.deepEqual(slicer.settings.find(s => s.field === "preset").options, ["default", "character"]);
+  const frames = slicer.settings.find(s => s.field === "frames");
+  assert.deepEqual([frames.def, frames.min, frames.max], ["1", 1, 64]);
+  assert.ok(slicer.keyFields.includes("clip"));
+  assert.ok(render.keyFields.includes("turntable"));
+  assert.match(render.fields, /slice-3d\.sheet/);
 });
 
 test("every mode lists price_noodle and noodle_guide next to run_noodle; a graph file cannot take their names", async () => {

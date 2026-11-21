@@ -17,7 +17,7 @@
 //                   XNO"), and the swap margin when non-zero; locked by a quote
 
 import {
-  Workflow, NODE_TYPES, displayName, topoSort, estimateGraphCost, graphModelKinds, decodeShareUrl, planBranches,
+  Workflow, NODE_TYPES, SETTING_SPECS, displayName, topoSort, estimateGraphCost, graphModelKinds, decodeShareUrl, planBranches,
 } from "nanoodle";
 import { gunzipSync, constants as zlibConstants } from "node:zlib";
 import { knownUsd } from "./usd.mjs";
@@ -69,12 +69,15 @@ export const NODE_POLICY = Object.freeze({
   inpaint: deny(WHY.inpaint),
   lipsync: deny(WHY.lipsync),
   resize: deny(WHY.local), vframes: deny(WHY.local), combine: deny(WHY.local),
+  "slice-3d": deny(WHY.local), "sprite-stack-render": deny(WHY.local),
   soundtrack: deny(WHY.local), trim: deny(WHY.local), extractaudio: deny(WHY.local),
   endpoint: deny(WHY.endpoint),
 });
 
 /** What to do instead, per refused type. */
 const INSTEAD = {
+  "slice-3d": "run this workflow in the Nanoodle editor or a local executor",
+  "sprite-stack-render": "run this workflow in the Nanoodle editor or a local executor",
   upload: "generate the image with an image node instead",
   aupload: "generate the audio with a music or tts node instead",
   vupload: "generate the video with a tvideo or ivideo node instead",
@@ -1163,9 +1166,25 @@ const GUIDE_PORTS = {
   model3d: { text: ["prompt"], media: "image", fields: "model (a model3d model; default tripo3d/v2.5)" },
 };
 
-/** Editor node type to hosted pricing catalog. Workflow normalizes the branch alias. */
+const SPRITE_NODE_HELP = {
+  "slice-3d": [
+    "Connect model3d.model (including a rigged Idol Max GLB) or mupload.model to model.",
+    "Optionally connect an image to paletteImage to supply palette colors.",
+    "An empty clip with frames=1 slices the rest pose. Set clip to an exact animation name and frames to 2–64 for a pose sequence, or leave clip empty to use the first animation.",
+    "The character preset uses resolution=128, slices=80, palette=0 (source colors) and outline=true. Explicit fields override the preset.",
+    "The sheet output is a PNG strip for one pose or an APNG of strips for a sequence. image previews the first pose and layout describes the slices.",
+  ].join(" "),
+  "sprite-stack-render": [
+    "Connect slice-3d.sheet to sheet. image gives the first pose at the selected yaw and pitch.",
+    "An animated slice sheet also produces video with a fixed camera. Enable turntable for an MP4 orbit on either a static or animated sheet.",
+    "Adjust pitch and spacing to control how silhouettes read from the side.",
+  ].join(" "),
+};
+const SPRITE_EXAMPLE = "https://nanoodle.com/guide/examples/slice-3d";
+
+/** Discoverable node type to hosted pricing catalog, or null for local rendering and logic. */
 export const GUIDE_NODE_MODEL_KIND = Object.freeze(Object.fromEntries([
-  ...Object.keys(NODE_POLICY).filter(type => NODE_POLICY[type].allowed), "decide-branch",
+  ...Object.keys(NODE_POLICY).filter(type => NODE_POLICY[type].allowed), "decide-branch", ...Object.keys(SPRITE_NODE_HELP),
 ].map(type => [type, KIND_OF({ type })])));
 
 const GUIDE_CAPABILITIES = {
@@ -1262,14 +1281,17 @@ export function authoringGuide({ catalogs = {}, kind = null, search = null, limi
   const nodeTypes = Object.keys(NODE_TYPES).map((type) => {
     const t = NODE_TYPES[type], pol = NODE_POLICY[type] || { allowed: false, why: "Not on this server's allowlist." };
     const gp = pol.allowed ? GUIDE_PORTS[type] || { text: [] } : null;
+    const spriteHelp = SPRITE_NODE_HELP[type];
+    const settings = spriteHelp ? SETTING_SPECS[type].map(({ f, ...spec }) => ({ field: f, ...spec })) : null;
     return {
       type, title: t.title, allowed: pol.allowed, why: pol.why,
       inputs: [...(t.inputs || [])],
       textPorts: gp ? [...gp.text] : [],
-      mediaPorts: gp && gp.media ? gp.media : null,
+      mediaPorts: spriteHelp ? t.inputs.join(", ") : gp?.media || null,
       outputs: (t.outputs || []).map((o) => ({ name: o.name, type: o.type })),
-      keyFields: pol.allowed ? [...(KEY_FIELDS[type] || [])] : [],
+      keyFields: settings ? settings.map(s => s.field) : [...(KEY_FIELDS[type] || [])],
       ...(gp ? { fields: gp.fields } : {}),
+      ...(spriteHelp ? { fields: spriteHelp, settings, exampleUrl: SPRITE_EXAMPLE } : {}),
     };
   });
 
@@ -1310,6 +1332,7 @@ export function authoringGuide({ catalogs = {}, kind = null, search = null, limi
   };
 
   const allowed = nodeTypes.filter((t) => t.allowed), refused = nodeTypes.filter((t) => !t.allowed);
+  const spriteTypes = nodeTypes.filter(t => Object.hasOwn(SPRITE_NODE_HELP, t.type));
   const lines = [
     "How to write a nanoodle workflow graph for this server.",
     "",
@@ -1330,13 +1353,17 @@ export function authoringGuide({ catalogs = {}, kind = null, search = null, limi
     "",
     `Refused node types: ${refused.map((t) => t.type).join(", ")}. A refusal names the node, the reason and what to use instead.`,
     "",
+    "Sprite workflows run in the Nanoodle editor and local executors. Paid hosted graphs exclude local media processing.",
+    ...spriteTypes.map(t => `- ${t.type} (${t.title}). ${t.fields} Settings: ${t.keyFields.join(", ")}.`),
+    `Open the wired Slice 3D example at ${SPRITE_EXAMPLE}`,
+    "",
     "Wiring and field rules:",
     ...WIRING_RULES.map((r) => `- ${r}`),
     "",
     "Minimal example (text → llm; use price_noodle before running):",
     JSON.stringify(minimalExample),
     "",
-    ...(formatOnly ? ["Models omitted by request. Remove format_only to list models."] : [
+    ...(nodeType && Object.hasOwn(SPRITE_NODE_HELP, nodeType) ? [`${nodeType} runs locally without a model catalog.`] : formatOnly ? ["Models omitted by request. Remove format_only to list models."] : [
       `Priced models${nodeType ? ` for ${nodeType}` : kind ? ` (${kind})` : ""}, cheapest first:`,
       ...(models.length ? models.map((m) => `- ${m.kind} ${m.id} [${m.nodeTypes.join(", ")}]: ${m.unitPrice}`) :
         ["- none matched (the catalog may be unavailable; try another filter)"]),

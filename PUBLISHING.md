@@ -1,7 +1,9 @@
 # Publishing Nanoodle MCP
 
 Merges to `main` run the offline suite, then build and install the npm tarball
-in a clean directory. The bundle includes the pinned Nanoodle engine. The workflow
+in a clean directory. The package depends on an exact Nanoodle engine version so
+npm can install the correct media libraries for the caller's platform. Publish the
+engine before preparing an MCP release that depends on it. The workflow
 publishes through Trusted Publishing on version-changing main pushes or an
 explicit main dispatch. It then registers that same npm version in the official
 MCP Registry. Each publishing job skips an already registered version.
@@ -31,11 +33,9 @@ In the existing npm package settings, add the GitHub Trusted Publisher for
 `nanoodlecom/nanoodle-mcp`, workflow `test.yml`, and environment `npm`. Enable
 direct `npm publish`. The GitHub `npm` environment accepts the `main` branch.
 
-For the first release with the re-pinned executor, run
-`npm view nanoodle@0.13.1 dist.integrity` and compare the result with the public
-SDK archive integrity in [vendor/README.md](vendor/README.md). To publish the
-already-declared `nanoodle-mcp@0.7.0`, dispatch the `test` workflow on `main`
-with version `0.7.0` after enabling the npm Trusted Publisher.
+The main push runs the tests and packs the npm distribution. After the hosted
+deployment activates that revision, the deploy workflow dispatches the
+`test` workflow on `main` to publish the release version.
 
 If npm succeeded and Registry publishing needs a retry, rerun the failed jobs
 or dispatch `publish-mcp-registry` on `main` with the already published version.

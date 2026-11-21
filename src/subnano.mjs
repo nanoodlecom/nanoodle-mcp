@@ -288,7 +288,7 @@ function clientFor(ctx) {
 }
 
 async function loadDecide() {
-  return import("../node_modules/nanoodle/src/decide.mjs");
+  return import(new URL("./decide.mjs", import.meta.resolve("nanoodle")));
 }
 
 async function runSfw(args, ctx) {

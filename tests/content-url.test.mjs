@@ -4,8 +4,8 @@
  * private presigned file). Resolved at the node boundary before the next node
  * builds videoUrl / videoDataUrl / image / audio. No live NanoGPT calls.
  *
- * This is nanoodle-js #49 (40679dfe), run against the vendored executor.
- * The harness and the two media fixtures ship inside that tarball.
+ * This is nanoodle-js #49 (40679dfe), run against the pinned executor.
+ * The SDK test harness and media fixtures are in tests/fixtures/sdk.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -13,9 +13,9 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Workflow, MediaRef, NanoClient } from "nanoodle";
 import { MEDIA_INLINE_MAX, dataUrlBytes } from "../node_modules/nanoodle/src/media.mjs";
-import { startMockServer, mockOpts, PNG_B64 } from "../node_modules/nanoodle/tests/harness/mock-server.mjs";
+import { startMockServer, mockOpts, PNG_B64 } from "./fixtures/sdk/mock-server.mjs";
 
-const media = (name) => fileURLToPath(new URL("../node_modules/nanoodle/tests/fixtures/media/" + name, import.meta.url));
+const media = (name) => fileURLToPath(new URL("./fixtures/sdk/" + name, import.meta.url));
 const KEY = "unit-test-key-do-not-leak";
 const RELATIVE = "/api/generate-video/content?runId=grok1&model=grok-imagine-video-1.5-lite";
 const PRESIGNED = "https://files.example/clip.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE&X-Amz-Signature=SUPERSECRET";

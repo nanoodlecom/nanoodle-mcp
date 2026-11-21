@@ -241,9 +241,17 @@ jobs:
           mv "$RUNNER_TEMP/nanoodle-mcp-$version.tgz" "$RUNNER_TEMP/nanoodle-mcp.tgz"
           cd "$RUNNER_TEMP/consumer"
           npm install --omit=dev --ignore-scripts "$RUNNER_TEMP/nanoodle-mcp.tgz"
-          installed_sdk="$(node -p 'require("./node_modules/nanoodle-mcp/node_modules/nanoodle/package.json").version')"
+          installed_sdk="$(node -p 'require(require.resolve("nanoodle/package.json", {paths:["./node_modules/nanoodle-mcp"]})).version')"
           test "$installed_sdk" = "$sdk_version"
           test "$(node_modules/.bin/nanoodle-mcp --version)" = "nanoodle-mcp $version"
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import { noodleGuide } from "nanoodle-mcp/src/tools.mjs";
+          for (const type of ["slice-3d", "sprite-stack-render"]) {
+            const guide = await noodleGuide({ node_type: type });
+            assert.ok(guide.structuredContent.nodeTypes.find(n => n.type === type)?.settings.length);
+          }
+          JS
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'workflow_dispatch'

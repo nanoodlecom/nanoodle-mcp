@@ -211,7 +211,7 @@ export async function attachEstimates(registry, { baseUrl = NANOGPT_API_ORIGIN, 
 }
 
 /** Input kinds whose values are media (file path or URL), mirroring the library's MEDIA_KINDS. */
-const MEDIA_KINDS = new Set(["image", "audio", "video", "inpaint"]);
+const MEDIA_KINDS = new Set(["image", "audio", "video", "model3d", "inpaint"]);
 
 /** Best-effort file extension for a media MIME type (the library doesn't export its own map). */
 const MIME_EXT = {
@@ -364,6 +364,14 @@ function describeOutputs(wf) {
   const byId = new Map(wf.graph.nodes.map((n) => [n.id, n]));
   let mediaFiles = 0;
   const parts = wf.outputs.map((o) => {
+    if (o.type === "slice-3d") {
+      mediaFiles += 2;
+      return "slice sheet, layout and image preview";
+    }
+    if (o.type === "sprite-stack-render") {
+      mediaFiles += 2;
+      return "image preview and MP4 for animated sheets or turntables";
+    }
     const kind = (o.ports && o.ports[0] && o.ports[0].type) || o.type; // odd types may declare no ports
     if (kind === "text") return "text";
     const f = (byId.get(o.nodeId) || {}).fields || {};
@@ -599,7 +607,7 @@ const noodleGuideTool = () => ({
   description:
     "Free, never charged: how to write a custom nanoodle workflow graph for run_noodle — the node " +
     "types this server runs (inputs, outputs, key fields), the wiring rules, a complete example " +
-    "graph, and hosted NanoGPT model candidates with their unit prices (cheapest first). Filter with " +
+    "graph, hosted NanoGPT model candidates with their unit prices, and local slice-3d and sprite-stack-render wiring. Filter with " +
     "`kind`, `node_type`, `search` (model ID substring) and `limit`. Use `format_only` to skip catalog reads. " +
     "Then check the estimated cost with price_noodle before calling run_noodle.",
   inputSchema: {
@@ -607,7 +615,7 @@ const noodleGuideTool = () => ({
     properties: {
       kind: { type: "string", enum: GUIDE_KINDS, description: "Only list models of this kind." },
       search: { type: "string", description: "Only list models whose id contains this text." },
-      node_type: { type: "string", enum: Object.keys(GUIDE_NODE_MODEL_KIND), description: "Only list model candidates for this hosted node type." },
+      node_type: { type: "string", enum: Object.keys(GUIDE_NODE_MODEL_KIND), description: "Look up a node and limit model candidates to its catalog. Local sprite nodes have no model catalog." },
       format_only: { type: "boolean", description: "Return the graph format, rules and example without looking up models." },
       limit: { type: "integer", minimum: 1, maximum: 50, description: "How many models to list (default 20)." },
     },
@@ -735,6 +743,21 @@ export function gateNotices(wf, result) {
 const INLINE_IMAGE_MAX = 1_500_000;
 const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 
+function* resultPorts(wf, result) {
+  for (const sink of wf.outputs) {
+    const { key, nodeId } = sink;
+    yield { key, nodeId, value: result.outputs[key] };
+    if (sink.type !== "slice-3d" && sink.type !== "sprite-stack-render") continue;
+    // RunResult exposes the primary port in outputs and every generated port in nodes.
+    const out = result.nodes[nodeId]?.out;
+    for (const port of sink.ports.slice(1)) {
+      const raw = out?.[port.name];
+      if (raw == null) continue;
+      yield { key: `${key}.${port.name}`, nodeId, value: port.type === "text" ? raw : new MediaRef(raw) };
+    }
+  }
+}
+
 /**
  * Turn a completed run into MCP tool-result content: media saved to disk, text
  * inline, cost line. Locally (stdio) media is referenced by file path; when
@@ -758,8 +781,8 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
   // uses this flag to keep it off disk (media pointers + receipts are safe to
   // persist, the files themselves die by --out-ttl).
   let textOutput = false;
-  for (const o of wf.outputs) {
-    const value = result.outputs[o.key];
+  for (const o of resultPorts(wf, result)) {
+    const value = o.value;
     if (value === undefined) {
       // an output a closed gate skipped: say so (it is not paid content — textOutput untouched)
       const rec = result.nodes && result.nodes[o.nodeId];
@@ -993,7 +1016,7 @@ export async function noodleGuide(args, { baseUrl, fetch = globalThis.fetch, log
     throw new ParamsError('noodle_guide "limit" must be an integer from 1 to 50');
   }
   if (a.node_type != null && (typeof a.node_type !== "string" || !Object.hasOwn(GUIDE_NODE_MODEL_KIND, a.node_type))) {
-    throw new ParamsError('noodle_guide "node_type" must be an allowed hosted node type');
+    throw new ParamsError('noodle_guide "node_type" must be one of the node types in the tool schema');
   }
   if (a.format_only != null && typeof a.format_only !== "boolean") {
     throw new ParamsError('noodle_guide "format_only" must be a boolean');

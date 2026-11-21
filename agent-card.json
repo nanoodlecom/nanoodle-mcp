@@ -1,7 +1,7 @@
 {
   "name": "nanoodle",
   "description": "Saved or agent-composed nanoodle workflows as MCP tools: BYOK, pay per call in Nano, or pay in NEAR",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "documentationUrl": "https://github.com/nanoodlecom/nanoodle-mcp#readme",
   "iconUrl": "https://nanoodle.com/icon-512.png",
   "provider": {

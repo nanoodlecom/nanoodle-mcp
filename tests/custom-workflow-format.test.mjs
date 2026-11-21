@@ -241,7 +241,7 @@ test("receipt USD figures reconcile: deposit.usd - charged.usd = refund.usd (to 
 test("authoringGuide: node types, rules, example, and filtered priced models", () => {
   const g = authoringGuide({ catalogs: CATS });
   assert.deepEqual(Object.keys(g.structured), ["nodeTypes", "wiringRules", "example", "models", "graphFormat", "minimalExample"]);
-  assert.equal(g.structured.nodeTypes.length, 31);
+  assert.equal(g.structured.nodeTypes.length, 33);
   const llm = g.structured.nodeTypes.find((t) => t.type === "llm");
   assert.deepEqual(Object.keys(llm), ["type", "title", "allowed", "why", "inputs", "textPorts", "mediaPorts", "outputs", "keyFields", "fields"]);
   assert.deepEqual(llm.textPorts, ["prompt", "system"]);

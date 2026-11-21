@@ -18,7 +18,7 @@ const IMG = { model: "blackforestlabs/flux-3/klein/text-to-image", size: "1024x1
 
 test("NODE_POLICY covers every engine node type, and nothing else", () => {
   assert.deepEqual(Object.keys(NODE_POLICY).sort(), Object.keys(NODE_TYPES).sort());
-  assert.equal(Object.keys(NODE_POLICY).length, 31);
+  assert.equal(Object.keys(NODE_POLICY).length, 33);
   for (const [type, p] of Object.entries(NODE_POLICY)) {
     assert.equal(typeof p.allowed, "boolean", type);
     assert.ok(p.why && p.why.length > 5, type);
@@ -33,7 +33,7 @@ test("the allowlist matches the documented table", () => {
 
 // vision sends no output limit; vedit/remix/transcribe/cleanvoice bill by input media length.
 const REFUSED = ["upload", "aupload", "vupload", "mupload", "inpaint", "lipsync", "resize", "vframes", "combine",
-  "soundtrack", "trim", "extractaudio", "endpoint", "vision", "vedit", "remix", "transcribe", "cleanvoice"];
+  "soundtrack", "trim", "extractaudio", "slice-3d", "sprite-stack-render", "endpoint", "vision", "vedit", "remix", "transcribe", "cleanvoice"];
 
 for (const type of REFUSED) {
   test(`a ${type} node is refused with NODE_NOT_ALLOWED, naming the node and why`, () => {

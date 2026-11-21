@@ -1,6 +1,8 @@
-# Vendored executor
+# Historical executor archives
 
-The active executor is `nanoodle-0.13.1.tgz`. Its runtime files come from
+The MCP server now installs the Nanoodle version pinned in `package.json` from npm.
+
+The archived 0.13.1 runtime files came from
 [nanoodle@0.13.1 on npm](https://www.npmjs.com/package/nanoodle/v/0.13.1) at SDK
 commit `5029a858f7ee4a8d726931315fbd3d7c1fd4f20b`. The vendored archive has
 SHA-256 `f4693fcfaacb7fea7a1a30a0eea87a192547c8e47420603f7806d80495d15e66`.

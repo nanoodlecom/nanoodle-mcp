@@ -935,6 +935,11 @@ baseline. It does not create a quote, run inference or list the editor's full
 inventory. Before quoting a run, pass the actual graph, settings and inputs to
 `price_noodle`.
 
+For a rigged model or a sprite animation, call `noodle_guide` with
+`{"node_type":"slice-3d"}` or `{"node_type":"sprite-stack-render"}`. The guide
+includes ports, settings, pose playback and a wired example. Use the editor
+or a local executor to run these media transforms. [Slice 3D example](https://nanoodle.com/guide/examples/slice-3d)
+
 ## Pay with NEAR / run custom workflows
 
 A server started with `--near-merchant` sells workflow runs for **NEAR**, with

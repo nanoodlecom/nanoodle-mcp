@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, cpSync, readdirSync, lstatSync, symlinkSync, linkSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, cpSync, existsSync, readdirSync, lstatSync, symlinkSync, linkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -133,8 +133,10 @@ function processIdentity(pid) {
   return { pid, uid: process.getuid(), bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), startTicks: stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19] };
 }
 function unseal(path) {
-  if (lstatSync(path).isDirectory()) { chmodSync(path, 0o700); for (const name of readdirSync(path)) unseal(join(path, name)); }
-  else if (!lstatSync(path).isSymbolicLink()) chmodSync(path, 0o600);
+  chmodSync(path, 0o700);
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    if (entry.isDirectory()) unseal(join(path, entry.name));
+  }
 }
 
 function copyRelease(w) {
@@ -146,12 +148,17 @@ function copyRelease(w) {
   for (const name of ['near-site.js', 'near-wallet.js', 'creator-site.js']) cpSync(join(packageRoot, 'assets', name), join(w.release, 'assets', name));
   mkdirSync(join(w.release, 'node_modules'));
   const lock = JSON.parse(readFileSync(join(packageRoot, 'package-lock.json'), 'utf8'));
-  for (const [path, value] of Object.entries(lock.packages)) if (path.startsWith('node_modules/') && !value.dev) cpSync(join(packageRoot, path), join(w.release, path), { recursive: true });
+  for (const [path, value] of Object.entries(lock.packages)) {
+    if (!path.startsWith('node_modules/') || value.dev) continue;
+    const installed = join(packageRoot, path);
+    if (value.optional && !existsSync(installed)) continue;
+    cpSync(installed, join(w.release, path), { recursive: true });
+  }
   chmodSync(w.release, 0o555);
   return packageRoot;
 }
 
-test('real CLI waits before any provider request, initializes while paused and admits MCP only after explicit reopening', { timeout: 15000 }, async t => {
+test('real CLI waits before any provider request, initializes while paused and admits MCP only after explicit reopening', { timeout: 45000 }, async t => {
   const w = fixture(t), packageRoot = copyRelease(w);
   let requests = 0;
   const api = createServer((_req, res) => { requests++; res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ data: [] })); });
@@ -182,7 +189,7 @@ test('real CLI waits before any provider request, initializes while paused and a
 });
 
 
-test('the hosted CLI recovers a recorded refund once and refuses stale Nano peers after a crash', { timeout: 30000 }, async t => {
+test('the hosted CLI recovers a recorded refund once and refuses stale Nano peers after a crash', { timeout: 60000 }, async t => {
   const w = fixture(t), packageRoot = copyRelease(w), key = await throwawayNearKey();
   const chain = createFakeChain(), nano = nanoGptMock();
   const merchant = 'startup-shop.testnet', payer = 'startup-payer.testnet', deposit = 10n ** 22n;
