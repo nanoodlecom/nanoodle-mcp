@@ -792,7 +792,7 @@ export async function runOperationalCheck(config, deps = {}) {
       const { paymentTx, payer } = sample;
       const accounts = [config.merchant, USDC_CONTRACTS[config.network]];
       const witnessed = await Promise.all(nearNodes.map(({ index, rpc, identity }) => check(`near-discovery-peer-${index}`, async () => {
-        const tx = await readDiscoveryStep("transaction", () => rpc.txStatus({ txHash: paymentTx, senderId: payer }));
+        const tx = await readDiscoveryStep("transaction", () => rpc.txStatus({ txHash: paymentTx, senderId: payer, waitUntil: "NONE" }));
         const receipt = Array.isArray(tx.receipts_outcome)
           && tx.receipts_outcome.find(row => row.outcome?.executor_id === config.merchant);
         need(tx.final_execution_status === "FINAL" && Object.hasOwn(tx.status ?? {}, "SuccessValue")

@@ -16,7 +16,7 @@ import { createMaintenanceBarrier } from "../src/maintenance.mjs";
 import { createNearGate } from "../src/near-gate.mjs";
 import { serveHttp } from "../src/http.mjs";
 import {
-  createNearRpc, createNearWatcher, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
+  createNearRpc, createNearRpcPool, createNearWatcher, openNearLedger, createNearUsdRate, createNearRates, createRefunder, parseNearSecretKey, parseNearToYocto,
 } from "../src/near/index.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 import { createNearFunding } from "../src/near/funding.mjs";
@@ -45,7 +45,8 @@ after(() => { globalThis.fetch = realFetch; });
 
 async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, guardRefunds = false,
   merchantBalance = parseNearToYocto("10"), maintenance, baseUrl, usdcToken, catalogFetch = mock.fetch, now = Date.now,
-  watchPaymentHistory = false, randomInt = () => dust++ } = {}) {
+  watchPaymentHistory = false, randomInt = () => dust++,
+  rpcForChain = chain => createNearRpc({ url: "https://rpc.fake", fetch: chain.fetch }) } = {}) {
   const out = await mkdtemp(join(tmpdir(), "near-gate-out-"));
   await mkdir(out, { recursive: true });
   const chain = createFakeChain({ now });
@@ -56,7 +57,7 @@ async function world({ limits, dust = 137, publicBase, canQuote, fundRun, rate, 
   const file = join(out, "near-state.json");
   const events = [];
   const make = () => {
-    const rpc = createNearRpc({ url: "https://rpc.fake", fetch: chain.fetch });
+    const rpc = rpcForChain(chain);
     const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT, now, watchPaymentHistory });
     const signer = parseNearSecretKey(key.secretKey);
     const refundFunding = guardRefunds ? createNearFunding({ rpc, ledger, accountId: MERCHANT, publicKey: signer.publicKey, network: "testnet" }) : null;
@@ -269,6 +270,57 @@ test("a discovered exact transfer is accepted automatically; top-ups and older t
   assert.equal(w.gate.quote(p.paymentId).status, "paid");
   const result = await call(w, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
   assert.equal(result.structuredContent.receipt.refund.status, "sent");
+});
+
+test("a discovered payment reads existing outcomes and waits for a finalized history peer", async t => {
+  for (const [asset, code] of [["near", "UNKNOWN_TRANSACTION"], ["usdc", "TIMEOUT_ERROR"], ["usdc", "TX_NOT_FINAL"]]) {
+    let clock = Date.now();
+    let archiveReady = false;
+    const lookups = [];
+    const usdcToken = asset === "usdc" ? USDC_CONTRACTS.testnet : undefined;
+    const w = await world({ now: () => clock, usdcToken, rate: createNearRates({ nearUsd: "3.64" }), rpcForChain: chain => createNearRpcPool({
+      urls: ["https://live.test", "https://archive.test"], chainId: "testnet", now: () => clock, maxHeadAgeMs: 90_000,
+      fetch: (url, init) => {
+        const { method, id, params } = JSON.parse(init.body), host = new URL(url).hostname;
+        if (method !== "tx") return chain.fetch(url, init);
+        lookups.push({ host, waitUntil: params.wait_until });
+        if (host === "archive.test" && archiveReady) return chain.fetch(url, init);
+        if (code === "TX_NOT_FINAL") return Response.json({ jsonrpc: "2.0", id, result: { final_execution_status: "EXECUTED" } });
+        return Response.json({ jsonrpc: "2.0", id, error: { code: -32000, cause: { name: code } } });
+      },
+    }) });
+    const watcher = createNearWatcher({ rpc: w.rpc, ledger: w.ledger, merchantId: MERCHANT,
+      pendingQuotes: w.gate.pendingQuotes, observeTransfer: w.gate.observeTransfer,
+      tokenContracts: usdcToken ? [usdcToken] : [], now: () => clock, schedule: () => null });
+    t.after(() => watcher.stop());
+    await watcher.start();
+    const quote = await call(w, "idea-poster", { ...INPUTS, _pay_with: asset });
+    const p = quote.structuredContent.payment;
+    clock += 1_000;
+    const tx = usdcToken ? w.chain.ftTransfer(usdcToken, PAYER, MERCHANT, BigInt(p.amountAtomic))
+      : w.chain.transfer(PAYER, MERCHANT, BigInt(p.amountYocto));
+    const manual = await w.gate.confirmPayment(p.paymentId, tx, PAYER);
+    assert.equal(manual.status, "pending");
+    assert.deepEqual(lookups, [{ host: "live.test", waitUntil: "FINAL" }]);
+    lookups.length = 0;
+    const before = w.ledger.getMeta("paymentWatch");
+    await watcher.tick();
+    assert.equal(w.gate.quote(p.paymentId).status, "pending");
+    assert.deepEqual(w.ledger.getMeta("paymentWatch"), before);
+    assert.deepEqual(lookups, [{ host: "live.test", waitUntil: "NONE" }, { host: "archive.test", waitUntil: "NONE" }]);
+    archiveReady = true;
+    lookups.length = 0;
+    const runs = mock.runs();
+    await watcher.tick();
+    assert.equal(watcher.status().listening, true);
+    assert.equal(w.gate.quote(p.paymentId).status, "paid");
+    assert.equal(w.gate.quote(p.paymentId).txHash, tx);
+    assert.equal(lookups.filter(({ host }) => host === "archive.test").length, usdcToken ? 2 : 1);
+    assert.ok(lookups.every(({ waitUntil }) => waitUntil === "NONE"));
+    await watcher.tick();
+    assert.equal(w.events.filter(event => event.event === "paid").length, 1);
+    assert.equal(mock.runs(), runs);
+  }
 });
 
 test("watcher replay repairs an expired quote with an old unattached claim after final proof", async () => {

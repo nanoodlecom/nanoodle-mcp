@@ -21,18 +21,21 @@ function hasKey(obj, key) {
 }
 
 /**
- * `txTimeoutMs` bounds the `tx` call. A `FINAL` wait for a hash the network has
- * never seen is held by the RPC node (about 30 s on public testnet RPC) before it
- * answers TIMEOUT_ERROR, so the default leaves room for that answer.
+ * The explicit wallet lookup waits for finality with a 40-second default.
+ * A receipt discovered in a finalized block uses an immediate history lookup
+ * with the RPC timeout and still requires a FINAL transaction outcome.
  */
-export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract = null, txTimeoutMs = 40_000 }) {
+export async function readPaymentTransfer({ rpc, txHash, senderId, merchantId, tokenContract = null, txTimeoutMs,
+  receiptDiscovered = false }) {
   base58Decode(txHash, 32);
   assertNearAccountId(senderId);
   assertNearAccountId(merchantId);
+  const timeoutMs = txTimeoutMs === undefined && !receiptDiscovered ? 40_000 : txTimeoutMs;
 
   let r;
   try {
-    r = await rpc.txStatus({ txHash, senderId, waitUntil: "FINAL", timeoutMs: txTimeoutMs });
+    r = await rpc.txStatus({ txHash, senderId, waitUntil: receiptDiscovered ? "NONE" : "FINAL", timeoutMs,
+      ...(receiptDiscovered && { receiptDiscovered }) });
   } catch (e) {
     if (NOT_FOUND.has(e?.code)) throw new NearError("TX_NOT_FOUND", `transaction ${txHash} was not found as final on this network`, { cause: e });
     if (TRANSPORT.has(e?.code)) throw new NearError("RPC_UNAVAILABLE", "the NEAR RPC could not be reached; try again", { cause: e });
