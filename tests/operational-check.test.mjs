@@ -2503,7 +2503,7 @@ test("fresh Market prices and waiting USDC work must fit the same Nano pool", as
     Object.assign(f.states["/state/funding-health.json"], {
       liabilitiesRaw: "0", reservedRaw: String(10n * raw - available), activeRuns: 1, oldestStartedAt: NOW - 1000,
     });
-    if (mode === "provider-key") f.config.providerUsesWallet = false;
+    if (mode === "provider-key") useApiProvider(f);
     const original = f.deps.computePrice;
     f.deps.computePrice = async (args, options) => {
       if (args.inputs?.Idea !== privateIdea) return original(args, options);
