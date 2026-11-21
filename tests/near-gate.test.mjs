@@ -722,6 +722,28 @@ test("restart after settlement was recorded but before the refund intent finishe
   assert.equal(replay.structuredContent.receipt.charged.yocto, CHARGED.toString());
 });
 
+test("restart before the refund intent preserves the completed graph and media result", async () => {
+  const w = await world();
+  const { p, pay } = await quoteAndPay(w, "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS });
+  w.refunder.refund = async () => { throw new Error("simulated stop before refund"); };
+  const balance = w.chain.balance(PAYER);
+  const runs = mock.runs();
+  await assert.rejects(pay(), /simulated stop before refund/);
+  const pending = w.ledger.getQuote(p.paymentId);
+  assert.equal(pending.status, "running");
+  assert.equal(pending.workflow.status, "succeeded");
+  const media = pending.result.content.find(part => part.text.includes("/out/"));
+  assert.ok(media);
+
+  const restarted = await w.restart();
+  const restored = restarted.gate.quote(p.paymentId);
+  assert.equal(restored.status, "settled");
+  assert.deepEqual(restored.workflow, pending.workflow);
+  assert.ok(restarted.gate.result(p.paymentId).content.some(part => part.text === media.text));
+  assert.equal(w.chain.balance(PAYER) - balance, REFUND, "only the original change was refunded");
+  assert.equal(mock.runs(), runs + 1, "recovery never executes the graph again");
+});
+
 test("concurrent duplicate paying calls run once", async () => {
   const w = await world();
   const { pay } = await quoteAndPay(w, "run_noodle", { graph: WORKED_GRAPH, inputs: INPUTS });
