@@ -44,8 +44,8 @@ export function selectFundingPause(pause, now) {
 
 /** Private telemetry, never financial authority. Snapshot only reads chain and
  * live reservation state; this timer signs nothing and runs no models/work. */
-export async function startFundingReport({ outDir, snapshot, sources, writerProtection = null, durableState = null,
-  mediaRetentionMs, intervalMs = 5_000, now = Date.now, monotonicNow = () => performance.now(), log = () => {} }) {
+export async function startFundingReport({ outDir, snapshot, sources, rpcStatus = null, writerProtection = null,
+  durableState = null, mediaRetentionMs, intervalMs = 5_000, now = Date.now, monotonicNow = () => performance.now(), log = () => {} }) {
   const runTimeoutMs = hostedRunTimeout();
   const identity = maintenanceProcessIdentity();
   const file = join(outDir, "funding-health.json"), temporary = file + ".tmp";
@@ -124,6 +124,13 @@ export async function startFundingReport({ outDir, snapshot, sources, writerProt
         }
       } catch (error) {
         report = { ok: false, code: fundingReportFailure(readFailureCodes.get(error?.code)) };
+        try {
+          const rpc = rpcStatus?.();
+          if (rpc && typeof rpc.configuration === "string" && /^[a-f0-9]{64}$/.test(rpc.configuration)) {
+            report.nanoRpc = { configuration: rpc.configuration, configuredPeers: rpc.configuredPeers,
+              cooldowns: selectRpcCooldowns(rpc.cooldowns, rpc.configuredPeers, now()) };
+          }
+        } catch { /* Preserve the funding failure even if advisory data cannot be read. */ }
       }
       const checkedAt = now();
       const expiresAt = Math.min(checkedAt + FUNDING_REPORT_MAX_AGE_MS, readExpiresAt);

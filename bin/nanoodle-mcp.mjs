@@ -417,6 +417,7 @@ async function main() {
           protectTransfers: guardedFunding,
           verifyRpcReads: guardedFunding,
           checkpointFile,
+          fundingReportFile: guardedFunding ? join(resolvedOut, "funding-health.json") : null,
           assertWriter: () => {
             if (!writerLocks) throw Error("Payment writer protection not acquired");
             writerLocks.assertHeld();
@@ -732,6 +733,7 @@ async function main() {
       const { startFundingReport } = await import("../src/funding-report.mjs");
       await startFundingReport({ outDir: resolvedOut,
         snapshot: async () => ({ ...await wallet.ops.fundingReport(), creatorReservations: near?.creatorReservations === true }),
+        rpcStatus: wallet.ops.fundingReadStatus,
         sources: fundingSources, durableState: moneyState,
         mediaRetentionMs: Number.isFinite(outTtlMs) ? outTtlMs : 0,
         writerProtection: () => {
