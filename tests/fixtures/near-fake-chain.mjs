@@ -392,7 +392,7 @@ const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8B
  * 402 invoice of 0.01 XNO for $0.0095 (1 XNO = $0.95) and is not counted as a run.
  * `fetch` serves in-process callers; `listen()` serves a child process.
  */
-export function nanoGptMock({ beforeChat = async () => {}, decisionAnswer, catalogs = WORKED_CATALOGS, walletPayments = false, walletPaymentSeen = null } = {}) {
+export function nanoGptMock({ beforeChat = async () => {}, decisionAnswer, catalogs = WORKED_CATALOGS, walletPayments = false, walletPaymentSeen = null, backupKey = null } = {}) {
   let chatRuns = 0;
   const chatBodies = [];
   const REPLY = "A lighthouse at dawn, gold light on wet rocks, gulls, long lens";
@@ -411,6 +411,14 @@ export function nanoGptMock({ beforeChat = async () => {}, decisionAnswer, catal
       return invoice.response;
     }
     const decision = method === "POST" && p === "/api/v1/decisions" && typeof decisionAnswer === "function";
+    if (backupKey && method === "POST" && ["/api/v1/chat/completions", "/v1/images/generations"].includes(p)) {
+      if (headers["x-x402"] === "true") {
+        const amountUsd = p.includes("chat/completions") ? "0.00041" : "0.009";
+        return json(402, { payment: { paymentId: `fixture-backup-${++invoiceSequence}`, amountUsd,
+          accepted: [{ scheme: "lightning-l402" }] } });
+      }
+      if (headers["x-api-key"] !== backupKey) return json(401, { error: "fixture requires the backup key" });
+    }
     if (walletPayments && method === "POST" && (decision || ["/api/v1/chat/completions", "/v1/images/generations"].includes(p))) {
       if (headers.authorization || headers["x-api-key"]) throw new Error("wallet fixture received an unexpected API key");
       if (String(headers["x-x402"] || "") === "true") {

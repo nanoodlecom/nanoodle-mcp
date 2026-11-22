@@ -962,10 +962,11 @@ async function startNearMode({
   } catch (e) { fail(e.message); }
   // NEAR/USD, XNO/USD and the swap rate derived from them. When runs are paid
   // from the Nano wallet, XNO/USD is required to quote; with an API key it is informational.
+  const walletFundsModels = modelPayment === "wallet" || modelPayment === "wallet_with_key_backup";
   let rates;
   try {
     rates = near.createNearRates({
-      nearUsd: usdText, xnoUsd: xnoUsdText, spreadBps: spreadText, xnoRequired: modelPayment === "wallet",
+      nearUsd: usdText, xnoUsd: xnoUsdText, spreadBps: spreadText, xnoRequired: walletFundsModels,
       refreshMs: refreshS * 1000, nanoGptBase: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, log,
     });
   } catch (e) { fail(e.message); }
@@ -1012,7 +1013,7 @@ async function startNearMode({
   const { createAuthorPayouts } = await import("../src/author-payouts.mjs");
   const authorPayouts = nanoOps ? createAuthorPayouts({ ledger, ops: nanoOps, log, usage, maintenance,
     marketPayoutMatches: payout => fundingSources?.marketPayoutMatches(payout) ?? true }) : null;
-  const fundRun = modelPayment === "wallet" || modelPayment === "api_key" ? nanoOps?.withFunding ?? null : null;
+  const fundRun = walletFundsModels || modelPayment === "api_key" ? nanoOps?.withFunding ?? null : null;
   const creatorReservations = modelPayment === "api_key" && fundRun !== null;
   let watcher = null;
   const gate = createNearGate({

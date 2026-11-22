@@ -11,11 +11,15 @@ import { createFakeChain, nanoGptMock, throwawayNearKey, WORKED_GRAPH } from "./
 import { callMcp } from "../src/near-site-browser.mjs";
 import { USDC_CONTRACTS } from "../src/near/ft.mjs";
 
-for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, execution, change and replay ${optedIn ? "with creator payout" : "without creator payout"}`, { timeout: 30_000 }, async () => {
+for (const { optedIn, backupKey, scenario } of [
+  { optedIn: true, scenario: "with creator payout" },
+  { optedIn: false, scenario: "without creator payout" },
+  { optedIn: false, backupKey: "fixture-backup-key", scenario: "with a wallet and backup API key" },
+]) test(`hosted workflows: NEAR/USDC locks, execution, change and replay ${scenario}`, { timeout: 30_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "hosted-e2e-")); await mkdir(join(dir, "graphs"));
   await writeFile(join(dir, "graphs", "poster.json"), JSON.stringify(WORKED_GRAPH));
-  const chain = createFakeChain(), key = await throwawayNearKey(), provider = nanoGptMock();
-  const node = await nanoNode({ balanceRaw: optedIn ? (10n ** 30n).toString() : "0" });
+  const chain = createFakeChain(), key = await throwawayNearKey(), provider = nanoGptMock({ backupKey });
+  const node = await nanoNode({ balanceRaw: optedIn || backupKey ? (10n ** 30n).toString() : "0" });
   chain.addAccount("merchant.testnet", 10n ** 25n, key.publicKey); chain.addAccount("payer.testnet", 10n ** 25n);
   chain.addFt(USDC_CONTRACTS.testnet, { "merchant.testnet": 0n, "payer.testnet": 10_000_000n });
   await chain.listen(); await provider.listen();
@@ -30,7 +34,9 @@ for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, ex
   }
   const child = spawn(process.execPath, [new URL("../bin/nanoodle-mcp.mjs", import.meta.url).pathname, "--graphs", join(dir, "graphs"), "--out", join(dir, "out"), "--serve", `127.0.0.1:${port}`, "--public-url", base,
     "--near-merchant", "merchant.testnet", "--near-network", "testnet", "--near-rpc", chain.url, "--near-usd", "3.64", "--xno-usd", "0.5", "--nano-rpc", node.url, "--no-local-work"], {
-    env: { PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_API_KEY: "test", NANOGPT_BASE_URL: provider.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANO_SEED: "0".repeat(64), ...(optedIn ? { NANOODLE_STATE_POLICY: policyFile } : {}) }, stdio: ["ignore", "ignore", "pipe"],
+    env: { PATH: process.env.PATH, HOME: dir, NANOODLE_WRITER_LOCK_DIR: join(dir, "writer-locks"), NANOGPT_BASE_URL: provider.url, NEAR_PRIVATE_KEY: key.secretKey, NEAR_USDC: "1", NANO_SEED: "0".repeat(64),
+      ...(backupKey ? { NANOGPT_FALLBACK_API_KEY: backupKey } : { NANOGPT_API_KEY: "test" }),
+      ...(optedIn ? { NANOODLE_STATE_POLICY: policyFile } : {}) }, stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = ""; child.stderr.on("data", data => { stderr += data; });
   try {
@@ -53,7 +59,7 @@ for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, ex
       const paid = await (await fetch(payment.statusUrl + "?wait=1")).json(); assert.equal(paid.status, "paid"); assert.equal(paid.tool, "run_workflow"); assert.match(paid.next, /Call run_workflow/);
       // Two subscribers can resume the same quote; the shared gate executes it once.
       const results = await Promise.all([request("run_workflow", { ...args, _payment_id: payment.paymentId }, { onWorkflow: state => snapshots.push(state) }), request("run_workflow", { ...args, _payment_id: payment.paymentId })]);
-      for (const result of results) { assert.equal(result.structuredContent.receipt.outcome, "succeeded"); if (optedIn) assert.equal(result.structuredContent.receipt.authorPayout.to, author);
+      for (const result of results) { assert.equal(result.structuredContent.receipt.outcome, "succeeded", JSON.stringify(result.content)); if (optedIn) assert.equal(result.structuredContent.receipt.authorPayout.to, author);
         else assert.equal(result.structuredContent.receipt.authorPayout, undefined);
         const receipt = result.structuredContent.receipt;
         assert.equal(receipt.refund.to, "payer.testnet"); assert.equal(receipt.refund.status, "sent");
@@ -61,5 +67,7 @@ for (const optedIn of [true, false]) test(`hosted workflows: NEAR/USDC locks, ex
       const saved = await (await fetch(`${base}/near/result/${payment.paymentId}`)).json(); assert.equal(saved.structuredContent.receipt.outcome, "succeeded");
     }
     assert.equal(provider.runs(), 2); assert.ok(snapshots.some(s => s.nodes.some(n => n.status === "running"))); assert.ok(snapshots.some(s => s.finishedAt));
+    const rates = await (await fetch(base + "/rates")).json();
+    assert.equal(rates.xnoRequired, Boolean(backupKey));
   } finally { child.kill("SIGKILL"); await chain.close(); await provider.close(); await node.close(); }
 });
