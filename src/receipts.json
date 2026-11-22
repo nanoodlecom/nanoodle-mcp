@@ -9,6 +9,8 @@
       "title": "Song in, music video out: a 61-cent tin robot that dances to its own track",
       "ability": "song-to-music-video",
       "thumb": "https://media.nanoodle.com/subnano/2026-10-21-song-to-music-video/poster.webp",
+      "thumbWidth": 960,
+      "thumbHeight": 540,
       "local": "img/tin-robot.webp",
       "blurb": "Feed in a song, get back a music video: a tin robot dancing to its own track for 61 cents, chorus cut."
     },

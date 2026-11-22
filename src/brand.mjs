@@ -2,7 +2,7 @@ export const NANOODLE_BRAND = "/brand/nanoodle-v1.0.0";
 export const NANO_BRAND_HEAD =
   `<link rel="stylesheet" href="${NANOODLE_BRAND}/tokens/tokens.css"><link rel="stylesheet" href="${NANOODLE_BRAND}/fonts/fonts.css">`;
 export const NANO_CONNECTOR = `<img src="${NANOODLE_BRAND}/assets/connector.png" alt="" width="26" height="26">`;
-export const NANO_WORDMARK = `<img class="product-wordmark" src="${NANOODLE_BRAND}/assets/wordmark-gradient.svg" alt="nanoodle">`;
+export const NANO_WORDMARK = `<img class="product-wordmark" src="${NANOODLE_BRAND}/assets/wordmark-gradient.svg" width="8727" height="1517" alt="nanoodle">`;
 export const NANO_SURFACE_CSS = `
   :root {
     color-scheme:dark;

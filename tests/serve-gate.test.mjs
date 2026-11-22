@@ -5,6 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile, readFile, mkdir, link, symlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -2300,7 +2301,7 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
     assert.match(html, /grok mcp add --transport http noodles http:\/\/pay\.test\/mcp/);
     assert.match(html, /data-client="claude"/);
     assert.match(html, /data-client="grok"/);
-    assert.match(html, /selectClient/);
+    assert.match(html, /<script defer src="\/nano-landing\.js\?v=[a-f0-9]+"/);
     assert.match(html, /402 payment quote/);
     assert.match(html, /You can connect without an account or an API key\./);
     assert.match(html, /href="\/llms\.txt"/);
@@ -2308,6 +2309,81 @@ test("landing hero: connect command, payment flow strip, llms.txt pointer", asyn
   } finally {
     server.close();
   }
+});
+
+test("Nano edge landing publishes crawl metadata, named media links and landing-only headers", async (t) => {
+  const names = ["character-sprites", "image-model-arena", "mix-the-references", "photo-to-video", "talking-avatar"];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "nanoodle-mcp", version: "0",
+    listTools: () => names.map(name => ({ name, description: "Sample workflow", inputSchema: { type: "object" } })),
+    callTool: () => assert.fail("landing and discovery must never execute tools"),
+    gate: {}, publicBase: "https://mcp.nanoodle.com", log: () => {},
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const canonical = "https://nano.nanoodle.com/";
+  const headers = { "X-Nanoodle-Surface": "nano" };
+  const response = await fetch(base + "/?campaign=test", { headers });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /^text\/html/);
+  assert.equal(response.headers.get("vary"), "X-Nanoodle-Surface");
+  const html = await response.text();
+  assert.ok(html.includes(`<link rel="canonical" href="${canonical}">`));
+  assert.ok(html.includes(`property="og:url" content="${canonical}"`));
+  const title = html.match(/<title>([^<]+)<\/title>/)[1];
+  assert.match(title, /Nanoodle MCP.*Nano over x402/);
+  assert.equal(html.match(/property="og:title" content="([^"]+)"/)[1], title);
+  const schema = JSON.parse(html.match(/<script type="application\/ld\+json">([^<]+)<\/script>/)[1]);
+  assert.equal(schema["@context"], "https://schema.org");
+  assert.equal(schema["@type"], "WebApplication");
+  assert.equal(schema.url, canonical);
+  const images = [...html.matchAll(/<img\b[^>]*>/g)].map(match => match[0]);
+  assert.equal(images.length, 9);
+  for (const image of images) assert.match(image, /width="[1-9]\d*" height="[1-9]\d*"/);
+  assert.match(images[0], /connector\.png" alt=""/);
+  const imageLinks = [...html.matchAll(/<a\b([^>]+)>((?:<img\b[^>]*>)+)<\/a>/g)];
+  assert.equal(imageLinks.length, 7);
+  for (const link of imageLinks) assert.match(link[1], /aria-label="[^"]+"/);
+
+  const csp = response.headers.get("content-security-policy");
+  const style = html.match(/<style>([\s\S]+?)<\/style>/)[1];
+  assert.ok(csp.includes(`'sha256-${createHash("sha256").update(style).digest("base64")}'`));
+  assert.match(csp, /script-src 'self';/);
+  assert.doesNotMatch(html, /<\w+[^<>]*\sonclick=/);
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.equal(response.headers.get("referrer-policy"), "strict-origin-when-cross-origin");
+  const scriptUrl = html.match(/<script defer src="([^"]+)"/)[1];
+  const script = await fetch(base + scriptUrl, { headers });
+  assert.equal(script.status, 200);
+  assert.match(script.headers.get("content-type"), /^text\/javascript/);
+  assert.match(await script.text(), /navigator\.clipboard\.writeText/);
+
+  const robots = await fetch(base + "/robots.txt", { headers });
+  assert.equal(robots.status, 200);
+  assert.match(robots.headers.get("content-type"), /^text\/plain/);
+  assert.equal(await robots.text(), `Sitemap: ${canonical}sitemap.xml\n`);
+  const sitemap = await fetch(base + "/sitemap.xml", { headers });
+  assert.equal(sitemap.status, 200);
+  assert.match(sitemap.headers.get("content-type"), /^application\/xml/);
+  const locations = Array.from((await sitemap.text()).matchAll(/<loc>([^<]+)<\/loc>/g), row => row[1]);
+  assert.deepEqual(locations, [canonical]);
+  const head = await fetch(base + "/", { method: "HEAD", headers });
+  assert.equal(head.headers.get("content-security-policy"), csp);
+  assert.equal(await head.text(), "");
+
+  const upstream = await fetch(base + "/");
+  assert.equal(upstream.headers.get("content-security-policy"), null);
+  assert.doesNotMatch(await upstream.text(), /<link rel="canonical"/);
+  assert.equal((await fetch(base + "/sitemap.xml")).status, 404);
+  const discovery = await fetch(base + "/llms.txt", { headers });
+  assert.equal(discovery.headers.get("content-security-policy"), null);
+  assert.match(await discovery.text(), /https:\/\/mcp\.nanoodle\.com\/mcp/);
+  const mcp = await fetch(base + "/mcp", {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+  });
+  assert.equal(mcp.headers.get("content-security-policy"), null);
+  assert.deepEqual((await mcp.json()).result.tools.map(tool => tool.name), names);
 });
 
 test("landing carries OG/social meta and the favicon; brand assets are served", async () => {
@@ -2333,7 +2409,7 @@ test("landing carries OG/social meta and the favicon; brand assets are served", 
     // favicon links + the icon sits next to the brand name
     assert.match(html, /rel="icon" href="\/favicon\.ico"/);
     assert.match(html, /rel="apple-touch-icon"/);
-    assert.match(html, /<a class="brand" href="\/"><img src="\/favicon\.png"/);
+    assert.match(html, /<a class="brand" href="\/" aria-label="t home"><img src="\/favicon\.png"/);
 
     // the assets themselves are served with real bytes and the right type
     for (const [path, type] of [
