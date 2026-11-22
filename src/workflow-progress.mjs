@@ -42,12 +42,13 @@ export function createWorkflowProgress(graph, { publish = () => {}, now = Date.n
       send();
     },
     finish(result, error) {
+      if (state.status !== "running") return snapshot();
       for (const node of state.nodes) {
         const rec = result?.nodes?.[node.id];
         if (terminal.has(rec?.status)) { node.status = rec.status; if (Number.isFinite(rec.ms)) node.ms = rec.ms; }
         else if (!terminal.has(node.status)) node.status = error ? "error" : "skipped";
       }
-      state.status = error || state.nodes.some(n => n.status === "error") ? "failed" : "succeeded";
+      state.status = error ? "failed" : "succeeded";
       state.finishedAt = now(); send(); return snapshot();
     },
   };
@@ -57,7 +58,10 @@ export function workflowMessage(state) {
   const finished = state.nodes.filter(n => terminal.has(n.status)).length;
   const active = state.nodes.filter(n => n.status === "running");
   const step = active.map(n => `${n.name}${n.detail === "queued" ? " (provider queue)" : ""}`).join(", ");
-  return `${finished}/${state.nodes.length} steps finished${step ? ` · Running: ${step}` : state.status === "running" ? " · Preparing next step" : ` · Workflow ${state.status}`}`;
+  const message = step ? `Running: ${step}`
+    : state.status !== "running" ? `Workflow ${state.status}`
+    : finished === state.nodes.length ? "Preparing results" : "Preparing next step";
+  return `${finished}/${state.nodes.length} steps finished · ${message}`;
 }
 
 /** Layer a DAG by its dependencies, including parallel branches and joins.

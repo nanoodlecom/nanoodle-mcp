@@ -164,6 +164,22 @@ test("saved, custom and Market execution use the same hosted timeout", async t =
   await assert.rejects(runner.run({ pricing: priced.pricing, inputs: priced.inputs, outDir: dir }), /hosted execution limit/);
 });
 
+test("a funded workflow preflight refusal reports one terminal failure without executing", async t => {
+  const nano = nanoGptMock(); await nano.listen(); t.after(() => nano.close());
+  const dir = await mkdtemp(join(tmpdir(), "hosted-preflight-progress-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "poster.json"), JSON.stringify(WORKED_GRAPH));
+  const registry = await loadTools({ dirs: [dir], apiKey: "fixture", baseUrl: nano.url, outDir: dir, remote: true });
+  const snapshots = [];
+  await assert.rejects(registry.callTool({ name: "poster", arguments: { Idea: "a river" } }, {
+    fundedMaxUsd: 0.001, workflow: state => snapshots.push(state),
+  }), { code: "QUOTE_BUDGET_EXCEEDED" });
+  assert.equal(nano.runs(), 0);
+  assert.deepEqual(snapshots.map(state => state.status), ["running", "failed"]);
+  assert.ok(snapshots.at(-1).finishedAt);
+  assert.ok(snapshots.at(-1).nodes.every(node => node.startedAt === undefined));
+});
+
 test("hosted saved and custom graphs use a backup key only after an unpaid provider quote", async t => {
   const providerCalls = [];
   let quotes = 0;
@@ -244,9 +260,15 @@ test("the deadline includes output downloads after the model has completed", asy
   const graph = { v: 1, nodes: [{ id: "i", type: "image", fields: { model: "fixture/image", prompt: "a river", size: "1024x1024" } }], links: [] };
   await writeFile(join(dir, "image.json"), JSON.stringify(graph));
   const registry = await loadTools({ dirs: [dir], apiKey: "fixture", baseUrl: base, outDir: dir, remote: true, runTimeoutMs: 500 });
-  await assert.rejects(registry.callTool({ name: "image", arguments: {} }), /hosted execution limit/);
+  for (const params of [{ name: "image", arguments: {} }, { name: "run_noodle", arguments: { graph } }]) {
+    const snapshots = [];
+    await assert.rejects(registry.callTool(params, { workflow: state => snapshots.push(state) }), /hosted execution limit/);
+    assert.equal(snapshots[0].status, "running");
+    assert.deepEqual(snapshots.filter(state => state.status !== "running").map(state => state.status), ["failed"]);
+    assert.equal(snapshots.at(-1).nodes[0].status, "done", "artifact failure preserves the completed model step");
+  }
   const runner = createWorkflowRunner({ apiKey: "fixture", baseUrl: base, budgetUsd: 1, runTimeoutMs: 500 });
   const priced = await runner.price({ graph }); assert.equal(priced.ok, true);
   await assert.rejects(runner.run({ pricing: priced.pricing, inputs: priced.inputs, outDir: dir }), /hosted execution limit/);
-  assert.equal(models, 2); assert.equal(downloads, 2, "both engines completed and the artifact read was cancelled");
+  assert.equal(models, 3); assert.equal(downloads, 3, "each model completed and each artifact read was cancelled");
 });

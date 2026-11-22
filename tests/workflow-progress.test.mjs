@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createWorkflowProgress, layoutWorkflow } from "../src/workflow-progress.mjs";
+import { createWorkflowProgress, layoutWorkflow, workflowMessage } from "../src/workflow-progress.mjs";
 import { displayAmount } from "../src/workflow-view.mjs";
 
 const graph = { nodes: [
@@ -43,6 +43,20 @@ test("execution failures settle unfinished nodes and observer failures never kil
   const result = p.finish(null, Error("PRIVATE ERROR"));
   assert.equal(result.status, "failed"); assert.ok(result.nodes.every(n => n.status === "error"));
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE ERROR/);
+});
+
+test("graph completion waits for output preparation and publishes a single terminal snapshot", () => {
+  const snapshots = [];
+  const p = createWorkflowProgress(graph, { publish: state => snapshots.push(state) });
+  p.event({ type: "node-error", nodeId: "idea" });
+  for (const nodeId of ["a", "b", "join"]) p.event({ type: "node-done", nodeId });
+  assert.match(workflowMessage(p.snapshot()), /Preparing results$/);
+
+  const final = p.finish();
+  assert.equal(final.status, "succeeded", "a successful call can retain an internal node error");
+  assert.equal(final.nodes[0].status, "error");
+  assert.deepEqual(p.finish(null, Error("late failure")), final);
+  assert.equal(snapshots.filter(state => state.status !== "running").length, 1);
 });
 
 test("receipt display rounds for reading without changing exact payment values", () => {
