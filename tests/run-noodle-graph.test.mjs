@@ -6,10 +6,11 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { loadTools, editorShareUrl, noodleGuide } from "../src/tools.mjs";
 import { createChargeGate } from "../src/gate.mjs";
 import { WORKED_GRAPH, nanoGptMock } from "./fixtures/near-fake-chain.mjs";
@@ -43,11 +44,19 @@ test("a local model file drives both the sprite preview and turntable MP4", asyn
       { id: "layers", from: { node: "slice", port: "sheet" }, to: { node: "view", port: "sheet" } },
     ],
   };
-  const result = await registry.callTool({ name: "run_noodle", arguments: { graph, inputs } });
-  assert.match(text(result), /^View: saved .*\.png$/m);
+  const terminal = [];
+  const result = await registry.callTool({ name: "run_noodle", arguments: { graph, inputs } }, {
+    workflow(state) {
+      if (state.status !== "running") terminal.push({ status: state.status, files: readdirSync(outDir) });
+    },
+  });
+  const preview = text(result).match(/^View: saved (.*\.png)$/m);
   const video = text(result).match(/^View\.video: saved (.*\.mp4)$/m);
+  assert.ok(preview, text(result));
   assert.ok(video, text(result));
   assert.equal((await readFile(video[1])).toString("ascii", 4, 8), "ftyp");
+  assert.deepEqual(terminal.map(state => state.status), ["succeeded"]);
+  for (const artifact of [preview[1], video[1]]) assert.ok(terminal[0].files.includes(basename(artifact)));
 });
 
 test("free mode: run_noodle runs an inline graph object (and the same graph as a JSON string)", async () => {

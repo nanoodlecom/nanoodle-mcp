@@ -694,7 +694,8 @@ export function describeRunFailure(e) {
  * the one they sent. Trim-and-disclose is the contract; without the disclose half it
  * is just a silent edit.
  *
- * Returns { onProgress, notices } — pass onProgress to wf.run and notices to emitResult.
+ * Pass onProgress to wf.run and notices to emitResult. Finish once those outputs
+ * are ready to return, or any part of the call has failed.
  */
 export function runNotices(wf, ctx = null) {
   const progress = createWorkflowProgress(wf.graph, { publish: state => ctx?.workflow?.(state) });
@@ -830,15 +831,6 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
 }
 
 /**
- * tools/call handler for run_noodle: decode a share link, build the workflow, run it.
- *
- * Argument-shape problems (missing url, wrong types, unknown input key) throw
- * ParamsError (→ -32602). Everything about the link's *contents* — a bad or
- * truncated link, the internal #ga= handoff, a graph needing unknown nodes,
- * or a run failure — throws a plain error the server surfaces as
- * an isError tool result, so the agent gets a readable message, never a crash.
- */
-/**
  * Everything run_noodle does before it runs: read `url` or `graph` and
  * `inputs`, decode, load the catalogs, build the Workflow and resolve the
  * inputs (a missing or unknown input throws ParamsError, → -32602). Nothing
@@ -881,14 +873,6 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
   }
   const inputs = await resolveInputs(wf, r.inputs, `run_noodle (${r.source === "graph" ? "inline graph" : r.url})`);
   return { graph: r.graph, workflowGraph: wf.graph, inputs, wf, catalogs, source: r.source, url: r.url };
-}
-
-async function runNoodle(params, { prepare, outDir, publicBase, ctx }) {
-  const { wf, inputs } = await prepare(params.arguments, { allowShortLinks: true });
-  const { onProgress, notices, finish } = runNotices(wf, ctx);
-  const result = await wf.run(inputs, hostedRunOptions({ onProgress })).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
-  finish(result);
-  return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices });
 }
 
 /**
@@ -1322,9 +1306,24 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
 
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
     async callTool(params, ctx = null) {
+      let progress, runResult;
+      const runWorkflow = async (wf, inputs) => {
+        try {
+          runResult = await wf.run(inputs, hostedRunOptions({ onProgress: progress.onProgress }));
+          return runResult;
+        } catch (error) {
+          runResult = error?.result;
+          throw describeRunFailure(error);
+        }
+      };
       const execute = async () => {
         if (params != null && typeof params === "object" && !Array.isArray(params)) {
-          if (params.name === RUN_NOODLE_NAME) return runNoodle(params, { prepare: registry.prepareRunNoodle, outDir, publicBase, ctx });
+          if (params.name === RUN_NOODLE_NAME) {
+            const { wf, inputs } = await registry.prepareRunNoodle(params.arguments, { allowShortLinks: true });
+            progress = runNotices(wf, ctx);
+            const result = await runWorkflow(wf, inputs);
+            return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices: progress.notices });
+          }
           if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
           if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
         }
@@ -1342,7 +1341,8 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
 
         // Everything past this point is a run failure, not a protocol error → isError content.
         const t0 = Date.now();
-        const { onProgress, notices, finish } = runNotices(tool.wf, ctx);
+        progress = runNotices(tool.wf, ctx);
+        const { notices } = progress;
         // humanize-comment: a per-run Workflow whose fetch adds the writer fallback,
         // dash fix and near-copy re-ask (src/humanize.mjs); everything else is unchanged.
         let runWf = tool.wf, hf = null;
@@ -1417,8 +1417,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
           hf.state.onLate = (c) => log(`humanize-comment: late x402 settlement for writer ${c.letter} (${c.kind}), invoice ${c.paymentId}, $${c.amountUsd}; result not used`);
           runWf = Workflow.fromJSON(tool.rawText, { apiKey, payment, baseUrl, quiet: true, catalog: tool.wf.catalog, fetch: hf.fetch });
         }
-        const result = await runWf.run(inputs, hostedRunOptions({ onProgress })).catch((e) => { finish(e.result, e); throw describeRunFailure(e); });
-        finish(result);
+        const result = await runWorkflow(runWf, inputs);
         if (tool.humanize) {
           notices.push(...humanizeRunNotes(hf.state));
           const note = rebuildHumanizeResult(runWf, result, tool.humanize, hf.state.answered, hf.state);
@@ -1437,7 +1436,18 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
         await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
         return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
       };
-      return executionLimit === null ? execute() : withHostedRun(execute, executionLimit);
+      try {
+        const output = await (executionLimit === null ? execute() : withHostedRun(execute, executionLimit));
+        if (progress) {
+          // If a payment gate owns the hosted scope, its deadline still applies here.
+          hostedRunOptions();
+          progress.finish(runResult);
+        }
+        return output;
+      } catch (error) {
+        progress?.finish(runResult, error);
+        throw error;
+      }
     },
   };
   return registry;
