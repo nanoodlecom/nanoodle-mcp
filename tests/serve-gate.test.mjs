@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMaintenanceBarrier } from "../src/maintenance.mjs";
+import { commitCostObservations } from "../src/cost-sidecar.mjs";
 import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain, probeX402Pair } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd, loadTools } from "../src/tools.mjs";
@@ -1920,6 +1921,51 @@ test("initialize and /version report the git short sha of this checkout", async 
   } finally {
     server.close();
   }
+});
+
+test("HTTP tools, Nano quotes and the landing page read current observed costs", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-quote-cost-refresh-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outDir = join(dir, "out"), costsPath = join(outDir, "costs.json");
+  await writeFile(join(dir, "poster.json"), JSON.stringify(WORKED_GRAPH));
+  const registry = await loadTools({ dirs: [dir], outDir });
+  const gate = makeGate(fakeChain(), { registry });
+  t.after(() => gate.stop());
+  const { listTools, callTool } = gate.wrapRegistry(registry);
+  const server = await serveHttp({ port: 0, name: "t", version: "0", listTools, callTool, gate,
+    refreshCosts: registry.refreshCosts, toolInfo: registry.tools, costs: registry.costs, publicBase: "http://pay.test" });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const mcp = async (method, params) => {
+    const r = await fetch(base + "/mcp", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const { error, result } = await r.json();
+    assert.equal(error, undefined);
+    return result;
+  };
+  const quote = () => mcp("tools/call", { name: "poster", arguments: { Idea: "a lighthouse" } });
+  const observe = (usd, day, ms) => commitCostObservations(costsPath,
+    new Map([["poster", { usd, at: `2026-07-${day}T00:00:00Z`, ms }]]), ["poster"]);
+  const unobserved = await quote();
+  assert.equal(argOf(unobserved).amountUsd, 0.05);
+  assert.doesNotMatch(unobserved.content[0].text, /typically ~/);
+
+  await observe(0.75, 20, 2_000);
+  await observe(0.20, 21, 5_000);
+  const list = await mcp("tools/list");
+  const description = list.tools.find(tool => tool.name === "poster").description;
+  assert.match(description, /last run \$0\.20, ~5s/);
+  assert.match(description, /\$1\.80 deposit/);
+
+  await observe(0.95, 22, 7_000);
+  const current = await quote();
+  assert.equal(argOf(current).amountUsd, 2.28);
+  assert.match(current.content[0].text, /typically ~7s/);
+
+  await observe(0.40, 23, 3_000);
+  assert.match(await (await fetch(base + "/")).text(), /last run \$0\.40, ~3s/);
 });
 
 test("pay page + status endpoint over HTTP", async () => {

@@ -1588,7 +1588,9 @@ export function createChargeGate({
           if (await canQuote() !== true) return errResult(QUOTE_FUNDING_UNAVAILABLE);
           // After validation, so the quote is for a call that will run and matches
           // the arguments the caller will pay for.
+          await registry.refreshCosts?.();
           const price = priceFor(name, args);
+          const etaMs = etaOf(name);
           const pair = await ratePair();
           if (verifyPaymentReads) {
             if (!await paymentReadsReady()) return errResult(QUOTE_READ_UNAVAILABLE);
@@ -1611,7 +1613,7 @@ export function createChargeGate({
             createdAt: now(), expiresAt: now() + QUOTE_TTL_MS,
             ...(isNanoHistoryHeight(confirmedHeight) && { historyAfter: confirmedHeight }),
             status: "pending", unpublished: true, waiters: [],
-            etaMs: etaOf(name),
+            etaMs,
           };
           if (fundRun && canFundQuote) {
             const { maxRaw, overheadRaw } = fundingTerms(q);

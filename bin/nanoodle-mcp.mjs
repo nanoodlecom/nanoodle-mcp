@@ -598,6 +598,7 @@ async function main() {
         name: "nanoodle-mcp",
         version: pkg.version,
         listTools: () => registry.listTools(),
+        refreshCosts: registry.refreshCosts,
         // strip the gate-facing sidecars (costUsd, costExact, textOutput) — stdio clients get pure MCP content
         callTool: (params, ctx) => registry.callTool(params, ctx).then(({ costUsd, costExact, textOutput, ...r }) => r),
       });
@@ -768,6 +769,7 @@ async function main() {
       name: "nanoodle-mcp",
       version: pkg.version,
       listTools,
+      refreshCosts: registry.refreshCosts,
       callTool,
       instructions,
       gate,
@@ -791,6 +793,7 @@ async function main() {
         httpServers.push(await serveHttp({
           host: nearServeHost, port: nearServePort, name: "nanoodle-mcp", version: pkg.version,
           listTools: near ? near.wrapped.listTools : () => [],
+          refreshCosts: registry.refreshCosts,
           callTool: near ? near.wrapped.callTool : unavailable,
           instructions: near ? near.nearInstructions : unavailable().content[0].text,
           paymentNote: near ? near.nearPaymentNote : unavailable().content[0].text,

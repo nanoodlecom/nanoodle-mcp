@@ -115,6 +115,57 @@ test("a failed cost rename leaves the observation in memory and the next write r
   assert.deepEqual(await readdir(outDir), ["costs.json", "costs.json.lock"]);
 });
 
+test("refreshes preserve a pending cost while a write fails and an older read finishes", { timeout: 5_000 }, async t => {
+  const { registry, load, costsPath } = await fixture(t);
+  await writeFile(costsPath, JSON.stringify({ chat: { usd: 0.01, at: "2026-07-20T00:00:00Z" } }));
+  const reading = Promise.withResolvers(), resumeRead = Promise.withResolvers();
+  const writing = Promise.withResolvers(), failWrite = Promise.withResolvers();
+  const originalRead = fs.readFile, originalRename = fs.rename;
+  let delayRead = true, delayWrite = true;
+  t.mock.method(fs, "readFile", async (file, options) => {
+    const text = await originalRead(file, options);
+    if (typeof file?.fd === "number" && delayRead) {
+      delayRead = false;
+      reading.resolve();
+      await resumeRead.promise;
+    }
+    return text;
+  });
+  t.mock.method(fs, "rename", async (src, dest) => {
+    if (dest === costsPath && delayWrite) {
+      delayWrite = false;
+      writing.resolve();
+      await failWrite.promise;
+      throw Error("fixture disk write failure");
+    }
+    return originalRename(src, dest);
+  });
+  syncFsMocks(t);
+  let runs = 0;
+  t.mock.method(registry.tools[0].wf, "run", async () => result(runs++ === 0 ? 0.90 : 0.03));
+
+  const staleRead = registry.refreshCosts();
+  let run;
+  try {
+    await reading.promise;
+    run = call(registry);
+    await writing.promise;
+    await registry.refreshCosts();
+    assert.equal(registry.costs.chat.usd, 0.90);
+  } finally {
+    failWrite.resolve();
+    resumeRead.resolve();
+    await Promise.all([staleRead, run]);
+  }
+
+  assert.match(registry.tools[0].description, /last run \$0\.90/);
+  assert.equal((await load()).costs.chat.usd, 0.01);
+  await call(registry);
+  const reopened = await load();
+  assert.equal(reopened.costs.chat.usd, 0.03);
+  assert.equal(reopened.costs.chat.hiUsd, 0.90);
+});
+
 async function startWriter(t, { dir, outDir }, mode) {
   const helper = new URL("./fixtures/cost-writer.mjs", import.meta.url);
   const child = fork(helper, [dir, outDir, mode], { stdio: ["ignore", "ignore", "pipe", "ipc"], execArgv: [] });

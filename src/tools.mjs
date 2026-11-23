@@ -1191,7 +1191,11 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     }
     Object.assign(t.inputSchema.properties, humanizeExtraProperties());
   }
-  if (tools.length) tools.push(createSfwTool({ spendSource, hosted, remote }));
+  if (tools.length) {
+    const tool = createSfwTool({ spendSource, hosted, remote });
+    tool.description = withObservedCost(tool.description, costs[tool.name]);
+    tools.push(tool);
+  }
   const byName = new Map(tools.map((t) => [t.name, t]));
 
   function refreshCostDescriptions(changedTools) {
@@ -1212,6 +1216,30 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     }
   }
 
+  function applyCostSnapshot(records) {
+    const changedTools = [];
+    for (const [name, record] of Object.entries(records)) {
+      const current = costs[name];
+      // A local observation or another read can finish while this snapshot is in flight.
+      const available = mergeCostRecords(current, record);
+      const merged = mergeCostRecords(available, pendingCosts.get(name));
+      if (merged === current) continue;
+      costs[name] = merged;
+      const tool = byName.get(name);
+      if (tool && renderCost(current) !== renderCost(merged)) changedTools.push(tool);
+    }
+    refreshCostDescriptions(changedTools);
+  }
+
+  async function refreshCosts() {
+    // Atomic rename lets readers see a committed snapshot without taking the writer lock.
+    let records;
+    try { records = await readCostSidecar(costsPath); }
+    catch { return; } // The current observations still serve if the sidecar is unavailable.
+    for (const name of byName.keys()) migrateCostName(records, name);
+    applyCostSnapshot(records);
+  }
+
   function queueCostWrite() {
     if (queuedCostWrite) return queuedCostWrite;
     // At most one active write and one queued batch share the per-process tail.
@@ -1222,15 +1250,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
       for (const [name, record] of observations) {
         if (pendingCosts.get(name) === record) pendingCosts.delete(name);
       }
-      const changedTools = [];
-      for (const [name, record] of Object.entries(stored)) {
-        const current = costs[name];
-        const merged = mergeCostRecords(record, pendingCosts.get(name));
-        costs[name] = merged;
-        const changedTool = byName.get(name);
-        if (changedTool && renderCost(current) !== renderCost(merged)) changedTools.push(changedTool);
-      }
-      refreshCostDescriptions(changedTools);
+      applyCostSnapshot(stored);
     }).catch(error => {
       try { log(`cannot write ${costsPath}: ${error.message}`); }
       catch { /* logging must not wedge the writer */ }
@@ -1261,6 +1281,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     failures,
     /** Live last-observed-cost records by tool name — the --charge gate reads these to sanity-check deposits. */
     costs,
+    refreshCosts,
     /** Up-front per-run cost forecasts by tool name (attachEstimates fills this) — the gate quotes off it before a tool has ever run. */
     estimates: {},
     /** Public catalogs, filled by attachCatalogs. Humanize quotes read prices from here. */

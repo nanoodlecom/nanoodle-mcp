@@ -1339,12 +1339,13 @@ e.g. *"Renders a product mockup image from a one-line feature description."*
 Long text is truncated to 200 characters and whitespace is collapsed, so write
 for one line. Graphs without a comment just get the node chain, as before.
 
-After each successful run the tool's real cost is recorded in
-`<out>/costs.json` (a small `{tool: {usd, at}}` sidecar next to your media
-outputs) and folded into the description as `last run $X` — observed, not
-estimated. The server announces the change with a
-`notifications/tools/list_changed` notification, so MCP clients that honor it
-show updated prices mid-session; others catch up on restart.
+After each successful run the server records the tool's observed cost in
+`<out>/costs.json` and includes it in the tool description as `last run $X`.
+The stdio server announces description changes with a
+`notifications/tools/list_changed` notification. A fresh `tools/list` request
+reads committed observations, including updates from other MCP processes that
+share the output directory. The HTTP landing page and new Nano quotes also
+read those observations.
 MCP processes sharing a local output directory coordinate cost updates with
 `costs.json.lock`. Leave that file in place while the processes are running.
 

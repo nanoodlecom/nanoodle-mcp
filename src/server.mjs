@@ -55,6 +55,7 @@ export function gitShortSha() {
  * @param {string} opts.version     serverInfo.version
  * @param {string|null} [opts.commit]  serverInfo.commit — short git sha. Omit to read this checkout; null to suppress.
  * @param {() => Array} opts.listTools
+ * @param {() => Promise<void>} [opts.refreshCosts]  load observations before listing tools
  * @param {(params: object) => Promise<object>} opts.callTool  may throw; err.mcpCode → JSON-RPC error
  * @param {string} [opts.instructions]  server-level guidance surfaced to the client on initialize
  * @param {(...args) => void} [opts.log]
@@ -63,7 +64,7 @@ export function gitShortSha() {
  *   `ctx` (optional) rides through to callTool — a streaming transport passes { streaming, report }
  *   so long-running tools can surface progress.
  */
-export function createDispatcher({ name, version, commit, listTools, callTool, instructions, log = (...a) => console.error(...a) }) {
+export function createDispatcher({ name, version, commit, listTools, refreshCosts, callTool, instructions, log = (...a) => console.error(...a) }) {
   const sha = commit === undefined ? gitShortSha() : (commit || null);
   const reply = (id, result) => ({ jsonrpc: "2.0", id, result });
   const fail = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
@@ -97,7 +98,10 @@ export function createDispatcher({ name, version, commit, listTools, callTool, i
       }
       if (method.startsWith("notifications/")) return null; // notifications/initialized, cancelled, ... — never answered
       if (method === "ping") return reply(id, {});
-      if (method === "tools/list") return reply(id, { tools: listTools() });
+      if (method === "tools/list") {
+        await refreshCosts?.();
+        return reply(id, { tools: listTools() });
+      }
       if (method === "tools/call") {
         try {
           return reply(id, await callTool(params, ctx));
@@ -122,6 +126,7 @@ export function createDispatcher({ name, version, commit, listTools, callTool, i
  * @param {string} opts.name        serverInfo.name
  * @param {string} opts.version     serverInfo.version
  * @param {() => Array} opts.listTools
+ * @param {() => Promise<void>} [opts.refreshCosts]
  * @param {(params: object) => Promise<object>} opts.callTool  may throw; err.mcpCode → JSON-RPC error
  * @param {(...args) => void} [opts.log]  stderr logger
  * @param {() => void} [opts.onClose]     called when stdin ends (default: exit 0)
@@ -132,13 +137,14 @@ export function serveMcp({
   name,
   version,
   listTools,
+  refreshCosts,
   callTool,
   instructions,
   log = (...a) => console.error(...a),
   onClose = () => process.exit(0),
 }) {
   const write = (msg) => output.write(JSON.stringify(msg) + "\n");
-  const dispatch = createDispatcher({ name, version, listTools, callTool, instructions, log });
+  const dispatch = createDispatcher({ name, version, listTools, refreshCosts, callTool, instructions, log });
   const handle = async (msg) => {
     const token = msg?.params?._meta?.progressToken;
     let progress = 0;
