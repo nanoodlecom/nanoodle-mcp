@@ -6,6 +6,7 @@ import fs, { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/pr
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { costProviderKey } from "../src/cost-sidecar.mjs";
 import { loadTools, renderCost } from "../src/tools.mjs";
 
 const result = costUsd => ({ costUsd, outputs: {}, nodes: {} });
@@ -29,6 +30,14 @@ function syncFsMocks(t) {
   syncBuiltinESMExports();
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
 }
+
+test("cost provider identity normalizes equivalent URLs and retains API paths", () => {
+  const one = costProviderKey("HTTPS://PROVIDER.EXAMPLE:443/api/../tenant-a///");
+  assert.equal(one, costProviderKey("https://provider.example/tenant-a"));
+  assert.notEqual(one, costProviderKey("http://provider.example/tenant-a"));
+  assert.notEqual(one, costProviderKey("https://provider.example:444/tenant-a"));
+  assert.notEqual(one, costProviderKey("https://provider.example/tenant-b"));
+});
 
 test("aliases of one executable share live and durable observations", async t => {
   const { dir, load, costsPath } = await fixture(t);

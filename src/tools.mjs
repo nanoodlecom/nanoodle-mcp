@@ -24,7 +24,7 @@ import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, deferHostedResult, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { nanoGptBackupFetch } from "./nanogpt-backup.mjs";
-import { commitCostObservations, mergeCostRecords, readCostSidecar, workflowCostKey } from "./cost-sidecar.mjs";
+import { commitCostObservations, costProviderKey, mergeCostRecords, readCostSidecar, workflowCostKey } from "./cost-sidecar.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
@@ -1104,6 +1104,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Observed costs inform quotes and descriptions. A missing sidecar must not block startup.
   const costsPath = join(outDir, "costs.json");
+  const providerKey = costProviderKey(baseUrl);
   const costs = Object.create(null);
   let storedCosts;
   let costWriteTail = Promise.resolve();
@@ -1156,7 +1157,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
       if (name === HUMANIZE_TOOL) x402 = humanizeColdPin(wf.graph, x402, log);
       // The special humanize runner can use different models from the saved graph.
       const humanize = name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph, humanizeFallbacks === null ? HUMANIZE_FALLBACKS : humanizeFallbacks) : null;
-      const costKey = workflowCostKey(wf.graph, humanize);
+      const costKey = workflowCostKey(wf.graph, humanize, providerKey);
       const observed = storedCosts?.[costKey];
       if (Number.isFinite(observed?.usd)) costs[name] = observed;
       tools.push({
@@ -1198,7 +1199,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     Object.assign(t.inputSchema.properties, humanizeExtraProperties());
   }
   if (tools.length) {
-    const tool = createSfwTool({ spendSource, hosted, remote });
+    const tool = createSfwTool({ spendSource, hosted, remote, providerKey });
     const observed = storedCosts?.[tool.costKey];
     if (Number.isFinite(observed?.usd)) costs[tool.name] = observed;
     tool.description = withObservedCost(tool.description, costs[tool.name]);

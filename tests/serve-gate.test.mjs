@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile, readFile, mkdir, link, symlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -16,6 +17,7 @@ import { commitCostObservations } from "../src/cost-sidecar.mjs";
 import { createChargeGate, hashArgs, parseUsdNano, pickNanoQuoteGrain, probeX402Pair } from "../src/gate.mjs";
 import { serveHttp, qrSvg } from "../src/http.mjs";
 import { formatCostUsd, loadTools } from "../src/tools.mjs";
+import { SFW_MODEL } from "../src/subnano.mjs";
 import { rawToXno } from "../src/wallet.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 
@@ -1985,6 +1987,69 @@ test("HTTP listings, Nano quotes and landing cards follow workflow identity acro
 
   await observe(0.40, 23, 3_000);
   assert.match(await (await fetch(base + "/")).text(), /last run \$0\.40, ~3s/);
+});
+
+test("saved workflow observations and quotes stay with the provider that ran them", async t => {
+  async function startProvider(cost) {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      if (req.method !== "POST" || !req.url.endsWith("/chat/completions")) {
+        res.writeHead(404).end();
+        return;
+      }
+      requests++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "offline answer" } }], cost }));
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    return { url: `http://127.0.0.1:${server.address().port}`, requests: () => requests };
+  }
+  const [providerA, providerB] = await Promise.all([startProvider(0.90), startProvider(0.01)]);
+  const dir = await mkdtemp(join(tmpdir(), "nano-cost-provider-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outDir = join(dir, "out"), costsPath = join(outDir, "costs.json");
+  await mkdir(outDir);
+  const graph = { links: [], nodes: [{ fields: { model: "fixture-chat", prompt: "same graph" }, id: "request", type: "llm" }] };
+  const raw = JSON.stringify(graph);
+  await Promise.all(["fixture", "alias"].map(name => writeFile(join(dir, `${name}.json`), raw)));
+  // This JSON uses the v1 canonical property order for the fixture graph.
+  const graphV1 = "graph:v1:" + createHash("sha256").update(JSON.stringify({ graph, humanize: null })).digest("hex");
+  const builtinV1 = `builtin:v1:sfw_check:${SFW_MODEL}`;
+  const unscoped = { usd: 1.25, at: "2026-07-22T00:00:00Z" };
+  await writeFile(costsPath, JSON.stringify({ [graphV1]: unscoped, [builtinV1]: unscoped }));
+  const load = baseUrl => loadTools({ dirs: [dir], outDir, baseUrl, apiKey: "offline-fixture" });
+  const [a, b] = await Promise.all([load(providerA.url), load(providerB.url)]);
+  assert.equal(a.costs.sfw_check, undefined);
+  assert.equal(b.costs.sfw_check, undefined);
+  const gate = makeGate(fakeChain());
+  t.after(() => gate.stop());
+  const params = { name: "fixture", arguments: {} };
+  async function checkDeposit(registry, expected, name = "fixture") {
+    const wrapped = gate.wrapRegistry(registry);
+    assert.equal(argOf(await wrapped.callTool({ ...params, name })).amountUsd, expected);
+    const description = wrapped.listTools().find(tool => tool.name === name).description;
+    assert.ok(description.includes(`$${expected.toFixed(2)} deposit per call`), description);
+    return description;
+  }
+
+  assert.doesNotMatch(await checkDeposit(b, 0.05), /last run/);
+  assert.equal((await a.callTool(params)).isError, undefined);
+  assert.doesNotMatch(await checkDeposit(b, 0.05), /last run/);
+  assert.deepEqual([providerA.requests(), providerB.requests()], [1, 0]);
+  const equivalent = await load(providerA.url.toUpperCase() + "///");
+  assert.match(await checkDeposit(equivalent, 2.16, "alias"), /last run \$0\.90/);
+  assert.doesNotMatch(await checkDeposit(await load(providerA.url + "/different-api"), 0.05), /last run/);
+
+  assert.equal((await b.callTool(params)).isError, undefined);
+  assert.match(await checkDeposit(await load(providerB.url), 0.03), /last run \$0\.01/);
+  assert.match(await checkDeposit(a, 2.16), /last run \$0\.90/);
+  assert.deepEqual([providerA.requests(), providerB.requests()], [1, 1]);
+  const stored = JSON.parse(await readFile(costsPath, "utf8"));
+  assert.deepEqual(stored[graphV1], unscoped);
+  assert.deepEqual(stored[builtinV1], unscoped);
+  assert.equal(Object.keys(stored).length, 4);
 });
 
 test("pay page + status endpoint over HTTP", async () => {

@@ -501,8 +501,8 @@ and the observed cost high-water mark used for pricing. The gate adds 20%,
 applies a 2× variance multiplier (1.25× for a deterministic forecast that
 covers observed costs), and rounds up to a whole cent. `--charge-usd` sets
 the opening deposit when neither cost signal is available and the minimum
-when a forecast only covers some priced nodes. Inexact runs leave previous
-exact pricing observations for the same workflow in place. The operator
+when a forecast only covers some priced nodes. Inexact runs preserve earlier
+exact pricing observations for the same workflow and provider. The operator
 absorbs any overrun. The gate prefers the exact raw-XNO/USD pair from
 an unpaid NanoGPT invoice. It refreshes the rate after 60 seconds and can
 keep using that observation for up to five minutes during an outage.
@@ -1344,9 +1344,11 @@ The stdio server announces description changes with a
 reads committed observations, including updates from other MCP processes that
 share the output directory. The HTTP landing page and new Nano quotes also
 read those observations. Saved-workflow costs follow the executable workflow
-definition across files and tool names. Built-in tools have their own identities.
-Older records keyed solely by tool name remain in the sidecar for reference.
-Tools start a new observed history when their identity has no matching record.
+definition across files and tool names when they use the same provider base URL.
+Built-in tools also track costs by provider. Equivalent URLs share history, and
+different API path prefixes have separate histories. Older records without a
+workflow or provider identity remain in the sidecar for reference. Tools start
+a new observed history when no record matches both identities.
 MCP processes sharing a local output directory coordinate cost updates with
 `costs.json.lock`. Leave that file in place while the processes are running.
 
