@@ -864,6 +864,13 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
   // fragment-less short links fetch, and those are redirect-header reads with
   // no credentials attached.
   const r = read || await readGraphArgs(args, { allowShortLinks, fetch });
+  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, fetch: executionFetch });
+  // Older SDKs silently drop null nodes. Reject them before running any sibling.
+  const nullNode = r.graph.nodes.indexOf(null);
+  if (nullNode !== -1) throw new Error(`node at position ${nullNode + 1} must be an object`);
+  if (wf.warnings.length) {
+    throw new Error(`this ${r.source === "graph" ? "graph" : "share link"} can't run headlessly — ${wf.warnings.join("; ")}`);
+  }
   // The graph is a stranger's, so the catalog matters MOST here: it's what
   // clamps variations to the model's real max_output_images and refs to
   // max_input_images before anything is billed. Cached, timeout-bounded and
@@ -871,7 +878,7 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
   // and a hanging or down endpoint delays the run by the fetch timeout once a
   // minute at worst (the failure marker covers the calls in between) before the
   // run proceeds unclamped.
-  const catalogs = await fetchCatalogs(graphModelKinds(r.graph), {
+  const catalogs = await fetchCatalogs(graphModelKinds(wf.graph), {
     baseUrl: baseUrl || undefined,
     fetch,
     log,
@@ -879,11 +886,7 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
     ...(catalogTimeoutMs ? { timeoutMs: catalogTimeoutMs } : {}),
     consequence: requireFreshCatalogs ? ", so graphs using it cannot be quoted" : ", so this link runs with whatever payload it asked for",
   });
-  const wf = new Workflow(r.graph, { apiKey, payment, baseUrl, quiet: true, catalog: catalogs, fetch: executionFetch });
-  if (wf.warnings.length) {
-    // unknown node types: the graph decodes but run() would always refuse
-    throw new Error(`this ${r.source === "graph" ? "graph" : "share link"} can't run headlessly — ${wf.warnings.join("; ")}`);
-  }
+  wf.catalog = catalogs;
   const inputs = await resolveInputs(wf, r.inputs, `run_noodle (${r.source === "graph" ? "inline graph" : r.url})`);
   return { graph: r.graph, workflowGraph: wf.graph, inputs, wf, catalogs, source: r.source, url: r.url };
 }

@@ -469,6 +469,25 @@ test("run_noodle: bad, internal, and unrunnable links come back as tool errors, 
   }
 });
 
+test("run_noodle reports a null node before catalog lookup or model dispatch", async t => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-null-node-"));
+  const srv = startServer({ outDir });
+  t.after(async () => {
+    await srv.close();
+    await rm(outDir, { recursive: true, force: true });
+  });
+  await srv.request("tools/list");
+  const before = apiRequests.length;
+  const graph = { nodes: [
+    { id: "llm", type: "llm", fields: { model: "test-model", prompt: "do not send" } },
+    null,
+  ], links: [] };
+  const response = await srv.request("tools/call", { name: "run_noodle", arguments: { graph } });
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /node at position 2 must be an object/);
+  assert.deepEqual(apiRequests.slice(before), []);
+});
+
 test("describeRunFailure: leads with the root-cause node, lists the cascade", async () => {
   const { describeRunFailure } = await import("../src/tools.mjs");
   const runError = Object.assign(new Error('run failed — "Image→Video": upstream failed: Image'), {
