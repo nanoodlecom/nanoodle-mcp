@@ -12,7 +12,7 @@
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
 import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
-import { readdir, readFile, mkdir, open, unlink, writeFile, rename } from "node:fs/promises";
+import { readdir, readFile, mkdir, open, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
@@ -24,6 +24,7 @@ import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, deferHostedResult, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { nanoGptBackupFetch } from "./nanogpt-backup.mjs";
+import { commitCostObservations, mergeCostRecords, migrateCostName, readCostSidecar } from "./cost-sidecar.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
@@ -1103,12 +1104,13 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Observed costs inform quotes and descriptions. A missing sidecar must not block startup.
   const costsPath = join(outDir, "costs.json");
-  let costs = {};
+  let costs = Object.create(null);
   let costWriteTail = Promise.resolve();
+  let queuedCostWrite;
+  const pendingCosts = new Map();
   try {
-    const parsed = JSON.parse(await readFile(costsPath, "utf8"));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) costs = parsed;
-  } catch { /* missing or corrupt → no cost segments yet */ }
+    costs = await readCostSidecar(costsPath);
+  } catch { /* unavailable → no cost segments yet */ }
   const tools = [];
   const failures = [];
   // Seed the reserved run_noodle name so a file that sanitizes to it gets suffixed, not shadowed.
@@ -1150,10 +1152,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
       usedNames.set(name, count);
       if (count > 1) name = `${name}-${count}`;
       // cost records written before ".noodle-graph" was stripped keep pricing deposits
-      if (!costs[name] && costs[`${name}-noodle-graph`]) {
-        costs[name] = costs[`${name}-noodle-graph`];
-        delete costs[`${name}-noodle-graph`];
-      }
+      migrateCostName(costs, name);
       if (name === HUMANIZE_TOOL) x402 = humanizeColdPin(wf.graph, x402, log);
       tools.push({
         name,
@@ -1195,49 +1194,65 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
   if (tools.length) tools.push(createSfwTool({ spendSource, hosted, remote }));
   const byName = new Map(tools.map((t) => [t.name, t]));
 
+  function refreshCostDescriptions(changedTools) {
+    let changed = false;
+    for (const tool of changedTools) {
+      const rec = costs[tool.name];
+      const description = tool.wf
+        ? buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name })
+        : withObservedCost(tool.description, rec);
+      if (description !== tool.description) {
+        tool.description = description;
+        changed = true;
+      }
+    }
+    if (changed) {
+      try { registry.onToolsChanged?.(); }
+      catch { /* notification listeners must not fail a completed run */ }
+    }
+  }
+
+  function queueCostWrite() {
+    if (queuedCostWrite) return queuedCostWrite;
+    // At most one active write and one queued batch share the per-process tail.
+    queuedCostWrite = costWriteTail.then(async () => {
+      queuedCostWrite = null;
+      const observations = new Map(pendingCosts);
+      const stored = await commitCostObservations(costsPath, observations, byName.keys());
+      for (const [name, record] of observations) {
+        if (pendingCosts.get(name) === record) pendingCosts.delete(name);
+      }
+      const changedTools = [];
+      for (const [name, record] of Object.entries(stored)) {
+        const current = costs[name];
+        const merged = mergeCostRecords(record, pendingCosts.get(name));
+        costs[name] = merged;
+        const changedTool = byName.get(name);
+        if (changedTool && renderCost(current) !== renderCost(merged)) changedTools.push(changedTool);
+      }
+      refreshCostDescriptions(changedTools);
+    }).catch(error => {
+      try { log(`cannot write ${costsPath}: ${error.message}`); }
+      catch { /* logging must not wedge the writer */ }
+    });
+    costWriteTail = queuedCostWrite;
+    return queuedCostWrite;
+  }
+
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
   async function recordCost(tool, result, ms) {
     const observedUsd = typeof result.providerUsd === "number" && Number.isFinite(result.providerUsd) ? result.providerUsd : result.costUsd;
     const observedExact = typeof result.providerUsd === "number" ? result.providerExact !== false : result.costExact !== false;
     if (typeof observedUsd !== "number" || !Number.isFinite(observedUsd)) return;
-    const rec = { usd: observedUsd, at: new Date().toISOString() };
+    const atMs = performance.timeOrigin + performance.now();
+    const rec = { usd: observedUsd, at: new Date(atMs).toISOString(), atMs };
     if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
     if (!observedExact) rec.exact = false; // renders "$X+"
-    // High-water mark across runs — the charge gate prices deposits off the
-    // worst run on record, so one cheap run can't shrink the deposit below it.
-    const prev = costs[tool.name];
-    const hi = Math.max(
-      prev && Number.isFinite(prev.hiUsd) ? prev.hiUsd : 0,
-      prev && Number.isFinite(prev.usd) ? prev.usd : 0);
-    if (hi > observedUsd) rec.hiUsd = hi;
-    costs[tool.name] = rec;
-    // Serialize snapshots and renames so an older writer cannot replace a
-    // newer sidecar. Keep observing costs for live quotes during disk writes.
-    const saved = costWriteTail.then(async () => {
-      await mkdir(outDir, { recursive: true });
-      const tmp = `${costsPath}.${process.pid}.${++saveSeq}.tmp`;
-      try {
-        await writeFile(tmp, JSON.stringify(costs, null, 2) + "\n");
-        await rename(tmp, costsPath);
-      } catch (error) {
-        await unlink(tmp).catch(() => {});
-        throw error;
-      }
-    }).catch(error => {
-      try { log(`cannot write ${costsPath}: ${error.message}`); }
-      catch { /* logging must not wedge the writer */ }
-    });
-    costWriteTail = saved;
-
+    costs[tool.name] = mergeCostRecords(costs[tool.name], rec);
+    pendingCosts.set(tool.name, mergeCostRecords(pendingCosts.get(tool.name), rec));
+    const saved = queueCostWrite();
     // Publish the matching description before yielding to another observation.
-    const description = tool.wf
-      ? buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name })
-      : withObservedCost(tool.description, rec);
-    if (description !== tool.description) {
-      tool.description = description;
-      try { registry.onToolsChanged?.(); }
-      catch { /* notification listeners must not fail a completed run */ }
-    }
+    refreshCostDescriptions([tool]);
     await saved;
   }
 

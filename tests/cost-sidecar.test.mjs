@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import fs, { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { fork } from "node:child_process";
+import { on, once } from "node:events";
+import fs, { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,7 +21,7 @@ async function fixture(t) {
   const warnings = [];
   const load = () => loadTools({ dirs: [dir], outDir, log: message => warnings.push(message) });
   const registry = await load();
-  return { load, registry, outDir, warnings, costsPath: join(outDir, "costs.json") };
+  return { dir, load, registry, outDir, warnings, costsPath: join(outDir, "costs.json") };
 }
 
 function syncFsMocks(t) {
@@ -75,6 +77,7 @@ test("a delayed cost write cannot overwrite newer observations after reopening",
   const reopened = await load();
   assert.equal(reopened.costs.chat.usd, 0.90);
   assert.equal(reopened.costs.other.usd, 0.40);
+  assert.equal(writes, 2, "observations made during the first write share a queued batch");
   assert.match(chat.description, /last run \$0\.90/);
   assert.equal(notifications.length, 3);
   for (const snapshot of notifications) {
@@ -89,6 +92,7 @@ test("a delayed cost write cannot overwrite newer observations after reopening",
 
 test("a failed cost rename leaves the observation in memory and the next write repairs the sidecar", async t => {
   const { registry, load, outDir, costsPath, warnings } = await fixture(t);
+  assert.deepEqual(await readdir(outDir), [], "loading the registry does not create the lock file");
   const realRename = fs.rename;
   let failed = false;
   t.mock.method(fs, "rename", async (src, dest) => {
@@ -102,11 +106,67 @@ test("a failed cost rename leaves the observation in memory and the next write r
   await call(registry);
   assert.equal(registry.costs.chat.usd, 0.90);
   assert.match(registry.tools[0].description, /last run \$0\.90/);
-  assert.deepEqual(await readdir(outDir), []);
+  assert.deepEqual(await readdir(outDir), ["costs.json.lock"]);
   assert.ok(warnings.some(line => line.includes("fixture disk write failure")));
   await call(registry);
   const reopened = await load();
   assert.equal(reopened.costs.chat.usd, 0.01);
   assert.equal(reopened.costs.chat.hiUsd, 0.90);
-  assert.deepEqual(await readdir(outDir), ["costs.json"]);
+  assert.deepEqual(await readdir(outDir), ["costs.json", "costs.json.lock"]);
+});
+
+async function startWriter(t, { dir, outDir }, mode) {
+  const helper = new URL("./fixtures/cost-writer.mjs", import.meta.url);
+  const child = fork(helper, [dir, outDir, mode], { stdio: ["ignore", "ignore", "pipe", "ipc"], execArgv: [] });
+  const messages = on(child, "message", { close: ["exit"] }), exit = once(child, "exit");
+  let stderr = "";
+  child.stderr.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill(); await exit; });
+  async function receive(event) {
+    const message = (await messages.next()).value?.[0];
+    assert.equal(message?.event, event, `expected ${event}, got ${JSON.stringify(message)}\n${stderr}`);
+    return message;
+  }
+  await receive("ready");
+  return { child, exit, receive, send: message => child.send(message) };
+}
+
+test("processes merge distinct tools and keep the newest same-tool observation", { timeout: 8_000 }, async t => {
+  const f = await fixture(t);
+  await writeFile(f.costsPath, JSON.stringify({ "chat-noodle-graph": { usd: 0.50, at: "2026-07-20T00:00:00Z" } }));
+  const [old, recent] = await Promise.all([startWriter(t, f, "before-lock"), startWriter(t, f, "normal")]);
+  old.send({ name: "chat", usd: 0.90 });
+  await old.receive("paused");
+  recent.send({ name: "chat", usd: 0.01, exact: false });
+  assert.equal((await recent.receive("done")).costs.chat.hiUsd, 0.50);
+  recent.send({ name: "other", usd: 0.40 });
+  await recent.receive("done");
+  old.send({ release: true });
+  const merged = await old.receive("done");
+  assert.equal(merged.costs.chat.usd, 0.01);
+  assert.equal(merged.costs.chat.exact, false);
+  assert.equal(merged.costs.chat.hiUsd, 0.90);
+  assert.equal(merged.costs.other.usd, 0.40);
+  assert.match(merged.description, /last run \$0\.01\+/);
+  assert.deepEqual(JSON.parse(await readFile(f.costsPath, "utf8")), merged.costs);
+  assert.equal((await f.load()).costs.chat.hiUsd, 0.90);
+});
+
+test("a competing writer recovers when the first process dies before rename", { timeout: 8_000 }, async t => {
+  const f = await fixture(t);
+  await writeFile(f.costsPath, JSON.stringify({ chat: { usd: 0.25, at: "2026-07-20T00:00:00Z" } }));
+  const [old, next] = await Promise.all([startWriter(t, f, "before-rename"), startWriter(t, f, "report-busy")]);
+  old.send({ name: "chat", usd: 0.80 });
+  await old.receive("paused");
+  assert.equal(JSON.parse(await readFile(f.costsPath, "utf8")).chat.usd, 0.25);
+  assert.equal(JSON.parse(await readFile(`${f.costsPath}.tmp`, "utf8")).chat.usd, 0.80);
+  next.send({ name: "other", usd: 0.40 });
+  await next.receive("busy");
+  old.child.kill("SIGKILL");
+  await old.exit;
+  await next.receive("done");
+  const reopened = await f.load();
+  assert.equal(reopened.costs.chat.usd, 0.25);
+  assert.equal(reopened.costs.other.usd, 0.40);
+  assert.deepEqual(await readdir(f.outDir), ["costs.json", "costs.json.lock"]);
 });

@@ -1345,6 +1345,8 @@ outputs) and folded into the description as `last run $X` — observed, not
 estimated. The server announces the change with a
 `notifications/tools/list_changed` notification, so MCP clients that honor it
 show updated prices mid-session; others catch up on restart.
+MCP processes sharing a local output directory coordinate cost updates with
+`costs.json.lock`. Leave that file in place while the processes are running.
 
 ## Limitations
 
