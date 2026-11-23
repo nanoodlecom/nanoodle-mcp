@@ -228,7 +228,7 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
       /balance; last run \$0\.0012\.$/);
     const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
     const [[key, record]] = Object.entries(sidecar);
-    assert.match(key, /^graph:v1:[a-f0-9]{64}$/);
+    assert.match(key, /^graph:v2:[a-f0-9]{64}$/);
     assert.equal(record.usd, 0.0012);
 
     // -- tools/call: an author-optional input can be omitted — the run proceeds with an
@@ -614,7 +614,7 @@ test("an unavailable sidecar does not block stdio listing or shutdown", { skip: 
   const { loadTools } = await import("../src/tools.mjs");
   const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-unavailable-costs-"));
   const costsPath = join(outDir, "costs.json");
-  const registry = await loadTools({ dirs: [FIXTURES], outDir });
+  const registry = await loadTools({ dirs: [FIXTURES], baseUrl: apiUrl, outDir });
   const { costKey } = registry.tools.find(tool => tool.name === "hello-noodle");
   await writeFile(costsPath, JSON.stringify({ [costKey]: { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
   const reader = startServer({ outDir });

@@ -866,11 +866,11 @@ function spendLine(spendSource) {
 }
 
 // The registry offers this built-in only when at least one graph loads.
-export function createSfwTool({ spendSource, hosted = false, remote = false }) {
+export function createSfwTool({ spendSource, hosted = false, remote = false, providerKey }) {
   const noLocal = remote || hosted;
   const sfw = {
     name: SFW_TOOL,
-    costKey: `builtin:v1:${SFW_TOOL}:${SFW_MODEL}`,
+    costKey: `builtin:v2:${SFW_TOOL}:${SFW_MODEL}:${providerKey}`,
     builtin: true,
     pricedPerRequest: true,
     depositNote: SFW_NOTE,

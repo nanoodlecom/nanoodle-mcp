@@ -25,13 +25,21 @@ export async function readCostSidecar(path) {
   return Object.assign(Object.create(null), parsed && !Array.isArray(parsed) && typeof parsed === "object" ? parsed : null);
 }
 
-export function workflowCostKey(graph, humanize) {
+export function costProviderKey(baseUrl) {
+  // NanoClient strips trailing slashes and appends its routes to the base URL.
+  // Keep path prefixes so separate services on the same host stay independent.
+  const base = String(baseUrl).replace(/\/+$/, "");
+  const endpoint = URL.parse(base)?.href.replace(/\/+$/, "") ?? base;
+  return createHash("sha256").update(endpoint).digest("hex");
+}
+
+export function workflowCostKey(graph, humanize, providerKey) {
   // Preserve execution order in arrays. JSON object member order is immaterial.
   const canonical = (_key, value) => value && typeof value === "object" && !Array.isArray(value)
     ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
     : value;
-  const definition = JSON.stringify({ graph, humanize }, canonical);
-  return `graph:v1:${createHash("sha256").update(definition).digest("hex")}`;
+  const definition = JSON.stringify({ graph, humanize, providerKey }, canonical);
+  return `graph:v2:${createHash("sha256").update(definition).digest("hex")}`;
 }
 
 function observedAt(record) {
@@ -78,8 +86,8 @@ export async function commitCostObservations(path, observations) {
     }
 
     const costs = await readCostSidecar(path);
-    // Keep old name-only records on disk. The name cannot prove which graph
-    // produced them, so new observations are merged only by workflow identity.
+    // Retain legacy records. New observations merge only with records that
+    // identify both the tool's execution definition and its provider.
     for (const [key, record] of observations) costs[key] = mergeCostRecords(costs[key], record);
 
     const tmp = `${path}.tmp`;

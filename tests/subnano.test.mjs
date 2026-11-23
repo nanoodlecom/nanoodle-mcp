@@ -186,11 +186,13 @@ test("repeated builtin calls replace the last-run cost instead of concatenating 
     await call();
     assert.match(desc(), /; last run \$0\.0026\.$/);
     assert.doesNotMatch(desc(), /<\$0\.0001|~15s/);
-    assert.match(sfw.costKey, /^builtin:v1:sfw_check:/);
+    assert.match(sfw.costKey, /^builtin:v2:sfw_check:/);
     await writeFile(join(dir, "sfw_check.json"), TINY);
-    const reopened = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    const reopened = await loadTools({ dirs: [dir], baseUrl: `http://127.0.0.1:${port}/`, outDir: join(dir, "out"), log: () => {} });
     assert.equal(reopened.costs.sfw_check.usd, 0.0026);
     assert.equal(reopened.costs["sfw_check-2"], undefined);
+    const otherProvider = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
+    assert.equal(otherProvider.costs.sfw_check, undefined);
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });
