@@ -10,24 +10,63 @@ import { loadTools, renderCost } from "../src/tools.mjs";
 
 const result = costUsd => ({ costUsd, outputs: {}, nodes: {} });
 const call = (registry, name = "chat") => registry.callTool({ name, arguments: {} });
+const graph = text => JSON.stringify({ v: 1, nodes: [{ id: "n", type: "text", fields: { text } }], links: [] });
 
 async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), "nanoodle-cost-sidecar-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const outDir = join(dir, "out");
   await mkdir(outDir);
-  const graph = JSON.stringify({ v: 1, nodes: [{ id: "n", type: "text", fields: { text: "fixture" } }], links: [] });
-  await Promise.all(["chat", "other"].map(name => writeFile(join(dir, `${name}.json`), graph)));
+  await Promise.all(["chat", "other"].map(name => writeFile(join(dir, `${name}.json`), graph(name))));
   const warnings = [];
   const load = () => loadTools({ dirs: [dir], outDir, log: message => warnings.push(message) });
   const registry = await load();
-  return { dir, load, registry, outDir, warnings, costsPath: join(outDir, "costs.json") };
+  const keys = Object.fromEntries(registry.tools.map(tool => [tool.name, tool.costKey]));
+  return { dir, load, registry, keys, outDir, warnings, costsPath: join(outDir, "costs.json") };
 }
 
 function syncFsMocks(t) {
   syncBuiltinESMExports();
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
 }
+
+test("aliases of one executable share live and durable observations", async t => {
+  const { dir, load, costsPath } = await fixture(t);
+  await writeFile(join(dir, "alias.json"), graph("chat"));
+  const registry = await load();
+  const chat = registry.tools.find(tool => tool.name === "chat");
+  t.mock.method(chat.wf, "run", async () => result(0.90));
+  let changes = 0;
+  registry.onToolsChanged = () => { changes++; };
+
+  await call(registry);
+  assert.equal(registry.costs.alias, registry.costs.chat);
+  assert.equal(registry.costs.alias.usd, 0.90);
+  assert.match(registry.tools.find(tool => tool.name === "alias").description, /last run \$0\.90/);
+  assert.equal(changes, 1);
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(costsPath, "utf8"))), [chat.costKey]);
+  assert.equal((await load()).costs.alias.usd, 0.90);
+});
+
+test("nested tool-name collisions keep live cost histories separate", async t => {
+  const { dir, outDir } = await fixture(t);
+  const alternate = join(dir, "alternate");
+  await mkdir(alternate);
+  await Promise.all([
+    writeFile(join(dir, "chat-2.json"), graph("already uses chat-2")),
+    writeFile(join(alternate, "chat.json"), graph("another chat")),
+  ]);
+  const registry = await loadTools({ dirs: [dir, alternate], outDir });
+  const chats = registry.tools.filter(tool => /^chat(?:-\d+)?$/.test(tool.name));
+  assert.deepEqual(chats.map(tool => tool.name).sort(), ["chat", "chat-2", "chat-3"]);
+  for (const [index, tool] of chats.entries()) {
+    const cost = (index + 1) / 10;
+    t.mock.method(tool.wf, "run", async () => result(cost));
+    await call(registry, tool.name);
+    assert.equal(registry.costs[tool.name].usd, cost);
+  }
+  assert.equal(new Set(chats.map(tool => registry.costs[tool.name].usd)).size, 3);
+});
 
 test("a delayed cost write cannot overwrite newer observations after reopening", { timeout: 5_000 }, async t => {
   const { registry, load, outDir, costsPath } = await fixture(t);
@@ -63,7 +102,7 @@ test("a delayed cost write cannot overwrite newer observations after reopening",
   })));
   const runs = [call(registry)];
   try {
-    assert.equal(JSON.parse(await firstWriting.promise).chat.usd, 0.01);
+    assert.equal(JSON.parse(await firstWriting.promise)[chat.costKey].usd, 0.01);
     runs.push(call(registry), call(registry, "other"));
     await Promise.all([secondRan.promise, otherRan.promise]);
     await new Promise(setImmediate);
@@ -116,8 +155,8 @@ test("a failed cost rename leaves the observation in memory and the next write r
 });
 
 test("refreshes preserve a pending cost while a write fails and an older read finishes", { timeout: 5_000 }, async t => {
-  const { registry, load, costsPath } = await fixture(t);
-  await writeFile(costsPath, JSON.stringify({ chat: { usd: 0.01, at: "2026-07-20T00:00:00Z" } }));
+  const { registry, load, keys, costsPath } = await fixture(t);
+  await writeFile(costsPath, JSON.stringify({ [keys.chat]: { usd: 0.01, at: "2026-07-20T00:00:00Z" } }));
   const reading = Promise.withResolvers(), resumeRead = Promise.withResolvers();
   const writing = Promise.withResolvers(), failWrite = Promise.withResolvers();
   const originalRead = fs.readFile, originalRename = fs.rename;
@@ -184,7 +223,7 @@ async function startWriter(t, { dir, outDir }, mode) {
 
 test("processes merge distinct tools and keep the newest same-tool observation", { timeout: 8_000 }, async t => {
   const f = await fixture(t);
-  await writeFile(f.costsPath, JSON.stringify({ "chat-noodle-graph": { usd: 0.50, at: "2026-07-20T00:00:00Z" } }));
+  await writeFile(f.costsPath, JSON.stringify({ [f.keys.chat]: { usd: 0.50, at: "2026-07-20T00:00:00Z" } }));
   const [old, recent] = await Promise.all([startWriter(t, f, "before-lock"), startWriter(t, f, "normal")]);
   old.send({ name: "chat", usd: 0.90 });
   await old.receive("paused");
@@ -202,18 +241,46 @@ test("processes merge distinct tools and keep the newest same-tool observation",
   assert.equal(merged.costs.chat.quoteHiUsd, 0.90);
   assert.equal(merged.costs.other.usd, 0.40);
   assert.match(merged.description, /last run \$0\.01\+/);
-  assert.deepEqual(JSON.parse(await readFile(f.costsPath, "utf8")), merged.costs);
+  assert.deepEqual(JSON.parse(await readFile(f.costsPath, "utf8")), {
+    [f.keys.chat]: merged.costs.chat, [f.keys.other]: merged.costs.other,
+  });
   assert.equal((await f.load()).costs.chat.quoteHiUsd, 0.90);
+});
+
+test("contending writers with the same tool name preserve two workflow histories", { timeout: 8_000 }, async t => {
+  const f = await fixture(t);
+  const alternate = join(f.dir, "alternate");
+  await mkdir(alternate);
+  await writeFile(join(alternate, "chat.json"), graph("different workflow"));
+  const [first, second] = await Promise.all([
+    startWriter(t, f, "before-rename"),
+    startWriter(t, { dir: alternate, outDir: f.outDir }, "report-busy"),
+  ]);
+  first.send({ name: "chat", usd: 0.90 });
+  await first.receive("paused");
+  second.send({ name: "chat", usd: 0.12, exact: false });
+  await second.receive("busy");
+  first.send({ release: true });
+  assert.equal((await first.receive("done")).costs.chat.usd, 0.90);
+  const changed = (await second.receive("done")).costs.chat;
+  assert.equal(changed.usd, 0.12);
+  assert.equal(changed.hiUsd, undefined);
+  assert.equal((await f.load()).costs.chat.usd, 0.90);
+  const reopened = await loadTools({ dirs: [alternate], outDir: f.outDir });
+  assert.equal(reopened.costs.chat.usd, 0.12);
+  assert.equal(reopened.costs.chat.quoteHiUsd, undefined);
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(f.costsPath, "utf8"))).sort(),
+    [f.keys.chat, reopened.tools[0].costKey].sort());
 });
 
 test("a competing writer recovers when the first process dies before rename", { timeout: 8_000 }, async t => {
   const f = await fixture(t);
-  await writeFile(f.costsPath, JSON.stringify({ chat: { usd: 0.25, at: "2026-07-20T00:00:00Z" } }));
+  await writeFile(f.costsPath, JSON.stringify({ [f.keys.chat]: { usd: 0.25, at: "2026-07-20T00:00:00Z" } }));
   const [old, next] = await Promise.all([startWriter(t, f, "before-rename"), startWriter(t, f, "report-busy")]);
   old.send({ name: "chat", usd: 0.80 });
   await old.receive("paused");
-  assert.equal(JSON.parse(await readFile(f.costsPath, "utf8")).chat.usd, 0.25);
-  assert.equal(JSON.parse(await readFile(`${f.costsPath}.tmp`, "utf8")).chat.usd, 0.80);
+  assert.equal(JSON.parse(await readFile(f.costsPath, "utf8"))[f.keys.chat].usd, 0.25);
+  assert.equal(JSON.parse(await readFile(`${f.costsPath}.tmp`, "utf8"))[f.keys.chat].usd, 0.80);
   next.send({ name: "other", usd: 0.40 });
   await next.receive("busy");
   old.child.kill("SIGKILL");

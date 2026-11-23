@@ -1923,12 +1923,25 @@ test("initialize and /version report the git short sha of this checkout", async 
   }
 });
 
-test("HTTP tools, Nano quotes and the landing page read current observed costs", async t => {
+test("HTTP listings, Nano quotes and landing cards follow workflow identity across mounts", async t => {
   const dir = await mkdtemp(join(tmpdir(), "nano-quote-cost-refresh-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const outDir = join(dir, "out"), costsPath = join(outDir, "costs.json");
-  await writeFile(join(dir, "poster.json"), JSON.stringify(WORKED_GRAPH));
-  const registry = await loadTools({ dirs: [dir], outDir });
+  const original = join(dir, "original"), mounted = join(dir, "mounted");
+  await Promise.all([mkdir(original), mkdir(mounted)]);
+  const different = structuredClone(WORKED_GRAPH);
+  different.nodes.find(node => node.type === "llm").fields.model = "different-model";
+  const alias = { ...WORKED_GRAPH, nodes: WORKED_GRAPH.nodes.map(({ fields, ...node }) => ({
+    fields: Object.fromEntries(Object.entries(fields).reverse()), ...node, x: 1_000,
+  })) };
+  await Promise.all([
+    writeFile(join(original, "poster.json"), JSON.stringify(WORKED_GRAPH)),
+    writeFile(join(mounted, "poster.json"), JSON.stringify(different)),
+    writeFile(join(mounted, "alias.json"), JSON.stringify(alias, null, 2)),
+  ]);
+  const writer = await loadTools({ dirs: [original], outDir });
+  const { costKey } = writer.tools.find(tool => tool.name === "poster");
+  const registry = await loadTools({ dirs: [mounted], outDir });
   const gate = makeGate(fakeChain(), { registry });
   t.after(() => gate.stop());
   const { listTools, callTool } = gate.wrapRegistry(registry);
@@ -1945,9 +1958,9 @@ test("HTTP tools, Nano quotes and the landing page read current observed costs",
     assert.equal(error, undefined);
     return result;
   };
-  const quote = () => mcp("tools/call", { name: "poster", arguments: { Idea: "a lighthouse" } });
+  const quote = (name = "alias") => mcp("tools/call", { name, arguments: { Idea: "a lighthouse" } });
   const observe = (usd, day, ms) => commitCostObservations(costsPath,
-    new Map([["poster", { usd, at: `2026-07-${day}T00:00:00Z`, ms }]]), ["poster"]);
+    new Map([[costKey, { usd, at: `2026-07-${day}T00:00:00Z`, ms }]]));
   const unobserved = await quote();
   assert.equal(argOf(unobserved).amountUsd, 0.05);
   assert.doesNotMatch(unobserved.content[0].text, /typically ~/);
@@ -1955,14 +1968,20 @@ test("HTTP tools, Nano quotes and the landing page read current observed costs",
   await observe(0.75, 20, 2_000);
   await observe(0.20, 21, 5_000);
   const list = await mcp("tools/list");
-  const description = list.tools.find(tool => tool.name === "poster").description;
+  const description = list.tools.find(tool => tool.name === "alias").description;
   assert.match(description, /last run \$0\.20, ~5s/);
   assert.match(description, /\$1\.80 deposit/);
+  const unrelated = list.tools.find(tool => tool.name === "poster").description;
+  assert.match(unrelated, /\$0\.05 deposit/);
+  assert.doesNotMatch(unrelated, /last run/);
 
   await observe(0.95, 22, 7_000);
   const current = await quote();
   assert.equal(argOf(current).amountUsd, 2.28);
   assert.match(current.content[0].text, /typically ~7s/);
+  const unrelatedQuote = await quote("poster");
+  assert.equal(argOf(unrelatedQuote).amountUsd, 0.05);
+  assert.doesNotMatch(unrelatedQuote.content[0].text, /typically ~/);
 
   await observe(0.40, 23, 3_000);
   assert.match(await (await fetch(base + "/")).text(), /last run \$0\.40, ~3s/);
@@ -2091,7 +2110,7 @@ test("a hand-added x402 block on a graph file reaches the gate (price + author)"
   assert.equal(decoded, tool.rawText);
 });
 
-test("editor-saved filenames make clean tool names, and legacy cost keys migrate", async () => {
+test("editor-saved filenames make clean tool names and ignore unqualified legacy costs", async t => {
   const { mkdtemp, readFile, writeFile } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join, dirname } = await import("node:path");
@@ -2099,14 +2118,26 @@ test("editor-saved filenames make clean tool names, and legacy cost keys migrate
   const { loadTools } = await import("../src/tools.mjs");
   const here = dirname(fileURLToPath(import.meta.url));
   const dir = await mkdtemp(join(tmpdir(), "clean-names-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
   const g = await readFile(join(here, "fixtures", "hello-noodle.json"), "utf8");
   await writeFile(join(dir, "poster.noodle-graph.json"), g);
-  await writeFile(join(dir, "costs.json"), JSON.stringify({ "poster-noodle-graph": { usd: 0.04, at: "2026-07-22T00:00:00Z" } }));
+  const legacy = {
+    "poster-noodle-graph": { usd: 0.04, at: "2026-07-22T00:00:00Z" },
+    poster: { usd: 0.90, at: "2026-07-23T00:00:00Z" },
+  };
+  const costsPath = join(dir, "costs.json");
+  await writeFile(costsPath, JSON.stringify(legacy));
   const registry = await loadTools({ dirs: [dir], apiKey: "k", outDir: dir });
-  assert.equal(registry.tools[0].name, "poster", "the .noodle-graph save suffix is not part of the name");
-  assert.equal(registry.costs.poster.usd, 0.04, "pre-rename cost record still prices the deposit");
-  assert.equal(registry.costs["poster-noodle-graph"], undefined);
-  assert.match(registry.tools[0].description, /\$0\.04/);
+  const [tool] = registry.tools;
+  assert.equal(tool.name, "poster", "the .noodle-graph save suffix is not part of the name");
+  assert.equal(registry.costs.poster, undefined);
+  assert.doesNotMatch(tool.description, /last run/);
+  t.mock.method(tool.wf, "run", async () => ({ costUsd: 0.01, outputs: {}, nodes: {} }));
+  await registry.callTool({ name: "poster", arguments: { Idea: "a lighthouse" } });
+  const { [tool.costKey]: recorded, ...retained } = JSON.parse(await readFile(costsPath, "utf8"));
+  assert.deepEqual(retained, legacy);
+  assert.equal(recorded.usd, 0.01);
+  assert.equal(recorded.hiUsd, undefined);
 });
 
 test("deposits track observed cost: cheap tools quote small deposits, live", async () => {

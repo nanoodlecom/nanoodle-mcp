@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -24,12 +25,13 @@ export async function readCostSidecar(path) {
   return Object.assign(Object.create(null), parsed && !Array.isArray(parsed) && typeof parsed === "object" ? parsed : null);
 }
 
-export function migrateCostName(costs, name) {
-  const oldName = `${name}-noodle-graph`;
-  if (!costs[name] && costs[oldName]) {
-    costs[name] = costs[oldName];
-    delete costs[oldName];
-  }
+export function workflowCostKey(graph, humanize) {
+  // Preserve execution order in arrays. JSON object member order is immaterial.
+  const canonical = (_key, value) => value && typeof value === "object" && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
+    : value;
+  const definition = JSON.stringify({ graph, humanize }, canonical);
+  return `graph:v1:${createHash("sha256").update(definition).digest("hex")}`;
 }
 
 function observedAt(record) {
@@ -60,7 +62,7 @@ export function mergeCostRecords(previous, incoming) {
 // The SQLite file supplies an exclusive writer reservation only. The kernel
 // releases that reservation if the process dies. Leave the lock file in place
 // so all writers continue to lock the same inode.
-export async function commitCostObservations(path, observations, toolNames) {
+export async function commitCostObservations(path, observations) {
   await mkdir(dirname(path), { recursive: true });
   const { DatabaseSync } = await import("node:sqlite");
   const lock = new DatabaseSync(`${path}.lock`);
@@ -76,8 +78,9 @@ export async function commitCostObservations(path, observations, toolNames) {
     }
 
     const costs = await readCostSidecar(path);
-    for (const name of toolNames) migrateCostName(costs, name);
-    for (const [name, record] of observations) costs[name] = mergeCostRecords(costs[name], record);
+    // Keep old name-only records on disk. The name cannot prove which graph
+    // produced them, so new observations are merged only by workflow identity.
+    for (const [key, record] of observations) costs[key] = mergeCostRecords(costs[key], record);
 
     const tmp = `${path}.tmp`;
     // A prior process may have died after staging the JSON. Only the holder

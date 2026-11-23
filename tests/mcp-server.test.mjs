@@ -227,7 +227,9 @@ test("full handshake: initialize → initialized → tools/list → tools/call",
     assert.match(relist.result.tools.find((t) => t.name === "hello-noodle").description,
       /balance; last run \$0\.0012\.$/);
     const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
-    assert.equal(sidecar["hello-noodle"].usd, 0.0012);
+    const [[key, record]] = Object.entries(sidecar);
+    assert.match(key, /^graph:v1:[a-f0-9]{64}$/);
+    assert.equal(record.usd, 0.0012);
 
     // -- tools/call: an author-optional input can be omitted — the run proceeds with an
     // empty value (local-only graph: text + text → join, no API traffic)
@@ -609,9 +611,12 @@ test("a running MCP client sees observed costs committed by another server", asy
 });
 
 test("an unavailable sidecar does not block stdio listing or shutdown", { skip: process.platform === "win32" }, async t => {
+  const { loadTools } = await import("../src/tools.mjs");
   const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-unavailable-costs-"));
   const costsPath = join(outDir, "costs.json");
-  await writeFile(costsPath, JSON.stringify({ "hello-noodle": { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
+  const registry = await loadTools({ dirs: [FIXTURES], outDir });
+  const { costKey } = registry.tools.find(tool => tool.name === "hello-noodle");
+  await writeFile(costsPath, JSON.stringify({ [costKey]: { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
   const reader = startServer({ outDir });
   t.after(async () => {
     const status = await reader.close();
@@ -650,8 +655,9 @@ test("cost sidecar: a run records its price, re-renders the description, and not
   assert.match(reg.tools[0].description, /balance; last run \$0\.0012\.$/);
   assert.match(reg.listTools().find((t) => t.name === "chat").description, /last run \$0\.0012/);
   const sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
-  assert.equal(sidecar.chat.usd, 0.0012);
-  assert.match(sidecar.chat.at, /^\d{4}-\d{2}-\d{2}T/);
+  const record = sidecar[reg.tools[0].costKey];
+  assert.equal(record.usd, 0.0012);
+  assert.match(record.at, /^\d{4}-\d{2}-\d{2}T/);
 
   // same price again → description unchanged → no second notification
   await reg.callTool({ name: "chat", arguments: {} });
@@ -674,19 +680,19 @@ test("cost sidecar: a cheaper run keeps the worst cost on record as hiUsd", asyn
     ],
     links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
   }));
-  // a past run cost $0.02; the stub's next run charges only $0.0012
-  await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
-
   const reg = await loadTools({ dirs: [dir], apiKey: "test-key", baseUrl: apiUrl, outDir });
+  const { costKey } = reg.tools[0];
+  // a past run cost $0.02; the stub's next run charges only $0.0012
+  await writeFile(join(outDir, "costs.json"), JSON.stringify({ [costKey]: { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
   await reg.callTool({ name: "chat", arguments: {} });
   let sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
-  assert.equal(sidecar.chat.usd, 0.0012);
-  assert.equal(sidecar.chat.hiUsd, 0.02, "the worst observed cost survives as the high-water mark");
+  assert.equal(sidecar[costKey].usd, 0.0012);
+  assert.equal(sidecar[costKey].hiUsd, 0.02, "the worst observed cost survives as the high-water mark");
 
   // and it survives further cheap runs
   await reg.callTool({ name: "chat", arguments: {} });
   sidecar = JSON.parse(await readFile(join(outDir, "costs.json"), "utf8"));
-  assert.equal(sidecar.chat.hiUsd, 0.02);
+  assert.equal(sidecar[costKey].hiUsd, 0.02);
 });
 
 test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrupt file ignored", async () => {
@@ -701,11 +707,13 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
     ],
     links: [{ id: "l1", from: { node: "n1", port: "text" }, to: { node: "n2", port: "prompt" } }],
   }));
-  const load = async () => (await loadTools({ dirs: [dir], apiKey: "test-key", outDir })).tools[0].description;
+  const load = () => loadTools({ dirs: [dir], apiKey: "test-key", outDir });
+  const { costKey } = (await load()).tools[0];
+  const description = async () => (await load()).tools[0].description;
   const at = "2026-07-19T00:00:00.000Z";
   const withRec = async (rec) => {
-    await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: rec }));
-    return load();
+    await writeFile(join(outDir, "costs.json"), JSON.stringify({ [costKey]: rec }));
+    return description();
   };
 
   assert.match(await withRec({ usd: 0.02, at }), /; last run \$0\.02\.$/);       // 0.0200 → trailing zeros trimmed
@@ -719,9 +727,9 @@ test("cost sidecar: rendering — zero-trimming, tiny costs, inexact '+', corrup
 
   // corrupt or junk sidecars are ignored, never fatal
   await writeFile(join(outDir, "costs.json"), "{not json");
-  assert.ok(!(await load()).includes("last run"));
-  await writeFile(join(outDir, "costs.json"), JSON.stringify({ chat: { usd: "expensive", at } }));
-  assert.ok(!(await load()).includes("last run"));
+  assert.ok(!(await description()).includes("last run"));
+  await writeFile(join(outDir, "costs.json"), JSON.stringify({ [costKey]: { usd: "expensive", at } }));
+  assert.ok(!(await description()).includes("last run"));
 });
 
 /* ========================= multiple --graphs dirs ========================= */
