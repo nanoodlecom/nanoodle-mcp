@@ -306,7 +306,7 @@ export function checkGraphSafety(graph, { inputs = {}, limits = DEFAULT_LIMITS }
         code: "UNKNOWN_NODE", nodeId: m[2], type: m[1],
         message: `node "${displayName(n)}" has unknown type "${m[1]}"; use one of the allowed types listed by noodle_guide`,
       });
-    } else if (w.startsWith("wire ")) {
+    } else if (w.startsWith("wire ") || (w.startsWith("input ") && w.includes(" has competing wires from "))) {
       refusals.push({ code: "UNSAFE_WIRING", message: w });
     } else {
       // Media-field placeholder scrubbed by the loader. Media fields must be left empty.

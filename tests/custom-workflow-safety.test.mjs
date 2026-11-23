@@ -162,6 +162,24 @@ test("an invalid routing assignment still refuses and preserves SDK wire diagnos
   }
 });
 
+test("competing input sources are refused with the SDK wire diagnostic", t => {
+  const conflicting = graph([
+    { id: "left", type: "text", fields: { text: "first input" } },
+    { id: "right", type: "text", fields: { text: "second input" } },
+    { id: "request", type: "llm", fields: { model: "m", prompt: "stored prompt" } },
+  ], [
+    link("1", "left", "text", "request", "prompt"),
+    link("2", "right", "text", "request", "prompt"),
+  ]);
+  const { warnings } = new Workflow(conflicting, { quiet: true });
+  if (!warnings.length) return t.skip("installed SDK predates competing-wire diagnostics");
+
+  assert.match(warnings[0], /input request\.prompt has competing wires from left\.text, right\.text/);
+  const r = checkGraphSafety(conflicting);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.refusals, [{ code: "UNSAFE_WIRING", message: warnings[0] }]);
+});
+
 test("a URL in a field is UNSAFE_FIELD (metadata address on llm.system)", () => {
   const r = checkGraphSafety(graph([{ id: "l", type: "llm", name: "Writer", fields: { model: "m", system: "http://169.254.169.254/" } }]));
   assert.deepEqual(codes(r), ["UNSAFE_FIELD"]);
