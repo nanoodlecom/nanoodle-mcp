@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +47,53 @@ async function fixtureDirs() {
   await writeFile(join(graphsDir, "idea-poster.json"), JSON.stringify(WORKED_GRAPH));
   return { graphsDir, outDir };
 }
+
+test("the paid server refuses malformed saved and composed graphs before model dispatch", { timeout: 60_000 }, async t => {
+  const { graphsDir, outDir } = await fixtureDirs();
+  const badTarget = structuredClone(WORKED_GRAPH);
+  badTarget.links[0].to.port = "promtp";
+  const dangling = structuredClone(WORKED_GRAPH);
+  dangling.links[0].from.node = "missing";
+  const competing = {
+    ...WORKED_GRAPH,
+    nodes: [...WORKED_GRAPH.nodes, { id: "second", type: "text", fields: { text: "competing input" } }],
+    links: [...WORKED_GRAPH.links, { from: { node: "second", port: "text" }, to: WORKED_GRAPH.links[0].to }],
+  };
+  const cases = [
+    ["bad-target", badTarget, "UNSAFE_WIRING", /undeclared target port "promtp"/],
+    ["dangling-source", dangling, "UNSAFE_WIRING", /missing source node "missing"/],
+    ["competing-inputs", competing, "UNSAFE_WIRING", /has competing wires/],
+    ["missing-node-id", { ...WORKED_GRAPH, nodes: [...WORKED_GRAPH.nodes, { type: "text" }] }, "BAD_GRAPH", /missing or invalid id/],
+    ["missing-node-type", { ...WORKED_GRAPH, nodes: [...WORKED_GRAPH.nodes, { id: "incomplete" }] }, "BAD_GRAPH", /missing or invalid type/],
+    ["null-node", { ...WORKED_GRAPH, nodes: [...WORKED_GRAPH.nodes, null] }, "BAD_GRAPH", /must be an object/],
+  ];
+  await Promise.all(cases.map(([name, graph]) => writeFile(join(graphsDir, `${name}.json`), JSON.stringify(graph))));
+  const chain = createFakeChain(), key = await throwawayNearKey(), nano = nanoGptMock();
+  chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
+  let srv;
+  t.after(async () => {
+    await srv?.kill();
+    await Promise.all([chain.close(), nano.close?.()]);
+    await rm(dirname(outDir), { recursive: true, force: true });
+  });
+  await Promise.all([chain.listen(), nano.listen()]);
+  const port = await freePort();
+  srv = await startServer({ graphsDir, outDir, chainUrl: chain.url, nanoUrl: nano.url, secretKey: key.secretKey, port });
+  const mcp = mcpClient(`http://127.0.0.1:${port}`);
+  const listed = new Set((await mcp.list()).map(tool => tool.name));
+  assert.ok(listed.has("idea-poster") && listed.has("run_noodle"));
+  for (const [name, graph, code, detail] of cases) {
+    assert.equal(listed.has(name), false, name);
+    const saved = await mcp.call(name, { Idea: "a testing brief" });
+    assert.equal(saved.rpcError?.code, -32602, name);
+    const composed = await mcp.call("run_noodle", { graph, inputs: { Idea: "a testing brief" } });
+    assert.equal(composed.isError, true, name);
+    assert.equal(composed.structuredContent.payment, undefined, name);
+    assert.ok(composed.structuredContent.refusals.some(r => r.code === code && detail.test(r.message)), name);
+  }
+  assert.ok((await mcp.call("idea-poster", { Idea: "a testing brief" })).structuredContent?.payment);
+  assert.equal(nano.runs(), 0);
+});
 
 for (const name of ["idea-poster", "run_noodle"]) test(`${name}: payment page streams progress and retains the finished graph across restart`, { timeout: 60_000 }, async () => {
   const { graphsDir, outDir } = await fixtureDirs();

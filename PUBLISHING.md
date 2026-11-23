@@ -1,12 +1,16 @@
 # Publishing Nanoodle MCP
 
 Merges to `main` run the offline suite, then build and install the npm tarball
-in a clean directory. The package depends on an exact Nanoodle engine version so
+in a clean directory. MCP npm releases depend on an exact Nanoodle engine version so
 npm can install the correct media libraries for the caller's platform. Publish the
 engine before preparing an MCP release that depends on it. The workflow
 publishes through Trusted Publishing on version-changing main pushes or an
 explicit main dispatch. It then registers that same npm version in the official
 MCP Registry. Each publishing job skips an already registered version.
+
+The hosted service temporarily uses an immutable SDK commit archive with its
+SHA-512 integrity in the lockfile. Before preparing the next MCP npm release,
+publish the SDK, pin its exact npm version, and regenerate the lockfile.
 
 ## Prepare a release
 
