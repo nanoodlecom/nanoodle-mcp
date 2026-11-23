@@ -231,7 +231,7 @@ jobs:
           npm ci --omit=dev --ignore-scripts
           mkdir "$RUNNER_TEMP/consumer"
           version="$(node -p 'require("./package.json").version')"
-          sdk_version="$(node -p 'require("./package-lock.json").packages["node_modules/nanoodle"].version')"
+          sdk_identity="$(node -p 'const {version,resolved,integrity} = require("./package-lock.json").packages["node_modules/nanoodle"]; JSON.stringify([version,resolved,integrity])')"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$REQUESTED_VERSION" != "$version" ]]; then
             echo "Requested version must match package.json on the tested main revision" >&2
@@ -241,12 +241,19 @@ jobs:
           mv "$RUNNER_TEMP/nanoodle-mcp-$version.tgz" "$RUNNER_TEMP/nanoodle-mcp.tgz"
           cd "$RUNNER_TEMP/consumer"
           npm install --omit=dev --ignore-scripts "$RUNNER_TEMP/nanoodle-mcp.tgz"
-          installed_sdk="$(node -p 'require(require.resolve("nanoodle/package.json", {paths:["./node_modules/nanoodle-mcp"]})).version')"
-          test "$installed_sdk" = "$sdk_version"
           test "$(node_modules/.bin/nanoodle-mcp --version)" = "nanoodle-mcp $version"
-          node --input-type=module <<'JS'
+          SDK_IDENTITY="$sdk_identity" node --input-type=module <<'JS'
           import assert from "node:assert/strict";
+          import { createRequire } from "node:module";
+          import { dirname, relative } from "node:path";
           import { noodleGuide } from "nanoodle-mcp/src/tools.mjs";
+          const require = createRequire(import.meta.url);
+          const manifest = require.resolve("nanoodle/package.json", { paths: ["./node_modules/nanoodle-mcp"] });
+          const key = relative(process.cwd(), dirname(manifest));
+          const { version, resolved, integrity } = require("./package-lock.json").packages[key];
+          assert.ok(resolved && integrity, "the installed SDK has locked provenance");
+          assert.equal(require(manifest).version, version);
+          assert.deepEqual([version, resolved, integrity], JSON.parse(process.env.SDK_IDENTITY));
           for (const type of ["slice-3d", "sprite-stack-render"]) {
             const guide = await noodleGuide({ node_type: type });
             assert.ok(guide.structuredContent.nodeTypes.find(n => n.type === type)?.settings.length);
