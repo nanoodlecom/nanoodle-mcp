@@ -189,7 +189,9 @@ test("processes merge distinct tools and keep the newest same-tool observation",
   old.send({ name: "chat", usd: 0.90 });
   await old.receive("paused");
   recent.send({ name: "chat", usd: 0.01, exact: false });
-  assert.equal((await recent.receive("done")).costs.chat.hiUsd, 0.50);
+  const recentCosts = (await recent.receive("done")).costs;
+  assert.equal(recentCosts.chat.hiUsd, 0.50);
+  assert.equal(recentCosts.chat.quoteHiUsd, 0.50);
   recent.send({ name: "other", usd: 0.40 });
   await recent.receive("done");
   old.send({ release: true });
@@ -197,10 +199,11 @@ test("processes merge distinct tools and keep the newest same-tool observation",
   assert.equal(merged.costs.chat.usd, 0.01);
   assert.equal(merged.costs.chat.exact, false);
   assert.equal(merged.costs.chat.hiUsd, 0.90);
+  assert.equal(merged.costs.chat.quoteHiUsd, 0.90);
   assert.equal(merged.costs.other.usd, 0.40);
   assert.match(merged.description, /last run \$0\.01\+/);
   assert.deepEqual(JSON.parse(await readFile(f.costsPath, "utf8")), merged.costs);
-  assert.equal((await f.load()).costs.chat.hiUsd, 0.90);
+  assert.equal((await f.load()).costs.chat.quoteHiUsd, 0.90);
 });
 
 test("a competing writer recovers when the first process dies before rename", { timeout: 8_000 }, async t => {

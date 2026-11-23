@@ -38,6 +38,7 @@ import { checkAddress } from "nanocurrency";
 import { rawToXno, authorAddress } from "./wallet.mjs";
 import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { fmtDur, formatCostUsd, ParamsError } from "./tools.mjs";
+import { observedQuoteHighWater } from "./cost-sidecar.mjs";
 import { redactUrl } from "./redact.mjs";
 import { runFundingBudget } from "./run-funding.mjs";
 import { nanoFundingCoverage, nanoFundingLiabilities, nanoQuoteClaim } from "./funding-liabilities.mjs";
@@ -1408,8 +1409,8 @@ export function createChargeGate({
        *   2. Otherwise a graph's own x402.usd is pinned and wins.
        *   3. Otherwise quote off the largest of two cost signals — an UP-FRONT
        *      catalog forecast (registry.estimates, valid before the tool has ever
-       *      run) and the worst metered cost actually seen (registry.costs, a live
-       *      high-water mark) — times a safety multiplier for run-to-run variance:
+       *      run) and the observed cost high-water mark used for pricing —
+       *      times a safety multiplier for run-to-run variance:
        *      1.25× when the cost is deterministic (image only), 2× otherwise.
        *   4. With no signal at all (never run, uncatalogued), fall back to the flat
        *      --charge-usd opening deposit.
@@ -1435,10 +1436,7 @@ export function createChargeGate({
         }
         const pin = pinned.get(name);
         if (pin) return pin;
-        const rec = registry.costs && registry.costs[name];
-        const obsHi = rec && rec.exact !== false
-          ? Math.max(Number.isFinite(rec.usd) ? rec.usd : 0, Number.isFinite(rec.hiUsd) ? rec.hiUsd : 0)
-          : 0;
+        const obsHi = observedQuoteHighWater(registry.costs?.[name]);
         const est = registry.estimates && registry.estimates[name];
         const estUsd = est && Number.isFinite(est.usd) ? est.usd : 0;
         const basis = Math.max(estUsd, obsHi);

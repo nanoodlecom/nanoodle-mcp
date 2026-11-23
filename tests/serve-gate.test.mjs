@@ -2133,6 +2133,9 @@ test("deposit derivation: high-water mark, inexact costs, tracks-not-caps, pinne
   // a lower-bound cost (exact:false) can't be trusted as a basis → flat opening deposit
   registry.costs = { poster: { usd: 0.001, exact: false } };
   assert.equal(await quoteUsd("b"), 0.05);
+  // Legacy sidecars can contain an earlier exact cost even after an inexact run.
+  registry.costs = { poster: { usd: 0.001, exact: false, hiUsd: 0.012 } };
+  assert.equal(await quoteUsd("legacy history"), 0.03);
   // a cost ABOVE the opening deposit now quotes what it actually costs — the deposit is no longer capped
   registry.costs = { poster: { usd: 0.2 } };
   assert.equal(await quoteUsd("c"), 0.48); // ceil(0.2 · 2.4)
@@ -2142,6 +2145,58 @@ test("deposit derivation: high-water mark, inexact costs, tracks-not-caps, pinne
   pinnedReg.costs = { poster: { usd: 0.004 } };
   const pinnedGate = makeGate(fakeChain(), { registry: pinnedReg }).wrapRegistry(pinnedReg);
   assert.equal(argOf(await pinnedGate.callTool({ name: "poster", arguments: { Text: "d" } })).amountUsd, 0.10);
+});
+
+test("a later inexact observation preserves the advertised and quoted Nano deposit", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "nano-quote-observed-history-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outDir = join(dir, "out");
+  await writeFile(join(dir, "poster.json"), JSON.stringify(WORKED_GRAPH));
+  const load = () => loadTools({ dirs: [dir], outDir });
+  const [reader, writer] = await Promise.all([load(), load()]);
+  const params = { name: "poster", arguments: { Idea: "a lighthouse" } };
+  const tool = writer.tools.find(tool => tool.name === params.name);
+  let observation;
+  t.mock.method(tool.wf, "run", async () => observation);
+  async function observe(costUsd, costExact) {
+    observation = { costUsd, costExact, outputs: {}, nodes: {} };
+    assert.equal((await writer.callTool(params)).isError, undefined);
+  }
+  function wrap(registry) {
+    const gate = makeGate(fakeChain(), { registry });
+    t.after(() => gate.stop());
+    return gate.wrapRegistry(registry);
+  }
+  async function checkDeposit(wrapped, expected) {
+    const description = wrapped.listTools().find(tool => tool.name === params.name).description;
+    assert.ok(description.includes(`$${expected.toFixed(2)} deposit per call`), description);
+    assert.equal(argOf(await wrapped.callTool(params)).amountUsd, expected);
+    return description;
+  }
+  const wrapped = wrap(reader);
+
+  await observe(0.03, false);
+  await observe(0.01, false);
+  await reader.refreshCosts();
+  assert.equal(reader.costs.poster.quoteHiUsd, 0);
+  await checkDeposit(wrapped, 0.05);
+
+  await observe(0.90, true);
+  await reader.refreshCosts();
+  await checkDeposit(wrapped, 2.16);
+
+  await observe(0.01, false);
+  await reader.refreshCosts();
+  assert.match(await checkDeposit(wrapped, 2.16), /last run \$0\.01\+/);
+  assert.equal(reader.costs.poster.hiUsd, 0.90);
+  assert.equal(reader.costs.poster.quoteHiUsd, 0.90);
+
+  await observe(1.50, false);
+  await observe(0.02, true);
+  const reopened = await load();
+  assert.equal(reopened.costs.poster.hiUsd, 1.50);
+  assert.equal(reopened.costs.poster.quoteHiUsd, 0.90);
+  assert.match(await checkDeposit(wrap(reopened), 2.16), /last run \$0\.02\./);
 });
 
 test("landing page links each workflow, states the author cut, and shows self-hosting; /graph serves the JSON", async () => {

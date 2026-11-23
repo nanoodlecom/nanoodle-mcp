@@ -496,16 +496,15 @@ is issued (nobody pays for a typo), and `run_noodle` is withdrawn in Nano charge
 mode; NEAR mode prices and sells it, custom graphs included — see
 [Pay with NEAR](#pay-with-near--run-custom-workflows).
 
-Pricing: `--charge-usd` sets the **ceiling** deposit, and the opening quote
-for a tool that has never run. Once a tool has run, its deposit tracks its
-real cost automatically: quotes become twice the settle price (worst observed
-metered cost + 20%, from the `costs.json` sidecar), ceiled to a whole cent
-with a 1¢ floor — a tool that meters $0.004 quotes a $0.01 deposit, not the
-flat ceiling. Size the ceiling generously; over-covering costs callers
-nothing since the difference comes back as change, while an under-sized
-deposit means runs can cost more than was collected and *you* eat the
-difference (the gate warns at startup when a graph's deposit is below its
-last observed cost + 20%). The gate prefers the exact raw-XNO/USD pair from
+For unpinned tools, the Nano deposit uses the higher of the catalog forecast
+and the observed cost high-water mark used for pricing. The gate adds 20%,
+applies a 2× variance multiplier (1.25× for a deterministic forecast that
+covers observed costs), and rounds up to a whole cent. `--charge-usd` sets
+the opening deposit when neither cost signal is available and the minimum
+when a forecast only covers some priced nodes. Inexact runs leave previous
+exact pricing observations in place. Historical high-water marks from older
+`costs.json` files remain eligible for pricing. The operator absorbs any
+overrun. The gate prefers the exact raw-XNO/USD pair from
 an unpaid NanoGPT invoice. It refreshes the rate after 60 seconds and can
 keep using that observation for up to five minutes during an outage.
 CoinGecko and Kraken provide timestamped XNO/USD fallbacks within the same

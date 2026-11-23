@@ -37,13 +37,24 @@ function observedAt(record) {
   return typeof record.at === "string" ? Date.parse(record.at) || 0 : 0;
 }
 
+export function observedQuoteHighWater(record) {
+  const latestExactUsd = record?.exact !== false && Number.isFinite(record?.usd) ? record.usd : 0;
+  const { quoteHiUsd, hiUsd } = record ?? {};
+  // Legacy high-water marks have no exactness attached. Keep their pricing
+  // protection when a record predates the separate quote high-water field.
+  const history = Number.isFinite(quoteHiUsd) && quoteHiUsd >= 0 ? quoteHiUsd : Number.isFinite(hiUsd) ? hiUsd : 0;
+  return Math.max(0, latestExactUsd, history);
+}
+
 export function mergeCostRecords(previous, incoming) {
   if (!Number.isFinite(incoming?.usd)) return previous;
   if (!Number.isFinite(previous?.usd)) return incoming;
   const latest = observedAt(incoming) >= observedAt(previous) ? incoming : previous;
   const hiUsd = Math.max(0, previous.usd, incoming.usd,
     Number.isFinite(previous.hiUsd) ? previous.hiUsd : 0, Number.isFinite(incoming.hiUsd) ? incoming.hiUsd : 0);
-  return hiUsd > latest.usd && hiUsd !== latest.hiUsd ? { ...latest, hiUsd } : latest;
+  const quoteHiUsd = Math.max(observedQuoteHighWater(previous), observedQuoteHighWater(incoming));
+  const withHistory = hiUsd > latest.usd && hiUsd !== latest.hiUsd ? { ...latest, hiUsd } : latest;
+  return quoteHiUsd === latest.quoteHiUsd ? withHistory : { ...withHistory, quoteHiUsd };
 }
 
 // The SQLite file supplies an exclusive writer reservation only. The kernel

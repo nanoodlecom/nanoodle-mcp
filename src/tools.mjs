@@ -1261,9 +1261,10 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
 
   /** Record a run's observed cost + duration and refresh the tool's description. Best-effort — never throws. */
   async function recordCost(tool, result, ms) {
-    const observedUsd = typeof result.providerUsd === "number" && Number.isFinite(result.providerUsd) ? result.providerUsd : result.costUsd;
-    const observedExact = typeof result.providerUsd === "number" ? result.providerExact !== false : result.costExact !== false;
-    if (typeof observedUsd !== "number" || !Number.isFinite(observedUsd)) return;
+    const hasProviderCost = Number.isFinite(result.providerUsd);
+    const observedUsd = hasProviderCost ? result.providerUsd : result.costUsd;
+    const observedExact = hasProviderCost ? result.providerExact !== false : result.costExact !== false;
+    if (!Number.isFinite(observedUsd)) return;
     const atMs = performance.timeOrigin + performance.now();
     const rec = { usd: observedUsd, at: new Date(atMs).toISOString(), atMs };
     if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
