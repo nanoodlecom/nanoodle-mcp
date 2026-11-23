@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { setTimeout } from "node:timers/promises";
 
@@ -7,8 +8,17 @@ const SQLITE_BUSY = 5;
 
 export async function readCostSidecar(path) {
   let parsed;
-  try { parsed = JSON.parse(await readFile(path, "utf8")); }
-  catch (error) {
+  try {
+    // Open before checking the type so a concurrent rename cannot substitute a
+    // blocking special file between the type check and the read.
+    const file = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    try {
+      if (!(await file.stat()).isFile()) throw new Error(`${path} is not a regular file`);
+      parsed = JSON.parse(await readFile(file, "utf8"));
+    } finally {
+      await file.close();
+    }
+  } catch (error) {
     if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
   }
   return Object.assign(Object.create(null), parsed && !Array.isArray(parsed) && typeof parsed === "object" ? parsed : null);

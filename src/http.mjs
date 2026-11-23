@@ -690,6 +690,7 @@ function payPageHtml(q) {
  *                                   (?refresh=1 forces a refetch, rate-limited by the service)
  * @param {Array} [opts.toolInfo]  registry.tools — per-tool editorUrl/rawText/x402/card for the landing page and /graph/:name.json
  * @param {object} [opts.costs]  registry.costs — live last-observed-cost records, shown on the landing cards
+ * @param {() => Promise<void>} [opts.refreshCosts]  load observations before serving their values
  * @param {string|null} [opts.outDir]  when set, /out/<file> serves generated media from it
  * @param {number} [opts.progressMs]  heartbeat interval on streamed tools/call responses
  * @param {number} [opts.maxStreams]  cap on concurrently-held event streams (tools/call holds +
@@ -706,6 +707,7 @@ export async function serveHttp({
   version,
   commit,
   listTools,
+  refreshCosts,
   callTool,
   instructions,
   gate = null,
@@ -742,7 +744,7 @@ export async function serveHttp({
     if (!["http:", "https:"].includes(url.protocol) || value !== url.origin) throw new TypeError("Allowed origins must be exact HTTP(S) origins");
     return url.origin;
   })]);
-  const dispatch = createDispatcher({ name, version, commit: sha, listTools, callTool, instructions, log });
+  const dispatch = createDispatcher({ name, version, commit: sha, listTools, refreshCosts, callTool, instructions, log });
   const graphByName = new Map(toolInfo.filter((t) => t.rawText).map((t) => [t.name, t.rawText]));
 
   // Every held event stream (a streaming tools/call, a /x402/watch subscriber)
@@ -950,6 +952,7 @@ export async function serveHttp({
         return send(200, `Sitemap: ${NANO_SITEMAP}\n`, "text/plain; charset=utf-8");
       }
       if (url.pathname === "/") {
+        await refreshCosts?.();
         if (nanoLanding) {
           res.setHeader("Content-Security-Policy", NANO_LANDING_CSP);
           res.setHeader("X-Frame-Options", "DENY");

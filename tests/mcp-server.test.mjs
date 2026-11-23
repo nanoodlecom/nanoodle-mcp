@@ -7,7 +7,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import http from "node:http";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -586,6 +586,45 @@ test("tool descriptions: the first comment node leads as the tool's intent", asy
   assert.equal(desc["pick-first"], `Second comment wins. text -> llm; returns text. ${TAIL}`);
   assert.equal(desc.plain, `text -> llm; returns text. ${TAIL}`);
   assert.equal(desc["only-comment"], `Just a note. ${TAIL}`);
+});
+
+test("a running MCP client sees observed costs committed by another server", async t => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-cost-refresh-"));
+  const reader = startServer({ outDir }), writer = startServer({ outDir });
+  t.after(async () => {
+    await Promise.all([reader.close(), writer.close()]);
+    await rm(outDir, { force: true, recursive: true });
+  });
+  const description = async () => (await reader.request("tools/list"))
+    .result.tools.find(tool => tool.name === "hello-noodle").description;
+
+  assert.doesNotMatch(await description(), /last run/);
+  const run = await writer.request("tools/call", { name: "hello-noodle", arguments: { Idea: "shared observation" } });
+  assert.equal(run.result.isError, undefined);
+  assert.match(await description(), /last run \$0\.0012/);
+  assert.match(await description(), /last run \$0\.0012/);
+  const changes = reader.messages.filter(message => message.method === "notifications/tools/list_changed");
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].id, undefined);
+});
+
+test("an unavailable sidecar does not block stdio listing or shutdown", { skip: process.platform === "win32" }, async t => {
+  const outDir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-unavailable-costs-"));
+  const costsPath = join(outDir, "costs.json");
+  await writeFile(costsPath, JSON.stringify({ "hello-noodle": { usd: 0.02, at: "2026-07-20T00:00:00Z" } }));
+  const reader = startServer({ outDir });
+  t.after(async () => {
+    const status = await reader.close();
+    await rm(outDir, { recursive: true, force: true });
+    assert.equal(status, 0);
+  });
+  const description = async () => (await reader.request("tools/list"))
+    .result.tools.find(tool => tool.name === "hello-noodle").description;
+  assert.match(await description(), /last run \$0\.02/);
+
+  await rm(costsPath);
+  execFileSync("mkfifo", [costsPath]);
+  assert.match(await description(), /last run \$0\.02/);
 });
 
 test("cost sidecar: a run records its price, re-renders the description, and notifies once", async () => {
