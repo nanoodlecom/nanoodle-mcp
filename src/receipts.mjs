@@ -58,8 +58,9 @@ export function receiptsHtml({ toolNames = null, compact = false } = {}) {
   }
   const [hero, ...rest] = articles;
   const thumb = pageThumb(hero);
+  const dimensions = hero.thumbWidth && hero.thumbHeight ? ` width="${hero.thumbWidth}" height="${hero.thumbHeight}"` : "";
   const shot = thumb
-    ? `<span class="shot"><img src="${esc(thumb)}" alt="${esc(ALT[hero.key] || hero.title)}" loading="lazy" decoding="async"></span>`
+    ? `<span class="shot"><img src="${esc(thumb)}" alt="${esc(ALT[hero.key] || hero.title)}"${dimensions} loading="lazy" decoding="async"></span>`
     : "";
   const notes = rest.map((article) => ext(article.url, "note",
     `<span class="when">${esc(shortDate(article.date))}</span>` +

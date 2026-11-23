@@ -2,15 +2,21 @@
 // nanoodle.com: nanoodle.com sends Cross-Origin-Resource-Policy: same-origin, so a
 // browser on the mcp host blocks images hotlinked from it.
 const MEDIA_EXAMPLES = "https://media.nanoodle.com/mcp/examples";
-const MEDIA_PREVIEWS = new Set(["image-model-arena", "photo-to-video", "talking-avatar"]);
+const MEDIA_PREVIEWS = {
+  "image-model-arena": { width: 640, height: 640, linkLabel: "Compare the image model arena results" },
+  "photo-to-video": { width: 640, height: 369, linkLabel: "Watch the photo-to-video sample" },
+  "talking-avatar": { width: 640, height: 608, linkLabel: "Watch the talking avatar sample" },
+  "mix-the-references": { width: 720, height: 720, linkLabel: "View the mix-the-references sample" },
+};
 
 // Only link reviewed, published samples; a call template is not output evidence.
 function reviewedSample(slug, description, alt) {
-  const preview = MEDIA_PREVIEWS.has(slug) ? `${MEDIA_EXAMPLES}/${slug}.webp` : `https://nanoodle.com/examples/gallery/${slug}/preview.webp`;
+  const media = MEDIA_PREVIEWS[slug];
+  const preview = media ? `${MEDIA_EXAMPLES}/${slug}.webp` : `https://nanoodle.com/examples/gallery/${slug}/preview.webp`;
   return {
     title: "Reviewed sample",
     play: `https://nanoodle.com/examples/gallery/#${slug}`,
-    ...(alt ? { preview, alt } : {}),
+    ...(alt ? { preview, alt, ...media } : {}),
     description,
   };
 }
@@ -53,13 +59,15 @@ const WORKFLOW_EXAMPLES = {
   },
   "mix-the-references": {
     ...reviewedSample("mix-the-references", "Four separate references become one picture: a paper-craft fox (image 1) wears a yellow knitted raincoat (image 2), holds one red paper lantern (image 3) and stands on a cardboard pier at dusk (image 4). FLUX.3 Klein Edit gets them in port order and the instruction names each image by number. Flaws in the saved run: the paper boats from the place reference mostly drop out and the coat comes out longer than its flat-lay reference.", "Paper-craft fox in a yellow knitted raincoat holding a red paper lantern on a cardboard pier"),
-    preview: "https://media.nanoodle.com/mcp/examples/mix-the-references.webp",
     title: "Composite sample",
   },
   "character-sprites": {
     title: "Iron Verdict",
     play: "https://nanoodle.com/examples/iron-verdict/",
     preview: `${MEDIA_EXAMPLES}/iron-verdict.png`,
+    width: 1280,
+    height: 850,
+    linkLabel: "Play Iron Verdict",
     alt: "Iron Verdict gameplay screenshot",
     skill: "https://github.com/nanoodlecom/noodle-skills/tree/main/skills/character-sprites",
     description: "A playable fighting game built with character-sprites. This graph generates a character reference and parts sheet; the local skill bakes animated sprites, and a coding agent adds combat, gravity and game rules.",
