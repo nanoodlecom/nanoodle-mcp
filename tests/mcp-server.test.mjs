@@ -358,7 +358,7 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
   await new Promise((r) => child.once("exit", r));
   const files = await readdir(join(cwd, "nanoodle-out"));
   assert.ok(files.includes("costs.json"), "cost sidecar should land in the out dir too");
-  const media = files.filter((f) => f !== "costs.json");
+  const media = files.filter((f) => !["costs.json", "costs.json.lock"].includes(f));
   assert.equal(media.length, 1);
   assert.match(media[0], /^poster-Image-.*\.png$/);
 });
