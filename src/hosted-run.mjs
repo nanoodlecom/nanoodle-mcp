@@ -28,19 +28,38 @@ export async function withHostedRun(execute, timeoutMs = DEFAULT_HOSTED_RUN_MS) 
   const duration = hostedRunTimeout(timeoutMs), controller = new AbortController();
   const label = duration >= 60_000 ? `${duration / 60_000} minute` : `${duration} ms`;
   const timeoutError = Object.assign(Error(`Workflow exceeded its ${label} hosted execution limit`), { code: "HOSTED_RUN_TIMEOUT" });
-  const scope = { controller, closed: false, deadline: performance.now() + duration, timeoutError };
+  const scope = { controller, closed: false, deadline: performance.now() + duration, timeoutError, results: [] };
   const timer = setTimeout(() => controller.abort(timeoutError), duration);
   // A stopped server/worker must be able to exit after its sockets and poll
   // loop close. The deadline is not a replacement process-liveness handle.
   timer.unref?.();
   try {
-    return await context.run(scope, async () => {
-      assertOpen(scope); const result = await execute(); assertOpen(scope); return result;
-    });
+    let result;
+    try {
+      result = await context.run(scope, () => { assertOpen(scope); return execute(); });
+      assertOpen(scope);
+    } finally {
+      scope.closed = true; clearTimeout(timer);
+      if (!controller.signal.aborted) controller.abort(Object.assign(Error("Hosted workflow execution has already finished"), { code: "HOSTED_RUN_CLOSED" }));
+    }
+    for (const { commit } of scope.results) commit();
+    return result;
+  } catch (error) {
+    await Promise.allSettled(scope.results.map(async ({ rollback }) => rollback(error)));
+    throw error;
   } finally {
-    scope.closed = true; clearTimeout(timer);
-    if (!controller.signal.aborted) controller.abort(Object.assign(Error("Hosted workflow execution has already finished"), { code: "HOSTED_RUN_CLOSED" }));
+    scope.results.length = 0;
   }
+}
+
+// A nested tool can hand back a prepared result before the enclosing scope
+// finishes. Its artifacts and terminal progress commit at that scope's deadline check.
+export function deferHostedResult(commit, rollback) {
+  const scope = context.getStore();
+  if (!scope) return false;
+  assertOpen(scope);
+  scope.results.push({ commit, rollback });
+  return true;
 }
 
 export function hostedRunOptions(options = {}) {
