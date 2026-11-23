@@ -11,11 +11,13 @@ import { humanizeFetch, requestOutputTokenCap } from "../src/humanize.mjs";
 import { HUMANIZE_MODEL_PRICES } from "../src/humanize-deposit.mjs";
 
 const DRAFT = "Thanks for sharing this, the drop from 14 to 6 minutes on CI is really great work.";
-// CYD/STARRY are a synthetic primary/fallback pair for this suite: since the
-// 2026-11-18 delisting repair the production panel has writer C on Starry
-// Ocean with no fallback, so the fallback payment paths are exercised here
-// with a stand-in pair injected through loadTools' humanizeFallbacks option.
-const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop";
+// CYD/STARRY are a synthetic primary/fallback pair for this suite: the
+// production panel has writer C on Artemis 31B with no fallback (Starry
+// Ocean held the seat 2026-11-18 to 2026-11-23), so the fallback payment
+// paths are exercised here with a stand-in pair injected through loadTools'
+// humanizeFallbacks option; the stub rewrites the graph's current C pin
+// (CURRENT_C) to the synthetic primary.
+const CYD = "TheDrummer/Cydonia-24B-v4.3", STARRY = "gemma-4-12b-it-starry-ocean", ANTI = "qwen/qwen3.8-27b-antislop", CURRENT_C = "thedrummer/artemis-31b-v1.2";
 const PRICE = 0.0001;
 delete process.env.NANOGPT_API_KEY; // keyless runs only: never fall back to an ambient key
 
@@ -95,7 +97,7 @@ async function stub(t, { plan, settleOnly = () => false, invoiceUsd = () => PRIC
   // Point the copied graph's writer C at the synthetic primary (its model field
   // and the judge's [C] label move together), and inject the synthetic fallback.
   const graphPath = join(dir, "humanize-comment.noodle-graph.json");
-  await writeFile(graphPath, (await readFile(graphPath, "utf8")).split(STARRY).join(CYD));
+  await writeFile(graphPath, (await readFile(graphPath, "utf8")).split(CURRENT_C).join(CYD));
   const registry = await loadTools({ dirs: [dir], payment, baseUrl: "http://127.0.0.1:" + srv.address().port,
     outDir: join(dir, "out"), log: () => {}, humanizeFallbacks: { [CYD]: STARRY },
     ...(backup && { backupKey: "fixture-backup", authorizeBackup: async () => {} }) });
@@ -118,7 +120,7 @@ const paidOncePerInvoice = (s) => {
 };
 
 test("x402 normal: writer invoices are settled by the wrapper, dashes fixed, one payment per call, exact cost", async (t) => {
-  const s = await stub(t, { plan: (b) => ({ content: b.model === "z-ai/glm-5.3" ? judge("A") : b.model === "qwen/qwen3.8-27b-novelist" ? "Nice one \u2014 14 to 6 is a real cut." : "rewrite by " + b.model }) });
+  const s = await stub(t, { plan: (b) => ({ content: b.model === "z-ai/glm-5.3" ? judge("A") : b.model === "meta-llama/llama-4-maverick" ? "Nice one \u2014 14 to 6 is a real cut." : "rewrite by " + b.model }) });
   const { result, texts, json } = await s.run();
   assert.notEqual(result.isError, true, texts.join("\n"));
   assert.equal(json.winner, "A");

@@ -34,7 +34,7 @@ test("a stale pin below the computed ceiling is raised to the ceiling at load", 
   const { graph, dir, registry } = await mount();
   try {
     const ceiling = humanizeCeilingDepositUsd(graph);
-    assert.equal(ceiling.toFixed(8), "0.05272831");
+    assert.equal(ceiling.toFixed(8), "0.06122676");
     const tool = registry.tools.find((t) => t.name === "humanize-comment");
     assert.equal(tool.x402.usd, ceiling);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -69,6 +69,6 @@ test("humanizeColdPin drops a pin it cannot check and keeps one at or above the 
   // a graph with no humanize nodes has no ceiling: the pin is dropped, not trusted
   assert.equal(humanizeColdPin({ nodes: [] }, { usd: 1 }).unpriceable, true);
   const graph = JSON.parse(await readFile(FIXTURE, "utf8"));
-  assert.equal(humanizeColdPin(graph, { usd: 0.06 }).usd, 0.06);
+  assert.equal(humanizeColdPin(graph, { usd: 0.07 }).usd, 0.07);
   assert.equal(humanizeColdPin(graph, null).usd, humanizeCeilingDepositUsd(graph));
 });

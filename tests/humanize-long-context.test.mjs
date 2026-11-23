@@ -43,8 +43,8 @@ test("a long-context quote prices the decider from the caller's context and cand
 
 test("a short call's quote is not inflated by the decider estimate", () => {
   const deposit = humanizeDepositUsd(graph, SHORT);
-  // main before this change quoted 0.00358265 for this call.
-  assert.ok(deposit <= 0.00358265 * 1.01, `short deposit ${deposit} grew more than 1%`);
+  // main before this change quoted 0.00422938 for this call.
+  assert.ok(deposit <= 0.00422938 * 1.01, `short deposit ${deposit} grew more than 1%`);
 });
 
 test("a writer is not admitted when it would not fit beside the decider headroom estimate", async () => {

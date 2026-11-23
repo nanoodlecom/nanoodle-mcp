@@ -35,12 +35,18 @@ export { HUMANIZE_SETTLE_MARKUP };
 
 /** USD per million tokens, [input, output]. Catalog rates override these when present. */
 export const HUMANIZE_MODEL_PRICES = Object.freeze({
+  // Replaced as Writer A on 2026-11-23 (humanize-opt cycle 7: faithful
+  // 3-6/10 with heavy DQs across cycles 2-6); row retained for stale mounts.
   "qwen/qwen3.8-27b-novelist": [0.1, 0.6],
+  "meta-llama/llama-4-maverick": [0.35, 1],
   "deepseek/deepseek-v4.1-flash-1017": [0.1, 0.6],
   // Delisted 2026-11-18; row retained so a stale mounted graph still prices
   // (its calls then fail per-writer) instead of failing every quote.
   "TheDrummer/Cydonia-24B-v4.3": [0.12, 0.15],
+  // Replaced as Writer C on 2026-11-23 (humanize-opt cycle 7); row
+  // retained for stale mounts (it also remains the Cydonia fallback).
   "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
+  "thedrummer/artemis-31b-v1.2": [0.1, 0.45],
   "qwen/qwen3.8-27b-antislop": [0.1, 0.6],
   // Replaced as Writer E on 2026-11-19 (humanize-opt cycle 1: Mercury 3 was
   // already answering 503s ahead of its 2026-12-28 shutdown); row retained so
