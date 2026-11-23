@@ -870,6 +870,7 @@ export function createSfwTool({ spendSource, hosted = false, remote = false }) {
   const noLocal = remote || hosted;
   const sfw = {
     name: SFW_TOOL,
+    costKey: `builtin:v1:${SFW_TOOL}:${SFW_MODEL}`,
     builtin: true,
     pricedPerRequest: true,
     depositNote: SFW_NOTE,

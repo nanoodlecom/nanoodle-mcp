@@ -24,7 +24,7 @@ import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, deferHostedResult, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { nanoGptBackupFetch } from "./nanogpt-backup.mjs";
-import { commitCostObservations, mergeCostRecords, migrateCostName, readCostSidecar } from "./cost-sidecar.mjs";
+import { commitCostObservations, mergeCostRecords, readCostSidecar, workflowCostKey } from "./cost-sidecar.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
@@ -1104,12 +1104,13 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
   // Observed costs inform quotes and descriptions. A missing sidecar must not block startup.
   const costsPath = join(outDir, "costs.json");
-  let costs = Object.create(null);
+  const costs = Object.create(null);
+  let storedCosts;
   let costWriteTail = Promise.resolve();
   let queuedCostWrite;
   const pendingCosts = new Map();
   try {
-    costs = await readCostSidecar(costsPath);
+    storedCosts = await readCostSidecar(costsPath);
   } catch { /* unavailable → no cost segments yet */ }
   const tools = [];
   const failures = [];
@@ -1147,15 +1148,20 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
         failures.push({ file, dir, reason: wf.warnings.join("; ") });
         continue;
       }
-      let name = sanitizeName(file);
-      const count = (usedNames.get(name) || 0) + 1;
-      usedNames.set(name, count);
-      if (count > 1) name = `${name}-${count}`;
-      // cost records written before ".noodle-graph" was stripped keep pricing deposits
-      migrateCostName(costs, name);
+      const stem = sanitizeName(file);
+      let name = stem, count = usedNames.get(stem) || 1;
+      while (usedNames.has(name)) name = `${stem}-${++count}`;
+      usedNames.set(stem, count);
+      if (name !== stem) usedNames.set(name, 1);
       if (name === HUMANIZE_TOOL) x402 = humanizeColdPin(wf.graph, x402, log);
+      // The special humanize runner can use different models from the saved graph.
+      const humanize = name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph, humanizeFallbacks === null ? HUMANIZE_FALLBACKS : humanizeFallbacks) : null;
+      const costKey = workflowCostKey(wf.graph, humanize);
+      const observed = storedCosts?.[costKey];
+      if (Number.isFinite(observed?.usd)) costs[name] = observed;
       tools.push({
         name,
+        costKey,
         file,
         dir,
         wf,
@@ -1168,7 +1174,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
         description: buildDescription(wf, spendSource, { cost: renderCost(costs[name]), name }),
         inputSchema: buildInputSchema(wf),
         // humanize-comment: input caps + writer record + exact ranked texts (src/humanize.mjs)
-        humanize: name === HUMANIZE_TOOL ? humanizeWriterRecord(wf.graph, humanizeFallbacks === null ? HUMANIZE_FALLBACKS : humanizeFallbacks) : null,
+        humanize,
         // Quoted per request from length and maxChars. The gate reads quoteDeposit.
         pricedPerRequest: name === HUMANIZE_TOOL,
       });
@@ -1193,10 +1199,13 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
   }
   if (tools.length) {
     const tool = createSfwTool({ spendSource, hosted, remote });
+    const observed = storedCosts?.[tool.costKey];
+    if (Number.isFinite(observed?.usd)) costs[tool.name] = observed;
     tool.description = withObservedCost(tool.description, costs[tool.name]);
     tools.push(tool);
   }
   const byName = new Map(tools.map((t) => [t.name, t]));
+  const byCostKey = Map.groupBy(tools, tool => tool.costKey);
 
   function refreshCostDescriptions(changedTools) {
     let changed = false;
@@ -1218,15 +1227,17 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
 
   function applyCostSnapshot(records) {
     const changedTools = [];
-    for (const [name, record] of Object.entries(records)) {
-      const current = costs[name];
+    for (const [key, aliases] of byCostKey) {
+      const current = costs[aliases[0].name];
       // A local observation or another read can finish while this snapshot is in flight.
-      const available = mergeCostRecords(current, record);
-      const merged = mergeCostRecords(available, pendingCosts.get(name));
+      const available = mergeCostRecords(current, records[key]);
+      const merged = mergeCostRecords(available, pendingCosts.get(key));
       if (merged === current) continue;
-      costs[name] = merged;
-      const tool = byName.get(name);
-      if (tool && renderCost(current) !== renderCost(merged)) changedTools.push(tool);
+      const changed = renderCost(current) !== renderCost(merged);
+      for (const tool of aliases) {
+        costs[tool.name] = merged;
+        if (changed) changedTools.push(tool);
+      }
     }
     refreshCostDescriptions(changedTools);
   }
@@ -1236,7 +1247,6 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     let records;
     try { records = await readCostSidecar(costsPath); }
     catch { return; } // The current observations still serve if the sidecar is unavailable.
-    for (const name of byName.keys()) migrateCostName(records, name);
     applyCostSnapshot(records);
   }
 
@@ -1246,9 +1256,9 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     queuedCostWrite = costWriteTail.then(async () => {
       queuedCostWrite = null;
       const observations = new Map(pendingCosts);
-      const stored = await commitCostObservations(costsPath, observations, byName.keys());
-      for (const [name, record] of observations) {
-        if (pendingCosts.get(name) === record) pendingCosts.delete(name);
+      const stored = await commitCostObservations(costsPath, observations);
+      for (const [key, record] of observations) {
+        if (pendingCosts.get(key) === record) pendingCosts.delete(key);
       }
       applyCostSnapshot(stored);
     }).catch(error => {
@@ -1269,11 +1279,14 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     const rec = { usd: observedUsd, at: new Date(atMs).toISOString(), atMs };
     if (Number.isFinite(ms)) rec.ms = Math.round(ms); // the tool's typical runtime — ETA copy reads this
     if (!observedExact) rec.exact = false; // renders "$X+"
-    costs[tool.name] = mergeCostRecords(costs[tool.name], rec);
-    pendingCosts.set(tool.name, mergeCostRecords(pendingCosts.get(tool.name), rec));
+    const { costKey } = tool;
+    const aliases = byCostKey.get(costKey);
+    const merged = mergeCostRecords(costs[tool.name], rec);
+    for (const alias of aliases) costs[alias.name] = merged;
+    pendingCosts.set(costKey, mergeCostRecords(pendingCosts.get(costKey), rec));
     const saved = queueCostWrite();
     // Publish the matching description before yielding to another observation.
-    refreshCostDescriptions([tool]);
+    refreshCostDescriptions(aliases);
     await saved;
   }
 
