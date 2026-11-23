@@ -12,7 +12,7 @@
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
 import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
-import { readdir, readFile, mkdir, writeFile, rename } from "node:fs/promises";
+import { readdir, readFile, mkdir, open, unlink, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, join, resolve } from "node:path";
@@ -22,7 +22,7 @@ import { HUMANIZE_TOOL, HUMANIZE_FALLBACKS, HUMANIZE_INPUT_CAPS, ONE_THREAD_PREF
 import { humanizeCeilingDepositUsd, humanizeDeciderReserveUsd, humanizeDepositUsd, humanizePriceTable } from "./humanize-deposit.mjs";
 import { knownUsd, parseUsdNano } from "./usd.mjs";
 import { FundingError } from "./run-funding.mjs";
-import { withHostedRun, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
+import { withHostedRun, deferHostedResult, hostedRunTimeout, hostedRunOptions, hostedRunFetch } from "./hosted-run.mjs";
 import { nanoGptBackupFetch } from "./nanogpt-backup.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
 import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
@@ -769,7 +769,7 @@ function* resultPorts(wf, result) {
  * `notices` lead the content (see runNotices): a caller who scrolls no further
  * than the first block still learns the run did not do exactly what they asked.
  */
-async function emitResult(wf, result, prefix, outDir, { publicBase = null, notices = [] } = {}) {
+async function emitResult(wf, result, prefix, outDir, { artifacts, publicBase, notices }) {
   const content = notices.map((text) => ({ type: "text", text }));
   for (const text of gateNotices(wf, result)) content.push({ type: "text", text });
   const gateName = (id) => {
@@ -802,7 +802,19 @@ async function emitResult(wf, result, prefix, outDir, { publicBase = null, notic
       const ext = extForMedia(bytes, value.mime);
       const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
       const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
-      await writeFile(path, bytes);
+      const { signal } = hostedRunOptions();
+      // Take ownership before writing so rollback can also remove a partial
+      // file. Exclusive creation preserves an existing result on a collision.
+      const artifact = await open(path, "wx");
+      artifacts.push(path);
+      try {
+        await artifact.writeFile(bytes, { signal });
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      } finally {
+        await artifact.close();
+      }
       if (publicBase) {
         content.push({ type: "text", text: `${o.key}: ${publicBase}/out/${basename(path)}` });
         const mime = /^image\//.test(value.mime || "") ? value.mime : EXT_MIME[ext];
@@ -1307,6 +1319,14 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
     /** tools/call handler. Throws ParamsError for malformed params; other errors mean the run failed. */
     async callTool(params, ctx = null) {
       let progress, runResult;
+      const artifacts = [];
+      const discardResult = async error => {
+        await Promise.allSettled(artifacts.map(async path => {
+          try { await unlink(path); }
+          catch (e) { if (e.code !== "ENOENT") log(`cannot discard output ${basename(path)}: ${e.message}`); }
+        }));
+        progress?.finish(runResult, error);
+      };
       const runWorkflow = async (wf, inputs) => {
         try {
           runResult = await wf.run(inputs, hostedRunOptions({ onProgress: progress.onProgress }));
@@ -1322,7 +1342,7 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
             const { wf, inputs } = await registry.prepareRunNoodle(params.arguments, { allowShortLinks: true });
             progress = runNotices(wf, ctx);
             const result = await runWorkflow(wf, inputs);
-            return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { publicBase, notices: progress.notices });
+            return emitResult(wf, result, RUN_NOODLE_NAME, outDir, { artifacts, publicBase, notices: progress.notices });
           }
           if (params.name === PRICE_NOODLE_NAME) return priceNoodle(params, { baseUrl, log, catalogTimeoutMs });
           if (params.name === NOODLE_GUIDE_NAME) return noodleGuide(params.arguments, { baseUrl, log, catalogTimeoutMs });
@@ -1434,18 +1454,17 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
           if (result.costExact === false && result.costUsd === 0) result.costUsd = null;
         }
         await recordCost(tool, result, Date.now() - t0); // run_noodle never reaches here — its costs aren't tracked
-        return emitResult(tool.wf, result, tool.name, outDir, { publicBase, notices });
+        return emitResult(tool.wf, result, tool.name, outDir, { artifacts, publicBase, notices });
       };
       try {
         const output = await (executionLimit === null ? execute() : withHostedRun(execute, executionLimit));
         if (progress) {
-          // If a payment gate owns the hosted scope, its deadline still applies here.
-          hostedRunOptions();
-          progress.finish(runResult);
+          const finish = () => progress.finish(runResult);
+          if (!deferHostedResult(finish, discardResult)) finish();
         }
         return output;
       } catch (error) {
-        progress?.finish(runResult, error);
+        await discardResult(error);
         throw error;
       }
     },

@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { readdirSync } from "node:fs";
+import { mkdtemp, readFile, readdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Workflow } from "nanoodle";
@@ -271,4 +272,74 @@ test("the deadline includes output downloads after the model has completed", asy
   const priced = await runner.price({ graph }); assert.equal(priced.ok, true);
   await assert.rejects(runner.run({ pricing: priced.pricing, inputs: priced.inputs, outDir: dir }), /hosted execution limit/);
   assert.equal(models, 3); assert.equal(downloads, 3, "each model completed and each artifact read was cancelled");
+});
+
+async function twoMediaOutputs(t, { failSecond = false, publicBase = null } = {}) {
+  const downloads = [];
+  let base;
+  base = await server(t, async (req, res) => {
+    if (req.url === "/v1/images/generations") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const name = JSON.parse(body).prompt;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ data: [{ url: `${base}/${name}.png` }], cost: 0.01 }));
+      return;
+    }
+    if (req.url === "/api/v1/image-models") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ data: [{ id: "fixture/image" }] }));
+      return;
+    }
+    downloads.push(req.url);
+    if (failSecond && req.url === "/second.png") {
+      res.writeHead(404).end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "image/png" }).end("fixture media");
+  });
+  const outDir = await mkdtemp(join(tmpdir(), "hosted-outputs-"));
+  t.after(() => rm(outDir, { recursive: true, force: true }));
+  await writeFile(join(outDir, "other-run.png"), "previous result");
+  const graph = { v: 1, links: [], nodes: ["first", "second"].map(id => ({
+    id, name: id, type: "image", fields: { model: "fixture/image", prompt: id, size: "1024x1024" },
+  })) };
+  const registry = await loadTools({ dirs: [], apiKey: "fixture", baseUrl: base, outDir, publicBase, remote: true });
+  const snapshots = [], terminalFiles = [];
+  const run = () => registry.callTool({ name: "run_noodle", arguments: { graph } }, {
+    workflow(state) {
+      snapshots.push(state);
+      if (state.status !== "running") terminalFiles.push(readdirSync(outDir));
+    },
+  });
+  return { run, outDir, downloads, snapshots, terminalFiles };
+}
+
+test("a later failed media download discards only the artifacts of that call", async t => {
+  const { run, outDir, downloads, snapshots, terminalFiles } = await twoMediaOutputs(t, { failSecond: true, publicBase: "https://artifacts.example" });
+  await assert.rejects(run(), /404/);
+  assert.deepEqual(downloads, ["/first.png", "/second.png"]);
+  assert.deepEqual(await readdir(outDir), ["other-run.png"]);
+  assert.equal(await readFile(join(outDir, "other-run.png"), "utf8"), "previous result");
+  assert.deepEqual(snapshots.filter(state => state.status !== "running").map(state => state.status), ["failed"]);
+  assert.deepEqual(terminalFiles, [["other-run.png"]]);
+  assert.ok(snapshots.at(-1).nodes.every(node => node.status === "done"));
+});
+
+test("the outer hosted deadline discards completed artifacts before reporting failure", async t => {
+  const { run, outDir, snapshots, terminalFiles } = await twoMediaOutputs(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let filesBeforeDeadline, statusBeforeDeadline;
+  await assert.rejects(withHostedRun(async () => {
+    const result = await run();
+    filesBeforeDeadline = await readdir(outDir);
+    statusBeforeDeadline = snapshots.at(-1).status;
+    t.mock.timers.tick(5_000);
+    return result;
+  }, 5_000), { code: "HOSTED_RUN_TIMEOUT" });
+  assert.equal(filesBeforeDeadline.length, 3, "both artifacts were written before the outer deadline");
+  assert.equal(statusBeforeDeadline, "running");
+  assert.deepEqual(await readdir(outDir), ["other-run.png"]);
+  assert.deepEqual(snapshots.filter(state => state.status !== "running").map(state => state.status), ["failed"]);
+  assert.deepEqual(terminalFiles, [["other-run.png"]]);
 });
