@@ -1101,9 +1101,10 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
   const runtimeFetch = backupKey ? nanoGptBackupFetch({ baseUrl, key: backupKey, authorize: authorizeBackup, fetch: scopedFetch }) : scopedFetch;
   // Wallet mode (payment callback, no key) changes only where money comes from.
   const spendSource = apiKey || !payment ? "your API key's balance" : "your x402 Nano wallet";
-  // Last-observed-cost sidecar: purely informational, so it must never block startup.
+  // Observed costs inform quotes and descriptions. A missing sidecar must not block startup.
   const costsPath = join(outDir, "costs.json");
   let costs = {};
+  let costWriteTail = Promise.resolve();
   try {
     const parsed = JSON.parse(await readFile(costsPath, "utf8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) costs = parsed;
@@ -1210,23 +1211,34 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
       prev && Number.isFinite(prev.usd) ? prev.usd : 0);
     if (hi > observedUsd) rec.hiUsd = hi;
     costs[tool.name] = rec;
-    try {
+    // Serialize snapshots and renames so an older writer cannot replace a
+    // newer sidecar. Keep observing costs for live quotes during disk writes.
+    const saved = costWriteTail.then(async () => {
       await mkdir(outDir, { recursive: true });
-      // write-then-rename: overlapping runs may record concurrently, and two
-      // writeFile calls on the same path can interleave — rename is atomic.
-      const tmp = `${costsPath}.${++saveSeq}.tmp`;
-      await writeFile(tmp, JSON.stringify(costs, null, 2) + "\n");
-      await rename(tmp, costsPath);
-    } catch (e) {
-      console.error(`nanoodle-mcp: cannot write ${costsPath}: ${e.message}`);
-    }
+      const tmp = `${costsPath}.${process.pid}.${++saveSeq}.tmp`;
+      try {
+        await writeFile(tmp, JSON.stringify(costs, null, 2) + "\n");
+        await rename(tmp, costsPath);
+      } catch (error) {
+        await unlink(tmp).catch(() => {});
+        throw error;
+      }
+    }).catch(error => {
+      try { log(`cannot write ${costsPath}: ${error.message}`); }
+      catch { /* logging must not wedge the writer */ }
+    });
+    costWriteTail = saved;
+
+    // Publish the matching description before yielding to another observation.
     const description = tool.wf
       ? buildDescription(tool.wf, spendSource, { cost: renderCost(rec), name: tool.name })
       : withObservedCost(tool.description, rec);
     if (description !== tool.description) {
       tool.description = description;
-      if (registry.onToolsChanged) registry.onToolsChanged();
+      try { registry.onToolsChanged?.(); }
+      catch { /* notification listeners must not fail a completed run */ }
     }
+    await saved;
   }
 
   const registry = {
