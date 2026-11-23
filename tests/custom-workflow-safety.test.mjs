@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
-import { NODE_TYPES } from "nanoodle";
+import { NODE_TYPES, Workflow } from "nanoodle";
 import {
   NODE_POLICY, DEFAULT_LIMITS, GraphArgsError, GraphRefusedError,
   readGraphArgs, checkGraphSafety, assertGraphSafe, applyInputs,
@@ -18,7 +18,6 @@ const IMG = { model: "blackforestlabs/flux-3/klein/text-to-image", size: "1024x1
 
 test("NODE_POLICY covers every engine node type, and nothing else", () => {
   assert.deepEqual(Object.keys(NODE_POLICY).sort(), Object.keys(NODE_TYPES).sort());
-  assert.equal(Object.keys(NODE_POLICY).length, 33);
   for (const [type, p] of Object.entries(NODE_POLICY)) {
     assert.equal(typeof p.allowed, "boolean", type);
     assert.ok(p.why && p.why.length > 5, type);
@@ -34,6 +33,7 @@ test("the allowlist matches the documented table", () => {
 // vision sends no output limit; vedit/remix/transcribe/cleanvoice bill by input media length.
 const REFUSED = ["upload", "aupload", "vupload", "mupload", "inpaint", "lipsync", "resize", "vframes", "combine",
   "soundtrack", "trim", "extractaudio", "slice-3d", "sprite-stack-render", "endpoint", "vision", "vedit", "remix", "transcribe", "cleanvoice"];
+if (Object.hasOwn(NODE_TYPES, "render3d")) REFUSED.push("render3d");
 
 for (const type of REFUSED) {
   test(`a ${type} node is refused with NODE_NOT_ALLOWED, naming the node and why`, () => {
@@ -129,10 +129,16 @@ test("even a media output may not be wired into model (it is a setting, not a me
 });
 
 test("wires into pricing fields are refused; wires into prompt/system are fine", () => {
-  for (const port of ["size", "variations", "duration", "resolution", "maxTokens", "modelOpts", "loraUrl", "loras", "url"]) {
-    const r = checkGraphSafety(graph(
-      [{ id: "t", type: "text", fields: { text: "9" } }, { id: "l", type: "llm", fields: { model: "m" } }],
-      [link("1", "t", "text", "l", port)]));
+  const assignments = [
+    ["image", "size"], ["image", "variations"], ["image", "modelOpts"], ["image", "loraUrl"], ["image", "loras"],
+    ["tvideo", "duration"], ["tvideo", "resolution"], ["llm", "maxTokens"],
+  ];
+  for (const [type, port] of assignments) {
+    const routed = graph(
+      [{ id: "t", type: "text", fields: { text: "9" } }, { id: "dest", type, fields: { model: "m" } }],
+      [link("1", "t", "text", "dest", port)]);
+    assert.deepEqual(new Workflow(routed, { quiet: true }).warnings, [], `${type}.${port} must be an engine-supported assignment`);
+    const r = checkGraphSafety(routed);
     assert.deepEqual(codes(r), ["UNSAFE_WIRING"], port);
     assert.match(r.refusals[0].message, new RegExp(`targets "${port}", a pricing or URL setting`));
   }
@@ -140,6 +146,20 @@ test("wires into pricing fields are refused; wires into prompt/system are fine",
     [{ id: "t", type: "text", fields: { text: "hi" } }, { id: "l", type: "llm", fields: { model: "m" } }],
     [link("1", "t", "text", "l", "prompt"), link("2", "t", "text", "l", "system")]));
   assert.equal(ok.ok, true, JSON.stringify(ok.refusals));
+});
+
+test("an invalid routing assignment still refuses and preserves SDK wire diagnostics", () => {
+  const invalid = graph(
+    [{ id: "t", type: "text", fields: { text: "9" } }, { id: "l", type: "llm", fields: { model: "m" } }],
+    [link("1", "t", "text", "l", "url")]);
+  const r = checkGraphSafety(invalid);
+  assert.equal(r.ok, false);
+  assert.ok(r.refusals.every(refusal => refusal.code === "UNSAFE_WIRING"));
+  assert.ok(r.refusals.some(refusal => refusal.message.includes('targets "url", a pricing or URL setting')));
+  for (const warning of new Workflow(invalid, { quiet: true }).warnings) {
+    assert.match(warning, /undeclared target port "url"/);
+    assert.ok(r.refusals.some(refusal => refusal.message === warning));
+  }
 });
 
 test("a URL in a field is UNSAFE_FIELD (metadata address on llm.system)", () => {

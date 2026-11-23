@@ -2,6 +2,7 @@
 // can read cold (estimated cost, service fee, deposit, refund, rate).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { NODE_TYPES } from "nanoodle";
 import {
   priceGraph, assertGraphSafe, estUsd, exactUsd, summarySentence, depositWhySentence,
   pricingVocabulary, formatQuote, formatReceipt, authoringGuide, checkGraphSafety,
@@ -241,11 +242,11 @@ test("receipt USD figures reconcile: deposit.usd - charged.usd = refund.usd (to 
 test("authoringGuide: node types, rules, example, and filtered priced models", () => {
   const g = authoringGuide({ catalogs: CATS });
   assert.deepEqual(Object.keys(g.structured), ["nodeTypes", "wiringRules", "example", "models", "graphFormat", "minimalExample"]);
-  assert.equal(g.structured.nodeTypes.length, 33);
+  assert.deepEqual(g.structured.nodeTypes.map(node => node.type), Object.keys(NODE_TYPES));
   const llm = g.structured.nodeTypes.find((t) => t.type === "llm");
   assert.deepEqual(Object.keys(llm), ["type", "title", "allowed", "why", "inputs", "textPorts", "mediaPorts", "outputs", "keyFields", "fields"]);
   assert.deepEqual(llm.textPorts, ["prompt", "system"]);
-  // the text says which ports take wires (llm has no NODE_TYPES inputs, yet its prompt is wireable)
+  // The guide describes the LLM ports that can be wired in a paid graph.
   assert.match(g.text, /^- llm \(LLM\): wire text into \[prompt, system\]; media inputs \[img1, img2/m);
   assert.match(g.text, /^Model kinds: chat -> llm; decision -> decide, decide-branch; image -> image, edit;/m);
   assert.deepEqual(llm.keyFields, ["model", "system", "prompt", "maxTokens"]);

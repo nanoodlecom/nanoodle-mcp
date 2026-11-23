@@ -48,6 +48,7 @@ const WHY = {
   inpaint: "Takes its image and mask straight from fields (any URL or inline data) and composites the mask locally.",
   lipsync: "May trim audio locally with ffmpeg.",
   local: "Local media processing (pure JS or ffmpeg) on the server.",
+  render3d: "Uses a local browser to render 3D models and may encode video with ffmpeg.",
   endpoint: "POSTs to any URL written in the graph, which would let a caller reach internal addresses.",
 };
 
@@ -70,6 +71,7 @@ export const NODE_POLICY = Object.freeze({
   lipsync: deny(WHY.lipsync),
   resize: deny(WHY.local), vframes: deny(WHY.local), combine: deny(WHY.local),
   "slice-3d": deny(WHY.local), "sprite-stack-render": deny(WHY.local),
+  ...(Object.hasOwn(NODE_TYPES, "render3d") ? { render3d: deny(WHY.render3d) } : {}),
   soundtrack: deny(WHY.local), trim: deny(WHY.local), extractaudio: deny(WHY.local),
   endpoint: deny(WHY.endpoint),
 });
@@ -78,6 +80,7 @@ export const NODE_POLICY = Object.freeze({
 const INSTEAD = {
   "slice-3d": "run this workflow in the Nanoodle editor or a local executor",
   "sprite-stack-render": "run this workflow in the Nanoodle editor or a local executor",
+  render3d: "run this workflow in the Nanoodle editor or a local executor",
   upload: "generate the image with an image node instead",
   aupload: "generate the audio with a music or tts node instead",
   vupload: "generate the video with a tvideo or ivideo node instead",
@@ -303,6 +306,8 @@ export function checkGraphSafety(graph, { inputs = {}, limits = DEFAULT_LIMITS }
         code: "UNKNOWN_NODE", nodeId: m[2], type: m[1],
         message: `node "${displayName(n)}" has unknown type "${m[1]}"; use one of the allowed types listed by noodle_guide`,
       });
+    } else if (w.startsWith("wire ")) {
+      refusals.push({ code: "UNSAFE_WIRING", message: w });
     } else {
       // Media-field placeholder scrubbed by the loader. Media fields must be left empty.
       const fm = /^node ([^ ]+) \(/.exec(w);
