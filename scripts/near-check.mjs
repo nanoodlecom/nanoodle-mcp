@@ -17,7 +17,7 @@ export function checkGraph(marker, twoSteps = false) {
   // This checks the payment/runtime path, not reasoning. A thinking model can
   // spend this small output budget before emitting the marker, producing a
   // billed empty answer. Keep strict output validation and a bounded budget.
-  const fields = { model: "openai/gpt-4.1-nano", temperature: 0, maxTokens: 256 };
+  const fields = { model: "orca/orcacyber-inkling-2-mini", reasoningEffort: "none", temperature: 0, maxTokens: 256 };
   const nodes = [
     { id: "input", type: "text", name: "Marker", fields: { text: "" } },
     { id: "extract", type: "llm", name: "Read marker", fields: { ...fields,

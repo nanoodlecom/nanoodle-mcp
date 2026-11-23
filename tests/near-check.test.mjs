@@ -78,7 +78,9 @@ test("daily canary resumes an ambiguous broadcast, verifies the refund, and pays
   const reads = f.chain.log.filter(row => row.params?.request_type === "view_account").length;
   const report = await runCheck(f.config, f.deps);
   assert.equal(report.ok, true); assert.equal(report.modelSteps, 2); assert.equal(f.quotes(), 1); assert.equal(f.runs(), 1);
-  assert.equal(report.model, "openai/gpt-4.1-nano");
+  assert.equal(report.model, "orca/orcacyber-inkling-2-mini");
+  assert.deepEqual(retained.args.graph.nodes.filter(node => node.type === "llm").map(node => node.fields.reasoningEffort),
+    ["none", "none"]);
   assert.equal(f.chain.sendTxCount, 2, "one deposit and one refund; no replacement deposit");
   assert.equal(f.chain.log.filter(row => row.params?.request_type === "view_account").length, reads, "an existing signed payment is reconciled without a new funding check");
   assert.equal(report.paymentTx, retained.signed.txHash);
