@@ -21,13 +21,14 @@ const INIT = { protocolVersion: "2025-06-18", capabilities: {},
   clientInfo: { name: "nanoodle-public-check", version: "1" } };
 const REQUIRED_TOOLS = ["noodle_guide", "price_noodle", "run_noodle"];
 const DECIDER_MODEL = "perplexity/pplx-decider-v1.2";
+const ANSWER_FIELDS = { model: "orca/orcacyber-inkling-2-mini", reasoningEffort: "none", maxTokens: 64 };
 const CONDITIONAL_GRAPH = {
   v: 1,
   nodes: [
     { id: "input", type: "text", fields: { text: "The budget was approved." } },
     { id: "decision", type: "decide-branch", fields: { model: DECIDER_MODEL, question: "Was the budget approved?" } },
-    { id: "yes-answer", type: "llm", fields: { model: "openai/gpt-4.1-nano", maxTokens: 64 } },
-    { id: "no-answer", type: "llm", fields: { model: "openai/gpt-4.1-nano", maxTokens: 64 } },
+    { id: "yes-answer", type: "llm", fields: { ...ANSWER_FIELDS } },
+    { id: "no-answer", type: "llm", fields: { ...ANSWER_FIELDS } },
   ],
   links: [
     { id: "input-text", from: { node: "input", port: "text" }, to: { node: "decision", port: "text" } },
