@@ -218,18 +218,18 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const mounted = registry.tools.find(tool => tool.name === "humanize-comment");
     // x402.usd is the cold ceiling (longest request, after the margin). A call quotes
     // less when its own draft, context, guidance, and maxChars cost less.
-    assert.equal(mounted.x402.usd.toFixed(8), "0.05272831");
+    assert.equal(mounted.x402.usd.toFixed(8), "0.06122676");
     // Tokens are bytes / 3.5 (caller text on the decider: bytes / 2.5). Writer output is the draft length plus a small slack,
     // and the decider adds room for its ranking JSON and for GLM reasoning. No
-    // writer in this fixture carries a fallback. The catalog sets Starry Ocean
+    // writer in this fixture carries a fallback. The catalog sets Artemis 31B
     // as writer C's primary, so the legacy fallback reserve is unused here.
     // The quote prices HUMANIZE_PRICED_REASKS
     // extra writer calls; the run may still attempt MAX_REASKS and stops when the
     // next one would pass the deposit. At the counted Guidance cap, with no keep
-    // and no repair, that charge is $0.00909159 after the 20% markup.
-    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.05272831.
-    // Prices per M tokens (NanoGPT, 20 Oct 2026): GLM-5.3 $0.60/$1.10,
-    // Starry Ocean $0.05/$0.25, others $0.10 in and $0.35-$0.60 out.
+    // and no repair, that charge is $0.01149837 after the 20% markup.
+    // The pinned ceiling is the more expensive capped shape plus 12%. It is $0.06122676.
+    // Prices per M tokens (NanoGPT, 23 Nov 2026): GLM-5.3 $0.60/$1.10,
+    // Maverick $0.35/$1.00, Artemis $0.10/$0.45, others $0.035-$0.10 in and $0.14-$0.60 out.
     const graph = JSON.parse(await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8"));
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
     const judge = byId.get("judge");
@@ -268,16 +268,16 @@ test("humanize-comment graph mounts as a text tool with a pinned deposit, locked
     const judgeUsd = judgeTokens * 0.6 + judgeOut * 1.1;
     const est = (x) => (x / 1e6 * 1.2).toFixed(8);
     assert.equal(HUMANIZE_BYTES_PER_TOKEN, 3.5);
-    assert.equal(est(base + reask + judgeUsd), "0.00909159", "guidance at its cap, one priced retry, after the markup");
+    assert.equal(est(base + reask + judgeUsd), "0.01149837", "guidance at its cap, one priced retry, after the markup");
     const shaped = { Draft: draft, Context: "c".repeat(Context), Guidance: "g".repeat(Guidance) };
-    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.00909159");
+    assert.equal(humanizeChargeUsd(graph, shaped).toFixed(8), "0.01149837");
     const budget = placeholderBudget();
     assert.ok(budget.count > 8, "repeats, not the 8-entry keep list, set the placeholder cap");
     assert.equal(budget.writerDraftChars <= Draft, true);
     const ceilingCharge = humanizeChargeUsd(graph, null, { ceiling: true });
     const ceiling = humanizeCeilingDepositUsd(graph);
-    assert.equal(ceilingCharge.toFixed(8), "0.04707885", "the capped worst case, before the margin");
-    assert.equal(ceiling.toFixed(8), "0.05272831");
+    assert.equal(ceilingCharge.toFixed(8), "0.05466675", "the capped worst case, before the margin");
+    assert.equal(ceiling.toFixed(8), "0.06122676");
     assert.equal(HUMANIZE_DEPOSIT_MARGIN, 0.12);
     assert.ok(ceiling >= ceilingCharge, "the ceiling covers the worst-case charge");
     assert.ok(ceiling <= ceilingCharge * 1.15 + 1e-9, "the margin stays inside 15%");
@@ -308,8 +308,8 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
   const { createServer } = await import("node:http");
   // exact writer outputs, with characters an LLM likes to "fix" (curly quote, double space, trailing newline; dashes are covered by the v2.7 test)
   const outputs = {
-    "qwen/qwen3.8-27b-novelist": "Hey, that\u2019s  a big win, 14 to 6!\n",
-    "gemma-4-12b-it-starry-ocean": "Nice cut. What changed first?",
+    "meta-llama/llama-4-maverick": "Hey, that\u2019s  a big win, 14 to 6!\n",
+    "thedrummer/artemis-31b-v1.2": "Nice cut. What changed first?",
     "qwen/qwen3.8-27b-antislop": "Good work on the CI time.",
     "tencent/hy4-flash": "14 \u2192 6 min, love it.",
   };
@@ -351,15 +351,15 @@ test("humanize-comment: model credit and texts come from the writers by id, not 
     const json = JSON.parse(result.content.find((c) => /"winner"/.test(c.text || "")).text);
     assert.deepEqual(Object.keys(json), ["winner", "text", "why", "ranked"]);
     assert.equal(json.winner, "C");
-    assert.equal(json.text, outputs["gemma-4-12b-it-starry-ocean"], "top-level text is the winner's exact output");
+    assert.equal(json.text, outputs["thedrummer/artemis-31b-v1.2"], "top-level text is the winner's exact output");
     const by = Object.fromEntries(json.ranked.map((r) => [r.writer, r]));
     assert.deepEqual(json.ranked.map((r) => r.writer), ["C", "A", "B", "D", "E"]);
     assert.deepEqual(Object.fromEntries(json.ranked.map((r) => [r.writer, r.model])), {
-      A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "gemma-4-12b-it-starry-ocean",
+      A: "meta-llama/llama-4-maverick", B: "deepseek/deepseek-v4.1-flash-1017", C: "thedrummer/artemis-31b-v1.2",
       D: "qwen/qwen3.8-27b-antislop", E: "tencent/hy4-flash",
     });
-    assert.equal(by.A.text, outputs["qwen/qwen3.8-27b-novelist"], "byte-exact, not the decider's paraphrase");
-    assert.equal(by.C.text, outputs["gemma-4-12b-it-starry-ocean"]);
+    assert.equal(by.A.text, outputs["meta-llama/llama-4-maverick"], "byte-exact, not the decider's paraphrase");
+    assert.equal(by.C.text, outputs["thedrummer/artemis-31b-v1.2"]);
     assert.equal(by.D.text, outputs["qwen/qwen3.8-27b-antislop"]);
     assert.equal(by.E.text, outputs["tencent/hy4-flash"], "a writer the decider dropped is still listed with its text");
     assert.equal(by.E.disqualified, true);
@@ -398,7 +398,7 @@ async function runHumanizeWith(t, judgeContent) {
   const block = result.content.find((c) => /^\{"winner"/.test(c.text || ""));
   return { json: JSON.parse(block.text), texts: result.content.map((c) => c.text || "") };
 }
-const HC_MODELS = { A: "qwen/qwen3.8-27b-novelist", B: "deepseek/deepseek-v4.1-flash-1017", C: "gemma-4-12b-it-starry-ocean", D: "qwen/qwen3.8-27b-antislop", E: "tencent/hy4-flash" };
+const HC_MODELS = { A: "meta-llama/llama-4-maverick", B: "deepseek/deepseek-v4.1-flash-1017", C: "thedrummer/artemis-31b-v1.2", D: "qwen/qwen3.8-27b-antislop", E: "tencent/hy4-flash" };
 
 test("humanize-comment: an unusable decider reply is an error, not the draft returned as success", async (t) => {
   for (const bad of ['{"winner":"A","text":"oops", "ranked":[{"writer":"A"', '{"winner":"A","text":"made up","why":"x"}', "[]", "Sure! Here is my ranking: A"]) {
@@ -652,7 +652,7 @@ test("humanize-comment v2.7: C is credited, dashes are fixed and a near-copy is 
       const reask = body.messages.length > 2 && /copied the draft/.test(last);
       calls.push(body.model + (reask ? " (re-ask)" : ""));
       const ok = (content) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } })); };
-      if (body.model === "qwen/qwen3.8-27b-novelist") return ok("Nice one \u2014 14 to 6 is a real cut \u2013 what did you change first?");
+      if (body.model === "meta-llama/llama-4-maverick") return ok("Nice one \u2014 14 to 6 is a real cut \u2013 what did you change first?");
       if (body.model === "qwen/qwen3.8-27b-antislop") return ok(reask ? "You took CI from 14 to 6 minutes. Thanks for writing it up." : DRAFT);
       if (body.model === "z-ai/glm-5.3") {
         judgePrompt = last;
@@ -672,18 +672,19 @@ test("humanize-comment v2.7: C is credited, dashes are fixed and a near-copy is 
   const texts = result.content.map((c) => c.text || "");
   const json = JSON.parse(texts.find((x) => /^\{"winner"/.test(x)));
   const by = Object.fromEntries(json.ranked.map((r) => [r.writer, r]));
-  // C: Starry Ocean answered as writer C's primary (it replaced the delisted
-  // Cydonia on 2026-11-18) and is the model credited; no writer has a fallback
-  assert.equal(by.C.model, "gemma-4-12b-it-starry-ocean");
-  assert.equal(by.C.text, "rewrite by gemma-4-12b-it-starry-ocean");
+  // C: Artemis 31B answered as writer C's primary (it replaced Starry Ocean
+  // on 2026-11-23; Starry Ocean had replaced the delisted Cydonia on
+  // 2026-11-18) and is the model credited; no writer has a fallback
+  assert.equal(by.C.model, "thedrummer/artemis-31b-v1.2");
+  assert.equal(by.C.text, "rewrite by thedrummer/artemis-31b-v1.2");
   assert.equal(json.winner, "C");
-  assert.equal(json.text, "rewrite by gemma-4-12b-it-starry-ocean");
+  assert.equal(json.text, "rewrite by thedrummer/artemis-31b-v1.2");
   assert.ok(!texts.some((x) => /did not answer/.test(x)), "no writer fell back or went missing");
   // the other writers keep their graph models
-  assert.deepEqual([by.A.model, by.B.model, by.D.model, by.E.model], ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "qwen/qwen3.8-27b-antislop", "tencent/hy4-flash"]);
+  assert.deepEqual([by.A.model, by.B.model, by.D.model, by.E.model], ["meta-llama/llama-4-maverick", "deepseek/deepseek-v4.1-flash-1017", "qwen/qwen3.8-27b-antislop", "tencent/hy4-flash"]);
   // dashes fixed before the decider read them, and the result carries the same text
   assert.equal(by.A.text, "Nice one, 14 to 6 is a real cut, what did you change first?");
-  assert.match(judgePrompt, /\[A\] qwen\/qwen3\.8-27b-novelist\nNice one, 14 to 6 is a real cut, what did you change first\?/);
+  assert.match(judgePrompt, /\[A\] meta-llama\/llama-4-maverick\nNice one, 14 to 6 is a real cut, what did you change first\?/);
   assert.doesNotMatch(judgePrompt, /[\u2014\u2013]/);
   // D copied the draft → re-asked once; the decider only ever saw the second answer
   assert.equal(by.D.text, "You took CI from 14 to 6 minutes. Thanks for writing it up.");
@@ -790,7 +791,7 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
       let content = "rewrite by " + body.model;
       if (body.model === "z-ai/glm-5.3") {
         judgePrompts.push(body.messages[body.messages.length - 1].content);
-        content = JSON.stringify({ winner: "A", text: "rewrite by qwen/qwen3.8-27b-novelist", why: "most human", ranked: [{ writer: "A", model: "qwen/qwen3.8-27b-novelist", text: "rewrite by qwen/qwen3.8-27b-novelist", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", model: "gemma-4-12b-it-starry-ocean", text: "rewrite by gemma-4-12b-it-starry-ocean", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", model: "inception/mercury-3", text: "rewrite by inception/mercury-3", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", model: "qwen/qwen3.8-27b-antislop", text: "rewrite by qwen/qwen3.8-27b-antislop", faithful: true, disqualified: true, reason: "near-copy" }, { writer: "B", model: "deepseek/deepseek-v4.1-flash-1017", text: "", faithful: false, disqualified: true, reason: "missing" }] });
+        content = JSON.stringify({ winner: "A", text: "rewrite by meta-llama/llama-4-maverick", why: "most human", ranked: [{ writer: "A", model: "meta-llama/llama-4-maverick", text: "rewrite by meta-llama/llama-4-maverick", faithful: true, disqualified: false, reason: "most human" }, { writer: "C", model: "thedrummer/artemis-31b-v1.2", text: "rewrite by thedrummer/artemis-31b-v1.2", faithful: true, disqualified: false, reason: "ok" }, { writer: "E", model: "inception/mercury-3", text: "rewrite by inception/mercury-3", faithful: true, disqualified: false, reason: "ok" }, { writer: "D", model: "qwen/qwen3.8-27b-antislop", text: "rewrite by qwen/qwen3.8-27b-antislop", faithful: true, disqualified: true, reason: "near-copy" }, { writer: "B", model: "deepseek/deepseek-v4.1-flash-1017", text: "", faithful: false, disqualified: true, reason: "missing" }] });
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }));
@@ -818,9 +819,9 @@ test("humanize-comment: a failed writer is skipped and the decider still returns
     assert.equal(json.ranked.find((r) => r.writer === json.winner).disqualified, false);
     assert.equal(judgePrompts.length, 1);
     assert.match(judgePrompts[0], /\[ORIGINAL\]\nThanks for sharing this\./);
-    assert.match(judgePrompts[0], /\[A\] qwen\/qwen3\.8-27b-novelist\nrewrite by qwen\/qwen3\.8-27b-novelist/);
+    assert.match(judgePrompts[0], /\[A\] meta-llama\/llama-4-maverick\nrewrite by meta-llama\/llama-4-maverick/);
     assert.doesNotMatch(judgePrompts[0], /\[B\]/, "the failed writer's block is missing");
-    assert.match(judgePrompts[0], /\[C\] gemma-4-12b-it-starry-ocean\nrewrite by gemma-4-12b-it-starry-ocean/);
+    assert.match(judgePrompts[0], /\[C\] thedrummer\/artemis-31b-v1\.2\nrewrite by thedrummer\/artemis-31b-v1\.2/);
     assert.match(judgePrompts[0], /\[D\] qwen\/qwen3\.8-27b-antislop\nrewrite by qwen\/qwen3\.8-27b-antislop/);
     assert.match(judgePrompts[0], /\[E\] tencent\/hy4-flash\nrewrite by tencent\/hy4-flash/);
     assert.equal(json.ranked.length, 5);

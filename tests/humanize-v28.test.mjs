@@ -9,7 +9,7 @@ import { loadTools } from "../src/tools.mjs";
 import { ONE_THREAD_PREFIX, guidanceUnits, HUMANIZE_INPUT_CAPS, humanizeExtraProperties, sentencesOf, finalSentence, ensureEnding, recordReviewPrice, TITLE_OUTPUT_MAX, humanizeWriterRecord, rebuildHumanizeResult, collectSpans, writerNote, guardRetryPrompt, placeholderBudget, codePoints, MAX_CHARS_LIMIT, reinsertSpans, checkHumanizeInputs, forceRepair, moveQuestionToEnd, applyHumanizeFallback, echoesInstruction, isParagraphOutput, assessWriterOutput } from "../src/humanize.mjs";
 
 const JOKE = "Guilty, I paid for ears I don't have.";
-const MODELS = ["qwen/qwen3.8-27b-novelist", "deepseek/deepseek-v4.1-flash-1017", "gemma-4-12b-it-starry-ocean", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
+const MODELS = ["meta-llama/llama-4-maverick", "deepseek/deepseek-v4.1-flash-1017", "thedrummer/artemis-31b-v1.2", "qwen/qwen3.8-27b-antislop", "inception/mercury-3"];
 
 function judge(winner, order, why = "ok") {
   return JSON.stringify({
@@ -991,16 +991,16 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
   const graphText = await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8");
   const graph = JSON.parse(graphText);
   const lines = {
-    "qwen/qwen3.8-27b-novelist": "NOVELIST-LINE",
+    "meta-llama/llama-4-maverick": "MAVERICK-LINE",
     "deepseek/deepseek-v4.1-flash-1017": "DEEPSEEK-LINE",
-    "gemma-4-12b-it-starry-ocean": "STARRY-LINE",
+    "thedrummer/artemis-31b-v1.2": "ARTEMIS-LINE",
     "qwen/qwen3.8-27b-antislop": "ANTISLOP-LINE",
     "tencent/hy4-flash": "HY4-LINE",
   };
   const labels = {
-    "qwen/qwen3.8-27b-novelist": "A",
+    "meta-llama/llama-4-maverick": "A",
     "deepseek/deepseek-v4.1-flash-1017": "B",
-    "gemma-4-12b-it-starry-ocean": "C",
+    "thedrummer/artemis-31b-v1.2": "C",
     "qwen/qwen3.8-27b-antislop": "D",
     "tencent/hy4-flash": "E",
   };
@@ -1036,7 +1036,7 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
   assert.equal(rebuildHumanizeResult(wf, result, record), null);
   const adapted = JSON.parse(result.get("Decider (GLM-5.3)"));
   assert.equal(adapted.winner, "C");
-  assert.equal(adapted.text, "STARRY-LINE", "the consumer adapter attaches the winning writer's text");
+  assert.equal(adapted.text, "ARTEMIS-LINE", "the consumer adapter attaches the winning writer's text");
   for (const [letter, id] of Object.entries(nodes)) {
     const row = adapted.ranked.find((r) => r.writer === letter);
     assert.equal(row.text, result.nodes[id].out.text);
