@@ -706,6 +706,7 @@ export function gateNotices(wf, result) {
 /** Small enough to ride inline as an MCP image block alongside its download URL. */
 const INLINE_IMAGE_MAX = 1_500_000;
 const EXT_MIME = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+const MAX_ARTIFACT_NAME_BYTES = 255;
 
 function* resultPorts(wf, result) {
   for (const sink of wf.outputs) {
@@ -764,7 +765,10 @@ async function emitResult(wf, result, prefix, outDir, { artifacts, publicBase, n
       const safeKey = o.key.replace(/[^\w.-]+/g, "_");
       const ext = extForMedia(bytes, value.mime);
       const stamp = `${Date.now()}-${++saveSeq}` + (publicBase ? `-${randomBytes(6).toString("hex")}` : "");
-      const path = resolve(outDir, `${prefix}-${safeKey}-${stamp}.${ext}`);
+      const suffix = `-${stamp}.${ext}`;
+      // Both stem parts are ASCII. Leave space for the full collision suffix and extension.
+      const stem = `${prefix}-${safeKey}`.slice(0, MAX_ARTIFACT_NAME_BYTES - suffix.length);
+      const path = resolve(outDir, `${stem}${suffix}`);
       const { signal } = hostedRunOptions();
       // Take ownership before writing so rollback can also remove a partial
       // file. Exclusive creation preserves an existing result on a collision.
