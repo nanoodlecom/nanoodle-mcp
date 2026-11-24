@@ -47,6 +47,9 @@ export const HUMANIZE_MODEL_PRICES = Object.freeze({
   // retained for stale mounts (it also remains the Cydonia fallback).
   "gemma-4-12b-it-starry-ocean": [0.05, 0.25],
   "thedrummer/artemis-31b-v1.2": [0.1, 0.45],
+  // Replaced as Writer D on 2026-11-23 (humanize-opt cycles 7-8: Hy4 Flash
+  // posted 19/20 faithful across two in-set trials vs antislop's 13/20);
+  // row retained for stale mounts.
   "qwen/qwen3.8-27b-antislop": [0.1, 0.6],
   // Replaced as Writer E on 2026-11-19 (humanize-opt cycle 1: Mercury 3 was
   // already answering 503s ahead of its 2026-12-28 shutdown); row retained so

@@ -241,10 +241,16 @@ test("x402 both fail: Cydonia 429 and Starry 503 → truthful notice, nothing pa
 });
 
 test("x402 re-ask: the near-copy re-ask gets its own invoice, paid once, and replaces the first answer", async (t) => {
-  const s = await stub(t, { plan: (b) => ({ content: b.model === "z-ai/glm-5.3" ? judge("D") : b.model === ANTI ? (b.messages.length > 2 ? "You took CI from 14 to 6 minutes. Thanks!" : DRAFT) : "rewrite by " + b.model }) });
+  // Writer D is the near-copy writer. Since 2026-11-23 D shares
+  // tencent/hy4-flash with E, so the plan tells D from E by the voice line
+  // in its system prompt, as the wrapper does.
+  const isD = (b) => b.model === "tencent/hy4-flash" && (b.messages || []).some((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("Voice for this rewrite: plain"));
+  const s = await stub(t, { plan: (b) => ({ content: b.model === "z-ai/glm-5.3" ? judge("D") : isD(b) ? (b.messages.length > 2 ? "You took CI from 14 to 6 minutes. Thanks!" : DRAFT) : "rewrite by " + b.model }) });
   const { result, texts, json } = await s.run();
   assert.notEqual(result.isError, true, texts.join("\n"));
-  assert.deepEqual(s.log.chat.filter((c) => c.startsWith(ANTI)).sort(), [ANTI, ANTI + " (re-ask)"]);
+  // the chat log records models only: D's two calls plus E's one, all hy4 —
+  // exactly one of them a re-ask, and the JSON below pins it to D.
+  assert.deepEqual(s.log.chat.filter((c) => c.startsWith("tencent/hy4-flash")).sort(), ["tencent/hy4-flash", "tencent/hy4-flash", "tencent/hy4-flash (re-ask)"]);
   assert.equal(json.ranked.find((r) => r.writer === "D").text, "You took CI from 14 to 6 minutes. Thanks!");
   assert.equal(json.text, "You took CI from 14 to 6 minutes. Thanks!");
   assert.equal(s.paid.length, 7, "5 writers + 1 re-ask + decider");
