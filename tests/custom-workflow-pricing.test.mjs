@@ -5,11 +5,96 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { estimateGraphCost, Workflow } from "nanoodle";
 import {
-  priceGraph, depositUsdFor, refusalsForQuote, assertGraphSafe, applyInputs,
+  priceGraph, depositUsdFor, refusalsForQuote, assertGraphSafe, checkGraphSafety, applyInputs,
   DEFAULT_CHAT_OUTPUT_TOKENS, SERVICE_FEE_RATE,
 } from "../src/custom-workflow.mjs";
 
 const link = (id, from, fromPort, to, toPort) => ({ id, from: { node: from, port: fromPort }, to: { node: to, port: toPort } });
+
+test("quotes four five-second Hyper image-to-video takes at their duration rate", async () => {
+  const model = "minimax/h3-hyper";
+  const image = "bytedance/seedream-v5.5";
+  const edit = "bytedance/seedream-v5.5/edit";
+  // Relevant rates from the public NanoGPT catalog, 2026-11-24.
+  const catalogs = {
+    image: [
+      { id: image, pricing: { per_image: { "1k": 0.02 } } },
+      { id: edit, pricing: { per_image: { "1k": 0.028 } } },
+    ],
+    video: [{
+      id: model,
+      pricing: {
+        duration_meter: "requested_whole_seconds",
+        text_to_video_per_duration: { 4: 0.10, 5: 0.13 },
+        image_to_video_per_duration: { 4: 0.11, 5: 0.15, 6: 0.18 },
+      },
+      supported_parameters: { parameters: {
+        mode: { type: "select", default: "auto" },
+        duration: { type: "select", default: "6" },
+        resolution: { type: "select", default: "768p" },
+      } },
+    }],
+  };
+  const nodes = [{ id: "wood", type: "image", fields: { model: image, size: "1k", prompt: "A domino row." } }];
+  const links = [];
+  for (const material of ["glass", "ice", "paper"]) {
+    nodes.push({ id: material, type: "edit", fields: { model: edit, size: "1k", prompt: `Make the dominoes from ${material}.` } });
+    links.push(link(`image-${material}`, "wood", "image", material, "image"));
+  }
+  for (const material of ["wood", "glass", "ice", "paper"]) {
+    const id = `take-${material}`;
+    nodes.push({ id, type: "ivideo", fields: { model, duration: "5", resolution: "768p", prompt: "The dominoes topple." } });
+    links.push(link(`start-${material}`, material, "image", id, "image"));
+  }
+  const graph = { v: 1, nodes, links };
+  const authored = structuredClone(graph);
+  for (const node of authored.nodes) {
+    node.fields.modelOpts = node.type === "ivideo" ? { mode: "image-to-video" } : { aspect_ratio: "16:9" };
+  }
+  const safety = checkGraphSafety(authored);
+  assert.equal(safety.ok, false);
+  assert.deepEqual(safety.refusals.map(({ nodeId, code }) => [nodeId, code]),
+    nodes.map(({ id }) => [id, "UNSAFE_FIELD"]));
+
+  const quote = priceGraph(assertGraphSafe(graph), catalogs);
+  assert.deepEqual(quote.unpriced, []);
+  assert.deepEqual(quote.items.filter(i => i.type === "ivideo").map(i => i.usd), [0.15, 0.15, 0.15, 0.15]);
+  assert.ok(Math.abs(quote.estimatedCostUsd - 0.704) < 1e-12);
+  assert.equal(quote.fixedPrice, false);
+  assert.equal(quote.depositUsd, 1.69);
+
+  const still = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR42mMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+  const videos = [];
+  const fetch = async (url, opts) => {
+    const path = new URL(url).pathname;
+    if (path === "/v1/images/generations") {
+      const { model: requestedModel } = JSON.parse(opts.body);
+      assert.ok(requestedModel === image || requestedModel === edit);
+      return Response.json({ data: [{ url: still }], cost: requestedModel === image ? 0.02 : 0.028 });
+    }
+    if (path === "/api/generate-video") {
+      videos.push(JSON.parse(opts.body));
+      return Response.json({ runId: `take-${videos.length}`, cost: 0.15 });
+    }
+    if (path === "/api/video/status") {
+      return Response.json({ status: "COMPLETED", output: { url: "https://fixture.invalid/take.mp4" } });
+    }
+    assert.fail(`Unexpected provider request ${path}`);
+  };
+  const result = await Workflow.fromJSON(quote.boundGraph, {
+    catalog: catalogs, apiKey: "fixture", fetch, pollIntervals: { video: 0 },
+  }).run({});
+  assert.equal(videos.length, 4);
+  for (const request of videos) {
+    assert.equal(request.model, model);
+    assert.equal(request.duration, "5");
+    assert.equal(request.resolution, "768p");
+    assert.equal(request.imageDataUrl, still);
+    assert.ok(request.mode == null || request.mode === "auto");
+  }
+  assert.equal(result.costExact, true);
+  assert.ok(Math.abs(result.costUsd - 0.704) < 1e-12);
+});
 
 // The doc's worked example (docs/near-payments.md).
 const WORKED = {
