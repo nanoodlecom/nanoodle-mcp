@@ -400,9 +400,11 @@ key) and its raw **graph JSON** at `/graph/<tool>.json`. The page also spells
 out the economics (deposits settle at metered cost + 20%; the markup is the
 author's cut on graphs that name a payout address, and the operator's on the
 rest, and the page says which of yours do) and how to self-host — this server, the editor, and the
-executor are MIT ([licensing](#licensing)). Generated media is served
-back under unguessable `/out/…` URLs (small images also ride inline in the
-tool result). Runs themselves are **not logged**: free serve mode keeps no
+executor are MIT ([licensing](#licensing)). Generated media comes back as an
+unguessable `/out/…` URL. Download that URL when handing off the original file
+to another tool. Images up to 1,500,000 bytes also come back as a base64 image
+block for display. A 1,200,000-byte PNG takes 1,600,000 bytes in base64 before MCP
+adds the rest of the response. Runs themselves are **not logged**: free serve mode keeps no
 record of who called what, and charge mode keeps only a payments ledger (money
 events, never run telemetry — see below).
 
