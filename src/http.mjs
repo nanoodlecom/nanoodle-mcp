@@ -15,7 +15,7 @@
  *   GET  /               landing page: hero connect command (Claude/Grok toggle), how payment
  *                        flows, daily run write-ups, tool list w/ per-workflow editor links, self-hosting + author-payout story
  *   GET  /llms.txt       endpoint discovery, written for agents
- *   GET  /robots.txt and /sitemap.xml   public Nano landing-page discovery
+ *   GET  /robots.txt and /sitemap.xml   public landing-page discovery (Nano, NEAR and MCP surfaces)
  *   GET  /version        { name, version, commit } — short git sha, so a deploy can be matched to main
  *   GET  /graph/:name.json  a served workflow's raw graph JSON, exactly as loaded
  *   GET  /pay/:id        self-contained pay page — QR code, exact amount, live status
@@ -65,6 +65,11 @@ const NANO_ORIGIN = "https://nano.nanoodle.com";
 const NANO_LANDING_URL = `${NANO_ORIGIN}/`;
 const NANO_SITEMAP = `${NANO_LANDING_URL}sitemap.xml`;
 const MCP_ORIGIN = "https://mcp.nanoodle.com";
+const MCP_LANDING_URL = `${MCP_ORIGIN}/`;
+const MCP_SITEMAP = `${MCP_LANDING_URL}sitemap.xml`;
+const NEAR_ORIGIN = "https://near.nanoodle.com";
+const NEAR_LANDING_URL = `${NEAR_ORIGIN}/`;
+const NEAR_SITEMAP = `${NEAR_LANDING_URL}sitemap.xml`;
 
 const OUT_MIME = {
   png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp",
@@ -767,6 +772,14 @@ export async function serveHttp({
       // only selects public landing metadata and never authorizes an origin.
       const nanoLanding = officialNano && (publicOrigin === NANO_ORIGIN ||
         (sharedNanoOrigin && req.headers["x-nanoodle-surface"] === "nano"));
+      // The NEAR listener is its own deployment (no Nano gate, NEAR gate,
+      // NEAR public origin): its landing gets the same crawl treatment as
+      // Nano's, selected by deployment config rather than a request marker.
+      const nearLanding = !gate && Boolean(nearGate) && publicOrigin === NEAR_ORIGIN;
+      // The shared MCP origin without the Nano marker is the MCP surface:
+      // its public landing is the edge-served hub, but robots/sitemap are
+      // answered here so the hub's canonical URL is discoverable.
+      const mcpLanding = sharedNanoOrigin && !nanoLanding;
       // Check before preflight or dispatch. Do not derive trust from Host or
       // forwarded headers supplied by the request being authorized.
       const hostedMatch = url.pathname.match(/^\/workflows\/(wf_[a-f0-9]{24})(?:\/(mcp|llms.txt))?$/);
@@ -945,17 +958,26 @@ export async function serveHttp({
         return send(200, htmlPage(page.title, page.body, LANDING_CSS + NANO_SURFACE_CSS + NANO_PORT_CSS + page.css, page.head), "text/html; charset=utf-8");
       }
 
-      if (nanoLanding && url.pathname === "/sitemap.xml") {
-        return send(200, `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${NANO_LANDING_URL}</loc></url></urlset>\n`, "application/xml; charset=utf-8");
+      if (url.pathname === "/sitemap.xml" && (nanoLanding || nearLanding || mcpLanding)) {
+        const landingUrl = nanoLanding ? NANO_LANDING_URL : nearLanding ? NEAR_LANDING_URL : MCP_LANDING_URL;
+        return send(200, `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${landingUrl}</loc></url></urlset>\n`, "application/xml; charset=utf-8");
       }
-      if (nanoLanding && url.pathname === "/robots.txt") {
-        return send(200, `Sitemap: ${NANO_SITEMAP}\n`, "text/plain; charset=utf-8");
+      if (url.pathname === "/robots.txt" && (nanoLanding || nearLanding || mcpLanding)) {
+        const sitemap = nanoLanding ? NANO_SITEMAP : nearLanding ? NEAR_SITEMAP : MCP_SITEMAP;
+        return send(200, `Sitemap: ${sitemap}\n`, "text/plain; charset=utf-8");
       }
       if (url.pathname === "/") {
         await refreshCosts?.();
         if (nanoLanding) {
           res.setHeader("Content-Security-Policy", NANO_LANDING_CSP);
           res.setHeader("X-Frame-Options", "DENY");
+          res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+        }
+        if (nearLanding) {
+          // Referrer policy only: the NEAR landing is interactive (wallet
+          // connect, in-browser studio, RPC calls), so Nano's default-src
+          // 'none' CSP and frame denial are NOT ported blind — they need
+          // their own verified pass against the wallet/studio flows.
           res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
         }
         return send(200, landingHtml({ name, version, listTools: publicTools, publicBase, charged: !!gate, canonicalUrl: nanoLanding ? NANO_LANDING_URL : null, toolInfo, costs, paymentNote, near: !!nearGate, usdc, merchant: nearHealth?.merchant, network: nearHealth?.network, hosting: !!creators }), "text/html; charset=utf-8");
