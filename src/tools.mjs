@@ -26,6 +26,7 @@ import { withHostedRun, deferHostedResult, hostedRunTimeout, hostedRunOptions, h
 import { nanoGptBackupFetch } from "./nanogpt-backup.mjs";
 import { commitCostObservations, costProviderKey, mergeCostRecords, readCostSidecar, workflowCostKey } from "./cost-sidecar.mjs";
 import { createWorkflowProgress } from "./workflow-progress.mjs";
+import { keyedInputs, matchInputs } from "./workflow-inputs.mjs";
 import { SFW_TOOL, createSfwTool, refreshBuiltinDeposits } from "./subnano.mjs";
 import { Workflow, MediaRef, mediaFromFile, estimateGraphCost, graphModelKinds } from "nanoodle";
 import { readGraphArgs, checkGraphSafety, priceGraph, bindPaidGraph, refusalsForQuote, pricingVocabulary, authoringGuide, GUIDE_NODE_MODEL_KIND, GraphRefusedError, DEFAULT_LIMITS } from "./custom-workflow.mjs";
@@ -464,44 +465,12 @@ function withObservedCost(description, rec) {
   return stripped.replace(/(every call spends real credit from [^.;]+)/, `$1; ${cost}`);
 }
 
-/** Clamp an input key to the property-key charset MCP clients enforce (^[a-zA-Z0-9_.-]{1,64}$). */
-function schemaKey(key) {
-  const safe = String(key).replace(/[^a-zA-Z0-9_.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
-  return safe || "input";
-}
+export { keyedInputs };
 
-/**
- * Author-marked optional node (the editor's "optional input" checkbox, saved as
- * fields.optional). Read off the graph itself so it holds even when the installed
- * nanoodle library predates optional-aware deriveInputs (< 0.6.0).
- */
-function authorOptional(wf, inp) {
-  const nodes = (wf.graph && wf.graph.nodes) || [];
-  const n = nodes.find((x) => x.id === inp.nodeId);
-  const v = n && n.fields && n.fields.optional;
-  return v === true || v === "true";
-}
-
-/** Derived inputs paired with schema-safe keys ("System prompt" → "System_prompt"), deduped. */
-export function keyedInputs(wf) {
-  const used = new Map();
-  return wf.inputs.map((inp) => {
-    let safe = schemaKey(inp.key);
-    const count = (used.get(safe) || 0) + 1;
-    used.set(safe, count);
-    if (count > 1) safe = `${safe.slice(0, 61)}_${count}`;
-    return {
-      inp, safe,
-      optional: !!inp.optional || authorOptional(wf, inp),
-      hasDef: inp.def != null && String(inp.def) !== "",
-    };
-  });
-}
-
-export function buildInputSchema(wf) {
+export function buildInputSchema(wf, inputs = keyedInputs(wf)) {
   const properties = {};
   const required = [];
-  for (const { inp, safe, optional, hasDef } of keyedInputs(wf)) {
+  for (const { inp, safe, optional, hasDef } of inputs) {
     const prop = { type: "string" };
     const bits = [];
     if (MEDIA_KINDS.has(inp.kind)) bits.push(`${inp.kind === "inpaint" ? "image" : inp.kind} — file path or https URL`);
@@ -626,36 +595,29 @@ const noodleGuideTool = () => ({
 /**
  * Map friendly-keyed tool arguments onto a workflow's derived inputs, resolving
  * local media paths to inline data via the library. Throws ParamsError (→ -32602)
- * for unknown keys, non-string values, or a missing required input.
+ * for unknown keys, conflicting assignments, non-string values, or a missing required input.
  */
 async function resolveInputs(wf, args, label) {
   const keyed = keyedInputs(wf);
-  // Both spellings resolve: the schema-safe key the tool advertises and the graph's own key.
-  const inputsByKey = new Map();
-  for (const { inp, safe } of keyed) {
-    inputsByKey.set(safe.toLowerCase(), inp);
-    inputsByKey.set(inp.key.toLowerCase(), inp);
+  const { assignments, unknown, duplicates, missing } = matchInputs(keyed, args);
+  if (unknown.length) {
+    throw new ParamsError(`unknown input "${unknown[0]}" for ${label} — inputs: ${keyed.map(({ safe }) => `"${safe}"`).join(", ") || "(none)"}`);
   }
-  const inputs = {};
-  for (const [k, v] of Object.entries(args)) {
-    const entry = inputsByKey.get(String(k).trim().toLowerCase());
-    if (!entry) {
-      throw new ParamsError(`unknown input "${k}" for ${label} — inputs: ${keyed.map(({ safe }) => `"${safe}"`).join(", ") || "(none)"}`);
-    }
-    if (typeof v !== "string") {
-      throw new ParamsError(`input "${k}" must be a string`);
-    }
-    if (MEDIA_KINDS.has(entry.kind) && !/^(data:|https?:)/i.test(v) && existsSync(v)) {
-      inputs[entry.key] = await mediaFromFile(v);
-    } else {
-      inputs[entry.key] = v;
-    }
+  if (duplicates.length) {
+    throw new ParamsError(`input "${duplicates[0].safe}" has conflicting values for ${label}`);
   }
-  const missing = keyed.filter(({ inp, optional, hasDef }) => !optional && !hasDef && inputs[inp.key] === undefined);
   if (missing.length) {
     throw new ParamsError(`missing required input${missing.length > 1 ? "s" : ""} for ${label}: ${missing.map(({ safe }) => `"${safe}"`).join(", ")}`);
   }
-  return inputs;
+  const inputs = [];
+  for (const [{ inp }, { key, value }] of assignments) {
+    if (typeof value !== "string") {
+      throw new ParamsError(`input "${key}" must be a string`);
+    }
+    const localMedia = MEDIA_KINDS.has(inp.kind) && !/^(data:|https?:)/i.test(value) && existsSync(value);
+    inputs.push([inp.key, localMedia ? await mediaFromFile(value) : value]);
+  }
+  return Object.fromEntries(inputs);
 }
 
 /**
@@ -892,26 +854,21 @@ export async function prepareRunNoodle(args, { apiKey, payment, baseUrl = NANOGP
 }
 
 /**
- * Inputs a graph would refuse at run time (unknown key, missing required
- * input), as refusals — price_noodle reports them instead of throwing, so an
- * agent sees every problem in one answer.
+ * Report bad runtime inputs as refusals so price_noodle can show every problem
+ * in one answer.
  */
 function inputRefusals(workflowGraph, given) {
   let wf;
   try { wf = new Workflow(workflowGraph, { quiet: true }); } catch { return []; }
   const keyed = keyedInputs(wf);
-  const known = new Set();
-  for (const { inp, safe } of keyed) { known.add(safe.toLowerCase()); known.add(inp.key.toLowerCase()); }
+  const { unknown, duplicates, missing } = matchInputs(keyed, given);
   const out = [];
-  const seen = new Set();
-  for (const k of Object.keys(given || {})) {
-    const lk = String(k).trim().toLowerCase();
-    if (!known.has(lk)) {
-      out.push({ code: "BAD_INPUTS", message: `unknown input "${k}" — this graph's inputs: ${keyed.map(({ safe }) => `"${safe}"`).join(", ") || "(none)"}` });
-    }
-    seen.add(lk);
+  for (const key of unknown) {
+    out.push({ code: "BAD_INPUTS", message: `unknown input "${key}" — this graph's inputs: ${keyed.map(({ safe }) => `"${safe}"`).join(", ") || "(none)"}` });
   }
-  const missing = keyed.filter(({ inp, safe, optional, hasDef }) => !optional && !hasDef && !seen.has(inp.key.toLowerCase()) && !seen.has(safe.toLowerCase()));
+  for (const { safe } of duplicates) {
+    out.push({ code: "BAD_INPUTS", message: `input "${safe}" has conflicting values` });
+  }
   if (missing.length) {
     out.push({ code: "BAD_INPUTS", message: `missing required input${missing.length > 1 ? "s" : ""}: ${missing.map(({ safe }) => `"${safe}"`).join(", ")}` });
   }

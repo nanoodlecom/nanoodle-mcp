@@ -32,11 +32,10 @@ function inputShape(graph, inputNodeIds) {
   const wf = Workflow.fromJSON(JSON.stringify(graph), { quiet: true });
   // Absent on legacy records: retain their published interface exactly.
   const visible = new Set(inputNodeIds || graph.nodes.filter(n => ["text", "choice"].includes(n.type) && n.name).map(n => String(n.id)));
-  const inputs = keyedInputs(wf).filter(({ inp }) => visible.has(String(inp.nodeId)));
+  const inputs = keyedInputs(wf, { exactAliases: true }).filter(({ inp }) => visible.has(String(inp.nodeId)));
   if (inputs.some(({ inp, safe }) => safe.startsWith("_") || ["__proto__", "constructor", "prototype"].includes(safe) || (inputNodeIds && (inp.key.startsWith("_") || ["__proto__", "constructor", "prototype"].includes(inp.key))))) throw new ParamsError("Customer input names must not begin with an underscore or use a reserved object key");
-  const schema = buildInputSchema(wf), allowed = new Set(inputs.map(i => i.safe));
-  return { inputs, schema: { type: "object", properties: Object.fromEntries(Object.entries(schema.properties).filter(([key]) => allowed.has(key))),
-    required: (schema.required || []).filter(key => allowed.has(key)), additionalProperties: false } };
+  const schema = buildInputSchema(wf, inputs);
+  return { inputs, schema: { ...schema, required: schema.required || [], additionalProperties: false } };
 }
 
 /** Immutable hosted workflows. Graphs stay server-side. */
