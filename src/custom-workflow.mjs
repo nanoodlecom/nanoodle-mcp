@@ -21,6 +21,7 @@ import {
 } from "nanoodle";
 import { gunzipSync, constants as zlibConstants } from "node:zlib";
 import { knownUsd } from "./usd.mjs";
+import { keyedInputs, matchInputs } from "./workflow-inputs.mjs";
 
 export const SERVICE_FEE_RATE = 0.2;
 export const DEFAULT_LIMITS = Object.freeze({
@@ -439,40 +440,20 @@ export function assertGraphSafe(graph, opts) {
 // ---------------------------------------------------------------------------
 
 /** The tool-schema key for an input name (same rule as src/tools.mjs schemaKey). */
-const schemaSafeKey = (key) => String(key).replace(/[^a-zA-Z0-9_.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64) || "input";
-
 /**
- * Deep copy of the graph with each matching input written into its node field.
- * Keys resolve exactly as the run path resolves them (src/tools.mjs keyedInputs
- * + resolveInputs): the input's own name or its schema-safe key, with the
- * "_2", "_3" suffixes that de-duplicate colliding safe keys. Unknown keys are
- * ignored here (the run path refuses them).
+ * Deep copy of the graph with each unambiguous input written into its node
+ * field. Execution accepts the same friendly and schema-safe spellings.
  */
 export function applyInputs(workflowGraph, inputs) {
   const g = structuredClone(workflowGraph);
   if (!inputs || typeof inputs !== "object" || !Object.keys(inputs).length) return g;
-  const derived = new Workflow(workflowGraph, { quiet: true }).inputs;
-  const byKey = new Map();
-  const used = new Map();
-  for (const inp of derived) {
-    let safe = schemaSafeKey(inp.key);
-    const count = (used.get(safe) || 0) + 1;
-    used.set(safe, count);
-    if (count > 1) safe = `${safe.slice(0, 61)}_${count}`;
-    byKey.set(safe.toLowerCase(), inp);
-    byKey.set(String(inp.key).toLowerCase(), inp);
-  }
-  const resolved = new Map();
-  for (const [k, v] of Object.entries(inputs)) {
-    const inp = byKey.get(String(k).trim().toLowerCase());
-    if (inp) resolved.set(inp.key, v);
-  }
+  const workflow = new Workflow(workflowGraph, { quiet: true });
+  const { assignments } = matchInputs(keyedInputs(workflow), inputs);
   const byId = new Map(g.nodes.map((n) => [n.id, n]));
-  for (const inp of derived) {
-    if (!resolved.has(inp.key)) continue;
+  for (const [{ inp }, { value }] of assignments) {
     const n = byId.get(inp.nodeId);
     if (!n) continue;
-    n.fields = { ...(n.fields || {}), [inp.field]: resolved.get(inp.key) };
+    n.fields = { ...(n.fields || {}), [inp.field]: value };
   }
   return g;
 }

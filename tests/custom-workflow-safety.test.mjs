@@ -418,13 +418,14 @@ test("a share link that inflates past maxGraphBytes is refused before it is deco
   assert.equal(ok.graph.nodes[0].id, "t");
 });
 
-test("applyInputs resolves keys exactly as the run path does, including the _2 suffix for colliding names", () => {
+test("applyInputs preserves a native key when generated input suffixes collide", () => {
   const g = graph([
     { id: "a", type: "llm", name: "My idea", fields: { model: "m", prompt: "" } },
     { id: "b", type: "llm", name: "My idea!", fields: { model: "m", prompt: "" } },
+    { id: "c", type: "llm", name: "My_idea_2", fields: { model: "m", prompt: "" } },
   ]);
   const wf = checkGraphSafety(g).workflowGraph;
-  const out = applyInputs(wf, { "My_idea": "first", "My_idea_2": "second" });
+  const out = applyInputs(wf, { My_idea: "first", My_idea_3: "second", My_idea_2: "third" });
   const byId = Object.fromEntries(out.nodes.map((n) => [n.id, n.fields.prompt]));
-  assert.deepEqual(byId, { a: "first", b: "second" });
+  assert.deepEqual(byId, { a: "first", b: "second", c: "third" });
 });

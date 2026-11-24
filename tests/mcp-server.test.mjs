@@ -367,6 +367,50 @@ test("out dir defaults to ./nanoodle-out and media lands there", async () => {
 
 /* ============================= run_noodle ============================= */
 
+test("colliding input names remain distinct in saved schemas, composed runs and pricing", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "nanoodle-mcp-input-names-"));
+  const graph = {
+    v: 1,
+    nodes: ["A B", "A@B", "A_B_2", "TITLE", "title@"].map((name, index) => ({
+      id: `input-${index}`, type: "text", name, fields: { text: "" },
+    })),
+    links: [],
+  };
+  await writeFile(join(dir, "colliding-inputs.json"), JSON.stringify(graph));
+  const srv = startServer({ graphs: dir, outDir: join(dir, "out") });
+  t.after(async () => {
+    await srv.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const list = await srv.request("tools/list");
+  const { inputSchema } = list.result.tools.find((tool) => tool.name === "colliding-inputs");
+  const inputs = { A_B: "one", A_B_3: "two", A_B_2: "three", TITLE: "four", title_2: "five" };
+  assert.deepEqual(Object.keys(inputSchema.properties), Object.keys(inputs));
+  assert.deepEqual(inputSchema.required, Object.keys(inputs));
+
+  const named = await srv.request("tools/call", { name: "colliding-inputs", arguments: inputs });
+  const composed = await srv.request("tools/call", { name: "run_noodle", arguments: { graph, inputs } });
+  for (const run of [named, composed]) {
+    assert.equal(run.error, undefined);
+    assert.equal(run.result.isError, undefined);
+    assert.deepEqual(run.result.content.slice(0, graph.nodes.length).map((block) => block.text), Object.values(inputs));
+  }
+
+  const price = async (values) => (await srv.request("tools/call", {
+    name: "price_noodle", arguments: { graph, inputs: values },
+  })).result.structuredContent.pricing.safety;
+  assert.equal((await price(inputs)).ok, true);
+  const { A_B_3, ...missing } = inputs;
+  assert.deepEqual((await price(missing)).refusals, [{ code: "BAD_INPUTS", message: 'missing required input: "A_B_3"' }]);
+
+  const conflicting = { ...inputs, "A@B": "different" };
+  const refused = await srv.request("tools/call", { name: "run_noodle", arguments: { graph, inputs: conflicting } });
+  assert.equal(refused.error.code, -32602);
+  assert.match(refused.error.message, /input "A_B_3" has conflicting values/);
+  assert.deepEqual((await price(conflicting)).refusals, [{ code: "BAD_INPUTS", message: 'input "A_B_3" has conflicting values' }]);
+});
+
 test("run_noodle is always listed, with a url-or-graph schema and the spend warning", async () => {
   const srv = startServer();
   try {

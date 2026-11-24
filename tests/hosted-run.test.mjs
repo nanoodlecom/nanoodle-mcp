@@ -274,7 +274,7 @@ test("the deadline includes output downloads after the model has completed", asy
   assert.equal(models, 3); assert.equal(downloads, 3, "each model completed and each artifact read was cancelled");
 });
 
-async function twoMediaOutputs(t, { failSecond = false, publicBase = null } = {}) {
+async function twoMediaOutputs(t, { failSecond = false, publicBase = null, outputNames = ["first", "second"] } = {}) {
   const downloads = [];
   let base;
   base = await server(t, async (req, res) => {
@@ -301,8 +301,8 @@ async function twoMediaOutputs(t, { failSecond = false, publicBase = null } = {}
   const outDir = await mkdtemp(join(tmpdir(), "hosted-outputs-"));
   t.after(() => rm(outDir, { recursive: true, force: true }));
   await writeFile(join(outDir, "other-run.png"), "previous result");
-  const graph = { v: 1, links: [], nodes: ["first", "second"].map(id => ({
-    id, name: id, type: "image", fields: { model: "fixture/image", prompt: id, size: "1024x1024" },
+  const graph = { v: 1, links: [], nodes: ["first", "second"].map((id, index) => ({
+    id, name: outputNames[index], type: "image", fields: { model: "fixture/image", prompt: id, size: "1024x1024" },
   })) };
   const registry = await loadTools({ dirs: [], apiKey: "fixture", baseUrl: base, outDir, publicBase, remote: true });
   const snapshots = [], terminalFiles = [];
@@ -314,6 +314,28 @@ async function twoMediaOutputs(t, { failSecond = false, publicBase = null } = {}
   });
   return { run, outDir, downloads, snapshots, terminalFiles };
 }
+
+test("long output labels publish distinct artifacts before terminal success", async t => {
+  const publicBase = "https://artifacts.example";
+  const outputNames = ["first", "second"].map(label => "Long output ".repeat(25) + label);
+  const { run, outDir, downloads, snapshots, terminalFiles } = await twoMediaOutputs(t, { publicBase, outputNames });
+  const result = await run();
+  const pointers = result.content.filter(block => block.type === "text" && block.text.includes(`${publicBase}/out/`));
+  assert.deepEqual(downloads, ["/first.png", "/second.png"]);
+  assert.equal(pointers.length, 2);
+  const filenames = pointers.map(({ text }, index) => {
+    const prefix = `${outputNames[index]}: ${publicBase}/out/`;
+    assert.ok(text.startsWith(prefix), text);
+    const filename = text.slice(prefix.length);
+    assert.match(filename, /-\d+-\d+-[a-f0-9]{12}\.png$/);
+    assert.ok(Buffer.byteLength(filename) <= 255);
+    return filename;
+  });
+  assert.equal(new Set(filenames).size, 2);
+  for (const filename of filenames) assert.equal(await readFile(join(outDir, filename), "utf8"), "fixture media");
+  assert.deepEqual(snapshots.filter(state => state.status !== "running").map(state => state.status), ["succeeded"]);
+  assert.deepEqual(terminalFiles.map(files => files.toSorted()), [[...filenames, "other-run.png"].sort()]);
+});
 
 test("a later failed media download discards only the artifacts of that call", async t => {
   const { run, outDir, downloads, snapshots, terminalFiles } = await twoMediaOutputs(t, { failSecond: true, publicBase: "https://artifacts.example" });
