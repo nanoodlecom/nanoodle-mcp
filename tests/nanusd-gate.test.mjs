@@ -11,6 +11,7 @@ import { createNanusdGate, nanusdPaymentView } from "../src/nanusd/gate.mjs";
 import { createPaymentRoute } from "../src/pay/route-core.mjs";
 import { parseUsdNano, usdNanoToAtomic, atomicToUsdNano } from "../src/pay/money.mjs";
 import { endpointDiscovery } from "../src/discovery.mjs";
+import { createRailRouter } from "../src/rail-router.mjs";
 
 const GENESIS = "usd_1gzne9cau473gmnx3meopyi1trxiw4cu54bzkrm1p6khhpfinwj55k9d4eeq";
 
@@ -124,6 +125,85 @@ test("core: a claim-mode adapter with different units and a fetched rate runs th
   assert.equal(sent.length, 1);
   const q2 = await route.issueQuote({ tool: "run_noodle", usdEstimate: "5.00" });
   await assert.rejects(() => route.confirmPayment(q2.id, { txHash: "TX1" }), /already consumed/);
+});
+
+function fakeRegistry() {
+  const tools = [
+    { name: "run_noodle", description: "Run a workflow", inputSchema: { type: "object", properties: { graph: { type: "object" } } } },
+    { name: "price_noodle", description: "Price a workflow", inputSchema: { type: "object", properties: {} } },
+    { name: "sing", description: "Make a song", inputSchema: { type: "object", properties: { idea: { type: "string" } } } },
+  ];
+  const state = { runs: 0, freeCalls: [] };
+  return {
+    tools, state,
+    listTools: () => tools,
+    prepareCall: () => {},
+    callTool: async (params) => {
+      if (params.name === "run_noodle" || params.name === "sing") { state.runs++; return { content: [{ type: "text", text: "ran" }], costUsd: 0.30 }; }
+      state.freeCalls.push(params);
+      return { content: [{ type: "text", text: "priced" }] };
+    },
+  };
+}
+
+test("execution reuse: wrapRegistry sells tools through the nanusd gate — quote, pay, run once, settle, replay", async () => {
+  const { mock, gate, payer } = nanusdFixture();
+  const registry = fakeRegistry();
+  const wrapped = gate.wrapRegistry(registry, { estimate: async () => "0.50", publicBase: "https://nanusd.nanoodle.com" });
+
+  const listed = wrapped.listTools();
+  const runTool = listed.find((t) => t.name === "run_noodle");
+  assert.ok(runTool.inputSchema.properties._payment_id, "paid tool carries the payment field");
+  assert.match(runTool.description, /paid in NANUSD/);
+  assert.equal(wrapped.sells("run_noodle"), true);
+  assert.equal(wrapped.railOnly.has("run_noodle"), true);
+
+  // Free tools pass through untouched.
+  const free = await wrapped.callTool({ name: "price_noodle", arguments: { graph: {} } });
+  assert.equal(free.content[0].text, "priced");
+  assert.equal(registry.state.runs, 0);
+
+  // No payment id → a quote, nothing runs.
+  const quote = await wrapped.callTool({ name: "run_noodle", arguments: { graph: {} } });
+  const payment = quote.structuredContent.payment;
+  assert.match(payment.paymentId, /^uq_/);
+  assert.equal(payment.payUrl, `https://nanusd.nanoodle.com/nanusd/pay/${payment.paymentId}`);
+  assert.equal(registry.state.runs, 0);
+
+  // Pay the exact deposit, resume → runs once, settles at cost + 20%.
+  const q = gate.quote(payment.paymentId);
+  mock.injectSend({ hash: "PAY9".padEnd(64, "0"), from: payer, to: GENESIS, amountRaw: q.depositAtomic });
+  const done = await wrapped.callTool({ name: "run_noodle", arguments: { graph: {}, _payment_id: payment.paymentId } });
+  assert.equal(done.content[0].text, "ran");
+  assert.equal(done.structuredContent.receipt.chargedUsd, "0.36");
+  assert.equal(registry.state.runs, 1);
+
+  // Replay returns the stored result; nothing runs or charges again.
+  const replay = await wrapped.callTool({ name: "run_noodle", arguments: { graph: {}, _payment_id: payment.paymentId } });
+  assert.equal(replay, done);
+  assert.equal(registry.state.runs, 1);
+});
+
+test("router reuse: nanusd registers as the composition rail beside nano", async () => {
+  const { gate } = nanusdFixture();
+  const registry = fakeRegistry();
+  const nanusd = gate.wrapRegistry(registry, { estimate: async () => "0.50" });
+  const nanoTool = { name: "sing", description: "Make a song", inputSchema: { type: "object", properties: {} } };
+  const nano = { listTools: () => [nanoTool], callTool: async () => ({ content: [{ type: "text", text: "nano" }] }) };
+  const router = createRailRouter({ nano, nanusd });
+  const R = (name, args) => router.route({ name, arguments: args });
+  assert.equal(R("run_noodle", { graph: {} }).gate, "nanusd");
+  assert.equal(R("sing", { _payment_id: "uq_abc" }).gate, "nanusd");
+  assert.equal(R("sing", { _pay_with: "nanusd" }).gate, "nanusd");
+  assert.equal(R("sing", { _payment_id: "pay_abc" }).gate, "nano");
+  assert.equal(R("sing", {}).gate, "nano");
+  assert.match(R("sing", { _pay_with: "near" }).refusal || "", /_pay_with must be "nano" or "nanusd"/);
+  assert.match(R("run_noodle", { graph: {}, _pay_with: "nano" }).refusal || "", /does not accept Nano \(XNO\) payments/);
+  const names = router.listTools().map((t) => t.name);
+  assert.ok(names.includes("run_noodle") && names.includes("sing"));
+  const quote = await router.callTool({ name: "run_noodle", arguments: { graph: {} } });
+  assert.match(quote.structuredContent.payment.paymentId, /^uq_/);
+  assert.throws(() => createRailRouter({ nano, near: { nearOnly: new Set() }, nanusd }), /alternative composition rails/);
 });
 
 test("discovery: the nanusd flavour names the asset, the network, and the guide", () => {

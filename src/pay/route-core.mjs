@@ -160,9 +160,128 @@ export function createPaymentRoute({ adapter, now = Date.now }) {
     return q.receipt;
   }
 
+  /**
+   * Execution reuse: wrap a tool registry so this route sells its tools
+   * with the same shape both production gates expose to the rail router
+   * ({ listTools, callTool, sells, assets, railOnly }).
+   *
+   * The money lifecycle around execution is the core's; execution itself
+   * is injected: `estimate(name, args)` prices a call in USD (the server
+   * wires its pricing machinery), `execute(name, args, ctx)` runs it and
+   * reports the metered cost on the result's `costUsd` sidecar (the
+   * convention both gates read). Free tools pass through untouched.
+   * A paid call without _payment_id is validated, priced and answered
+   * with a quote — never charged. Resuming with _payment_id detects (or,
+   * for claim-mode adapters, verifies) the payment, runs the tool
+   * exactly once, settles, and replays the stored result thereafter.
+   */
+  function wrapRegistry(registry, {
+    freeTools = ["price_noodle", "noodle_guide"],
+    railOnly = ["run_noodle", "price_noodle", "noodle_guide"],
+    paidTools = null,
+    estimate,
+    execute = (name, args, ctx) => registry.callTool({ name, arguments: args }, ctx),
+    publicBase = "",
+    paidLine = null,
+  } = {}) {
+    if (typeof estimate !== "function") throw new TypeError("wrapRegistry needs an estimate(name, args) pricing hook");
+    const free = new Set(freeTools);
+    const all = registry.listTools().map((t) => t.name);
+    const paid = new Set(paidTools ?? all.filter((n) => !free.has(n)));
+    const offered = new Set([...paid, ...free]);
+    const line = paidLine ?? `paid in ${adapter.asset} on the ${adapter.network} network: a deposit is held up front, you are charged the actual model cost + 20% service fee, and the rest is refunded automatically in ${adapter.asset}`;
+    const locks = new Map();
+    const withLock = (id, fn) => {
+      const prev = locks.get(id) || Promise.resolve();
+      const run = prev.then(fn, fn);
+      locks.set(id, run.catch(() => {}));
+      return run;
+    };
+    const paymentBlock = (q) => ({
+      paymentId: q.id, rail: q.rail, asset: q.asset, network: q.network, merchant: q.merchant,
+      amountRaw: q.depositAtomic, amountDisplay: adapter.formatAtomic(BigInt(q.depositAtomic)), amountUsd: q.depositUsd,
+      expiresAt: q.expiresAt, status: q.status,
+      ...(publicBase ? { payUrl: `${publicBase}/${q.rail}/pay/${q.id}`, statusUrl: `${publicBase}/${q.rail}/status/${q.id}` } : {}),
+    });
+    const quoteResult = (q) => ({
+      content: [{ type: "text", text:
+        `PAYMENT REQUIRED — send exactly ${adapter.formatAtomic(BigInt(q.depositAtomic))} (about $${q.depositUsd}) to ${q.merchant} on the ${q.network} network, then call the same tool again with the same arguments plus "_payment_id": "${q.id}". ` +
+        `The deposit caps the charge: you pay the actual model cost + 20%, and the rest returns to the paying account in ${q.asset}. Quote expires ${q.expiresAt}.` }],
+      structuredContent: { payment: paymentBlock(q) },
+    });
+
+    function listTools() {
+      return registry.listTools()
+        .filter((t) => offered.has(t.name))
+        .map((t) => {
+          if (!paid.has(t.name)) return t;
+          return {
+            ...t,
+            description: `${t.description} (${line})`,
+            inputSchema: {
+              ...t.inputSchema,
+              properties: {
+                ...(t.inputSchema.properties || {}),
+                _payment_id: { type: "string", description: `The paymentId from this tool's ${adapter.asset} quote. After paying the exact quoted amount, repeat the original arguments plus this id.` },
+                ...Object.fromEntries((adapter.claimFields || []).map((f) => [f.name, f.schema])),
+              },
+            },
+          };
+        });
+    }
+
+    async function callTool(params, ctx = null) {
+      if (params == null || typeof params !== "object" || Array.isArray(params)) return registry.callTool(params, ctx);
+      const name = params.name;
+      if (free.has(name) && !paid.has(name)) return registry.callTool(params, ctx);
+      if (!paid.has(name)) throw new Error(`unknown tool "${name}" — available: ${[...offered].join(", ")}`);
+      const rawArgs = params.arguments == null ? {} : params.arguments;
+      if (typeof rawArgs !== "object" || Array.isArray(rawArgs)) throw new Error("tools/call arguments must be an object");
+      const { _payment_id, _pay_with, ...claimArgs } = rawArgs;
+      const args = Object.fromEntries(Object.entries(claimArgs).filter(([k]) => !(adapter.claimFields || []).some((f) => f.name === k)));
+
+      if (_payment_id == null) {
+        if (typeof registry.prepareCall === "function") registry.prepareCall({ name, arguments: args }); // never quote a call that would not run
+        const usdEstimate = await estimate(name, args);
+        return quoteResult(await issueQuote({ tool: name, usdEstimate }));
+      }
+      const paymentId = String(_payment_id);
+      return withLock(paymentId, async () => {
+        const q = quotes.get(paymentId);
+        if (!q) throw new Error(`unknown payment id "${paymentId}" — call without _payment_id for a fresh quote`);
+        if (q.result) return q.result; // replay: never runs or charges again
+        if (q.status === "pending") {
+          if (adapter.detection === "watch") await detectPayments();
+          else await confirmPayment(paymentId, adapter.claimFromArgs ? adapter.claimFromArgs(claimArgs) : claimArgs);
+        }
+        if (q.status !== "paid") {
+          return { content: [{ type: "text", text: `Payment for ${paymentId} has not been detected yet (status: ${q.status}). Pay the exact quoted amount, wait for it to confirm, then call again with the same _payment_id.` }],
+            structuredContent: { payment: paymentBlock(q) } };
+        }
+        let result, runError = null;
+        try { result = await execute(name, args, ctx); } catch (e) { runError = e; }
+        if (runError) {
+          const receipt = await settle(paymentId, { actualUsd: "0", runOk: false });
+          return { content: [{ type: "text", text: `The run failed (${String(runError.message || runError)}). Your deposit of ${adapter.formatAtomic(BigInt(q.depositAtomic))} was refunded in full to ${q.payment.payer} in ${q.asset}.` }],
+            structuredContent: { receipt }, isError: true };
+        }
+        const actualUsd = result?.costUsd ?? result?.structuredContent?.costUsd ?? q.estimateUsd;
+        const receipt = await settle(paymentId, { actualUsd: String(actualUsd), runOk: true });
+        const settled = {
+          ...(result && typeof result === "object" ? result : { content: [{ type: "text", text: String(result ?? "") }] }),
+          structuredContent: { ...(result?.structuredContent || {}), receipt },
+        };
+        q.result = settled;
+        return settled;
+      });
+    }
+
+    return { listTools, callTool, sells: (n) => paid.has(n), assets: new Set(adapter.assets), railOnly: new Set(railOnly) };
+  }
+
   return {
     rail: adapter.rail, assets: adapter.assets, idPrefix: adapter.idPrefix,
-    issueQuote, detectPayments, confirmPayment, settle,
+    issueQuote, detectPayments, confirmPayment, settle, wrapRegistry,
     quote: (id) => quotes.get(id) || null,
     journal: () => [...journal],
   };
