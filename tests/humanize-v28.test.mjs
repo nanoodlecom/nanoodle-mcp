@@ -66,6 +66,8 @@ test("v2.8 schema: keep, ending, maxChars, and a 600-character guidance cap", as
     const registry = await loadTools({ dirs: [dir], outDir: join(dir, "out"), log: () => {} });
     const tool = registry.listTools().find((t) => t.name === "humanize-comment");
     assert.deepEqual(tool.inputSchema.properties.keep, humanizeExtraProperties().keep);
+    assert.equal(tool.inputSchema.properties.keep.maxItems, 8);
+    assert.equal(tool.inputSchema.properties.keep.items.maxLength, 500);
     assert.deepEqual(tool.inputSchema.properties.ending, humanizeExtraProperties().ending);
     assert.deepEqual(tool.inputSchema.properties.maxChars, humanizeExtraProperties().maxChars);
     assert.deepEqual(tool.inputSchema.properties.title, humanizeExtraProperties().title);
@@ -761,6 +763,16 @@ test("keep_last through the tool keeps a closing quote on the final sentence", a
     return "Nice post.";
   }, { Draft: "First line. Did you see it?'", Context: "a note", ending: "keep_last" });
   assert.ok(asked.text.endsWith("Did you see it?'"), asked.text);
+});
+
+test("nine keep entries are rejected before any paid call", async (t) => {
+  const keep = Array.from({ length: 9 }, (_, i) => `item ${i + 1}`);
+  let hits = 0;
+  await assert.rejects(
+    runHumanize(t, () => { hits++; return "unexpected"; }, { Draft: keep.join(", "), Context: "a list", keep }),
+    (e) => e.mcpCode === -32602 && /at most 8 spans.*Nothing was charged/.test(e.message),
+  );
+  assert.equal(hits, 0);
 });
 
 test("impossible keep constraints are rejected before any paid call", async (t) => {

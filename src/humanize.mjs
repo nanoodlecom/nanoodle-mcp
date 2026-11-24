@@ -1000,9 +1000,9 @@ export function humanizeExtraProperties() {
   return {
     keep: {
       type: "array",
-      items: { type: "string", minLength: 1 },
+      items: { type: "string", minLength: 1, maxLength: KEEP_MAX_CHARS },
       maxItems: KEEP_MAX_ITEMS,
-      description: `optional; verbatim spans (a joke, a closing line) that must survive exactly. Each span is swapped for a placeholder before the rewrite and put back after. Every match in the draft counts, and the placeholder draft must stay within the draft cap. Overlapping keeps are protected together so each one survives. A rewrite that drops, duplicates, or changes a span is rejected. At most ${KEEP_MAX_ITEMS} spans, each at most ${KEEP_MAX_CHARS} characters.`,
+      description: `Optional array of up to ${KEEP_MAX_ITEMS} verbatim strings, each at most ${KEEP_MAX_CHARS} characters. Every occurrence in the draft is replaced with a placeholder before rewriting and restored afterward. The placeholder draft must stay within the draft cap. Overlapping matches are protected together. A rewrite that drops, duplicates, or changes protected text is rejected.`,
     },
     ending: {
       type: "string",
