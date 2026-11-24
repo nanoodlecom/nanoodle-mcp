@@ -34,7 +34,7 @@ test("a stale pin below the computed ceiling is raised to the ceiling at load", 
   const { graph, dir, registry } = await mount();
   try {
     const ceiling = humanizeCeilingDepositUsd(graph);
-    assert.equal(ceiling.toFixed(8), "0.06122676");
+    assert.equal(ceiling.toFixed(8), "0.05948152");
     const tool = registry.tools.find((t) => t.name === "humanize-comment");
     assert.equal(tool.x402.usd, ceiling);
   } finally { await rm(dir, { recursive: true, force: true }); }

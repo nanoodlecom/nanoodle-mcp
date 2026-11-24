@@ -1312,13 +1312,45 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
   // including one that re-enters this wrapper with the caller's original body, sends this string.
   const billedBodies = new Map();
   let reasksLeft = maxReasks;
-  const byModel = new Map();
-  const dupes = new Set();
+  // Writers are told apart by model AND system prompt: two writers may share
+  // a model (Hy4 Flash writes two voices since 2026-11-23) and differ only by
+  // their voice prompt, so keying on the model alone would leave both outside
+  // every guard below (keep spans, re-asks, budget metering). The key is the
+  // pair. A record entry without a system (hand-built records) keys on the
+  // model alone; a key that still collides is left alone, as before.
+  const systemTextOf = (body) => {
+    const parts = [];
+    for (const m of (body && body.messages) || []) {
+      if (!m || m.role !== "system") continue;
+      if (typeof m.content === "string") parts.push(m.content);
+      else if (Array.isArray(m.content)) for (const part of m.content) if (part && typeof part.text === "string") parts.push(part.text);
+    }
+    return parts.join("\n");
+  };
+  const byKey = new Map();
+  const keyDupes = new Set();
+  for (const l of LETTERS) {
+    const r = record[l];
+    const k = r.model + "\n" + (typeof r.system === "string" ? r.system : "");
+    if (byKey.has(k)) keyDupes.add(k); else byKey.set(k, l);
+  }
+  for (const k of keyDupes) byKey.delete(k);
+  const byModelOnly = new Map();
+  const modelDupes = new Set();
   for (const l of LETTERS) {
     const m = record[l].model;
-    if (byModel.has(m)) dupes.add(m); else byModel.set(m, l);
+    if (byModelOnly.has(m)) modelDupes.add(m); else byModelOnly.set(m, l);
   }
-  for (const m of dupes) byModel.delete(m); // two writers on one model can't be told apart: leave them alone
+  for (const m of modelDupes) byModelOnly.delete(m);
+  const identify = (body) => {
+    if (!body || typeof body.model !== "string") return undefined;
+    const sys = systemTextOf(body);
+    if (sys) {
+      const hit = byKey.get(body.model + "\n" + sys);
+      if (hit) return hit;
+    }
+    return byModelOnly.get(body.model);
+  };
   const hdr = (h, k) => { if (!h) return null; if (typeof h.get === "function") return h.get(k); const e = Object.entries(h).find(([n]) => n.toLowerCase() === k); return e ? e[1] : null; };
   const wait = (ms, signal) => new Promise((res, rej) => {
     if (signal && signal.aborted) return rej(signal.reason);
@@ -1597,7 +1629,7 @@ export function humanizeFetch({ record, draft, fetch = globalThis.fetch, payment
     if (!init || typeof init.body !== "string") return fetch(url, init);
     let body;
     try { body = JSON.parse(init.body); } catch { return fetch(url, init); }
-    const letter = body && byModel.get(body.model);
+    const letter = body && identify(body);
     if (!letter) {
       if (body && body.model === "z-ai/glm-5.3" && !state.judgeReq) {
         const user = (body.messages || []).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).join("\n");
@@ -2277,7 +2309,7 @@ export function humanizeWriterRecord(graph, fallbacks = HUMANIZE_FALLBACKS) {
     const w = link && nodes.get(link.from.node);
     if (!w || w.type !== "llm") return null;
     if (w.fields.model !== m[2]) throw new Error(`humanize-comment: join ${n.id} labels [${m[1]}] ${m[2]} but its writer ${w.id} runs ${w.fields.model}`);
-    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, maxTokens: Number(w.fields.maxTokens) || 600, fallbackModel: fallbacks[w.fields.model] || null });
+    record[m[1]] = Object.freeze({ writer: m[1], nodeId: w.id, model: w.fields.model, system: typeof w.fields.system === "string" ? w.fields.system : null, maxTokens: Number(w.fields.maxTokens) || 600, fallbackModel: fallbacks[w.fields.model] || null });
   }
   return LETTERS.every((l) => record[l]) && nodes.has("judge") && nodes.has("draft") ? Object.freeze(record) : null;
 }

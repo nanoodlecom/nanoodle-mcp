@@ -990,19 +990,16 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
   const { Workflow } = await import("nanoodle");
   const graphText = await readFile(new URL("./fixtures/hosted/humanize-comment.noodle-graph.json", import.meta.url), "utf8");
   const graph = JSON.parse(graphText);
-  const lines = {
-    "meta-llama/llama-4-maverick": "MAVERICK-LINE",
-    "deepseek/deepseek-v4.1-flash-1017": "DEEPSEEK-LINE",
-    "thedrummer/artemis-31b-v1.2": "ARTEMIS-LINE",
-    "qwen/qwen3.8-27b-antislop": "ANTISLOP-LINE",
-    "tencent/hy4-flash": "HY4-LINE",
-  };
-  const labels = {
-    "meta-llama/llama-4-maverick": "A",
-    "deepseek/deepseek-v4.1-flash-1017": "B",
-    "thedrummer/artemis-31b-v1.2": "C",
-    "qwen/qwen3.8-27b-antislop": "D",
-    "tencent/hy4-flash": "E",
+  // D and E share tencent/hy4-flash since 2026-11-23; the mock tells them
+  // apart by the voice line in their system prompts, as the wrapper does.
+  const lines = { A: "MAVERICK-LINE", B: "DEEPSEEK-LINE", C: "ARTEMIS-LINE", D: "PLAIN-LINE", E: "HY4-LINE" };
+  const models = { A: "meta-llama/llama-4-maverick", B: "deepseek/deepseek-v4.1-flash-1017", C: "thedrummer/artemis-31b-v1.2", D: "tencent/hy4-flash", E: "tencent/hy4-flash" };
+  const letterOf = (body) => {
+    if (body.model === "tencent/hy4-flash") {
+      const sys = (body.messages || []).filter((m) => m.role === "system").map((m) => m.content).join("\n");
+      return sys.includes("Voice for this rewrite: plain") ? "D" : "E";
+    }
+    return Object.keys(models).find((k) => models[k] === body.model);
   };
   const nodes = { A: "w-a", B: "w-b", C: "w-c", D: "w-d", E: "w-e" };
   const rankedIds = {
@@ -1016,19 +1013,19 @@ test("the decider prompt is the writers' own outputs, with no MCP rebuild (#98)"
     const body = JSON.parse(init.body);
     const user = (body.messages || []).filter((m) => m.role === "user").map((m) => m.content).join("\n");
     if (body.model === "z-ai/glm-5.3") judgeUser = user;
-    const content = lines[body.model] || JSON.stringify(rankedIds);
+    const content = lines[letterOf(body)] || JSON.stringify(rankedIds);
     return new Response(JSON.stringify({ choices: [{ message: { content } }], x_nanogpt_pricing: { costUsd: 0.0001 } }), { status: 200, headers: { "content-type": "application/json" } });
   };
   const wf = Workflow.fromJSON(graphText, { apiKey: "test-key", baseUrl: "http://nano.test", fetch });
   const result = await wf.run({ Draft: "Draft line.", Context: "Context line.", Guidance: "Guidance line." });
-  for (const [model, line] of Object.entries(lines)) {
-    assert.ok(judgeUser.includes(`[${labels[model]}] ${model}\n${line}`), `${model} missing from decider prompt`);
+  for (const [letter, line] of Object.entries(lines)) {
+    assert.ok(judgeUser.includes(`[${letter}] ${models[letter]}\n${line}`), `${models[letter]} (${letter}) missing from decider prompt`);
   }
   const returned = JSON.parse(result.get("Decider (GLM-5.3)"));
   assert.deepEqual(returned, rankedIds, "the graph returns the decider's ranked ids, not copied writer text");
   for (const row of returned.ranked) assert.equal(row.text, undefined);
-  for (const [model, line] of Object.entries(lines)) {
-    const id = nodes[labels[model]];
+  for (const [letter, line] of Object.entries(lines)) {
+    const id = nodes[letter];
     assert.equal(result.nodes[id].status, "done");
     assert.equal(result.nodes[id].out.text, line, `${id} keeps the writer's own text`);
   }
