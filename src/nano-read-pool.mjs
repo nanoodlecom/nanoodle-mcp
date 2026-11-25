@@ -132,7 +132,9 @@ export function qualifyNanoAccountViews(rows) {
 }
 
 export function checkedReceivable(value, body, view, checkAddress) {
-  const blocks = value?.blocks;
+  // Some peers return an empty JSON array even when a source map was requested.
+  const reply = value?.blocks;
+  const blocks = Array.isArray(reply) && reply.length === 0 ? "" : reply;
   if (blocks !== "" && (!blocks || typeof blocks !== "object" || Array.isArray(blocks))) throw fail("NANO_RPC_BAD_RECEIVABLE");
   const entries = Object.entries(blocks || {}), normalized = {}, seen = new Set(); let sum = 0n;
   const count = Number(body.count);

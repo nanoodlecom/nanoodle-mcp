@@ -515,12 +515,20 @@ test("a frozen first peer cannot hide a confirmed payment behind an empty list",
   assert.ok(w.calls.every(c => ["block_info", "account_info", "receivable"].includes(c.action)));
 });
 
+test("a peer can prove zero receivable with an empty array", async () => {
+  const w = world(2);
+  w.peers[0].receivable = { blocks: [] };
+  assert.deepEqual(await w.pool.read(receivable), { blocks: "" });
+  w.peers[0].receivable = { blocks: [SEND] };
+  await assert.rejects(w.pool.read(receivable), { code: "NANO_RPC_READ_QUORUM" });
+});
+
 test("a cached incomplete list cannot contradict its atomic account pending total", async () => {
   const w = world();
   for (const p of w.peers) { p.info = nanoAccountInfo({ pending: "7" }); p.receivable = pending(7); }
   w.peers[0].receivable = { blocks: "" };
   assert.equal((await w.pool.read(receivable)).blocks[SEND].amount, "7");
-  w.peers[1].receivable = { blocks: "" };
+  w.peers[1].receivable = { blocks: [] };
   await assert.rejects(w.pool.read(receivable), { code: "NANO_RPC_READ_QUORUM" });
 });
 
