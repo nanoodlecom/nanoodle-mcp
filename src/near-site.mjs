@@ -3,6 +3,12 @@ import { runViewHtml, RUN_VIEW_CSS } from "./run-view.mjs";
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 export const BRAND_BASE = "/brand/255labs-v1.1.0";
 
+// The /og.jpg asset served on this host is the shared nanoodle-mcp share
+// card (same bytes as the Nano surface), so its alt text matches http.mjs.
+const NEAR_OG_IMAGE_ALT = "nanoodle-mcp share card on a near-black dot grid: the noodle-bowl icon beside a " +
+  "cyan-to-periwinkle gradient wordmark, the headline 'AI workflows, paid in Nano over x402.', the " +
+  "connect command in a bordered pill, and text, image, video, and audio port dots.";
+
 export const nearWorkflowCopy = {
   "idea-to-3d-model": { title: "Turn an object idea into a 3D model", intent: "Describe a prop, toy or product concept. A writing model shapes the brief, Muse renders the concept art, and TRELLIS.2 builds a textured GLB you can rotate and download.", sampleDescription: "One brief became this teal wind-up submarine. Play the turntable to see the generated model from every side, or open the sample to explore the concept image and interactive 3D viewer." },
   "image-model-arena": { title: "Compare four image models", intent: "One brief, four different image models. Compare how they handle your text, composition and details before choosing one for a project." },
@@ -27,14 +33,30 @@ export function nearSitePage({ version, publicBase, merchant, network, tools, ca
   const config = { publicBase, merchant, tools: tools.map(t => ({ name: t.name, title: t.title || nearWorkflowCopy[t.name]?.title, schema: t.inputSchema, ...(t.graph ? { graph: t.graph, defaults: t.defaults } : {}) })), usdc };
   const title = `nanoodle — Give your agents new abilities, paid in ${assets}`;
   const description = `Give your agents image, video, music and 3D abilities. Build and share open-source AI workflows, connect over MCP, and pay per run in ${assets} with automatic change.`;
+  const structuredData = JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    name: "nanoodle",
+    url: `${publicBase}/`,
+    description,
+    applicationCategory: "MultimediaApplication",
+  }).replace(/</g, "\\u003c");
   return {
     title,
     head: NANO_BRAND_HEAD + `<link rel="preload" href="${NANOODLE_BRAND}/fonts/righteous-latin.woff2" as="font" type="font/woff2" crossorigin>` +
       `<meta name="description" content="${esc(description)}"><meta name="theme-color" content="#0b0d12">` +
       `<link rel="canonical" href="${esc(publicBase)}/"><meta property="og:type" content="website"><meta property="og:site_name" content="nanoodle">` +
-      `<meta property="og:title" content="${esc(title)}"><meta property="og:description" content="${esc(description)}"><meta property="og:url" content="${esc(publicBase)}/">`,
+      `<meta property="og:title" content="${esc(title)}"><meta property="og:description" content="${esc(description)}"><meta property="og:url" content="${esc(publicBase)}/">` +
+      `<meta property="og:image" content="${esc(publicBase)}/og.jpg">` +
+      `<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">` +
+      `<meta property="og:image:alt" content="${esc(NEAR_OG_IMAGE_ALT)}">` +
+      `<meta name="twitter:card" content="summary_large_image">` +
+      `<meta name="twitter:title" content="${esc(title)}">` +
+      `<meta name="twitter:description" content="${esc(description)}">` +
+      `<meta name="twitter:image" content="${esc(publicBase)}/og.jpg">` +
+      `<script type="application/ld+json">${structuredData}</script>`,
     body: `
-      <header class="top"><a class="brand" href="/">${NANO_CONNECTOR}${NANO_WORDMARK}</a><span class="network-label">on NEAR</span>
+      <header class="top"><a class="brand" href="/" aria-label="nanoodle home">${NANO_CONNECTOR}${NANO_WORDMARK}</a><span class="network-label">on NEAR</span>
         <nav><a href="#workflows">Abilities</a><a href="#build">Build</a><a href="https://github.com/nanoodlecom/nanoodle-mcp">Source ↗</a></nav></header>
       <section class="near-intro" aria-labelledby="intro-title"><p class="eyebrow">Open-source workflows for agents</p>
         <h1 id="intro-title">Give your agents<br><span>new abilities.</span></h1>
@@ -62,7 +84,7 @@ export function nearSitePage({ version, publicBase, merchant, network, tools, ca
   "author": "nano_…"
 }</code></pre></div></section>
       <section class="near-trust"><div><h2>Open source, from editor to execution.</h2><p>Inspect the <a href="https://github.com/nanoodlecom/nanoodle">editor</a>, <a href="https://github.com/nanoodlecom/nanoodle-js">workflow runtime</a> and <a href="https://github.com/nanoodlecom/nanoodle-mcp">MCP server</a>. Build on them or host your own. Each shared workflow carries its author’s licence.</p><p>Prompts aren’t written to server logs; generated media expires after 24 hours. Generation runs through <a href="https://nano-gpt.com">NanoGPT</a>, whose <a href="https://nano-gpt.com/privacy">privacy policy</a> applies to prompts sent to the models.</p></div><a href="https://github.com/nanoodlecom/nanoodle-mcp">Explore the source ↗</a></section>
-      <footer class="near-footer"><div class="footer-top"><a class="brand" href="/">${NANO_WORDMARK}</a><span>NEAR ${esc(network)} · v${esc(version)}</span><a href="/llms.txt">Agent instructions</a><a href="/near/health">Service status</a><a href="https://mcp.nanoodle.com">x402 on Nano ↗</a><a href="https://branding.nanoodle.com/">Brand guidelines</a></div><a class="labs-brand" href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" alt="255labs"><span>Full signal. Zero noise.</span></a></footer>
+      <footer class="near-footer"><div class="footer-top"><a class="brand" href="/">${NANO_WORDMARK}</a><span>NEAR ${esc(network)} · v${esc(version)}</span><a href="/llms.txt">Agent instructions</a><a href="/near/health">Service status</a><a href="https://mcp.nanoodle.com">x402 on Nano ↗</a><a href="https://branding.nanoodle.com/">Brand guidelines</a></div><a class="labs-brand" href="https://255labs.xyz"><img src="${BRAND_BASE}/255labs-lockup-paper.svg" width="140" height="36" alt="255labs"><span>Full signal. Zero noise.</span></a></footer>
       <script type="module" src="${esc(scriptUrl)}"></script>`,
     css: `
       ${RUN_VIEW_CSS}
