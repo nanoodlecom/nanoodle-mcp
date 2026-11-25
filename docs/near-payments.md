@@ -328,8 +328,8 @@ starts a workflow or requests another payment.
 is unfinished, 200 with the existing MCP result and receipt after settlement,
 404 for an unknown id. The unguessable private payment link grants read access
 to that run's output, so keep it private. Responses use `no-store`; pay pages
-send no referrer. Paid text remains in memory and is not recoverable after a
-server restart. Persisted media links remain recoverable while the files exist.
+send no referrer. Text from a successful run is available after a restart for
+24 hours. Media links remain recoverable while their files exist.
 The default agent payment watcher still closes on payment so agents can resume
 their bound MCP call immediately; the browser's optional run watcher is separate.
 
@@ -344,8 +344,8 @@ The tab keeps quote/request history in `sessionStorage` so a reload resumes the
 same payment instead of requesting another. That browser storage can contain
 the inputs you entered; generated result text is not persisted there. Server
 logs do not retain prompts. Paid execution remains idempotent if a connection
-fails or the tab reloads. Keep the result tab open; generated media expires after
-24 hours and text results do not survive a server restart.
+fails or the tab reloads. Reopen the original payment link to retrieve the
+result during its retention window. Generated media defaults to 24 hours.
 
 ### Authorize the merchant refund key
 
@@ -963,9 +963,13 @@ Rules that make restarts safe:
   restart, the server re-broadcasts the same signed bytes, which is idempotent because the
   hash is the same. It signs a new transaction only when the old one is provably dead (see
   [Refunds](#refunds)).
-- Text output, the caller's paid content, stays in memory only, as in the Nano mode. A replay
-  after a restart returns the receipt and states that the text was not retained. It never
-  runs again.
+- Successful text output and any accompanying media links are written to an
+  owner-only file in `out/.near-results/` before recording the settlement.
+  The financial ledger stores the file's checksum and expiration. The server
+  removes the result file after the 24-hour window. Full encrypted backups can
+  include saved outputs. Payment-evidence exports contain the ledger reference.
+  If saving a text result fails, the full deposit is refunded through the
+  normal refund queue.
 - Finished quotes are pruned 24 hours after they finish; unpaid quotes one hour after they
   expire. Pruning runs at startup and at most once a minute while quoting. A stored quote
   keeps only what payment and settlement need (amount, USD deposit, estimated cost, locked
@@ -1110,8 +1114,8 @@ These are deliberate cuts for this version.
   a reasoning model's hidden tokens, if a provider does not count them against
   `max_tokens`). A run that costs more than its deposit is capped at the deposit, and the
   operator absorbs the overrun.
-- Text results are not kept across restarts. A replay after a restart returns the receipt
-  only.
+- Text results from releases before durable checkout replay may have a receipt
+  without recoverable output. Replay never starts a second run.
 - Built-in tools (`sfw_check`, `humanize-comment`) are not sold in
   NEAR mode.
 - The NEAR pay page connects a wallet rather than using a universal payment QR code.

@@ -742,9 +742,8 @@ async function emitResult(wf, result, prefix, outDir, { artifacts, publicBase, n
   };
   // Does any content block carry an actual tool OUTPUT as text (an LLM/text
   // node's result), as opposed to a /out/ URL, a "saved <path>" pointer, or the
-  // cost line? Only true text output is the customer's paid content; the gate
-  // uses this flag to keep it off disk (media pointers + receipts are safe to
-  // persist, the files themselves die by --out-ttl).
+  // cost line? The paid gates use this flag to distinguish text outputs from
+  // media pointers when choosing how to retain a result.
   let textOutput = false;
   for (const o of resultPorts(wf, result)) {
     const value = o.value;
@@ -803,7 +802,7 @@ async function emitResult(wf, result, prefix, outDir, { artifacts, publicBase, n
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput
-  // tells persist() this result holds paid content that must never hit disk.
+  // distinguishes generated text from result notices and media pointers.
   // Every serving layer strips BOTH before replying to an MCP client.
   // costExact rides along so the gate can label a lower-bound total as one instead of as the actual cost
   return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, costExact: result.costExact !== false, textOutput };

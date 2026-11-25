@@ -8,7 +8,7 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fetchCatalogs, loadTools } from "../src/tools.mjs";
@@ -31,6 +31,7 @@ const DEPOSIT = 8379000000000000000000n;          // docs/near-payments.md#worke
 const CHARGED = 3102197802197802197803n;
 const REFUND = 5276802197802197802197n;
 const INPUTS = { Idea: "a lighthouse at dawn" };
+const TEXT_GRAPH = { ...WORKED_GRAPH, nodes: WORKED_GRAPH.nodes.slice(0, 2), links: WORKED_GRAPH.links.slice(0, 1) };
 
 let realFetch, mock, key, graphsDir;
 
@@ -914,26 +915,57 @@ test("concurrent duplicate paying calls run once", async () => {
   assert.equal(w.ledger.refunds().length, 1);
 });
 
-test("text output is never written to near-state.json", async () => {
-  const w = await world();
-  const textGraph = {
-    nodes: [
-      { id: "t", type: "text", name: "Topic", fields: { text: "" } },
-      { id: "l", type: "llm", fields: { model: "z-ai/glm-5.3-flash", system: "Write a haiku." } },
-    ],
-    links: [{ from: { node: "t", port: "text" }, to: { node: "l", port: "prompt" } }],
-  };
-  const { pay, p } = await quoteAndPay(w, "run_noodle", { graph: textGraph, inputs: { Topic: "tides" } });
+test("a settled text result expires and stays out of the financial ledger", async () => {
+  let now = Date.now();
+  const w = await world({ now: () => now });
+  const args = { graph: TEXT_GRAPH, inputs: { Idea: "private fixture input" } };
+  const { pay, p } = await quoteAndPay(w, "run_noodle", args);
   const r = await pay();
   assert.ok(!r.isError, text(r));
   assert.ok(text(r).includes(mock.REPLY));
   const disk = await readFile(w.file, "utf8");
-  assert.ok(!disk.includes(mock.REPLY), "the paid text stays in memory");
-  assert.ok(!disk.includes("tides"), "inputs are not stored either");
+  assert.ok(!disk.includes(mock.REPLY));
+  assert.ok(!disk.includes("private fixture input"));
+  const file = join(w.out, ".near-results", p.paymentId + ".json");
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+  assert.equal((await stat(join(w.out, ".near-results"))).mode & 0o777, 0o700);
+  assert.ok(!((await readFile(file, "utf8")).includes("private fixture input")));
   const n = await w.restart();
-  const replay = await n.callTool({ name: "run_noodle", arguments: { graph: textGraph, inputs: { Topic: "tides" }, _payment_id: p.paymentId, _payment_tx: r.structuredContent.receipt.deposit.txHash, _payment_sender: PAYER } });
-  assert.match(text(replay), /not retained across a server restart; the run is not repeated/);
-  assert.ok(!text(replay).includes(mock.REPLY));
+  assert.deepEqual(n.gate.result(p.paymentId), r);
+  now += 24 * 60 * 60_000 + 5_000;
+  assert.match(text(n.gate.result(p.paymentId)), /retention window has expired/);
+  n.gate.pruneResults();
+  await assert.rejects(stat(file), { code: "ENOENT" });
+});
+
+test("restart before recording change still delivers the saved text and refunds exactly once", async () => {
+  const w = await world();
+  const { p, pay } = await quoteAndPay(w, "run_noodle", { graph: TEXT_GRAPH, inputs: INPUTS });
+  w.refunder.refund = async () => { throw new Error("simulated stop before refund"); };
+  const runs = mock.runs(), sends = w.chain.sendTxCount;
+  await assert.rejects(pay(), /simulated stop before refund/);
+  assert.ok(w.ledger.getQuote(p.paymentId).resultRef);
+  const n = await w.restart();
+  const r = n.gate.result(p.paymentId);
+  assert.ok(text(r).includes(mock.REPLY));
+  assert.equal(r.structuredContent.receipt.refund.status, "sent");
+  await n.gate.resume();
+  assert.equal(mock.runs(), runs + 1);
+  assert.equal(w.chain.sendTxCount, sends + 1);
+});
+
+test("failed text storage refunds the full deposit", async () => {
+  const w = await world();
+  await writeFile(join(w.out, ".near-results"), "directory unavailable");
+  const { pay, p } = await quoteAndPay(w, "run_noodle", { graph: TEXT_GRAPH, inputs: INPUTS });
+  const r = await pay();
+  assert.match(text(r), /result could not be saved/);
+  assert.equal(r.structuredContent.receipt.refund.yocto, p.amountYocto);
+  assert.equal(r.structuredContent.receipt.refund.status, "sent");
+  const before = w.chain.sendTxCount;
+  const n = await w.restart();
+  assert.equal(n.gate.result(p.paymentId).structuredContent.receipt.outcome, "run_failed");
+  assert.equal(w.chain.sendTxCount, before);
 });
 
 test("no rate, no quote", async () => {
