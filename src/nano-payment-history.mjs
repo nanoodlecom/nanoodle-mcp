@@ -50,6 +50,41 @@ export function checkedAnchoredNanoHistory(page, { account, head, count }, check
   return { ...page, history, previous: next };
 }
 
+/** Some proxies return compact history even with raw:true. Reconstruct only
+ * missing predecessor links from a single, bounded read of confirmed blocks. */
+export async function completeAnchoredNanoHistory(page, request, { rpc, checkAddress, hashBlock, height = null }) {
+  const count = Number(request.count), rows = page?.history;
+  if (!rpc || !Array.isArray(rows) || !rows.length || rows.length > count || count > NANO_HISTORY_PAGE) {
+    return checkedAnchoredNanoHistory(page, request, checkAddress, height);
+  }
+  const missing = rows.filter(row => row?.previous == null && row?.type !== "open");
+  if (!missing.length) return checkedAnchoredNanoHistory(page, request, checkAddress, height);
+  const owner = canon(request.account);
+  if (!owner || owner !== canon(page.account) || !Number.isSafeInteger(count)
+      || !isNanoHistoryHash(request.head) || !isNanoHistoryHash(rows[0]?.hash)
+      || rows[0].hash.toUpperCase() !== request.head.toUpperCase()
+      || missing.some(row => !isNanoHistoryHash(row?.hash) || !isNanoBlockHeight(row.height))) throw badHistory();
+  const hashes = missing.map(row => row.hash.toUpperCase());
+  if (new Set(hashes).size !== hashes.length) throw badHistory();
+  const { blocks } = await rpc({ action: "blocks_info", hashes, json_block: "true", source: "true" });
+  const filled = new Map();
+  for (const row of missing) {
+    const hash = row.hash.toUpperCase(), witness = blocks?.[hash];
+    const contents = witness?.contents;
+    const kind = nanoHistoryKind(row);
+    if (!["true", true].includes(witness?.confirmed) || witness.height !== row.height || witness.subtype !== kind
+      || contents?.type !== "state" || canon(contents.account) !== owner
+      || (kind === "receive" && (witness.amount !== row.amount || canon(witness.source_account) !== canon(row.account)))) {
+      throw badHistory();
+    }
+    let computedHash;
+    try { computedHash = hashBlock(contents); } catch { throw badHistory(); }
+    if (computedHash.toUpperCase() !== hash) throw badHistory();
+    filled.set(row, { ...row, previous: contents.previous });
+  }
+  return checkedAnchoredNanoHistory({ ...page, history: rows.map(row => filled.get(row) ?? row) }, request, checkAddress, height);
+}
+
 export function readNanoPaymentHistory(value) {
   if (value === undefined) return { through: null, coveredAt: null, backfill: null };
   if (!value || (value.through !== null && !isNanoHistoryHash(value.through))

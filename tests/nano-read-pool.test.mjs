@@ -33,6 +33,7 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
       if (body.action === "receivable") { assert.equal(body.include_only_confirmed, "true"); return p.receivable; }
       if (body.action === "account_history") return p.historyRead ? p.historyRead(body) : p.history;
       if (body.action === "block_info") { const value = p.blocks[body.hash]; if (value instanceof Error) throw value; if (!value) throw absent(); return value; }
+      if (body.action === "blocks_info" && p.blockBatch) return p.blockBatch(body);
       assert.fail("not a read-only request");
     } });
   return { pool, peers, calls, tick: ms => { at += ms; elapsed += ms; }, jumpWall: ms => { at += ms; } };
@@ -705,6 +706,33 @@ test("anchored raw history falls back when a peer cannot prove continuous confir
   w.peers[1].history = { ...page, history: [] };
   await assert.rejects(w.pool.read(request), { code: "NANO_RPC_READ_QUORUM" });
   assert.equal(w.pool.status().readablePeers, 0);
+});
+
+test("anchored payment reads qualify compact history only with matching confirmed blocks", async () => {
+  const w = world(2);
+  const contents = { type: "state", account: ACCOUNT, representative: ACCOUNT, balance: "100", previous: OTHER, link: SEND };
+  const head = hashBlock(contents).toUpperCase();
+  const row = { hash: head, type: "receive", account: PAYER, amount: "7", height: "10", confirmed: "true" };
+  const page = { account: ACCOUNT, previous: OTHER, history: [row] };
+  const witness = { subtype: "receive", amount: "7", source_account: PAYER, height: "10", confirmed: "true", contents };
+  const [compact, complete] = w.peers;
+  compact.info = complete.info = nanoAccountInfo({ frontier: head });
+  compact.receivable = { blocks: [] };
+  compact.history = page;
+  complete.history = { ...page, history: [{ ...row, previous: OTHER }] };
+  compact.blockBatch = request => {
+    assert.deepEqual(request.hashes, [head]);
+    assert.equal(request.source, "true");
+    return { blocks: { [head]: witness } };
+  };
+  assert.deepEqual((await w.pool.readPaymentWindow()).history, complete.history);
+  for (const changed of [
+    { confirmed: "false" }, { source_account: ACCOUNT }, { height: "9" }, { amount: "8" },
+    { contents: { ...contents, previous: SEND } },
+  ]) {
+    compact.blockBatch = () => ({ blocks: { [head]: { ...witness, ...changed } } });
+    assert.equal((await w.pool.readPaymentWindow()).history, null);
+  }
 });
 
 test("a stale negative block lookup cannot hide a positive confirmation", async () => {

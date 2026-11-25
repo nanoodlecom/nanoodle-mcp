@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { MAX_RPC_RETRY_MS, rpcPeerSetId, selectRpcCooldowns } from "./rpc-backoff.mjs";
 import { NANO_GENESIS, selectNanoCheckpoint } from "./nano-checkpoint.mjs";
-import { checkedAnchoredNanoHistory, isNanoBlockHeight, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "./nano-payment-history.mjs";
+import { completeAnchoredNanoHistory, isNanoBlockHeight, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "./nano-payment-history.mjs";
 
 export { NANO_GENESIS } from "./nano-checkpoint.mjs";
 // Genesis, receivable, account_info, and history at that confirmed account head.
@@ -366,9 +366,12 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
         const row = { base, info, view };
         if (base !== standbyUrl && base !== ownedPrimary) primaryViews.push(row);
         if (body.action === "receivable") data = checkedReceivable(data, body, view, checkAddress);
+        // The standby has a fixed RPC budget for a cold scan.
+        const historyProof = { rpc: base === standbyUrl ? null : request => readRpc(request, base), checkAddress, hashBlock };
         if (body.action === "account_history") {
           data = body.head && yes(body.raw)
-            ? checkedAnchoredNanoHistory(data, body, checkAddress, view.confirmedFrontier === body.head.toUpperCase() ? view.confirmedHeight : null)
+            ? await completeAnchoredNanoHistory(data, body, { ...historyProof,
+              height: view.confirmedFrontier === body.head.toUpperCase() ? view.confirmedHeight : null })
             : checkedHistory(data, checkAddress);
         }
         let history = null;
@@ -379,7 +382,7 @@ export function createNanoReadPool({ bases, rpc, account, checkAddress, hashBloc
             const height = paymentWindow.historyHeight;
             const frontierHeight = head === view.confirmedFrontier ? view.confirmedHeight : null;
             if (height !== null && frontierHeight !== null && BigInt(height) !== frontierHeight) throw fail("NANO_RPC_UNPROVEN_HISTORY");
-            const proved = checkedAnchoredNanoHistory(await readRpc(request, base), request, checkAddress, frontierHeight ?? height);
+            const proved = await completeAnchoredNanoHistory(await readRpc(request, base), request, { ...historyProof, height: frontierHeight ?? height });
             if (BigInt(proved.history[0].height) <= view.confirmedHeight) history = proved;
           } catch (error) {
             if (error?.rateLimited === true) {
