@@ -56,6 +56,15 @@ about 0.000045 NEAR per transfer make a deposit and refund per call practical. T
 x402: there is no HTTP 402 and no facilitator, only an in-band MCP quote paid by a plain
 transfer. Design and threat model: [docs/near-payments.md](docs/near-payments.md).
 
+**How NanoUSD fits (in preparation — not live).** A third, separate route at
+nanusd.nanoodle.com will take NanoUSD (NANUSD): a USD-pegged asset on its own
+Nano-protocol network (accounts start with `usd_`), issued by Nanswap against
+USDC reserves — not a token on Nano, and not USDC. Its gate is an instance of
+the shared payment route (`src/pay/route-core.mjs`) with its own adapter
+(`src/nanusd/`), the same quote → settle → change lifecycle as the other
+rails, with the rate locked at the 1:1 peg so no oracle is involved. Design:
+[docs/nanusd-payments.md](docs/nanusd-payments.md).
+
 **Status.**
 - Offline: the whole payment flow passes against a local NEAR chain stand-in and a local
   NanoGPT stand-in (35 checks), and the market worker passes against a local market
