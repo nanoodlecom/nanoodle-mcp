@@ -55,6 +55,7 @@ import { writePrivateStateSync } from "../src/private-state.mjs";
 import { createServiceLifecycle, moneyStateStatus } from "../src/service-lifecycle.mjs";
 import { createMoneyLog } from "../src/money-log.mjs";
 import { verifyStartupState } from "../src/startup-state.mjs";
+import { createMarketRateReader } from "../src/market-rates.mjs";
 /*
  * src/wallet.mjs and src/gate.mjs are the ONLY modules that reach `nanocurrency`,
  * and they load on demand (see loadWalletMod / loadGateMod below). `nanocurrency`
@@ -627,6 +628,11 @@ async function main() {
     let instructions;
     let paymentNote = null;
     let nearInfo = null;
+    const catalogOrigin = process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN;
+    // The public NanoGPT hosts retired XNO x402. An alternate configured
+    // provider may still offer an invoice rate.
+    const probeInvoiceRate = !["api.nano-gpt.com", "nano-gpt.com"].includes(URL.parse(catalogOrigin)?.hostname);
+    const marketRates = createMarketRateReader();
     const nearHealth = nearMode ? { merchant: nearMerchant, network: nearNetwork } : null;
     if (nearMode) {
       try {
@@ -637,7 +643,7 @@ async function main() {
           modelPayment: apiKey ? "api_key" : backupKey ? "wallet_with_key_backup" : wallet ? "wallet" : null,
           nanoOps: wallet?.ops,
           fundingSources, maintenance,
-          requireExistingState: requiredState?.requireExisting === true,
+          requireExistingState: requiredState?.requireExisting === true, probeInvoiceRate, marketRates,
           assertWriter: () => writerLocks.assertHeld(),
           maxDepositUsd: nearMaxDeposit, outDir: resolvedOut, publicBase: nearPublicUrl?.replace(/\/+$/, "") || publicBase, dual: chargeUsd != null,
         });
@@ -683,6 +689,7 @@ async function main() {
         validate: (p) => registry.prepareCall(p),
         xnoUsd,
         oracleBase: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN,
+        probeInvoiceRate, marketRates,
         wsUrl: nanoWs,
         publicBase,
         // In-flight money (pending quotes, queued refunds) survives restarts here.
@@ -890,7 +897,7 @@ async function startMarketWorkerInServer({ apiKey, wallet, marketWebhook, creato
  */
 async function startNearMode({
   registry, merchant, network, rpcFlag, keyFile, envText, envFile, usdText, usdFlag, spreadText, spreadFlag, xnoUsdText,
-  quoteTtlMin, refreshS, modelPayment, nanoOps, fundingSources, maxDepositUsd, outDir, publicBase, dual,
+  quoteTtlMin, refreshS, modelPayment, nanoOps, fundingSources, maxDepositUsd, outDir, publicBase, dual, probeInvoiceRate, marketRates,
   requireExistingState = false, maintenance = null,
   assertWriter = () => {},
 }) {
@@ -970,7 +977,7 @@ async function startNearMode({
   try {
     rates = near.createNearRates({
       nearUsd: usdText, xnoUsd: xnoUsdText, spreadBps: spreadText, xnoRequired: walletFundsModels,
-      refreshMs: refreshS * 1000, nanoGptBase: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, log,
+      refreshMs: refreshS * 1000, nanoGptBase: process.env.NANOGPT_BASE_URL || NANOGPT_API_ORIGIN, probeInvoiceRate, marketRates, log,
     });
   } catch (e) { fail(e.message); }
   await rates.start(); // first fetch before serving, so the first quote is warm (bounded by the fetch timeouts)
@@ -1033,6 +1040,8 @@ async function startNearMode({
   // Explicit recovery of recorded obligations; no new workflows are admitted.
   if (maintenance) await maintenance.recover(() => gate.resume());
   else await gate.resume(); // interrupted runs are refunded, never re-run
+  const resultSweep = setInterval(gate.pruneResults, 60_000);
+  resultSweep.unref();
   watcher = near.createNearWatcher({
     rpc, ledger, merchantId: merchant, pendingQuotes: gate.pendingQuotes,
     observeTransfer: gate.observeTransfer, log, tokenContracts: [usdcToken], maintenance,

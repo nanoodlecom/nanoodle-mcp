@@ -10,6 +10,7 @@ import {
   createNearRates, COINGECKO_RATES_URL, parseSpreadBps, spreadPair, ratioDecimal, bpsPercent,
 } from "../src/near/rates.mjs";
 import { createNearUsdRate } from "../src/near/rate.mjs";
+import { createMarketRateReader } from "../src/market-rates.mjs";
 import { usdToYocto, settleYocto, depositYocto } from "../src/near/amount.mjs";
 
 const CG = '{"near":{"usd":3.64,"last_updated_at":1794262198},"nano":{"usd":0.8,"last_updated_at":1794262190}}';
@@ -34,6 +35,17 @@ function net({ cg = [{ text: CG_UNSTAMPED }], probe = [{ status: 402, json: PROB
 }
 
 const noTimer = { refreshMs: 0 };
+
+test("hosted rates share a market fetch and skip the retired invoice probe", async () => {
+  const { fetch, calls } = net({ cg: [{ text: CG }] });
+  const marketRates = createMarketRateReader({ fetch });
+  const r = createNearRates({ fetch, now: () => CG_NOW, probeInvoiceRate: false, marketRates, ...noTimer });
+  const [quoteRate, market] = await Promise.all([r.current(), marketRates.coingecko()]);
+  assert.equal(quoteRate.xnoUsd, market.nano.usd);
+  assert.equal(quoteRate.xnoSource, "coingecko");
+  assert.equal(calls.cg, 1);
+  assert.equal(calls.probe, 0);
+});
 
 test("spread math: exact yocto, and 0 bps is the old pair exactly", () => {
   assert.deepEqual(spreadPair(3_640_000_000n, 0), { usdNano: 3_640_000_000n, yocto: 10n ** 24n });

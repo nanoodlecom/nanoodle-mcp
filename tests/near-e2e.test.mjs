@@ -95,7 +95,8 @@ test("the paid server refuses malformed saved and composed graphs before model d
   assert.equal(nano.runs(), 0);
 });
 
-for (const name of ["idea-poster", "run_noodle"]) test(`${name}: payment page streams progress and retains the finished graph across restart`, { timeout: 60_000 }, async () => {
+for (const workflow of ["idea-poster", "run_noodle", "text-only"]) test(`${workflow}: payment page streams progress and retains the result across restart`, { timeout: 60_000 }, async () => {
+  const textOnly = workflow === "text-only", name = textOnly ? "run_noodle" : workflow;
   const { graphsDir, outDir } = await fixtureDirs();
   const chain = createFakeChain(), key = await throwawayNearKey();
   chain.addAccount("merchant.testnet", parseNearToYocto("1"), key.publicKey);
@@ -110,7 +111,8 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: payment page st
   let srv = await startServer(serverOptions);
   const base = `http://127.0.0.1:${port}`, snapshots = [];
   try {
-    const args = name === "run_noodle" ? { graph: WORKED_GRAPH, inputs: { Idea: "PRIVATE BRIEF" } } : { Idea: "PRIVATE BRIEF" };
+    const graph = textOnly ? { ...WORKED_GRAPH, nodes: WORKED_GRAPH.nodes.slice(0, 2), links: WORKED_GRAPH.links.slice(0, 1) } : WORKED_GRAPH;
+    const args = name === "run_noodle" ? { graph, inputs: { Idea: "PRIVATE BRIEF" } } : { Idea: "PRIVATE BRIEF" };
     const quote = await mcpClient(base).call(name, args), p = quote.structuredContent.payment;
     const unpaidResult = await fetch(`${base}/near/result/${p.paymentId}`);
     assert.equal(unpaidResult.status, 202, "reading a result never starts unpaid work");
@@ -173,11 +175,20 @@ for (const name of ["idea-poster", "run_noodle"]) test(`${name}: payment page st
     const data = terminalStream.split("\n").find(line => line.startsWith("data: "));
     assert.deepEqual(JSON.parse(data.slice(6)).workflow, restored.workflow);
     const restoredResult = await (await fetch(`${base}/near/result/${p.paymentId}`)).json();
-    const media = done.content.find(part => part.type === "text" && part.text.includes("/out/"));
-    assert.ok(media);
-    assert.ok(restoredResult.content.some(part => part.text === media.text));
-    await mcpClient(base).call(name, { ...args, _payment_id: p.paymentId });
+    const replay = await mcpClient(base).call(name, { ...args, _payment_id: p.paymentId });
+    if (textOnly) {
+      assert.ok(done.content.some(part => part.text === nano.REPLY));
+      assert.deepEqual(restoredResult, done);
+      assert.deepEqual(replay, done);
+      const sidecar = await fetch(`${base}/out/.near-results%2F${p.paymentId}.json`);
+      assert.equal(sidecar.status, 404);
+    } else {
+      const media = done.content.find(part => part.type === "text" && part.text.includes("/out/"));
+      assert.ok(media);
+      assert.ok(restoredResult.content.some(part => part.text === media.text));
+    }
     assert.equal(nano.runs(), 1, "reconnecting or replaying never starts another model call");
+    assert.equal(chain.sendTxCount, 1);
   } finally { releaseChat(); await srv?.kill(); await chain.close(); await nano.close(); }
 });
 
