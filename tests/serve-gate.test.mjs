@@ -1758,7 +1758,7 @@ test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async ()
   // 0.2 XNO priced at $0.05 → $0.25/XNO → a $0.05 quote should be ~0.2 XNO
   const fetch = async (url, opts) => {
     probes.push(url);
-    assert.match(url, /^https:\/\/api\.nano-gpt\.com\/api\/v1\/chat\/completions$/);
+    assert.equal(url, "https://nano-gpt.com/api/v1/chat/completions");
     assert.equal(opts.headers["x-x402"], "true");
     return {
       status: 402,
@@ -1789,7 +1789,7 @@ test("rate oracle: cached prices expire during an outage and recover with a fres
   const signals = [];
   const fetch = async (url, { signal }) => {
     signals.push(signal);
-    if (new URL(url).hostname !== "api.nano-gpt.com") return new Response("{}", { status: 503 });
+    if (new URL(url).hostname !== "nano-gpt.com") return new Response("{}", { status: 503 });
     probes++;
     if (!probeOk) return { status: 500, json: async () => ({}) };
     return {
@@ -1861,7 +1861,7 @@ test("Nano checkout uses fresh independent rates on cold start and prefers NanoG
     if (host === "api.coingecko.com") return Response.json({ nano: { usd: 0.4,
       last_updated_at: now / 1000 - (coinGeckoFresh ? 5 : 301) } });
     if (host === "api.kraken.com") return Response.json({ error: [], result: { NANOUSD: [["0.5", "10", now / 1000 - 1]] } });
-    assert.equal(host, "api.nano-gpt.com");
+    assert.equal(host, "nano-gpt.com");
     probes++;
     return Response.json({ accepts: oracleReady
       ? [{ scheme: "nano", maxAmountRequired: "100000000000000000000000000000", maxAmountRequiredUSD: "0.025" }]

@@ -27,7 +27,7 @@
  *
  * API key: NANOGPT_API_KEY env var, --key <key>, or --env-file <path> (.env-style file).
  * Precedence: --key > --env-file > NANOGPT_API_KEY (same as the nanoodle CLI).
- * NANOGPT_BASE_URL overrides the default https://api.nano-gpt.com.
+ * NANOGPT_BASE_URL overrides the default https://nano-gpt.com.
  *
  * Wallet mode (accountless x402, used only when no API key is set):
  * NANO_PRIVATE_KEY (64-hex secret key) or NANO_SEED (64-hex seed, account 0), from the

@@ -20,7 +20,20 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadTools, attachCatalogs, attachEstimates, editorShareUrl } from "../src/tools.mjs";
+import { loadTools, attachCatalogs, attachEstimates, editorShareUrl, fetchCatalogs } from "../src/tools.mjs";
+import { NANOGPT_API_ORIGIN, NANOGPT_ALTERNATE_ORIGIN } from "../src/nanogpt-origin.mjs";
+
+test("paid catalog lookup fails over between the official public origins", async () => {
+  const attempts = [];
+  const catalogs = await fetchCatalogs(["chat"], { requireFresh: true, maxAgeMs: 0, fetch: async (url, { headers }) => {
+    attempts.push(new URL(url).origin);
+    assert.deepEqual(headers, { Accept: "application/json" });
+    if (attempts.length === 1) throw new TypeError("fetch failed");
+    return Response.json({ data: [{ id: "fixture" }] });
+  } });
+  assert.deepEqual(attempts, [NANOGPT_API_ORIGIN, NANOGPT_ALTERNATE_ORIGIN]);
+  assert.deepEqual(catalogs.chat, [{ id: "fixture" }]);
+});
 
 /** 1x1 transparent PNG. */
 const PNG_B64 =

@@ -75,9 +75,10 @@ cat /var/lib/nanoodle-near-check/latest.json
 ## Recovery and manual checks
 
 New canaries use `orca/orcacyber-inkling-2-mini` with reasoning disabled and a
-256-token limit. New version-two checkpoints require the model's first text output to
-equal a fresh 16-character hexadecimal marker. No decorative prefix is required;
-the two-step variant extracts and copies that marker through both models.
+256-token limit. The canary sends a fresh 16-character hexadecimal marker as the
+input. The first text output must contain exactly that marker, with an optional
+`Marker: ` label. Both replay and the checkout page must return the original
+text. The two-step variant copies the marker through both models.
 The marker checks payment, execution and result delivery without
 depending on a thinking model finishing inside a tiny budget. Strict marker,
 progress, receipt, refund and replay checks still apply. Retained work keeps its

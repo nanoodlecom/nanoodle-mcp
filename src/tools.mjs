@@ -11,7 +11,7 @@
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
-import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
+import { NANOGPT_API_ORIGIN, NANOGPT_ALTERNATE_ORIGIN } from "./nanogpt-origin.mjs";
 import { readdir, readFile, mkdir, open, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -71,6 +71,27 @@ const CATALOG_FAIL_TTL_MS = 60 * 1000;
  */
 const CATALOG_TIMEOUT_MS = 8000;
 
+async function readCatalog(base, kind, fetch, timeoutMs) {
+  const fallback = base === NANOGPT_API_ORIGIN && timeoutMs >= 2;
+  const started = performance.now();
+  const read = async (origin, limit) => {
+    const response = await fetch(origin + CATALOG_PATH[kind], {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(limit),
+    });
+    if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
+    return (await response.json()).data;
+  };
+  try {
+    return await read(base, fallback ? Math.floor(timeoutMs / 2) : timeoutMs);
+  } catch (error) {
+    const remaining = Math.floor(timeoutMs - (performance.now() - started));
+    if (!fallback || remaining < 1
+        || !(error.name === "TimeoutError" || error instanceof TypeError || error.status === 408 || error.status >= 500)) throw error;
+    return read(NANOGPT_ALTERNATE_ORIGIN, remaining);
+  }
+}
+
 /**
  * Fetch the raw public catalog array for each pricing `kind`, keyed for the
  * library's opt-in `catalog` option AND for estimateGraphCost — same shape,
@@ -113,12 +134,7 @@ export async function fetchCatalogs(kinds, { baseUrl = NANOGPT_API_ORIGIN, fetch
       return; // already logged when the failure was recorded
     }
     try {
-      const r = await fetch(base + CATALOG_PATH[kind], {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = (await r.json()).data;
+      const data = await readCatalog(base, kind, fetch, timeoutMs);
       if (Array.isArray(data) && data.length) {
         catalogs[kind] = data;
         catalogCache.set(key, { at: Date.now(), data });

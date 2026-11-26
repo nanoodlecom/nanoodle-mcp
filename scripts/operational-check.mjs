@@ -47,7 +47,7 @@ import { RAW_PER_XNO, parseSpreadBps, spreadPair } from "../src/near/rates.mjs";
 import { exactUsd } from "../src/custom-workflow.mjs";
 import { nearRunFundingBudget } from "../src/funding-liabilities.mjs";
 import { runFundingBudget } from "../src/run-funding.mjs";
-import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
+import { atomicJson, canonicalCanaryOutput, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
@@ -915,7 +915,7 @@ export async function runOperationalCheck(config, deps = {}) {
           const statusCopy = await statusReceipt;
           need(!result?.isError && matchesLedger(receipt) && (!statusCopy || isDeepStrictEqual(receipt, statusCopy)), code);
           const text = Array.isArray(result.content) && result.content.find(part => part?.type === "text")?.text;
-          const output = typeof text === "string" ? text.trim() : "";
+          const output = canonicalCanaryOutput(text);
           // An eviction notice can accompany a valid receipt after restart.
           need(/^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output), "near-settled-payment-output-unavailable");
           const { outputSha256 } = sample;

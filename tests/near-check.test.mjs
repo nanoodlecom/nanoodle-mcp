@@ -30,6 +30,7 @@ async function fixture() {
     if (String(url).includes("/near/result/")) {
       if (change.unreadyPage) return Response.json({ status: "settled" }, { status: 202 });
       if (change.markerOnlyInPageMetadata) return response({ ...result, content: [], hidden: result.content[0].text });
+      if (change.pageRemovesLabel) return response({ ...result, content: [{ type: "text", text: result.content[0].text.replace(/^Marker: /, "") }] });
       if (change.wrongPageReceipt) return response({ ...result, structuredContent: { receipt: { outcome: "succeeded" } } });
       return response(result);
     }
@@ -53,7 +54,8 @@ async function fixture() {
       const state = JSON.parse(readFileSync(join(stateDir, "state.json")));
       const deposit = BigInt(state.quote.amountYocto), charged = parseNearToYocto("0.0001"), refunded = deposit - charged;
       const refund = await sendTransfer({ rpc, signer, signerId: merchant, receiverId: payer, amountYocto: refunded });
-      result = { content: [{ type: "text", text: change.wrongOutput ? "wrong" : change.markerOnlyInBilling ? "" : state.v < 2 ? `Answer: NANOODLE_OK:${state.marker}` : state.marker },
+      const marker = state.v < 2 ? `Answer: NANOODLE_OK:${state.marker}` : (change.echoLabel ? `Marker: ${state.marker}` : state.marker);
+      result = { content: [{ type: "text", text: change.wrongOutput ? "wrong" : change.markerOnlyInBilling ? "" : marker },
         ...(change.markerOnlyInBilling ? [{ type: "text", text: `billing note: ${state.marker}` }] : [])], structuredContent: { receipt: {
         outcome: "succeeded", deposit: { yocto: deposit.toString(), txHash: state.signed.txHash }, charged: { yocto: charged.toString(), usd: "0.0003" },
         refund: { yocto: refunded.toString(), txHash: refund.txHash, to: change.wrongRefund ? merchant : payer, status: "sent" },
@@ -148,6 +150,20 @@ test("same-day canary reuse requires the live payment-page result and refund wit
     assert.equal((await runCheck(f.config, f.deps)).reused, true);
     assert.equal(f.chain.sendTxCount, 2);
   });
+});
+
+test("the canary recognizes a labeled marker and requires the original text on readback", async () => {
+  const f = await fixture();
+  f.change.echoLabel = true;
+  const report = await runCheck(f.config, f.deps);
+  assert.match(report.output, /^[a-f0-9]{16}$/);
+  const state = JSON.parse(readFileSync(join(f.config.stateDir, "state.json"), "utf8"));
+  assert.equal(state.args.inputs.Marker, state.marker);
+  assert.equal(state.result.content[0].text, `Marker: ${report.output}`);
+  f.change.pageRemovesLabel = true;
+  await assert.rejects(runCheck(f.config, f.deps), /Payment page result or receipt differs/);
+  assert.equal(f.chain.sendTxCount, 2);
+  assert.equal(f.runs(), 1);
 });
 
 test("version-one canary checkpoints retain their original expected output and graph", async () => {
