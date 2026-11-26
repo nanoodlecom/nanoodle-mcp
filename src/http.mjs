@@ -900,9 +900,9 @@ export async function serveHttp({
           const t0 = Date.now();
           let ticks = 0;
           let workflowState;
-          const emitProgress = (message) => {
+          const emitProgress = (message, snapshot = workflowState) => {
             if (progressToken === undefined) return false; // no progress channel on this call
-            event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message, ...(workflowState ? { _meta: { [WORKFLOW_META_KEY]: workflowState } } : {}) } });
+            event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: ++ticks, message, ...(snapshot ? { _meta: { [WORKFLOW_META_KEY]: snapshot } } : {}) } });
             return true;
           };
           /*
@@ -918,7 +918,12 @@ export async function serveHttp({
             status: "working",
             report(s) { this.status = s; },
             announce(s) { this.status = s; return emitProgress(s); },
-            workflow(state) { workflowState = state; this.announce(workflowMessage(state)); },
+            workflow(state) {
+              // Payments may still be settling after the terminal workflow event.
+              workflowState = state.status === "running" ? state : undefined;
+              this.report(workflowMessage(state));
+              emitProgress(this.status, state);
+            },
           };
           const beat = setInterval(() => {
             const line = `${ctx.status} (${Math.round((Date.now() - t0) / 1000)}s elapsed)`;

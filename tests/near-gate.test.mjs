@@ -915,6 +915,32 @@ test("concurrent duplicate paying calls run once", async () => {
   assert.equal(w.ledger.refunds().length, 1);
 });
 
+test("paid MCP heartbeats continue during settlement without repeating terminal workflow progress", async t => {
+  const w = await world();
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  const refund = w.refunder.refund;
+  w.refunder.refund = async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    return refund(...args);
+  };
+  const server = await serveHttp({ port: 0, name: "test", version: "test", listTools: w.listTools, callTool: w.callTool,
+    nearGate: w.gate, progressMs: 5, log: () => {} });
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const response = await realFetch(`http://127.0.0.1:${server.address().port}/mcp`, {
+    method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "idea-poster", arguments: { ...INPUTS, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER },
+      _meta: { progressToken: "paid-run" },
+    } }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  const events = (await response.text()).split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+  const terminals = events.filter(event => event.params?._meta?.["com.nanoodle/workflow"]?.status === "succeeded");
+  assert.equal(terminals.length, 1);
+  assert.ok(events.slice(events.indexOf(terminals[0]) + 1).some(event => /elapsed\)$/.test(event.params?.message)));
+  assert.equal(events.at(-1).result.structuredContent.receipt.outcome, "succeeded");
+});
+
 test("a settled text result expires and stays out of the financial ledger", async () => {
   let now = Date.now();
   const w = await world({ now: () => now });
