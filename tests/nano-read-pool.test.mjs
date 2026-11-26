@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { createBlock, checkAddress, hashBlock } from "nanocurrency";
-import { createNanoReadPool, nanoStandbyConfig, NANO_COLD_STANDBY_SCAN_REQUESTS } from "../src/nano-read-pool.mjs";
+import { createNanoReadPool, nanoOwnedPrimary, nanoStandbyConfig, NANO_COLD_STANDBY_SCAN_REQUESTS } from "../src/nano-read-pool.mjs";
 import { rpcPeerSetId } from "../src/rpc-backoff.mjs";
 import { NANO_GENESIS_HASH, NANO_GENESIS_REPLY, nanoAccountInfo } from "./fixtures/nano-protocol.mjs";
 
@@ -40,6 +40,16 @@ function world(count = 3, requestsPerMinute = 0, account = ACCOUNT, persistConfi
 }
 const receivable = { action: "receivable", account: ACCOUNT, count: "50", threshold: "1", source: "true" };
 const info = { action: "account_info", account: ACCOUNT };
+
+test("the owned Nano RPC opt-in requires a private Tailscale IPv4 address and fallback coverage", () => {
+  const backups = ["https://a.example", "https://b.example"];
+  const owned = "http://100.100.0.1:7077";
+  assert.equal(nanoOwnedPrimary([owned, ...backups], true), owned);
+  for (const first of ["https://100.100.rpc.example", "http://100.128.0.1:7077", "http://192.168.1.9"]) {
+    assert.throws(() => nanoOwnedPrimary([first, ...backups], true), /Tailscale IPv4 address/);
+  }
+  assert.throws(() => nanoOwnedPrimary([owned, backups[0]], true), /two fallback endpoints/);
+});
 
 test("a reachable owned Nano primary verifies the stored checkpoint without consulting public RPCs", async () => {
   const persisted = [];
