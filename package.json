@@ -34,7 +34,7 @@
     "@x402/extensions": "2.29.0",
     "@x402/svm": "2.29.0",
     "nanocurrency": "^2.5.0",
-    "nanoodle": "https://codeload.github.com/nanoodlecom/nanoodle-js/tar.gz/5f89017d375699248b817d59dbcaa12f0ff95af3"
+    "nanoodle": "https://codeload.github.com/nanoodlecom/nanoodle-js/tar.gz/09730461de22fd66e966578794a8b146c98fe424"
   },
   "keywords": [
     "mcp",
