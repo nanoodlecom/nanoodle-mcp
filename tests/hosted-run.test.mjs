@@ -9,6 +9,7 @@ import { Workflow } from "nanoodle";
 import { withHostedRun, hostedRunOptions, hostedRunTimeout, hostedRunFetch } from "../src/hosted-run.mjs";
 import { createRunFunding } from "../src/run-funding.mjs";
 import { loadTools } from "../src/tools.mjs";
+import { serveHttp } from "../src/http.mjs";
 import { createWorkflowRunner } from "../src/market/runner.mjs";
 import { nanoGptMock, WORKED_GRAPH } from "./fixtures/near-fake-chain.mjs";
 
@@ -274,7 +275,7 @@ test("the deadline includes output downloads after the model has completed", asy
   assert.equal(models, 3); assert.equal(downloads, 3, "each model completed and each artifact read was cancelled");
 });
 
-async function twoMediaOutputs(t, { failSecond = false, publicBase = null, outputNames = ["first", "second"] } = {}) {
+async function twoMediaOutputs(t, { failSecond = false, publicBase = null, outputNames = ["first", "second"], media = "fixture media" } = {}) {
   const downloads = [];
   let base;
   base = await server(t, async (req, res) => {
@@ -296,7 +297,7 @@ async function twoMediaOutputs(t, { failSecond = false, publicBase = null, outpu
       res.writeHead(404).end();
       return;
     }
-    res.writeHead(200, { "content-type": "image/png" }).end("fixture media");
+    res.writeHead(200, { "content-type": "image/png" }).end(media);
   });
   const outDir = await mkdtemp(join(tmpdir(), "hosted-outputs-"));
   t.after(() => rm(outDir, { recursive: true, force: true }));
@@ -335,6 +336,27 @@ test("long output labels publish distinct artifacts before terminal success", as
   for (const filename of filenames) assert.equal(await readFile(join(outDir, filename), "utf8"), "fixture media");
   assert.deepEqual(snapshots.filter(state => state.status !== "running").map(state => state.status), ["succeeded"]);
   assert.deepEqual(terminalFiles.map(files => files.toSorted()), [[...filenames, "other-run.png"].sort()]);
+});
+
+test("hosted PNG handoff downloads the original bytes through its artifact URL", async t => {
+  // The mock serves opaque PNG response bytes. MCP should preserve their length and content.
+  const bytes = Buffer.alloc(1_200_000, 0xab);
+  Buffer.from("89504e470d0a1a0a", "hex").copy(bytes);
+  const { run, outDir } = await twoMediaOutputs(t, { publicBase: "https://artifacts.example", media: bytes });
+  const result = await run();
+  const pointer = result.content.find(block => block.type === "text" && block.text.startsWith("first: https://"));
+  const inline = result.content.find(block => block.type === "image");
+  assert.equal(inline.mimeType, "image/png");
+  assert.equal(inline.data.length, 1_600_000);
+  assert.deepEqual(Buffer.from(inline.data, "base64"), bytes);
+
+  const app = await serveHttp({ port: 0, name: "fixture", version: "fixture", outDir, listTools: () => [], log: () => {} });
+  t.after(() => new Promise(resolve => app.close(resolve)));
+  const path = new URL(pointer.text.slice("first: ".length)).pathname;
+  const download = await fetch(`http://127.0.0.1:${app.address().port}${path}`);
+  assert.equal(download.status, 200);
+  assert.equal(download.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), bytes);
 });
 
 test("a later failed media download discards only the artifacts of that call", async t => {
