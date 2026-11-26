@@ -19,8 +19,8 @@
  *   4. Repeating the paying call returns the stored outcome. It never runs,
  *      charges or refunds again, also across restarts.
  *
- * Money state lives in src/near/ledger.mjs (sync, fsync'd). Text output, the
- * caller's paid content, is kept in memory only. See docs/near-payments.md.
+ * Money state lives in src/near/ledger.mjs (sync, fsync'd). A private result
+ * file is committed before settlement and expires after the replay window.
  */
 import { randomBytes } from "node:crypto";
 import { graphModelKinds } from "nanoodle";
@@ -50,12 +50,16 @@ import { FundingError } from "./run-funding.mjs";
 import { withHostedRun, hostedRunTimeout } from "./hosted-run.mjs";
 import { nearRefundTerms, sameNearRefund } from "./near/refund-terms.mjs";
 import { sameCreatorPayout } from "./creator-payout-evidence.mjs";
+import { SETTLED_NEAR_QUOTE_RETENTION_MS } from "./near/ledger.mjs";
+import { createNearResultStore } from "./near/result-store.mjs";
 
 const RUN_NOODLE = "run_noodle";
 const refundReference = result => ({ refundId: result.refundId, ...(result.status === "none" && { refundWaived: true }) });
 const FINAL = new Set(["settled", "failed", "rejected"]);
 const SIDE_CARS = ["costUsd", "costExact", "providerUsd", "providerExact", "billedUsd", "textOutput"];
 const TEXT_NOT_RETAINED = "The result text was not retained across a server restart; the run is not repeated.";
+const RESULT_UNAVAILABLE = "The saved result is temporarily unavailable. Keep your original payment ID for recovery.";
+const RESULT_EXPIRED = "The 24-hour result retention window has expired.";
 const ERROR_NOT_RETAINED = "Details: (error details not retained across restarts)";
 
 const errResult = (text, structuredContent) => ({
@@ -166,8 +170,9 @@ export function createNearGate({
   const ev = (event, fields) => {
     try { usage(event, { rail: "near", ...fields }); } catch { /* the ledger sink never breaks a call */ }
   };
+  const resultStore = createNearResultStore(ledger.file, { now, retentionMs: SETTLED_NEAR_QUOTE_RETENTION_MS, log });
 
-  /** Full results (incl. text) of finished calls in this process, by payment id. */
+  /** Optional inline media and failure details for this process, by payment id. */
   const results = new Map();
   // Stream live snapshots in memory. The terminal snapshot joins the receipt.
   const workflows = new Map();
@@ -368,8 +373,14 @@ export function createNearGate({
   /** The stored outcome of a finished quote. Never runs, charges or refunds. */
   function replay(q) {
     if (q.status === "settled") {
+      if (q.resultRef && now() >= q.resultRef.expiresAt) return withReceipt(q, { content: [] }, RESULT_EXPIRED);
       const mem = results.get(q.id);
       if (mem) return withReceipt(q, mem);
+      if (q.resultRef) {
+        const stored = resultStore.load(q.id, q.resultRef);
+        if (stored) return withReceipt(q, stored);
+        return withReceipt(q, { isError: true, content: [] }, RESULT_UNAVAILABLE);
+      }
       if (q.result) return withReceipt(q, q.result);
       return withReceipt(q, { content: [] }, TEXT_NOT_RETAINED);
     }
@@ -428,6 +439,15 @@ export function createNearGate({
     if (t - lastPrune < 60_000) return;
     lastPrune = t;
     try { ledger.prune({ unpaidRetainMs: expiredRetainMs }); } catch (e) { log(`NEAR state prune failed: ${(e && e.message) || e}`); }
+  }
+
+  function pruneResults() {
+    const t = now();
+    resultStore.sweep();
+    for (const id of results.keys()) {
+      const q = ledger.getQuote(id);
+      if (!q || (q.resultRef && t >= q.resultRef.expiresAt)) results.delete(id);
+    }
   }
 
   async function catalogsFor(graph) {
@@ -860,7 +880,7 @@ export function createNearGate({
       catch { return errResult("Your payment is verified. The run is paused while the operator restores NEAR refund funding. Retry this same payment id; no model work was started and no new payment is needed.",
         { payment: { paymentId: q.id, status: "paid", retryable: true, code: "NEAR_FUNDING_UNAVAILABLE" } }); }
     }
-    let res;
+    let res, resultRef;
     try {
       if (prepError) throw prepError;
       const execute = async () => {
@@ -871,6 +891,13 @@ export function createNearGate({
           xnoUsd: q.rate?.xnoUsd,
           workflow(state) { workflows.set(q.id, state); changed(q.id); ctx?.workflow?.(state); },
         });
+        if (result.textOutput) {
+          try {
+            resultRef = resultStore.store(q.id, result.content.filter(part => part?.type === "text"));
+          } catch {
+            throw new NearError("RESULT_WRITE_FAILED", "The checkout result could not be saved.");
+          }
+        }
         // Money-only checkpoint before the funding scope releases creator
         // overhead. No result text is persisted by this handoff.
         if (budget) q = ledger.updateQuote(q.id, { fundingOutcomeReady: true });
@@ -879,11 +906,14 @@ export function createNearGate({
       res = await withHostedRun(() => budget ? fundRun(budget, execute) : execute(), executionLimit);
     } catch (e) {
       const msg = String((e && e.message) || e);
-      const error = prepError?.code === "QUOTE_BUDGET_EXCEEDED"
-        ? "The current model estimate exceeds this quote's budget. No model work started. The full deposit is being returned. Request a new quote to try again."
-        : q.status === "paid" && budget?.maxRaw === 0n && e?.code === "FUNDING_INSUFFICIENT"
-          ? "The shared Nano wallet cannot cover the creator payout. No model work started. The full deposit is being returned."
-        : "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
+      let error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
+      if (prepError?.code === "QUOTE_BUDGET_EXCEEDED") {
+        error = "The current model estimate exceeds this quote's budget. No model work started. The full deposit is being returned. Request a new quote to try again.";
+      } else if (q.status === "paid" && budget?.maxRaw === 0n && e?.code === "FUNDING_INSUFFICIENT") {
+        error = "The shared Nano wallet cannot cover the creator payout. No model work started. The full deposit is being returned.";
+      } else if (e?.code === "RESULT_WRITE_FAILED") {
+        error = "The result could not be saved. The full deposit is being returned.";
+      }
       // Persist the failure before the refund goes out, so a restart never re-runs it.
       q = ledger.updateQuote(q.id, {
         status: "failed", outcome: "run_failed", error, finishedAt: now(), ...finishedWorkflow(q.id),
@@ -914,12 +944,13 @@ export function createNearGate({
     });
     const costUsd = s.known ? knownUsd(settleUsd) : null;
     const authorRaw = q.author ? authorPayoutRaw(s, q.rate, parseUsdNano(q.rate.xnoUsd)) : 0n;
-    // Keep the media-only result and terminal progress with the settlement so
-    // the payment page can recover them even if the refund is still pending.
+    // Record the durable result reference and terminal graph with the money
+    // outcome, before sending the refund. Media-only links use the legacy field.
     const persisted = res.textOutput ? null : { content: (body.content || []).filter((c) => c && c.type === "text") };
     q = ledger.updateQuote(q.id, {
       ...finishedWorkflow(q.id),
       result: persisted,
+      ...(resultRef && { resultRef, finishedAt: resultRef.expiresAt - SETTLED_NEAR_QUOTE_RETENTION_MS }),
       settlement: {
         costUsd, exact: s.known ? res.costExact !== false && billedAs === "reported" : false,
         modelPayment,
@@ -931,9 +962,9 @@ export function createNearGate({
     });
     workflows.delete(q.id);
     ensureAuthorPayout(q);
-    results.set(q.id, body);
+    if (!resultRef || body.content.some(part => part?.type !== "text")) results.set(q.id, body);
     const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: s.refundYocto, reason: "change", ...refundAsset(q) });
-    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), finishedAt: now() });
+    q = ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), finishedAt: q.finishedAt ?? now() });
     ev("change", {
       paymentId: q.id, tool: name, to: q.payer, costUsd,
       chargedYocto: s.chargedYocto.toString(), refundYocto: s.refundYocto.toString(), status: rf.status, hash: rf.txHash || null,
@@ -955,7 +986,7 @@ export function createNearGate({
           ensureAuthorPayout(q);
           // The run finished and was settled; only the refund intent may be missing.
           const rf = await refunder.refund({ paymentId: q.id, to: q.payer, amountYocto: BigInt(q.settlement.refundYocto), reason: "change", ...refundAsset(q) });
-          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), finishedAt: t });
+          ledger.updateQuote(q.id, { status: "settled", outcome: "succeeded", ...refundReference(rf), finishedAt: q.finishedAt ?? t });
           log(`NEAR payment ${q.id}: settled after a restart`);
         } else {
           const error = "The server restarted while this run was in progress.";
@@ -977,6 +1008,7 @@ export function createNearGate({
     await refunder.resume();
     await authorPayouts?.resume();
     ledger.prune({ unpaidRetainMs: expiredRetainMs });
+    pruneResults();
   }
 
   /* ---------------- registry wrapper ---------------- */
@@ -1087,6 +1119,7 @@ export function createNearGate({
   }
 
   return { wrapRegistry, resume: maintenance ? () => maintenance.run(resume, "background") : resume, authorPayouts,
+    pruneResults,
     fundingLiabilitiesRaw: context => nearCreatorLiabilities({ quotes: ledger.quotes(), payouts: ledger.payouts() }, context),
     quote: paymentView,
     confirmPayment: maintenance ? (...args) => maintenance.run(() => confirmPayment(...args)) : confirmPayment,

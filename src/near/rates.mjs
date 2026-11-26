@@ -100,6 +100,8 @@ export function createNearRates({
   timeoutMs = 8_000,
   coingeckoUrl = COINGECKO_RATES_URL,
   nanoGptBase = null,
+  probeInvoiceRate = true,
+  marketRates = null,
   log = () => {},
   setInterval: setIntervalFn = globalThis.setInterval,
   clearInterval: clearIntervalFn = globalThis.clearInterval,
@@ -155,25 +157,26 @@ export function createNearRates({
     return { ...value, at: iso(observedAt), observedAt, fetchedAt: t };
   }
 
-  const fetchCoinGecko = () => fetchCoinGeckoRates(fetch, { url: coingeckoUrl, timeoutMs });
+  const fetchCoinGecko = marketRates?.coingecko ?? (() => fetchCoinGeckoRates(fetch, { url: coingeckoUrl, timeoutMs }));
+  const fetchKraken = marketRates?.kraken ?? (() => fetchKrakenNanoRate(fetch, { timeoutMs: Math.min(timeoutMs, 3_000) }));
 
   async function doRefresh() {
     if (!anyLive()) return;
-    const wantNear = nearLive(), wantXno = xnoLive();
+    const wantNear = nearLive(), wantXno = xnoLive(), wantProbe = wantXno && probeInvoiceRate;
     // CoinGecko answers both ids in one request; with a static NEAR/USD it is
     // asked only when the NanoGPT probe fails (XNO/USD fallback).
     let [cg, probe] = await Promise.allSettled([
-      wantNear ? fetchCoinGecko() : Promise.resolve({ near: null, nano: null }),
-      wantXno ? probeX402Pair({ fetch, url: probeUrl, signal: AbortSignal.timeout(timeoutMs) }) : Promise.resolve(null),
+      wantNear || (wantXno && !wantProbe) ? fetchCoinGecko() : Promise.resolve({ near: null, nano: null }),
+      wantProbe ? probeX402Pair({ fetch, url: probeUrl, signal: AbortSignal.timeout(timeoutMs) }) : Promise.resolve(null),
     ]);
     const failedProbe = wantXno && probe.status === "rejected";
     const providerCache = failedProbe && xno?.source === "nanogpt-x402" && usable(xno, now());
     if (failedProbe && !providerCache && !wantNear) [cg] = await Promise.allSettled([fetchCoinGecko()]);
     let fallback = null;
-    if (failedProbe && !providerCache) {
+    if (wantXno && (!wantProbe || failedProbe) && !providerCache) {
       fallback = cg.status === "fulfilled" ? marketObservation(cg.value.nano, now(), { requireTimestamp: true }) : null;
       if (!fallback) {
-        const kraken = await fetchKrakenNanoRate(fetch, { timeoutMs: Math.min(timeoutMs, 3_000) }).catch(() => null);
+        const kraken = await fetchKraken().catch(() => null);
         fallback = marketObservation(kraken, now(), { requireTimestamp: true });
       }
     }
@@ -196,15 +199,15 @@ export function createNearRates({
           source: "nanogpt-x402", at: iso(t), observedAt: t, fetchedAt: t };
         xnoError = null;
       } else {
-        const why = `NanoGPT x402 probe: ${probe.status === "rejected" ? errText(probe.reason) : "no answer"}`;
+        const why = probeInvoiceRate ? `NanoGPT x402 probe: ${probe.status === "rejected" ? errText(probe.reason) : "no answer"}; ` : "";
         if (providerCache && usable(xno, t)) {
           xno = { ...xno, fetchedAt: t };
-          xnoError = `${why}; using the recent NanoGPT rate`;
+          xnoError = `${why}using the recent NanoGPT rate`;
         } else if (fallback && usable(fallback, t)) {
           xno = { ...fallback, pair: { usdNano: fallback.usdNano, raw: RAW_PER_XNO } };
-          xnoError = `${why}; using ${fallback.source === "coingecko" ? "CoinGecko" : "Kraken"}`;
+          xnoError = why ? `${why}using ${fallback.source === "coingecko" ? "CoinGecko" : "Kraken"}` : null;
         } else {
-          xnoError = `${why}; no fresh XNO/USD price from CoinGecko or Kraken`;
+          xnoError = `${why}no fresh XNO/USD price from CoinGecko or Kraken`;
         }
       }
     }
