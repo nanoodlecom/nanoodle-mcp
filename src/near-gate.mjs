@@ -869,7 +869,7 @@ export function createNearGate({
     let prepared = null, budget = null, prepError = null;
     try {
       // Saved-tool arguments carry no graph. An active quote must still refer to the same workflow after a restart.
-      if (q.savedWorkflowKey != null && (q.savedWorkflowKey !== tool?.costKey || q.author !== authorAddress(tool.x402))) {
+      if (q.savedWorkflowKey != null && q.savedWorkflowKey !== tool?.costKey) {
         throw new NearError("QUOTED_WORKFLOW_CHANGED", "The saved workflow changed after this quote.");
       }
       prepared = await prepare(registry, name, args, tool);
