@@ -234,6 +234,8 @@ export function createChargeGate({
   validate = null,
   xnoUsd = null,
   oracleBase = null,
+  probeInvoiceRate = true,
+  marketRates = null,
   wsUrl = null,
   publicBase,
   pollMs = 1000,
@@ -297,27 +299,31 @@ export function createChargeGate({
     return age >= 0 && age < limit && marketRateFresh(rate.observedAt, now());
   }
   async function refreshRate() {
-    try {
-      const pair = await nanoGptPair();
-      rate = { pair, at: monotonicNow(), observedAt: now(), source: "nanogpt-x402" };
-      return pair;
-    } catch {
-      if (rate?.source === "nanogpt-x402" && rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
-        rate.at = monotonicNow();
-        log("NanoGPT XNO/USD probe failed. Using the recent NanoGPT rate.");
-        return rate.pair;
+    if (probeInvoiceRate) {
+      try {
+        const pair = await nanoGptPair();
+        rate = { pair, at: monotonicNow(), observedAt: now(), source: "nanogpt-x402" };
+        return pair;
+      } catch {
+        if (rate?.source === "nanogpt-x402" && rateYoungerThan(LIVE_RATE_MAX_AGE_MS)) {
+          rate.at = monotonicNow();
+          log("NanoGPT XNO/USD probe failed. Using the recent NanoGPT rate.");
+          return rate.pair;
+        }
       }
     }
 
+    const coinGecko = marketRates?.coingecko ?? (() => fetchCoinGeckoRates(fetch));
+    const kraken = marketRates?.kraken ?? (() => fetchKrakenNanoRate(fetch));
     const signals = await Promise.allSettled([
-      fetchCoinGeckoRates(fetch).then(prices => prices.nano),
-      fetchKrakenNanoRate(fetch),
+      coinGecko().then(prices => prices.nano),
+      kraken(),
     ]);
     const fallback = signals.map(result => result.status === "fulfilled" ? result.value : null)
       .find(value => value && marketRateFresh(value.observedAt, now()));
     if (fallback) {
       const pair = { usdNano: fallback.usdNano, raw: RAW_PER_XNO };
-      if (rate?.source !== fallback.source) log(`NanoGPT XNO/USD probe failed. Using ${fallback.source}.`);
+      if (rate?.source !== fallback.source) log(`Using ${fallback.source} for XNO/USD.`);
       rate = { pair, at: monotonicNow(), observedAt: fallback.observedAt, source: fallback.source };
       return pair;
     }
@@ -325,7 +331,8 @@ export function createChargeGate({
       rate.at = monotonicNow();
       return rate.pair;
     }
-    throw new Error("Cannot price this call: the NanoGPT x402 rate probe failed and no fresh CoinGecko or Kraken XNO/USD rate was available. Try again shortly.");
+    const failed = probeInvoiceRate ? "the NanoGPT x402 rate probe failed and " : "";
+    throw new Error(`Cannot price this call: ${failed}no fresh CoinGecko or Kraken XNO/USD rate was available. Try again shortly.`);
   }
   async function ratePair() {
     if (rateYoungerThan(60_000)) return rate.pair;

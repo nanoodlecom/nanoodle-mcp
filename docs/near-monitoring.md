@@ -75,9 +75,10 @@ cat /var/lib/nanoodle-near-check/latest.json
 ## Recovery and manual checks
 
 New canaries use `orca/orcacyber-inkling-2-mini` with reasoning disabled and a
-256-token limit. New version-two checkpoints require the model's first text output to
-equal a fresh 16-character hexadecimal marker. No decorative prefix is required;
-the two-step variant extracts and copies that marker through both models.
+256-token limit. The canary sends a fresh 16-character hexadecimal marker as the
+input. The first text output must contain exactly that marker, with an optional
+`Marker: ` label. Both replay and the checkout page must return the original
+text. The two-step variant copies the marker through both models.
 The marker checks payment, execution and result delivery without
 depending on a thinking model finishing inside a tiny budget. Strict marker,
 progress, receipt, refund and replay checks still apply. Retained work keeps its
@@ -108,11 +109,11 @@ is rejected, inspect the recorded hash and account on chain before archiving the
 state. Do not delete state to blindly retry. If recovery finds a completed run
 whose original progress stream was lost, missing live progress correctly fails
 the check rather than claiming that streaming was verified.
-The server also keeps paid text output in memory: a restart between execution
-and replay can preserve the receipt and refund while losing replayable text.
-This check reports that as a failure. Finish paid checks before restarting the
-app, and inspect the retained original result and on-chain receipt before
-archiving an interrupted manual check.
+The server saves text outputs privately before settling, so the same paid
+result must remain readable after a restart within the 24-hour window. The
+monitor still checks the original marker and receipt. A run settled by a
+previous release may lack a saved output. Inspect its canary checkpoint and
+on-chain receipt before archiving an interrupted manual check.
 
 The five-minute read-only check reports the retained canary's checkout page,
 receipt, graph, event stream and result separately. It can report a missing

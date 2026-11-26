@@ -1758,7 +1758,7 @@ test("rate oracle: NanoGPT's own 402 invoice implies the XNO/USD rate", async ()
   // 0.2 XNO priced at $0.05 → $0.25/XNO → a $0.05 quote should be ~0.2 XNO
   const fetch = async (url, opts) => {
     probes.push(url);
-    assert.match(url, /^https:\/\/api\.nano-gpt\.com\/api\/v1\/chat\/completions$/);
+    assert.equal(url, "https://nano-gpt.com/api/v1/chat/completions");
     assert.equal(opts.headers["x-x402"], "true");
     return {
       status: 402,
@@ -1789,7 +1789,7 @@ test("rate oracle: cached prices expire during an outage and recover with a fres
   const signals = [];
   const fetch = async (url, { signal }) => {
     signals.push(signal);
-    if (new URL(url).hostname !== "api.nano-gpt.com") return new Response("{}", { status: 503 });
+    if (new URL(url).hostname !== "nano-gpt.com") return new Response("{}", { status: 503 });
     probes++;
     if (!probeOk) return { status: 500, json: async () => ({}) };
     return {
@@ -1861,7 +1861,7 @@ test("Nano checkout uses fresh independent rates on cold start and prefers NanoG
     if (host === "api.coingecko.com") return Response.json({ nano: { usd: 0.4,
       last_updated_at: now / 1000 - (coinGeckoFresh ? 5 : 301) } });
     if (host === "api.kraken.com") return Response.json({ error: [], result: { NANOUSD: [["0.5", "10", now / 1000 - 1]] } });
-    assert.equal(host, "api.nano-gpt.com");
+    assert.equal(host, "nano-gpt.com");
     probes++;
     return Response.json({ accepts: oracleReady
       ? [{ scheme: "nano", maxAmountRequired: "100000000000000000000000000000", maxAmountRequiredUSD: "0.025" }]
@@ -2571,7 +2571,12 @@ test("Nano edge landing publishes crawl metadata, named media links and landing-
   const upstream = await fetch(base + "/");
   assert.equal(upstream.headers.get("content-security-policy"), null);
   assert.doesNotMatch(await upstream.text(), /<link rel="canonical"/);
-  assert.equal((await fetch(base + "/sitemap.xml")).status, 404);
+  // Without the Nano marker this origin is the MCP surface, which publishes
+  // its OWN one-URL sitemap — the Nano URL must not leak into it.
+  const upstreamSitemap = await fetch(base + "/sitemap.xml");
+  assert.equal(upstreamSitemap.status, 200);
+  assert.deepEqual(Array.from((await upstreamSitemap.text()).matchAll(/<loc>([^<]+)<\/loc>/g), row => row[1]),
+    ["https://mcp.nanoodle.com/"]);
   const discovery = await fetch(base + "/llms.txt", { headers });
   assert.equal(discovery.headers.get("content-security-policy"), null);
   assert.match(await discovery.text(), /https:\/\/mcp\.nanoodle\.com\/mcp/);
@@ -2581,6 +2586,81 @@ test("Nano edge landing publishes crawl metadata, named media links and landing-
   });
   assert.equal(mcp.headers.get("content-security-policy"), null);
   assert.deepEqual((await mcp.json()).result.tools.map(tool => tool.name), names);
+});
+
+test("NEAR landing publishes crawl metadata, social cards and discovery files", async (t) => {
+  const names = ["character-sprites", "image-model-arena", "mix-the-references", "photo-to-video", "talking-avatar"];
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "nanoodle-mcp", version: "0",
+    listTools: () => names.map(name => ({ name, description: "Sample workflow", inputSchema: { type: "object" } })),
+    callTool: () => assert.fail("landing and discovery must never execute tools"),
+    nearGate: {}, nearHealth: { merchant: "nanoodle.near", network: "mainnet" },
+    publicBase: "https://near.nanoodle.com", log: () => {},
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const canonical = "https://near.nanoodle.com/";
+  const response = await fetch(base + "/");
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("referrer-policy"), "strict-origin-when-cross-origin");
+  // Deliberate: Nano's default-src 'none' CSP is not ported to this
+  // interactive wallet/studio surface (see the nearLanding note in http.mjs).
+  assert.equal(response.headers.get("content-security-policy"), null);
+  const html = await response.text();
+  assert.ok(html.includes(`<link rel="canonical" href="${canonical}">`));
+  assert.ok(html.includes(`property="og:url" content="${canonical}"`));
+  assert.ok(html.includes(`property="og:image" content="${canonical}og.jpg"`));
+  assert.ok(html.includes(`property="og:image:width" content="1200"`));
+  assert.ok(html.includes(`property="og:image:height" content="630"`));
+  assert.match(html, /property="og:image:alt" content="[^"]+"/);
+  const title = html.match(/<title>([^<]+)<\/title>/)[1];
+  assert.match(title, /Give your agents new abilities, paid in NEAR/);
+  assert.equal(html.match(/property="og:title" content="([^"]+)"/)[1], title);
+  assert.equal(html.match(/name="twitter:title" content="([^"]+)"/)[1], title);
+  assert.equal(html.match(/name="twitter:description" content="([^"]+)"/)[1],
+    html.match(/name="description" content="([^"]+)"/)[1]);
+  assert.ok(html.includes(`name="twitter:card" content="summary_large_image"`));
+  assert.ok(html.includes(`name="twitter:image" content="${canonical}og.jpg"`));
+  const schema = JSON.parse(html.match(/<script type="application\/ld\+json">([^<]+)<\/script>/)[1]);
+  assert.equal(schema["@context"], "https://schema.org");
+  assert.equal(schema["@type"], "WebApplication");
+  assert.equal(schema.url, canonical);
+  const images = [...html.matchAll(/<img\b[^>]*>/g)].map(match => match[0]);
+  assert.ok(images.length > 0);
+  for (const image of images) assert.match(image, /width="[1-9]\d*" height="[1-9]\d*"/);
+  assert.ok(html.includes(`aria-label="nanoodle home"`));
+
+  const robots = await fetch(base + "/robots.txt");
+  assert.equal(robots.status, 200);
+  assert.match(robots.headers.get("content-type"), /^text\/plain/);
+  assert.equal(await robots.text(), `Sitemap: ${canonical}sitemap.xml\n`);
+  const sitemap = await fetch(base + "/sitemap.xml");
+  assert.equal(sitemap.status, 200);
+  assert.match(sitemap.headers.get("content-type"), /^application\/xml/);
+  const locations = Array.from((await sitemap.text()).matchAll(/<loc>([^<]+)<\/loc>/g), row => row[1]);
+  assert.deepEqual(locations, [canonical]);
+});
+
+test("MCP surface on the shared origin publishes its own robots and sitemap", async (t) => {
+  const server = await serveHttp({
+    host: "127.0.0.1", port: 0, name: "nanoodle-mcp", version: "0",
+    listTools: () => [],
+    callTool: () => assert.fail("discovery must never execute tools"),
+    gate: {}, publicBase: "https://mcp.nanoodle.com", log: () => {},
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const canonical = "https://mcp.nanoodle.com/";
+  const robots = await fetch(base + "/robots.txt");
+  assert.equal(robots.status, 200);
+  assert.equal(await robots.text(), `Sitemap: ${canonical}sitemap.xml\n`);
+  const sitemap = await fetch(base + "/sitemap.xml");
+  assert.equal(sitemap.status, 200);
+  const locations = Array.from((await sitemap.text()).matchAll(/<loc>([^<]+)<\/loc>/g), row => row[1]);
+  assert.deepEqual(locations, [canonical]);
+  // The Nano marker still selects the Nano discovery files on this origin.
+  const nanoRobots = await fetch(base + "/robots.txt", { headers: { "X-Nanoodle-Surface": "nano" } });
+  assert.equal(await nanoRobots.text(), "Sitemap: https://nano.nanoodle.com/sitemap.xml\n");
 });
 
 test("landing carries OG/social meta and the favicon; brand assets are served", async () => {

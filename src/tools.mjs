@@ -11,7 +11,7 @@
  * All heavy lifting (graph parsing, input derivation, execution, NanoGPT transport)
  * is the `nanoodle` library's; this file only adapts it to the MCP tool shape.
  */
-import { NANOGPT_API_ORIGIN } from "./nanogpt-origin.mjs";
+import { NANOGPT_API_ORIGIN, NANOGPT_ALTERNATE_ORIGIN } from "./nanogpt-origin.mjs";
 import { readdir, readFile, mkdir, open, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -71,6 +71,27 @@ const CATALOG_FAIL_TTL_MS = 60 * 1000;
  */
 const CATALOG_TIMEOUT_MS = 8000;
 
+async function readCatalog(base, kind, fetch, timeoutMs) {
+  const fallback = base === NANOGPT_API_ORIGIN && timeoutMs >= 2;
+  const started = performance.now();
+  const read = async (origin, limit) => {
+    const response = await fetch(origin + CATALOG_PATH[kind], {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(limit),
+    });
+    if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
+    return (await response.json()).data;
+  };
+  try {
+    return await read(base, fallback ? Math.floor(timeoutMs / 2) : timeoutMs);
+  } catch (error) {
+    const remaining = Math.floor(timeoutMs - (performance.now() - started));
+    if (!fallback || remaining < 1
+        || !(error.name === "TimeoutError" || error instanceof TypeError || error.status === 408 || error.status >= 500)) throw error;
+    return read(NANOGPT_ALTERNATE_ORIGIN, remaining);
+  }
+}
+
 /**
  * Fetch the raw public catalog array for each pricing `kind`, keyed for the
  * library's opt-in `catalog` option AND for estimateGraphCost — same shape,
@@ -113,12 +134,7 @@ export async function fetchCatalogs(kinds, { baseUrl = NANOGPT_API_ORIGIN, fetch
       return; // already logged when the failure was recorded
     }
     try {
-      const r = await fetch(base + CATALOG_PATH[kind], {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = (await r.json()).data;
+      const data = await readCatalog(base, kind, fetch, timeoutMs);
       if (Array.isArray(data) && data.length) {
         catalogs[kind] = data;
         catalogCache.set(key, { at: Date.now(), data });
@@ -742,9 +758,8 @@ async function emitResult(wf, result, prefix, outDir, { artifacts, publicBase, n
   };
   // Does any content block carry an actual tool OUTPUT as text (an LLM/text
   // node's result), as opposed to a /out/ URL, a "saved <path>" pointer, or the
-  // cost line? Only true text output is the customer's paid content; the gate
-  // uses this flag to keep it off disk (media pointers + receipts are safe to
-  // persist, the files themselves die by --out-ttl).
+  // cost line? The paid gates use this flag to distinguish text outputs from
+  // media pointers when choosing how to retain a result.
   let textOutput = false;
   for (const o of resultPorts(wf, result)) {
     const value = o.value;
@@ -803,7 +818,7 @@ async function emitResult(wf, result, prefix, outDir, { artifacts, publicBase, n
   }
   // costUsd and textOutput ride as structured sidecars for the --charge gate:
   // costUsd feeds its margin math (author payout = charge − cost), textOutput
-  // tells persist() this result holds paid content that must never hit disk.
+  // distinguishes generated text from result notices and media pointers.
   // Every serving layer strips BOTH before replying to an MCP client.
   // costExact rides along so the gate can label a lower-bound total as one instead of as the actual cost
   return { content, costUsd: Number.isFinite(result.costUsd) ? result.costUsd : null, costExact: result.costExact !== false, textOutput };
