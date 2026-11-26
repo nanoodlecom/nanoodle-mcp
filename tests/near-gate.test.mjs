@@ -58,7 +58,7 @@ async function world({ limits, dust = 137, publicBase, canQuote, canFundQuote, f
   const registry = await loadTools({ dirs: [graphsDir], apiKey: "test-key", baseUrl, outDir: out, publicBase: "http://127.0.0.1:1", log: () => {} });
   const file = join(out, "near-state.json");
   const events = [];
-  const make = () => {
+  const make = (currentRegistry = registry) => {
     const rpc = rpcForChain(chain);
     const ledger = openNearLedger({ file, network: "testnet", merchant: MERCHANT, now, watchPaymentHistory });
     const signer = parseNearSecretKey(key.secretKey);
@@ -73,11 +73,11 @@ async function world({ limits, dust = 137, publicBase, canQuote, canFundQuote, f
       baseUrl, now, ...(usdcToken && { usdcEnabled: true, usdcToken }),
       usage: (event, fields) => events.push({ event, ...fields }),
     });
-    const { listTools, callTool } = gate.wrapRegistry(registry);
+    const { listTools, callTool } = gate.wrapRegistry(currentRegistry);
     return { gate, ledger, rpc, refunder, listTools, callTool };
   };
   const g = make();
-  return { ...g, chain, registry, file, out, events, restart: async () => { const n = make(); await n.gate.resume(); return n; } };
+  return { ...g, chain, registry, file, out, events, restart: async currentRegistry => { const n = make(currentRegistry); await n.gate.resume(); return n; } };
 }
 
 const call = (w, name, args) => w.callTool({ name, arguments: args });
@@ -591,6 +591,53 @@ async function quoteAndPay(w, name, args, { amount, blockTimeMs } = {}) {
   const tx = w.chain.transfer(PAYER, MERCHANT, amount ?? BigInt(p.amountYocto), { blockTimeMs });
   return { p, tx, pay: () => call(w, name, { ...args, _payment_id: p.paymentId, _payment_tx: tx, _payment_sender: PAYER }) };
 }
+
+test("an existing paid quote cannot run a replacement saved graph after restart", async t => {
+  const w = await world();
+  const finished = await quoteAndPay(w, "idea-poster", INPUTS);
+  const original = await finished.pay();
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  assert.equal((await w.gate.confirmPayment(p.paymentId, tx, PAYER)).status, "paid");
+  const graph = structuredClone(WORKED_GRAPH);
+  graph.nodes.find(n => n.type === "llm").fields.system = "A different saved workflow";
+  const dir = await mkdtemp(join(tmpdir(), "near-replaced-graph-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "idea-poster.json"), JSON.stringify(graph));
+  const replacement = await loadTools({ dirs: [dir], outDir: w.out, apiKey: "test-key", log: () => {} });
+  const restarted = await w.restart(replacement);
+  const args = { ...INPUTS, _payment_id: p.paymentId };
+  const runs = mock.runs();
+  const result = await call(restarted, "idea-poster", args);
+  assert.equal(mock.runs(), runs, "the replacement must not reach the provider");
+  assert.match(text(result), /saved workflow changed after this quote/);
+  const { receipt } = result.structuredContent;
+  assert.equal(receipt.outcome, "run_failed");
+  assert.equal(receipt.charged.yocto, "0");
+  assert.equal(receipt.refund.yocto, p.amountYocto);
+  assert.equal(receipt.refund.status, "sent");
+  assert.deepEqual(await call(restarted, "idea-poster", args), result);
+  assert.equal(restarted.ledger.refunds().filter(r => r.paymentId === p.paymentId).length, 1);
+  const replay = await call(restarted, "idea-poster", { ...INPUTS, _payment_id: finished.p.paymentId });
+  assert.deepEqual(replay.structuredContent.receipt, original.structuredContent.receipt);
+  assert.ok(replay.content.some(part => part.type === "text" && part.text.includes("/out/")));
+  assert.equal(mock.runs(), runs);
+});
+
+test("a stored paid quote from before saved-workflow binding still resumes", async () => {
+  const w = await world();
+  const { p, tx } = await quoteAndPay(w, "idea-poster", INPUTS);
+  assert.equal((await w.gate.confirmPayment(p.paymentId, tx, PAYER)).status, "paid");
+  const state = JSON.parse(await readFile(w.file, "utf8"));
+  assert.ok(state.quotes[p.paymentId].savedWorkflowKey);
+  delete state.quotes[p.paymentId].savedWorkflowKey;
+  await writeFile(w.file, JSON.stringify(state));
+
+  const restarted = await w.restart();
+  const runs = mock.runs();
+  const result = await call(restarted, "idea-poster", { ...INPUTS, _payment_id: p.paymentId });
+  assert.equal(result.structuredContent.receipt.outcome, "succeeded");
+  assert.equal(mock.runs(), runs + 1);
+});
 
 test("tools/list offers run_noodle, the free helpers and safe saved graphs, with payment arguments", async () => {
   const w = await world();

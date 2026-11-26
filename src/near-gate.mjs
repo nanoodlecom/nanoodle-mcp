@@ -534,6 +534,7 @@ export function createNearGate({
       // Only what payment and settlement need is stored; the itemized pricing is in the answer.
       const record = {
         id, tool: name, ...(resumeTool ? { resumeTool } : {}), argsHash: hashArgs(name, args), status: "pending", author,
+        ...(tool?.costKey && { savedWorkflowKey: tool.costKey }),
         ...(asset === "usdc" ? { asset, tokenContract: usdcToken } : {}),
         amountYocto: amountYocto.toString(),
         depositUsd: exactUsd(pricing.depositUsd),
@@ -867,6 +868,10 @@ export function createNearGate({
     // The bound MCP call is still checked before any model work can begin.
     let prepared = null, budget = null, prepError = null;
     try {
+      // Saved-tool arguments carry no graph. An active quote must still refer to the same workflow after a restart.
+      if (q.savedWorkflowKey != null && q.savedWorkflowKey !== tool?.costKey) {
+        throw new NearError("QUOTED_WORKFLOW_CHANGED", "The saved workflow changed after this quote.");
+      }
       prepared = await prepare(registry, name, args, tool);
       if (fundRun && (providerUsesWallet || q.author)) {
         budget = nearRunFundingBudget(q, { providerUsesWallet });
@@ -909,6 +914,8 @@ export function createNearGate({
       let error = "The run did not complete. Provider costs already incurred are the operator's, not yours; you can try again with a new quote.";
       if (prepError?.code === "QUOTE_BUDGET_EXCEEDED") {
         error = "The current model estimate exceeds this quote's budget. No model work started. The full deposit is being returned. Request a new quote to try again.";
+      } else if (prepError?.code === "QUOTED_WORKFLOW_CHANGED") {
+        error = "The saved workflow changed after this quote. The full deposit is being returned.";
       } else if (q.status === "paid" && budget?.maxRaw === 0n && e?.code === "FUNDING_INSUFFICIENT") {
         error = "The shared Nano wallet cannot cover the creator payout. No model work started. The full deposit is being returned.";
       } else if (e?.code === "RESULT_WRITE_FAILED") {
