@@ -16,7 +16,7 @@ import { waitForRecentAppStart } from "../src/probe-startup.mjs";
 import { paymentLiabilities, nearLiquidityChecks, nanoLiquidityCheck, paidNearRunFundingRaw, paidNanoRunFundingRaw,
   marketRunFunding, recentPaidWorkflowFailures } from "../src/operational-state.mjs";
 import { findUnrecordedNanoPayments, nanoWatchDemand, NANO_SCAN_GRACE_MS } from "../src/operational-nano-watch.mjs";
-import { checkedAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
+import { completeAnchoredNanoHistory, NANO_HISTORY_PAGE, NANO_RECEIVABLE_COUNT } from "../src/nano-payment-history.mjs";
 import { base58Encode, base58Decode, createNearRpc, loadNearSigner, checkUsdcMerchant, parseNearToYocto, USDC_CONTRACTS } from "../src/near/index.mjs";
 import { readNearPaymentReceipts, readNearReceiptTransaction } from "../src/near/watch.mjs";
 import { hasUnverifiedNearPaymentClaim, SETTLED_NEAR_QUOTE_RETENTION_MS } from "../src/near/ledger.mjs";
@@ -47,7 +47,7 @@ import { RAW_PER_XNO, parseSpreadBps, spreadPair } from "../src/near/rates.mjs";
 import { exactUsd } from "../src/custom-workflow.mjs";
 import { nearRunFundingBudget } from "../src/funding-liabilities.mjs";
 import { runFundingBudget } from "../src/run-funding.mjs";
-import { atomicJson, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
+import { atomicJson, canonicalCanaryOutput, checkGraph, DEFAULT_CHECK_MAX_NEAR } from "./near-check.mjs";
 
 const ALL = ["nano", "near", "usdc", "market"];
 const NEAR_BACKFILL_ALERT_MS = 5 * 60_000;
@@ -365,7 +365,7 @@ export async function runOperationalCheck(config, deps = {}) {
     const response = await request(url, init); need(response.ok, `http-${response.status}`); return response.json();
   };
   const nanoRpc = async (url, body, signal) => {
-    need(["account_info", "account_history", "receivable", "block_count", "version", "block_info", "telemetry"].includes(body.action), "probe-action-forbidden");
+    need(["account_info", "account_history", "receivable", "block_count", "version", "block_info", "blocks_info", "telemetry"].includes(body.action), "probe-action-forbidden");
     const response = await request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal });
     need(response.status !== 429, "nano-rpc-rate-limited");
     need(response.ok, `http-${response.status}`);
@@ -694,7 +694,7 @@ export async function runOperationalCheck(config, deps = {}) {
       }
       checkedReceivable(pending, receivableRequest, view, checkAddress);
       const historyRequest = { action: "account_history", account, head: view.confirmedFrontier, count: String(NANO_HISTORY_PAGE), raw: "true" };
-      checkedAnchoredNanoHistory(await rpc(historyRequest), historyRequest, checkAddress, view.confirmedHeight);
+      await completeAnchoredNanoHistory(await rpc(historyRequest), historyRequest, { rpc, checkAddress, hashBlock, height: view.confirmedHeight });
       return true;
     }, []);
     // A valid but newer account view still matters when its payment window
@@ -915,7 +915,7 @@ export async function runOperationalCheck(config, deps = {}) {
           const statusCopy = await statusReceipt;
           need(!result?.isError && matchesLedger(receipt) && (!statusCopy || isDeepStrictEqual(receipt, statusCopy)), code);
           const text = Array.isArray(result.content) && result.content.find(part => part?.type === "text")?.text;
-          const output = typeof text === "string" ? text.trim() : "";
+          const output = canonicalCanaryOutput(text);
           // An eviction notice can accompany a valid receipt after restart.
           need(/^(?:NANOODLE_OK:)?[a-f0-9]{16}$/.test(output), "near-settled-payment-output-unavailable");
           const { outputSha256 } = sample;

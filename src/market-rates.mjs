@@ -41,3 +41,24 @@ export async function fetchKrakenNanoRate(fetch, { timeoutMs = 3_000 } = {}) {
   const trade = body.result?.NANOUSD?.[0];
   return Array.isArray(trade) ? marketRate(trade[0], trade[2], "kraken") : null;
 }
+
+// Both hosted checkout rails share a short cache. Every quote still verifies
+// the provider's observation timestamp against its existing freshness limit.
+export function createMarketRateReader({ fetch = globalThis.fetch, now = () => performance.now() } = {}) {
+  function share(read) {
+    let fetchedAt = -Infinity, value, inflight;
+    return () => {
+      if (now() - fetchedAt < 15_000) return Promise.resolve(value);
+      inflight ??= read().then(result => {
+        value = result;
+        fetchedAt = now();
+        return result;
+      }).finally(() => { inflight = null; });
+      return inflight;
+    };
+  }
+  return {
+    coingecko: share(() => fetchCoinGeckoRates(fetch)),
+    kraken: share(() => fetchKrakenNanoRate(fetch)),
+  };
+}

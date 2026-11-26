@@ -21,21 +21,30 @@ export function checkGraph(marker, twoSteps = false) {
   const nodes = [
     { id: "input", type: "text", name: "Marker", fields: { text: "" } },
     { id: "extract", type: "llm", name: "Read marker", fields: { ...fields,
-      system: "Return only the 16 lowercase hexadecimal characters after Marker: in the user's message. Copy them exactly. No prefix, punctuation, spaces or explanation." } },
+      system: "Copy the user's 16 lowercase hexadecimal characters exactly. Return only those characters." } },
   ];
   const links = [{ id: "read", from: { node: "input", port: "text" }, to: { node: "extract", port: "prompt" } }];
   if (twoSteps) {
     nodes.push({ id: "format", type: "llm", name: "Copy marker", fields: { ...fields, system: "Return the user's 16 lowercase hexadecimal characters exactly. No prefix, punctuation, spaces or explanation." } });
     links.push({ id: "handoff", from: { node: "extract", port: "text" }, to: { node: "format", port: "prompt" } });
   }
-  return { graph: { v: 1, nodes, links }, inputs: { Marker: `Marker: ${marker}` }, _pay_with: "near" };
+  return { graph: { v: 1, nodes, links }, inputs: { Marker: marker }, _pay_with: "near" };
+}
+
+const firstOutput = result => result?.content?.find(part => part?.type === "text")?.text;
+
+export function canonicalCanaryOutput(text) {
+  return typeof text === "string" ? text.trim().replace(/^Marker: /, "") : "";
 }
 
 function correctOutput(result, state) {
   if (state.v < 2) return resultText(result).includes(`NANOODLE_OK:${state.marker}`);
-  // Validate the model output itself, not marker text in billing or metadata.
-  const text = result?.content?.find(c => c.type === "text")?.text;
-  return /^[a-f0-9]{16}$/.test(state.marker) && typeof text === "string" && text.trim() === state.marker;
+  // Accept the exact marker or the single label echoed by the earlier prompt.
+  return /^[a-f0-9]{16}$/.test(state.marker) && canonicalCanaryOutput(firstOutput(result)) === state.marker;
+}
+
+function sameOutput(result, state) {
+  return correctOutput(result, state) && (state.v < 2 || firstOutput(result) === firstOutput(state.result));
 }
 
 /** Dependencies are injectable so crash recovery and payment limits run offline. */
@@ -70,7 +79,7 @@ export async function runCheck(config, deps = {}) {
     const [view, cached] = await Promise.all([json(`/near/status/${paymentId}`), json(`/near/result/${paymentId}`)]);
     require(view?.paymentId === paymentId && view.status === "settled" && isDeepStrictEqual(view.receipt, receipt),
       "Payment page status or refund differs from the verified receipt");
-    require(cached && !cached.isError && correctOutput(cached, state) && isDeepStrictEqual(cached.structuredContent?.receipt, receipt),
+    require(cached && !cached.isError && sameOutput(cached, state) && isDeepStrictEqual(cached.structuredContent?.receipt, receipt),
       "Payment page result or receipt differs from the verified run");
   }
   try {
@@ -170,7 +179,7 @@ export async function runCheck(config, deps = {}) {
     stage = "replay_and_result";
     const replay = await call("run_noodle", paidArgs);
     require(isDeepStrictEqual(replay.structuredContent?.receipt, receipt), "Replay changed the receipt");
-    require(correctOutput(replay, state), "Paid output is unavailable on replay; text results are not retained across server restarts");
+    require(!replay.isError && sameOutput(replay, state), "Paid output is unavailable or changed on replay");
     await verifyPaymentPage(receipt);
     const report = { ok: true, checkedAt: new Date(now()).toISOString(), runDay: state.day, model: state.args.graph.nodes.find(n => n.type === "llm").fields.model, modelSteps: state.args.graph.nodes.filter(n => n.type === "llm").length,
       output: expected, progressFrames: state.progress.length, chargedUsd: receipt.charged.usd, chargedNear: formatYoctoAsNear(charged), refundedNear: formatYoctoAsNear(refunded), payerGasNear: formatYoctoAsNear(BigInt(state.gasYocto)),

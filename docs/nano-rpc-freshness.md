@@ -94,7 +94,10 @@ consensus protocol or a guarantee when all configured nodes are frozen together.
 Receivable scans request confirmed sends only. A short complete pending page
 must agree with that peer's atomic confirmed pending total. History scans expose
 only confirmed entries so the payment cursor cannot advance past an unconfirmed
-receive. Block outcome reads consult the qualified peers: a positive confirmation
+receive. If a primary endpoint omits predecessor links, the reader requests one
+bounded batch of confirmed blocks from that peer and checks their hashes,
+ownership, height and receive details before validating the full history chain.
+Block outcome reads consult the qualified peers: a positive confirmation
 wins over a stale negative response, and partial outages cannot establish that a
 block is absent. State-block contents must hash to the requested block ID.
 
