@@ -241,7 +241,12 @@ export function createPaymentRoute({ adapter, now = Date.now }) {
       const args = Object.fromEntries(Object.entries(claimArgs).filter(([k]) => !(adapter.claimFields || []).some((f) => f.name === k)));
 
       if (_payment_id == null) {
-        if (typeof registry.prepareCall === "function") registry.prepareCall({ name, arguments: args }); // never quote a call that would not run
+        // Validate through the same registry entry point that executes the request.
+        if (name === "run_noodle" && typeof registry.prepareRunNoodle === "function") {
+          await registry.prepareRunNoodle(args, { allowShortLinks: false });
+        } else if (typeof registry.prepareCall === "function") {
+          await registry.prepareCall({ name, arguments: args });
+        }
         const usdEstimate = await estimate(name, args);
         return quoteResult(await issueQuote({ tool: name, usdEstimate }));
       }
