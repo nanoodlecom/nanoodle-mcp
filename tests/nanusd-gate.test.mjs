@@ -4,6 +4,9 @@
 // asset-agnostic (the same lifecycle the Nano and NEAR gates implement).
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { blake2b } from "../src/nanusd/blake2b.mjs";
 import { parseNanusdAddress, isValidNanusdAddress, nanusdAddressFromPublicKey } from "../src/nanusd/address.mjs";
 import { createNanusdRpc, createMockNanusdNode } from "../src/nanusd/rpc.mjs";
@@ -12,6 +15,7 @@ import { createPaymentRoute } from "../src/pay/route-core.mjs";
 import { parseUsdNano, usdNanoToAtomic, atomicToUsdNano } from "../src/pay/money.mjs";
 import { endpointDiscovery } from "../src/discovery.mjs";
 import { createRailRouter } from "../src/rail-router.mjs";
+import { loadTools } from "../src/tools.mjs";
 
 const GENESIS = "usd_1gzne9cau473gmnx3meopyi1trxiw4cu54bzkrm1p6khhpfinwj55k9d4eeq";
 
@@ -182,6 +186,36 @@ test("execution reuse: wrapRegistry sells tools through the nanusd gate — quot
   const replay = await wrapped.callTool({ name: "run_noodle", arguments: { graph: {}, _payment_id: payment.paymentId } });
   assert.equal(replay, done);
   assert.equal(registry.state.runs, 1);
+});
+
+test("NanoUSD verifies actual saved and composed inputs before pricing a quote", async (t) => {
+  const { mock, gate, payer } = nanusdFixture();
+  const dir = await mkdtemp(join(tmpdir(), "nanusd-registry-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const graph = { nodes: [{ id: "idea", name: "Idea", type: "text", fields: { text: "" } }], links: [] };
+  await writeFile(join(dir, "story.json"), JSON.stringify(graph));
+  const registry = await loadTools({ dirs: [dir], outDir: dir, apiKey: "test", baseUrl: "http://127.0.0.1:9", log: () => {} });
+  const priced = [];
+  const wrapped = gate.wrapRegistry(registry, { estimate: async (name) => { priced.push(name); return "0.50"; } });
+
+  for (const [name, args] of [["story", {}], ["run_noodle", { graph }]]) {
+    await assert.rejects(wrapped.callTool({ name, arguments: args }), { mcpCode: -32602, message: /missing required input.*"Idea"/ });
+  }
+  assert.deepEqual(priced, [], "invalid input must not reach the pricing hook");
+
+  const inputs = { Idea: "local fixture text" };
+  for (const [name, args] of [["story", inputs], ["run_noodle", { graph, inputs }]]) {
+    const quote = await wrapped.callTool({ name, arguments: args });
+    const { paymentId, amountRaw } = quote.structuredContent.payment;
+    mock.injectSend({ hash: name.padEnd(64, "0"), from: payer, to: GENESIS, amountRaw });
+    const terminal = [];
+    const result = await wrapped.callTool({ name, arguments: { ...args, _payment_id: paymentId } }, {
+      workflow(state) { if (state.status !== "running") terminal.push(state.status); },
+    });
+    assert.equal(result.content[0].text, inputs.Idea);
+    assert.deepEqual(terminal, ["succeeded"]);
+  }
+  assert.deepEqual(priced, ["story", "run_noodle"]);
 });
 
 test("router reuse: nanusd registers as the composition rail beside nano", async () => {
