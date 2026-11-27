@@ -97,6 +97,13 @@ export function createHostedWorkflows({ dir, callTool, publicBase, merchant, net
     const record = get(id); if (!record) return [];
     const { schema } = inputShape(record.graph, record.inputNodeIds);
     return ["run_workflow", "price_workflow"].map(name => ({ name,
+      // Directory reviewers (Claude Connectors, OpenAI) require a title and
+      // readOnlyHint/destructiveHint on every tool — classified honestly:
+      // price_workflow only reads, run_workflow executes and spends per call.
+      title: name === "price_workflow" ? `Price ${record.name} (free)` : record.name,
+      annotations: name === "price_workflow"
+        ? { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+        : { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       description: name === "price_workflow" ? "Check the cost of this hosted workflow for free; no models run."
         : `${record.description || record.name} Hosted by Nanoodle. Quote first; pay NEAR or USDC; unused funds return automatically. ${record.author ? "Creator earnings go to the graph's embedded Nano address." : "No creator payout is configured for this workflow."}`,
       inputSchema: { ...schema, properties: { ...schema.properties,

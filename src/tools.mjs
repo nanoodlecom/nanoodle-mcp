@@ -559,11 +559,31 @@ const graphArgProperties = () => ({
 });
 
 /**
+ * MCP tool annotations (the spec's ToolAnnotations) plus a human title for
+ * every tool this server lists. Directory reviewers read them: the Claude
+ * Connectors Directory portal flags any tool missing a title or a
+ * readOnlyHint/destructiveHint, and OpenAI's directory asks for all three
+ * hints — so they are classified honestly here, once, at the source:
+ * - READ: free lookups that run nothing and change nothing (price/guide).
+ * - EXECUTE: runs a workflow on hosted models; every call spends real credit
+ *   and produces a new result, so it is neither read-only nor idempotent.
+ *   No tool here deletes or overwrites caller data, so destructiveHint stays
+ *   false throughout — the spend is disclosed in each description instead.
+ */
+const READ_ANNOTATIONS = Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+const EXECUTE_ANNOTATIONS = Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true });
+
+/** Human-readable tool title from its machine name ("hello-noodle" → "Hello noodle"). */
+const toolTitle = (name) => name.replace(/[_-]+/g, " ").replace(/^./, (c) => c.toUpperCase());
+
+/**
  * The one tool that isn't tied to a saved file: it takes any nanoodle share
  * link, or a graph the caller composed, and runs it.
  */
 const runNoodleTool = (spendSource) => ({
   name: RUN_NOODLE_NAME,
+  title: "Run a workflow",
+  annotations: EXECUTE_ANNOTATIONS,
   description:
     "Run any nanoodle workflow: pass a share link as `url` (a nanoodle.com/#g=… workflow link, a " +
     "nanoodle.com/play.html#a=… app link, or a da.gd/TinyURL short link to one) OR a custom " +
@@ -577,6 +597,9 @@ const runNoodleTool = (spendSource) => ({
 /** Free: the itemized price of a graph, without running it or creating a quote. */
 const priceNoodleTool = () => ({
   name: PRICE_NOODLE_NAME,
+  title: "Price a workflow (free)",
+  // openWorldHint: resolving a fragment-less short link reads the network.
+  annotations: { ...READ_ANNOTATIONS, openWorldHint: true },
   description:
     "Free, never charged: price a workflow before you run it. Takes the same `url` OR `graph` " +
     "and `inputs` as run_noodle and returns the estimated cost (itemized per paid node: node, " +
@@ -590,6 +613,8 @@ const priceNoodleTool = () => ({
 /** Free: how to author a graph, plus the priced models. */
 const noodleGuideTool = () => ({
   name: NOODLE_GUIDE_NAME,
+  title: "Workflow authoring guide (free)",
+  annotations: READ_ANNOTATIONS,
   description:
     "Free, never charged: how to write a custom nanoodle workflow graph for run_noodle — the node " +
     "types this server runs (inputs, outputs, key fields), the wiring rules, a complete example " +
@@ -1291,6 +1316,11 @@ export async function loadTools({ dirs, apiKey, payment, backupKey, authorizeBac
       return [
         ...tools.map((t) => ({
           name: t.name,
+          // Every saved-workflow tool runs its graph on hosted models when
+          // called — EXECUTE class. sfw_check's name titles poorly, so it
+          // gets its intent as the title instead.
+          title: t.name === SFW_TOOL ? "Check if media is safe for work" : toolTitle(t.name),
+          annotations: EXECUTE_ANNOTATIONS,
           description: t.description,
           inputSchema: t.inputSchema,
           ...(t.pricedPerRequest ? { pricedPerRequest: true, depositNote: t.depositNote } : {}),
